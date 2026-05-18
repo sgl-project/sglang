@@ -280,5 +280,3 @@ def _extract_forward_batch(args, kwargs):
         if isinstance(arg, ForwardBatch):
             return arg
     return None
-
-

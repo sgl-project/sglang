@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 VIOLATION_FIELDS: int = 8
-CANARY_FIELDS_PER_SLOT: int = 4
+CANARY_FIELDS_PER_SLOT: int = 5
 CANARY_SLOT_BYTES: int = CANARY_FIELDS_PER_SLOT * 8
 
 # Slot field offsets (in 8-byte words). Mirrors the kCanaryField* constants
@@ -22,6 +22,21 @@ _CANARY_FIELD_REQ_ID: int = 0
 _CANARY_FIELD_TOKEN_ID: int = 1
 _CANARY_FIELD_POSITION: int = 2
 _CANARY_FIELD_PREV_HASH: int = 3
+# real_kv_hash: splitmix64 mix of a few bytes of the real KV pool's slot
+# data captured at write time. Verified by reading the same bytes again
+# at verify time; mismatch implies the real KV slot changed underneath
+# the canary (the attn-kernel-config / PD-transfer corruption modes
+# canary-with-real-data is designed to catch).
+_CANARY_FIELD_REAL_KV_HASH: int = 4
+
+# Modes for ``--kv-cache-canary-real-data``. ``OFF`` disables the
+# real-KV mix entirely (the real_kv_hash field stays zero); ``BIT`` mixes
+# a 16-byte prefix of the real slot; ``ALL`` mixes the full real-slot
+# stride. Mirrored in C++ as ``kRealKvHashMode*`` constants.
+REAL_KV_HASH_MODE_OFF: int = 0
+REAL_KV_HASH_MODE_BIT: int = 1
+REAL_KV_HASH_MODE_ALL: int = 2
+REAL_KV_HASH_BIT_BYTES: int = 16
 
 # Violation-row field offsets. Mirrors the kViolationField* constants.
 _VIOLATION_FIELD_KERNEL_KIND: int = 0
@@ -51,6 +66,7 @@ class FailReason(enum.IntEnum):
     POSITION = 3
     HASH = 4
     POSITION_MONOTONIC = 5
+    REAL_KV_HASH = 6
 
 
 @cache_once
@@ -90,6 +106,10 @@ def canary_step(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
+    real_kv_buf: torch.Tensor,
+    real_kv_slot_stride_bytes: int,
+    real_kv_read_bytes: int,
+    real_kv_hash_mode: int,
 ) -> None:
     """Launch one KV-cache canary step.
 
@@ -163,6 +183,10 @@ def canary_step(
         slot_run_counter,
         kernel_run_counter,
         kernel_kind,
+        real_kv_buf,
+        real_kv_slot_stride_bytes,
+        real_kv_read_bytes,
+        real_kv_hash_mode,
     )
 
 
@@ -194,6 +218,10 @@ def canary_step_torch_reference(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
+    real_kv_buf: torch.Tensor,
+    real_kv_slot_stride_bytes: int,
+    real_kv_read_bytes: int,
+    real_kv_hash_mode: int,
 ) -> None:
     """Pure-torch / pure-Python reference implementation of :func:`canary_step`.
 
@@ -236,6 +264,12 @@ def canary_step_torch_reference(
         dst_buf=dst_buf,
         slot_stride_bytes=slot_stride_bytes,
     )
+    real_kv_view = _RealKvView.from_tensor(
+        real_kv_buf=real_kv_buf,
+        slot_stride_bytes=int(real_kv_slot_stride_bytes),
+        read_bytes=int(real_kv_read_bytes),
+        mode=int(real_kv_hash_mode),
+    )
     plan = _RefPlan.from_tensors(
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
@@ -264,12 +298,14 @@ def canary_step_torch_reference(
     active_verify = _run_verify_entries(
         plan=plan,
         int_views=int_views,
+        real_kv_view=real_kv_view,
         seed=seed,
         sink=sink,
     )
     active_write = _run_write_chains(
         plan=plan,
         int_views=int_views,
+        real_kv_view=real_kv_view,
         seed=seed,
     )
 
@@ -341,6 +377,70 @@ class _IntViewBundle:
         """
         dst_dev_i64 = self._dst_i64.to(self._dst_buf.device)
         self._dst_buf.view(torch.int64).copy_(dst_dev_i64)
+
+
+class _RealKvView:
+    """Host-side reader for the optional real-KV slot buffer.
+
+    In ``OFF`` mode :meth:`hash_slot` always returns 0; in ``BIT`` /
+    ``ALL`` modes it pulls ``read_bytes`` consecutive bytes starting at
+    the slot's stride offset and folds them through splitmix64 in 8-byte
+    chunks (zero-padded if ``read_bytes`` is not a multiple of 8). The
+    CUDA kernel uses the same chunked-XOR mix so this implementation is
+    a bit-exact reference.
+    """
+
+    def __init__(
+        self,
+        *,
+        real_kv_buf: torch.Tensor,
+        slot_stride_bytes: int,
+        read_bytes: int,
+        mode: int,
+    ) -> None:
+        self._mode = int(mode)
+        self._slot_stride_bytes = int(slot_stride_bytes)
+        self._read_bytes = int(read_bytes)
+        if self._mode == REAL_KV_HASH_MODE_OFF or self._read_bytes <= 0:
+            self._host_bytes: Optional[bytes] = None
+        else:
+            flat_bytes = real_kv_buf.detach().to("cpu").contiguous().view(torch.uint8)
+            self._host_bytes = bytes(flat_bytes.numpy().tobytes())
+
+    @classmethod
+    def from_tensor(
+        cls,
+        *,
+        real_kv_buf: torch.Tensor,
+        slot_stride_bytes: int,
+        read_bytes: int,
+        mode: int,
+    ) -> "_RealKvView":
+        return cls(
+            real_kv_buf=real_kv_buf,
+            slot_stride_bytes=slot_stride_bytes,
+            read_bytes=read_bytes,
+            mode=mode,
+        )
+
+    def hash_slot(self, slot_idx: int) -> int:
+        """Return the splitmix64-folded hash of the real-KV slot, or 0 if disabled."""
+        if self._mode == REAL_KV_HASH_MODE_OFF or self._host_bytes is None:
+            return 0
+        start = int(slot_idx) * self._slot_stride_bytes
+        end = start + self._read_bytes
+        if start < 0 or end > len(self._host_bytes):
+            return 0
+        chunk = self._host_bytes[start:end]
+        acc = 0
+        i = 0
+        while i < self._read_bytes:
+            j = min(i + 8, self._read_bytes)
+            word_bytes = chunk[i:j]
+            word = int.from_bytes(word_bytes, byteorder="little", signed=False)
+            acc = splitmix64_mix(acc, word, 0)
+            i = j
+        return acc & _U64_MASK
 
 
 class _RefPlan:
@@ -474,6 +574,7 @@ def _run_verify_entries(
     *,
     plan: _RefPlan,
     int_views: _IntViewBundle,
+    real_kv_view: _RealKvView,
     seed: int,
     sink: _RefViolationSink,
 ) -> int:
@@ -495,6 +596,9 @@ def _run_verify_entries(
         actual_prev_hash = (
             int_views.load_field(slot_idx, _CANARY_FIELD_PREV_HASH) & _U64_MASK
         )
+        actual_real_kv_hash = (
+            int_views.load_field(slot_idx, _CANARY_FIELD_REAL_KV_HASH) & _U64_MASK
+        )
 
         if prev_slot_idx < 0:
             expected_prev_hash = seed & _U64_MASK
@@ -508,6 +612,8 @@ def _run_verify_entries(
                 prev_prev_hash, prev_token & _U64_MASK, prev_position & _U64_MASK
             )
 
+        expected_real_kv_hash = real_kv_view.hash_slot(slot_idx)
+
         fail_reason = FailReason.NONE
         if actual_req_id != expected_req_id:
             fail_reason = FailReason.REQ_ID
@@ -515,15 +621,23 @@ def _run_verify_entries(
             fail_reason = FailReason.POSITION_MONOTONIC
         elif actual_prev_hash != expected_prev_hash:
             fail_reason = FailReason.HASH
+        elif actual_real_kv_hash != expected_real_kv_hash:
+            fail_reason = FailReason.REAL_KV_HASH
         if fail_reason != FailReason.NONE:
+            if fail_reason == FailReason.REAL_KV_HASH:
+                expected_hash_field = expected_real_kv_hash
+                actual_hash_field = actual_real_kv_hash
+            else:
+                expected_hash_field = expected_prev_hash
+                actual_hash_field = actual_prev_hash
             sink.record(
                 fail_reason=int(fail_reason),
                 slot_idx=slot_idx,
                 req_id=actual_req_id,
                 token_id=actual_token_id,
                 position=actual_position,
-                expected_hash=expected_prev_hash,
-                actual_hash=actual_prev_hash,
+                expected_hash=expected_hash_field,
+                actual_hash=actual_hash_field,
             )
 
     return active
@@ -533,6 +647,7 @@ def _run_write_chains(
     *,
     plan: _RefPlan,
     int_views: _IntViewBundle,
+    real_kv_view: _RealKvView,
     seed: int,
 ) -> int:
     """Walk active write-req chains, mutating slots. Returns total slot count."""
@@ -567,11 +682,13 @@ def _run_write_chains(
             req_id = int(plan.write_req_ids[i])
             token_id = int(plan.write_token_ids[i])
             position = int(plan.write_positions[i])
+            real_kv_hash = real_kv_view.hash_slot(slot_idx)
 
             int_views.store_field(slot_idx, _CANARY_FIELD_REQ_ID, req_id)
             int_views.store_field(slot_idx, _CANARY_FIELD_TOKEN_ID, token_id)
             int_views.store_field(slot_idx, _CANARY_FIELD_POSITION, position)
             int_views.store_field(slot_idx, _CANARY_FIELD_PREV_HASH, prev_hash)
+            int_views.store_field(slot_idx, _CANARY_FIELD_REAL_KV_HASH, real_kv_hash)
 
             prev_hash = splitmix64_mix(
                 prev_hash, token_id & _U64_MASK, position & _U64_MASK
