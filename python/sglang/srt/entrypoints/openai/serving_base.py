@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -12,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.iochain.base import IOChain, IOContext
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -21,6 +23,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-async-task IOContext slot — each concurrent request gets its own.
+_iochain_ctx: ContextVar[Optional[IOContext]] = ContextVar("iochain_ctx", default=None)
+
 
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
@@ -28,6 +33,7 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self._iochain: Optional[IOChain] = None
         self.allowed_custom_labels = (
             set(
                 self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
@@ -36,6 +42,17 @@ class OpenAIServingBase(ABC):
             and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )
+
+    def set_iochain(self, chain: IOChain) -> None:
+        """
+        Attach an IOChain to this handler.
+
+        Called once at server startup by ``http_server.py`` after
+        ``load_iochain`` has built the chain from entry points and CLI args.
+        All subsequent requests handled by this instance will pass through
+        the chain's processors.
+        """
+        self._iochain = chain
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
@@ -70,6 +87,79 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    async def _before_inference(self, request: Any, adapted_request: Any) -> None:
+        """
+        IOChain ingress phase — runs after tokenisation, before inference.
+
+        Creates a fresh ``IOContext``, stores it in the per-task ``ContextVar``
+        so ``_after_inference`` can retrieve it, then executes
+        ``IOChain.run_ingress``.  Blocking processors may raise to abort the
+        request; non-blocking processors run as background tasks.
+
+        No-op if no chain is attached or the chain has no processors.
+        """
+        if not self._iochain or not self._iochain._processors:
+            return
+        ctx = self._iochain.make_context(request, adapted_request)
+        _iochain_ctx.set(ctx)
+        await self._iochain.run_ingress(ctx)
+
+    async def _after_inference(
+        self, request: Any, adapted_request: Any, response: Any
+    ) -> None:
+        """
+        IOChain egress phase — runs after the response is fully delivered.
+
+        Retrieves the ``IOContext`` stored by ``_before_inference``, sets
+        ``ctx.response`` (``None`` for streaming), then executes
+        ``IOChain.run_egress`` in reverse processor order.
+
+        For streaming responses this is called from inside ``_wrap_streaming_egress``
+        after the last SSE chunk, so ``response`` is always ``None`` there.
+
+        No-op if no chain is attached, the chain has no processors, or no
+        context was stored (e.g. ingress was skipped).
+        """
+        if not self._iochain or not self._iochain._processors:
+            return
+        ctx = _iochain_ctx.get()
+        if ctx is None:
+            return
+        ctx.response = response
+        await self._iochain.run_egress(ctx)
+
+    def _wrap_streaming_egress(
+        self, response: Any, request: Any, adapted_request: Any
+    ) -> Any:
+        """
+        Wrap a ``StreamingResponse`` so the IOChain egress phase fires after
+        the last SSE chunk is sent to the client.
+
+        If *response* is not a ``StreamingResponse`` it is returned unchanged.
+        The wrapper guarantees egress even if the generator raises or the
+        client disconnects mid-stream (``finally`` block).
+        ``ctx.response`` is ``None`` for all streaming requests.
+        """
+        if not isinstance(response, StreamingResponse):
+            return response
+
+        original = response.body_iterator
+
+        async def _wrapped():
+            try:
+                async for chunk in original:
+                    yield chunk
+            finally:
+                await self._after_inference(request, adapted_request, None)
+
+        return StreamingResponse(
+            _wrapped(),
+            status_code=response.status_code,
+            media_type=response.media_type,
+            headers=dict(response.headers),
+            background=response.background,
+        )
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -98,15 +188,21 @@ class OpenAIServingBase(ABC):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
+            # IOChain ingress hook — runs after tokenisation, before inference.
+            await self._before_inference(request, adapted_request)
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                return self._wrap_streaming_egress(response, request, adapted_request)
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                await self._after_inference(request, adapted_request, response)
+                return response
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code

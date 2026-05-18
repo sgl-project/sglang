@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from dataclasses import field
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -491,6 +492,7 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    io_processors: List[str] = field(default_factory=list)
 
     # Data parallelism
     dp_size: int = 1
@@ -5121,6 +5123,17 @@ class ServerArgs:
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
+            "--io-processor",
+            dest="io_processors",
+            type=str,
+            action="append",
+            default=[],
+            metavar="MODULE:CLASS",
+            help="Load an IOProcessor plugin at startup (e.g. 'mypackage.processors:MyProcessor'). "
+            "May be repeated. Plugins in the 'sglang.io_processor_plugins' entry-point group "
+            "are discovered automatically without this flag.",
         )
 
         # Data parallelism

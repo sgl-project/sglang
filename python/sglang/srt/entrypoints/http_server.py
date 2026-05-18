@@ -349,6 +349,28 @@ async def lifespan(fast_api_app: FastAPI):
         fast_api_app.state.openai_serving_chat
     )
 
+    # Load IOChain processor plugins and wire to all serving handlers.
+    # TODO: replace hardcoded attribute list with a registry so new handlers
+    #       are wired automatically.
+    from sglang.srt.iochain.loader import load_iochain
+
+    iochain = load_iochain(server_args)
+    if iochain._processors:
+        for _attr in [
+            "openai_serving_completion",
+            "openai_serving_chat",
+            "openai_serving_embedding",
+            "openai_serving_score",
+            "openai_serving_rerank",
+            "openai_serving_classify",
+            "openai_serving_tokenize",
+            "openai_serving_detokenize",
+            "openai_serving_transcription",
+        ]:
+            _handler = getattr(fast_api_app.state, _attr, None)
+            if _handler is not None:
+                _handler.set_iochain(iochain)
+
     # Launch tool server
     tool_server = None
     if server_args.tool_server == "demo":
