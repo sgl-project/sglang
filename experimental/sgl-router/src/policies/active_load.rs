@@ -49,6 +49,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Unique identifier for an in-flight request. Minted by
@@ -86,12 +87,20 @@ struct WorkerCounters {
 }
 
 /// Per-request bookkeeping the janitor consults to find expired requests.
+///
+/// `cancel` is a [`CancellationToken`] the janitor fires when the entry
+/// is swept. The chat handler holds a clone (via
+/// [`ActiveLoadGuard::cancel_token`]) and aborts its upstream fetch
+/// with `ApiError::StaleRequestExpired` when the token resolves —
+/// surfacing the stale-request expiry as a 504 to the client instead
+/// of leaving the handler hung on a long-lived upstream.
 #[derive(Debug)]
 struct RequestEntry {
     worker: WorkerId,
     prefill_load: usize,
     decode_load: usize,
     registered_at: Instant,
+    cancel: CancellationToken,
 }
 
 /// Clock abstraction so tests can drive the janitor deterministically.
@@ -212,6 +221,7 @@ impl ActiveLoadRegistry {
         counters
             .decode_load
             .fetch_add(decode_load, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
         self.requests.insert(
             request_id.clone(),
             RequestEntry {
@@ -219,12 +229,14 @@ impl ActiveLoadRegistry {
                 prefill_load,
                 decode_load,
                 registered_at: self.clock.now(),
+                cancel: cancel.clone(),
             },
         );
         ActiveLoadGuard {
             registry: Some(Arc::clone(self)),
             request_id: Some(request_id),
             worker,
+            cancel,
         }
     }
 
@@ -299,6 +311,12 @@ impl ActiveLoadRegistry {
                         .decode_load
                         .fetch_sub(entry.decode_load, Ordering::Relaxed);
                 }
+                // Wake the chat handler awaiting this request so it can
+                // return `ApiError::StaleRequestExpired` to the client.
+                // Cancellation is idempotent; if the handler already
+                // finished and dropped the guard, the token is already
+                // dropped and `cancel()` is a no-op for everyone.
+                entry.cancel.cancel();
                 count += 1;
                 tracing::warn!(
                     request_id = %id,
@@ -326,7 +344,7 @@ impl ActiveLoadRegistry {
 /// `Arc<ActiveLoadRegistry>` (cloned from the shared one held in
 /// `AppContext`).
 pub fn spawn_janitor(registry: Arc<ActiveLoadRegistry>, interval: Duration) -> JanitorHandle {
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let join = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -361,7 +379,7 @@ pub fn spawn_janitor(registry: Arc<ActiveLoadRegistry>, interval: Duration) -> J
 /// giving callers a clean shutdown path.
 #[must_use = "JanitorHandle owns the background task; dropping it cancels the janitor"]
 pub struct JanitorHandle {
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -398,12 +416,25 @@ pub struct ActiveLoadGuard {
     /// and the janitor consult the same source of truth.
     request_id: Option<RequestId>,
     worker: WorkerId,
+    /// Cancellation token mirrored from `RequestEntry::cancel`. The
+    /// chat handler awaits `cancel.cancelled()` in a `tokio::select!`
+    /// branch so the janitor can interrupt an upstream fetch and force
+    /// the handler to return `ApiError::StaleRequestExpired` (HTTP 504).
+    cancel: CancellationToken,
 }
 
 impl ActiveLoadGuard {
     /// Read-only accessor (mainly for tests + diagnostic logging).
     pub fn worker(&self) -> &WorkerId {
         &self.worker
+    }
+
+    /// Borrow the cancellation token. The chat handler clones it for
+    /// the `tokio::select!` branch (`token.cancelled().await`) so the
+    /// guard itself can still move into the SSE pump task (or stay in
+    /// the buffered-response scope) without losing the wake-up channel.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 }
 
@@ -639,6 +670,50 @@ mod tests {
         registry.forget_worker(&WorkerId("never-registered".into()));
         // No assertion beyond "did not panic"; the body of the test
         // exercises the contract.
+    }
+
+    /// Task D: janitor expiry fires the guard's cancellation token so
+    /// the in-flight handler can return `StaleRequestExpired`.
+    #[tokio::test]
+    async fn janitor_expiry_fires_guard_cancel_token() {
+        let (registry, clock) = registry_with_mock_clock(Duration::from_secs(1));
+        let w = WorkerId("w0".into());
+        let g = registry.register(w.clone(), 50, 5);
+        let cancel = g.cancel_token().clone();
+        assert!(
+            !cancel.is_cancelled(),
+            "fresh guard's cancel token must not be cancelled",
+        );
+
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(registry.sweep_stale(), 1);
+
+        // The sweep must have fired the token. We don't await
+        // `cancelled()` because the test is single-threaded and the
+        // token resolves synchronously after `cancel.cancel()`.
+        assert!(
+            cancel.is_cancelled(),
+            "stale sweep must cancel the guard's token",
+        );
+        // Drop the guard last so the test exits cleanly.
+        drop(g);
+    }
+
+    /// Task D: normal completion (guard drop) does NOT cancel the token.
+    /// The chat handler's `select!` branch is meant to fire only on a
+    /// janitor expiry — successful completion drops the guard without
+    /// touching the token, so the request returns 200 OK.
+    #[test]
+    fn guard_drop_does_not_cancel_token() {
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        let w = WorkerId("w0".into());
+        let g = registry.register(w, 1, 1);
+        let cancel = g.cancel_token().clone();
+        drop(g);
+        assert!(
+            !cancel.is_cancelled(),
+            "normal guard drop must NOT cancel the token (sweep-only signal)",
+        );
     }
 
     /// Concurrent stress: many guards on the same worker should leave the

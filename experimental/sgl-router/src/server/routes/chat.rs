@@ -187,6 +187,13 @@ pub async fn chat_completions(
     let guard = worker.load_guard();
     let prefill_load = estimate_prefill_tokens(&body);
     let active_guard = ctx.active_load.register(worker.id.clone(), prefill_load, 0);
+    // Snapshot the stale-request cancel token BEFORE moving the guard
+    // into the streaming pump or the response future. The token is
+    // cheap to clone (it's an `Arc<...>` internally) and the chat
+    // handler races the upstream fetch against `token.cancelled()` to
+    // surface a 504 `stale_request_expired` if the janitor expires
+    // the request mid-flight.
+    let stale_token = active_guard.cancel_token().clone();
 
     if streaming {
         // Hand BOTH guards to the streaming body task. They are held
@@ -197,16 +204,26 @@ pub async fn chat_completions(
         // cache-aware policy and over-attract new requests to the same
         // worker.
         let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
-        ctx.proxy
-            .forward_streaming_to(
-                &worker.url,
-                &worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                body,
-                Some(stream_guards),
-            )
-            .await
+        // For streaming, the cancellation race is only over the
+        // initial headers fetch (`forward_streaming_to.await`) — once
+        // headers arrive, the SSE pump owns the guard. Pre-headers
+        // cancellation surfaces as 504; post-headers cancellation
+        // (janitor fires mid-stream) is observable in the pump task
+        // dropping the M4 guard, but the response status is already
+        // 200 by then and the client sees a truncated stream.
+        let fetch = ctx.proxy.forward_streaming_to(
+            &worker.url,
+            &worker.breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+            Some(stream_guards),
+        );
+        tokio::select! {
+            biased;
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+            r = fetch => r,
+        }
     } else {
         // Non-streaming: the handler awaits the full buffered response,
         // so both guards live correctly in this scope. The tuple binding
@@ -214,15 +231,23 @@ pub async fn chat_completions(
         // function — the `forward_json_to` future does not need them
         // (it does not return until the body is buffered).
         let _holds: (LoadGuard, _) = (guard, active_guard);
-        ctx.proxy
-            .forward_json_to(
-                &worker.url,
-                &worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                body,
-            )
-            .await
+        let fetch = ctx.proxy.forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        );
+        // Race the upstream fetch against the stale-request token. If
+        // the janitor fires while we're awaiting the response, return
+        // 504 instead of leaving the client hung. `biased` makes the
+        // token branch checked first so a cancellation that occurred
+        // before the next poll is observed promptly.
+        tokio::select! {
+            biased;
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+            r = fetch => r,
+        }
     }
 }
 

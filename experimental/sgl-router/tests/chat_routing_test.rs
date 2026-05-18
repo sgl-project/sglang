@@ -1045,6 +1045,88 @@ async fn streaming_active_load_drops_on_client_disconnect() {
     );
 }
 
+/// Task D: stale-request janitor expiry surfaces as HTTP 504 with
+/// `x-router-error-code: stale_request_expired`. The chat handler
+/// races the upstream fetch against the janitor's per-request
+/// cancellation token; when the token wins, the handler returns
+/// `ApiError::StaleRequestExpired`.
+///
+/// Wiring: build an `AppContext` with a short
+/// `stale_request_timeout` `ActiveLoadRegistry` + spawn a janitor
+/// with sub-second cadence + dispatch to a slow upstream that takes
+/// longer than the timeout. The janitor sweeps before the upstream
+/// returns; cancellation fires; handler returns 504.
+#[tokio::test]
+async fn janitor_expiry_returns_504_stale_request_expired() {
+    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    // Upstream that takes 2s to respond — longer than our 50ms
+    // stale_request_timeout.
+    let worker =
+        common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
+
+    let cfg = config_for(&worker.url);
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    // Aggressive 50ms timeout: the janitor will sweep on the next
+    // tick (every 20ms) and fire the cancellation token before the
+    // upstream returns.
+    let active_load = ActiveLoadRegistry::new(
+        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        Duration::from_millis(50),
+    );
+    let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
+    let ctx = Arc::new(AppContext::with_active_load(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
+    ));
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "stale-request expiry must surface as 504",
+    );
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("stale_request_expired"),
+        "504 response must carry x-router-error-code: stale_request_expired",
+    );
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("\"code\":\"stale_request_expired\""),
+        "504 body must encode the same code in the JSON envelope: {body_str}",
+    );
+}
+
 /// Task A: a non-streaming request that errors out (upstream
 /// unreachable) still drops the active-load guard. The handler's normal
 /// return path is the only drop point — confirming the guard is on the
