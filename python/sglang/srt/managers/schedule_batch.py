@@ -22,17 +22,13 @@ Store information about requests and batches.
 
 The following is the flow of data structures for a batch:
 
-ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+ScheduleBatch -> ForwardBatch
 
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
-- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
-  It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
-  It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
-
-TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
+  It is constructed directly from a ScheduleBatch by `ForwardBatch.init_new`.
 """
 
 import copy
@@ -130,9 +126,6 @@ def _compute_pad_value(hash: int) -> int:
 
 
 class BaseFinishReason:
-    def __init__(self, is_error: bool = False):
-        self.is_error = is_error
-
     def to_json(self):
         raise NotImplementedError()
 
@@ -187,7 +180,7 @@ class FINISH_LENGTH(BaseFinishReason):
 
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self, message=None, status_code=None, err_type=None):
-        super().__init__(is_error=True)
+        super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
@@ -599,6 +592,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -622,7 +616,6 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
@@ -739,8 +732,10 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
+        # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
+        self.best_match_node: Any = None
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -774,8 +769,6 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
@@ -818,6 +811,7 @@ class Req(ReqDllmMixin):
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
+        self.routed_experts_start_len = routed_experts_start_len
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
@@ -855,12 +849,12 @@ class Req(ReqDllmMixin):
         self.spec_verify_ct = 0
 
         # Per-request count of accepted draft tokens (excludes the bonus token).
-        self.spec_accepted_drafts = 0
+        self.spec_num_correct_drafts = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
-        self.spec_acceptance_histogram: List[int] = []
+        self.spec_correct_drafts_histogram: List[int] = []
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -959,17 +953,17 @@ class Req(ReqDllmMixin):
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
-    def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
+    def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.
 
         Args:
-            accepted_draft_tokens: Number of draft tokens accepted in this step.
+            num_correct_drafts: Number of correct draft tokens (no bonus) in this step.
         """
-        if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
-            self.spec_acceptance_histogram.extend(
-                [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
+        if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
+            self.spec_correct_drafts_histogram.extend(
+                [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
-        self.spec_acceptance_histogram[accepted_draft_tokens] += 1
+        self.spec_correct_drafts_histogram[num_correct_drafts] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -1039,12 +1033,14 @@ class Req(ReqDllmMixin):
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
+                self.best_match_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
+                match_result.best_match_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1430,7 +1426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
-    all_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
@@ -1470,7 +1466,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+
+    # One-shot per-forward overrides; init_new consumes and resets.
     seq_lens_cpu_cache: torch.Tensor = None
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None
+    return_hidden_states_before_norm: bool = False
+
+    # Forward-pass metrics
+    fpm_start_time: float = 0.0
 
     # Stream
     has_stream: bool = False
@@ -2319,7 +2322,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Update fields
-        self.input_ids = self.output_ids
+        # Coerce to int64: torch sampling helpers (sampling_from_probs_torch /
+        # top_k_top_p_min_p_sampling_from_probs_torch) return int32 token ids,
+        # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
+        self.input_ids = self.output_ids.to(torch.int64)
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
@@ -2526,89 +2532,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(
-        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
-    ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-        else:
-            extend_seq_lens = self.extend_lens
-            extend_prefix_lens = self.prefix_lens
-            extend_logprob_start_lens = self.extend_logprob_start_lens
-
-        if self.sampling_info:
-            if self.has_grammar:
-                self.sampling_info.grammars = [req.grammar for req in self.reqs]
-            else:
-                self.sampling_info.grammars = None
-
-        seq_lens_cpu = (
-            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
-        )
-
-        return ModelWorkerBatch(
-            forward_mode=self.forward_mode,
-            input_ids=self.input_ids,
-            req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
-            orig_seq_lens=self.orig_seq_lens,
-            out_cache_loc=self.out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu,
-            seq_lens_sum=self.seq_lens_sum,
-            return_logprob=self.return_logprob,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
-            global_num_tokens=self.global_num_tokens,
-            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            is_extend_in_batch=self.is_extend_in_batch,
-            all_extend_in_batch=self.all_extend_in_batch,
-            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            tbo_split_seq_index=self.tbo_split_seq_index,
-            global_forward_mode=self.global_forward_mode,
-            extend_num_tokens=self.extend_num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_logprob_start_lens=extend_logprob_start_lens,
-            multimodal_inputs=self.multimodal_inputs,
-            encoder_cached=self.encoder_cached,
-            encoder_lens=self.encoder_lens,
-            encoder_lens_cpu=self.encoder_lens_cpu,
-            encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_ids=[req.lora_id for req in self.reqs],
-            sampling_info=self.sampling_info,
-            input_embeds=self.input_embeds,
-            replace_embeds=self.replace_embeds,
-            replace_positions=self.replace_positions,
-            ne_token_table=self.ne_token_table,
-            token_type_ids=self.token_type_ids,
-            spec_algorithm=self.spec_algorithm,
-            spec_info=self.spec_info,
-            hicache_consumer_index=self.hicache_consumer_index,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.return_hidden_states
-                else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-                    )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            is_prefill_only=self.is_prefill_only,
-            multi_item_delimiter_indices=self.multi_item_delimiter_indices,
-            dimensions=self.dimensions,
-            return_pooled_hidden_states=self.return_pooled_hidden_states,
-            dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
-            dllm_config=self.dllm_config,
-            reqs=self.reqs,
-            has_grammar=self.has_grammar,
-            mamba_track_indices=self.mamba_track_indices,
-            mamba_track_mask=self.mamba_track_mask,
-            mamba_track_seqlens=self.mamba_track_seqlens,
-        )
-
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
@@ -2626,8 +2549,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
@@ -2636,6 +2559,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
         )
 
@@ -2714,9 +2638,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
         # may become tombstoned, causing SWA memory leak.
         # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+            evict_threshold = pre_len - sliding_window_size
+        else:
+            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
-            pre_len - sliding_window_size - self.tree_cache.page_size,
+            evict_threshold,
         )
 
         if self.tree_cache.page_size > 1:
@@ -2736,108 +2664,3 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
-
-
-@dataclasses.dataclass
-class ModelWorkerBatch:
-    # The forward mode
-    forward_mode: ForwardMode
-    # The input ids
-    input_ids: torch.Tensor
-    # The indices of requests in the req_to_token_pool
-    req_pool_indices: torch.Tensor
-    # The sequence length
-    seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool_allocator
-    out_cache_loc: torch.Tensor
-    # The sequence length tensor on CPU
-    seq_lens_cpu: Optional[torch.Tensor]
-    seq_lens_sum: int
-
-    # For logprob
-    return_logprob: bool
-    top_logprobs_nums: Optional[List[int]]
-    token_ids_logprobs: Optional[List[List[int]]]
-
-    # For DP attention
-    global_num_tokens: Optional[List[int]]
-    global_num_tokens_for_logprob: Optional[List[int]]
-    is_extend_in_batch: bool
-    all_extend_in_batch: bool
-    can_run_dp_cuda_graph: bool
-    tbo_split_seq_index: Optional[int]
-    global_forward_mode: Optional[ForwardMode]
-
-    # For extend
-    extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[List[int]]
-    extend_prefix_lens: Optional[List[int]]
-    extend_logprob_start_lens: Optional[List[int]]
-    extend_input_logprob_token_ids: Optional[torch.Tensor]
-
-    # For multimodal
-    multimodal_inputs: Optional[List[MultimodalInputs]]
-
-    # For encoder-decoder
-    encoder_cached: Optional[List[bool]]
-    encoder_lens: Optional[torch.Tensor]
-    encoder_lens_cpu: Optional[List[int]]
-    encoder_out_cache_loc: Optional[torch.Tensor]
-
-    # For LoRA
-    lora_ids: Optional[List[str]]
-
-    # Sampling info
-    sampling_info: SamplingBatchInfo
-
-    # The original sequence lengths, Qwen-1M related
-    orig_seq_lens: Optional[torch.Tensor] = None
-
-    # The input Embeds
-    input_embeds: Optional[torch.Tensor] = None
-    replace_embeds: Optional[torch.Tensor] = None
-    replace_positions: Optional[torch.Tensor] = None
-
-    # token table for ngram embedding
-    ne_token_table: Optional[torch.Tensor] = None
-
-    # For corss-encoder model
-    token_type_ids: Optional[torch.Tensor] = None
-
-    # Speculative decoding
-    spec_algorithm: SpeculativeAlgorithm = None
-
-    spec_info: Optional[SpecInput] = None
-
-    # If set, the output of the batch contains the hidden states of the run.
-    capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = -1
-
-    # For matryoshka embeddings
-    dimensions: Optional[list[int]] = None
-
-    # Whether to return pooled hidden states (pre-head transformer output)
-    return_pooled_hidden_states: bool = False
-
-    # Whether this batch is prefill-only (no token generation needed)
-    is_prefill_only: bool = False
-
-    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
-
-    # Diffusion LLM
-    dllm_block_offsets: Optional[List[int]] = None
-    dllm_config: Optional[DllmConfig] = None
-
-    # For constrained decoding
-    # FIXME(lsyin): remove this after fully overlap grammar
-    reqs: Optional[List[Req]] = None
-    has_grammar: bool = False
-
-    # For hidden states before normal
-    return_hidden_states_before_norm: bool = False
-
-    # For mamba state tracking
-    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
-    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
-    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64

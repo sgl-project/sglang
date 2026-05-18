@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 
@@ -27,8 +27,8 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
-    num_accepted_drafts: int = 0  # no bonus included
-    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
+    num_correct_drafts: int = 0  # no bonus included
+    num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -48,6 +48,11 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # Refs the worker wants scheduler to keep alive for the same 2-iter window
+    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
+    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    extra_keep_alive_refs: Optional[List[Any]] = None
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -55,7 +60,11 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    def copy_to_cpu(self, return_logprob: bool):
+    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
+    fpm_start_event: Optional[torch.cuda.Event] = None
+    fpm_end_event: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
@@ -84,7 +93,7 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
