@@ -187,7 +187,10 @@ class SchedulerOutputProcessorMixin:
         is_decoupled_draft = bool(
             self.is_generation and batch.spec_algorithm.is_decoupled_draft()
         )
-        decoded_draft_tokens = [None] * len(batch.reqs) if is_decoupled_draft else []
+
+        # only those reqs that finish prefill in this batch will generate draft tokens,
+        # so we need to store there indices to flush there new tokens
+        draft_prefill_reqs_to_flush_idxs = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -250,10 +253,7 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     if is_decoupled_draft:
-                        decoded_draft_tokens[i] = (
-                            len(req.output_ids),
-                            int(next_token_id),
-                        )
+                        draft_prefill_reqs_to_flush_idxs.append(i)
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -353,7 +353,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
             if is_decoupled_draft:
-                self.flush_draft_updates(batch, decoded_draft_tokens)
+                self.flush_draft_updates(batch, draft_prefill_reqs_to_flush_idxs)
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -548,8 +548,6 @@ class SchedulerOutputProcessorMixin:
             and not batch.is_spec_v2
         )
 
-        decoded_draft_tokens = [None] * len(batch.reqs) if is_decoupled_draft else []
-
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
@@ -579,10 +577,6 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif is_decoupled_draft:
-                decoded_draft_tokens[i] = (
-                    len(req.output_ids),
-                    int(next_token_id),
-                )
                 req.output_ids.append(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)
@@ -654,7 +648,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         if is_decoupled_draft:
-            self.flush_draft_updates(batch, decoded_draft_tokens)
+            self.flush_draft_updates(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

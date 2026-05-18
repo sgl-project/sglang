@@ -71,30 +71,29 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "close_output_lens_by_req",
         "close_dst_drafter_ranks",
     ),
-    ("drafter", "sync_draft_requests"): _fields(
-        "recv_batch_size",
-        "recv_rids",
-        "recv_committed_lens_by_req",
-        "recv_output_lens_by_req",
-        "num_created_reqs",
-        "created_rids",
-        "created_committed_lens_by_req",
-        "created_output_lens_by_req",
-    ),
-    ("drafter", "process_updates"): _fields(
-        "forward_mode",
-        "batch_size",
-        "control_rids",
+    ("drafter", "sync_control_messages"): _fields(
+        "num_messages",
+        "num_sync",
         "num_commit",
         "num_close",
-        "applied_commit_rids",
-        "applied_committed_lens_by_req",
+        "num_created_reqs",
         "num_applied_commit",
-        "num_deferred_commit",
-        "batch_rids",
+        "num_pending_commit",
+        "num_sleeping_reqs",
+    ),
+    ("drafter", "emit_draft_tokens"): _fields(
+        "num_emit_candidates",
         "num_stream_outputs",
         "committed_lens_by_req",
         "output_lens_by_req",
+    ),
+    ("drafter", "sleep_requests"): _fields(
+        "num_slept",
+        "slept_rids",
+    ),
+    ("drafter", "wake_requests"): _fields(
+        "num_woken",
+        "woken_rids",
     ),
     ("draft_proxy", "send_control_batch"): _fields(
         "verifier_rank",
@@ -155,16 +154,11 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_commit",
         "num_close",
     ),
-    ("token_sync_thread", "drain_sync_batch"): _fields(
+    ("token_sync_thread", "drain_control_batch"): _fields(
         "drafter_rank",
         "batch_size",
         "rids",
         "num_sync",
-    ),
-    ("token_sync_thread", "drain_post_result_batch"): _fields(
-        "drafter_rank",
-        "batch_size",
-        "rids",
         "num_commit",
         "num_close",
     ),
@@ -229,15 +223,16 @@ class DecoupledSpecTraceEvent(Enum):
     VERIFIER_BUILD_SYNC_BATCH = auto()
     VERIFIER_SNAPSHOT_TAIL_BATCH = auto()
     VERIFIER_BUILD_UPDATE_BATCH = auto()
-    DRAFTER_SYNC_DRAFT_REQUESTS = auto()
-    DRAFTER_PROCESS_UPDATES = auto()
+    DRAFTER_SYNC_CONTROL_MESSAGES = auto()
+    DRAFTER_EMIT_DRAFT_TOKENS = auto()
+    DRAFTER_SLEEP_REQUESTS = auto()
+    DRAFTER_WAKE_REQUESTS = auto()
     DRAFT_PROXY_SEND_CONTROL_BATCH = auto()
     DRAFT_PROXY_RECV_TAIL_STREAM_BATCH = auto()
     DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH = auto()
     DRAFT_PROXY_APPLY_CONTROL_BATCH = auto()
     TOKEN_SYNC_RECV_CONTROL_BATCH = auto()
-    TOKEN_SYNC_DRAIN_SYNC_BATCH = auto()
-    TOKEN_SYNC_DRAIN_POST_RESULT_BATCH = auto()
+    TOKEN_SYNC_DRAIN_CONTROL_BATCH = auto()
     TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH = auto()
     TOKEN_SYNC_SEND_RESULT_BATCH = auto()
     TOKEN_SYNC_DRAIN_OUTGOING_RESULTS = auto()
@@ -413,43 +408,20 @@ def _draft_proxy_tail_fields(owner: Any, output_batch: Any) -> dict[str, Any]:
     }
 
 
-def _token_sync_recv_control_fields(
-    owner: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> dict[str, Any]:
-    if result is None:
-        return None
-    return _token_sync_message_fields(owner, result)
-
-
-def _token_sync_drain_sync_fields(
+def _token_sync_control_message_fields(
     owner: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
 ) -> dict[str, Any]:
     messages = result
+    if messages is None:
+        return None
     return {
         "drafter_rank": int(owner.drafter_rank),
         "batch_size": len(messages),
         "rids": [message.request_id for message in messages],
         "num_sync": sum(_is_sync_message(message) for message in messages),
-    }
-
-
-def _token_sync_drain_post_result_fields(
-    owner: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> dict[str, Any]:
-    messages = result
-    return {
-        "drafter_rank": int(owner.drafter_rank),
-        "batch_size": len(messages),
-        "rids": [message.request_id for message in messages],
         "num_commit": sum(_is_commit_message(message) for message in messages),
         "num_close": sum(_is_close_message(message) for message in messages),
     }
@@ -475,17 +447,6 @@ def _token_sync_send_result_fields(
         args[1],
         dst_verifier_rank=args[0],
     )
-
-
-def _token_sync_message_fields(owner: Any, messages: list[Any]) -> dict[str, Any]:
-    return {
-        "drafter_rank": int(owner.drafter_rank),
-        "batch_size": len(messages),
-        "rids": [message.request_id for message in messages],
-        "num_sync": sum(_is_sync_message(message) for message in messages),
-        "num_commit": sum(_is_commit_message(message) for message in messages),
-        "num_close": sum(_is_close_message(message) for message in messages),
-    }
 
 
 def _token_sync_draft_result_fields(
@@ -599,11 +560,17 @@ TRACE_EVENT_SPECS: dict[DecoupledSpecTraceEvent, _TraceEventSpec] = {
     DecoupledSpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH: _TraceEventSpec(
         "verifier", "build_update_batch", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_SYNC_DRAFT_REQUESTS: _TraceEventSpec(
-        "drafter", "sync_draft_requests", _payload_fields
+    DecoupledSpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES: _TraceEventSpec(
+        "drafter", "sync_control_messages", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_PROCESS_UPDATES: _TraceEventSpec(
-        "drafter", "process_updates", _payload_fields
+    DecoupledSpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS: _TraceEventSpec(
+        "drafter", "emit_draft_tokens", _payload_fields
+    ),
+    DecoupledSpecTraceEvent.DRAFTER_SLEEP_REQUESTS: _TraceEventSpec(
+        "drafter", "sleep_requests", _payload_fields
+    ),
+    DecoupledSpecTraceEvent.DRAFTER_WAKE_REQUESTS: _TraceEventSpec(
+        "drafter", "wake_requests", _payload_fields
     ),
     DecoupledSpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH: _TraceEventSpec(
         "draft_proxy", "send_control_batch", _draft_proxy_send_control_fields
@@ -618,18 +585,12 @@ TRACE_EVENT_SPECS: dict[DecoupledSpecTraceEvent, _TraceEventSpec] = {
         "draft_proxy", "apply_control_batch", _draft_proxy_apply_control_fields
     ),
     DecoupledSpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH: _TraceEventSpec(
-        "token_sync_thread", "recv_control_batch", _token_sync_recv_control_fields
+        "token_sync_thread", "recv_control_batch", _token_sync_control_message_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_SYNC_BATCH: _TraceEventSpec(
+    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH: _TraceEventSpec(
         "token_sync_thread",
-        "drain_sync_batch",
-        _token_sync_drain_sync_fields,
-        _non_empty_result,
-    ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_POST_RESULT_BATCH: _TraceEventSpec(
-        "token_sync_thread",
-        "drain_post_result_batch",
-        _token_sync_drain_post_result_fields,
+        "drain_control_batch",
+        _token_sync_control_message_fields,
         _non_empty_result,
     ),
     DecoupledSpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH: _TraceEventSpec(

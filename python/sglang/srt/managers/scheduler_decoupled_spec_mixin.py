@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Deque, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Deque, Dict, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
@@ -46,13 +47,7 @@ class DraftReqState:
     verifier_committed_prefix_len: int = 0
     pending_verify_commits: Deque[VerifyCommit] = field(default_factory=deque)
     pending_close: Optional[DraftClose] = None
-
-
-@dataclass
-class DraftCommitApplyResult:
-    stream_output: Optional[Tuple[str, int, int, int, int]] = None
-    applied_commits: list[VerifyCommit] = field(default_factory=list)
-    deferred_commits: list[VerifyCommit] = field(default_factory=list)
+    is_sleeping: bool = False
 
 
 class SchedulerDecoupledSpecMixin:
@@ -133,6 +128,7 @@ class SchedulerDecoupledSpecMixin:
 
     def init_draft_state_tables(self: Scheduler) -> None:
         self.draft_req_table: Dict[DraftReqKey, DraftReqState] = {}
+        self.draft_sleeping_reqs: Dict[DraftReqKey, Req] = {}
         self.decoupled_verify_drafter_ranks: list[int] = []
         self.decoupled_verify_req_to_drafter_rank: Dict[str, int] = {}
         self.decoupled_verify_drafter_loads: Dict[int, int] = {}
@@ -177,18 +173,57 @@ class SchedulerDecoupledSpecMixin:
         if start_ns is None:
             return
 
+    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS)
     def flush_draft_updates(
         self: Scheduler,
         batch: ScheduleBatch,
-        decoded_tokens: list[Optional[tuple[int, int]]],
-    ) -> None:
+        req_indices: Optional[list[int]] = None,
+    ) -> Optional[DraftTailStreamOutputBatch]:
         if not self.is_draft_worker_batch(batch):
-            return
-        post_decode_messages = self._drain_draft_update_messages()
-        stream_outputs = self._process_draft_updates(
-            batch, decoded_tokens, post_decode_messages
-        )
-        self._submit_draft_tokens_stream(stream_outputs)
+            return None
+        if req_indices is None:
+            emit_candidate_indices = list(range(len(batch.reqs)))
+        else:
+            emit_candidate_indices = list(req_indices)
+
+        stream_output_batch = DraftTailStreamOutputBatch()
+        src_drafter_rank = self.get_decoupled_spec_rank()
+        for req_batch_idx in emit_candidate_indices:
+            if not (0 <= req_batch_idx < len(batch.reqs)):
+                continue
+            req = batch.reqs[req_batch_idx]
+            if not req.output_ids:
+                continue
+            state = self._get_draft_state_by_req(req)
+            token_pos = len(req.output_ids) - 1
+            token_id = int(req.output_ids[-1])
+            committed_len = int(state.verifier_committed_prefix_len)
+            if token_pos < committed_len:
+                continue
+            stream_output_batch.outputs.append(
+                DraftTailStreamOutput(
+                    src_drafter_rank=src_drafter_rank,
+                    dst_verifier_rank=int(state.key.src_verifier_rank),
+                    request_id=state.key.request_id,
+                    base_committed_len=committed_len,
+                    new_token_pos=token_pos,
+                    new_token_id=token_id,
+                )
+            )
+
+        trace_payload = {
+            "num_emit_candidates": len(emit_candidate_indices),
+            "num_stream_outputs": len(stream_output_batch.outputs),
+            "committed_lens_by_req": [
+                int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
+                for req in batch.reqs
+            ],
+            "output_lens_by_req": [len(req.output_ids) for req in batch.reqs],
+        }
+        setattr(stream_output_batch, "_decoupled_spec_payload", trace_payload)
+        if stream_output_batch.outputs and self.is_draft_entry_rank():
+            self._get_token_sync_thread().submit_draft_results(stream_output_batch)
+        return stream_output_batch
 
     def prepare_verify_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
         if not self.is_verify_worker_batch(batch):
@@ -321,18 +356,6 @@ class SchedulerDecoupledSpecMixin:
             )
         return state
 
-    def _submit_draft_tokens_stream(
-        self: Scheduler,
-        stream_output_batch: DraftTailStreamOutputBatch,
-    ) -> None:
-        """
-        Submit new draft tokens produced by a decode round to the verifier.
-        """
-        if not stream_output_batch.outputs:
-            return
-        if not self.is_draft_entry_rank():
-            return
-        self._get_token_sync_thread().submit_draft_results(stream_output_batch)
 
     def apply_verify_commit(
         self: Scheduler,
@@ -511,6 +534,7 @@ class SchedulerDecoupledSpecMixin:
                 del req.hidden_states[truncate_from:]
 
         req.output_ids.append(bonus_token_id)
+        req.fill_ids = req.origin_input_ids + req.output_ids
         if req.grammar is not None:
             try:
                 req.grammar.accept_token(bonus_token_id)
@@ -635,17 +659,20 @@ class SchedulerDecoupledSpecMixin:
         """
         state = self._get_draft_state_by_req(req)
 
-        # remove the req from waiting_queue or running_batch
+        # remove the req from waiting_queue, running_batch, and sleeping table
         self.waiting_queue = [
             queued_req for queued_req in self.waiting_queue if queued_req is not req
         ]
-        if getattr(self, "running_batch", None) is not None and self.running_batch.reqs:
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or batch.is_empty():
+                continue
             keep_indices = [
-                i
-                for i, running_req in enumerate(self.running_batch.reqs)
-                if running_req is not req
+                i for i, batch_req in enumerate(batch.reqs) if batch_req is not req
             ]
-            self.running_batch.filter_batch(keep_indices=keep_indices)
+            if len(keep_indices) != len(batch.reqs):
+                batch.filter_batch(keep_indices=keep_indices)
+                batch.batch_is_full = False
+        self.draft_sleeping_reqs.pop(state.key, None)
         self.draft_req_table.pop(state.key, None)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -697,291 +724,309 @@ class SchedulerDecoupledSpecMixin:
         state.verifier_committed_prefix_len = len(req.output_ids)
         return req
 
-    def _drain_draft_update_messages(
-        self: Scheduler,
-    ) -> list[VerifyCommit | DraftClose]:
-        """
-        (called by decoupled drafter)
-        Drain all VerifyCommit and DraftClose messages from token sync thread
-        """
-        messages: list[DraftControlMessage] | None = None
-        if self.is_draft_entry_rank():
-            messages = self._get_token_sync_thread().drain_post_result_messages()
-
-        return [
-            message
-            for message in self._broadcast_draft_control_messages(messages)
-            if isinstance(message, (VerifyCommit, DraftClose))
-        ]
-
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_SYNC_DRAFT_REQUESTS)
-    def sync_draft_requests(self: Scheduler) -> dict | None:
-        """
-        (called by decoupled drafter)
-        Drain DraftSync messages from token sync thread, and handle them.
-        DraftSync creates a new drafter-side request from verifier state.
-        """
-        if not self.spec_algorithm.is_decoupled_draft():
-            return None
-
-        messages: list[DraftControlMessage] | None = None
-        if self.is_draft_entry_rank():
-            messages = self._get_token_sync_thread().drain_sync_messages()
-
-        messages = [
-            message
-            for message in self._broadcast_draft_control_messages(messages)
-            if isinstance(message, DraftSync)
-        ]
-        if not messages:
-            return None
-
-        created_reqs: list[Req] = []
-        for message in messages:
-            entry = self.draft_req_table.get(message.draft_key)
-            if entry is not None:
-                if entry.pending_close is not None:
-                    self.draft_req_table.pop(message.draft_key, None)
-                    continue
-            req = self._create_draft_request(message)
-            running_batch = self.running_batch
-            if req not in self.waiting_queue and req not in running_batch.reqs:
-                self._add_request_to_queue(req)
-            created_reqs.append(req)
-        return {
-            "recv_batch_size": len(messages),
-            "recv_rids": [message.request_id for message in messages],
-            "recv_committed_lens_by_req": [
-                len(message.committed_output_ids) for message in messages
-            ],
-            "recv_output_lens_by_req": [
-                len(message.committed_output_ids) for message in messages
-            ],
-            "num_created_reqs": len(created_reqs),
-            "created_rids": [
-                parse_draft_scheduler_rid(req.rid).request_id for req in created_reqs
-            ],
-            "created_committed_lens_by_req": [
-                int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
-                for req in created_reqs
-            ],
-            "created_output_lens_by_req": [
-                len(req.output_ids) for req in created_reqs
-            ],
-        }
-
-    def _apply_commits_and_maybe_emit(
+    def _find_draft_req_batch(
         self: Scheduler,
         req: Req,
-        *,
-        commits: Optional[list[VerifyCommit]] = None,
-        batch: ScheduleBatch,
-        req_batch_idx: int,
-        decoded_token: Optional[tuple[int, int]] = None,
-    ) -> DraftCommitApplyResult:
-        """
-        1. apply the pending verify commits to the req,
-          and update its scheduler state and other states(if needed)
-        2. if the bonus token is not overwritten,
-          this req is considered having decoded a new valid draft token,
-          therefore, drafter will send this draft token to verifier,
-          as streaming draft token output
-        """
-        state = self._get_draft_state_by_req(req)
-        result = DraftCommitApplyResult()
+    ) -> tuple[Optional[ScheduleBatch], Optional[int]]:
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or batch.is_empty():
+                continue
+            for req_batch_idx, batch_req in enumerate(batch.reqs):
+                if batch_req is req:
+                    return batch, req_batch_idx
+        return None, None
 
-        commits_to_apply: list[VerifyCommit] = []
-        if state.pending_verify_commits:
-            commits_to_apply.extend(state.pending_verify_commits)
-            state.pending_verify_commits.clear()
+    def _apply_pending_verify_commits_for_state(
+        self: Scheduler,
+        state: DraftReqState,
+    ) -> list[VerifyCommit]:
+        req = state.req
+        if (
+            req is None
+            or state.pending_close is not None
+            or req.req_pool_idx is None
+            or req.kv_committed_freed
+        ):
+            return []
 
-        if commits:
-            commits_to_apply.extend(commits)
-
-        for commit_idx, verify_commit in enumerate(commits_to_apply):
+        applied_commits: list[VerifyCommit] = []
+        while state.pending_verify_commits:
+            verify_commit = state.pending_verify_commits[0]
             if int(verify_commit.bonus_token_pos) >= len(req.output_ids):
-                # if a drafter req has multiple pending verify commits,
-                # it can only apply the first few commits that update the bonus token
-                # within the current output_ids range.
-                result.deferred_commits.extend(commits_to_apply[commit_idx:])
-                state.pending_verify_commits.extend(commits_to_apply[commit_idx:])
+                # the draft request has not materialized the bonus token position for this VerifyCommit
                 break
+            state.pending_verify_commits.popleft()
+            batch, req_batch_idx = self._find_draft_req_batch(req)
             self.apply_verify_commit(
                 req,
                 verify_commit,
                 batch=batch,
                 req_batch_idx=req_batch_idx,
             )
-            result.applied_commits.append(verify_commit)
+            applied_commits.append(verify_commit)
+        return applied_commits
 
-        if not self.is_draft_entry_rank() or decoded_token is None:
-            return result
-
-        token_pos, token_id = (int(decoded_token[0]), int(decoded_token[1]))
-        committed_len = int(state.verifier_committed_prefix_len)
-        if (
-            token_pos >= committed_len
-            and token_pos < len(req.output_ids)
-            and int(req.output_ids[token_pos]) == token_id
-        ):
-            result.stream_output = (
-                state.key.request_id,
-                int(state.key.src_verifier_rank),
-                committed_len,
-                token_pos,
-                token_id,
-            )
-        return result
-
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_PROCESS_UPDATES)
-    def _process_draft_updates(
+    def _handle_draft_sync_message(
         self: Scheduler,
-        batch: ScheduleBatch,
-        decoded_tokens: list[Optional[tuple[int, int]]],
-        control_messages: list[VerifyCommit | DraftClose],
-    ) -> DraftTailStreamOutputBatch:
-        """
-        args:
-          decoded_tokens: the list of (token_pos, token_id) for each new decoded token
-          control_messages: VerifyCommit and DraftClose message received from verifier
+        message: DraftSync,
+    ) -> Optional[Req]:
+        entry = self.draft_req_table.get(message.draft_key)
+        if entry is not None and entry.pending_close is not None:
+            self.draft_req_table.pop(message.draft_key, None)
+            return None
 
-        called by decoupled drafter, during `process_batch_result_decode()`:
-        1. apply DraftClose message: release the draft req
-        2. apply VerifyCommit message to the req, and collect & send new draft token
+        req = self._create_draft_request(message)
+        running_batch = self.running_batch
+        if (
+            req not in self.waiting_queue
+            and req not in running_batch.reqs
+            and req not in self.draft_sleeping_reqs.values()
+        ):
+            self._add_request_to_queue(req)
+        return req
+
+    def _handle_draft_verify_commit_message(
+        self: Scheduler,
+        message: VerifyCommit,
+    ) -> list[VerifyCommit]:
+        entry = self._get_or_create_draft_state(message.draft_key)
+        if entry.pending_close is not None:
+            return []
+        entry.pending_verify_commits.append(message)
+        return self._apply_pending_verify_commits_for_state(entry)
+
+    def _handle_draft_close_message(self: Scheduler, message: DraftClose) -> None:
+        entry = self.draft_req_table.get(message.draft_key)
+        if entry is None:
+            entry = self._get_or_create_draft_state(message.draft_key)
+            entry.pending_close = message
+            return
+
+        entry.pending_verify_commits.clear()
+        req = entry.req
+        if req is not None:
+            self.release_draft_request(req)
+        else:
+            entry.req = None
+            entry.is_sleeping = False
+            entry.pending_close = message
+            self.draft_sleeping_reqs.pop(message.draft_key, None)
+
+    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES)
+    def sync_draft_requests(self: Scheduler) -> dict | None:
         """
-        # build draft_key -> req mapping
-        current_req_by_key: dict[DraftReqKey, Req] = {}
-        decoded_token_by_key: dict[DraftReqKey, Optional[tuple[int, int]]] = {}
-        for req_batch_idx, req in enumerate(batch.reqs):
-            state = self._get_draft_state_by_req(req)
-            current_req_by_key[state.key] = req
-            decoded_token_by_key[state.key] = (
-                decoded_tokens[req_batch_idx]
-                if req_batch_idx < len(decoded_tokens)
-                else None
+        (called by decoupled drafter)
+        Drain all verifier-to-drafter control messages in arrival order.
+        DraftSync creates requests, VerifyCommit advances/truncates existing
+        requests when its bonus token has materialized, and DraftClose releases
+        drafter-side state.
+        """
+        if not self.spec_algorithm.is_decoupled_draft():
+            return None
+
+        messages: list[DraftControlMessage] | None = None
+        if self.is_draft_entry_rank():
+            messages = self._get_token_sync_thread().drain_control_messages()
+
+        messages = self._broadcast_draft_control_messages(messages)
+
+        num_sync = 0
+        num_commit = 0
+        num_close = 0
+        num_created_reqs = 0
+        num_applied_commit = 0
+
+        # First apply verifier commits that were deferred in earlier loops. A
+        # previous prefill/decode result may have materialized their bonus token.
+        for state in list(self.draft_req_table.values()):
+            num_applied_commit += len(
+                self._apply_pending_verify_commits_for_state(state)
             )
 
-        # collect each req's VerifyCommit message
-        commits_by_key: dict[DraftReqKey, list[VerifyCommit]] = {}
-        deferred_commit_messages: list[VerifyCommit] = []
         closed_keys: set[DraftReqKey] = set()
-        for message in control_messages:
+        for message in messages:
             draft_key = message.draft_key
-            entry = self.draft_req_table.get(draft_key)
-            req = entry.req if entry is not None else None
             if isinstance(message, DraftClose):
-                # this req will be release upon recv DraftClose
-                # discard its pending VerifyCommits
+                num_close += 1
                 closed_keys.add(draft_key)
-                commits_by_key.pop(draft_key, None)
-                deferred_commit_messages = [
-                    commit
-                    for commit in deferred_commit_messages
-                    if commit.draft_key != draft_key
-                ]
-                if entry is None:
-                    entry = self._get_or_create_draft_state(draft_key)
-                entry.pending_verify_commits.clear()
-                if req is not None:
-                    self.release_draft_request(req)
-                else:
-                    entry.req = None
-                    entry.pending_close = message
+                self._handle_draft_close_message(message)
                 continue
 
             if draft_key in closed_keys:
                 continue
 
-            if entry is None:
-                entry = self._get_or_create_draft_state(draft_key)
-
-            if entry.pending_close is not None:
-                continue
-
-            if req is None:
-                entry.pending_verify_commits.append(message)
-                deferred_commit_messages.append(message)
-                continue
-
-            assert (
-                parse_draft_scheduler_rid(req.rid) == draft_key
-            ), "draft_req_table contains a request under a mismatched draft_key"
-            if draft_key in current_req_by_key:
-                commits_by_key.setdefault(draft_key, []).append(message)
-            else:
-                # if the req is not in current batch, cache the pending VerifyCommit message
-                entry.pending_verify_commits.append(message)
-                deferred_commit_messages.append(message)
-
-        commit_messages = [
-            message for message in control_messages if isinstance(message, VerifyCommit)
-        ]
-        close_messages = [
-            message for message in control_messages if isinstance(message, DraftClose)
-        ]
-
-        # apply VerifyCommit and send new draft token
-        stream_output_batch = DraftTailStreamOutputBatch()
-        src_drafter_rank = self.get_decoupled_spec_rank()
-        applied_commit_messages: list[VerifyCommit] = []
-        for req_batch_idx, req in enumerate(batch.reqs):
-            draft_key = self._get_draft_state_by_req(req).key
-            decoded_token = decoded_token_by_key.get(draft_key)
-            apply_result = self._apply_commits_and_maybe_emit(
-                req,
-                commits=commits_by_key.get(draft_key),
-                batch=batch,
-                req_batch_idx=req_batch_idx,
-                decoded_token=decoded_token,
-            )
-            applied_commit_messages.extend(apply_result.applied_commits)
-            deferred_commit_messages.extend(apply_result.deferred_commits)
-            stream_output_item = apply_result.stream_output
-            if stream_output_item is not None:
-                (
-                    request_id,
-                    dst_verifier_rank,
-                    base_committed_len,
-                    token_pos,
-                    token_id,
-                ) = stream_output_item
-                stream_output_batch.outputs.append(
-                    DraftTailStreamOutput(
-                        src_drafter_rank=src_drafter_rank,
-                        dst_verifier_rank=dst_verifier_rank,
-                        request_id=request_id,
-                        base_committed_len=base_committed_len,
-                        new_token_pos=token_pos,
-                        new_token_id=token_id,
-                    )
+            if isinstance(message, DraftSync):
+                num_sync += 1
+                req = self._handle_draft_sync_message(message)
+                if req is not None:
+                    num_created_reqs += 1
+            elif isinstance(message, VerifyCommit):
+                num_commit += 1
+                num_applied_commit += len(
+                    self._handle_draft_verify_commit_message(message)
                 )
-        trace_payload = {
-            "forward_mode": str(batch.forward_mode),
-            "batch_size": len(batch.reqs),
-            "control_rids": [message.request_id for message in control_messages],
-            "num_commit": len(commit_messages),
-            "num_close": len(close_messages),
-            "applied_commit_rids": [
-                message.request_id for message in applied_commit_messages
-            ],
-            "applied_committed_lens_by_req": [
-                int(message.bonus_token_pos) + 1
-                for message in applied_commit_messages
-            ],
-            "num_applied_commit": len(applied_commit_messages),
-            "num_deferred_commit": len(deferred_commit_messages),
-            "batch_rids": [
-                self._get_draft_state_by_req(req).key.request_id for req in batch.reqs
-            ],
-            "num_stream_outputs": len(stream_output_batch.outputs),
-            "committed_lens_by_req": [
-                int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
-                for req in batch.reqs
-            ],
-            "output_lens_by_req": [len(req.output_ids) for req in batch.reqs],
+
+        # A new DraftSync can attach a request to commits that arrived before
+        # the sync, so scan once more after all new controls are handled.
+        for state in list(self.draft_req_table.values()):
+            num_applied_commit += len(
+                self._apply_pending_verify_commits_for_state(state)
+            )
+
+        if not messages and num_applied_commit == 0:
+            return None
+        return {
+            "num_messages": len(messages),
+            "num_sync": num_sync,
+            "num_commit": num_commit,
+            "num_close": num_close,
+            "num_created_reqs": num_created_reqs,
+            "num_applied_commit": num_applied_commit,
+            "num_pending_commit": sum(
+                len(state.pending_verify_commits)
+                for state in self.draft_req_table.values()
+            ),
+            "num_sleeping_reqs": len(self.draft_sleeping_reqs),
         }
-        setattr(stream_output_batch, "_decoupled_spec_payload", trace_payload)
-        return stream_output_batch
+
+    def _draft_ahead_window(self: Scheduler) -> int:
+        draft_tokens = self.server_args.speculative_num_draft_tokens
+        return max(0, int(draft_tokens or 0) * 2)
+
+    def _draft_req_ahead(self: Scheduler, state: DraftReqState) -> int:
+        req = state.req
+        if req is None:
+            return 0
+        return len(req.output_ids) - int(state.verifier_committed_prefix_len)
+
+    def has_draft_sleeping_requests(self: Scheduler) -> bool:
+        # check whether decoupled drafter has sleeping requests
+        return bool(self.draft_sleeping_reqs)
+
+    def _build_draft_decode_batch(self: Scheduler, reqs: list[Req]) -> ScheduleBatch:
+        device = self.device
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+
+        batch.req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in reqs], dtype=torch.int64, device=device
+        )
+        seq_lens = [
+            len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            for req in reqs
+        ]
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        batch.output_ids = torch.tensor(
+            [
+                int(req.output_ids[-1])
+                if req.output_ids
+                else int(req.origin_input_ids[-1])
+                for req in reqs
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        return batch
+
+    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_SLEEP_REQUESTS)
+    def sleep_overrun_draft_requests(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+    ) -> Optional[ScheduleBatch]:
+        if batch is None or batch.is_empty():
+            return batch
+        setattr(batch, "_decoupled_spec_payload", None)
+        window = self._draft_ahead_window()
+        if window <= 0:
+            return batch
+
+        keep_indices: list[int] = []
+        slept_rids: list[str] = []
+        slept_any = False
+        for req_batch_idx, req in enumerate(batch.reqs):
+            state = self._get_draft_state_by_req(req)
+            ahead = self._draft_req_ahead(state)
+            if ahead >= window:
+                state.is_sleeping = True
+                self.draft_sleeping_reqs[state.key] = req
+                slept_rids.append(state.key.request_id)
+                slept_any = True
+            else:
+                keep_indices.append(req_batch_idx)
+
+        if slept_any:
+            batch.filter_batch(keep_indices=keep_indices)
+            batch.batch_is_full = False
+            setattr(
+                batch,
+                "_decoupled_spec_payload",
+                {
+                    "num_slept": len(slept_rids),
+                    "slept_rids": slept_rids,
+                },
+            )
+        return batch
+
+    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_WAKE_REQUESTS)
+    def wake_draft_sleeping_requests(self: Scheduler) -> Optional[dict]:
+        window = self._draft_ahead_window()
+        if window <= 0 or not self.draft_sleeping_reqs:
+            return None
+        max_batch_size = getattr(self.server_args, "pp_max_micro_batch_size", None)
+        if not max_batch_size:
+            max_batch_size = getattr(self, "max_running_requests", None)
+        max_batch_size = int(max_batch_size or 0)
+        if max_batch_size > 0:
+            available_num_reqs = max(0, max_batch_size - len(self.running_batch.reqs))
+            if available_num_reqs == 0:
+                return None
+        else:
+            available_num_reqs = len(self.draft_sleeping_reqs)
+
+        wake_reqs: list[Req] = []
+        woken_rids: list[str] = []
+        for draft_key, req in list(self.draft_sleeping_reqs.items()):
+            state = self.draft_req_table.get(draft_key)
+            if state is None or state.req is not req:
+                self.draft_sleeping_reqs.pop(draft_key, None)
+                continue
+            ahead = self._draft_req_ahead(state)
+            if ahead < window:
+                state.is_sleeping = False
+                self.draft_sleeping_reqs.pop(draft_key, None)
+                wake_reqs.append(req)
+                woken_rids.append(draft_key.request_id)
+                if len(wake_reqs) >= available_num_reqs:
+                    break
+
+        if not wake_reqs:
+            return None
+
+        # build decode batch for these woken reqs, and merge them into the current batch
+        wake_batch = self._build_draft_decode_batch(wake_reqs)
+        if self.running_batch.is_empty():
+            self.running_batch = wake_batch
+        else:
+            self.running_batch.merge_batch(wake_batch)
+        self.running_batch.batch_is_full = False
+        return {
+            "num_woken": len(wake_reqs),
+            "woken_rids": woken_rids,
+        }
 
     def validate_verify_outputs(
         self: Scheduler,

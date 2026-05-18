@@ -146,7 +146,7 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _active_pool_idxs(self: Scheduler) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
+        """Pool idxs currently owned by reqs in last_batch / running_batch, or owned by sleeping draft requests in decoupled drafter.
 
         Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
@@ -156,6 +156,10 @@ class SchedulerRuntimeCheckerMixin:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
+                if req.req_pool_idx is not None:
+                    idxs.add(req.req_pool_idx)
+        if self.spec_algorithm.is_decoupled_draft():
+            for req in self.draft_sleeping_reqs.values():
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
         return idxs
@@ -404,6 +408,23 @@ class SchedulerRuntimeCheckerMixin:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
+                assert req.kv_committed_freed == req.kv_overallocated_freed
+                if req.kv_committed_freed or req.req_pool_idx is None:
+                    continue
+
+                allocated_len = req.kv_allocated_len
+                if self.page_size > 1:
+                    allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
+
+                full_uncached += allocated_len - req.cache_protected_len
+                if self.is_hybrid_swa:
+                    swa_uncached += allocated_len - max(
+                        req.cache_protected_len, req.swa_evicted_seqlen
+                    )
+
+        if self.spec_algorithm.is_decoupled_draft():
+            for req in self.draft_sleeping_reqs.values():
                 assert req.kv_committed_freed == req.kv_overallocated_freed
                 if req.kv_committed_freed or req.req_pool_idx is None:
                     continue

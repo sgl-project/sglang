@@ -153,36 +153,13 @@ class TokenSyncThread:
             return None
         return iter_control_batch_messages(control_batch)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_SYNC_BATCH)
-    def drain_sync_messages(self) -> list[DraftSync]:
-        return [
-            message
-            for message in self._drain_pending_controls(DraftSync)
-            if isinstance(message, DraftSync)
-        ]
-
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_POST_RESULT_BATCH)
-    def drain_post_result_messages(self) -> list[VerifyCommit | DraftClose]:
-        return [
-            message
-            for message in self._drain_pending_controls((VerifyCommit, DraftClose))
-            if isinstance(message, (VerifyCommit, DraftClose))
-        ]
-
-    def _drain_pending_controls(
-        self,
-        control_types: Any,
-    ) -> list[DraftControlMessage]:
+    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
+    def drain_control_messages(self) -> list[DraftControlMessage]:
+        """Drain all pending control messages while preserving arrival order."""
         drained_messages: list[DraftControlMessage] = []
-        remaining_controls: deque[DraftControlMessage] = deque()
         with self._pending_lock:
             while self._pending_controls:
-                message = self._pending_controls.popleft()
-                if isinstance(message, control_types):
-                    drained_messages.append(message)
-                else:
-                    remaining_controls.append(message)
-            self._pending_controls = remaining_controls
+                drained_messages.append(self._pending_controls.popleft())
         return drained_messages
 
     @trace_decoupled_spec(

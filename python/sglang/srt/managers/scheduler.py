@@ -1571,6 +1571,12 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+            elif (
+                self.spec_algorithm.is_decoupled_draft()
+                and self.has_draft_sleeping_requests()
+            ):
+                # sleep for 0.01 ms, to avoid busy loop in on_idle(), when there're only sleeping draft requests
+                time.sleep(0.0001)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -2567,6 +2573,10 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        # for decoupled drafter, after applying VerifyCommit messages, some sleeping draft requests need to be woken up
+        if self.spec_algorithm.is_decoupled_draft():
+            self.wake_draft_sleeping_requests()
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2916,6 +2926,13 @@ class Scheduler(
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
+
+        if self.spec_algorithm.is_decoupled_draft():
+            batch = self.sleep_overrun_draft_requests(batch)
+            if batch is None or batch.is_empty():
+                if batch is not None:
+                    batch.batch_is_full = False
+                return batch
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
@@ -3333,6 +3350,10 @@ class Scheduler(
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and not (
+                self.spec_algorithm.is_decoupled_draft()
+                and self.has_draft_sleeping_requests()
+            )
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
