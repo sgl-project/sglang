@@ -888,6 +888,11 @@ class HiCacheController:
 
         # TODO: support "hf3fs", "eic", "nixl", "simm"
         if backend in {"hf3fs", "eic", "nixl", "simm"}:
+            logger.warning(
+                "HiCache draft L3 disabled: backend %s does not yet support "
+                "draft pool registration.",
+                backend,
+            )
             return
 
         self.draft_io_mode = "generic"
