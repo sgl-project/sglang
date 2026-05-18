@@ -1760,11 +1760,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        rank = rank_offset + self.tp_rank
+        rank = rank_offset + self.tp_size * self.pp_rank + self.tp_rank
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}, "
+            f"pp_rank={self.pp_rank}, tp_rank={self.tp_rank}, tp_size={self.tp_size}"
         )
 
         try:
