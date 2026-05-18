@@ -48,6 +48,8 @@ class DraftReqState:
     pending_verify_commits: Deque[VerifyCommit] = field(default_factory=deque)
     pending_close: Optional[DraftClose] = None
     is_sleeping: bool = False
+    mamba_checkpoint_positions: set[int] = field(default_factory=set)
+    mamba_checkpoint_slots: Optional[torch.Tensor] = None
 
 
 class SchedulerDecoupledSpecMixin:
@@ -356,6 +358,190 @@ class SchedulerDecoupledSpecMixin:
             )
         return state
 
+    def _invalidate_draft_mamba_checkpoints(
+        self: Scheduler,
+        state: DraftReqState,
+        positions: Optional[list[int]] = None,
+    ) -> None:
+        """
+        Evict the draft mamba ckpts at the given token positions,
+        which are, specifically, the positions that have been committed by the verifier.
+        """
+        if positions is None:
+            state.mamba_checkpoint_positions.clear()
+            return
+
+        for pos in positions:
+            state.mamba_checkpoint_positions.discard(pos)
+
+    def _release_draft_mamba_checkpoint_slots(
+        self: Scheduler,
+        state: DraftReqState,
+    ) -> None:
+        """
+        Release the draft mamba checkpoint slots back to the pool when a draft request is released.
+        """
+        slots = state.mamba_checkpoint_slots
+        state.mamba_checkpoint_positions.clear()
+        state.mamba_checkpoint_slots = None
+        if slots is None:
+            return
+
+        self.req_to_token_pool.mamba_pool.free(slots)
+
+    def _ensure_draft_mamba_checkpoint_slots(
+        self: Scheduler,
+        state: DraftReqState,
+    ) -> torch.Tensor:
+        """
+        Ensure the draft request can allocate mamba checkpoint slots
+        for its potential future rollback.
+        """
+        if state.mamba_checkpoint_slots is not None:
+            return state.mamba_checkpoint_slots
+
+        window = self._draft_ahead_window()
+        if window <= 0:
+            raise RuntimeError(
+                "Decoupled drafter mamba rollback requires a positive draft "
+                f"ahead window. request_id={state.key.request_id}, window={window}"
+            )
+
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        if mamba_pool is None:
+            raise RuntimeError(
+                "Decoupled drafter mamba checkpoint requested without a mamba pool: "
+                f"request_id={state.key.request_id}"
+            )
+
+        slots = mamba_pool.alloc(window)
+        if slots is None:
+            raise RuntimeError(
+                "Not enough space for decoupled drafter mamba rollback "
+                "checkpoints. Try to increase --mamba-full-memory-ratio or "
+                f"--max-mamba-cache-size. request_id={state.key.request_id}, "
+                f"window={window}, mamba_pool_size={mamba_pool.size}, "
+                f"mamba_available_size={mamba_pool.available_size()}"
+            )
+
+        state.mamba_checkpoint_slots = slots
+        return slots
+
+    def _draft_mamba_checkpoint_slot_for_pos(
+        self: Scheduler,
+        state: DraftReqState,
+        token_pos: int,
+    ) -> torch.Tensor:
+        """
+        Given a token's position in req.output_ids,
+        return the corresponding pre-allocated mamba checkpoint slot idx,
+        for checkpointing the mamba state after emitting that token.
+        """
+        slots = self._ensure_draft_mamba_checkpoint_slots(state)
+        slot_count = int(slots.numel())
+        slot_offset = token_pos % slot_count
+        for existing_pos in state.mamba_checkpoint_positions:
+            if existing_pos != token_pos and existing_pos % slot_count == slot_offset:
+                raise RuntimeError(
+                    "Decoupled drafter mamba checkpoint ring would overwrite a "
+                    "live checkpoint. This indicates the drafter exceeded its "
+                    "rollback window. "
+                    f"request_id={state.key.request_id}, token_pos={token_pos}, "
+                    f"existing_pos={existing_pos}, slot_count={slot_count}"
+                )
+        return slots[slot_offset : slot_offset + 1]
+
+    def _prune_draft_mamba_checkpoints(self: Scheduler, state: DraftReqState) -> None:
+        """
+        Prune the draft mamba checkpoints that are no longer needed
+        after the verifier has committed a longer prefix.
+        """
+        req = state.req
+        if req is None or not state.mamba_checkpoint_positions:
+            return
+        committed_len = int(state.verifier_committed_prefix_len)
+        output_len = len(req.output_ids)
+        # Only keep checkpoints for tokens that are still in the drafter's uncommitted suffix.
+        positions_to_invalidate = [
+            pos
+            for pos in state.mamba_checkpoint_positions
+            if pos < committed_len or pos >= output_len
+        ]
+        self._invalidate_draft_mamba_checkpoints(state, positions_to_invalidate)
+
+    def checkpoint_draft_mamba_tail_tokens(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        req_indices: Optional[list[int]] = None,
+    ) -> None:
+        """
+        Checkpoint the drafter mamba state for a batch of reqs 
+        after they emit their tail token.
+        """
+        if not self.is_draft_worker_batch(batch):
+            return
+        if req_indices is None:
+            checkpoint_candidate_indices = range(len(batch.reqs))
+        else:
+            checkpoint_candidate_indices = req_indices
+
+        for req_batch_idx in checkpoint_candidate_indices:
+            if not (0 <= req_batch_idx < len(batch.reqs)):
+                continue
+            req = batch.reqs[req_batch_idx]
+            if req.mamba_pool_idx is None or not req.output_ids:
+                continue
+
+            state = self._get_draft_state_by_req(req)
+            self._prune_draft_mamba_checkpoints(state)
+            token_pos = len(req.output_ids) - 1
+            if token_pos in state.mamba_checkpoint_positions:
+                continue
+
+            checkpoint_slot = self._draft_mamba_checkpoint_slot_for_pos(
+                state, token_pos
+            )
+            self.req_to_token_pool.mamba_pool.copy_from(
+                req.mamba_pool_idx.unsqueeze(0), checkpoint_slot
+            )
+            state.mamba_checkpoint_positions.add(token_pos)
+
+    def _restore_draft_mamba_checkpoint(
+        self: Scheduler,
+        req: Req,
+        token_pos: int,
+    ) -> None:
+        """
+        Restore the draft req's mamba state from the checkpoint 
+        corresponding to the given token position in req.output_ids.
+        """
+        if req.mamba_pool_idx is None:
+            return
+
+        state = self._get_draft_state_by_req(req)
+        if token_pos not in state.mamba_checkpoint_positions:
+            raise RuntimeError(
+                "Missing decoupled drafter mamba checkpoint for verifier "
+                "rollback. This usually means a draft token was emitted before "
+                "its mamba rollback state was saved. "
+                f"request_id={state.key.request_id}, token_pos={token_pos}, "
+                "available_checkpoint_positions="
+                f"{sorted(state.mamba_checkpoint_positions)}"
+            )
+
+        slots = state.mamba_checkpoint_slots
+        if slots is None:
+            raise RuntimeError(
+                "Decoupled drafter mamba checkpoint metadata exists without "
+                "allocated checkpoint slots: "
+                f"request_id={state.key.request_id}, token_pos={token_pos}"
+            )
+
+        slot_count = int(slots.numel())
+        slot_offset = token_pos % slot_count
+        checkpoint_slot = slots[slot_offset : slot_offset + 1]
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_pool.copy_from(checkpoint_slot, req.mamba_pool_idx.unsqueeze(0))
 
     def apply_verify_commit(
         self: Scheduler,
@@ -461,6 +647,7 @@ class SchedulerDecoupledSpecMixin:
         if bonus_token_matches:
             # if the bonus token matches, only need to push forward the committed prefix
             state.verifier_committed_prefix_len = new_committed_len
+            self._prune_draft_mamba_checkpoints(state)
             return
 
         # The verifier-selected bonus token replaces the drafter suffix starting at
@@ -494,6 +681,8 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_committed_len={req.kv_committed_len} "
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
+
+        self._restore_draft_mamba_checkpoint(req, bonus_token_pos)
 
         if removed > 0:
             if req.grammar is not None:
@@ -568,6 +757,7 @@ class SchedulerDecoupledSpecMixin:
             )
 
         state.verifier_committed_prefix_len = new_committed_len
+        self._prune_draft_mamba_checkpoints(state)
 
         if batch is not None and req_batch_idx is not None:
             if not (0 <= req_batch_idx < len(batch.reqs)):
@@ -673,6 +863,7 @@ class SchedulerDecoupledSpecMixin:
                 batch.filter_batch(keep_indices=keep_indices)
                 batch.batch_is_full = False
         self.draft_sleeping_reqs.pop(state.key, None)
+        self._release_draft_mamba_checkpoint_slots(state)
         self.draft_req_table.pop(state.key, None)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 

@@ -350,6 +350,16 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _check_mamba_pool(self: Scheduler, ps: PoolStats) -> Tuple[bool, str]:
+        decoupled_draft_ckpt_slots = set()
+        if self.spec_algorithm.is_decoupled_draft():
+            for state in self.draft_req_table.values():
+                slots = state.mamba_checkpoint_slots
+                if slots is None:
+                    continue
+                decoupled_draft_ckpt_slots.update(
+                    int(idx) for idx in slots.reshape(-1).tolist()
+                )
+
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -357,6 +367,7 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.mamba_protected_size(),
             self._session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            uncached=len(decoupled_draft_ckpt_slots),
         )
         if leak:
             # Page-level leak diagnosis for mamba
@@ -379,11 +390,15 @@ class SchedulerRuntimeCheckerMixin:
             )
             expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
             leaked_mamba_pages = (
-                expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+                expected_mamba_pages
+                - free_mamba_pages
+                - cached_mamba_pages
+                - decoupled_draft_ckpt_slots
             )
             msg += (
                 f", leaked_full_pages={leaked_full_pages or None}"
                 f", leaked_mamba_pages={leaked_mamba_pages or None}"
+                f", decoupled_draft_ckpt_slots={decoupled_draft_ckpt_slots or None}"
             )
         return leak, msg
 
