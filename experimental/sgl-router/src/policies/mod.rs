@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod active_load;
+pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
 pub mod power_of_two;

@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::*;
 use sgl_router::discovery::{spawn_discovery, ModelId};
-use sgl_router::policies::factory::build_registry as build_policy_registry;
+use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -70,6 +70,7 @@ model_ids = ["tiny"]
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,
             }),
+            cache_aware: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {

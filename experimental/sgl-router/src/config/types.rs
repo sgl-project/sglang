@@ -14,13 +14,18 @@ pub struct Config {
 /// values at deserialization time and removes the runtime string match in
 /// the policy factory.
 ///
-/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"`.
+/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"` /
+/// `"cache_aware_zmq"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     RoundRobin,
     Random,
     PowerOfTwo,
+    /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
+    /// Requires the model to have a tokenizer loaded; cache_aware tuning
+    /// lives on `ModelConfig::cache_aware`.
+    CacheAwareZmq,
 }
 
 impl Default for PolicyKind {
@@ -53,6 +58,62 @@ pub struct ModelConfig {
     pub policy: PolicyKind,
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Tuning for the cache-aware ZMQ policy. Ignored unless
+    /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
+    /// policy construction time.
+    #[serde(default)]
+    pub cache_aware: Option<CacheAwareConfig>,
+}
+
+/// Per-model cache-aware-ZMQ tuning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CacheAwareConfig {
+    /// Lower bound on `matched_blocks / total_blocks` for the tree match
+    /// to win the selection. Below this, the policy falls back to
+    /// min-load. Default 0.5 — a half-cached prompt is still a strong
+    /// signal but not so weak that random hash collisions could trigger
+    /// affinity to an arbitrary worker.
+    #[serde(default = "default_cache_threshold")]
+    pub cache_threshold: f32,
+    /// Absolute load spread (`max - min`) above which the cache check is
+    /// skipped in favour of min-load. Default 32 — picked to dominate
+    /// over typical batch-of-8 effect.
+    #[serde(default = "default_balance_abs")]
+    pub balance_abs_threshold: usize,
+    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
+    /// that the absolute check is gated on. Default 1.1 — 10 % relative
+    /// difference triggers re-balancing.
+    #[serde(default = "default_balance_rel")]
+    pub balance_rel_threshold: f32,
+    /// Number of tokens per KV block in the SGLang worker. Must match
+    /// the worker config — mismatch silently misses every cache lookup.
+    /// Default 64; SGLang ships with 64 by default.
+    #[serde(default = "default_block_size")]
+    pub block_size: u32,
+}
+
+impl Default for CacheAwareConfig {
+    fn default() -> Self {
+        Self {
+            cache_threshold: default_cache_threshold(),
+            balance_abs_threshold: default_balance_abs(),
+            balance_rel_threshold: default_balance_rel(),
+            block_size: default_block_size(),
+        }
+    }
+}
+
+fn default_cache_threshold() -> f32 {
+    0.5
+}
+fn default_balance_abs() -> usize {
+    32
+}
+fn default_balance_rel() -> f32 {
+    1.1
+}
+fn default_block_size() -> u32 {
+    64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
