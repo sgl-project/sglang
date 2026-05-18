@@ -1729,20 +1729,32 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_for_lin = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
+            qkv_a, _ = self.wqkv_a(x_for_lin)
             q = qkv_a[..., : self.q_lora_rank]
             kv = qkv_a[..., self.q_lora_rank :]
             del qkv_a
         else:
-            kv, _ = self.wkv(x_quant if x_quant is not None else x)
-            # fp8 tuple: Fp8LinearMethod.apply handles isinstance(x, tuple), skips per1x128 quant
-            q, _ = self.wq_a(x_quant if x_quant is not None else x)
-        # [bs, q_lora_rank]
-        q = self.q_norm(q)
-        q_lora = q  # only used for indexer
+            kv, _ = self.wkv(x_for_lin)
+            q, _ = self.wq_a(x_for_lin)
+
+        if _use_aiter and _is_gfx95_supported:
+            # q_for_wqb: quantized q for wq_b
+            # q_lora: unquantized q for indexer
+            q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
+                q,
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+            )
+        else:
+            # [bs, q_lora_rank]
+            q = self.q_norm(q)
+            q_lora = q  # only used for indexer
+            q_for_wqb = q
+
         # [bs, n_local_heads, head_dim]
-        q, _ = self.wq_b(q)
+        q, _ = self.wq_b(q_for_wqb)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
         q = rms_normalize_triton(q, self.eps)
