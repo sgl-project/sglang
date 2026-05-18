@@ -39,6 +39,11 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
+    # Parallel slot allocation on the cpu_value channel for Python-state
+    # relays (kv_committed_delta, finished status). Allocated in lockstep
+    # with ``future_indices`` so producer (process_batch_result) and consumer
+    # (next iter cache_finished_req / prepare_for_decode) share a key.
+    cpu_future_indices: Optional[FutureIndices] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
