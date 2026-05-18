@@ -596,8 +596,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
+        # In overlap mode, prepare_for_decode() may have pre-incremented
+        # kv_committed_len for a request whose EOS was not yet detected,
+        # leaving exactly 1 extra allocated slot that must be freed here.
+        max_overalloc = 0 if global_server_args.disable_overlap_schedule else 1
         assert (
-            start_p == end_p
+            end_p - start_p <= max_overalloc
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     if page_size > 1:

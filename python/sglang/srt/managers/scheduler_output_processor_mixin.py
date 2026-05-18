@@ -563,6 +563,14 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
 
+            if req.finished() and (self.enable_overlap or self.enable_overlap_mlx):
+                # The overlap scheduler's prepare_for_decode() already ran for
+                # this request before we processed the batch that generated its
+                # EOS token, inflating kv_committed_len by 1.  Undo that so
+                # cache_finished_req inserts the correct prefix (seqlen - 1),
+                # not one position past it (the EOS KV itself).
+                req.kv_committed_len -= 1
+
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
