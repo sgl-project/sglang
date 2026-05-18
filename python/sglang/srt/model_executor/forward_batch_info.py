@@ -563,9 +563,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids: Optional[List[str]] = None
 
     def _relayer_buffer_ready(self, name: str) -> bool:
+        """``True`` when the bound slot for ``name`` has been written. See
+        ``ScheduleBatch._relayer_buffer_ready`` for the slot-level rationale.
+        """
         if self.relayer is None or self.relayer_gpu_future_indices is None:
             return False
-        return self.relayer.gpu_scalar.has_buffer(name)
+        return self.relayer.gpu_scalar.slot_ready(
+            name, self.relayer_gpu_future_indices.interval
+        )
 
     def relayer_resolve_seq_lens(self) -> Optional[torch.Tensor]:
         """Channel-resolved seq_lens (cross-stream-safe); falls back to

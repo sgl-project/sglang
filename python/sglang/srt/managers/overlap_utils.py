@@ -100,6 +100,13 @@ class GpuScalarChannel:
         self._allocator = allocator
         self._buffers: Dict[str, torch.Tensor] = {}
         self._producer_events: Dict[str, torch.cuda.Event] = {}
+        # Track the most recent stored interval per buffer name. Consumers
+        # check this to distinguish "buffer exists, this iter's slot has
+        # been written" from "buffer exists from a prior iter, current slot
+        # is freshly alloc'd and holds stale data". Resolves over the
+        # currently-bound slot are only valid when it matches the last
+        # store's interval (within a single producer per name).
+        self._last_stored_interval: Dict[str, slice] = {}
 
     @property
     def device(self) -> torch.device:
@@ -142,6 +149,7 @@ class GpuScalarChannel:
         if name not in self._buffers:
             self.ensure_buffer(name, value.shape[1:], value.dtype)
         self._buffers[name][intv] = value
+        self._last_stored_interval[name] = intv
         event = self._new_event()
         if producer_stream is None:
             event.record()
@@ -181,6 +189,21 @@ class GpuScalarChannel:
 
     def buffer(self, name: str) -> torch.Tensor:
         return self._buffers[name]
+
+    def slot_ready(self, name: str, interval: slice) -> bool:
+        """``True`` when the named buffer's most recent store covers
+        ``interval``. Consumers reading via the currently-bound slot use
+        this to distinguish "buffer exists but my slot has not been
+        written this iter" from "my slot is valid"; the former case must
+        fall back to the direct attribute.
+        """
+        last = self._last_stored_interval.get(name)
+        if last is None:
+            return False
+        buf_len = self._allocator.future_buffer_len
+        a, b, _ = interval.indices(buf_len)
+        c, d, _ = last.indices(buf_len)
+        return c <= a and b <= d
 
     def has_buffer(self, name: str) -> bool:
         return name in self._buffers

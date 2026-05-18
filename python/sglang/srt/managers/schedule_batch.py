@@ -1629,13 +1629,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self._relayer_seq_lens_ctx = (None, None)
 
     def _relayer_buffer_ready(self, name: str) -> bool:
+        """``True`` when the bound slot for ``name`` has been written this
+        iter. Buffer-level existence is not sufficient — a fresh alloc
+        after wrap may target an index where stale data sits until the
+        producer stores. Slot-level check ensures resolve returns
+        current-iter data.
+        """
         ctx = self.__dict__.get("_relayer_seq_lens_ctx")
         if ctx is None:
             return False
         relayer, fi = ctx
         if relayer is None or fi is None:
             return False
-        return relayer.gpu_scalar.has_buffer(name)
+        return relayer.gpu_scalar.slot_ready(name, fi.interval)
 
     def relayer_resolve_seq_lens(self):
         """Resolve seq_lens via channel (cross-stream-safe) when the slot has
@@ -2311,7 +2317,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
-        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
             self.assert_lockstep()
 
     def prepare_for_split_prefill(self):
@@ -2649,7 +2655,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
             self.assert_lockstep()
 
     def filter_batch(
@@ -2745,7 +2751,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
-        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
             self.assert_lockstep()
 
     def merge_batch(self, other: "ScheduleBatch"):
@@ -2798,7 +2804,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
             self.assert_lockstep()
 
     def copy(self):
