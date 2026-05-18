@@ -2642,20 +2642,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
             self.assert_lockstep()
 
-    def maybe_wait_verify_done(self):
-        # Stream-level wait instead of CPU sync: schedule_stream waits for
-        # the verify_done event on the forward_stream without blocking the
-        # host. Visibility of new_seq_lens / output_ids / accept_lens on
-        # schedule_stream is established by the wait; subsequent reads here
-        # are race-free. The Relayer ``gpu_scalar`` channel additionally
-        # records its own per-store event for resolves that happen on a
-        # different stream than the one that called this method.
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                current_stream = torch.get_device_module(self.device).current_stream()
-                draft_input.verify_done.wait(current_stream)
-
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2663,9 +2649,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2756,15 +2739,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.assert_lockstep()
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # In the regular scheduler path:
-        # 1) self is always prefill, whose seq_lens is not a future
-        # 2) other is always decode, which is finished in previous step
-        # so verify_done is already synced and this is a no-op.
-        # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
-        # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2844,14 +2818,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
-        # Wait on relayer seq_lens producer so schedule_stream observes
-        # the post-decode seq_lens written by forward N.
-        relayer = self.__dict__.get("_relayer_ctx", (None, None))[0]
-        if relayer is not None:
-            event = relayer.gpu_scalar._producer_events.get("seq_lens")
-            if event is not None:
-                current_stream = torch.get_device_module(self.device).current_stream()
-                event.wait(current_stream)
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()

@@ -3025,9 +3025,7 @@ class Scheduler(
         next_draft_input is rebound on SB.spec_info; its tensor fields
         (topk_p / topk_index / bonus_tokens / new_seq_lens / hidden_states)
         are then rebound to channel slot views so any subsequent SB-side
-        read (next-iter filter / prepare_for_decode) carries the per-buffer
-        cross-stream event.wait inline, removing the dependence on a
-        downstream maybe_wait_verify_done.
+        read carries the per-buffer cross-stream event.wait inline.
         """
         batch.spec_info = batch_result.next_draft_input
         batch.spec_info.future_indices = future_indices
