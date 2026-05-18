@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm100_supported,
 )
 
 global _use_multi_stream
@@ -244,16 +245,10 @@ class Indexer(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
         # Optional CuTe DSL FP8 paged MQA logits kernel (Blackwell SM100 only).
-        self.use_cute_dsl_paged_mqa_logits = False
-        if _is_cuda and get_global_server_args().nsa_use_cute_dsl_paged_mqa_logits:
-            from sglang.srt.layers.attention.nsa.cute_dsl_paged_mqa_logits import (
-                IS_CUTLASS_DSL_AVAILABLE,
-                _is_sm_100f,
-            )
-
-            self.use_cute_dsl_paged_mqa_logits = (
-                IS_CUTLASS_DSL_AVAILABLE and _is_sm_100f()
-            )
+        self.use_cute_dsl_paged_mqa_logits = (
+            get_global_server_args().nsa_use_cute_dsl_paged_mqa_logits
+            and is_sm100_supported()
+        )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
