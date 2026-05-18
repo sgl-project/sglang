@@ -18,7 +18,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=480, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationPipelined(PDDisaggregationServerBase):
