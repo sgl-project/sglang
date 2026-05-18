@@ -42,7 +42,22 @@ class FutureIndices:
     interval: Optional[slice] = None
 
 
-class FutureMap:
+class Relayer:
+    """Scheduler-owned service for cross-iter relay state.
+
+    Holds the future-style channels through which forward iter N's outputs
+    are relayed to iter N+1 (token ids in non-spec mode; draft input
+    fields + new_seq_lens in spec V2). Each call site allocates future
+    slot indices when launching forward, the worker stores forward results
+    into the slots, and the next-iter scheduler resolves slot contents
+    back onto the consuming batch.
+
+    Earlier name was ``FutureMap``. Renamed to ``Relayer`` to reflect the
+    broader role of unifying scheduler-side relay channels; subsequent
+    work will add channels for CPU per-req values and deferred actions
+    behind the same ``alloc / store / resolve`` API.
+    """
+
     def __init__(
         self,
         max_running_requests: int,

@@ -13,7 +13,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.overlap_utils import Relayer
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
@@ -104,7 +104,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
     def process_prebuilt(
         self: ScheduleBatch,
         server_args: ServerArgs,
-        future_map: FutureMap,
+        relayer: Relayer,
     ):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
@@ -176,10 +176,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
-                spec_info.future_indices = future_map.alloc_future_indices(
+                spec_info.future_indices = relayer.alloc_future_indices(
                     len(self.seq_lens)
                 )
-                future_map.store_to_map_for_new_batch(
-                    spec_info.future_indices, spec_info
-                )
+                relayer.store_to_map_for_new_batch(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
