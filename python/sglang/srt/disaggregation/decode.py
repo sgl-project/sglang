@@ -609,7 +609,12 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
+        # Skip poll only when all past handshake and no receiver flipped to Failed
+        # (e.g. by AbortReq); otherwise aborted reqs stay stuck until WAITING_TIMEOUT.
+        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
+            getattr(decode_req.kv_receiver, "conclude_state", None) == KVPoll.Failed
+            for decode_req in self.queue
+        ):
             return
 
         polls = poll_and_all_reduce(
