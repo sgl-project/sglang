@@ -24,7 +24,7 @@ from .triton_mla_kernels_decode_common import _bucket_total_tokens
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Reduced from 28 to 4 configs. Split-K attention on already-gathered BF16 KV.
+        # Split-K attention on already-gathered BF16 KV.
         # - BLOCK_N=256: amortizes memory access over KV tokens (memory-bound kernel).
         # - BLOCK_D=128: matches KV tile structure.
         # - num_warps=8, num_stages=2: memory-bound kernel benefits from more warps
@@ -243,7 +243,7 @@ def _splitk_attention_kernel(
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Reduced from 7 to 3 configs. Simple reduce kernel merging split-K results.
+        # Simple reduce kernel merging split-K results.
         # - BLOCK_D=128: 4 iterations to cover d_v=512.
         # - num_warps=4: sufficient for this simple reduce operation.
         # - BLOCK_H varies for different batch sizes:

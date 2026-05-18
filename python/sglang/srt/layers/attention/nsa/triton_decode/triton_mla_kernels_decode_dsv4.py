@@ -57,7 +57,7 @@ DSV4_USE_FIXED_KERNEL_THRESHOLD = 32768
 
 @triton.autotune(
     configs=[
-        # Reduced from 20 to 4 configs. This is a pure memory-copy + FP8→BF16 dequant kernel.
+        # This is a pure memory-copy + FP8→BF16 dequant kernel.
         # - BLOCK_TK controls how many (token×topk) pairs per block.
         # - Larger BLOCK_TK amortizes launch overhead but needs more warps.
         # - BLOCK_TK=128 is already validated as the fixed config for small workloads

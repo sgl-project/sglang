@@ -73,7 +73,7 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Reduced from 22 to 4 configs. Selected based on CDNA4 architecture analysis:
+        # Selected based on CDNA4 architecture analysis:
         # - BLOCK_D=128 is fixed (matches KV tile structure for d_qk=512).
         # - BLOCK_N=256: best for amortizing memory access over topk dimension.
         #   (decode attention is memory-bound; larger BLOCK_N = fewer iterations)
