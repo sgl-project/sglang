@@ -1,0 +1,44 @@
+# sgl-router /metrics snapshot — M4 GPU E2E
+#
+# Captured from the convergence test (test_cache_aware_zmq_converges_to_one_worker)
+# after firing 10 same-prefix /v1/chat/completions requests at two prefill
+# workers (qwen3-0.6B on 2 separate H200s) under cache_aware_zmq policy.
+#
+# Host: kangyan-zhou-h200-4gpu-m4-e2e.devbox.rdxa (4x H200, h200-sci-k8s cluster)
+# Date: 2026-05-18
+# Router commit: f7474dfe0 (sgl-router/m4-cache-aware-pd)
+#
+# Result: 10/10 requests dispatched to a single worker. Convergence
+# threshold in the test is >=8/10; observed perfect convergence (10/10).
+# This validates:
+#   - Patch 1 (SGLang /server_info exposes kv_events block) end-to-end:
+#     the router subscribed to each worker's ZMQ publisher and recorded
+#     BlockStored events into the radix tree.
+#   - Patch 2 (/metrics Prometheus endpoint) — counters labelled per
+#     worker_url, model_id, mode, outcome.
+#   - cache_aware_zmq policy correctness — overlap-driven selection
+#     pinned subsequent requests to the worker that first stored the
+#     common prefix.
+#
+# Known partial-wiring (Phase D brief):
+#   - sgl_router_overlap_blocks histogram is registered but unwired at
+#     call sites; the family appears in /metrics with no buckets/sum/count
+#     emitted. The policy reads the radix tree directly, so convergence
+#     works without this metric being populated.
+#   - sgl_router_active_load gauge: unwired (no decrement/increment at
+#     dispatch); no labels emitted.
+#   - sgl_router_stale_requests_total counter: unwired (janitor records
+#     internally but does not increment this counter); no labels emitted.
+#   - sgl_router_decode_affinity_total: unwired; no labels emitted.
+
+# HELP sgl_router_requests_total Total chat-completions requests dispatched to a worker.
+# TYPE sgl_router_requests_total counter
+sgl_router_requests_total{worker_url="http://127.0.0.1:41939",model_id="Qwen/Qwen3-0.6B",mode="plain",outcome="success"} 10
+# HELP sgl_router_overlap_blocks Overlap-block count observed at cache-aware-zmq policy selection.
+# TYPE sgl_router_overlap_blocks histogram
+# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).
+# TYPE sgl_router_active_load gauge
+# HELP sgl_router_stale_requests_total Total stale-request cancellations fired by the janitor.
+# TYPE sgl_router_stale_requests_total counter
+# HELP sgl_router_decode_affinity_total Decode-affinity outcomes from select_decode_with_affinity.
+# TYPE sgl_router_decode_affinity_total counter
