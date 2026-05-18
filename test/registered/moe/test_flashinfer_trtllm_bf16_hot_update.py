@@ -27,8 +27,9 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
             self.skipTest("FlashInfer TRTLLM BF16 MoE is only tested on SM100+.")
 
         try:
-            import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401
             from flashinfer.fused_moe.core import convert_to_block_layout  # noqa: F401
+
+            import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401
         except ImportError as err:
             self.skipTest(f"FlashInfer TRTLLM MoE helpers are unavailable: {err}")
 
