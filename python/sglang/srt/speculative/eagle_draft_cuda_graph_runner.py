@@ -425,8 +425,12 @@ class EAGLEDraftCudaGraphRunner:
 
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Common inputs
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        # Common inputs. Read seq_lens via the Relayer ``gpu_scalar`` channel
+        # when ForwardBatch carries a relayer ctx: this gives the post-decode
+        # seq_lens (with cuda-event cross-stream sync) so the cuda-graph
+        # replay sees a settled view that matches what the next iter's
+        # schedule will read.
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.relayer_resolve_seq_lens())
         buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
             forward_batch.out_cache_loc
         )
