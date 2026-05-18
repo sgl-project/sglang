@@ -6,7 +6,6 @@
 
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
-#include <immintrin.h>
 namespace {
 
 using namespace at::vec;
