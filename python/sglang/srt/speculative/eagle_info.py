@@ -438,7 +438,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if not req.finished() and req.grammar is not None:
                     try:
                         req.grammar.accept_token(id)
@@ -447,7 +447,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                             f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                         )
                         raise e
-                    req.check_finished()
+                    req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break

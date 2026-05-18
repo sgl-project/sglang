@@ -86,7 +86,7 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.check_finished()
+            req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
@@ -223,7 +223,7 @@ class SchedulerBatchResultProcessor:
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.check_finished()
+                    req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -308,7 +308,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
-                    req.check_finished()
+                    req.update_finish_state()
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
@@ -578,7 +578,7 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
+        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
@@ -618,7 +618,7 @@ class SchedulerBatchResultProcessor:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
-            req.check_finished(new_accepted_len)
+            req.update_finish_state(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)
 
@@ -686,7 +686,7 @@ class SchedulerBatchResultProcessor:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
-        # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
+        # else: Spec V1 — output_ids, update_finish_state, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
         return next_token_ids, next_token_logprobs
 
