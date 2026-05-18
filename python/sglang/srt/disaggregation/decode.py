@@ -584,6 +584,14 @@ class DecodePreallocQueue:
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            # Probe-alloc first: budget check uses min(full, swa) tokens but
+            # alloc_extend works in pages, so a req can pass the budget and
+            # still fail at allocation due to page rounding. None means
+            # leave it queued for the next tick.
+            kv_loc = self._pre_alloc(req)
+            if kv_loc is None:
+                continue
+
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
@@ -898,6 +906,12 @@ class DecodePreallocQueue:
                     break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
+            if dst_kv_indices is None:
+                # alloc_extend bailed (pool short on pages); skip this req
+                # and try the next one. Smaller reqs may still fit.
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                continue
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1312,16 +1326,18 @@ class DecodePreallocQueue:
                     extend_num_tokens=delta_len,
                 )
 
-        assert kv_loc is not None, (
-            f"KV cache is full! Bug in memory estimation. "
-            f"available={self.token_to_kv_pool_allocator.available_size()}, "
-            f"evictable={self.tree_cache.evictable_size()}, "
-            f"protected={self.tree_cache.protected_size()}, "
-            f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
-            f"fill={fill_len}, prefix={prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-            f"req={req.rid}"
-        )
+        if kv_loc is None:
+            # alloc_extend rolls back its full+swa slots on failure but not
+            # the req_pool slot taken above — release it here to avoid
+            # leaking one slot per failed retry.
+            logger.debug(
+                f"_pre_alloc deferred req={req.rid}: kv pool short, "
+                f"available={self.token_to_kv_pool_allocator.available_size()}, "
+                f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
+                f"fill={fill_len}, prefix={prefix_len}"
+            )
+            self.req_to_token_pool.free(req)
+            return None
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))), kv_loc

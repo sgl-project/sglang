@@ -45,6 +45,20 @@ class SetKAndS:
         _set_k_and_s_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
 
+class GetKAndS:
+    @classmethod
+    def execute(cls, pool, buf, loc) -> NopeFp8RopeBf16Pack:
+        return _get_k_and_s_triton(
+            buf=buf,
+            loc=loc,
+            page_size=pool.page_size,
+            nope_dim=pool.qk_nope_head_dim,
+            rope_dim=pool.qk_rope_head_dim,
+            quantize_block_size=pool.quantize_block_size,
+            scale_pad=pool.scale_pad,
+        )
+
+
 def _set_k_and_s_triton(
     buf: torch.Tensor,
     loc: torch.Tensor,
@@ -255,3 +269,132 @@ def _set_k_and_s_torch(
         buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
+
+
+def _get_k_and_s_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+    nope_dim: int,
+    rope_dim: int,
+    quantize_block_size: int,
+    scale_pad: int,
+) -> NopeFp8RopeBf16Pack:
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens,) = loc.shape
+
+    scale_dim = nope_dim // quantize_block_size
+    nope_rope_bytes = nope_dim + rope_dim * 2
+
+    assert buf.dtype == torch.uint8
+    assert loc.dtype in (torch.int64, torch.int32), f"{loc.dtype=}"
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+
+    k_nope = torch.empty(num_tokens, nope_dim, dtype=fp8_dtype, device=buf.device)
+    k_rope = torch.empty(num_tokens, rope_dim, dtype=torch.bfloat16, device=buf.device)
+    scale = torch.empty(num_tokens, scale_dim, dtype=torch.uint8, device=buf.device)
+
+    buf_fp8 = buf.view(fp8_dtype)
+    buf_bf16 = buf.view(torch.bfloat16)
+    buf_uint8 = buf.view(torch.uint8)
+
+    s_offset_nbytes_in_page = page_size * nope_rope_bytes
+
+    _get_k_and_s_triton_kernel[(num_tokens,)](
+        buf_fp8,
+        buf_bf16,
+        buf_uint8,
+        loc,
+        k_nope,
+        k_rope,
+        scale,
+        k_nope.stride(0),
+        k_rope.stride(0),
+        scale.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NUM_NOPE_ELEMS_PER_TOKEN=nope_dim,
+        NUM_ROPE_ELEMS_PER_TOKEN=rope_dim,
+        NUM_SCALE_ELEMS_PER_TOKEN=scale_dim,
+        NUM_NOPE_ROPE_BYTES_PER_TOKEN=nope_rope_bytes,
+        PADDED_SCALE_ELEMS_PER_TOKEN=scale_dim + scale_pad,
+        S_OFFSET_NBYTES_IN_PAGE=s_offset_nbytes_in_page,
+        BLOCK_NOPE=512,
+        BLOCK_ROPE=64,
+        BLOCK_SCALE=8,
+    )
+
+    return NopeFp8RopeBf16Pack(
+        k_nope_fp8=k_nope,
+        k_rope_bf16=k_rope,
+        scale_k_nope_ue8m0=scale,
+    )
+
+
+@triton.jit
+def _get_k_and_s_triton_kernel(
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    loc_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    scale_k_nope_ptr,
+    k_nope_ptr_stride_0,
+    k_rope_ptr_stride_0,
+    scale_k_nope_ptr_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_NOPE_ELEMS_PER_TOKEN: tl.constexpr,
+    NUM_ROPE_ELEMS_PER_TOKEN: tl.constexpr,
+    NUM_NOPE_ROPE_BYTES_PER_TOKEN: tl.constexpr,
+    NUM_SCALE_ELEMS_PER_TOKEN: tl.constexpr,
+    PADDED_SCALE_ELEMS_PER_TOKEN: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+    BLOCK_SCALE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+
+    nope_range = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_range < NUM_NOPE_ELEMS_PER_TOKEN
+    in_k_nope_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * NUM_NOPE_ROPE_BYTES_PER_TOKEN
+        + nope_range
+    )
+    k_nope = tl.load(buf_fp8_ptr + in_k_nope_offsets, mask=nope_mask, other=0.0)
+
+    rope_range = tl.arange(0, BLOCK_ROPE)
+    in_k_rope_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE // 2
+        + loc_token_offset_in_page * (NUM_NOPE_ROPE_BYTES_PER_TOKEN // 2)
+        + NUM_NOPE_ELEMS_PER_TOKEN // 2
+        + rope_range
+    )
+    k_rope = tl.load(buf_bf16_ptr + in_k_rope_offsets)
+
+    scale_range = tl.arange(0, BLOCK_SCALE)
+    scale_mask = scale_range < NUM_SCALE_ELEMS_PER_TOKEN
+    in_scale_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE
+        + S_OFFSET_NBYTES_IN_PAGE
+        + loc_token_offset_in_page * PADDED_SCALE_ELEMS_PER_TOKEN
+        + scale_range
+    )
+    k_scale = tl.load(buf_uint8_ptr + in_scale_offsets, mask=scale_mask, other=0)
+
+    out_k_nope_offsets = token_id * k_nope_ptr_stride_0 + nope_range
+    tl.store(k_nope_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
+
+    out_k_rope_offsets = token_id * k_rope_ptr_stride_0 + rope_range
+    tl.store(k_rope_ptr + out_k_rope_offsets, k_rope)
+
+    out_scale_offsets = token_id * scale_k_nope_ptr_stride_0 + scale_range
+    tl.store(scale_k_nope_ptr + out_scale_offsets, k_scale, mask=scale_mask)

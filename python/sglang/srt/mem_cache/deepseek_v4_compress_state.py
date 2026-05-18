@@ -47,6 +47,7 @@ class CompressStatePool:
         online: bool = False,
     ):
         self.ring_size = ring_size
+        self.online = online
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
@@ -79,3 +80,18 @@ class CompressStatePool:
                 )
                 if not online:
                     self.kv_score_buffer[-1].clear()
+
+    def get_cpu_copy(self, state_locs: torch.Tensor):
+        if state_locs.numel() == 0:
+            return None
+        return self.kv_score_buffer.kv_score[state_locs].detach().to("cpu", copy=True)
+
+    def load_cpu_copy(self, state_data, state_locs: torch.Tensor):
+        if state_data is None or state_locs.numel() == 0:
+            return
+        device_data = state_data.to(
+            self.kv_score_buffer.kv_score.device, non_blocking=True
+        )
+        self.kv_score_buffer.kv_score[state_locs] = device_data
+        if not self.online:
+            self.kv_score_buffer[-1].clear()
