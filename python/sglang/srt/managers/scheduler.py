@@ -3073,6 +3073,12 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
                     future_indices = self.relayer.alloc_future_indices(bs)
+                    # Allocate a parallel slot range on the cpu_value channel
+                    # so process_batch_result can store kv_committed_delta /
+                    # finished status under a slot key that's stable across
+                    # the iter boundary. Carried alongside the GPU future
+                    # indices on batch_result.
+                    cpu_future_indices = self.relayer.cpu_value.alloc(bs)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
@@ -3096,6 +3102,7 @@ class Scheduler(
                             )
                         else:
                             batch_result.future_indices = future_indices
+                        batch_result.cpu_future_indices = cpu_future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
