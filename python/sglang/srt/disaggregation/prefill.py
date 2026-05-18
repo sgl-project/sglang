@@ -804,14 +804,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-                state_page_size = (
-                    kvcache.swa_page_size
-                    if isinstance(kvcache, DeepSeekV4TokenToKVPool)
-                    else page_size
-                )
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // state_page_size) * state_page_size
+                window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
@@ -821,7 +815,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), state_page_size
+                    window_kv_indices_swa.cpu().numpy(), page_size
                 )
 
             def _nsa_payload():
