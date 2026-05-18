@@ -168,7 +168,9 @@ class SchedulerMlxOverlapMixin:
             )
 
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
