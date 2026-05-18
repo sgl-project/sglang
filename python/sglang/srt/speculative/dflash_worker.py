@@ -20,6 +20,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -47,7 +48,50 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
-class DFlashWorker:
+class DFlashDraftExecutor(DraftExecutor):
+    """DraftExecutor wrapping the inner draft `TpModelWorker` used by DFlash.
+
+    Holds a reference to the inner draft TpModelWorker; exposes the canonical
+    `draft_runner` accessor expected by spec-info shape classmethods. DFlash's
+    attention-backend / cuda-graph setup remains driven by the coordinator (it
+    is intertwined with the verify pipeline), so this executor's
+    `init_*` methods are no-ops.
+    """
+
+    def __init__(
+        self,
+        inner_tp: TpModelWorker,
+        target_worker: TpModelWorker,
+        speculative_algorithm: SpeculativeAlgorithm,
+    ):
+        self._inner_tp = inner_tp
+        self._target_worker = target_worker
+        self._speculative_algorithm = speculative_algorithm
+
+    @property
+    def draft_runner(self):
+        return self._inner_tp.model_runner
+
+    @property
+    def target_worker(self) -> TpModelWorker:
+        return self._target_worker
+
+    @property
+    def speculative_algorithm(self) -> SpeculativeAlgorithm:
+        return self._speculative_algorithm
+
+    @property
+    def eagle_use_aux_hidden_state(self) -> bool:
+        return False
+
+    def init_attention_backend(self) -> None:
+        pass
+
+    def init_cuda_graphs(self) -> None:
+        pass
+
+
+class DFlashSpecCoordinator(SpecCoordinator):
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
 
     def __init__(
@@ -72,6 +116,9 @@ class DFlashWorker:
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -139,7 +186,7 @@ class DFlashWorker:
             target_worker.model_runner.model_config.context_len
         )
         saved_server_args = get_global_server_args()
-        self.draft_worker = TpModelWorker(
+        self._inner_tp = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -155,10 +202,13 @@ class DFlashWorker:
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
-        self.draft_model_runner = self.draft_worker.model_runner
-        self.draft_model = self.draft_model_runner.model
+        self.draft_runner = self._inner_tp.model_runner
+        self._draft_executor: DraftExecutor = DFlashDraftExecutor(
+            self._inner_tp, target_worker, self.speculative_algorithm
+        )
+        self.draft_model = self.draft_runner.model
         draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+            draft_hf_config=self.draft_runner.model_config.hf_config
         )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
@@ -341,6 +391,10 @@ class DFlashWorker:
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        return self._draft_executor
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
@@ -596,7 +650,7 @@ class DFlashWorker:
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
-        allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        allocator = self.draft_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
@@ -604,7 +658,7 @@ class DFlashWorker:
             else:
                 block_end_cpu = seq_lens_cpu + int(self.block_size)
                 last_loc = get_last_loc(
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    self.draft_runner.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     block_start,
                 )
@@ -623,7 +677,7 @@ class DFlashWorker:
 
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
+                self.draft_runner.req_to_token_pool.req_to_token,
                 block_start,
                 block_end,
                 block_cache_loc,
@@ -646,9 +700,9 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
-                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-                attn_backend=self.draft_model_runner.attn_backend,
+                req_to_token_pool=self.draft_runner.req_to_token_pool,
+                token_to_kv_pool=self.draft_runner.token_to_kv_pool,
+                attn_backend=self.draft_runner.attn_backend,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -656,7 +710,7 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_logits_output = self.draft_model_runner.forward(
+                draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
         finally:
@@ -906,7 +960,7 @@ class DFlashWorker:
             return
 
         target_req_to_token = batch.req_to_token_pool.req_to_token
-        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        draft_req_to_token = self.draft_runner.req_to_token_pool.req_to_token
 
         req_pool_indices = batch.req_pool_indices
         if req_pool_indices.dtype != torch.int64:
@@ -1024,7 +1078,7 @@ class DFlashWorker:
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+            self.draft_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,
                 k,
@@ -1040,7 +1094,7 @@ class DFlashWorker:
         ctx_cache_loc: torch.Tensor,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
-        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        token_to_kv_pool = self.draft_runner.token_to_kv_pool
         layers = self.draft_model.layers
 
         def _write_layer_kv(
@@ -1157,13 +1211,15 @@ class DFlashWorker:
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
-            batch.spec_info = draft_input
 
+            # Scheduler installs draft_input on batch.spec_info via
+            # batch_result.next_draft_input — see scheduler.py unified install.
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_correct_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                next_draft_input=draft_input,
             )
 
         # Decode / target-verify stage.
@@ -1200,7 +1256,7 @@ class DFlashWorker:
             commit_lens,
             next_target_hidden,
             num_correct_drafts_per_req_cpu,
-        ) = verify_input.verify(
+        ) = verify_input.sample(
             batch=batch,
             logits_output=logits_output,
             page_size=self.page_size,
@@ -1219,7 +1275,6 @@ class DFlashWorker:
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
-        batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
@@ -1236,4 +1291,9 @@ class DFlashWorker:
             num_correct_drafts=num_correct_drafts,
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=draft_input,
         )
+
+
+# Pre-rename alias; existing call sites keep importing `DFlashWorker`.
+DFlashWorker = DFlashSpecCoordinator

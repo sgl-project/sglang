@@ -55,7 +55,7 @@ class FrozenKVMTPCudaGraphRunner:
 
     def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
-        self.model_runner = model_runner = frozen_kv_mtp_worker.draft_model_runner
+        self.model_runner = model_runner = frozen_kv_mtp_worker.draft_runner
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile

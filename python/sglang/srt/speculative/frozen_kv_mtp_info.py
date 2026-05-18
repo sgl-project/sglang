@@ -69,8 +69,8 @@ class FrozenKVMTPVerifyInput(EagleVerifyInput):
     def __post_init__(self):
         SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_VERIFY)
 
-    def verify(self, *args, **kwargs) -> EagleVerifyOutput:
-        output = super().verify(*args, **kwargs)
+    def sample(self, *args, **kwargs) -> EagleVerifyOutput:
+        output = super().sample(*args, **kwargs)
         output.draft_extend_input = _to_frozen_kv_mtp_draft_extend_input(
             output.draft_extend_input
         )
