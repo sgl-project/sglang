@@ -46,6 +46,7 @@ def test_pd_mode_response_has_decode_affinity_header(
                     model_id=spec["model"],
                     tokenizer_path=spec["model"],
                     prefill_urls=[prefill.url],
+                    prefill_bootstrap_ports=[8997],
                     decode_urls=[decode_a.url, decode_b.url],
                     timeout=120.0,
                 )

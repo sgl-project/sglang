@@ -113,6 +113,14 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         for addr in &ep.addresses {
             let url = format!("http://{addr}:{port}");
             let id = WorkerId(format!("{ns}/{slice_name}/{addr}:{port}"));
+            // TODO(M4-followup): plumb bootstrap_port from the Pod
+            // annotation `sglang.ai/bootstrap-port` (matching SMG's
+            // `service_discovery.rs`). EndpointSlice doesn't carry pod
+            // annotations directly; this requires either a parallel
+            // Pod informer or shifting discovery to a Pod watcher.
+            // Not exercised by any M4 acceptance test (those use the
+            // static-file backend), so deferring. PD-disagg in K8s
+            // won't work until this lands.
             out.push(WorkerSpec {
                 id,
                 url,

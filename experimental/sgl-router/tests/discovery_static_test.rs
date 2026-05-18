@@ -60,6 +60,57 @@ model_ids = ["m1"]
     assert_eq!(seen_ids, ["w1".to_string(), "w2".to_string()].into());
 }
 
+/// `bootstrap_port` on a TOML `[[workers]]` entry is carried through
+/// the discovery event. Required so prefill workers' bootstrap server
+/// port reaches the chat handler's PD injection step. The field is
+/// optional — a worker entry without it defaults to `None`.
+#[tokio::test]
+async fn loads_bootstrap_port_from_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.toml");
+    tokio::fs::write(
+        &path,
+        r#"
+[[workers]]
+id = "p1"
+url = "http://prefill:30000"
+mode = "prefill"
+model_ids = ["m1"]
+bootstrap_port = 8997
+
+[[workers]]
+id = "d1"
+url = "http://decode:30000"
+mode = "decode"
+model_ids = ["m1"]
+"#,
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let cfg = StaticFileDiscoveryConfig {
+        path: path.to_string_lossy().into_owned(),
+        poll_interval_ms: 50,
+    };
+    let _h = sgl_router::discovery::static_file::spawn(cfg, tx)
+        .await
+        .unwrap();
+
+    let mut bootstrap_ports = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let DiscoveryEvent::Added(spec) = event {
+            bootstrap_ports.insert(spec.id.0.clone(), spec.bootstrap_port);
+        }
+    }
+    assert_eq!(bootstrap_ports.get("p1"), Some(&Some(8997)));
+    assert_eq!(bootstrap_ports.get("d1"), Some(&None));
+}
+
 #[tokio::test]
 async fn add_worker_to_file_emits_added_event() {
     let dir = tempfile::tempdir().unwrap();
