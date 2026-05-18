@@ -478,6 +478,32 @@ class Relayer:
     def resolve_num_correct_drafts(self, indices: torch.Tensor) -> torch.Tensor:
         return self.gpu_scalar.resolve_by_indices(indices, "num_correct_drafts")
 
+    # seq_lens family. The "post-iter" seq_lens is derived from the previous
+    # iter's seq_lens + the forward-driven finish/accept decision; storing it
+    # to the gpu_scalar channel lets next iter's consumers (attention
+    # backends, cuda graph runner, sampling) read a settled value with
+    # cross-stream sync built in. Mirror methods exist for seq_lens_cpu and
+    # orig_seq_lens which follow the same relay shape but on different
+    # devices / dtypes.
+
+    def store_seq_lens(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "seq_lens", value)
+
+    def resolve_seq_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "seq_lens")
+
+    def store_seq_lens_cpu(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "seq_lens_cpu", value)
+
+    def resolve_seq_lens_cpu(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "seq_lens_cpu")
+
+    def store_orig_seq_lens(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "orig_seq_lens", value)
+
+    def resolve_orig_seq_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "orig_seq_lens")
+
     # CPU value channel named relays. Producers (process_batch_result CPU
     # branches that decide finish / commit / etc.) call store_*; consumers
     # in the next iter call resolve_*. Each relay name is its own logical

@@ -2388,14 +2388,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update seq_lens after allocation.
         #
-        # The post-decode seq_lens is driven by forward N's "did the req
-        # finish?" output: delta = 0 if finished else 1. Today the scheduler
-        # speculatively advances by +1 for every req and the consumer trims
-        # for finished ones; a future migration replaces this with
-        # ``seq_lens = old + relayer.resolve_kv_committed_delta(fi)`` (where
-        # the Relayer cpu_value channel already holds the per-req decision
-        # computed in process_batch_result). For now the in-place mutation
-        # stays so downstream consumers keep their current contract.
+        # Speculative +1 per req; consumers (kv_committed_delta resolve below
+        # if a relayer ctx is set) trim back for finished reqs. The post-iter
+        # values are also stored to the Relayer ``gpu_scalar`` channel so the
+        # next iter's attention / cuda graph / sampling consumers can resolve
+        # them with cross-stream sync built in (instead of reading the live
+        # SB tensor whose visibility crosses streams).
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
@@ -2407,6 +2405,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # Mirror the new lens onto the Relayer gpu_scalar channel.
+        ctx_relayer, ctx_gpu_fi = getattr(self, "_relayer_seq_lens_ctx", (None, None))
+        if ctx_relayer is not None and ctx_gpu_fi is not None:
+            ctx_relayer.store_seq_lens(ctx_gpu_fi, self.seq_lens)
+            ctx_relayer.store_seq_lens_cpu(ctx_gpu_fi, self.seq_lens_cpu)
+            ctx_relayer.store_orig_seq_lens(ctx_gpu_fi, self.orig_seq_lens)
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
