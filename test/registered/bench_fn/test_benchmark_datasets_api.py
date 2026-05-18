@@ -282,6 +282,48 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
+    def test_custom_sampler_multimodal(self):
+        img_filename = "test_pixel.jpg"
+        img_path = self.tmpdir_path / img_filename
+        img = Image.new("RGB", (1, 1), color="red")
+        img.save(img_path, format="JPEG")
+
+        rows = [
+            {
+                "conversations": [
+                    {"content": "Describe <image 1>"},
+                    {"content": "A small red pixel."},
+                ],
+                "image": str(img_path),
+            }
+        ]
+        jsonl_path = self.tmpdir_path / "custom_mm.jsonl"
+        with open(jsonl_path, "w") as f:
+            f.write(json.dumps(rows[0]) + "\n")
+
+        with patch(
+            "sglang.benchmark.datasets.custom.AutoProcessor.from_pretrained",
+            return_value=self.processor,
+        ):
+            dataset_rows = sample_custom_requests(
+                dataset_path=str(jsonl_path),
+                num_requests=1,
+                tokenizer=self.tokenizer,
+                prompt_suffix="###",
+                fixed_output_len=None,
+                backend="vllm-chat",
+            )
+
+        self.assertEqual(len(dataset_rows), 1)
+        row = dataset_rows[0]
+
+        self.assertIsNotNone(row.image_data)
+
+        self.assertIn("###", row.prompt)
+
+        expected_len = len(self.tokenizer.encode("A small red pixel."))
+        self.assertEqual(row.output_len, expected_len)
+
     def test_openai_sampler(self):
         dataset_path = self._write_openai_jsonl()
         rows = sample_openai_requests(
