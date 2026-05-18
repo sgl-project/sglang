@@ -259,12 +259,12 @@ def canary_step_torch_reference(
     on any device (CPU, CUDA, …); the reference does its work in Python
     after pulling the few small index tensors to host.
     """
-    int_views = _IntViewBundle.from_buffers(
+    int_views = _IntViewBundle(
         src_buf=src_buf,
         dst_buf=dst_buf,
         slot_stride_bytes=slot_stride_bytes,
     )
-    real_kv_view = _RealKvView.from_tensor(
+    real_kv_view = _RealKvView(
         real_kv_buf=real_kv_buf,
         slot_stride_bytes=int(real_kv_slot_stride_bytes),
         read_bytes=int(real_kv_read_bytes),
@@ -285,7 +285,7 @@ def canary_step_torch_reference(
         write_req_entry_counts=write_req_entry_counts,
         write_req_active_mask=write_req_active_mask,
     )
-    sink = _RefViolationSink.from_tensors(
+    sink = _RefViolationSink(
         violation_ring=violation_ring,
         violation_ring_valid=violation_ring_valid,
         violation_write_index=violation_write_index,
@@ -345,20 +345,6 @@ class _IntViewBundle:
             self._dst_i64 = dst_buf.detach().to("cpu").view(torch.int64).clone()
             self._aliased = False
 
-    @classmethod
-    def from_buffers(
-        cls,
-        *,
-        src_buf: torch.Tensor,
-        dst_buf: torch.Tensor,
-        slot_stride_bytes: int,
-    ) -> "_IntViewBundle":
-        return cls(
-            src_buf=src_buf,
-            dst_buf=dst_buf,
-            slot_stride_bytes=slot_stride_bytes,
-        )
-
     def load_field(self, slot_idx: int, field: int) -> int:
         row_start = slot_idx * self._slot_stride_i64
         return int(self._src_i64[row_start + field].item())
@@ -406,22 +392,6 @@ class _RealKvView:
         else:
             flat_bytes = real_kv_buf.detach().to("cpu").contiguous().view(torch.uint8)
             self._host_bytes = bytes(flat_bytes.numpy().tobytes())
-
-    @classmethod
-    def from_tensor(
-        cls,
-        *,
-        real_kv_buf: torch.Tensor,
-        slot_stride_bytes: int,
-        read_bytes: int,
-        mode: int,
-    ) -> "_RealKvView":
-        return cls(
-            real_kv_buf=real_kv_buf,
-            slot_stride_bytes=slot_stride_bytes,
-            read_bytes=read_bytes,
-            mode=mode,
-        )
 
     def hash_slot(self, slot_idx: int) -> int:
         """Return the splitmix64-folded hash of the real-KV slot, or 0 if disabled."""
@@ -514,10 +484,6 @@ class _RefViolationSink:
         )
         self._is_errored_host = int(is_errored.detach().to("cpu").item())
         self._ring_capacity = int(self._ring_host.shape[0])
-
-    @classmethod
-    def from_tensors(cls, **kwargs) -> "_RefViolationSink":
-        return cls(**kwargs)
 
     def record(
         self,
