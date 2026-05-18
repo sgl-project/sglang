@@ -326,6 +326,8 @@ class ForwardData:
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
+    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -928,6 +930,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=forward_data.top_logprobs_nums,
             token_ids_logprobs=forward_data.token_ids_logprobs,
             is_extend_in_batch=forward_data.is_extend_in_batch,
+            all_extend_in_batch=forward_data.all_extend_in_batch,
             can_run_dp_cuda_graph=forward_data.can_run_dp_cuda_graph,
             global_forward_mode=forward_data.global_forward_mode,
             is_prefill_only=forward_data.is_prefill_only,
