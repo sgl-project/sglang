@@ -18,10 +18,15 @@ The plan's Task 0 list is the input; this file is the output that drives Tasks 1
 * Plan Task 2 (`workers/pd.rs` annotation parser) is **DROPPED**. M2 already
   populates `Worker.mode` via selector-based dispatch at discovery time. PD
   pool isolation in M4 reads `Worker.mode` via
-  `WorkerRegistry::workers_for_mode`. No annotation parsing needed.
-* E2E test in PD mode requires real GPU workers. Port the test shape with
-  MockWorker only; the SMG end-to-end variant relies on a different mock
-  harness and isn't worth dragging in for M4.
+  `WorkerRegistry::workers_for_mode`. No annotation parsing needed. The
+  `bootstrap_port` field is added to `WorkerSpec` directly so PD dispatch
+  can find each prefill worker's bootstrap server.
+* PD-mode dual dispatch + bootstrap injection (`bootstrap_host`,
+  `bootstrap_port`, `bootstrap_room`) is M4 scope — required for Task 6
+  ("E2E in PD mode … bonus tokens decoded correctly") and the
+  `test_pd_mode_response_has_decode_affinity_header` acceptance test. The
+  router fans the same modified body to both prefill and decode via
+  `tokio::join!`; the decode response is what the client sees.
 
 ## Category 1 — Inline tests inside SMG policy files
 
@@ -100,7 +105,7 @@ The `test_pd_routing.rs` file is 920+ lines of SMG-specific format / serializati
 |---|---|---|
 | **PD pool isolation under partial failure** | new test | `tests/pd_pool_isolation_test.rs`: prefill pool empty / all-breaker-open → 503 with `no_prefill_workers_available`. |
 | **Active-load guard double-drop safety** | new test | Inline in `policies/active_load.rs`: Rust's affine type system makes literal double-drop unreachable. Test asserts the more interesting property — two guards on the same counter increment by exactly 2 and drop to 0 in either order. |
-| **Decoder affinity vs decode-pool load** | **deferred to M5** | The decoder-affinity logic (decode-side prefers the decode worker paired with the prefill chosen) requires the full PD request flow (prefill→decode handoff). M4 only ships PD pool isolation; affinity is M5. Documented here so we don't lose the gap. |
+| **Decoder affinity vs decode-pool load** | new test | M4 dispatches both prefill and decode (dual-dispatch + bootstrap injection). The decoder-affinity logic (decode side prefers the decode worker on the same host as the chosen prefill) lives in `policies/registry.rs::decode_with_affinity`. Test: prefill on host A + decode workers on hosts {A, B} → request always lands on decode-A. |
 | **Stale-request janitor expiry** | new test | Inline in `policies/active_load.rs`: register a request, advance an injected clock, run janitor → counter zeroed; idempotent on a second run. |
 
 ## Category 4 — New M4-specific tests (TDD targets)
@@ -148,7 +153,6 @@ End-to-end at the HTTP layer using MockWorker:
 
 * `no_prefill_workers_available` and `stale_request_expired` codes added to
   `ApiError` in M4 (per kickoff brief).
-* **Decoder affinity** (gap-closer #3) deferred to M5 — requires the
-  prefill→decode handoff path that M5 owns.
-* Real-GPU PD e2e (4-GPU H100) deferred to M5; M4 lands the MockWorker-based
-  HTTP-level proof.
+* M5 is purely OpenAI completions + embeddings + tool-call parsing. The PD
+  request path (dual dispatch + bootstrap injection) is owned end-to-end by
+  M4 — M5 does not touch it.
