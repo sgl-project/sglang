@@ -152,19 +152,7 @@ def _build_plan(
     req_to_token_table: torch.Tensor,
     swa_window_size: Optional[int],
 ) -> Optional[BatchPlan]:
-    verify_req_ids: List[int] = []
-    verify_positions: List[int] = []
-    verify_slot_indices: List[int] = []
-    verify_prev_slot_indices: List[int] = []
-
-    write_req_ids: List[int] = []
-    write_token_ids: List[int] = []
-    write_positions: List[int] = []
-    write_slot_indices: List[int] = []
-
-    write_req_seed_slot_indices: List[int] = []
-    write_req_entry_starts: List[int] = []
-    write_req_entry_counts: List[int] = []
+    accumulator = _PlanAccumulator()
 
     cursor = 0
     for req_pool_idx, n, k_req in zip(req_pool_indices, seq_lens, prefix_lens):
@@ -179,79 +167,144 @@ def _build_plan(
 
         k_req_int = int(k_req)
         if k_req_int > 0:
-            slot_indices_for_verify = _pull_verify_slot_indices(
-                req_to_token_table=req_to_token_table,
+            _append_verify_entries(
+                accumulator=accumulator,
                 req_pool_idx=req_pool_idx_int,
                 k_req=k_req_int,
+                req_to_token_table=req_to_token_table,
                 swa_window_size=swa_window_size,
             )
-            window_start = k_req_int - len(slot_indices_for_verify)
-            for j, slot_idx in enumerate(slot_indices_for_verify):
-                pos = window_start + j
-                verify_req_ids.append(req_pool_idx_int)
-                verify_positions.append(pos)
-                verify_slot_indices.append(int(slot_idx))
-                if pos == 0:
-                    verify_prev_slot_indices.append(-1)
-                elif j > 0:
-                    verify_prev_slot_indices.append(int(slot_indices_for_verify[j - 1]))
-                else:
-                    # Window starts at pos > 0 (SWA truncation): prev slot
-                    # lives at column (pos - 1) of the same req in
-                    # req_to_token. For the full-prefix case (window_start
-                    # == 0) j > 0 always holds when pos > 0, so this branch
-                    # is reached only on the SWA path.
-                    prev_slot = int(req_to_token_table[req_pool_idx_int, pos - 1])
-                    verify_prev_slot_indices.append(prev_slot)
 
         if n > 0:
-            seed_slot = -1
-            if k_req_int > 0:
-                seed_slot = int(req_to_token_table[req_pool_idx_int, k_req_int - 1])
-            entry_start = len(write_slot_indices)
-            write_req_seed_slot_indices.append(seed_slot)
-            write_req_entry_starts.append(entry_start)
-            write_req_entry_counts.append(n)
-
-            for offset in range(n):
-                pos = k_req_int + offset
-                token_id = input_ids_list[cursor + offset]
-                slot_idx = out_cache_loc_list[cursor + offset]
-                write_req_ids.append(req_pool_idx_int)
-                write_token_ids.append(int(token_id))
-                # ForwardBatch.positions carries the canonical position for
-                # each new token. Fall back to the prefix+offset derivation
-                # when the tensor is unavailable (e.g. some test paths).
-                if positions_list is not None:
-                    write_positions.append(int(positions_list[cursor + offset]))
-                else:
-                    write_positions.append(pos)
-                write_slot_indices.append(int(slot_idx))
+            _append_write_entries(
+                accumulator=accumulator,
+                req_pool_idx=req_pool_idx_int,
+                k_req=k_req_int,
+                n=n,
+                cursor=cursor,
+                input_ids_list=input_ids_list,
+                out_cache_loc_list=out_cache_loc_list,
+                positions_list=positions_list,
+                req_to_token_table=req_to_token_table,
+            )
 
         cursor = next_cursor
 
-    num_verify = len(verify_req_ids)
-    num_write = len(write_req_ids)
-    num_write_reqs = len(write_req_seed_slot_indices)
-    if num_verify == 0 and num_write == 0:
-        return None
+    return accumulator.into_plan()
 
-    return BatchPlan(
-        verify_req_ids=verify_req_ids,
-        verify_positions=verify_positions,
-        verify_slot_indices=verify_slot_indices,
-        verify_prev_slot_indices=verify_prev_slot_indices,
-        write_req_ids=write_req_ids,
-        write_token_ids=write_token_ids,
-        write_positions=write_positions,
-        write_slot_indices=write_slot_indices,
-        write_req_seed_slot_indices=write_req_seed_slot_indices,
-        write_req_entry_starts=write_req_entry_starts,
-        write_req_entry_counts=write_req_entry_counts,
-        num_verify=num_verify,
-        num_write=num_write,
-        num_write_reqs=num_write_reqs,
+
+def _append_verify_entries(
+    *,
+    accumulator: "_PlanAccumulator",
+    req_pool_idx: int,
+    k_req: int,
+    req_to_token_table: torch.Tensor,
+    swa_window_size: Optional[int],
+) -> None:
+    slot_indices_for_verify = _pull_verify_slot_indices(
+        req_to_token_table=req_to_token_table,
+        req_pool_idx=req_pool_idx,
+        k_req=k_req,
+        swa_window_size=swa_window_size,
     )
+    window_start = k_req - len(slot_indices_for_verify)
+    for j, slot_idx in enumerate(slot_indices_for_verify):
+        pos = window_start + j
+        accumulator.verify_req_ids.append(req_pool_idx)
+        accumulator.verify_positions.append(pos)
+        accumulator.verify_slot_indices.append(int(slot_idx))
+        if pos == 0:
+            accumulator.verify_prev_slot_indices.append(-1)
+        elif j > 0:
+            accumulator.verify_prev_slot_indices.append(
+                int(slot_indices_for_verify[j - 1])
+            )
+        else:
+            # Window starts at pos > 0 (SWA truncation): prev slot lives at
+            # column (pos - 1) of the same req in req_to_token. For the
+            # full-prefix case (window_start == 0) j > 0 always holds when
+            # pos > 0, so this branch is reached only on the SWA path.
+            prev_slot = int(req_to_token_table[req_pool_idx, pos - 1])
+            accumulator.verify_prev_slot_indices.append(prev_slot)
+
+
+def _append_write_entries(
+    *,
+    accumulator: "_PlanAccumulator",
+    req_pool_idx: int,
+    k_req: int,
+    n: int,
+    cursor: int,
+    input_ids_list: List[int],
+    out_cache_loc_list: List[int],
+    positions_list: Optional[List[int]],
+    req_to_token_table: torch.Tensor,
+) -> None:
+    seed_slot = -1
+    if k_req > 0:
+        seed_slot = int(req_to_token_table[req_pool_idx, k_req - 1])
+    entry_start = len(accumulator.write_slot_indices)
+    accumulator.write_req_seed_slot_indices.append(seed_slot)
+    accumulator.write_req_entry_starts.append(entry_start)
+    accumulator.write_req_entry_counts.append(n)
+
+    for offset in range(n):
+        pos = k_req + offset
+        token_id = input_ids_list[cursor + offset]
+        slot_idx = out_cache_loc_list[cursor + offset]
+        accumulator.write_req_ids.append(req_pool_idx)
+        accumulator.write_token_ids.append(int(token_id))
+        # ForwardBatch.positions carries the canonical position for each
+        # new token. Fall back to the prefix+offset derivation when the
+        # tensor is unavailable (e.g. some test paths).
+        if positions_list is not None:
+            accumulator.write_positions.append(int(positions_list[cursor + offset]))
+        else:
+            accumulator.write_positions.append(pos)
+        accumulator.write_slot_indices.append(int(slot_idx))
+
+
+class _PlanAccumulator:
+    """Mutable per-list buffer that ``_build_plan`` fills row by row."""
+
+    def __init__(self) -> None:
+        self.verify_req_ids: List[int] = []
+        self.verify_positions: List[int] = []
+        self.verify_slot_indices: List[int] = []
+        self.verify_prev_slot_indices: List[int] = []
+
+        self.write_req_ids: List[int] = []
+        self.write_token_ids: List[int] = []
+        self.write_positions: List[int] = []
+        self.write_slot_indices: List[int] = []
+
+        self.write_req_seed_slot_indices: List[int] = []
+        self.write_req_entry_starts: List[int] = []
+        self.write_req_entry_counts: List[int] = []
+
+    def into_plan(self) -> Optional[BatchPlan]:
+        num_verify = len(self.verify_req_ids)
+        num_write = len(self.write_req_ids)
+        num_write_reqs = len(self.write_req_seed_slot_indices)
+        if num_verify == 0 and num_write == 0:
+            return None
+
+        return BatchPlan(
+            verify_req_ids=self.verify_req_ids,
+            verify_positions=self.verify_positions,
+            verify_slot_indices=self.verify_slot_indices,
+            verify_prev_slot_indices=self.verify_prev_slot_indices,
+            write_req_ids=self.write_req_ids,
+            write_token_ids=self.write_token_ids,
+            write_positions=self.write_positions,
+            write_slot_indices=self.write_slot_indices,
+            write_req_seed_slot_indices=self.write_req_seed_slot_indices,
+            write_req_entry_starts=self.write_req_entry_starts,
+            write_req_entry_counts=self.write_req_entry_counts,
+            num_verify=num_verify,
+            num_write=num_write,
+            num_write_reqs=num_write_reqs,
+        )
 
 
 def _pull_verify_slot_indices(

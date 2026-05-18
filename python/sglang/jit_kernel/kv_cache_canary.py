@@ -340,10 +340,8 @@ class _IntViewBundle:
         self._src_i64 = src_buf.detach().to("cpu").view(torch.int64).clone()
         if dst_buf.data_ptr() == src_buf.data_ptr():
             self._dst_i64 = self._src_i64
-            self._aliased = True
         else:
             self._dst_i64 = dst_buf.detach().to("cpu").view(torch.int64).clone()
-            self._aliased = False
 
     def load_field(self, slot_idx: int, field: int) -> int:
         row_start = slot_idx * self._slot_stride_i64
