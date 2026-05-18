@@ -381,7 +381,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.maybe_prepare_mlp_sync_batch(self.dp_attn_adapter, batch)
 
         if batch:
             set_schedule_time_batch(batch)
@@ -395,7 +395,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -428,7 +428,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()

@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import dataclasses
 import faulthandler
 import logging
 import os
@@ -20,7 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -147,11 +148,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import (
-    has_shm_features,
-    init_mm_embedding_cache,
-    unwrap_shm_features,
-)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -159,7 +155,6 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ModelWorkerBatch,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -168,6 +163,12 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+)
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -185,9 +186,8 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -208,11 +208,9 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
-    broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -221,7 +219,6 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_mps,
     kill_itself_when_parent_died,
-    point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -426,6 +423,12 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
@@ -450,10 +453,64 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
-        self.init_cache_with_memory_pool()
+        result = kv_cache_builder.build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            page_size=self.page_size,
+            spec_algorithm=self.spec_algorithm,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            enable_metrics=self.enable_metrics,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            ps=self.ps,
+            tp_group=self.tp_group,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+
+        if self.enable_hisparse:
+            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if (
+            self.server_args.disaggregation_mode == "decode"
+            and self.server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
 
         # Register draft KV pool (when spec + HiCache co-enabled).
-        self._maybe_register_hicache_draft()
+        kv_cache_builder.maybe_register_hicache_draft(
+            tree_cache=self.tree_cache,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_overlap=self.enable_overlap,
+            page_size=self.page_size,
+        )
 
         # Init running status
         self.init_running_status()
@@ -505,6 +562,43 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        self.request_receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=self.recv_from_tokenizer,
+            recv_from_rpc=self.recv_from_rpc,
+            recv_skipper=self.recv_skipper,
+            input_blocker=self.input_blocker,
+            mm_receiver=self.mm_receiver,
+            ps=self.ps,
+            tp_group=self.tp_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_tp_group=self.attn_tp_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_group=self.attn_cp_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            world_group=self.world_group,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            max_recv_per_poll=self.max_recv_per_poll,
+            stream_output=self.stream_output,
+            get_last_forward_mode=lambda: (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            ),
+        )
+
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            tp_group=self.tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            offload_tags=self.offload_tags,
+            ps=self.ps,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            get_require_mlp_sync=lambda: self.require_mlp_sync,
+        )
 
         self.is_initializing = False
 
@@ -810,257 +904,6 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
-    def init_cache_with_memory_pool(self):
-        server_args = self.server_args
-        uses_transformers_backend = (
-            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
-        )
-
-        # Hybrid memory pool
-        self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        _spec = self.tp_worker.model_runner.linear_attn_model_spec
-        _registry_needs_mamba = (
-            _spec.uses_mamba_radix_cache if _spec is not None else False
-        )
-        self.is_hybrid_ssm = (
-            self.tp_worker.model_runner.hybrid_gdn_config is not None
-            or self.tp_worker.model_runner.mamba2_config is not None
-            or _registry_needs_mamba
-        )
-
-        self.sliding_window_size = None
-        if self.is_hybrid_swa:
-            self.sliding_window_size = self.tp_worker.sliding_window_size
-            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
-                self.tp_worker.get_tokens_per_layer_info()
-            )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
-
-        self.disable_radix_cache = server_args.disable_radix_cache or (
-            self.model_config.is_multimodal and uses_transformers_backend
-        )
-        if self.disable_radix_cache and not server_args.disable_radix_cache:
-            logger.warning(
-                "Radix cache is disabled for multimodal models with the "
-                "Transformers backend to avoid multimodal prefix-cache mismatches."
-            )
-
-        # Decode radix cache is unsupported with hybrid SWA/SSM models —
-        # these use specialized memory pools incompatible with the
-        # prefix-match-and-lock allocation path.
-        if (
-            server_args.disaggregation_decode_enable_radix_cache
-            and server_args.disaggregation_mode == "decode"
-        ):
-            if self.is_hybrid_swa:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with sliding window attention (SWA) models"
-                )
-            if self.is_hybrid_ssm:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with Mamba/SSM models"
-                )
-
-        effective_chunked_prefill_size = server_args.chunked_prefill_size
-        if self.model_config.is_multimodal and uses_transformers_backend:
-            effective_chunked_prefill_size = None
-
-        params = CacheInitParams(
-            disable=self.disable_radix_cache,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
-            is_eagle=self.spec_algorithm.is_eagle(),
-            tp_cache_group=(
-                self.attn_tp_cpu_group
-                if self.server_args.enable_dp_attention
-                else self.tp_cpu_group
-            ),
-            attn_cp_cache_group=self.attn_cp_cpu_group,
-            attn_tp_cache_group=self.attn_tp_cpu_group,
-            eviction_policy=server_args.radix_eviction_policy,
-            enable_metrics=self.enable_metrics,
-            enable_kv_cache_events=self.enable_kv_cache_events,
-            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-            pp_rank=self.ps.pp_rank,
-            pp_size=self.ps.pp_size,
-            chunked_prefill_size=effective_chunked_prefill_size,
-            sliding_window_size=self.sliding_window_size,
-        )
-
-        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
-                from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-                self.tree_cache = ChunkCache(params)
-            else:
-                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-                self.tree_cache = SWAChunkCache(params)
-        else:
-            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-                # lazy import to avoid JIT overhead
-                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-                logger.info("Using experimental C++ radix tree implementation.")
-                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                from sglang.srt.mem_cache.unified_cache_components import (
-                    ComponentType,
-                )
-                from sglang.srt.mem_cache.unified_radix_cache import (
-                    UnifiedRadixCache,
-                )
-
-                tree_components = [ComponentType.FULL]
-                if self.is_hybrid_swa or self.is_hybrid_ssm:
-                    tree_components.append(
-                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
-                    )
-                params.tree_components = tuple(tree_components)
-                self.tree_cache = UnifiedRadixCache(params)
-                if self.enable_hierarchical_cache:
-                    self.tree_cache.init_hicache(server_args, params)
-                    self.tp_worker.register_hicache_layer_transfer_counter(
-                        self.tree_cache.cache_controller.layer_done_counter
-                    )
-            elif self.enable_hierarchical_cache:
-                if self.is_hybrid_ssm:
-                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
-                        HiMambaRadixCache,
-                    )
-
-                    self.tree_cache = HiMambaRadixCache(
-                        params=params, server_args=server_args
-                    )
-                else:
-                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
-                    self.tree_cache = HiRadixCache(
-                        params=params, server_args=server_args
-                    )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
-            elif self.is_hybrid_swa:
-                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-                self.tree_cache = SWARadixCache(params=params)
-            elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-                self.tree_cache = MambaRadixCache(params)
-            elif server_args.enable_lmcache:
-                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                    LMCRadixCache,
-                )
-
-                self.tree_cache = LMCRadixCache(
-                    params=params,
-                    model_config=self.model_config,
-                    tp_size=self.ps.tp_size,
-                    rank=self.ps.tp_rank,
-                    tp_group=self.tp_group,
-                )
-            else:
-                self.tree_cache = RadixCache(params)
-
-        if (
-            server_args.enable_streaming_session
-            and not self.tree_cache.supports_streaming_session()
-        ):
-            self.tree_cache = StreamingSession(self.tree_cache)
-
-        if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
-
-        if (
-            server_args.disaggregation_mode == "decode"
-            and server_args.disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=params.tp_cache_group,
-                tree_cache=self.tree_cache,
-                server_args=self.server_args,
-            )
-        else:
-            self.decode_offload_manager = None
-
-        embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
-        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
-
-    def _get_draft_kv_pool(self):
-        """Return (draft_token_to_kv_pool, draft_model_config) for the current
-        draft worker, or (None, None) when no draft KV pool is available."""
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
-            return None, None
-
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
-            return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-        return (
-            self.draft_worker.model_runner.token_to_kv_pool,
-            self.draft_worker.model_config,
-        )
-
-    def _maybe_register_hicache_draft(self) -> None:
-        """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-        if not self.enable_hierarchical_cache:
-            return
-
-        draft_kv_pool, _ = self._get_draft_kv_pool()
-        if draft_kv_pool is None:
-            return
-
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
-        )
-
-        pool = draft_kv_pool
-        if isinstance(pool, HybridLinearKVPool):
-            pool = pool.full_kv_pool
-
-        # Create host pool for draft with the same slot count as the target host pool,
-        # so that host indices stay 1-to-1 between target and draft KV caches.
-        primary = self.tree_cache.cache_controller.mem_pool_host
-        kw = dict(
-            host_to_device_ratio=primary.size / pool.size,
-            host_size=0,
-            page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
-        )
-        if isinstance(pool, MHATokenToKVPool):
-            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, MLATokenToKVPool):
-            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
-        else:
-            logger.warning(
-                "Draft pool type %s not supported for HiCache, skipping.",
-                type(pool).__name__,
-            )
-            return
-
-        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
-
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -1216,7 +1059,12 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_overlap=self.enable_overlap,
+        )
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
         # when this node runs a spec module.
@@ -1551,7 +1399,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1587,7 +1435,7 @@ class Scheduler(
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1660,197 +1508,6 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
-
-    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
-
-    def recv_requests(
-        self,
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-
-        if self.recv_skipper is not None:
-            last_forward_mode = (
-                self.last_batch.forward_mode if self.last_batch is not None else None
-            )
-            if not self.recv_skipper.handle(last_forward_mode):
-                return []
-
-        if self.ps.pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-            else:
-                recv_reqs = None
-        else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
-            else:
-                recv_reqs = None
-
-        if self.input_blocker is not None:
-            recv_reqs = self.input_blocker.handle(recv_reqs)
-
-        if self.server_args.enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
-
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
-            if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
-            elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
-
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
-
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.ps.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
-
-        return recv_reqs
-
-    def _split_work_and_control_reqs(self, recv_reqs: List):
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
@@ -2586,7 +2243,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch(
+                self.dp_attn_adapter, new_batch
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -2604,7 +2263,9 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        ret = self.maybe_prepare_mlp_sync_batch(
+            self.dp_attn_adapter, ret, need_sync=need_mlp_sync
+        )
 
         # Handle ngram embedding
         ret = self._maybe_prepare_ngram_embedding(ret)
@@ -2992,14 +2653,61 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
+    def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
+        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
+        attr_snapshot = [
+            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+        ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+        # List (not tuple) so that workers can register additional refs via
+        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+
+    @contextmanager
+    def _overlap_forward_isolation(self, batch: ScheduleBatch):
+        """Make SB transactional across one overlap forward.
+
+        1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
+           input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
+           only need sampling_info restored - V1 carries spec_info forward as
+           next-iter draft input.
+        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
+           shares the pre-accumulated penalty buffer) so V2's multiple init_new
+           calls don't double-accumulate penalties.
+        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
+           tensors in the snapshot survive the caching allocator past the
+           forward stream. Must run AFTER the sampling_info swap so the
+           forward-only copy gets pinned.
+        """
+        # 1. snapshot
+        snapshot_v2_full = batch.is_spec_v2
+        sched_snapshot = (
+            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            if snapshot_v2_full
+            else None
+        )
+        sched_sampling_info = batch.sampling_info
+
+        # 2. sampling_info substitute
+        if sched_sampling_info is not None:
+            batch.sampling_info = sched_sampling_info.copy_for_forward()
+
+        # 3. pin for 2-iter tensor lifetime
+        self.record_batch_in_overlap(batch)
+
+        try:
+            yield
+        finally:
+            if snapshot_v2_full:
+                for name, value in sched_snapshot.items():
+                    setattr(batch, name, value)
+            else:
+                batch.sampling_info = sched_sampling_info
 
     def run_batch(
         self,
@@ -3022,42 +2730,33 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
-            else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
-                worker_batch_or_batch = batch
-
             if self.enable_overlap:
-                model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                with self._overlap_forward_isolation(batch):
+                    bs = len(batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
-
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
-                        # here pp is not compatible with overlap
-                    )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(
-                            return_logprob=batch.return_logprob,
-                            return_hidden_states=batch.return_hidden_states,
-                        )
-                    else:
-                        batch_result.future_indices = future_indices
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(batch)
+                        # FIXME: pp is not compatible with overlap
+                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        # Park any refs the worker wants kept alive 2 iters
+                        # (cross-stream tensor lifetime; pinned in the same
+                        # ring slot as the SB attr snapshot).
+                        if batch_result.extra_keep_alive_refs:
+                            self.batch_record_buf[self.batch_record_ct].extend(
+                                batch_result.extra_keep_alive_refs
+                            )
+                        # FIXME(lsyin): maybe move this to forward_batch_generation
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
+                            )
+                        else:
+                            batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
@@ -3082,7 +2781,7 @@ class Scheduler(
                     else {}
                 )
                 batch_result = self.model_worker.forward_batch_generation(
-                    worker_batch_or_batch, **kwargs
+                    batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -3109,24 +2808,18 @@ class Scheduler(
 
             ret = batch_result
         else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-
             if self.enable_overlap:
-                self.record_batch_in_overlap(model_worker_batch)
+                self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    pooler_output = self.tp_worker.forward_batch_embedding(
-                        model_worker_batch
-                    )
+                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                     )
                     ret.copy_to_cpu()
             else:
-                pooler_output = self.tp_worker.forward_batch_embedding(
-                    model_worker_batch
-                )
+                pooler_output = self.tp_worker.forward_batch_embedding(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
@@ -3463,7 +3156,10 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
-            logger.info("Cache flushed successfully!")
+            # Per-DP-group leader logs once: ranks within a DP group are
+            # state-synchronous, but DP groups may diverge.
+            if self.is_stats_logging_rank:
+                logger.info("Cache flushed successfully!")
             success = True
         else:
             logging.warning(

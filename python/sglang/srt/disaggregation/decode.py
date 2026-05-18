@@ -1573,7 +1573,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
@@ -1601,7 +1601,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
@@ -1670,7 +1670,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        ret = self.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.maybe_prepare_mlp_sync_batch(self.dp_attn_adapter, ret)
         if ret:
             set_schedule_time_batch(ret)
         return ret
