@@ -905,7 +905,9 @@ class DFlashWorker:
             draft_input.target_hidden = draft_input.target_hidden[:0]
             return
 
-        target_req_to_token = batch.req_to_token_pool.req_to_token
+        target_req_to_token = (
+            self.target_worker.model_runner.req_to_token_pool.req_to_token
+        )
         draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
 
         req_pool_indices = batch.req_pool_indices

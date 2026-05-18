@@ -378,6 +378,9 @@ class ForwardData:
     def prefix_lens(self) -> Optional[List[int]]:
         return self.extend_prefix_lens
 
+    def batch_size(self) -> int:
+        return self.seq_lens.shape[0]
+
 
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
