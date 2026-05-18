@@ -83,7 +83,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() or a2a_backend.is_megamoe():
+    if (
+        a2a_backend.is_none()
+        or a2a_backend.is_megamoe()
+        or a2a_backend.is_ascend_fuseep()
+    ):
+        # ascend_fuseep bypasses the dispatcher abstraction (see
+        # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
+        # StandardDispatcher is created but never invoked.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -107,19 +114,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_ascend_fuseep():
-        from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
-
-        return NpuFuseEPDispatcher(
-            group=get_tp_group().device_group,
-            router_topk=moe_runner_config.top_k,
-            permute_fusion=True,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
-            hidden_size=moe_runner_config.hidden_size,
-            params_dtype=moe_runner_config.params_dtype,
-        )
-
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -1046,6 +1040,10 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if get_moe_a2a_backend().is_ascend_fuseep():
+            from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
+
+            return forward_fuseep(self, hidden_states, topk_output)
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
