@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.evict_policy import (
+    AdapterMixStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -301,6 +302,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
         elif self.eviction_policy == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        elif self.eviction_policy == "adaptermix":
+            self.eviction_strategy: EvictionStrategy = AdapterMixStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "slru":
@@ -565,7 +568,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, start_time), node)
+            for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -578,7 +582,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, start_time)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
