@@ -14,6 +14,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     divide,
     get_tp_group,
     split_tensor_along_last_dim,
@@ -39,6 +40,8 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1568,7 +1571,14 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if should_use_tp_invariant_row_linear(input_parallel.shape[-1]):
+                output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
+                    input_parallel, self.weight.t(), bias_
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by

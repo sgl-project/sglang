@@ -32,6 +32,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    is_true_on_policy_enabled,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -222,11 +227,30 @@ class RMSNorm(MultiPlatformOp):
         cast_x_before_out_mul: bool = False,
         fp32_residual: bool = True,
         has_weight: bool = True,
-        weight_dtype: Optional = None,
-        override_orig_dtype: Optional = None,
+        weight_dtype: Optional[torch.dtype] = None,
+        override_orig_dtype: Optional[torch.dtype] = None,
         x_pad_to_multiple: int = 0,
+        true_on_policy_weight_dtype: Optional[torch.dtype] = None,
+        true_on_policy_override_orig_dtype: Optional[torch.dtype] = None,
+        true_on_policy_fp32_residual: bool = False,
     ) -> None:
         super().__init__()
+        true_on_policy_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=true_on_policy_weight_dtype,
+            override_orig_dtype=true_on_policy_override_orig_dtype,
+            fp32_residual=true_on_policy_fp32_residual,
+        )
+        if not cast_x_before_out_mul:
+            cast_x_before_out_mul = true_on_policy_kwargs.get(
+                "cast_x_before_out_mul", cast_x_before_out_mul
+            )
+        fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+        if weight_dtype is None:
+            weight_dtype = true_on_policy_kwargs.get("weight_dtype", weight_dtype)
+        if override_orig_dtype is None:
+            override_orig_dtype = true_on_policy_kwargs.get(
+                "override_orig_dtype", override_orig_dtype
+            )
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
@@ -280,11 +304,17 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if (
+            self.weight.dtype != x.dtype
+            or self.cast_x_before_out_mul
+            or self.override_orig_dtype is not None
+        ):
+            return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or is_true_on_policy_enabled()
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(

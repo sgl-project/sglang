@@ -51,6 +51,12 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    is_true_on_policy_enabled,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -96,9 +102,11 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        if get_server_args().rl_on_policy_target is not None:
-            x = x.bfloat16()
-
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or x.dtype != self.gate_up_proj.weight.dtype
+        ):
+            x = x.to(self.gate_up_proj.weight.dtype)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
@@ -289,11 +297,7 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(
-                    torch.float32
-                    if get_server_args().rl_on_policy_target is not None
-                    else None
-                ),
+                params_dtype=(torch.float32 if is_true_on_policy_enabled() else None),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -320,16 +324,7 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
-                )
-                if get_server_args().rl_on_policy_target is not None
-                else {}
-            )
+            norm_kwargs = get_on_policy_rms_norm_kwargs()
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
             )

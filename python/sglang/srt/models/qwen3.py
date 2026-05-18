@@ -34,6 +34,11 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.true_on_policy import (
+    should_disable_fused_qk_norm_mrope,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -106,16 +111,16 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_parallel().tp_rank
 
-        norm_kwargs = (
-            dict(
-                cast_x_before_out_mul=True,
-                fp32_residual=False,
-            )
-            if get_server_args().rl_on_policy_target is not None
-            else {}
+        self.q_norm = RMSNorm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -271,14 +276,20 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_server_args().rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or hidden_states.dtype != self.qkv_proj.weight.dtype
+        ):
+            # True-on-policy RMSNorm can produce fp32 activations while dense
+            # projections remain bf16, including during cuda-graph capture when
+            # the global on-policy flag is temporarily cleared.
+            hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
 
         save_kv_cache = True
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_server_args().rl_on_policy_target is None
+            and not should_disable_fused_qk_norm_mrope()
         )
 
         if use_aiter_fused:
@@ -298,9 +309,9 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_server_args().rl_on_policy_target is not None:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
+        if should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
@@ -364,10 +375,18 @@ class Qwen3DecoderLayer(nn.Module):
             else {}
         )
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+            true_on_policy_override_orig_dtype=torch.float32,
+            true_on_policy_fp32_residual=True,
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+            true_on_policy_override_orig_dtype=torch.float32,
+            true_on_policy_fp32_residual=True,
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

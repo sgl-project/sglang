@@ -474,6 +474,8 @@ def apply_qk_norm(
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and get_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
