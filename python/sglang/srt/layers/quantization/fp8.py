@@ -1640,10 +1640,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
-                # *EPMoE backends bypass self.runner via run_moe_core, and the
-                # AITER fused func is only registered for ("none", "aiter").
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON

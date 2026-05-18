@@ -6,8 +6,10 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
-    layerwise_component_matches_selection,
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    layerwise_component_matches_any_selection,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -513,9 +515,11 @@ class LayerwiseOffloadManager:
 
         def make_pre_hook(i):
             def hook(module, input):
-                # wait only for the current layer if it's being prefetched
                 if i == 0:
                     self.prepare_for_next_req(non_blocking=False)
+                if i not in self._gpu_layers:
+                    # LTX audio VAE traverses decoder.up in reverse order
+                    self.prefetch_layer(i, non_blocking=False)
                 if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
@@ -554,8 +558,9 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # Legacy --dit-layerwise-offload configures these modules when no component is named.
-    layerwise_offload_default_enabled: bool = True
+    # whether the current module is selected by the `dit` group
+    layerwise_offload_dit_group_enabled: bool = True
+
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
@@ -664,6 +669,54 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
     )
 
 
+def get_layerwise_offload_component_names_for_pipeline(
+    modules: Mapping[str, object],
+    component_names: Sequence[str] | None = None,
+) -> list[str]:
+    """Resolve layerwise selectors against the current pipeline modules.
+
+    Explicit unsupported component names are kept so callers can report them.
+    """
+    normalized_component_names = normalize_layerwise_offload_components(component_names)
+    selected_component_names = (
+        set(normalized_component_names)
+        if normalized_component_names is not None
+        else None
+    )
+
+    if selected_component_names is None:
+        return [
+            component_name
+            for component_name, module in modules.items()
+            if isinstance(module, LayerwiseOffloadableModuleMixin)
+            and module.layerwise_offload_dit_group_enabled
+        ]
+
+    if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+        return [
+            component_name
+            for component_name, module in modules.items()
+            if isinstance(module, LayerwiseOffloadableModuleMixin)
+        ]
+
+    explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
+    select_dit_group = LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names
+    selected_pipeline_component_names: list[str] = []
+    for component_name, module in modules.items():
+        if layerwise_component_matches_any_selection(
+            component_name, explicit_component_names
+        ):
+            selected_pipeline_component_names.append(component_name)
+            continue
+        if (
+            select_dit_group
+            and isinstance(module, LayerwiseOffloadableModuleMixin)
+            and module.layerwise_offload_dit_group_enabled
+        ):
+            selected_pipeline_component_names.append(component_name)
+    return selected_pipeline_component_names
+
+
 def configure_layerwise_offload_modules(
     modules: Mapping[str, object],
     server_args: ServerArgs,
@@ -682,27 +735,33 @@ def configure_layerwise_offload_modules(
     # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
+    normalized_component_names = normalize_layerwise_offload_components(component_names)
     selected_component_names = (
-        set(component_names) if component_names is not None else None
+        set(normalized_component_names)
+        if normalized_component_names is not None
+        else None
     )
     select_all = (
-        selected_component_names is not None and "all" in selected_component_names
-    )
-    select_default = (
         selected_component_names is not None
-        and LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS in selected_component_names
+        and LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names
+    )
+    selected_pipeline_component_names = (
+        get_layerwise_offload_component_names_for_pipeline(
+            modules,
+            normalized_component_names,
+        )
     )
 
     if warn_missing and selected_component_names is not None and not select_all:
         explicit_component_names = selected_component_names - {
-            LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+            LAYERWISE_OFFLOAD_DIT_GROUP
         }
         missing_component_names = [
             selected_component_name
             for selected_component_name in explicit_component_names
             if not any(
-                layerwise_component_matches_selection(
-                    component_name, selected_component_name
+                layerwise_component_matches_any_selection(
+                    component_name, [selected_component_name]
                 )
                 for component_name in modules
             )
@@ -717,13 +776,7 @@ def configure_layerwise_offload_modules(
 
         unsupported_component_names = [
             component_name
-            for component_name in modules
-            if any(
-                layerwise_component_matches_selection(
-                    component_name, selected_component_name
-                )
-                for selected_component_name in explicit_component_names
-            )
+            for component_name in selected_pipeline_component_names
             if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
         ]
         if unsupported_component_names:
@@ -732,27 +785,13 @@ def configure_layerwise_offload_modules(
                 sorted(unsupported_component_names),
             )
 
-    for component_name, module in modules.items():
+    for component_name in selected_pipeline_component_names:
+        module = modules[component_name]
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
-            continue
-        if selected_component_names is None:
-            if not module.layerwise_offload_default_enabled:
-                continue
-        elif (
-            not select_all
-            and not any(
-                layerwise_component_matches_selection(
-                    component_name, selected_component_name
-                )
-                for selected_component_name in selected_component_names
-            )
-            and not (select_default and module.layerwise_offload_default_enabled)
-        ):
-            # if the current component is not selected to be layerwise-offload, skip
             continue
         module_id = id(module)
         if module_id in configured_module_ids:
-            # avoid multiple configures on a same module
+            # avoid duplicated configures on a same module
             continue
 
         configured_module_ids.add(module_id)
