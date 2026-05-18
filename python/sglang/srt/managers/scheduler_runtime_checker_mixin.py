@@ -355,9 +355,14 @@ class SchedulerRuntimeCheckerMixin:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba
+            # Skip page-level diagnosis when allocator has no `free_pages`.
+            free_pages_attr = getattr(
+                self.token_to_kv_pool_allocator, "free_pages", None
+            )
+            if free_pages_attr is None:
+                return leak, msg
             free_full_pages = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
+                free_pages_attr.tolist()
                 + self.token_to_kv_pool_allocator.release_pages.tolist()
             )
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
