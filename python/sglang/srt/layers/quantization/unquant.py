@@ -54,9 +54,7 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-_FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR = (
-    "_sglang_flashinfer_trtllm_bf16_layout_meta"
-)
+_FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR = "_sglang_flashinfer_trtllm_bf16_layout_meta"
 _FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL = "canonical"
 _FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED = "flashinfer_trtllm_bf16"
 
@@ -83,11 +81,7 @@ def _set_flashinfer_trtllm_bf16_layout_meta(
 def _zero_flashinfer_trtllm_bf16_padding(layer: torch.nn.Module) -> None:
     padded_size = getattr(layer, "intermediate_size_per_partition", None)
     unpadded_size = getattr(layer, "intermediate_size_per_partition_unpadded", None)
-    if (
-        padded_size is None
-        or unpadded_size is None
-        or unpadded_size >= padded_size
-    ):
+    if padded_size is None or unpadded_size is None or unpadded_size >= padded_size:
         return
 
     w13_weight = layer.w13_weight.data
@@ -99,6 +93,7 @@ def _zero_flashinfer_trtllm_bf16_padding(layer: torch.nn.Module) -> None:
 
     if w2_weight.dim() == 3:
         w2_weight[:, :, unpadded_size:padded_size].zero_()
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
