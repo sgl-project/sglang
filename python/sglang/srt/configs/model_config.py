@@ -450,17 +450,16 @@ class ModelConfig:
         if not self.is_hybrid_swa:
             self.has_attention_sinks = self._detect_attention_sinks()
             self.is_hybrid_swa_compress = False
-            self.is_swa_with_compressed_attention = False
             return
 
         logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-        self.is_swa_with_compressed_attention = any(
+        self.is_deepseek_v4_arch = any(
             arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
             for arch in self.hf_config.architectures
         )
 
-        if self.is_hybrid_swa and not self.is_swa_with_compressed_attention:
+        if not self.is_deepseek_v4_arch:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
