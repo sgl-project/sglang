@@ -420,6 +420,7 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_fp8_t2i",
@@ -427,6 +428,7 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
@@ -434,6 +436,7 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=[],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "hunyuanvideo_modelopt_fp8_t2v",
@@ -470,6 +473,7 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -478,6 +482,7 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
@@ -486,6 +491,7 @@ else:
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=[],
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
     ]
 
