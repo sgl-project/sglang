@@ -195,13 +195,12 @@ class TestReasonerGrammarBackend(CustomTestCase):
         self.assertEqual(mask.device.type, "cpu")
         self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
-        logits = torch.zeros(1, 100, dtype=torch.float32)
+        logits = torch.zeros(1, 65, dtype=torch.float32)
         obj.apply_vocab_mask(logits, mask)
 
         self.assertEqual(logits[0, 2].item(), 0)
         self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
-        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:96])))
-        self.assertTrue(torch.all(torch.isneginf(logits[0, 96:])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
 
     def test_init_strict_reasoning_grammar_supports_xgrammar_masks(self):
         from sglang.srt.constrained import xgrammar_backend
@@ -232,13 +231,12 @@ class TestReasonerGrammarBackend(CustomTestCase):
         self.assertEqual(mask.device.type, "cpu")
         self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
-        logits = torch.zeros(1, 100, dtype=torch.float32)
+        logits = torch.zeros(1, 65, dtype=torch.float32)
         obj.apply_vocab_mask(logits, mask)
 
         self.assertEqual(logits[0, 2].item(), 0)
         self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
-        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:96])))
-        self.assertTrue(torch.all(torch.isneginf(logits[0, 96:])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
 
     def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
         from sglang.srt.constrained import outlines_backend

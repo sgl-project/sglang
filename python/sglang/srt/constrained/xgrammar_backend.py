@@ -231,11 +231,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
+        if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type in {"cpu", "npu"}:
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
