@@ -1032,7 +1032,8 @@ class LTX2TransformerBlock(nn.Module):
             self.audio_scale_shift_table, batch_size, temb_audio, slice(0, 3)
         )
         norm_audio_hidden_states = (
-            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa) + ashift_msa
+            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa)
+            + ashift_msa
         )
         attn_audio_hidden_states = self.audio_attn1(
             norm_audio_hidden_states,
@@ -1079,7 +1080,8 @@ class LTX2TransformerBlock(nn.Module):
                 slice(None),
             )
             norm_audio_hidden_states = (
-                self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_q) + ashift_q
+                self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_q)
+                + ashift_q
             )
             mod_audio_encoder_hidden_states = (
                 audio_encoder_hidden_states * (1 + a_prompt_scale) + a_prompt_shift
@@ -1231,7 +1233,8 @@ class LTX2TransformerBlock(nn.Module):
             self.audio_scale_shift_table, batch_size, temb_audio, slice(3, 6)
         )
         norm_audio_hidden_states = (
-            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp)
+            + ashift_mlp
         )
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
         audio_hidden_states = audio_hidden_states + audio_ff_output * agate_mlp

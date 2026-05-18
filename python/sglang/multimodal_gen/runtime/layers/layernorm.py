@@ -298,7 +298,7 @@ class RMSNorm(CustomOp):
 class RMSNormNoWeight(CustomOp):
     def forward_native(x: torch.Tensor, eps: float) -> torch.Tensor:
         return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
-    
+
     def forward_npu(x: torch.Tensor, eps: float) -> torch.Tensor:
         return fused_rmsnorm_without_weight(x, eps)
 
