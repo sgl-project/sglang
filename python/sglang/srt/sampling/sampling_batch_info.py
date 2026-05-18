@@ -77,20 +77,30 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
+        temperatures = (
+            torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                pin_memory=True,
+            )
+            .to(device, non_blocking=True)
+            .view(-1, 1)
+        )
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.top_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=True,
+        ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
+            [r.sampling_params.top_k for r in reqs],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).to(device, non_blocking=True)
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.min_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=True,
+        ).to(device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [
@@ -102,8 +112,8 @@ class SamplingBatchInfo:
                     for r in reqs
                 ],
                 dtype=torch.int64,
-                device=device,
-            )
+                pin_memory=True,
+            ).to(device, non_blocking=True)
             if enable_deterministic
             else None
         )
