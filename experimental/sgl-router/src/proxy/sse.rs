@@ -44,10 +44,7 @@ use tokio_stream::wrappers::ReceiverStream;
 /// pack arbitrary cleanup state in. Pass `None` for callers that manage the
 /// guard externally (e.g. non-streaming paths where the handler itself is the
 /// guard scope).
-pub fn bytes_stream_to_body<S, E>(
-    stream: S,
-    stream_guards: Option<Box<dyn Send + 'static>>,
-) -> Body
+pub fn bytes_stream_to_body<S, E>(stream: S, stream_guards: Option<Box<dyn Send + 'static>>) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,

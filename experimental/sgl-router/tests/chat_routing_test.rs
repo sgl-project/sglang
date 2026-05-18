@@ -935,13 +935,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(
-        cfg,
-        tokenizers,
-        proxy,
-        registry,
-        policies,
-    ));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
     let active_load = Arc::clone(&ctx.active_load);
     let app = build_router(ctx);
 
@@ -1061,8 +1055,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
-    let worker =
-        common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let worker = common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
 
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());

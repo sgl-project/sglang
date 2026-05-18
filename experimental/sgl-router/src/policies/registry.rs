@@ -559,7 +559,10 @@ mod tests {
             .into_iter()
             .filter(|w| w.mode() == WorkerMode::Decode)
             .collect::<Vec<_>>();
-        let d1 = pool.iter().find(|w| w.url == "http://host_b:30001").unwrap();
+        let d1 = pool
+            .iter()
+            .find(|w| w.url == "http://host_b:30001")
+            .unwrap();
         let _g = d1.load_guard();
 
         let chosen = resolver

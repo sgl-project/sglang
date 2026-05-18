@@ -199,34 +199,15 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
     let prefill_b = common::mock_worker::MockWorker::start(vec![]).await;
     let decode_a = common::mock_worker::MockWorker::start(vec![]).await;
     let decode_b = common::mock_worker::MockWorker::start(vec![]).await;
-    // The host portion of MockWorker URLs is always `127.0.0.1`, so we
-    // cannot use real-host affinity in this test (every worker shares
-    // the same host). Instead, build the WorkerSpec URLs with the host
-    // override that points at the actual listening port (127.0.0.1:p)
-    // — and use the port as a tiebreaker by making each prefill share
-    // its host *string* with one specific decode. We accomplish this
-    // by overriding the host in the URL string to a synthetic value
-    // pre-resolved via a /etc/hosts-style mapping: not available in
-    // a unit test.
-    //
-    // The simpler approach that exercises the affinity selection: use
-    // `127.0.0.1:port_a` for prefill_a + decode_a and a DIFFERENT host
-    // alias for prefill_b + decode_b. Since the OS only listens on
-    // 127.0.0.1, we cheat: the URL string carries `host_a` /
-    // `host_b` literally — the registry never resolves it (selection
-    // only inspects the string). The actual TCP traffic must use the
-    // real URL, so the test only asserts header presence on the
-    // prefill mock workers (which we DO route to via their real URL).
-    //
-    // To make affinity selection meaningful, register two distinct
-    // URLs per pool that vary in their host substring. We do that
-    // here by re-registering with a fake host that matches.
-    let prefill_a_url = prefill_a.url.replace("127.0.0.1", "127.0.0.1");
-    let _ = (&prefill_a_url, &prefill_b.url);
-    // Build the context with the REAL URLs — affinity falls back to
-    // min-load since all hosts are `127.0.0.1`. We assert that a
-    // decode URL IS set in the header (the helper returned Some)
-    // even when affinity is moot.
+    // MockWorker URLs always bind to `127.0.0.1`, so every worker
+    // shares the same host string and the affinity helper's
+    // same-host branch is moot here — the helper still returns a
+    // decode peer via the load-tiebreak fallback. The unit tests in
+    // `policies::registry::tests::decoder_picks_same_host_when_available`
+    // carry the real burden of pinning the host-affinity rules; this
+    // integration test only asserts the wiring is in place (the
+    // `x-sgl-decode-url` header IS set on PD requests, and the
+    // value is one of the registered decode worker URLs).
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -276,7 +257,10 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             continue;
         }
         let hdr = g.headers.get("x-sgl-decode-url").unwrap_or_else(|| {
-            panic!("{label} did not receive an x-sgl-decode-url header. headers: {:?}", g.headers)
+            panic!(
+                "{label} did not receive an x-sgl-decode-url header. headers: {:?}",
+                g.headers
+            )
         });
         assert!(
             decode_urls.contains(hdr),
