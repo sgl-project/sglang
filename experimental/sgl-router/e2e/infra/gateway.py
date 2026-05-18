@@ -185,6 +185,7 @@ class Gateway:
         tokenizer_path: str,
         prefill_urls: list[str],
         decode_urls: list[str],
+        prefill_bootstrap_ports: list[int | None] | None = None,
         policy: str = "round_robin",
         timeout: float = 60.0,
     ) -> None:
@@ -193,13 +194,32 @@ class Gateway:
         Discovery emits ``WorkerMode::Prefill`` for ``prefill_urls`` and
         ``WorkerMode::Decode`` for ``decode_urls``; the router's
         `PdPoolResolver` filters per-pool at request time.
+
+        ``prefill_bootstrap_ports`` carries the SGLang
+        ``--disaggregation-bootstrap-port`` setting for each prefill
+        worker; the router writes this into the workers TOML so the
+        chat handler can inject it as the ``bootstrap_port`` field on
+        PD-disagg request bodies. Length must match ``prefill_urls``
+        when provided; ``None`` entries become ``bootstrap_port = None``
+        in the TOML (the worker will reject the request with a clear
+        error). If the whole arg is ``None``, no entries get a
+        ``bootstrap_port`` and the field defaults to ``None`` — used
+        by tests that don't care about PD bootstrap correctness.
         """
+        if prefill_bootstrap_ports is not None and len(prefill_bootstrap_ports) != len(
+            prefill_urls
+        ):
+            raise ValueError(
+                f"prefill_bootstrap_ports length ({len(prefill_bootstrap_ports)}) "
+                f"must match prefill_urls length ({len(prefill_urls)})"
+            )
         self._launch(
             self._build_pd_config(
                 model_id=model_id,
                 tokenizer_path=tokenizer_path,
                 prefill_urls=prefill_urls,
                 decode_urls=decode_urls,
+                prefill_bootstrap_ports=prefill_bootstrap_ports,
                 policy=policy,
             ),
             timeout=timeout,
@@ -296,13 +316,20 @@ class Gateway:
         tokenizer_path: str,
         prefill_urls: list[str],
         decode_urls: list[str],
+        prefill_bootstrap_ports: list[int | None] | None,
         policy: str,
     ) -> str:
         entries = []
         for i, u in enumerate(prefill_urls):
-            entries.append(
-                f'[[workers]]\nid = "p{i}"\nurl = "{u}"\nmode = "prefill"\nmodel_ids = ["{model_id}"]'
+            entry = (
+                f'[[workers]]\nid = "p{i}"\nurl = "{u}"\nmode = "prefill"'
+                f'\nmodel_ids = ["{model_id}"]'
             )
+            if prefill_bootstrap_ports is not None:
+                bp = prefill_bootstrap_ports[i]
+                if bp is not None:
+                    entry += f"\nbootstrap_port = {bp}"
+            entries.append(entry)
         for i, u in enumerate(decode_urls):
             entries.append(
                 f'[[workers]]\nid = "d{i}"\nurl = "{u}"\nmode = "decode"\nmodel_ids = ["{model_id}"]'

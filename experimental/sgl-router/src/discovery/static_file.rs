@@ -38,6 +38,10 @@ struct StaticWorker {
     mode: WorkerMode,
     #[serde(default)]
     model_ids: Vec<String>,
+    /// SGLang `--disaggregation-bootstrap-port` for prefill workers.
+    /// Optional; absent for decode and plain workers.
+    #[serde(default)]
+    bootstrap_port: Option<u16>,
 }
 
 fn parse(content: &str) -> Result<HashMap<WorkerId, WorkerSpec>> {
@@ -52,7 +56,7 @@ fn parse(content: &str) -> Result<HashMap<WorkerId, WorkerSpec>> {
                 url: w.url,
                 mode: w.mode,
                 model_ids: w.model_ids.into_iter().map(ModelId).collect(),
-                bootstrap_port: None,
+                bootstrap_port: w.bootstrap_port,
             },
         );
     }

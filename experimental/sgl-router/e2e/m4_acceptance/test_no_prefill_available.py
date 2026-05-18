@@ -48,6 +48,7 @@ def test_no_prefill_workers_available_returns_503(
                     model_id=spec["model"],
                     tokenizer_path=spec["model"],
                     prefill_urls=[prefill.url],
+                    prefill_bootstrap_ports=[8998],
                     decode_urls=[decode.url],
                     timeout=120.0,
                 )
