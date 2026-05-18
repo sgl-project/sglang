@@ -15,7 +15,7 @@ from sglang.srt.kv_cache_canary.fingerprint import mix_step
 from sglang.srt.kv_cache_canary.host_state import CanaryHostState
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-py-1-gpu", disabled="host-only test")
+register_cuda_ci(est_time=10, suite="base-b-test-1-gpu-small")
 
 
 class TestCanaryHostState(unittest.TestCase):
