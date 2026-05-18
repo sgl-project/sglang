@@ -103,13 +103,28 @@ async fn main() -> Result<()> {
             .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
-        cfg.clone(),
-        tokenizers,
-        proxy,
-        registry,
-        policies,
-    ));
+    // M4: shared ActiveLoadRegistry + janitor task. The janitor reaps
+    // request entries whose lifetime exceeded `stale_request_timeout`,
+    // so a leaked guard (proxy task panic, etc.) does not inflate a
+    // worker's load forever.
+    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::with_defaults();
+    // Sweep cadence = 30 s (1 / 10 of the default 5-minute timeout) is
+    // a comfortable compromise between detection latency and noise.
+    let janitor_handle = sgl_router::policies::active_load::spawn_janitor(
+        Arc::clone(&active_load),
+        std::time::Duration::from_secs(30),
+    );
+
+    let ctx = Arc::new(
+        sgl_router::server::app_context::AppContext::with_active_load(
+            cfg.clone(),
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            active_load,
+        ),
+    );
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
@@ -125,9 +140,13 @@ async fn main() -> Result<()> {
     let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
     let server_result = serve.await.context("axum serve");
 
-    // Best-effort: cancel discovery + manager on shutdown.
+    // Best-effort: cancel discovery + manager + janitor on shutdown.
+    // The janitor handle's drop signals cancellation; we additionally
+    // await `shutdown` so the task joins cleanly before the process
+    // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    janitor_handle.shutdown().await;
     server_result
 }
 

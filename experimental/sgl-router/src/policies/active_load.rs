@@ -293,6 +293,75 @@ impl ActiveLoadRegistry {
     }
 }
 
+/// Spawn a background janitor task that periodically calls
+/// [`ActiveLoadRegistry::sweep_stale`].
+///
+/// Returns a [`JanitorHandle`] that owns the join handle and a cancellation
+/// token. Dropping the handle cancels the task; calling
+/// [`JanitorHandle::shutdown`] cancels and awaits the join.
+///
+/// `interval` is the wall-clock cadence of the sweep. A sensible default
+/// is half the configured `stale_request_timeout` so an expired entry is
+/// reaped within 1.5× the timeout in the worst case. Pass a fresh
+/// `Arc<ActiveLoadRegistry>` (cloned from the shared one held in
+/// `AppContext`).
+pub fn spawn_janitor(registry: Arc<ActiveLoadRegistry>, interval: Duration) -> JanitorHandle {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_for_task.cancelled() => {
+                    tracing::debug!("active-load janitor: shutdown requested");
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let n = registry.sweep_stale();
+                    if n > 0 {
+                        tracing::info!(
+                            swept = n,
+                            "active-load janitor: removed stale requests",
+                        );
+                    }
+                }
+            }
+        }
+    });
+    JanitorHandle {
+        cancel,
+        join: Some(join),
+    }
+}
+
+/// Owner handle for the background janitor task. Dropping the handle
+/// cancels the task; calling [`Self::shutdown`] cancels AND awaits join,
+/// giving callers a clean shutdown path.
+#[must_use = "JanitorHandle owns the background task; dropping it cancels the janitor"]
+pub struct JanitorHandle {
+    cancel: tokio_util::sync::CancellationToken,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl JanitorHandle {
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(j) = self.join.take() {
+            // 2 s ceiling guards against a runtime-teardown hang; the
+            // janitor exits within one tick of `cancelled()`.
+            let _ = tokio::time::timeout(Duration::from_secs(2), j).await;
+        }
+    }
+}
+
+impl Drop for JanitorHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// RAII guard returned by [`ActiveLoadRegistry::register`].
 ///
 /// `#[must_use]`: a statement-form `registry.register(...)` would drop the
@@ -471,6 +540,41 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert_eq!(registry.sweep_stale(), 0);
         assert_eq!(registry.prefill_load(&w), 50);
+    }
+
+    /// Spawned janitor sweeps stale entries on its periodic tick. Uses
+    /// real (short) sleeps so that the tokio interval timer fires; the
+    /// registry's clock is the real `SystemTimeClock` so both views of
+    /// "now" advance together. 200 ms total wait is comfortably above
+    /// the 30 ms timeout we configure.
+    #[tokio::test]
+    async fn spawn_janitor_sweeps_stale_entries() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemTimeClock);
+        let registry = ActiveLoadRegistry::new(clock, Duration::from_millis(30));
+        let w = WorkerId("w0".into());
+        let _g = registry.register(w.clone(), 50, 2);
+        assert_eq!(registry.inflight_count(), 1);
+
+        let handle = spawn_janitor(Arc::clone(&registry), Duration::from_millis(20));
+        // Wait long enough for at least one sweep to find the entry
+        // past the 30 ms timeout. 200 ms allows ~9 ticks of slack.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(registry.inflight_count(), 0, "janitor should have swept");
+        assert_eq!(registry.prefill_load(&w), 0);
+        assert_eq!(registry.decode_load(&w), 0);
+        handle.shutdown().await;
+    }
+
+    /// Shutdown is idempotent — calling `shutdown` once must cleanly
+    /// terminate the janitor without hanging.
+    #[tokio::test]
+    async fn spawn_janitor_shutdown_is_clean() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemTimeClock);
+        let registry = ActiveLoadRegistry::new(clock, Duration::from_secs(60));
+        let handle = spawn_janitor(Arc::clone(&registry), Duration::from_millis(100));
+        // Verify shutdown completes within a generous bound.
+        let r = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
+        assert!(r.is_ok(), "janitor shutdown timed out");
     }
 
     /// Concurrent stress: many guards on the same worker should leave the
