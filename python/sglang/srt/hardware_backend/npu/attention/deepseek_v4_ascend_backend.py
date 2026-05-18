@@ -283,9 +283,14 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
+        # iforgetmyname Talantan1102/sglang#1: clamp seqused_kv >= 1 so idle
+        # ranks (where actual_seq_lengths_kv may contain 0) don't trip
+        # sparse-attn metadata with a zero-length entry, which has bitten the
+        # NPU kernel in the dpattn + idle-rank workload.
+        seqused_kv_safe = fm.actual_seq_lengths_kv.clamp(min=1)
         common = {
             "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
-            "seqused_kv": fm.actual_seq_lengths_kv,
+            "seqused_kv": seqused_kv_safe,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,  # sliding window
             "cmp_mask_mode": 3,  # causal
