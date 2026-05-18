@@ -245,7 +245,7 @@ class CanaryRunner:
 
         Replay-side pre-fill calls this when there is no plan (e.g. the
         batch is degenerate / out_cache_loc is empty) so the recorded
-        canary kernel becomes a no-op for this replay rather than re-using
+        canary kernel becomes a no-op for this replay rather than reusing
         stale data from a prior forward.
         """
         self._launch.verify_mask.fill_(-1)
@@ -490,5 +490,3 @@ class CanaryRunner:
             f"actual_hash={int(actual_hash) & u64_mask:#x} "
             f"(total violations recorded: {write_index})"
         )
-
-

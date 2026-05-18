@@ -341,7 +341,9 @@ def run_tail(
     runner.end_of_forward()
 
 
-def launch_canary_for_capture(runner: Optional[CanaryRunner], *, kernel_kind: int) -> None:
+def launch_canary_for_capture(
+    runner: Optional[CanaryRunner], *, kernel_kind: int
+) -> None:
     """Capture-only kernel launch: record one kernel with skip-sentinel buffers.
 
     During ``CudaGraphRunner.capture``, the patched ``model.forward`` runs

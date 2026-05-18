@@ -66,9 +66,7 @@ def install_on_model_runner(
         return
 
     device = torch.device(model_runner.device)
-    launch_capacity = _compute_launch_capacity(
-        model_runner=model_runner, config=config
-    )
+    launch_capacity = _compute_launch_capacity(model_runner=model_runner, config=config)
     runner = attach(
         pool=pool,
         config=config,
