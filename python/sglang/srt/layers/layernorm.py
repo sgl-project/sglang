@@ -830,6 +830,9 @@ class Gemma4RMSNorm(MultiPlatformOp):
             out = out.reshape(original_shape)
         return out
 
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
