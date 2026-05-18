@@ -372,7 +372,7 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     )
 
     # Corrupt slot[0].prev_hash field (offset 24 bytes = field index 3).
-    buf_view = buf.view(torch.int64).view(-1, CANARY_SLOT_BYTES // 8)
+    buf_view = buf.view(torch.int64)
     buf_view[0, 3] = torch.tensor(
         to_signed_int64(0xDEADBEEFDEADBEEF), dtype=torch.int64, device="cuda"
     )
