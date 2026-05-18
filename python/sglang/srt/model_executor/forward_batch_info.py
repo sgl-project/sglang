@@ -816,6 +816,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
+        seq_lens_list = self.seq_lens_cpu.tolist()
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
@@ -826,12 +827,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
-                        self.seq_lens_cpu[batch_idx] - 1,
+                        seq_lens_list[batch_idx] - 1,
                         dtype=torch.int64,
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens_cpu[batch_idx]
+                        mm_input, seq_lens_list[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend(include_draft_extend_v2=True):
@@ -863,7 +864,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                     if mrope_positions.numel() == 0:
                         mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens_cpu[batch_idx]
+                            mm_input, seq_lens_list[batch_idx]
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 
