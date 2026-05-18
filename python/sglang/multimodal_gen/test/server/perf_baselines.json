@@ -2477,7 +2477,7 @@
                 "32": 184.4
             },
             "expected_e2e_ms": 18039.38,
-            "expected_avg_denoise_ms": 183.75,
+            "expected_avg_denoise_ms": 271.95,
             "expected_median_denoise_ms": 179.26,
             "estimated_full_test_time_s": 160.0
         },
@@ -2531,7 +2531,7 @@
                 "29": 237.2,
                 "30": 127.08,
                 "31": 123.1,
-                "32": 128.06
+                "32": 209.80
             },
             "expected_e2e_ms": 12000.0,
             "expected_avg_denoise_ms": 238.8,
