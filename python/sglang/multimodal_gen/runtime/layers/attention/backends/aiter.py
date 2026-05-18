@@ -205,7 +205,6 @@ def _mla_prefill_ps_attention(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
-    return_softmax_lse: bool,
 ) -> torch.Tensor:
     """
     Run mla_prefill_ps_asm_fwd + mla_reduce_v1 on 4D batch tensors.
@@ -298,11 +297,7 @@ def _mla_prefill_ps_attention(
         output,
         final_lse,
     )
-    output = output.view(B, S_q, H, D_v)
-    if return_softmax_lse:
-        return output, final_lse
-    else:   
-        return output
+    return output.view(B, S_q, H, D_v)
 
 
 class AITerImpl(AttentionImpl):
@@ -362,7 +357,7 @@ class AITerImpl(AttentionImpl):
                 one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
                 q_scale = k_scale = v_scale = one
 
-            if _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2]):
+            if _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2]) and not return_softmax_lse:
                 return _mla_prefill_ps_attention(
                     q_fp8,
                     k_fp8,
@@ -372,12 +367,11 @@ class AITerImpl(AttentionImpl):
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
-                    return_lse=return_softmax_lse,
                 )
 
             logger.warning_once(
                 "FP8 MLA prefill kernel unsupported "
-                "(need gfx950, v_head_dim=%d, num_heads divisible by %d; "
+                "(need gfx950, no return_lse, v_head_dim=%d, num_heads divisible by %d; "
                 "got v_head_dim=%d, num_heads=%d). Falling back to BF16.",
                 _MLA_PREFILL_V_HEAD_DIM,
                 _MLA_PREFILL_HEAD_TILE,
