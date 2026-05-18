@@ -143,8 +143,13 @@ class TritonLoRABackend(BaseLoRABackend):
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
-        max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        # decode-shape upper bound (bs * 1 token per seq)
+        decode_max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        # PCG token bucket upper bound (e.g. piecewise_cuda_graph_tokens max)
+        # so the same pinned buffer survives prefill capture/replay as well.
+        max_tokens = max(decode_max_tokens, max_num_tokens_pcg or 0)
         mlpb = self.max_loras_per_batch
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
@@ -155,7 +160,7 @@ class TritonLoRABackend(BaseLoRABackend):
                     (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
                 ),
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=num_tokens_per_bs,
+                max_len=max_tokens,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
                 scalings=torch.zeros(mlpb, dtype=torch.float),

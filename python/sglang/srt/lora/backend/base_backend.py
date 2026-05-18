@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -146,6 +146,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -154,6 +155,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         Args:
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
             num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+            max_num_tokens_pcg: PCG token bucket upper bound (= max(server_args.piecewise_cuda_graph_tokens))
+                                so prefill graph capture/replay can share the same pinned buffers.
+                                Pass None when PCG is disabled. Each backend may use this to
+                                widen its capture-time buffer allocations.
         """
         pass
 

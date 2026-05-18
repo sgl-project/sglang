@@ -661,9 +661,19 @@ class CudaGraphRunner:
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
+            # Pass PCG token upper bound so the same pinned buffers can also be
+            # reused for prefill piecewise capture/replay (Phase 1: triton backend).
+            pcg_tokens = self.model_runner.server_args.piecewise_cuda_graph_tokens
+            max_num_tokens_pcg = (
+                max(pcg_tokens)
+                if pcg_tokens
+                and not self.model_runner.server_args.disable_piecewise_cuda_graph
+                else None
+            )
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
+                max_num_tokens_pcg=max_num_tokens_pcg,
             )
 
         enable_mamba_track = (
