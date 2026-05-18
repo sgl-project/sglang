@@ -2926,7 +2926,21 @@ class Scheduler(
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
+            # Spec V1 decode returns verify_output.accept_tokens (flat
+            # shape (sum_accept,) > bs); SB.output_ids must hold (bs,)
+            # for merge_batch / filter_batch / assert_lockstep to stay
+            # consistent. Spec V1 doesn't consume SB.output_ids
+            # downstream (worker's spec_info carries the state and
+            # process_batch_result_decode reads batch_result.next_token_ids),
+            # so skip the assignment.
+            if (
+                not self.spec_algorithm.is_none()
+                and not batch.is_spec_v2
+                and batch.forward_mode.is_decode()
+            ):
+                batch.output_ids = None
+            else:
+                batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
