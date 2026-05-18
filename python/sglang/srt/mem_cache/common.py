@@ -464,12 +464,17 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
+        # Channel-resolved reads: when SB has a Relayer ctx, fetch
+        # ``seq_lens`` / ``seq_lens_cpu`` from the gpu_scalar channel slot so
+        # the value reflects the post-decode store (with cross-stream sync
+        # built in via the channel's cuda event wait) rather than the live
+        # SB attribute.
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens=batch.relayer_resolve_seq_lens(),
+            seq_lens_cpu=batch.relayer_resolve_seq_lens_cpu(),
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
