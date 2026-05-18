@@ -248,6 +248,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+ENABLE_LORA: Optional[bool] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -262,6 +263,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
+    global ENABLE_LORA
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -284,6 +286,7 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    ENABLE_LORA = server_args.enable_lora
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -388,9 +391,14 @@ def filter_moe_weight_param_global_expert(name, x, num_local_experts):
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
+
+    Disabled for LoRA because the current Cutlass FP4 LoRA runner expects
+    bf16/float16 hidden states and local LoRA routing metadata, not the
+    dispatcher's pre-packed all-gathered FP4 payload.
     """
     return (
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        and not ENABLE_LORA
         and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
