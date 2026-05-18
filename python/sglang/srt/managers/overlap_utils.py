@@ -314,15 +314,26 @@ class Relayer:
         return self._gpu_allocator.is_empty(s)
 
     def resolve_future(self, batch: ScheduleBatch):
-        """Forward-entry resolve: rewrite non-spec input_ids in-place from
-        the gpu_scalar token_ids slot. Spec V2 draft input is resolved at
-        scheduler-side ``_apply_spec_v2_relay_outputs`` via
-        ``resolve_draft_input_from_channel``.
+        """Forward-entry resolve.
+
+        Non-spec: rewrite ``batch.input_ids`` in-place from the gpu_scalar
+        token_ids slot.
+
+        Spec V2: re-resolve ``batch.spec_info`` tensor fields from channel
+        via current ``future_indices.indices``. This restores the invariant
+        that bonus_tokens / topk_p / topk_index / hidden_states / new_seq_lens
+        shape matches future_indices.indices shape. Cached views can drift
+        when ``running_batch`` accumulates merge/filter ops across iters
+        where it isn't the forwarded batch (so the end-of-iter
+        ``_apply_spec_v2_relay_outputs`` on that batch never runs on
+        running_batch's spec_info).
         """
         if self.spec_algo.is_none():
             _resolve_future_token_ids(
                 batch.input_ids, self.gpu_scalar.buffer("token_ids")
             )
+        elif self.spec_algo.supports_spec_v2():
+            self.resolve_draft_input_from_channel(batch.spec_info)
 
     def resolve_draft_input_from_channel(self, draft_input: "EagleDraftInput"):
         """Rebind a spec V2 draft input's tensor fields to gpu_scalar slot
