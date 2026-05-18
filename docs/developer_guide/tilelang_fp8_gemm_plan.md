@@ -91,6 +91,7 @@ The wrapper should expose a small API:
 - `update_tilelang_config(gpu_id, server_args) -> None`
 - `gemm_nt_f8f8bf16(lhs, rhs, out) -> None`
 - `warmup_or_autotune_shapes(shapes) -> None`
+- `autotune_shape(M, N, K, ...) -> dict`
 - `load_selected_configs(path) -> None`
 - `export_selected_configs(path) -> None`
 - `get_kernel_info(M, N, K) -> dict`
@@ -127,6 +128,11 @@ Selected configs for reproducible benchmark or CI runs can be loaded with
 `SGLANG_TILELANG_GEMM_CONFIG_PATH=/path/to/config.json` or by calling
 `tilelang_gemm_wrapper.load_selected_configs(path)`. The path may point to the
 new exported JSON format or to a directory of legacy per-shape JSON files.
+
+Autotuning can be enabled explicitly in tooling, or with
+`SGLANG_TILELANG_GEMM_AUTOTUNE=1` for precompile paths. The default profiling
+backend is `SGLANG_TILELANG_GEMM_AUTOTUNE_BACKEND=cudagraph`; this keeps
+small-`M` measurements aligned with decode-time CUDA graph execution.
 
 ### Autotuning And Cache
 
@@ -191,6 +197,8 @@ allowed for `--fp8-gemm-backend tilelang`.
 - Replace fixed tuning configs with TileLang autotuning.
 - Add config-space generation and selected-config loading for base, swapAB,
   split-K, and split-K swapAB variants.
+- Add a TileLang profiler based tuning path with CUDA graph timing for
+  small-`M` shapes.
 - Add precompile/autotune hooks and cache-key strategy.
 - Add developer documentation for tuning and cache behavior.
 - Add best-config export support for reproducible CI benchmarks.

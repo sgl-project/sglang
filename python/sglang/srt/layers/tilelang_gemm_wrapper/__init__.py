@@ -7,6 +7,8 @@ from sglang.srt.layers.tilelang_gemm_wrapper.configurer import (
     is_available,
 )
 from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
+    autotune_shape,
+    autotune_shapes,
     clear_cache,
     export_selected_configs,
     get_candidate_configs,
@@ -21,6 +23,8 @@ from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
 __all__ = [
     "TILELANG_MIN_VERSION",
     "assert_available",
+    "autotune_shape",
+    "autotune_shapes",
     "clear_cache",
     "export_selected_configs",
     "get_candidate_configs",

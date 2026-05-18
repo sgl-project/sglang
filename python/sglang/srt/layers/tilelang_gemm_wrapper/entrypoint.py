@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional, Tuple
 
 import torch
 
@@ -28,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 _M_MAX = 1024 * 16
 _DO_COMPILE = True
-_SELECTED_CONFIGS: Dict[Tuple[int, int, int, str], dict] = {}
+_SELECTED_CONFIGS: Dict[Tuple[int, int, int], dict] = {}
 _PARTIAL_BUFFER_CACHE: Dict[Tuple[str, int, int, int, str, str], torch.Tensor] = {}
 _CONFIG_STORE = SelectedConfigStore()
 _CONFIG_PATH_LOADED: Optional[str] = None
+_AUTOTUNE_BACKENDS = ("event", "cupti", "cudagraph")
+_AUTOTUNE_BACKEND = Literal["event", "cupti", "cudagraph"]
 
 
 def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
@@ -196,7 +198,7 @@ def _compile_from_config(config: dict):
 
 
 def _record_selected_config(config: dict) -> None:
-    key = (config["M"], config["N"], config["K"], config["kernel_type"])
+    key = (config["M"], config["N"], config["K"])
     _SELECTED_CONFIGS[key] = dict(config)
 
 
@@ -216,6 +218,213 @@ def _get_partial_buffer(
             (split_k, M, N), device=device, dtype=torch_dtype
         )
     return _PARTIAL_BUFFER_CACHE[key]
+
+
+def _ceildiv(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _validate_autotune_backend(backend: str) -> _AUTOTUNE_BACKEND:
+    if backend not in _AUTOTUNE_BACKENDS:
+        raise ValueError(
+            "TileLang FP8 GEMM autotune backend must be one of "
+            f"{_AUTOTUNE_BACKENDS}, got {backend}."
+        )
+    return backend  # type: ignore[return-value]
+
+
+def _make_autotune_inputs(M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
+    A_fp8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device="cuda")
+    A_scale = torch.ones(
+        (M, _ceildiv(K, 128)),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    B_fp8 = torch.empty((N, K), dtype=torch.float8_e4m3fn, device="cuda")
+    B_scale = torch.ones(
+        (_ceildiv(N, 128), _ceildiv(K, 128)),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    out = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    return A_fp8, A_scale, B_fp8, B_scale, out
+
+
+def _kernel_args_from_inputs(
+    config: dict,
+    inputs: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    A_fp8, A_scale, B_fp8, B_scale, out = inputs
+    kernel_type = config["kernel_type"]
+
+    if kernel_type in SPLIT_K_KERNEL_TYPES:
+        partial = _get_partial_buffer(
+            kernel_type,
+            config["split_k"],
+            config["M"],
+            config["N"],
+            out.device,
+            config["accum_dtype"],
+        )
+        if kernel_type in SWAP_AB_KERNEL_TYPES:
+            return B_fp8, B_scale, A_fp8, A_scale, partial, out
+        return A_fp8, A_scale, B_fp8, B_scale, partial, out
+
+    if kernel_type in SWAP_AB_KERNEL_TYPES:
+        return B_fp8, B_scale, A_fp8, A_scale, out
+
+    return A_fp8, A_scale, B_fp8, B_scale, out
+
+
+def _benchmark_config_with_tilelang_profiler(
+    config: dict,
+    inputs: tuple[torch.Tensor, ...],
+    *,
+    warmup: int,
+    rep: int,
+    backend: _AUTOTUNE_BACKEND,
+) -> float:
+    kernel = _compile_from_config(config)
+    kernel_args = _kernel_args_from_inputs(config, inputs)
+    profiler = kernel.get_profiler()
+    latency = profiler.do_bench(
+        warmup=warmup,
+        rep=rep,
+        input_tensors=list(kernel_args),
+        backend=backend,
+        return_mode="mean",
+    )
+    return float(latency)
+
+
+def autotune_shape(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    warmup: int = 25,
+    rep: int = 100,
+    backend: str = "cudagraph",
+    kernel_types: Optional[Iterable[str]] = None,
+    max_configs: Optional[int] = None,
+) -> dict:
+    """Tune one concrete shape with TileLang's profiler.
+
+    TileLang 0.1.9 exposes a CUDA graph profiler backend. Use it by default so
+    small-M decode shapes are measured with the same semantics that motivated
+    the historical custom tuner.
+    """
+
+    assert_available()
+
+    profile_backend = _validate_autotune_backend(backend)
+    candidates = generate_candidate_configs(M, N, K, kernel_types)
+    if max_configs is not None and max_configs > 0:
+        candidates = candidates[:max_configs]
+    if not candidates:
+        raise RuntimeError(
+            f"No TileLang FP8 GEMM autotune candidates for M={M}, N={N}, K={K}."
+        )
+
+    logger.info(
+        "Autotuning TileLang FP8 GEMM shape M=%s, N=%s, K=%s with %s configs "
+        "using %s profiler backend",
+        M,
+        N,
+        K,
+        len(candidates),
+        profile_backend,
+    )
+
+    inputs = _make_autotune_inputs(M, N, K)
+    best_config: Optional[dict] = None
+    best_latency_ms = float("inf")
+
+    for idx, config in enumerate(candidates):
+        _validate_config(config)
+        try:
+            latency_ms = _benchmark_config_with_tilelang_profiler(
+                config,
+                inputs,
+                warmup=warmup,
+                rep=rep,
+                backend=profile_backend,
+            )
+        except Exception:
+            logger.debug(
+                "TileLang FP8 GEMM autotune config failed at index %s: %s",
+                idx,
+                config,
+                exc_info=True,
+            )
+            continue
+
+        if latency_ms < best_latency_ms:
+            best_latency_ms = latency_ms
+            best_config = dict(config)
+            logger.debug(
+                "TileLang FP8 GEMM best latency so far: %.6f ms with %s",
+                best_latency_ms,
+                best_config,
+            )
+
+    if best_config is None:
+        raise RuntimeError(
+            f"TileLang FP8 GEMM autotune failed for M={M}, N={N}, K={K}; "
+            "no candidate compiled and profiled successfully."
+        )
+
+    best_config.update(
+        {
+            "tuned_latency_ms": best_latency_ms,
+            "tuned_profiler_backend": profile_backend,
+            "tuned_warmup": warmup,
+            "tuned_rep": rep,
+        }
+    )
+    _CONFIG_STORE.add(best_config)
+    _record_selected_config(best_config)
+
+    logger.info(
+        "Selected TileLang FP8 GEMM config for M=%s, N=%s, K=%s: %.6f ms, %s",
+        M,
+        N,
+        K,
+        best_latency_ms,
+        best_config,
+    )
+    return dict(best_config)
+
+
+def autotune_shapes(
+    shapes: Iterable[Tuple[int, int, int]],
+    *,
+    warmup: int = 25,
+    rep: int = 100,
+    backend: str = "cudagraph",
+    kernel_types: Optional[Iterable[str]] = None,
+    max_configs: Optional[int] = None,
+) -> list[dict]:
+    """Tune concrete (M, N, K) shapes and return selected configs."""
+
+    if not _DO_COMPILE:
+        return []
+
+    selected = []
+    for M, N, K in shapes:
+        selected.append(
+            autotune_shape(
+                M,
+                N,
+                K,
+                warmup=warmup,
+                rep=rep,
+                backend=backend,
+                kernel_types=kernel_types,
+                max_configs=max_configs,
+            )
+        )
+    return selected
 
 
 def gemm_nt_f8f8bf16(
@@ -258,17 +467,46 @@ def gemm_nt_f8f8bf16(
         kernel(A_fp8, A_scale, B_fp8, B_scale, out)
 
 
-def warmup_or_autotune_shapes(shapes: Iterable[Tuple[int, int, int]]) -> None:
+def warmup_or_autotune_shapes(
+    shapes: Iterable[Tuple[int, int, int]],
+    *,
+    autotune: Optional[bool] = None,
+    warmup: int = 25,
+    rep: int = 100,
+    backend: Optional[str] = None,
+    kernel_types: Optional[Iterable[str]] = None,
+    max_configs: Optional[int] = None,
+) -> None:
     """Compile kernels for concrete (M, N, K) shapes on the compile rank.
 
-    The default config is conservative, but this entrypoint compiles through the
-    same config dispatch path used at runtime.
+    The default path compiles selected configs. If autotune is enabled, the
+    shape is tuned first with TileLang's profiler and the selected config is
+    retained for later export.
     """
 
     if not _DO_COMPILE:
         return
 
     assert_available()
+    if autotune is None:
+        autotune = envs.SGLANG_TILELANG_GEMM_AUTOTUNE.get()
+    if backend is None:
+        backend = envs.SGLANG_TILELANG_GEMM_AUTOTUNE_BACKEND.get()
+    if max_configs is None:
+        env_max_configs = envs.SGLANG_TILELANG_GEMM_AUTOTUNE_MAX_CONFIGS.get()
+        max_configs = env_max_configs if env_max_configs > 0 else None
+
+    if autotune:
+        autotune_shapes(
+            shapes,
+            warmup=warmup,
+            rep=rep,
+            backend=backend,
+            kernel_types=kernel_types,
+            max_configs=max_configs,
+        )
+        return
+
     for M, N, K in shapes:
         config = _select_config(M, N, K)
         _validate_config(config)

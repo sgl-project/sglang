@@ -10,11 +10,29 @@ from typing import Iterable, List
 import torch
 import triton
 
+from sglang.srt.layers.tilelang_gemm_wrapper.configs import KERNEL_TYPES
+
 logger = logging.getLogger(__name__)
 
 
 def _tflops(M: int, N: int, K: int, latency_ms: float) -> float:
     return 2.0 * M * N * K / latency_ms / 1e9
+
+
+def _do_bench(fn, rep: int, backend: str) -> float:
+    quantiles = [0.5, 0.2, 0.8]
+    if backend == "cudagraph":
+        result = triton.testing.do_bench_cudagraph(
+            fn, rep=rep, quantiles=quantiles
+        )
+    elif backend == "event":
+        result = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
+    else:
+        raise ValueError(f"Unsupported benchmark backend: {backend}")
+
+    if isinstance(result, (list, tuple)):
+        return float(result[0])
+    return float(result)
 
 
 def _per_block_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -51,9 +69,28 @@ def _benchmark_one(
     N: int,
     K: int,
     rep: int,
+    bench_backend: str,
     skip_baseline: bool,
+    autotune: bool,
+    autotune_backend: str,
+    autotune_warmup: int,
+    autotune_rep: int,
+    autotune_max_configs: int | None,
+    kernel_types: list[str] | None,
 ) -> dict:
     from sglang.srt.layers import tilelang_gemm_wrapper
+
+    if autotune:
+        tilelang_gemm_wrapper.autotune_shape(
+            M,
+            N,
+            K,
+            warmup=autotune_warmup,
+            rep=autotune_rep,
+            backend=autotune_backend,
+            max_configs=autotune_max_configs,
+            kernel_types=kernel_types,
+        )
 
     A_fp8, A_scale, B_fp8, B_scale = _prepare_data(M, N, K)
     C_tl = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
@@ -63,9 +100,7 @@ def _benchmark_one(
     def tilelang_run():
         tilelang_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C_tl)
 
-    tl_ms, _, _ = triton.testing.do_bench(
-        tilelang_run, rep=rep, quantiles=[0.5, 0.2, 0.8]
-    )
+    tl_ms = _do_bench(tilelang_run, rep=rep, backend=bench_backend)
     kernel_info = tilelang_gemm_wrapper.get_kernel_info(M, N, K)
 
     result = {
@@ -96,9 +131,7 @@ def _benchmark_one(
             A_fp8, B_fp8, A_scale, B_scale, [128, 128], output_dtype=torch.bfloat16
         )
 
-    baseline_ms, _, _ = triton.testing.do_bench(
-        triton_run, rep=rep, quantiles=[0.5, 0.2, 0.8]
-    )
+    baseline_ms = _do_bench(triton_run, rep=rep, backend=bench_backend)
     max_diff = (C_tl - C_ref).abs().max().item()
     result.update(
         {
@@ -135,12 +168,43 @@ def _parse_shape_values(values: Iterable[str]) -> list[tuple[int, int]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", action="append", required=True, help="N,K shape")
-    parser.add_argument("--m-values", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024])
+    parser.add_argument(
+        "--m-values",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    )
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--config-path", help="Selected-config JSON file or directory")
     parser.add_argument("--export-config-path", help="Export selected configs after benchmark")
     parser.add_argument("--output", "-o", help="CSV output path")
+    parser.add_argument(
+        "--bench-backend",
+        default="cudagraph",
+        choices=("event", "cudagraph"),
+        help="Timing backend for final TileLang/Triton benchmark measurements",
+    )
     parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Tune candidate configs before measuring each shape",
+    )
+    parser.add_argument(
+        "--autotune-backend",
+        default="cudagraph",
+        choices=("event", "cupti", "cudagraph"),
+        help="TileLang profiler backend to use while autotuning",
+    )
+    parser.add_argument("--autotune-warmup", type=int, default=25)
+    parser.add_argument("--autotune-rep", type=int, default=100)
+    parser.add_argument("--autotune-max-configs", type=int)
+    parser.add_argument(
+        "--kernel-type",
+        action="append",
+        choices=KERNEL_TYPES,
+        help="Restrict autotuning to one or more kernel families",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -158,7 +222,20 @@ def main() -> None:
     for N, K in _parse_shape_values(args.shape):
         for M in args.m_values:
             logger.info("Benchmarking M=%s, N=%s, K=%s", M, N, K)
-            row = _benchmark_one(M, N, K, args.rep, args.skip_baseline)
+            row = _benchmark_one(
+                M,
+                N,
+                K,
+                args.rep,
+                args.bench_backend,
+                args.skip_baseline,
+                args.autotune,
+                args.autotune_backend,
+                args.autotune_warmup,
+                args.autotune_rep,
+                args.autotune_max_configs,
+                args.kernel_type,
+            )
             rows.append(row)
             logger.info("%s", row)
 

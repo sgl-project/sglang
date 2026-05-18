@@ -11,7 +11,10 @@ import logging
 import sys
 from typing import Iterable, Set, Tuple
 
-from sglang.srt.layers.tilelang_gemm_wrapper.configs import DEFAULT_M_VALUES
+from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    DEFAULT_M_VALUES,
+    KERNEL_TYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,12 @@ def warmup_tilelang_shapes(
     m_values: Iterable[int],
     config_path: str | None = None,
     export_config_path: str | None = None,
+    autotune: bool = False,
+    autotune_backend: str = "cudagraph",
+    autotune_warmup: int = 25,
+    autotune_rep: int = 100,
+    autotune_max_configs: int | None = None,
+    kernel_types: Iterable[str] | None = None,
 ) -> None:
     from sglang.srt.layers import tilelang_gemm_wrapper
 
@@ -77,8 +86,17 @@ def warmup_tilelang_shapes(
     if not shapes:
         raise RuntimeError("No TileLang GEMM shapes to warm up.")
 
-    logger.info("Warming %s TileLang FP8 GEMM shapes", len(shapes))
-    tilelang_gemm_wrapper.warmup_or_autotune_shapes(shapes)
+    action = "Autotuning" if autotune else "Warming"
+    logger.info("%s %s TileLang FP8 GEMM shapes", action, len(shapes))
+    tilelang_gemm_wrapper.warmup_or_autotune_shapes(
+        shapes,
+        autotune=autotune,
+        warmup=autotune_warmup,
+        rep=autotune_rep,
+        backend=autotune_backend,
+        max_configs=autotune_max_configs,
+        kernel_types=kernel_types,
+    )
 
     if export_config_path:
         tilelang_gemm_wrapper.export_selected_configs(export_config_path)
@@ -106,6 +124,40 @@ def main() -> None:
     parser.add_argument(
         "--export-config-path",
         help="Optional path to export selected configs after warmup",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Tune candidate configs instead of only compiling selected configs",
+    )
+    parser.add_argument(
+        "--autotune-backend",
+        default="cudagraph",
+        choices=("event", "cupti", "cudagraph"),
+        help="TileLang profiler backend to use while autotuning",
+    )
+    parser.add_argument(
+        "--autotune-warmup",
+        type=int,
+        default=25,
+        help="Warmup value passed to TileLang profiler during autotuning",
+    )
+    parser.add_argument(
+        "--autotune-rep",
+        type=int,
+        default=100,
+        help="Repetition count passed to TileLang profiler during autotuning",
+    )
+    parser.add_argument(
+        "--autotune-max-configs",
+        type=int,
+        help="Optional cap on candidate configs per shape for smoke runs",
+    )
+    parser.add_argument(
+        "--kernel-type",
+        action="append",
+        choices=KERNEL_TYPES,
+        help="Restrict autotuning to one or more kernel families",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -135,6 +187,12 @@ def main() -> None:
         args.m_values,
         config_path=args.config_path,
         export_config_path=args.export_config_path,
+        autotune=args.autotune,
+        autotune_backend=args.autotune_backend,
+        autotune_warmup=args.autotune_warmup,
+        autotune_rep=args.autotune_rep,
+        autotune_max_configs=args.autotune_max_configs,
+        kernel_types=args.kernel_type,
     )
 
 
