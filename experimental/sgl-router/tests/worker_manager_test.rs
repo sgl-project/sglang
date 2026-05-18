@@ -55,12 +55,20 @@ async fn manager_processes_added_then_removed() {
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    tx.send(DiscoveryEvent::Added(spec_for("w1", &url_a, WorkerMode::Plain)))
-        .await
-        .unwrap();
-    tx.send(DiscoveryEvent::Added(spec_for("w2", &url_b, WorkerMode::Plain)))
-        .await
-        .unwrap();
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url_a,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w2",
+        &url_b,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
 
     // Give the manager time to drain.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -86,9 +94,13 @@ async fn manager_handles_mode_changed() {
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    tx.send(DiscoveryEvent::Added(spec_for("w1", &url, WorkerMode::Prefill)))
-        .await
-        .unwrap();
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Prefill,
+    )))
+    .await
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         registry

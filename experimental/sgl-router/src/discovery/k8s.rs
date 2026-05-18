@@ -51,8 +51,8 @@ fn classify_mode(es: &EndpointSlice, mode: &K8sDiscoveryMode) -> Option<WorkerMo
 ///
 /// Supports the equality-based subset of the K8s label-selector grammar:
 /// `key=value` (and the alias `key==value`). Set-based operators (`in`,
-/// `notin`, presence tests) are not supported — fall back to the server-
-/// side selector in plain mode if you need them.
+/// `not in`, presence tests) are not supported — fall back to the
+/// server-side selector in plain mode if you need them.
 fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> bool {
     for term in selector.split(',') {
         let term = term.trim();
@@ -219,11 +219,8 @@ async fn emit_diff(
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
-async fn process_events<S>(
-    mut stream: S,
-    tx: mpsc::Sender<DiscoveryEvent>,
-    mode: K8sDiscoveryMode,
-) where
+async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
+where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
     let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
