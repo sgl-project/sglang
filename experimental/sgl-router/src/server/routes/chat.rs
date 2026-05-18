@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::ModelId;
+use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -59,23 +60,37 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
-    let workers = ctx.registry.healthy_workers_for(&model_id);
-    if workers.is_empty() {
-        return Err(ApiError::NoHealthyWorkers {
-            model: model_str.clone(),
-        });
-    }
+    // PD pool isolation: for PD-mode deployments, prefill traffic
+    // selects from the prefill pool only. Plain-mode deployments fall
+    // through to the full candidate set. Partial-failure errors
+    // (`no_prefill_workers_available`) are surfaced as 503 with a
+    // distinct error code so operators can alert independently.
+    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+    let workers = resolver
+        .prefill_candidates(&model_id)
+        .map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
 
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
     let selection_ctx = SelectionContext::new(&model_id, Some(&body));
-    let worker = policy
-        .select(&workers, &selection_ctx)
-        .ok_or_else(|| ApiError::PolicySelectionFailed {
-            model: model_str.clone(),
-        })?;
+    let worker =
+        policy
+            .select(&workers, &selection_ctx)
+            .ok_or_else(|| ApiError::PolicySelectionFailed {
+                model: model_str.clone(),
+            })?;
 
     let guard = worker.load_guard();
 

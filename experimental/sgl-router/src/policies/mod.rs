@@ -7,6 +7,7 @@ pub mod factory;
 pub mod kv_events;
 pub mod power_of_two;
 pub mod random;
+pub mod registry;
 pub mod round_robin;
 
 use crate::discovery::ModelId;
