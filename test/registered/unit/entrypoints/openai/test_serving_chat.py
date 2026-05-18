@@ -152,7 +152,9 @@ class ServingChatTestCase(unittest.TestCase):
             toggle_param="thinking", default_enabled=True
         )
         self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
 
         req = ChatCompletionRequest(
             model="x",
@@ -192,7 +194,9 @@ class ServingChatTestCase(unittest.TestCase):
             toggle_param="thinking", default_enabled=True
         )
         self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
 
         req = ChatCompletionRequest(
             model="x",
@@ -227,6 +231,77 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
+
+    def test_kimi_tool_call_disables_template_default_thinking(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat.reasoning_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"a": {"type": "integer"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertFalse(kwargs["thinking"])
+
+    def test_kimi_tool_call_keeps_explicit_template_thinking(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat.reasoning_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"a": {"type": "integer"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+            chat_template_kwargs={"thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertTrue(kwargs["thinking"])
 
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
@@ -314,7 +389,9 @@ class ServingChatTestCase(unittest.TestCase):
             toggle_param="thinking", default_enabled=True
         )
         self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
 
         req = ChatCompletionRequest(

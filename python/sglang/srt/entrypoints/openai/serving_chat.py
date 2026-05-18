@@ -467,6 +467,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
+        if self._should_skip_default_kimi_reasoning_for_tool_call(request):
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs.setdefault("thinking", False)
+
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
@@ -1535,7 +1540,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest
     ) -> bool:
         if (
-            self.reasoning_parser != "kimi_k2"
+            self.tool_call_parser != "kimi_k2"
             or not request.tools
             or request.tool_choice == "none"
         ):

@@ -1,11 +1,14 @@
-import copy
 import json
 import logging
 import re
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.base_format_detector import (
+    BaseFormatDetector,
+    StructuralTag,
+    get_model_structural_tag,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -23,6 +26,8 @@ _KIMI_K2_SPECIAL_TOKENS = [
     "<|tool_call_end|>",
     "<|tool_call_argument_begin|>",
 ]
+
+_KIMI_LOOSE_OBJECT_SCHEMA = {"type": "object"}
 
 
 def _strip_special_tokens(text: str) -> str:
@@ -339,84 +344,36 @@ class KimiK2Detector(BaseFormatDetector):
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
-    ) -> Optional["StructuralTag"]:
+    ) -> Optional[StructuralTag]:
         if not (
-            tools
-            and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
+            tools and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
         ):
             return super().get_structural_tag(
                 tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
             )
-
-        try:
-            from xgrammar import StructuralTag
-            from xgrammar.structural_tag import (
-                ConstStringFormat,
-                JSONSchemaFormat,
-                SequenceFormat,
-                TagFormat,
-                TagsWithSeparatorFormat,
-            )
-        except ImportError:
+        if get_model_structural_tag is None:
             return None
 
-        if isinstance(tool_choice, ToolChoice):
-            selected_tools = [
-                tool
-                for tool in tools
-                if tool.function.name == tool_choice.function.name
-            ]
-        else:
-            selected_tools = tools
+        converted_tools = []
+        for tool in tools:
+            converted_tool = tool.model_dump()
+            function = converted_tool["function"]
+            if not function.get("strict", False):
+                function["strict"] = True
+                function["parameters"] = _KIMI_LOOSE_OBJECT_SCHEMA
+            converted_tools.append(converted_tool)
 
-        tags = []
-        for tool in selected_tools:
-            function = tool.function
-            if function.name is None:
-                continue
-            schema = self._get_xgrammar_schema(function.parameters, function.strict)
-            tags.append(
-                TagFormat(
-                    begin=(
-                        "<|tool_call_begin|>"
-                        f"functions.{function.name}:0"
-                        "<|tool_call_argument_begin|>"
-                    ),
-                    content=JSONSchemaFormat(json_schema=schema, style="json"),
-                    end="<|tool_call_end|>",
-                )
-            )
-
-        if not tags:
-            return None
-
-        return StructuralTag(
-            format=SequenceFormat(
-                elements=[
-                    ConstStringFormat(value="<|tool_calls_section_begin|>"),
-                    TagsWithSeparatorFormat(
-                        tags=tags,
-                        separator="",
-                        at_least_one=True,
-                        stop_after_first=True,
-                    ),
-                    ConstStringFormat(value="<|tool_calls_section_end|>"),
-                ]
-            )
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model="kimi",
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
         )
 
     def get_structural_tag_name(self) -> str:
         return "kimi"
-
-    @staticmethod
-    def _get_xgrammar_schema(parameters, strict: bool):
-        schema = copy.deepcopy(parameters or {"type": "object"})
-        if (
-            strict
-            and isinstance(schema, dict)
-            and schema.get("type") == "object"
-            and "properties" in schema
-            and "additionalProperties" not in schema
-        ):
-            schema["additionalProperties"] = False
-        return schema

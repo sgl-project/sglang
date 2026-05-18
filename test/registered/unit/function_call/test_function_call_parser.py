@@ -4782,17 +4782,19 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("required")
         serialized = self._constraint_json(result)
         self.assertIn("<|tool_calls_section_begin|>", serialized)
-        self.assertIn("functions.get_weather:0", serialized)
+        self.assertIn("functions.get_weather:", serialized)
+        self.assertIn('"pattern":"\\\\d+"', serialized)
         self.assertIn("<|tool_call_end|>", serialized)
         self.assertIn("<|tool_calls_section_end|>", serialized)
 
-    def test_kimi_required_no_strict_uses_tool_schema(self):
-        """Kimi required calls should still generate parser-valid JSON objects."""
+    def test_kimi_required_no_strict_uses_loose_object_schema(self):
+        """Kimi required calls keep non-strict arguments object-shaped but loose."""
         parser = self._make_parser("kimi_k2", strict=False)
         result = parser.get_structure_constraint("required")
         serialized = self._constraint_json(result)
-        self.assertIn('"properties"', serialized)
-        self.assertIn('"city"', serialized)
+        self.assertIn('"json_schema":{"type":"object"}', serialized)
+        self.assertNotIn('"additionalProperties":false', serialized)
+        self.assertNotIn('"properties"', serialized)
 
     def test_kimi_required_strict_uses_tool_schema(self):
         """With strict, native xgrammar should include the tool's parameter schema."""
@@ -4801,7 +4803,6 @@ class TestGetStructureConstraint(unittest.TestCase):
         serialized = self._constraint_json(result)
         self.assertIn('"properties"', serialized)
         self.assertIn('"city"', serialized)
-        self.assertIn('"additionalProperties":false', serialized)
 
     # --- reasoning-prefix ownership ---
 
