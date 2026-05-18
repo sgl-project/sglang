@@ -166,6 +166,9 @@ class CanaryHostState:
 
         num_verify = len(verify_req_ids)
         num_write = len(write_req_ids)
+        write_slot_indices_flat: List[int] = []
+        for w in write_slot_indices_per_req:
+            write_slot_indices_flat.extend(int(s) for s in w)
 
         expected_req_ids = verify_req_ids + write_req_ids
         expected_token_ids = verify_token_ids + write_token_ids
@@ -182,6 +185,7 @@ class CanaryHostState:
             verify_mask=verify_mask,
             verify_seq_positions=verify_seq_positions_full,
             verify_slot_indices=verify_slot_indices,
+            write_slot_indices=write_slot_indices_flat,
             num_verify=num_verify,
             num_write=num_write,
             next_state=next_state,
@@ -202,6 +206,7 @@ class BatchPlan:
     verify_mask: List[int]
     verify_seq_positions: List[int]
     verify_slot_indices: List[int]
+    write_slot_indices: List[int]
     num_verify: int
     num_write: int
     next_state: Dict[int, _RequestState]

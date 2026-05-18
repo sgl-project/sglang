@@ -140,7 +140,7 @@ def run_head(
     plan = _plan_from_forward_batch(runner=runner, forward_batch=forward_batch)
     if plan is None:
         return None
-    runner.run_head(plan=plan, slot_indices=forward_batch.out_cache_loc)
+    runner.run_head(plan=plan)
     return plan
 
 
@@ -152,7 +152,7 @@ def run_tail(
 ) -> None:
     if runner is None or plan is None:
         return
-    runner.run_tail(plan=plan, slot_indices=forward_batch.out_cache_loc)
+    runner.run_tail(plan=plan)
     runner.host_state.commit_plan(plan)
     runner.end_of_forward()
 
@@ -201,17 +201,33 @@ def _plan_from_forward_batch(
         return None
 
     cursor = 0
+    filtered_req_pool_indices: List[int] = []
+    filtered_seq_lens: List[int] = []
+    filtered_prefix_lens: List[int] = []
     tokens_per_req: List[List[int]] = []
     write_slots_per_req: List[List[int]] = []
-    for n in seq_lens:
-        tokens_per_req.append(input_ids_list[cursor : cursor + n])
-        write_slots_per_req.append(out_cache_loc_list[cursor : cursor + n])
-        cursor += n
+    for req_pool_idx, n, prefix_len in zip(req_pool_indices, seq_lens, prefix_lens):
+        next_cursor = cursor + n
+        # Padding row in ReqToTokenPool is index 0 (cuda-graph padded batches
+        # set padding rows' req_pool_indices to 0). Skipping it avoids
+        # corrupting the host state with synthetic warmup writes.
+        if int(req_pool_idx) == 0:
+            cursor = next_cursor
+            continue
+        tokens_per_req.append(input_ids_list[cursor:next_cursor])
+        write_slots_per_req.append(out_cache_loc_list[cursor:next_cursor])
+        filtered_req_pool_indices.append(int(req_pool_idx))
+        filtered_seq_lens.append(int(n))
+        filtered_prefix_lens.append(int(prefix_len))
+        cursor = next_cursor
+
+    if not filtered_req_pool_indices:
+        return None
 
     return runner.host_state.plan_batch(
-        req_pool_indices=[int(x) for x in req_pool_indices],
-        req_token_counts=[int(x) for x in seq_lens],
-        req_start_positions=[int(x) for x in prefix_lens],
+        req_pool_indices=filtered_req_pool_indices,
+        req_token_counts=filtered_seq_lens,
+        req_start_positions=filtered_prefix_lens,
         input_tokens_per_req=tokens_per_req,
         write_slot_indices_per_req=write_slots_per_req,
     )

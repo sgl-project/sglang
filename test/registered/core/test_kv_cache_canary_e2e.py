@@ -16,12 +16,13 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+
+_MODEL = "Qwen/Qwen3-0.6B"
 
 register_cuda_ci(est_time=240, suite="base-b-test-1-gpu-small")
 
@@ -31,7 +32,7 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = _MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         # Ensure no perturbation is configured.
@@ -40,7 +41,14 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--kv-cache-canary", "log"],
+            other_args=[
+                "--kv-cache-canary",
+                "log",
+                # Shadow K/V tensors add ~4× layer-size to the pool; leave
+                # headroom so the canary tensors fit.
+                "--mem-fraction-static",
+                "0.65",
+            ],
             env=env,
         )
 
@@ -75,7 +83,7 @@ class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = _MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         # 1% per forward, deterministic seed for reproducibility.
@@ -84,7 +92,12 @@ class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--kv-cache-canary", "raise"],
+            other_args=[
+                "--kv-cache-canary",
+                "raise",
+                "--mem-fraction-static",
+                "0.65",
+            ],
             env=env,
         )
 

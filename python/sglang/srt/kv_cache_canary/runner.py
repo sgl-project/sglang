@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -37,16 +36,17 @@ class CanaryRunner:
     """Top-level orchestrator for KV cache canary.
 
     One instance lives on each rank. Owns the host-side request state, the
-    GPU-side violation buffer + counters, the side stream and background
-    daemon that polls the ``is_errored`` flag and health counters, and the
+    GPU-side violation buffer + counters, the side stream that asynchronously
+    copies the ``is_errored`` flag and health counters back to host, and the
     log/raise policy.
 
     .. warning::
         Several pieces in this class are critical safety logic and must NOT
         be simplified away by an automated pass:
 
-        - the daemon poll thread (README §4): ``_start_daemon`` /
-          ``_daemon_loop`` / ``_record_poll_events``,
+        - the side-stream + event-based async D2H pump
+          (``_record_poll_events`` / ``_pull_latest_from_events``) — the hot
+          path stays non-blocking, the README §4 design,
         - the §5 health monitoring: ``_maybe_health_check``,
         - the unconditional cross-rank allreduce in ``_cross_rank_max``,
           called from every ``end_of_forward``.
@@ -92,64 +92,85 @@ class CanaryRunner:
             torch.cuda.Event() if torch.cuda.is_available() else None
         )
 
-        self._daemon_lock = threading.Lock()
-        # Latest values pulled by the daemon — main thread reads these.
+        # Latest values pulled by the side-stream events; main inference
+        # thread reads these inside ``end_of_forward``.
         self._latest_is_errored: int = 0
         self._latest_counters: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._raise_latch: bool = False
         self._last_log_time_per_reason: Dict[int, float] = {}
         self._forward_step: int = 0
-
-        self._daemon_stop = threading.Event()
-        self._daemon_thread: Optional[threading.Thread] = None
-        self._start_daemon()
+        # Whether ``_record_poll_events`` has armed the cudaEvent at least
+        # once. ``event.query()`` on an unrecorded event is undefined; skip
+        # until we've recorded once.
+        self._poll_armed: bool = False
 
     @property
     def config(self) -> CanaryConfig:
         return self._config
 
-    def run_head(self, *, plan: BatchPlan, slot_indices: torch.Tensor) -> None:
-        self._run_kernel_pair(
-            plan=plan, write_slot_indices=slot_indices, kernel_kind=KERNEL_KIND_HEAD
-        )
+    def run_head(self, *, plan: BatchPlan) -> None:
+        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
 
-    def run_tail(self, *, plan: BatchPlan, slot_indices: torch.Tensor) -> None:
-        self._run_kernel_pair(
-            plan=plan, write_slot_indices=slot_indices, kernel_kind=KERNEL_KIND_TAIL
-        )
+    def run_tail(self, *, plan: BatchPlan) -> None:
+        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_TAIL)
 
     def end_of_forward(self) -> None:
         """Called once per forward (after run_tail) on the compute stream.
 
-        Records events for the daemon to query, increments the step counter,
-        and unconditionally allreduces the (host-cached) error flag so every
-        rank decides to raise in lock-step (no single-rank raise → no NCCL
-        deadlock; README §3 decision #3).
+        Records D2H copies on the side stream, queries the recorded event
+        non-blockingly, refreshes the host-side cached error flag + health
+        counters, increments the step counter, and unconditionally
+        allreduces the local error flag so every rank decides to raise in
+        lock-step (no single-rank raise → no NCCL deadlock; README §3
+        decision #3).
+
+        Skipped during cuda graph capture: side-stream / event / sync ops
+        are unsafe inside captured regions.
         """
         if not self._config.enabled:
             return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
         self._record_poll_events()
+        self._pull_latest_from_events()
         self._forward_step += 1
-        with self._daemon_lock:
-            local_flag = self._latest_is_errored
+        local_flag = self._latest_is_errored
         global_flag = self._cross_rank_max(local_flag)
         self._maybe_health_check()
         if global_flag:
             self._handle_violation_global()
 
-    def shutdown(self) -> None:
-        self._daemon_stop.set()
-        if self._daemon_thread is not None:
-            self._daemon_thread.join(timeout=2.0)
+    def _pull_latest_from_events(self) -> None:
+        """Non-blocking event.query() — if done, refresh host-cached values.
 
-    def __del__(self) -> None:
+        Called from the main inference thread only (never from another
+        thread) so we never query while another thread is mid-capture.
+        """
         try:
-            self.shutdown()
+            if (
+                self._is_errored_event is not None
+                and self._poll_armed
+                and self._is_errored_event.query()
+            ):
+                self._latest_is_errored = int(self._is_errored_host.item())
+            if (
+                self._counters_event is not None
+                and self._poll_armed
+                and self._counters_event.query()
+            ):
+                self._latest_counters = tuple(  # type: ignore[assignment]
+                    int(x) for x in self._counters_host.tolist()
+                )
         except Exception:
-            pass
+            logger.exception("kv-canary: event poll failed")
 
     def _record_poll_events(self) -> None:
         if self._side_stream is None or self._is_errored_event is None:
+            return
+        # Skip during cuda graph capture: side-stream operations and
+        # event.record / event.query interact badly with the captured stream
+        # (CUDA refuses these ops mid-capture).
+        if torch.cuda.is_current_stream_capturing():
             return
         compute_stream = torch.cuda.current_stream(self._device)
         with torch.cuda.stream(self._side_stream):
@@ -158,6 +179,7 @@ class CanaryRunner:
                 self._device_state.is_errored, non_blocking=True
             )
             self._is_errored_event.record(stream=self._side_stream)
+            self._poll_armed = True
             if self._counters_event is not None and (
                 self._forward_step % max(1, self._config.health_print_every_n_forwards)
                 == 0
@@ -180,40 +202,10 @@ class CanaryRunner:
                 )
                 self._counters_event.record(stream=self._side_stream)
 
-    def _start_daemon(self) -> None:
-        if not self._config.enabled or self._side_stream is None:
-            return
-        self._daemon_thread = threading.Thread(
-            target=self._daemon_loop,
-            name="kv-canary-poll",
-            daemon=True,
-        )
-        self._daemon_thread.start()
-
-    def _daemon_loop(self) -> None:
-        poll_interval = max(0.001, self._config.daemon_poll_seconds)
-        while not self._daemon_stop.is_set():
-            try:
-                if (
-                    self._is_errored_event is not None
-                    and self._is_errored_event.query()
-                ):
-                    flag = int(self._is_errored_host.item())
-                    with self._daemon_lock:
-                        self._latest_is_errored = flag
-                if self._counters_event is not None and self._counters_event.query():
-                    counters = tuple(int(x) for x in self._counters_host.tolist())
-                    with self._daemon_lock:
-                        self._latest_counters = counters  # type: ignore[assignment]
-            except Exception:
-                logger.exception("kv-canary: daemon poll iteration failed")
-            self._daemon_stop.wait(poll_interval)
-
     def _run_kernel_pair(
         self,
         *,
         plan: BatchPlan,
-        write_slot_indices: torch.Tensor,
         kernel_kind: int,
     ) -> None:
         if not self._config.enabled:
@@ -222,9 +214,7 @@ class CanaryRunner:
         if total == 0:
             return
 
-        slot_indices = self._make_slot_indices_tensor(
-            plan=plan, write_slot_indices=write_slot_indices
-        )
+        slot_indices = self._make_slot_indices_tensor(plan=plan)
 
         if kernel_kind == KERNEL_KIND_HEAD:
             src_buf_k, dst_buf_k = self._k_tail, self._k_head
@@ -267,16 +257,9 @@ class CanaryRunner:
                 kernel_kind=kernel_kind,
             )
 
-    def _make_slot_indices_tensor(
-        self, *, plan: BatchPlan, write_slot_indices: torch.Tensor
-    ) -> torch.Tensor:
-        write_part = write_slot_indices.to(device=self._device, dtype=torch.int64)
-        if plan.num_verify == 0:
-            return write_part
-        verify_part = torch.tensor(
-            plan.verify_slot_indices, dtype=torch.int64, device=self._device
-        )
-        return torch.cat([verify_part, write_part])
+    def _make_slot_indices_tensor(self, *, plan: BatchPlan) -> torch.Tensor:
+        flat = plan.verify_slot_indices + plan.write_slot_indices
+        return torch.tensor(flat, dtype=torch.int64, device=self._device)
 
     def _cross_rank_max(self, local_flag: int) -> int:
         """Unconditional all-reduce-MAX on the local 1-byte flag.
@@ -318,9 +301,7 @@ class CanaryRunner:
         """README §5 — counter-zero detection + periodic print."""
         step = self._forward_step
         period = max(1, self._config.health_print_every_n_forwards)
-        with self._daemon_lock:
-            counters = self._latest_counters
-        kernel_head, kernel_tail, slot_head, slot_tail = counters
+        kernel_head, kernel_tail, slot_head, slot_tail = self._latest_counters
 
         if step == self._config.counter_zero_warmup_forwards:
             if kernel_head == 0 or kernel_tail == 0:
