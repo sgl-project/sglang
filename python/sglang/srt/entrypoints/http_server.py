@@ -2333,6 +2333,11 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    if os.environ.get("SGLANG_THREADED_ENGINE") == "1":
+        from sglang.srt.entrypoints.engine_threaded import launch_threaded_server
+
+        return launch_threaded_server(server_args, execute_warmup_func, launch_callback)
+
     # Launch subprocesses
     (
         tokenizer_manager,
