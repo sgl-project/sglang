@@ -349,9 +349,29 @@ def to_signed_int64(unsigned_value: int) -> int:
     return value
 
 
+VIOLATION_KIND_HEAD_K: str = "head_k"
+VIOLATION_KIND_HEAD_V: str = "head_v"
+VIOLATION_KIND_TAIL_K: str = "tail_k"
+VIOLATION_KIND_TAIL_V: str = "tail_v"
+VIOLATION_KINDS: Tuple[str, str, str, str] = (
+    VIOLATION_KIND_HEAD_K,
+    VIOLATION_KIND_HEAD_V,
+    VIOLATION_KIND_TAIL_K,
+    VIOLATION_KIND_TAIL_V,
+)
+
+
 @dataclass(slots=True)
-class CanaryDeviceState:
-    """GPU-resident state shared across head/tail kernel invocations."""
+class CanaryViolationSlot:
+    """One independent violation-state set (ring + first_violation + is_errored).
+
+    Four instances live on ``CanaryDeviceState`` — one per
+    (head|tail) x (K-half|V-half) kernel launch. Keeping them disjoint stops
+    the K-half launch from CAS-latching ``first_violation_set`` and
+    silently masking every V-half mismatch (and vice versa), so V-half page
+    table bugs become visible instead of being shadowed by an earlier K-half
+    mismatch in the same forward.
+    """
 
     violation_ring: torch.Tensor
     violation_ring_valid: torch.Tensor
@@ -359,15 +379,11 @@ class CanaryDeviceState:
     first_violation: torch.Tensor
     first_violation_set: torch.Tensor
     is_errored: torch.Tensor
-    slot_run_counter_head: torch.Tensor
-    slot_run_counter_tail: torch.Tensor
-    kernel_run_counter_head: torch.Tensor
-    kernel_run_counter_tail: torch.Tensor
 
     @classmethod
     def allocate(
         cls, *, device: torch.device, ring_capacity: int
-    ) -> "CanaryDeviceState":
+    ) -> "CanaryViolationSlot":
         return cls(
             violation_ring=torch.zeros(
                 ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
@@ -381,31 +397,71 @@ class CanaryDeviceState:
             ),
             first_violation_set=torch.zeros(1, dtype=torch.int32, device=device),
             is_errored=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+
+    def reset(self) -> None:
+        self.is_errored.zero_()
+        self.first_violation_set.zero_()
+        self.first_violation.zero_()
+        self.violation_ring_valid.zero_()
+        self.violation_write_index.zero_()
+
+
+@dataclass(slots=True)
+class CanaryDeviceState:
+    """GPU-resident state shared across head/tail kernel invocations.
+
+    Violation state is split four ways — one ``CanaryViolationSlot`` per
+    ``(head|tail) x (K-half|V-half)`` kernel launch — so K-half and V-half
+    detection paths never share a ``first_violation`` latch or an
+    ``is_errored`` flag. Counters stay split only by head/tail (K/V launches
+    of the same kernel kind share write/verify work over the same slot
+    indices, so per-kernel-kind counters are enough for health monitoring).
+    """
+
+    violation_slots: Dict[str, CanaryViolationSlot]
+    slot_run_counter_head: torch.Tensor
+    slot_run_counter_tail: torch.Tensor
+    kernel_run_counter_head: torch.Tensor
+    kernel_run_counter_tail: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls, *, device: torch.device, ring_capacity: int
+    ) -> "CanaryDeviceState":
+        return cls(
+            violation_slots={
+                kind: CanaryViolationSlot.allocate(
+                    device=device, ring_capacity=ring_capacity
+                )
+                for kind in VIOLATION_KINDS
+            },
             slot_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),
             slot_run_counter_tail=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter_tail=torch.zeros(1, dtype=torch.int64, device=device),
         )
 
-    def reset_violation_state(self) -> None:
-        """Zero out is_errored / first_violation / ring buffer state.
+    def get_violation_slot(self, kind: str) -> CanaryViolationSlot:
+        return self.violation_slots[kind]
 
-        Called from the LOG-mode violation handler after the first-violation
-        row has been pulled to host. Without this reset the GPU-side
-        ``is_errored`` flag stays at 1 forever, ``first_violation_set``
-        latches the first row permanently (new violations are silently
-        masked), and ``violation_ring_valid`` fills up so subsequent CAS
-        attempts all fail (= permanent ring deadlock after capacity rows).
+    def reset_violation_state(self) -> None:
+        """Zero out every per-kind violation slot.
+
+        Called from the LOG-mode violation handler after each kind's
+        first-violation row has been pulled to host. Without this reset the
+        GPU-side ``is_errored`` flag stays at 1 forever,
+        ``first_violation_set`` latches the first row permanently (new
+        violations are silently masked), and ``violation_ring_valid`` fills
+        up so subsequent CAS attempts all fail (= permanent ring deadlock
+        after capacity rows).
 
         Counters (slot/kernel run counters) are intentionally NOT reset:
         the §5 health monitor uses their monotonic growth to detect "canary
         stopped running".
         """
-        self.is_errored.zero_()
-        self.first_violation_set.zero_()
-        self.first_violation.zero_()
-        self.violation_ring_valid.zero_()
-        self.violation_write_index.zero_()
+        for slot in self.violation_slots.values():
+            slot.reset()
 
 
 @dataclass(slots=True)
