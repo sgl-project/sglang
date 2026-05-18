@@ -2502,9 +2502,7 @@ class ServerArgs:
                 assert (
                     self.mamba_track_interval % self.page_size == 0
                 ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                assert (
-                    self.mamba_cache_chunk_size % self.page_size == 0
-                ), f"For SSM models with extra buffer, mamba_cache_chunk_size must be divisible by page_size, got {self.mamba_cache_chunk_size=}, {self.page_size=}"
+                assert self.mamba_cache_chunk_size is not None
         elif not self.disable_radix_cache:  # no_buffer
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
@@ -6829,6 +6827,9 @@ class ServerArgs:
         if not hasattr(self, "_mamba_cache_chunk_size"):
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            assert (
+                max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
+            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
