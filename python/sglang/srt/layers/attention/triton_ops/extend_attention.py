@@ -32,13 +32,14 @@ if _is_cuda:
 _is_hip = is_hip()
 
 
-def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
+def _get_block_sizes_for_extend_attention(Lq: int, Lv: int, max_len_extend: int):
     """
     Get block sizes and configuration for extend attention kernels.
 
     Args:
         Lq: Query head dimension
         Lv: Value head dimension
+        max_len_extend: Maximum extend length per sequence in the batch
 
     Returns:
         tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
@@ -76,6 +77,8 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # Blackwell data-center architecture (GB200, B200, sm_100a)
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (64, 64)
+            elif max_len_extend <= 16:
+                BLOCK_M, BLOCK_N = (16, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
@@ -591,7 +594,7 @@ def extend_attention_fwd(
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
+        _get_block_sizes_for_extend_attention(Lq, Lv, max_len_extend)
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
@@ -1001,7 +1004,7 @@ def extend_attention_fwd_unified(
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
+        _get_block_sizes_for_extend_attention(Lq, Lv, max_len_extend)
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
