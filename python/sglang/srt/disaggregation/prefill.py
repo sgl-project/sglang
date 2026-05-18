@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -440,6 +439,13 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
             return 0
 
+        # Layer-pipelined transfer currently requires the mooncake backend.
+        if self.transfer_backend not in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.FAKE,
+        ):
+            return 0
+
         # Universal guard: model must implement forward_split_prefill to use
         # pipelined transfer. Models without it (e.g. Mamba-only, hybrid models
         # that haven't added support) safely fallback to the normal path.
@@ -457,9 +463,8 @@ class SchedulerDisaggregationPrefillMixin:
             return 0
 
         # If user explicitly set group_size, respect it (backward compatible)
-        explicit = os.environ.get("SGLANG_PIPELINE_GROUP_SIZE")
-        if explicit is not None:
-            return int(explicit)
+        if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
+            return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
         # Adaptive: control iterations in [6, 10] based on prompt length
         num_layers = self.model_config.num_hidden_layers
@@ -497,7 +502,9 @@ class SchedulerDisaggregationPrefillMixin:
                 group_size = self._get_pipeline_group_size(batch)
                 if group_size > 0:
                     result = self.run_batch_pipelined(batch, group_size=group_size)
-                    self.process_batch_result_pipelined_prefill(batch, result)
+                    self.process_batch_result_disagg_prefill(
+                        batch, result, pipelined=True
+                    )
                 else:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
@@ -558,10 +565,15 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        pipelined: bool = False,
     ) -> None:
         """
-        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        Adapted from process_batch_result_prefill
+        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
+        Adapted from process_batch_result_prefill.
+
+        When pipelined=True, KV data was already sent per-layer in
+        run_batch_pipelined, so only the metadata buffer is set here
+        instead of calling send_kv_chunk.
         """
         (
             logits_output,
@@ -632,7 +644,13 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+
+                if pipelined:
+                    # KV already sent per-layer in run_batch_pipelined.
+                    # Only set the metadata buffer here.
+                    self.disagg_metadata_buffers.set_buf(req)
+                else:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -677,127 +695,6 @@ class SchedulerDisaggregationPrefillMixin:
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
             batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
-
-    def process_batch_result_pipelined_prefill(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> None:
-        """Process batch result for layer-pipelined KV transfer.
-
-        Similar to process_batch_result_disagg_prefill but skips send_kv_chunk
-        since KV data was already sent per-layer in run_batch_pipelined.
-        Sets metadata buffer directly instead.
-        """
-        (
-            logits_output,
-            next_token_ids,
-            extend_input_len_per_req,
-            extend_logprob_start_len_per_req,
-        ) = (
-            result.logits_output,
-            result.next_token_ids,
-            result.extend_input_len_per_req,
-            result.extend_logprob_start_len_per_req,
-        )
-
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-        if result.routed_experts_output is not None:
-            result.routed_experts_output.finalize()
-            result.routed_experts_output = None
-        if result.indexer_topk_output is not None:
-            result.indexer_topk_output.finalize()
-            result.indexer_topk_output = None
-
-        logprob_pt = 0
-        next_token_ids = result.next_token_ids.tolist()
-        if batch.return_logprob:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
-                )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
-
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
-        ):
-            if req.is_chunked <= 0:
-                req.time_stats.set_prefill_finished_time()
-
-                req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
-                self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
-                    req.output_topk_p = batch.spec_info.topk_p[i]
-                    req.output_topk_index = batch.spec_info.topk_index[i]
-                    req.hidden_states_tensor = (
-                        batch.spec_info.hidden_states[i].cpu().clone()
-                    )
-                else:
-                    req.hidden_states_tensor = None
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-
-                # KV already sent per-layer in run_batch_pipelined.
-                # Only set the metadata buffer here.
-                self.disagg_metadata_buffers.set_buf(req)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
-
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
-            else:
-                # Chunked requests are not expected in pipelined mode,
-                # but handle gracefully by falling back.
-                req.is_chunked -= 1
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
-                            i,
-                            req,
-                            logits_output,
-                            logprob_pt,
-                            num_input_logprobs,
-                            last_prefill_chunk=False,
-                        )
-                        logprob_pt += num_input_logprobs
-                req.time_stats.set_last_chunked_prefill_finish_time()
-
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
