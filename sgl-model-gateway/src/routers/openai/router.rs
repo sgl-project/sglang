@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use data_connector::{ConversationId, ListParams, ResponseId, SortOrder};
 use futures_util::{future::join_all, StreamExt};
 use serde_json::{json, to_value, Value};
@@ -42,7 +43,10 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::{apply_provider_headers, extract_auth_header},
+    routers::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        http::routing_view::{view_parse_error, ChatRoutingView},
+    },
 };
 
 pub struct OpenAIRouter {
@@ -470,9 +474,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body_bytes: &Bytes,
         model_id: Option<&str>,
     ) -> Response {
+        // OpenAI provider serialises to the upstream OpenAI-compatible
+        // API and needs the full typed `ChatCompletionRequest`.
+        let body: ChatCompletionRequest = match serde_json::from_slice(body_bytes) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<ChatRoutingView>(body_bytes, e),
+        };
+        let body = &body;
         let start = Instant::now();
         let model = model_id.unwrap_or(body.model.as_str());
         let streaming = body.stream;
@@ -522,7 +533,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
 
-        let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
+        let provider = self.get_provider_arc_for_worker(worker.as_ref(), Some(model));
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_OPENAI,
@@ -538,7 +549,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut ctx = RequestContext::for_chat(
             Arc::new(body.clone()),
             headers.cloned(),
-            model_id.map(String::from),
+            Some(model.to_string()),
             ComponentRefs::Shared(self.shared_components()),
         );
 

@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -26,19 +27,22 @@ use crate::{
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        http::{
+            pd_router::extract_chat_request_text,
+            routing_view::{view_parse_error, ChatRoutingView, GenerateRoutingView},
+        },
+        RouterTrait,
     },
 };
 
@@ -481,6 +485,286 @@ impl Router {
         }
     }
 
+    // ============================================================
+    // Proto-pattern bytes path (chat/generate)
+    // ============================================================
+    //
+    // Mirrors the SGLang gRPC OpenAI-passthrough RPCs (see
+    // `proto/sglang/runtime/v1/sglang.proto::OpenAIRequest`): the body
+    // is opaque JSON bytes that the receiving SGLang server unmarshals
+    // itself. The router only needs a small set of fields for routing
+    // decisions, captured up front in a `*RoutingView`. The bytes
+    // forward verbatim — no typed deserialise of `ChatCompletionRequest`
+    // / `GenerateRequest` on the hot path. Multimodal payloads with
+    // 100+ KB embedded image strings see ~10× speedup vs. the typed
+    // path because serde never materialises the giant String.
+    //
+    // route_completion / route_responses / route_embeddings /
+    // route_classify / route_rerank still use the typed path
+    // (`route_typed_request`) — they're not on this PR's hot path.
+
+    pub async fn route_bytes_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text_for_routing: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_: u32| async {
+                let res = self
+                    .route_bytes_once(headers, body, route, model_id, is_stream, text_for_routing)
+                    .await;
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+                res
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await;
+
+        if response.status().is_success() {
+            let duration = start.elapsed();
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
+    async fn route_bytes_once(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        route: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text_for_routing: Option<&str>,
+    ) -> Response {
+        let worker = match self
+            .select_worker_for_model(model_id, text_for_routing, headers)
+            .await
+        {
+            Some(w) => w,
+            None => {
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_bytes_request(headers, body, route, worker.url(), is_stream, load_guard)
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        let status = response.status();
+        worker.record_outcome(status.is_success());
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
+        response
+    }
+
+    /// Bytes-aware send. The dp-aware branch parses to Value to inject
+    /// `data_parallel_rank` (unavoidable mutation); the non-dp-aware
+    /// branch is pure `body(body.clone())` passthrough — `Bytes::clone`
+    /// is an O(1) atomic refcount bump on the shared buffer axum hands
+    /// us, no copy.
+    async fn send_bytes_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        route: &'static str,
+        worker_url: &str,
+        is_stream: bool,
+        load_guard: Option<WorkerLoadGuard>,
+    ) -> Response {
+        let worker = self.worker_registry.get_by_url(worker_url);
+        let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
+        const DP_RANK_KEY: &str = "data_parallel_rank";
+
+        let mut request_builder = if self.dp_aware {
+            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
+                Ok(tup) => tup,
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return error::internal_error(
+                        "dp_rank_extraction_failed",
+                        format!("Failed to extract dp_rank: {}", e),
+                    );
+                }
+            };
+            let mut json_val: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error::bad_request(
+                        "json_parse_error",
+                        format!("dp_aware: failed to parse body as JSON: {e}"),
+                    );
+                }
+            };
+            if let Some(map) = json_val.as_object_mut() {
+                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Modified request body: {}",
+                        serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
+                    );
+                }
+            } else {
+                return error::bad_request(
+                    "dp_rank_insertion_failed",
+                    "Failed to insert the data_parallel_rank field into the request body",
+                );
+            }
+            self.client
+                .post(format!("{}{}", worker_url_prefix, route))
+                .json(&json_val)
+        } else {
+            self.client
+                .post(format!("{}{}", worker_url, route))
+                .body(body.clone())
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        };
+
+        if let Some(key) = api_key {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
+        }
+
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "Failed to send bytes request worker_url={} route={} error={}",
+                    worker_url, route, e
+                );
+                return convert_reqwest_error(e);
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        if !is_stream {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(body) => {
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => error::internal_error(
+                    "read_response_body_failed",
+                    format!("Failed to get response body: {}", e),
+                ),
+            }
+        } else {
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            let stream = res.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            break;
+                        }
+                    }
+                }
+            });
+            let stream = UnboundedReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
+            response
+        }
+    }
+
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
@@ -738,21 +1022,75 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &Bytes,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
-            .await
+        let view: GenerateRoutingView = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<GenerateRoutingView>(body, e),
+        };
+        self.route_bytes_request(
+            headers,
+            body,
+            "/generate",
+            model_id.or(view.model.as_deref()),
+            view.stream,
+            view.text.as_deref(),
+        )
+        .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &Bytes,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let view: ChatRoutingView = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<ChatRoutingView>(body, e),
+        };
+        let effective_model = model_id.or(Some(view.model.as_str()));
+
+        // Cache-aware (and any future policy that reports
+        // `needs_request_text() == true`) hashes on the conversation
+        // text to keep multi-turn chats on the same worker for KV-cache
+        // reuse. Skip the second parse when no policy needs it so the
+        // non-cache-aware deployment stays at one `from_slice`.
+        //
+        // TODO: this lookup is redundant — `route_bytes_request` →
+        // `route_bytes_once` resolves the same policy from
+        // `effective_model` again for its load-guard branch. Fold both
+        // into one resolved `Arc<dyn LoadBalancingPolicy>` threaded
+        // through the call so we don't double-look-up per request.
+        let policy = match effective_model {
+            Some(m) => self.policy_registry.get_policy_or_default(m),
+            None => self.policy_registry.get_default_policy(),
+        };
+        // TODO: this is a second `from_slice` on the same body — the
+        // typed `ChatRoutingView` above already paid one parse. If
+        // cache-aware becomes the dominant deployment, plumb the raw
+        // `messages` array out of the routing view (or parse to
+        // `Value` once and reuse) so the cache-aware path stays at a
+        // single parse instead of two.
+        let request_text_owned = if policy.needs_request_text() {
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => extract_chat_request_text(&v),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        self.route_bytes_request(
+            headers,
+            body,
+            "/v1/chat/completions",
+            effective_model,
+            view.stream,
+            request_text_owned.as_deref(),
+        )
+        .await
     }
 
     async fn route_completion(

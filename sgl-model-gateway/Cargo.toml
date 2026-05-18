@@ -164,6 +164,11 @@ name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
 
+[[bench]]
+name = "proto_pattern_perf"
+harness = false
+path = "benches/proto_pattern_perf.rs"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries

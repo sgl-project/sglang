@@ -9,13 +9,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 
 use crate::protocols::{
-    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
-    generate::GenerateRequest,
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
@@ -75,11 +74,22 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a generate request
+    /// Route a generate request.
+    ///
+    /// **Proto-pattern signature** — see
+    /// `proto/sglang/runtime/v1/sglang.proto::OpenAIRequest`. `body`
+    /// is the original client request bytes; the receiving router
+    /// parses exactly what it needs (HTTP unified parses a routing
+    /// view, PD parses a `Value` because it has to mutate the body
+    /// for bootstrap injection, gRPC parses the typed proto request).
+    /// Routing decisions that need a model id come from `model_id`
+    /// when `RouterManager` resolved one in IGW mode (single
+    /// registered model = implicit default); otherwise routers fall
+    /// back to whatever's in `body`.
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
+        _body: &Bytes,
         _model_id: Option<&str>,
     ) -> Response {
         (
@@ -89,11 +99,12 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a chat completion request
+    /// Route a chat completion request. See `route_generate` for the
+    /// meaning of `body` and `model_id`.
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &Bytes,
         model_id: Option<&str>,
     ) -> Response;
 

@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use bytes::Bytes;
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,11 +41,9 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -169,27 +168,54 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+/// Read the raw request body up to a generous limit. Matches what
+/// `Json::from_request` would have consumed.
+async fn read_body_bytes(request: Request) -> Result<Bytes, Response> {
+    axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|e| {
+            crate::routers::error::bad_request(
+                "body_read_error",
+                format!("Failed to read request body: {e}"),
+            )
+        })
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    request: Request,
 ) -> Response {
-    let model_id = body.model.as_deref();
+    // Proto-pattern: read raw body, hand it to the router. Each
+    // concrete router parses exactly what it needs (HTTP unified
+    // parses a routing view, PD parses a `Value` because it has to
+    // mutate the body for bootstrap injection, gRPC parses the typed
+    // proto request). RouterManager peeks at `model` for IGW
+    // dispatch and passes the resolved id forward as `model_id`.
+    let body = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate(Some(&headers), &body, None)
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    request: Request,
 ) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
-        .await
+    // Proto-pattern: see `generate` above. Mirrors the SGLang gRPC
+    // `OpenAIRequest { bytes json_body }` design — the gateway is a
+    // protocol-version-agnostic forwarder, the receiving server
+    // unmarshals the JSON.
+    let body = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    state.router.route_chat(Some(&headers), &body, None).await
 }
 
 async fn v1_completions(

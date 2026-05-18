@@ -26,8 +26,8 @@ impl RouterTrait for MockRouter {
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        _view: &smg::routers::http::routing_view::ChatRoutingView,
+        _body: &bytes::Bytes,
     ) -> Response<Body> {
         StatusCode::OK.into_response()
     }

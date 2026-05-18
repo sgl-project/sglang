@@ -22,6 +22,8 @@ async fn test_multiple_concurrent_requests_tracking() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 50,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     }])
     .await;
 
@@ -65,6 +67,8 @@ async fn test_inflight_request_appears_in_bucket() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 2000,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     }])
     .await;
 
@@ -119,6 +123,8 @@ async fn test_failed_request_still_deregisters() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 1.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     }])
     .await;
 

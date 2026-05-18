@@ -7,10 +7,11 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
@@ -29,18 +30,15 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
+        classify::ClassifyRequest, common::StringOrArray, completion::CompletionRequest,
+        embedding::EmbeddingRequest, rerank::RerankRequest,
     },
     routers::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        http::routing_view::{validate_extensions_in_value, ChatRoutingView, GenerateRoutingView},
+        RouterTrait,
     },
 };
 
@@ -60,9 +58,21 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
+    /// SGLang RL extension. When true and `is_stream` is false, PD
+    /// merges `routed_experts` from the prefill response into the
+    /// decode response (base64 prefix-suffix concat).
+    return_routed_experts: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+impl PDRequestContext<'_> {
+    /// Whether the response merge step needs to walk the prefill JSON.
+    /// Logprobs and routed_experts both live there.
+    fn needs_prefill_json_merge(&self) -> bool {
+        !self.is_stream && (self.return_logprob || self.return_routed_experts)
+    }
 }
 
 impl PDRouter {
@@ -181,24 +191,10 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        // GenerateRequest doesn't support batch via arrays, only via input_ids
-        if let Some(InputIds::Batch(batches)) = &req.input_ids {
-            if !batches.is_empty() {
-                return Some(batches.len());
-            }
-        }
-        None
-    }
-
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
-        None
-    }
+    // Batch-size derivation lives in the free functions
+    // `generate_batch_size_from_value` / `chat_batch_size_from_value`
+    // below so PD can read them off the same `Value` it parses for
+    // bootstrap injection.
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
         if let StringOrArray::Array(arr) = &req.prompt {
@@ -274,10 +270,10 @@ impl PDRouter {
         Ok(original)
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch(
         &self,
         headers: Option<&HeaderMap>,
-        original_request: &T,
+        original_request: Value,
         context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
@@ -287,22 +283,18 @@ impl PDRouter {
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_PD,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            endpoint,
-            bool_to_static_str(context.is_stream),
-        );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        record_pd_request_start(&context);
+        // Each retry needs a fresh Value because `inject_bootstrap_into_value`
+        // mutates in place. The serde round-trip lives at the typed call
+        // sites (`route_completion`, `route_rerank`) once before this
+        // dispatch; Value callers (`route_generate`, `route_chat`) hand
+        // their parsed body straight in. Wrapping in `Arc` only saves
+        // an extra `Value` clone at dispatch entry.
+        let shared_request = Arc::new(original_request);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
@@ -327,10 +319,10 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        // Deep-clone the pre-serialized Value once per
+                        // retry; bootstrap injection mutates and
+                        // consumes it.
+                        let mut json_request = (*shared_request).clone();
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -600,28 +592,16 @@ impl PDRouter {
                         .await;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                // Process prefill response. We need the prefill body
+                // when *any* prefill-side merge applies (logprobs or
+                // routed_experts).
+                let needs_prefill_json = context.needs_prefill_json_merge();
+                let prefill_body = match self
+                    .process_prefill_response(prefill_result, prefill.url(), needs_prefill_json)
+                    .await
+                {
+                    Ok((_, body)) => body,
+                    Err(error_response) => return error_response,
                 };
 
                 if context.is_stream {
@@ -651,11 +631,12 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    if context.needs_prefill_json_merge() {
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
+                            context.return_routed_experts,
                             prefill_body,
                         )
                         .await
@@ -903,6 +884,7 @@ impl PDRouter {
         res: reqwest::Response,
         status: StatusCode,
         return_logprob: bool,
+        return_routed_experts: bool,
         prefill_body: Option<bytes::Bytes>,
     ) -> Response {
         let response = res.bytes().await;
@@ -914,7 +896,7 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
+        if !return_logprob && !return_routed_experts {
             return (status, decode_body).into_response();
         }
 
@@ -922,16 +904,22 @@ impl PDRouter {
             return (status, decode_body).into_response();
         };
 
-        // Merge logprobs from prefill and decode
+        // Parse both responses to walk into them for merging logprobs
+        // and/or routed_experts.
         let (Ok(prefill_json), Ok(mut decode_json)) = (
             serde_json::from_slice::<Value>(&prefill_body),
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
-            warn!("Failed to parse responses for logprob merging");
+            warn!("Failed to parse responses for prefill/decode merging");
             return (status, decode_body).into_response();
         };
 
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        if return_logprob {
+            Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        }
+        if return_routed_experts {
+            Self::merge_routed_experts(&prefill_json, &mut decode_json);
+        }
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
@@ -1062,6 +1050,82 @@ impl PDRouter {
             }
         }
         request
+    }
+
+    /// Merge `routed_experts` from prefill into the decode response.
+    ///
+    /// SGLang's RL extension ships expert ids as a base64-packed byte
+    /// string. The decode worker echoes the prefill's leading bytes
+    /// (first `prefill_len` bytes of decode are the same as prefill)
+    /// and appends per-token expert ids in the suffix. To produce the
+    /// merged stream the gateway concatenates `prefill_bytes ++
+    /// decode_bytes[prefill_len..]` and writes that back into
+    /// `decode_json["routed_experts"]`. Returns `true` when a merge
+    /// happened, `false` if either side was missing or unparsable.
+    ///
+    /// Caller (`merge_prefill_json`) walks two known envelopes for
+    /// this field: `meta_info.routed_experts` on `/generate`
+    /// responses, and `sglext.routed_experts` on OpenAI-compatible
+    /// responses (the `sglext` envelope is a typed contract upstream
+    /// — see `python/sglang/srt/entrypoints/openai/protocol.py::SglExt`).
+    fn merge_routed_experts_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let (Some(prefill_routed_experts), Some(decode_routed_experts)) = (
+            prefill_json.get("routed_experts").and_then(Value::as_str),
+            decode_json.get("routed_experts").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+
+        // Base64 decode failures here mean the client asked for merged
+        // routed_experts but will receive only decode-side payload.
+        // Log as error so data-integrity events show up in dashboards;
+        // leave decode_json untouched.
+        let prefill_bytes = match BASE64_STANDARD.decode(prefill_routed_experts) {
+            Ok(b) => b,
+            Err(error) => {
+                error!("routed_experts_decode_failed (prefill): merge skipped: {error}");
+                return false;
+            }
+        };
+        let decode_bytes = match BASE64_STANDARD.decode(decode_routed_experts) {
+            Ok(b) => b,
+            Err(error) => {
+                error!("routed_experts_decode_failed (decode): merge skipped: {error}");
+                return false;
+            }
+        };
+
+        let suffix = decode_bytes.get(prefill_bytes.len()..).unwrap_or_default();
+        let mut merged = Vec::with_capacity(prefill_bytes.len() + suffix.len());
+        merged.extend_from_slice(&prefill_bytes);
+        merged.extend_from_slice(suffix);
+
+        if let Some(slot) = decode_json.get_mut("routed_experts") {
+            *slot = Value::String(BASE64_STANDARD.encode(&merged));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Walk both possible response shapes (chat-completions
+    /// `sglext.routed_experts` and `/generate` `meta_info.routed_experts`)
+    /// and merge whichever applies.
+    fn merge_routed_experts(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let mut merged_any = false;
+        // chat: response.sglext.routed_experts
+        if let Some(prefill_sglext) = prefill_json.get("sglext") {
+            if let Some(decode_sglext) = decode_json.get_mut("sglext") {
+                merged_any |= Self::merge_routed_experts_in_json(prefill_sglext, decode_sglext);
+            }
+        }
+        // generate: response.meta_info.routed_experts
+        if let Some(prefill_meta) = prefill_json.get("meta_info") {
+            if let Some(decode_meta) = decode_json.get_mut("meta_info") {
+                merged_any |= Self::merge_routed_experts_in_json(prefill_meta, decode_meta);
+            }
+        }
+        merged_any
     }
 
     // Helper to merge logprobs from prefill and decode responses
@@ -1248,73 +1312,148 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &Bytes,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
-        } else {
-            None
+        // PD has to mutate the body (bootstrap_host/port/room
+        // injection per attempt), so we parse to `Value` either way.
+        // Routing-decision fields are read off the same `Value` so
+        // there's no second `from_slice` over the bytes.
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
+            }
         };
 
-        let batch_size = Self::get_generate_batch_size(body);
+        // Preserve the structured-400 contract: SGLang extension
+        // fields with the wrong type get the named
+        // `invalid_sglang_extension` code instead of being silently
+        // forwarded. The view's typed Deserialize would have caught
+        // this; with a permissive Value parse we re-check explicitly.
+        if let Some(field) = validate_extensions_in_value::<GenerateRoutingView>(&request_json) {
+            return error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
 
+        let is_stream = json_bool(&request_json, "stream").unwrap_or(false);
+        let return_logprob = json_bool(&request_json, "return_logprob").unwrap_or(false);
+        let return_routed_experts =
+            json_bool(&request_json, "return_routed_experts").unwrap_or(false);
+
+        if is_stream && return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
+
+        // Stash `body_model` and `batch_size` as owned values so we
+        // can move `request_json` into the retry loop without leaving
+        // a borrow alive in `PDRequestContext`.
+        let body_model_owned = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let batch_size = generate_batch_size_from_value(&request_json);
+
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| {
+                request_json
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .flatten();
+
+        let effective_model = model_id.or(body_model_owned.as_deref());
         let context = PDRequestContext {
             route: "/generate",
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts,
             request_text,
-            model_id,
+            model_id: effective_model,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &Bytes,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
-        } else {
-            None
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
+            }
         };
 
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
+        if let Some(field) = validate_extensions_in_value::<ChatRoutingView>(&request_json) {
+            return error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
 
+        let is_stream = json_bool(&request_json, "stream").unwrap_or(false);
+        let return_logprob = json_bool(&request_json, "logprobs").unwrap_or(false);
+        let return_routed_experts =
+            json_bool(&request_json, "return_routed_experts").unwrap_or(false);
+
+        if is_stream && return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
+
+        // See `route_generate`: stash owned scalars so we can move
+        // `request_json` into the retry loop.
+        let body_model_owned = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let batch_size = chat_batch_size_from_value(&request_json);
+
+        // Skip the walk when no active policy reports
+        // `needs_request_text == true` (cache-aware is the canonical
+        // consumer today; the gate keeps the non-cache-aware path at
+        // a single body parse).
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| extract_chat_request_text(&request_json))
+            .flatten();
+
+        let effective_model = model_id.or(body_model_owned.as_deref());
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts,
             request_text,
-            model_id,
+            model_id: effective_model,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_completion(
@@ -1343,12 +1482,25 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts: false,
             request_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        // Pre-serialize once outside the retry loop so each retry only
+        // pays a `Value::clone`, not a serde round-trip. Record the
+        // start metric on failure so the failure counts toward the
+        // same dispatch row `execute_dual_dispatch` would have recorded.
+        let request_json = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                record_pd_request_start(&context);
+                return Self::handle_serialization_error(e);
+            }
+        };
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_rerank(
@@ -1369,12 +1521,24 @@ impl RouterTrait for PDRouter {
             batch_size: None,
             is_stream: false,
             return_logprob: false,
+            return_routed_experts: false,
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        // Pre-serialize once outside the retry loop; on failure still
+        // record the start metric so the request counter doesn't drift
+        // below the error counter for this dispatch.
+        let request_json = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                record_pd_request_start(&context);
+                return Self::handle_serialization_error(e);
+            }
+        };
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_embeddings(
@@ -1410,8 +1574,116 @@ impl RouterTrait for PDRouter {
     }
 }
 
+/// Read a top-level JSON boolean field by name. Used by the PD
+/// router to pull routing flags (`stream`, `return_logprob`,
+/// `return_routed_experts`) off the `Value` it already parsed for
+/// bootstrap injection.
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+/// Record the "request start" metric for the PD path. Lives here as
+/// a free function so the typed call sites can invoke it on their
+/// pre-serialization error paths (before `execute_dual_dispatch`
+/// would otherwise have recorded it), keeping the request counter
+/// from diverging from the error counter on the rare typed
+/// `serde_json::to_value` failure.
+fn record_pd_request_start(context: &PDRequestContext<'_>) {
+    let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+    let endpoint = route_to_endpoint(context.route);
+    Metrics::record_router_request(
+        metrics_labels::ROUTER_HTTP,
+        metrics_labels::BACKEND_PD,
+        metrics_labels::CONNECTION_HTTP,
+        model,
+        endpoint,
+        bool_to_static_str(context.is_stream),
+    );
+}
+
+/// Pull a stable cache-aware routing prefix out of an already-parsed
+/// chat body, walking the FULL `messages` array. Cache-aware (and any
+/// other policy reporting `needs_request_text() == true`) needs every
+/// turn of the conversation in order to reuse the previous turn's KV
+/// cache on the same worker — first-message-only collapses every
+/// conversation that shares a system prompt onto one worker.
+///
+/// Per message:
+/// - `content` as string → append the string verbatim;
+/// - `content` as array of parts → append text-typed parts in order
+///   and skip image/audio/etc. (image URLs are not stable prefixes
+///   and add noise to the hash).
+///
+/// Messages are joined by `\n` so adjacent turns with the same raw
+/// text do not silently merge. Roles are preserved as a leading
+/// `{role}:` tag so a user turn cannot impersonate the system one;
+/// a malformed message with no `role` field still parses but uses an
+/// empty tag (`:`). Returns `None` if no text was found anywhere
+/// (e.g. an all-image conversation has no useful prefix).
+pub(crate) fn extract_chat_request_text(json: &Value) -> Option<String> {
+    let messages = json.get("messages")?.as_array()?;
+    let mut out = String::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        let Some(content) = msg.get("content") else {
+            continue;
+        };
+        let chunk = match content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => {
+                let mut buf = String::new();
+                for part in parts {
+                    let is_text = part.get("type").and_then(Value::as_str) == Some("text");
+                    if !is_text {
+                        continue;
+                    }
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        buf.push_str(t);
+                    }
+                }
+                buf
+            }
+            _ => continue,
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(role);
+        out.push(':');
+        out.push_str(&chunk);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Mirrors `GenerateRoutingView::batch_size` but reads from a raw
+/// `Value` so PD doesn't have to re-construct the typed view. SGLang's
+/// `input_ids` is either `Vec<u32>` (single — its length is the token
+/// count, NOT the batch size) or `Vec<Vec<u32>>` (batch — outer length
+/// IS the batch size); disambiguate by the type of the first element.
+fn generate_batch_size_from_value(value: &Value) -> Option<usize> {
+    let arr = value.get("input_ids")?.as_array()?;
+    match arr.first() {
+        Some(Value::Array(_)) => Some(arr.len()),
+        _ => None,
+    }
+}
+
+/// Mirrors `ChatRoutingView::batch_size`: `n > 1` triggers PD batch
+/// estimation, anything else is single-shot.
+fn chat_batch_size_from_value(value: &Value) -> Option<usize> {
+    match value.get("n")?.as_u64()? {
+        n if n > 1 => Some(n as usize),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
@@ -1427,6 +1699,45 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+        }
+    }
+
+    /// Mock policy that records the `request_text` it sees on every
+    /// `select_worker` call, then returns `None` so the PD dispatch
+    /// short-circuits before any HTTP is attempted.
+    ///
+    /// `needs_request_text() == true` triggers PD's walker gate so
+    /// `extract_chat_request_text` runs and its output flows into
+    /// `SelectWorkerInfo::request_text`.
+    #[derive(Debug, Default)]
+    struct RecordingPolicy {
+        seen_request_text: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::policies::LoadBalancingPolicy for RecordingPolicy {
+        async fn select_worker(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            info: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> Option<usize> {
+            self.seen_request_text
+                .lock()
+                .unwrap()
+                .push(info.request_text.map(str::to_string));
+            None
+        }
+
+        fn name(&self) -> &'static str {
+            "test-recording"
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
@@ -1480,6 +1791,74 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    /// Wire-up regression: PD's `route_chat` must run the full-array
+    /// walker AND pass the result into the policy as `request_text`.
+    /// This test replaces the prefill+decode policies with a recorder
+    /// that returns `None` from `select_worker` (so the dispatch
+    /// short-circuits before HTTP) and asserts the recorded text is
+    /// the walker's role-tagged multi-message output. A regression
+    /// that dropped `request_text` between `route_chat` and the
+    /// policy would leave the recorded text as `None`.
+    #[tokio::test]
+    async fn route_chat_passes_walker_output_to_policy() {
+        let router = create_test_pd_router();
+
+        let recording = Arc::new(RecordingPolicy::default());
+        router.policy_registry.set_prefill_policy(recording.clone());
+        router.policy_registry.set_decode_policy(recording.clone());
+
+        // Register one healthy prefill + one healthy decode so the
+        // policy is actually invoked (empty worker lists fail before
+        // ever calling select_worker).
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://prefill".to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://decode".to_string(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "stream": false,
+            })
+            .to_string(),
+        );
+
+        // Response will be a server-selection 5xx because the
+        // recording policy returns None — that's fine. We only care
+        // that the policy was called with the walker's output.
+        let _ = router.route_chat(None, &body, None).await;
+
+        let seen = recording.seen_request_text.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "policy must have been invoked at least once"
+        );
+        let first = seen[0]
+            .as_ref()
+            .expect("policy must see Some(request_text); got None means walker output was dropped");
+        let expected = "system:be concise\nuser:hello";
+        assert_eq!(
+            first, expected,
+            "policy must see the walker's role-tagged multi-message output"
+        );
     }
 
     #[test]
@@ -1575,5 +1954,160 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    /// Cache-aware policies hash on a stable text prefix per request.
+    /// The walker concatenates every message's text content so turn N+1
+    /// of a conversation shares a stable prefix with turn N — that's
+    /// what lets the prefix trie route subsequent turns to the worker
+    /// that already holds the KV cache.
+    mod extract_chat_request_text {
+        use serde_json::json;
+
+        use super::super::extract_chat_request_text;
+
+        #[test]
+        fn single_user_string_message() {
+            let body = json!({
+                "messages": [{"role": "user", "content": "deep learning is"}]
+            });
+            assert_eq!(
+                extract_chat_request_text(&body),
+                Some("user:deep learning is".to_string())
+            );
+        }
+
+        #[test]
+        fn multi_turn_grows_prefix() {
+            // A 4-message conversation (system + user + assistant + user).
+            // The walker concatenates every message so the cache-aware
+            // prefix trie keeps matching across turns.
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "what is rust?"},
+                    {"role": "assistant", "content": "a systems lang"},
+                    {"role": "user", "content": "and ownership?"}
+                ]
+            });
+            assert_eq!(
+                extract_chat_request_text(&body),
+                Some(
+                    "system:be concise\n\
+                     user:what is rust?\n\
+                     assistant:a systems lang\n\
+                     user:and ownership?"
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn turn_n_strictly_extends_turn_n_minus_1_prefix() {
+            // The whole point of the walker: turn N's routing text
+            // must be a prefix of turn N+1's, so the cache-aware trie
+            // picks the same worker.
+            let turn1 = json!({
+                "messages": [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "what is rust?"}
+                ]
+            });
+            let turn2 = json!({
+                "messages": [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "what is rust?"},
+                    {"role": "assistant", "content": "a systems lang"},
+                    {"role": "user", "content": "and ownership?"}
+                ]
+            });
+            let t1 = extract_chat_request_text(&turn1).unwrap();
+            let t2 = extract_chat_request_text(&turn2).unwrap();
+            assert!(
+                t2.starts_with(&t1),
+                "turn N+1 routing text must extend turn N's; got {t1:?} vs {t2:?}"
+            );
+        }
+
+        #[test]
+        fn role_tag_disambiguates_same_text() {
+            // Without the role prefix, an assistant echoing the user
+            // would yield identical text. With the tag, the two turns
+            // produce distinct routing prefixes that hash to separate
+            // trie entries.
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hello"}
+                ]
+            });
+            assert_eq!(
+                extract_chat_request_text(&body),
+                Some("user:hello\nassistant:hello".to_string())
+            );
+        }
+
+        #[test]
+        fn multimodal_parts_keep_text_drop_images() {
+            // System prompt mixes text + image parts; image is ignored
+            // for hashing (no stable prefix), text is preserved.
+            let body = json!({
+                "messages": [{
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "you are "},
+                        {"type": "text", "text": "helpful"},
+                        {"type": "image_url", "image_url": {"url": "ignored"}}
+                    ]
+                }]
+            });
+            assert_eq!(
+                extract_chat_request_text(&body),
+                Some("system:you are helpful".to_string())
+            );
+        }
+
+        #[test]
+        fn all_image_message_is_skipped() {
+            // A message whose content is purely images contributes
+            // nothing to the prefix (and must not split the role tag
+            // off into a dangling `role:` token).
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": "x"}}
+                    ]},
+                    {"role": "user", "content": "describe please"}
+                ]
+            });
+            assert_eq!(
+                extract_chat_request_text(&body),
+                Some("user:describe please".to_string())
+            );
+        }
+
+        #[test]
+        fn missing_messages_yields_none() {
+            let body = json!({"model": "x"});
+            assert_eq!(extract_chat_request_text(&body), None);
+        }
+
+        #[test]
+        fn empty_messages_yields_none() {
+            let body = json!({"messages": []});
+            assert_eq!(extract_chat_request_text(&body), None);
+        }
+
+        #[test]
+        fn all_messages_textless_yields_none() {
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": "x"}}
+                    ]}
+                ]
+            });
+            assert_eq!(extract_chat_request_text(&body), None);
+        }
     }
 }

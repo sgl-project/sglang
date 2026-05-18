@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Json, Path, State},
+    extract::{FromRef, Json, Path, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
@@ -19,9 +19,38 @@ use axum::{
     Router,
 };
 use futures_util::stream::{self, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Shared state for mock-worker handlers. Wraps the existing config Arc
+/// plus a request-capture buffer so tests can assert what payload the
+/// worker actually received (e.g. that SGLang extension fields the
+/// gateway claims to forward verbatim really do reach the backend).
+///
+/// `recorded_requests` is intentionally a `std::sync::Mutex`: the lock
+/// is only held across `.push(...)` and is released before any `.await`,
+/// so a sync mutex is correct and keeps `record(...)` non-async.
+#[derive(Clone)]
+pub struct MockWorkerState {
+    pub config: Arc<RwLock<MockWorkerConfig>>,
+    recorded_requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl MockWorkerState {
+    fn record(&self, payload: Value) {
+        self.recorded_requests.lock().unwrap().push(payload);
+    }
+}
+
+// Existing handlers extract `Arc<RwLock<MockWorkerConfig>>` directly via
+// State; this lets them keep working unchanged when the router is built
+// with `MockWorkerState`.
+impl FromRef<MockWorkerState> for Arc<RwLock<MockWorkerConfig>> {
+    fn from_ref(state: &MockWorkerState) -> Self {
+        state.config.clone()
+    }
+}
 
 /// Configuration for mock worker behavior
 #[derive(Clone)]
@@ -31,6 +60,16 @@ pub struct MockWorkerConfig {
     pub health_status: HealthStatus,
     pub response_delay_ms: u64,
     pub fail_rate: f32,
+    /// Optional base64 string injected as `meta_info.routed_experts`
+    /// (and `sglext.routed_experts` for chat completions) in
+    /// non-streaming responses, but **only when the request payload has
+    /// `return_routed_experts: true`**. The gating is what makes
+    /// forwarding tests load-bearing.
+    pub routed_experts_b64: Option<String>,
+    /// Bypass the `return_routed_experts: true` gate above. Used by the
+    /// no-merge inverse test to prove the gateway *did not* merge when
+    /// the flag is absent.
+    pub always_emit_routed_experts: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +89,7 @@ pub enum HealthStatus {
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
+    recorded_requests: Arc<Mutex<Vec<Value>>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -58,9 +98,16 @@ impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
             shutdown_handle: None,
             shutdown_tx: None,
         }
+    }
+
+    /// Snapshot of every JSON request body received by `/generate` and
+    /// `/v1/chat/completions` since startup, in arrival order.
+    pub fn recorded_requests(&self) -> Vec<Value> {
+        self.recorded_requests.lock().unwrap().clone()
     }
 
     /// Start the mock worker server
@@ -96,7 +143,10 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
-            .with_state(config);
+            .with_state(MockWorkerState {
+                config,
+                recorded_requests: self.recorded_requests.clone(),
+            });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
@@ -295,10 +345,11 @@ async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>)
 }
 
 async fn generate_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Json(payload): Json<serde_json::Value>,
+    State(state): State<MockWorkerState>,
+    Json(payload): Json<Value>,
 ) -> Response {
-    let config = config.read().await;
+    state.record(payload.clone());
+    let config = state.config.read().await;
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
@@ -381,35 +432,42 @@ async fn generate_handler(
         )
             .into_response()
     } else {
-        (
-            [("x-worker-id", worker_id)],
-            Json(json!({
-                "text": "This is a mock response.",
-                "meta_info": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "completion_tokens_wo_jump_forward": 5,
-                    "input_token_logprobs": null,
-                    "output_token_logprobs": null,
-                    "first_token_latency": config.response_delay_ms as f64 / 1000.0,
-                    "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
-                    "time_per_output_token": 0.01,
-                    "finish_reason": {
-                        "type": "stop",
-                        "reason": "length"
-                    }
+        let mut body = json!({
+            "text": "This is a mock response.",
+            "meta_info": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "completion_tokens_wo_jump_forward": 5,
+                "input_token_logprobs": null,
+                "output_token_logprobs": null,
+                "first_token_latency": config.response_delay_ms as f64 / 1000.0,
+                "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
+                "time_per_output_token": 0.01,
+                "finish_reason": {
+                    "type": "stop",
+                    "reason": "length"
                 }
-            })),
-        )
-            .into_response()
+            }
+        });
+        let client_asked_for_experts = payload
+            .get("return_routed_experts")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if client_asked_for_experts || config.always_emit_routed_experts {
+            if let Some(b64) = config.routed_experts_b64.as_deref() {
+                body["meta_info"]["routed_experts"] = json!(b64);
+            }
+        }
+        ([("x-worker-id", worker_id)], Json(body)).into_response()
     }
 }
 
 async fn chat_completions_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Json(payload): Json<serde_json::Value>,
+    State(state): State<MockWorkerState>,
+    Json(payload): Json<Value>,
 ) -> Response {
-    let config = config.read().await;
+    state.record(payload.clone());
+    let config = state.config.read().await;
 
     if should_fail(&config).await {
         return (
@@ -465,7 +523,7 @@ async fn chat_completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        Json(json!({
+        let mut body = json!({
             "id": format!("chatcmpl-{}", Uuid::new_v4()),
             "object": "chat.completion",
             "created": timestamp,
@@ -483,14 +541,26 @@ async fn chat_completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
-        }))
-        .into_response()
+        });
+        let client_asked_for_experts = payload
+            .get("return_routed_experts")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if client_asked_for_experts || config.always_emit_routed_experts {
+            if let Some(b64) = config.routed_experts_b64.as_deref() {
+                // SGLang chat responses surface routed_experts under
+                // `sglext`; the merge code in pd_router.rs walks both
+                // `meta_info` and `sglext`.
+                body["sglext"] = json!({ "routed_experts": b64 });
+            }
+        }
+        Json(body).into_response()
     }
 }
 
 async fn completions_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<Value>,
 ) -> Response {
     let config = config.read().await;
 
@@ -570,7 +640,7 @@ async fn completions_handler(
 
 async fn responses_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<Value>,
 ) -> Response {
     let config = config.read().await;
 
@@ -1217,7 +1287,7 @@ fn response_exists_for_port(port: u16, response_id: &str) -> bool {
 // Minimal rerank handler returning mock results; router shapes final response
 async fn rerank_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     let config = config.read().await;
 
@@ -1273,6 +1343,8 @@ impl Default for MockWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }
     }
 }

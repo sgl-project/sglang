@@ -239,6 +239,72 @@ mod cache_aware_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Multi-turn cache-aware regression: each turn of a single
+    /// conversation must land on the same worker so the KV-cache from
+    /// the prior turn can be reused. Previously the unified HTTP router
+    /// hardcoded `None` for the routing text on `/v1/chat/completions`,
+    /// which silently disabled cache-aware routing and scattered turns
+    /// across workers.
+    #[tokio::test]
+    async fn test_cache_aware_chat_multi_turn_consistent_worker() {
+        let config = TestRouterConfig::cache_aware(3110);
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19060, 2))
+                .await;
+        let app = ctx.create_app().await;
+
+        // Simulate 4 turns of one conversation. Each turn extends the
+        // prior `messages` array, so the cache-aware prefix trie sees
+        // turn N's text as a prefix of turn N+1's and must keep
+        // routing to the same worker.
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are a careful assistant."}),
+            json!({"role": "user", "content": "What is Rust's ownership model?"}),
+        ];
+
+        for turn in 0..4 {
+            let payload = json!({
+                "model": "mock-model",
+                "messages": messages,
+                "stream": false,
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "turn {turn} should succeed");
+
+            // Extend the conversation with the assistant's reply + a
+            // new user turn so the next iteration shares a strictly
+            // longer prefix.
+            messages.push(json!({"role": "assistant", "content": "A systems language."}));
+            messages.push(json!({"role": "user", "content": format!("Follow-up #{turn}?")}));
+        }
+
+        // Each turn appears in exactly one worker's recorded log, and
+        // every turn must land on the same worker for KV-cache reuse.
+        let totals: Vec<usize> = ctx
+            .workers
+            .iter()
+            .map(|w| w.recorded_requests().len())
+            .collect();
+        let occupied: Vec<usize> = totals.iter().copied().filter(|n| *n > 0).collect();
+        assert_eq!(
+            occupied.len(),
+            1,
+            "cache-aware multi-turn chat must land on a single worker, got {totals:?}"
+        );
+        assert_eq!(
+            occupied[0], 4,
+            "the chosen worker must receive all 4 turns, got {totals:?}"
+        );
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]
