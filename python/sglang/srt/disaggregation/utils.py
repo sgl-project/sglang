@@ -117,16 +117,6 @@ def poll_and_all_reduce_with_staging(
 #########################
 
 
-def _to_signed_int64(unsigned_value: int) -> int:
-    """Reinterpret an unsigned-64 value as torch's signed int64 for storage."""
-    assert 0 <= unsigned_value < (1 << 64)
-    mask = (1 << 64) - 1
-    value = unsigned_value & mask
-    if value >= (1 << 63):
-        value -= 1 << 64
-    return value
-
-
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
 
@@ -340,13 +330,14 @@ class MetadataBuffers:
         # canary attached (returns 0/0 → decode treats as fresh chain).
         if self.token_to_kv_pool is not None and req.req_pool_idx is not None:
             from sglang.srt.kv_cache_canary.api import export_pd_canary_snapshot
+            from sglang.srt.kv_cache_canary.host_state import to_signed_int64
 
             k_req, prev_hash_tail = export_pd_canary_snapshot(
                 pool=self.token_to_kv_pool,
                 req_pool_idx=int(req.req_pool_idx),
             )
             self.canary_k_req[req.metadata_buffer_index, 0] = k_req
-            self.canary_prev_hash_tail[req.metadata_buffer_index, 0] = _to_signed_int64(
+            self.canary_prev_hash_tail[req.metadata_buffer_index, 0] = to_signed_int64(
                 prev_hash_tail
             )
 

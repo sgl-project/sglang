@@ -126,7 +126,7 @@ def install_spec_allocator_free_hook(
 
     Idempotent. Only patches when an allocator is present.
     """
-    allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+    allocator = model_runner.token_to_kv_pool_allocator
     if allocator is None:
         return
     if getattr(allocator, "_kv_canary_free_patched", False):

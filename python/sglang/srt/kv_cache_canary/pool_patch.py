@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -79,35 +79,47 @@ def attach_shadow_buffers(
     setattr(pool, _CANARY_POOL_KIND_ATTR, pool_kind)
 
 
-def _attach_mha(pool: "MHATokenToKVPool") -> None:
-    layer_num = pool.layer_num
-    if layer_num <= 0:
-        raise RuntimeError(f"kv-canary: pool has invalid layer_num={layer_num}")
+def _set_canary_shadow(
+    target: object,
+    *,
+    k_template: torch.Tensor,
+    v_template: Optional[torch.Tensor],
+) -> None:
+    """Allocate canary shadow tensors on ``target`` from K (and optional V).
 
-    k_template = pool.k_buffer[0]
-    v_template = pool.v_buffer[0]
-
-    k_shape = tuple(k_template.shape)
-    v_shape = tuple(v_template.shape)
+    ``target`` is the pool object the runner pulls shadows off (the pool
+    itself for MHA/MLA, or the parent SWA pool whose ``swa_kv_pool``
+    sub-pool supplied the templates). ``v_template=None`` means the pool
+    has no V half (MLA latent rep, DSV4 single kv_buffer); only the K-half
+    shadow gets allocated and ``canary_has_v_half`` is False.
+    """
     dtype = k_template.dtype
     device = k_template.device
+    k_shape = tuple(k_template.shape)
 
-    pool.canary_k_head = torch.zeros(k_shape, dtype=dtype, device=device)
-    pool.canary_k_tail = torch.zeros(k_shape, dtype=dtype, device=device)
-    pool.canary_v_head = torch.zeros(v_shape, dtype=dtype, device=device)
-    pool.canary_v_tail = torch.zeros(v_shape, dtype=dtype, device=device)
+    target.canary_k_head = torch.zeros(k_shape, dtype=dtype, device=device)
+    target.canary_k_tail = torch.zeros(k_shape, dtype=dtype, device=device)
+    if v_template is None:
+        target.canary_v_head = None
+        target.canary_v_tail = None
+        target.canary_has_v_half = False
+    else:
+        v_shape = tuple(v_template.shape)
+        target.canary_v_head = torch.zeros(v_shape, dtype=dtype, device=device)
+        target.canary_v_tail = torch.zeros(v_shape, dtype=dtype, device=device)
+        target.canary_has_v_half = True
 
-    pool.canary_slot_stride_bytes = int(k_template[0].nbytes)
-    pool.canary_has_v_half = True
+    target.canary_slot_stride_bytes = int(k_template[0].nbytes)
 
+
+def _attach_mha(pool: "MHATokenToKVPool") -> None:
+    if pool.layer_num <= 0:
+        raise RuntimeError(f"kv-canary: pool has invalid layer_num={pool.layer_num}")
+    _set_canary_shadow(pool, k_template=pool.k_buffer[0], v_template=pool.v_buffer[0])
     _patch_get_contiguous_buf_infos_mha(pool)
-
     logger.info(
-        "kv-canary: attached shadow tensors to MHATokenToKVPool "
-        "(k_shape=%s, v_shape=%s, dtype=%s, slot_stride_bytes=%d)",
-        k_shape,
-        v_shape,
-        dtype,
+        "kv-canary: attached MHA shadow (dtype=%s, slot_stride_bytes=%d)",
+        pool.canary_k_head.dtype,
         pool.canary_slot_stride_bytes,
     )
 
@@ -116,35 +128,20 @@ def _attach_mla(pool: "MLATokenToKVPool") -> None:
     """Attach to MLA / NSA / FP4 — single latent ``kv_buffer`` (no V half).
 
     MLA stores a single latent representation per slot; ``kv_buffer[i]`` is
-    the only layer-shaped buffer. We only allocate a K-half shadow pair
-    (``canary_k_head`` / ``canary_k_tail``); ``canary_has_v_half=False`` tells
-    the runner to skip the V-half kernel launch.
+    the only layer-shaped buffer. Only allocate a K-half shadow pair;
+    ``canary_has_v_half=False`` tells the runner to skip the V-half kernel
+    launch.
     """
-    layer_num = pool.layer_num
-    if layer_num <= 0:
-        raise RuntimeError(f"kv-canary: MLA pool has invalid layer_num={layer_num}")
-
-    kv_template = pool.kv_buffer[0]
-    kv_shape = tuple(kv_template.shape)
-    dtype = kv_template.dtype
-    device = kv_template.device
-
-    pool.canary_k_head = torch.zeros(kv_shape, dtype=dtype, device=device)
-    pool.canary_k_tail = torch.zeros(kv_shape, dtype=dtype, device=device)
-    pool.canary_v_head = None
-    pool.canary_v_tail = None
-
-    pool.canary_slot_stride_bytes = int(kv_template[0].nbytes)
-    pool.canary_has_v_half = False
-
+    if pool.layer_num <= 0:
+        raise RuntimeError(
+            f"kv-canary: MLA pool has invalid layer_num={pool.layer_num}"
+        )
+    _set_canary_shadow(pool, k_template=pool.kv_buffer[0], v_template=None)
     _patch_get_contiguous_buf_infos_mla(pool)
-
     logger.info(
-        "kv-canary: attached shadow tensors to %s "
-        "(kv_shape=%s, dtype=%s, slot_stride_bytes=%d)",
+        "kv-canary: attached MLA-style shadow on %s (dtype=%s, slot_stride_bytes=%d)",
         type(pool).__name__,
-        kv_shape,
-        dtype,
+        pool.canary_k_head.dtype,
         pool.canary_slot_stride_bytes,
     )
 
@@ -152,9 +149,9 @@ def _attach_mla(pool: "MLATokenToKVPool") -> None:
 def _attach_swa(pool: "BaseSWAKVPool") -> None:
     """Attach shadows to the SWA sub-pool using its own slot index space.
 
-    Critical: SWA's slot index space is independent from the full pool's. We
-    attach the shadows on ``pool.swa_kv_pool`` (an ``MHATokenToKVPool`` for
-    SWAKVPool, a ``DeepSeekV4SingleKVPool`` for DSV4). This way
+    Critical: SWA's slot index space is independent from the full pool's.
+    We size the shadows off ``pool.swa_kv_pool`` (an MHA-style pool for
+    SWAKVPool, a single-kv_buffer pool for DSV4) so
     ``shadow[swa_slot_idx]`` corresponds 1:1 with ``swa_kv_pool[swa_slot_idx]``
     and never aliases full-pool slots.
 
@@ -162,109 +159,92 @@ def _attach_swa(pool: "BaseSWAKVPool") -> None:
     (the PD-main path for SWA) so the canary shadow rides PD KV transfer.
     """
     swa_sub_pool = pool.swa_kv_pool
-    if not hasattr(swa_sub_pool, "k_buffer") or not hasattr(swa_sub_pool, "v_buffer"):
-        _attach_swa_single_buffer(pool, swa_sub_pool)
+    if hasattr(swa_sub_pool, "k_buffer") and hasattr(swa_sub_pool, "v_buffer"):
+        _set_canary_shadow(
+            pool,
+            k_template=swa_sub_pool.k_buffer[0],
+            v_template=swa_sub_pool.v_buffer[0],
+        )
+    elif hasattr(swa_sub_pool, "kv_buffer"):
+        _set_canary_shadow(pool, k_template=swa_sub_pool.kv_buffer[0], v_template=None)
     else:
-        _attach_swa_mha_style(pool, swa_sub_pool)
-
-    _patch_get_state_buf_infos_swa(pool)
-
-
-def _attach_swa_mha_style(pool: "BaseSWAKVPool", swa_sub_pool: "KVCache") -> None:
-    k_template = swa_sub_pool.k_buffer[0]
-    v_template = swa_sub_pool.v_buffer[0]
-
-    k_shape = tuple(k_template.shape)
-    v_shape = tuple(v_template.shape)
-    dtype = k_template.dtype
-    device = k_template.device
-
-    pool.canary_k_head = torch.zeros(k_shape, dtype=dtype, device=device)
-    pool.canary_k_tail = torch.zeros(k_shape, dtype=dtype, device=device)
-    pool.canary_v_head = torch.zeros(v_shape, dtype=dtype, device=device)
-    pool.canary_v_tail = torch.zeros(v_shape, dtype=dtype, device=device)
-
-    pool.canary_slot_stride_bytes = int(k_template[0].nbytes)
-    pool.canary_has_v_half = True
-
-    logger.info(
-        "kv-canary: attached shadow tensors to SWA pool sub-pool "
-        "(k_shape=%s, v_shape=%s, dtype=%s, slot_stride_bytes=%d)",
-        k_shape,
-        v_shape,
-        dtype,
-        pool.canary_slot_stride_bytes,
-    )
-
-
-def _attach_swa_single_buffer(pool: "BaseSWAKVPool", swa_sub_pool: "KVCache") -> None:
-    """DSV4 case: sub-pool has a single ``kv_buffer`` (no K/V split)."""
-    if not hasattr(swa_sub_pool, "kv_buffer"):
         raise RuntimeError(
             f"kv-canary: SWA sub-pool {type(swa_sub_pool).__name__} has neither "
             "k_buffer/v_buffer nor kv_buffer; cannot attach shadow"
         )
-    kv_template = swa_sub_pool.kv_buffer[0]
-    kv_shape = tuple(kv_template.shape)
-    dtype = kv_template.dtype
-    device = kv_template.device
-
-    pool.canary_k_head = torch.zeros(kv_shape, dtype=dtype, device=device)
-    pool.canary_k_tail = torch.zeros(kv_shape, dtype=dtype, device=device)
-    pool.canary_v_head = None
-    pool.canary_v_tail = None
-
-    pool.canary_slot_stride_bytes = int(kv_template[0].nbytes)
-    pool.canary_has_v_half = False
-
+    _patch_get_state_buf_infos_swa(pool)
     logger.info(
-        "kv-canary: attached shadow tensors to SWA pool (single kv_buffer) "
-        "(kv_shape=%s, dtype=%s, slot_stride_bytes=%d)",
-        kv_shape,
-        dtype,
+        "kv-canary: attached SWA shadow on %s (v_half=%s, dtype=%s, slot_stride_bytes=%d)",
+        type(pool).__name__,
+        pool.canary_has_v_half,
+        pool.canary_k_head.dtype,
         pool.canary_slot_stride_bytes,
+    )
+
+
+def _compose_buf_infos_with_canaries(
+    *,
+    data_ptrs: List[int],
+    data_lens: List[int],
+    item_lens: List[int],
+    pool: object,
+    page_size: int,
+    has_v_half: bool,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Splice canary entries into a `(ptrs, lens, item_lens)` buf-info triple.
+
+    Single buffer (``has_v_half=False``): append ``[k_head, k_tail]`` at the
+    tail.
+
+    K|V split (``has_v_half=True``): insert ``[k_head, k_tail]`` at the K
+    block tail and ``[v_head, v_tail]`` at the V block tail so ``len // 2``
+    still bisects K vs V — what downstream PD code relies on.
+    """
+    k_head = pool.canary_k_head
+    k_tail = pool.canary_k_tail
+    k_extra_ptrs = [k_head.data_ptr(), k_tail.data_ptr()]
+    k_extra_lens = [k_head.nbytes, k_tail.nbytes]
+    k_extra_item_lens = [k_head[0].nbytes * page_size, k_tail[0].nbytes * page_size]
+
+    if not has_v_half:
+        return (
+            list(data_ptrs) + k_extra_ptrs,
+            list(data_lens) + k_extra_lens,
+            list(item_lens) + k_extra_item_lens,
+        )
+
+    v_head = pool.canary_v_head
+    v_tail = pool.canary_v_tail
+    v_extra_ptrs = [v_head.data_ptr(), v_tail.data_ptr()]
+    v_extra_lens = [v_head.nbytes, v_tail.nbytes]
+    v_extra_item_lens = [v_head[0].nbytes * page_size, v_tail[0].nbytes * page_size]
+
+    mid = len(data_ptrs) // 2
+    return (
+        list(data_ptrs[:mid]) + k_extra_ptrs + list(data_ptrs[mid:]) + v_extra_ptrs,
+        list(data_lens[:mid]) + k_extra_lens + list(data_lens[mid:]) + v_extra_lens,
+        list(item_lens[:mid])
+        + k_extra_item_lens
+        + list(item_lens[mid:])
+        + v_extra_item_lens,
     )
 
 
 def _patch_get_contiguous_buf_infos_mha(pool: "MHATokenToKVPool") -> None:
     original = pool.get_contiguous_buf_infos
 
-    def patched_get_contiguous_buf_infos() -> Tuple[List[int], List[int], List[int]]:
-        kv_data_ptrs, kv_data_lens, kv_item_lens = original()
-        num = len(kv_data_ptrs) // 2
-        k_ptrs = kv_data_ptrs[:num]
-        v_ptrs = kv_data_ptrs[num:]
-        k_lens = kv_data_lens[:num]
-        v_lens = kv_data_lens[num:]
-        k_item_lens = kv_item_lens[:num]
-        v_item_lens = kv_item_lens[num:]
-
-        k_head = pool.canary_k_head
-        k_tail = pool.canary_k_tail
-        v_head = pool.canary_v_head
-        v_tail = pool.canary_v_tail
-
-        new_ptrs = (
-            k_ptrs
-            + [k_head.data_ptr(), k_tail.data_ptr()]
-            + v_ptrs
-            + [v_head.data_ptr(), v_tail.data_ptr()]
+    def patched() -> Tuple[List[int], List[int], List[int]]:
+        ptrs, lens, item_lens = original()
+        return _compose_buf_infos_with_canaries(
+            data_ptrs=ptrs,
+            data_lens=lens,
+            item_lens=item_lens,
+            pool=pool,
+            page_size=pool.page_size,
+            has_v_half=True,
         )
-        new_lens = (
-            k_lens
-            + [k_head.nbytes, k_tail.nbytes]
-            + v_lens
-            + [v_head.nbytes, v_tail.nbytes]
-        )
-        new_item_lens = (
-            k_item_lens
-            + [k_head[0].nbytes * pool.page_size, k_tail[0].nbytes * pool.page_size]
-            + v_item_lens
-            + [v_head[0].nbytes * pool.page_size, v_tail[0].nbytes * pool.page_size]
-        )
-        return new_ptrs, new_lens, new_item_lens
 
-    pool.get_contiguous_buf_infos = patched_get_contiguous_buf_infos
+    pool.get_contiguous_buf_infos = patched
 
 
 def _patch_get_contiguous_buf_infos_mla(pool: "MLATokenToKVPool") -> None:
@@ -276,80 +256,45 @@ def _patch_get_contiguous_buf_infos_mla(pool: "MLATokenToKVPool") -> None:
     """
     original = pool.get_contiguous_buf_infos
 
-    def patched_get_contiguous_buf_infos() -> Tuple[List[int], List[int], List[int]]:
-        data_ptrs, data_lens, item_lens = original()
-        k_head = pool.canary_k_head
-        k_tail = pool.canary_k_tail
-        new_ptrs = data_ptrs + [k_head.data_ptr(), k_tail.data_ptr()]
-        new_lens = data_lens + [k_head.nbytes, k_tail.nbytes]
-        new_item_lens = item_lens + [
-            k_head[0].nbytes * pool.page_size,
-            k_tail[0].nbytes * pool.page_size,
-        ]
-        return new_ptrs, new_lens, new_item_lens
+    def patched() -> Tuple[List[int], List[int], List[int]]:
+        ptrs, lens, item_lens = original()
+        return _compose_buf_infos_with_canaries(
+            data_ptrs=ptrs,
+            data_lens=lens,
+            item_lens=item_lens,
+            pool=pool,
+            page_size=pool.page_size,
+            has_v_half=False,
+        )
 
-    pool.get_contiguous_buf_infos = patched_get_contiguous_buf_infos
+    pool.get_contiguous_buf_infos = patched
 
 
 def _patch_get_state_buf_infos_swa(pool: "BaseSWAKVPool") -> None:
     """SWA + PD: ``get_state_buf_infos`` is the main path.
 
-    When the SWA sub-pool has an MHA-style K|V split (``canary_has_v_half``
-    True), we insert the K-shadow at the K block tail and the V-shadow at the
-    V block tail so downstream PD code that bisects with ``len/2`` keeps
-    splitting K vs V correctly. When the sub-pool has a single ``kv_buffer``
-    (e.g. DSV4), we just append the two K-shadow entries at the end.
+    When the SWA sub-pool has an MHA-style K|V split, we insert K-shadow at
+    the K block tail and V-shadow at the V block tail so downstream PD code
+    that bisects with ``len/2`` keeps splitting K vs V correctly. Single
+    ``kv_buffer`` (DSV4) just appends the two K-shadow entries at the end.
     """
     original = pool.get_state_buf_infos
 
-    def patched_get_state_buf_infos() -> Tuple[List[int], List[int], List[int]]:
-        data_ptrs, data_lens, item_lens = original()
-        k_head = pool.canary_k_head
-        k_tail = pool.canary_k_tail
+    def patched() -> Tuple[List[int], List[int], List[int]]:
+        ptrs, lens, item_lens = original()
         page_size = getattr(pool, "swa_page_size", None) or getattr(
             pool, "page_size", 1
         )
+        return _compose_buf_infos_with_canaries(
+            data_ptrs=ptrs,
+            data_lens=lens,
+            item_lens=item_lens,
+            pool=pool,
+            page_size=page_size,
+            has_v_half=pool.canary_has_v_half,
+        )
 
-        if pool.canary_v_head is not None and pool.canary_v_tail is not None:
-            # K|V midpoint preserving insert.
-            num = len(data_ptrs) // 2
-            k_ptrs = list(data_ptrs[:num])
-            v_ptrs = list(data_ptrs[num:])
-            k_lens = list(data_lens[:num])
-            v_lens = list(data_lens[num:])
-            k_item_lens = list(item_lens[:num])
-            v_item_lens = list(item_lens[num:])
-            v_head = pool.canary_v_head
-            v_tail = pool.canary_v_tail
-            new_ptrs = (
-                k_ptrs
-                + [k_head.data_ptr(), k_tail.data_ptr()]
-                + v_ptrs
-                + [v_head.data_ptr(), v_tail.data_ptr()]
-            )
-            new_lens = (
-                k_lens
-                + [k_head.nbytes, k_tail.nbytes]
-                + v_lens
-                + [v_head.nbytes, v_tail.nbytes]
-            )
-            new_item_lens = (
-                k_item_lens
-                + [k_head[0].nbytes * page_size, k_tail[0].nbytes * page_size]
-                + v_item_lens
-                + [v_head[0].nbytes * page_size, v_tail[0].nbytes * page_size]
-            )
-            return new_ptrs, new_lens, new_item_lens
-
-        new_ptrs = list(data_ptrs) + [k_head.data_ptr(), k_tail.data_ptr()]
-        new_lens = list(data_lens) + [k_head.nbytes, k_tail.nbytes]
-        new_item_lens = list(item_lens) + [
-            k_head[0].nbytes * page_size,
-            k_tail[0].nbytes * page_size,
-        ]
-        return new_ptrs, new_lens, new_item_lens
-
-    pool.get_state_buf_infos = patched_get_state_buf_infos
+    pool.get_state_buf_infos = patched
 
 
 def get_shadow_buffers(

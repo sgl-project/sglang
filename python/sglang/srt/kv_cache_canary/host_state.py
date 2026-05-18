@@ -224,7 +224,7 @@ class CanaryHostState:
                     verify_req_ids.append(req_pool_idx)
                     verify_token_ids.append(lc.token_id)
                     verify_positions.append(lc.position)
-                    verify_prev_hashes.append(_to_signed_int64(lc.prev_hash_at_write))
+                    verify_prev_hashes.append(to_signed_int64(lc.prev_hash_at_write))
                     verify_seq_positions.append(lc.position)
                     verify_slot_indices.append(lc.slot_idx)
 
@@ -240,7 +240,7 @@ class CanaryHostState:
                     write_req_ids.append(req_pool_idx)
                     write_token_ids.append(token_id)
                     write_positions.append(pos)
-                    write_prev_hashes.append(_to_signed_int64(prev_hash))
+                    write_prev_hashes.append(to_signed_int64(prev_hash))
                     last_token_id = token_id
                     last_position = pos
                     last_slot_idx = slot_idx
@@ -318,7 +318,7 @@ class BatchPlan:
     next_state: Dict[int, _RequestState]
 
 
-def _to_signed_int64(unsigned_value: int) -> int:
+def to_signed_int64(unsigned_value: int) -> int:
     assert (
         0 <= unsigned_value < (1 << 64)
     ), f"kv-canary: prev_hash out of unsigned-64 range: {unsigned_value:#x}"

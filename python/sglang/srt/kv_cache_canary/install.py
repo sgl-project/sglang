@@ -94,7 +94,7 @@ def _select_pool_kind(
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
-    is_draft = bool(getattr(model_runner, "is_draft_worker", False))
+    is_draft = bool(model_runner.is_draft_worker)
     if isinstance(pool, BaseSWAKVPool):
         return PoolKind.SWA
     if isinstance(pool, MLATokenToKVPool):
