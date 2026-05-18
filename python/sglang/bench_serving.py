@@ -785,9 +785,9 @@ def _build_start_profile_body() -> Dict[str, Any]:
         "SGLANG_TORCH_PROFILER_DIR"
     )
     if output_dir:
-        output_dir_path = Path(
-            os.path.abspath(os.path.normpath(output_dir))
-        ) / str(time.time())
+        output_dir_path = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
+            time.time()
+        )
         output_dir_path.mkdir(exist_ok=True, parents=True)
         body["output_dir"] = str(output_dir_path)
 

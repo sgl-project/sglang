@@ -77,9 +77,7 @@ class TestBuildStartProfileBody(CustomTestCase):
     def setUp(self):
         # Make sure no leftover SGLANG_TORCH_PROFILER_DIR sneaks output_dir
         # into bodies we expect to be empty.
-        self._env_patch = mock.patch.dict(
-            "os.environ", {}, clear=False
-        )
+        self._env_patch = mock.patch.dict("os.environ", {}, clear=False)
         self._env_patch.start()
         import os
 
@@ -157,15 +155,11 @@ class TestAsyncRequestProfile(CustomTestCase):
             self.assertNotIn(forbidden, body)
 
     def test_start_profile_num_steps(self):
-        recorded = self._run(
-            _make_args(profile_num_steps=5), "http://x/start_profile"
-        )
+        recorded = self._run(_make_args(profile_num_steps=5), "http://x/start_profile")
         self.assertEqual(recorded[0]["json"]["num_steps"], 5)
 
     def test_stop_profile_body_is_empty(self):
-        recorded = self._run(
-            _make_args(profile_num_steps=5), "http://x/stop_profile"
-        )
+        recorded = self._run(_make_args(profile_num_steps=5), "http://x/stop_profile")
         self.assertEqual(recorded[0]["json"], {})
 
 
