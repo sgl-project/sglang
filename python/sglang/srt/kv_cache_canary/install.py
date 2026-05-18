@@ -9,11 +9,14 @@ from sglang.srt.kv_cache_canary.api import (
     attach,
     get_runner,
     install_req_to_token_pool_free_hook,
+    install_spec_allocator_free_hook,
+    install_swa_eviction_hook,
     maybe_perturb_req_to_token,
     run_head,
     run_tail,
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
+from sglang.srt.kv_cache_canary.pool_patch import PoolKind
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -43,18 +46,13 @@ def install_on_model_runner(
     if not config.enabled:
         return
 
-    if _server_args_use_disaggregation(model_runner):
-        logger.warning(
-            "kv-canary: PD disaggregation is not yet supported by v1; skipping install."
-        )
-        return
-
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
     pool = model_runner.token_to_kv_pool
-    if not isinstance(pool, MHATokenToKVPool):
+    pool_kind = _select_pool_kind(model_runner=model_runner, pool=pool)
+    if pool_kind is None:
         logger.warning(
-            "kv-canary v1 only supports MHATokenToKVPool; got %s. Skipping.",
+            "kv-canary: unsupported pool type %s; skipping install.",
             type(pool).__name__,
         )
         return
@@ -68,6 +66,7 @@ def install_on_model_runner(
         config=config,
         req_to_token_pool=model_runner.req_to_token_pool,
         device=device,
+        pool_kind=pool_kind,
     )
     if runner is None:
         return
@@ -76,18 +75,35 @@ def install_on_model_runner(
         runner=runner,
         req_to_token_pool=model_runner.req_to_token_pool,
     )
+
+    if isinstance(pool, BaseSWAKVPool):
+        install_swa_eviction_hook(runner=runner, pool=pool)
+
+    install_spec_allocator_free_hook(
+        runner=runner,
+        model_runner=model_runner,
+    )
+
     _patch_model_forward(model_runner=model_runner)
     setattr(model_runner, _FORWARD_PATCHED_ATTR, True)
 
 
-def _server_args_use_disaggregation(model_runner: "ModelRunner") -> bool:
-    server_args = getattr(model_runner, "server_args", None)
-    if server_args is None:
-        return False
-    mode = getattr(server_args, "disaggregation_mode", None)
-    if mode is None or mode == "null":
-        return False
-    return True
+def _select_pool_kind(
+    *, model_runner: "ModelRunner", pool: object
+) -> Optional[PoolKind]:
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    is_draft = bool(getattr(model_runner, "is_draft_worker", False))
+    if isinstance(pool, BaseSWAKVPool):
+        return PoolKind.SWA
+    if isinstance(pool, MLATokenToKVPool):
+        return PoolKind.MLA
+    if isinstance(pool, MHATokenToKVPool):
+        if is_draft:
+            return PoolKind.DRAFT
+        return PoolKind.FULL
+    return None
 
 
 def _patch_model_forward(*, model_runner: "ModelRunner") -> None:

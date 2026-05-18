@@ -19,12 +19,13 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryHostState,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
+    PoolKind,
     attach_shadow_buffers,
     get_shadow_buffers,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +60,21 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pool: "MHATokenToKVPool",
+        pool: "KVCache",
         num_req_slots: int,
         device: torch.device,
+        pool_kind: PoolKind = PoolKind.FULL,
     ) -> None:
         self._config = config
         self._device = device
+        self._pool_kind = pool_kind
 
-        attach_shadow_buffers(pool)
+        attach_shadow_buffers(pool, pool_kind=pool_kind)
         self._slot_stride_bytes = pool.canary_slot_stride_bytes
         self._k_head, self._k_tail, self._v_head, self._v_tail = get_shadow_buffers(
             pool
         )
+        self._has_v_half: bool = pool.canary_has_v_half
 
         self.host_state = CanaryHostState(config=config, num_req_slots=num_req_slots)
         self._device_state = CanaryDeviceState.allocate(
@@ -107,6 +111,10 @@ class CanaryRunner:
     @property
     def config(self) -> CanaryConfig:
         return self._config
+
+    @property
+    def pool_kind(self) -> PoolKind:
+        return self._pool_kind
 
     def run_head(self, *, plan: BatchPlan) -> None:
         self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
@@ -234,7 +242,10 @@ class CanaryRunner:
         verify_mask = _to_int32(plan.verify_mask, self._device)
         verify_seq_positions = _to_int64(plan.verify_seq_positions, self._device)
 
-        for src_buf, dst_buf in ((src_buf_k, dst_buf_k), (src_buf_v, dst_buf_v)):
+        buf_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = [(src_buf_k, dst_buf_k)]
+        if self._has_v_half and src_buf_v is not None and dst_buf_v is not None:
+            buf_pairs.append((src_buf_v, dst_buf_v))
+        for src_buf, dst_buf in buf_pairs:
             canary_step(
                 src_buf=src_buf.view(torch.uint8).flatten(),
                 dst_buf=dst_buf.view(torch.uint8).flatten(),

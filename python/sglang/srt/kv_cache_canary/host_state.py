@@ -53,6 +53,68 @@ class CanaryHostState:
         with self._lock:
             self._states.pop(req_pool_idx, None)
 
+    def reset_request_for_slot(self, slot_idx: int) -> None:
+        """Drop any host state whose last_committed lives in this physical slot.
+
+        Used by SWA window-slide eviction: when a slot is evicted from the
+        sliding window, any request that thought its verify-target lived in
+        that slot must forget it (otherwise next plan_batch builds a stale
+        verify entry).
+        """
+        with self._lock:
+            stale_req_pool_idxs: List[int] = []
+            for req_pool_idx, state in self._states.items():
+                if state.last_committed is None:
+                    continue
+                if state.last_committed.slot_idx == slot_idx:
+                    stale_req_pool_idxs.append(req_pool_idx)
+            for req_pool_idx in stale_req_pool_idxs:
+                self._states.pop(req_pool_idx, None)
+
+    def reset_all_last_committed(self) -> None:
+        """Drop ``last_committed`` for every tracked request.
+
+        Conservative SWA window-slide fallback: when we can't enumerate which
+        slots were just evicted (e.g. the free hook only fires with no
+        argument), wiping last_committed on all requests prevents stale
+        verify entries. The next forward will pure-write and re-anchor.
+        """
+        with self._lock:
+            for req_pool_idx, state in list(self._states.items()):
+                if state.last_committed is None:
+                    continue
+                self._states[req_pool_idx] = _RequestState(
+                    prev_hash_tail=state.prev_hash_tail,
+                    k_req=state.k_req,
+                    last_committed=None,
+                )
+
+    def reset_request_to(self, *, req_pool_idx: int, k_req: int) -> None:
+        """Roll a request's high-water mark back to ``k_req`` (spec reject path).
+
+        Spec decoding rejects drafted tokens after the target verifies them;
+        the rejected tokens' slots get freed and reused. The canary chain
+        must rewind ``K_req`` to the new low-water mark so the next batch's
+        verify target is the last *accepted* token (not the rejected ones).
+        """
+        with self._lock:
+            existing = self._states.get(req_pool_idx)
+            if existing is None:
+                return
+            if k_req <= 0:
+                self._states.pop(req_pool_idx, None)
+                return
+            # We don't have a per-position prev_hash snapshot, so the safest
+            # behaviour is to drop last_committed (no verify entry until a
+            # fresh write commits) but keep prev_hash_tail at the new k_req
+            # boundary. Callers can pass k_req = old k_req to no-op.
+            new_state = _RequestState(
+                prev_hash_tail=existing.prev_hash_tail,
+                k_req=min(existing.k_req, k_req),
+                last_committed=None,
+            )
+            self._states[req_pool_idx] = new_state
+
     def has_state(self, req_pool_idx: int) -> bool:
         with self._lock:
             return req_pool_idx in self._states

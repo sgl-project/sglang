@@ -8,12 +8,15 @@ import torch
 
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.host_state import BatchPlan
+from sglang.srt.kv_cache_canary.pool_patch import PoolKind, install_swa_free_hook
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.mem_cache.req_to_token_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +25,11 @@ _GLOBAL_RUNNER_KEY = "_kv_cache_canary_runner"
 
 def attach(
     *,
-    pool: "MHATokenToKVPool",
+    pool: "KVCache",
     config: CanaryConfig,
     req_to_token_pool: "ReqToTokenPool",
     device: torch.device,
+    pool_kind: PoolKind = PoolKind.FULL,
 ) -> Optional[CanaryRunner]:
     """Attach canary to ``pool`` and create a runner.
 
@@ -44,13 +48,18 @@ def attach(
         pool=pool,
         num_req_slots=int(req_to_token_pool.size),
         device=device,
+        pool_kind=pool_kind,
     )
     setattr(pool, _GLOBAL_RUNNER_KEY, runner)
-    logger.info("kv-canary: attached runner in mode=%s", config.mode.value)
+    logger.info(
+        "kv-canary: attached runner in mode=%s pool_kind=%s",
+        config.mode.value,
+        pool_kind.value,
+    )
     return runner
 
 
-def get_runner(pool: "MHATokenToKVPool") -> Optional[CanaryRunner]:
+def get_runner(pool: "KVCache") -> Optional[CanaryRunner]:
     return getattr(pool, _GLOBAL_RUNNER_KEY, None)
 
 
@@ -77,6 +86,64 @@ def install_req_to_token_pool_free_hook(
 
     req_to_token_pool.free = patched_free
     setattr(req_to_token_pool, "_kv_canary_free_patched", True)
+
+
+def install_swa_eviction_hook(
+    *,
+    runner: CanaryRunner,
+    pool: "BaseSWAKVPool",
+) -> None:
+    """Hook SWA window-slide eviction so host state forgets evicted slots.
+
+    When SWA slides past a token the slot it occupied is freed back to the
+    SWA sub-pool. The host's ``last_committed.slot_idx`` may still point at
+    that now-free (or soon-to-be-reused) slot; if we tried to verify the
+    next batch against it we'd be reading a stranger's data. The conservative
+    fix is to drop ``last_committed`` for every tracked request on every
+    eviction batch. The next forward writes fresh entries and re-anchors.
+    """
+    install_swa_free_hook(
+        pool=pool,
+        on_free=runner.host_state.reset_all_last_committed,
+    )
+
+
+def install_spec_allocator_free_hook(
+    *,
+    runner: CanaryRunner,
+    model_runner: "ModelRunner",
+) -> None:
+    """Hook spec decoding's allocator.free so rejected slots reset chain state.
+
+    Eagle/MTP verify accepts a prefix of drafts; the rest are 'rejected' and
+    their slots are freed via ``token_to_kv_pool_allocator.free(...)``. The
+    canary's host state (``last_committed.slot_idx`` and the prev-hash chain)
+    must rewind so the next batch doesn't try to verify against a slot we
+    just gave back. We can't enumerate which req_pool_idx owns each slot
+    here, so we use the same conservative fallback as SWA: clear all
+    last_committed on every free batch. ``K_req`` is preserved (correct
+    by-position writes are still safe).
+
+    Idempotent. Only patches when an allocator is present.
+    """
+    allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return
+    if getattr(allocator, "_kv_canary_free_patched", False):
+        return
+    if not hasattr(allocator, "free"):
+        return
+    original_free = allocator.free
+
+    def patched_free(free_index: torch.Tensor) -> None:
+        original_free(free_index)
+        try:
+            runner.host_state.reset_all_last_committed()
+        except Exception:
+            logger.exception("kv-canary: spec allocator.free hook failed")
+
+    allocator.free = patched_free
+    setattr(allocator, "_kv_canary_free_patched", True)
 
 
 _PERTURB_RNG_CACHE: dict = {}
