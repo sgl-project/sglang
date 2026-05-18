@@ -36,6 +36,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             "minimax-append-think",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
+            "--weight-loader-prefetch-checkpoints",
         ]
         cls.process = popen_launch_server(
             cls.model,
