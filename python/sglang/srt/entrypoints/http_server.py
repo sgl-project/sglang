@@ -527,20 +527,8 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
-    tm = _global_state.tokenizer_manager
 
-    if tm.server_args.enable_mis:
-        # MIS-only server: /generate is rejected at the tokenizer manager,
-        # so probe via the score path which produces an MIS-structured
-        # GenerateReqInput. Exercises the same kernel chain production
-        # traffic uses.
-        async def gen():
-            await tm.score_request(
-                query=[0],
-                items=[[0]],
-                label_token_ids=[0] if tm.is_generation else None,
-            )
-    elif tm.is_generation:
+    if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -548,23 +536,32 @@ async def health_generate(request: Request) -> Response:
             log_metrics=False,
         )
         if (
-            tm.server_args.disaggregation_mode
+            _global_state.tokenizer_manager.server_args.disaggregation_mode
             != DisaggregationMode.NULL.value
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
-
-        async def gen():
-            async for _ in tm.generate_request(gri, request):
-                break
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
         )
 
+    async def gen():
+        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+            break
+
+    if _global_state.tokenizer_manager.server_args.enable_mis:
+        # MIS-only server: /generate is rejected at the tokenizer manager, so
+        # probe via the score path. Overrides gen() to exercise the same
+        # kernel chain production scoring traffic uses.
         async def gen():
-            async for _ in tm.generate_request(gri, request):
-                break
+            await _global_state.tokenizer_manager.score_request(
+                query=[0],
+                items=[[0]],
+                label_token_ids=(
+                    [0] if _global_state.tokenizer_manager.is_generation else None
+                ),
+            )
 
     task = asyncio.create_task(gen())
 
@@ -1902,71 +1899,72 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Construct a warmup request
     is_vlm = bool(model_info.get("has_image_understanding", False))
+    if model_info["is_generation"]:
+        if is_vlm and not server_args.skip_tokenizer_init:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
+    max_new_tokens = 8 if model_info["is_generation"] else 1
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
+    if server_args.skip_tokenizer_init:
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
+        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        # Only use chat completions format for generation models, not embedding models
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
+    else:
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
+
     if server_args.enable_mis:
         # MIS-only server: /generate is rejected at the tokenizer manager, so
-        # warm up via /v1/score with a minimal MIS-structured payload.
-        # Exercises the same kernels production scoring traffic uses.
+        # warm up via /v1/score with a minimal MIS-structured payload. Overrides
+        # the request constructed above to exercise the same kernels production
+        # scoring traffic uses.
         request_name = "/v1/score"
         json_data = {
             "query": [0],
             "items": [[0]],
             "label_token_ids": [0] if model_info["is_generation"] else None,
         }
-    else:
-        if model_info["is_generation"]:
-            if is_vlm and not server_args.skip_tokenizer_init:
-                request_name = "/v1/chat/completions"
-            else:
-                request_name = "/generate"
-        else:
-            request_name = "/encode"
-        max_new_tokens = 8 if model_info["is_generation"] else 1
-        json_data = {
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-            },
-        }
-        if server_args.skip_tokenizer_init:
-            json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["input_ids"] = json_data["input_ids"][0]
-        elif (
-            is_vlm
-            and server_args.disaggregation_mode == "null"
-            and model_info["is_generation"]
-        ):
-            # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
-            # Only use chat completions format for generation models, not embedding models
-            json_data = {
-                "model": _global_state.tokenizer_manager.served_model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": "Describe the image.",
-                            },
-                        ],
-                    }
-                ],
-                "max_tokens": max_new_tokens,
-                "stream": False,
-                "temperature": 0.0,
-            }
-        else:
-            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
