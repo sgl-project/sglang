@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod active_load;
 pub mod factory;
 pub mod kv_events;
 pub mod power_of_two;
