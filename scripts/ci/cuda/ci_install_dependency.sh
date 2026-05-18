@@ -220,6 +220,9 @@ uninstall_stale_flashinfer() {
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
+    # Uninstall nvidia-cutlass-dsl-libs-base, which doesn't work on cu13 runners (ref: https://github.com/vllm-project/vllm/pull/40082#issuecomment-4349406309)
+    $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
