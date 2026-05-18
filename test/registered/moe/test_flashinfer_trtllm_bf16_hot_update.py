@@ -110,36 +110,28 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
             loaded.append((w1, w3, w2))
         return loaded
 
+    def _assert_equal(self, actual, expected):
+        if not torch.is_tensor(expected):
+            expected = torch.full_like(actual, expected)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def _assert_canonical_update_visible(self, layer, loaded):
         real = self.intermediate_size
         padded = self.padded_intermediate_size
 
         for expert_id, (w1, w3, w2) in enumerate(loaded):
             # FlashInfer TRTLLM stores W13 in W3/W1 order.
-            torch.testing.assert_close(layer.w13_weight[expert_id, :real, :], w3)
-            torch.testing.assert_close(
+            self._assert_equal(layer.w13_weight[expert_id, :real, :], w3)
+            self._assert_equal(
                 layer.w13_weight[expert_id, padded : padded + real, :], w1
             )
-            torch.testing.assert_close(layer.w2_weight[expert_id, :, :real], w2)
+            self._assert_equal(layer.w2_weight[expert_id, :, :real], w2)
 
-            self.assertTrue(
-                torch.all(
-                    layer.w13_weight[expert_id, real:padded, :]
-                    == 0
-                ).item()
+            self._assert_equal(layer.w13_weight[expert_id, real:padded, :], 0)
+            self._assert_equal(
+                layer.w13_weight[expert_id, padded + real : 2 * padded, :], 0
             )
-            self.assertTrue(
-                torch.all(
-                    layer.w13_weight[expert_id, padded + real : 2 * padded, :]
-                    == 0
-                ).item()
-            )
-            self.assertTrue(
-                torch.all(
-                    layer.w2_weight[expert_id, :, real:padded]
-                    == 0
-                ).item()
-            )
+            self._assert_equal(layer.w2_weight[expert_id, :, real:padded], 0)
 
     def test_hot_update_reloads_canonical_weights_after_flashinfer_pack(self):
         layer = self._make_layer()
