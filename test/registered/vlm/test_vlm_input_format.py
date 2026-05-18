@@ -42,8 +42,6 @@ register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
-_is_cuda = is_cuda()
-_is_xpu = is_xpu()
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
