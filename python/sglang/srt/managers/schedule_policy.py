@@ -160,19 +160,17 @@ class SchedulePolicy:
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
-    ) -> bool:
+    ) -> None:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return False
+            return
 
         policy = self._determine_active_policy(waiting_queue)
 
-        prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
-            prefix_computed = True
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -200,7 +198,6 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
-        return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
