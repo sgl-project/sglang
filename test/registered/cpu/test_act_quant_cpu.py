@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
+
 def act_quant_pytorch(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
