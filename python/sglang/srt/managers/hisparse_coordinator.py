@@ -283,10 +283,6 @@ class HiSparseCoordinator:
                 layer_id,
                 io_backend="kernel",
             )
-        # Direct PD admission runs outside the model forward stream.  The preload
-        # must be complete before the request is marked ready, otherwise decode
-        # can race the H2D copy and read a partially populated hot buffer.
-        device_module.current_stream().synchronize()
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
