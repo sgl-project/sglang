@@ -4,6 +4,16 @@ from typing import List
 import torch
 import yaml
 
+from sglang.srt.utils.common import is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
+        get_npu_pdmux_manager,
+        load_npu_pdmux_config,
+    )
+
 STREAM_GROUPS = []
 SM_COUNTS = []
 SM_GROUP_NUM = 8  # Default number of SM groups
@@ -23,6 +33,9 @@ class PDMuxConfig:
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
     """Load pdmux configuration from YAML file into a dataclass."""
+    if _is_npu:
+        return load_npu_pdmux_config(config_path)
+
     if not config_path:
         return PDMuxConfig()
 
@@ -142,6 +155,9 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
 
 
 def set_current_stream_idx(idx: int):
+    if _is_npu:
+        get_npu_pdmux_manager().set_current_stream_idx(idx)
+        return
     global CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
     if idx < 0 or idx >= len(STREAM_GROUPS):
         raise ValueError(f"Invalid stream index: {idx}")
@@ -151,14 +167,20 @@ def set_current_stream_idx(idx: int):
 
 def get_stream_groups() -> list[tuple[torch.cuda.Stream, torch.cuda.Stream]]:
     """Get the stream groups."""
+    if _is_npu:
+        return get_npu_pdmux_manager().get_stream_groups()
     return STREAM_GROUPS
 
 
 def get_sm_counts() -> list[tuple[int, int]]:
     """Get the SM counts."""
+    if _is_npu:
+        return get_npu_pdmux_manager().get_cube_counts()
     return SM_COUNTS
 
 
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
+    if _is_npu:
+        return get_npu_pdmux_manager().get_current_stream_idx()
     return CURRENT_STREAM_IDX
