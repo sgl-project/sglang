@@ -459,34 +459,21 @@ class SchedulerOutputProcessorMixin:
             kv_committed_deltas.append(accept_lens[i] - 1)
             finished_status.append(False)
 
-        # Relayer cpu_value channel is the single source of truth for per-req
-        # kv_committed_delta + finished status after iter N. Read back the
-        # delta and apply to req.kv_committed_len in one place so consumers
-        # (cache_finished_req / prepare_for_decode / SWA evict) see a
-        # post-iter value derived from the channel rather than from an
-        # in-place mutation scattered across this loop. We also attach a
-        # per-req ``relayer_kv_committed_ctx`` so downstream callers using
-        # ``Req.relayer_resolve_kv_committed_len`` resolve the channel
-        # value directly.
-        relayer = getattr(self, "relayer", None)
-        if relayer is not None and result.cpu_future_indices is not None:
-            relayer.store_kv_committed_delta(
-                result.cpu_future_indices, kv_committed_deltas
+        # Relayer cpu_value channel owns kv_committed_delta + finished status.
+        # Channel is the sole source: req.kv_committed_len stays at its
+        # iter-start baseline; consumers read post-iter value via
+        # Req.relayer_resolve_kv_committed_len. Promotion (baseline += delta)
+        # happens once at next bind_relayer_for_iter before the slot wraps.
+        relayer = self.relayer
+        assert (
+            relayer is not None and result.cpu_future_indices is not None
+        ), "spec V2 overlap path requires relayer + cpu_future_indices"
+        relayer.store_kv_committed_delta(result.cpu_future_indices, kv_committed_deltas)
+        relayer.store_finished_status(result.cpu_future_indices, finished_status)
+        for slot_offset, req in enumerate(batch.reqs):
+            req.set_relayer_kv_committed_ctx(
+                relayer, result.cpu_future_indices, slot_offset
             )
-            relayer.store_finished_status(result.cpu_future_indices, finished_status)
-            for slot_offset, (req, delta) in enumerate(
-                zip(
-                    batch.reqs,
-                    relayer.resolve_kv_committed_delta(result.cpu_future_indices),
-                )
-            ):
-                req.set_relayer_kv_committed_ctx(
-                    relayer, result.cpu_future_indices, slot_offset
-                )
-                req.kv_committed_len += delta
-        else:
-            for req, delta in zip(batch.reqs, kv_committed_deltas):
-                req.kv_committed_len += delta
 
         return predict_tokens
 

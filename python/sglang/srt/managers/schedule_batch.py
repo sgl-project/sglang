@@ -969,6 +969,22 @@ class Req(ReqDllmMixin):
     def clear_relayer_kv_committed_ctx(self):
         self._relayer_kv_committed_ctx = None
 
+    def promote_relayer_kv_committed_delta(self):
+        """Move the channel-resident delta into ``kv_committed_len`` and
+        clear ctx. Called before the cpu_value slot is reused so the
+        post-iter committed length is captured before the slot wraps.
+        """
+        ctx = self.__dict__.get("_relayer_kv_committed_ctx")
+        if ctx is None:
+            return
+        relayer, cpu_fi, slot_offset, baseline = ctx
+        if relayer is not None and cpu_fi is not None and slot_offset is not None:
+            deltas = relayer.resolve_kv_committed_delta(cpu_fi)
+            d = deltas[slot_offset] if slot_offset < len(deltas) else None
+            if d is not None:
+                self.kv_committed_len = baseline + d
+        self._relayer_kv_committed_ctx = None
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
@@ -1296,6 +1312,9 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
+        # Drop any stale channel ctx so post-retract resolve returns the
+        # zeroed baseline rather than baseline+stale_delta.
+        self.clear_relayer_kv_committed_ctx()
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
@@ -1699,11 +1718,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def bind_relayer_for_iter(self, relayer):
         """Allocate this iter's relay slots (gpu_scalar for seq_lens family,
-        cpu_value for kv_committed_delta / finished_status). Drops any
-        stale ctx from the previous iter before binding new slots.
+        cpu_value for kv_committed_delta / finished_status). Promotes
+        each req's previous-iter channel delta into req.kv_committed_len
+        before clearing ctx, so the new baseline reflects the prior iter's
+        committed lengths once the old slot is about to be reused.
         """
-        # Drop stale ctx so prepare_for_decode's explicit store and
-        # filter_batch's cpu_value read target this iter's fresh slots.
+        for req in self.reqs:
+            req.promote_relayer_kv_committed_delta()
+        # Drop stale ctx so this iter's stores / reads target fresh slots.
         self.clear_relayer_ctx()
         if relayer is None:
             return
@@ -2316,7 +2338,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            new_pages = sum(
+                1
+                for r in requests
+                if r.relayer_resolve_kv_committed_len() % page_size == 0
+            )
             return new_pages * page_size
 
         if self.is_spec_v2:
@@ -2346,7 +2372,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         alloc_len = get_alloc_len_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            kv_committed = r.relayer_resolve_kv_committed_len()
+            x = max(0, kv_committed + 2 * alloc_len - r.kv_allocated_len)
             cur = r.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
