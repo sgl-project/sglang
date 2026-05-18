@@ -96,12 +96,29 @@ export const DeepSeekV4Deployment = () => {
   const MARLIN_HARDWARE = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
+  // MegaMoE is only supported on Blackwell with DeepEP-based recipes
+  // (balanced / max-throughput / pd-disagg). It's disabled on Hopper
+  // (H100 / H200 / H200-FP4) and on low-latency / cp recipes.
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp"]);
+  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200", "h200-fp4"]);
+  const isMegamoeUnsupported = (vals) =>
+    MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
+    MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
+
   const resolveItems = (option, vals) => {
     if (option.name === "recipe" && vals && MARLIN_HARDWARE.has(vals.hardware)) {
       return option.items.map((it) =>
         MARLIN_UNSUPPORTED_RECIPES.has(it.id)
           ? { ...it, disabled: true, disabledReason: `Not supported on ${MARLIN_LABEL[vals.hardware]}` }
           : it
+      );
+    }
+    if (option.name === "megamoe" && vals && isMegamoeUnsupported(vals)) {
+      const reason = MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)
+        ? "MegaMoE is only supported on Blackwell"
+        : "MegaMoE is not supported on this recipe";
+      return option.items.map((it) =>
+        it.id === "disabled" ? it : { ...it, disabled: true, disabledReason: reason }
       );
     }
     return option.items;
@@ -150,6 +167,15 @@ export const DeepSeekV4Deployment = () => {
         MARLIN_UNSUPPORTED_RECIPES.has(next.recipe)
       ) {
         next.recipe = "low-latency";
+      }
+      // Switching to a hardware/recipe combo that doesn't support MegaMoE
+      // while w4a8 / w4a4 is selected: fall back to disabled.
+      if (
+        (optionName === "hardware" || optionName === "recipe") &&
+        next.megamoe !== "disabled" &&
+        isMegamoeUnsupported(next)
+      ) {
+        next.megamoe = "disabled";
       }
       return next;
     });

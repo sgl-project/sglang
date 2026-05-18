@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
+    ComponentLoadSpec,
+    order_component_load_specs,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentResidencyStrategy,
@@ -385,10 +389,16 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading required components: %s", required_modules)
 
         loaded_components = {}
-        for module_name, (
-            transformers_or_diffusers,
-            architecture,
-        ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+        component_load_specs: list[ComponentLoadSpec] = []
+
+        # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
+        for index, (
+            module_name,
+            (
+                transformers_or_diffusers,
+                architecture,
+            ),
+        ) in enumerate(model_index.items()):
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -405,15 +415,43 @@ class ComposedPipelineBase(ABC):
                 loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
-            # we load the module from the extra config module map if it exists
             if module_name in self._extra_config_module_map:
                 load_module_name = self._extra_config_module_map[module_name]
             else:
                 load_module_name = module_name
-
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
+            # collect loading specs
+            component_load_specs.append(
+                ComponentLoadSpec(
+                    module_name=module_name,
+                    load_module_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    architecture=architecture,
+                    index=index,
+                )
+            )
+
+        # reorder loading order to avoid OOM
+        component_load_specs: ComponentLoadSpec = order_component_load_specs(
+            component_load_specs
+        )
+        logger.info(
+            "Memory-aware component load order: %s",
+            [spec.module_name for spec in component_load_specs],
+        )
+
+        for spec in tqdm(
+            iterable=component_load_specs, desc="Loading required modules"
+        ):
+            module_name: str = spec.module_name
+            load_module_name: str = spec.load_module_name
+            transformers_or_diffusers: str = spec.transformers_or_diffusers
+            architecture: str = spec.architecture
+            component_model_path: str = spec.component_model_path
+
             attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(
                     module_name, load_module_name
