@@ -26,10 +26,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
+from sglang.srt.speculative.base_spec_worker import DraftExecutor
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -56,20 +53,8 @@ if is_cuda() or is_musa():
 logger = logging.getLogger(__name__)
 
 
-def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
-
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
-
-
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -233,7 +218,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
-    def verify(
+    def sample(
         self,
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
@@ -242,8 +227,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
+        Sample tokens, run tree acceptance, and allocate cache slots for the
+        accepted slice. dataclass-level counterpart of `EAGLEWorkerV2.verify`
+        (which is the worker-level end-to-end entry, including target forward).
 
         WARNING: This API in-place modifies the states of logits_output
 
@@ -667,7 +653,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
@@ -725,20 +711,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
     @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
+    def hidden_size_for(cls, worker: DraftExecutor) -> Optional[int]:
         """Decode-phase `hidden_states` width: draft self-chain output
         (draft model writes its own last hidden back via `capture_for_decode`
         and the draft loop). Returns None when the draft architecture doesn't
         consume the field (e.g., STANDALONE)."""
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
+        return worker.draft_runner.model_config.spec_hidden_size
 
     @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+    def dtype_for(cls, worker: DraftExecutor) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.dtype
+        return worker.draft_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
@@ -749,6 +735,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
+        # `new_seq_lens` stays None: it is a V2-overlap signal that the worker
+        # has computed next iter's seq_lens. V1 must leave it None so the
+        # scheduler's `is not None` gate in `run_batch` doesn't overwrite
+        # `batch.seq_lens` with a 0-length tensor while `batch.reqs` still
+        # holds the finished reqs (which then crashes the next filter_batch).
+        # V2 overrides this method to populate `new_seq_lens` for its
+        # future_map buffer (see `overlap_utils._lazy_init_buf`).
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=(
@@ -759,7 +752,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
@@ -827,7 +819,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 class EagleDraftExtendInput(SpecInput):
     """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
+    Produced by `EagleVerifyInput.sample`, installed on `batch.spec_info` for
     the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
     the next iter's draft.
     """
@@ -874,7 +866,7 @@ class EagleDraftExtendInput(SpecInput):
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
+    def hidden_size_for(cls, worker: DraftExecutor) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
         widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
         None when the draft architecture doesn't consume the field
@@ -901,7 +893,7 @@ class EagleDraftExtendInput(SpecInput):
         return target_hidden * num_aux
 
     @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+    def dtype_for(cls, worker: DraftExecutor) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
         return worker.target_worker.model_runner.model_config.dtype
@@ -1012,6 +1004,10 @@ class EagleVerifyOutput:
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accept_indices: torch.Tensor
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.sample` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(

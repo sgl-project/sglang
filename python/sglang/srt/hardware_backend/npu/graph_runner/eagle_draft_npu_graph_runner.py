@@ -29,7 +29,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.base_spec_worker import DraftExecutor
 
 from sglang.srt.utils import is_npu
 
@@ -45,7 +45,7 @@ if is_npu():
 
 
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(self, eagle_worker: "DraftExecutor"):
         super().__init__(eagle_worker)
         self.update_attr_name = None
         self.update_attr_type = None

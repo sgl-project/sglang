@@ -27,11 +27,11 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.base_spec_worker import DraftExecutor
 
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(self, eagle_worker: "DraftExecutor"):
         super().__init__(eagle_worker)
 
     def _create_graph(self):

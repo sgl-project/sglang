@@ -11,9 +11,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
 )
+from sglang.srt.speculative.base_spec_worker import SpecResourceContext
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
@@ -49,26 +49,27 @@ class StandaloneDraftWorker(EagleDraftWorker):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        *,
+        ctx: Optional[SpecResourceContext] = None,
     ):
-        # copy args
+        # Shared spec config + memory-pool refs (reuse host coordinator's ctx
+        # when provided, so adaptive mutations stay consistent).
+        self._ctx = ctx or SpecResourceContext.from_server_args(
+            server_args, target_worker
+        )
+
+        # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
-        self.target_worker = target_worker
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
-
-        # Args for easy access
         self.device = server_args.device
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
 
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -81,32 +82,27 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
         with empty_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        # Alias for better readability
-        self.draft_runner = self.draft_worker.model_runner
+        # Alias for better readability. Backed by `_draft_runner` because
+        # `DraftExecutor` declares `draft_runner` as an abstract @property.
+        self._draft_runner = self.draft_worker.model_runner
 
         self.init_token_map()
         self.init_lm_head()
@@ -125,6 +121,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def draft_runner(self):
+        return self._draft_runner
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""
@@ -147,22 +147,16 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
+        # Shared spec config + memory-pool refs.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
-        self._target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -178,6 +172,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             moe_dp_rank,
             nccl_port,
             target_worker,
+            ctx=self._ctx,
         )
 
         # Some dummy tensors

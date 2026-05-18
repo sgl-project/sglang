@@ -43,6 +43,11 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import (
+    DraftExecutor,
+    SpecCoordinator,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -64,7 +69,6 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
@@ -78,9 +82,9 @@ from sglang.srt.utils import empty_context
 logger = logging.getLogger(__name__)
 
 
-class FrozenKVMTPWorker(TpModelWorker):
-    """Frozen-KV MTP worker; same constructor shape as EAGLEWorker. Entry:
-    :meth:`forward_batch_generation` (stubs for now).
+class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
+    """Frozen-KV MTP worker; monolithic (coordinator + draft executor) since
+    no V2 form exists yet. Entry: :meth:`forward_batch_generation`.
     """
 
     def __init__(
@@ -95,17 +99,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.gpu_id = gpu_id
-        self.device = server_args.device
-        self.target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        # Shared spec config + memory-pool refs; properties on `DraftExecutor` /
+        # `SpecCoordinator` forward `self.topk` / `self.target_worker` / ... here.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Frozen-KV MTP runs DSv4-style MTP, not EAGLE3; no aux hidden states.
+        self.eagle_use_aux_hidden_state = False
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
             "FrozenKVMTPWorker should only be instantiated for "
             "SpeculativeAlgorithm.FROZEN_KV_MTP, got "
@@ -120,11 +119,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         # Defer cuda graph capture; we do it ourselves below.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-
-        # Draft attention uses target req_to_token + KV allocator (read-only).
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
 
         target_cfg = target_worker.model_runner.memory_pool_config
         draft_pool_config = MemoryPoolConfig(
@@ -148,47 +142,49 @@ class FrozenKVMTPWorker(TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+        if hasattr(self.draft_runner.model, "set_embed_and_head"):
+            self.draft_runner.model.set_embed_and_head(embed, head)
         else:
             logger.debug(
                 "Draft model %s does not implement set_embed_and_head; "
                 "skipping target-embedding bind in Frozen-KV MTP skeleton.",
-                type(self.draft_model_runner.model).__name__,
+                type(self.draft_runner.model).__name__,
             )
 
         self.kv_context: Optional["FrozenKVMTPContext"] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
+        if hasattr(self.draft_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
+        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self._init_draft_attn_backend()
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.init_attention_backend()
         self.cuda_graph_runner = None
 
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
             self.init_cuda_graphs()
 
     @property
-    def draft_model_runner(self):
+    def draft_runner(self):
         return self.model_runner
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        # V1 monolithic: this worker is both coordinator and draft executor.
+        return self
 
     def get_attn_backend(self):  # pragma: no cover - exposed for adaptive
         return self.draft_attn_backend
@@ -203,33 +199,34 @@ class FrozenKVMTPWorker(TpModelWorker):
             or self.server_args.attention_backend
         )
 
-    def _init_draft_attn_backend(self):
+    def init_attention_backend(self):
         if self.topk == 1:
-            return self.draft_model_runner.attn_backend
-
-        backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+            self.draft_attn_backend = self.draft_runner.attn_backend
+        else:
+            backend_type = self._resolve_draft_backend_type()
+            if backend_type != "triton":
+                raise ValueError(
+                    "Frozen-KV MTP topk > 1 currently supports only the triton "
+                    f"attention backend, got {backend_type}."
+                )
+            self.draft_attn_backend = self._init_triton_draft_attn_backend()
+        self.draft_runner.draft_attn_backend = self.draft_attn_backend
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         max_bs = self.req_to_token_pool.size * self.topk
         kv_indptr_buf = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.draft_model_runner.device
+            (max_bs + 1,), dtype=torch.int32, device=self.draft_runner.device
         )
         return TritonAttnBackend(
-            self.draft_model_runner,
+            self.draft_runner,
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
 
     def _bind_kv_context(self) -> None:
-        draft_model = self.draft_model_runner.model
+        draft_model = self.draft_runner.model
         if not hasattr(draft_model, "build_frozen_kv_mtp_context") or not hasattr(
             draft_model, "bind_frozen_kv_context"
         ):
@@ -264,7 +261,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     @property
     def _recurrent_hidden_size(self) -> int:
-        return int(self.draft_model_runner.model.backbone_hidden_size)
+        return int(self.draft_runner.model.backbone_hidden_size)
 
     def _init_frozen_kv_metadata(self, forward_batch: ForwardBatch) -> None:
         if forward_batch.forward_mode.is_idle():
@@ -354,17 +351,21 @@ class FrozenKVMTPWorker(TpModelWorker):
         seq_lens_cpu: Optional[torch.Tensor] = None,
         mm_input_embeds: Optional[torch.Tensor] = None,
         draft_input: Optional[FrozenKVMTPDraftInput] = None,
-    ) -> None:
-        """Run the one-token assistant seed step against frozen target KV."""
+    ) -> FrozenKVMTPDraftInput:
+        """Run the one-token assistant seed step against frozen target KV.
+
+        Returns the next-iter `FrozenKVMTPDraftInput`. Caller installs it as
+        `batch.spec_info` (we only mutate `batch.spec_info` transiently for
+        the forward and restore it on return).
+        """
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
-            batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
+            return FrozenKVMTPDraftInput.create_idle_input(
                 device=batch.device,
                 hidden_size=self._recurrent_hidden_size,
                 dtype=self.model_config.dtype,
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
-            return
 
         if draft_input is None:
             draft_input = FrozenKVMTPDraftInput()
@@ -392,16 +393,14 @@ class FrozenKVMTPWorker(TpModelWorker):
             model_worker_batch = batch.get_model_worker_batch(
                 seq_lens_cpu_cache=seq_lens_cpu
             )
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.draft_model_runner
-            )
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
             forward_batch.return_logprob = False
             if mm_input_embeds is not None:
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
             with self._target_kv_pool_view(forward_batch):
-                logits_output = self.draft_model_runner.forward(
+                logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
@@ -411,10 +410,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.input_ids = input_ids_backup
             batch.return_hidden_states = return_hidden_states_backup
             batch.return_logprob = return_logprob_backup
-            # Keep the seeded draft state; only restore the old object on error paths
-            # before the assignment above could have happened.
-            if batch.spec_info is not draft_input:
-                batch.spec_info = spec_info_backup
+            batch.spec_info = spec_info_backup
+
+        return draft_input
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -425,11 +423,11 @@ class FrozenKVMTPWorker(TpModelWorker):
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
             with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
+                self.draft_tp_context(self.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
-                self.forward_draft_extend(
+                next_draft_input = self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
                     next_token_ids,
@@ -441,11 +439,12 @@ class FrozenKVMTPWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -453,8 +452,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
+        # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
-        logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+        verify_output = self.verify(batch)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -464,8 +464,9 @@ class FrozenKVMTPWorker(TpModelWorker):
                 )
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+        next_draft_input = None
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -474,18 +475,21 @@ class FrozenKVMTPWorker(TpModelWorker):
                 self.server_args.enable_dp_attention
                 or draft_extend_input.input_ids.shape[0] > 0
             ):
-                # Stash for the seed step; _run_assistant_seed_step swaps in
-                # a fresh FrozenKVMTPDraftInput for next iter.
+                # Install draft_extend_input as batch.spec_info for the seed
+                # step; the assembled next-iter FrozenKVMTPDraftInput is
+                # returned via batch_result and installed by the scheduler
+                # before the next draft.
                 batch.spec_info = draft_extend_input
-                self.forward_draft_extend_after_decode(batch)
+                next_draft_input = self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
-            logits_output=logits_output,
+            logits_output=verify_output.logits_output,
             next_token_ids=verify_output.accept_tokens,
             num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
             num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_cuda_graph=verify_output.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
 
     def forward_target_extend(
@@ -508,9 +512,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> FrozenKVMTPDraftInput:
+        """Run the prefill seed step. Returns next-iter `FrozenKVMTPDraftInput`;
+        scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
+        """
         last_hidden = self._select_last_extend_hidden(batch, hidden_states)
-        self._run_assistant_seed_step(
+        return self._run_assistant_seed_step(
             batch,
             next_token_ids,
             last_hidden,
@@ -518,26 +525,25 @@ class FrozenKVMTPWorker(TpModelWorker):
             mm_input_embeds=mm_input_embeds,
         )
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch
+    ) -> FrozenKVMTPDraftInput:
+        """Run the post-verify seed step. Returns next-iter
+        `FrozenKVMTPDraftInput`; caller installs on `batch.spec_info`.
+        """
         draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
-        input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
-            # All reqs finished; stash an idle FrozenKVMTPDraftInput so the
-            # next-iter draft sees a valid spec_info.
-            batch = batch.copy()
-            batch.prepare_for_idle()
-            batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
+        # Idle / all-finished short-circuit: idle DraftExtendInput leaves
+        # `bonus_tokens=None`, so we can't run `_select_last_verified_seed`.
+        # Return an idle FrozenKVMTPDraftInput for the next iter's draft.
+        if batch.forward_mode.is_idle() or draft_extend_input.input_ids.shape[0] == 0:
+            return FrozenKVMTPDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=self._recurrent_hidden_size,
                 dtype=self.model_config.dtype,
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
-            return
-
-        if batch.forward_mode.is_idle():
-            return
 
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
@@ -553,9 +559,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             last_token_ids, last_hidden = self._select_last_verified_seed(
                 draft_extend_input
             )
-            # `_run_assistant_seed_step` constructs a fresh `FrozenKVMTPDraftInput`
-            # and installs it on `batch.spec_info` for next iter.
-            self._run_assistant_seed_step(
+            return self._run_assistant_seed_step(
                 batch,
                 last_token_ids,
                 last_hidden,
@@ -595,9 +599,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
@@ -685,7 +687,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self._set_positions(forward_batch)
 
             with self._target_kv_pool_view(forward_batch):
-                logits_output = self.draft_model_runner.forward(
+                logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
 
@@ -756,7 +758,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: FrozenKVMTPVerifyOutput = spec_info.verify(
+        res: FrozenKVMTPVerifyOutput = spec_info.sample(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
@@ -787,4 +789,5 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         del seq_lens_pre_verify
-        return logits_output, res, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res

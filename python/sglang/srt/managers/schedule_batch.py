@@ -2408,6 +2408,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
+        # Lockstep invariant: `reqs`, `seq_lens`, `req_pool_indices`,
+        # `orig_seq_lens`, `seq_lens_cpu` must share length. This is the
+        # only structural enforcement; producer-side asserts (e.g. scheduler
+        # `new_seq_lens` install) catch most violations earlier, but this
+        # final check makes any leaked breakage land here with a clean stack
+        # instead of as a delayed CUDA OOB inside `seq_lens[keep_indices]`.
+        n_reqs = len(self.reqs)
+        assert self.seq_lens is None or self.seq_lens.size(0) == n_reqs, (
+            f"[filter_batch] seq_lens.size(0)={self.seq_lens.size(0)} != len(reqs)={n_reqs}; "
+            f"forward_mode={self.forward_mode}, "
+            f"req_pool_indices.size={self.req_pool_indices.size(0) if self.req_pool_indices is not None else None}, "
+            f"orig_seq_lens.size={self.orig_seq_lens.size(0) if self.orig_seq_lens is not None else None}, "
+            f"seq_lens_cpu.size={self.seq_lens_cpu.size(0) if self.seq_lens_cpu is not None else None}, "
+            f"spec_info={type(self.spec_info).__name__ if self.spec_info else None}"
+        )
+        assert (
+            self.req_pool_indices is None or self.req_pool_indices.size(0) == n_reqs
+        ), (
+            f"[filter_batch] req_pool_indices.size(0)={self.req_pool_indices.size(0)} != "
+            f"len(reqs)={n_reqs}"
+        )
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2421,8 +2443,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
+            # Filter out all requests. Also shrink the per-req lockstep
+            # tensors to keep `len(self.reqs) == seq_lens.size(0) == ...`
+            # invariant — leaving them at the pre-filter size leaks stale
+            # refs into the next filter_batch entry.
             self.reqs = []
+            if self.seq_lens is not None:
+                self.seq_lens = self.seq_lens[:0]
+            if self.req_pool_indices is not None:
+                self.req_pool_indices = self.req_pool_indices[:0]
+            if self.orig_seq_lens is not None:
+                self.orig_seq_lens = self.orig_seq_lens[:0]
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[:0]
+            if self.output_ids is not None:
+                self.output_ids = self.output_ids[:0]
+            self.seq_lens_sum = 0
             return
 
         if len(keep_indices) == len(self.reqs):

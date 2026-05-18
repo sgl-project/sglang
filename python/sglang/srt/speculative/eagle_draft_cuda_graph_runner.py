@@ -38,7 +38,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.base_spec_worker import DraftExecutor
 
 
 @dataclass
@@ -61,18 +61,14 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
 class EAGLEDraftCudaGraphRunner:
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: "DraftExecutor",
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
-            self.model_runner = model_runner = eagle_worker.draft_runner
-        else:
-            self.model_runner = model_runner = eagle_worker.model_runner
+        self.model_runner = model_runner = eagle_worker.draft_runner
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile

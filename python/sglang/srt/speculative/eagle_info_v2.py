@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -42,12 +42,18 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+    EagleVerifyOutput,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -84,9 +90,38 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
-@dataclass
-class EagleDraftInputV2Mixin:
-    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+class EagleDraftInputV2(EagleDraftInput):
+    """V2 (overlap) sister of `EagleDraftInput`. Adds V2-only prepare methods.
+    V1 path constructs `EagleDraftInput`; V2 path constructs this subclass so
+    `prepare_for_decode` / `prepare_for_v2_draft` are dispatched correctly.
+    """
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
+        # V2's future_map buffer (`overlap_utils._lazy_init_buf`) reads
+        # `draft_input.new_seq_lens[0]` to derive shape, so V2's idle input
+        # must populate it. V1 leaves it None (see base impl).
+        return cls(
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+        )
+
+    def prepare_for_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -175,11 +210,11 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
-        self: EagleDraftInput,
+        self,
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
-        draft_model_runner: ModelRunner,
+        draft_runner: ModelRunner,
         topk: int,
         num_steps: int,
     ):
@@ -208,27 +243,48 @@ class EagleDraftInputV2Mixin:
         self.num_tokens_for_logprob_per_req = topk
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
         batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
+
+
+@dataclass(kw_only=True)
+class EagleVerifyOutputV2(EagleVerifyOutput):
+    """V2 sister of `EagleVerifyOutput`. Adds `predict` (the full per-position
+    sampled token tensor, shape `[bs * draft_token_num]`) which V2's overlap
+    pipeline uses as `GenerationBatchResult.next_token_ids` to slice without
+    a GPU->CPU sync. V1 paths produce the base `EagleVerifyOutput` and have
+    no `predict` field — they read tokens from `accept_tokens` instead.
+
+    `kw_only=True` because parent has defaulted `can_run_cuda_graph` and
+    Python dataclass forbids non-defaulted subclass fields after defaulted
+    parent fields; kw-only side-steps this so V2 can require `predict`."""
+
+    predict: torch.Tensor
+
+
+class EagleDraftExtendInputV2(EagleDraftExtendInput):
+    """V2 sister of `EagleDraftExtendInput`. Adds the V2-only extend-to-fill
+    prepare path used by the second forward (`_draft_extend_for_decode`)."""
 
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
         batch: ModelWorkerBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
-        draft_model_runner: Any,
+        draft_runner: Any,
         cuda_graph_runner: Any,
     ):
+        # Caller is responsible for `batch.spec_info = self` before calling.
+        assert batch.spec_info is self
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
-        batch.spec_info = self
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
@@ -238,7 +294,7 @@ class EagleDraftInputV2Mixin:
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
         batch.capture_hidden_mode = capture_mode
@@ -247,17 +303,25 @@ class EagleDraftInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            draft_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 
-@dataclass
-class EagleVerifyInputV2Mixin:
+class EagleVerifyInputV2(EagleVerifyInput):
+    """V2 sister of `EagleVerifyInput`. Overrides `sample` (the V1 dataclass-
+    level method) with the V2 logic that builds an `EagleDraftExtendInputV2`
+    and a `predict` tensor for the V2 overlap pipeline.
+
+    Lives as a separate class (rather than mixin on V1) so V2's `sample` does
+    not get shadowed by V1's `sample` via MRO. V2 worker construction sites
+    instantiate this subclass directly.
+    """
+
     def prepare_for_v2_verify(
-        self: EagleVerifyInput,
+        self,
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
@@ -331,24 +395,34 @@ class EagleVerifyInputV2Mixin:
         return verify_forward_batch, can_run_cuda_graph
 
     def sample(
-        self: EagleVerifyInput,
+        self,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
-    ):
+    ) -> EagleVerifyOutputV2:
+        """V2 override of `EagleVerifyInput.sample`. Samples target tokens,
+        verifies against drafts, and produces an `EagleVerifyOutputV2`.
+
+        `verify_output.accept_tokens` is the V1-style flat accepted slice;
+        `verify_output.predict` is the V2-only full padded per-position sample.
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
-        """
+        device = batch.input_ids.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_correct_drafts = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
+            return EagleVerifyOutputV2(
+                draft_extend_input=EagleDraftExtendInputV2(
+                    hidden_states=logits_output.hidden_states,
+                    num_correct_drafts=num_correct_drafts,
+                    num_accept_tokens=num_correct_drafts + 1,
+                ),
+                logits_output=logits_output,
+                accept_tokens=torch.empty(0, dtype=torch.int32, device=device),
+                num_correct_drafts_per_req_cpu=[],
+                accept_indices=accept_index,
+                predict=predict,
             )
-            accept_index = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
-            )
-            return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -481,10 +555,25 @@ class EagleVerifyInputV2Mixin:
                 spec_steps=self.spec_steps,
             )
 
-        # `num_correct_drafts` stays drafts-only inside this function; the returned
-        # tensor includes the trailing/bonus token via out-of-place +1 so the
-        # name no longer flips semantics mid-function (naming doc C2).
-        return predict, num_correct_drafts + 1, accept_index
+        # `num_correct_drafts` is drafts-only here; bonus is added via out-of-place
+        # +1 when packaged into `EagleDraftExtendInput.num_accept_tokens`, so the
+        # local name does not flip semantics mid-function (naming doc C2).
+        return EagleVerifyOutputV2(
+            draft_extend_input=EagleDraftExtendInputV2(
+                # V2 keeps `hidden_states` as the full target output (shape
+                # `[bs * draft_token_num, hidden]`); V1 instead stores the
+                # accept-sliced view. The downstream V2 cuda-graph runner
+                # expects the full layout.
+                hidden_states=logits_output.hidden_states,
+                num_correct_drafts=num_correct_drafts,
+                num_accept_tokens=num_correct_drafts + 1,
+            ),
+            logits_output=logits_output,
+            accept_tokens=predict[accept_index],
+            num_correct_drafts_per_req_cpu=[],
+            accept_indices=accept_index,
+            predict=predict,
+        )
 
 
 @triton.jit

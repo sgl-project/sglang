@@ -21,8 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-    from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.base_spec_worker import SpecCoordinator
 
 
 class SpeculativeAlgorithm(Enum):
@@ -137,7 +136,15 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    ) -> Optional[Union[Type[SpecCoordinator], Type[TpModelWorker]]]:
+        """Dispatch the spec-decoding worker class for this algorithm.
+
+        EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER_EAGLE use the unified V2
+        worker class regardless of `disable_overlap_schedule` — V2 workers do
+        not depend on overlap-scheduler state internally; the scheduler now
+        passes a `ModelWorkerBatch` in both modes. FROZEN_KV_MTP and NGRAM
+        remain V1-only.
+        """
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -167,40 +174,22 @@ class SpeculativeAlgorithm(Enum):
             return FrozenKVMTPWorker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
-            # FIXME: migrate to EagleWorker
-            if enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
-
-                return MultiLayerEagleWorkerV2
-
-            from sglang.srt.speculative.multi_layer_eagle_worker import (
-                MultiLayerEagleWorker,
+            from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                MultiLayerEagleWorkerV2,
             )
 
-            return MultiLayerEagleWorker
+            return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
-            if enable_overlap:
-                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-                return EAGLEWorkerV2
-
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            return EAGLEWorker
+            return EAGLEWorkerV2
         elif self.is_standalone():
-            if enable_overlap:
-                from sglang.srt.speculative.standalone_worker_v2 import (
-                    StandaloneWorkerV2,
-                )
+            from sglang.srt.speculative.standalone_worker_v2 import (
+                StandaloneWorkerV2,
+            )
 
-                return StandaloneWorkerV2
-
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            return StandaloneWorker
+            return StandaloneWorkerV2
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
@@ -229,12 +218,21 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # V2 overlap-only: forward stream computes next iter's seq_lens before
+    # scheduler dispatches the next batch. Scheduler reads this on the
+    # next_draft_input relay to sync schedule-side seq_lens. None on V1 and
+    # non-overlap algos. Declared on base so scheduler's unified install path
+    # can read it generically across all spec algos without isinstance/getattr.
+    new_seq_lens: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,

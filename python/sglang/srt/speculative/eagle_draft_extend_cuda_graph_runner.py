@@ -36,7 +36,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.base_spec_worker import DraftExecutor
 
 
 @dataclass
@@ -60,20 +60,15 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
 class EAGLEDraftExtendCudaGraphRunner:
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: "DraftExecutor",
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
-            self.model_runner = model_runner = eagle_worker.draft_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        else:
-            self.model_runner = model_runner = eagle_worker.model_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND
+        self.model_runner = model_runner = eagle_worker.draft_runner
+        self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         self.graphs = {}
         self.output_buffers = {}
@@ -301,15 +296,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
-        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
-        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
-        num_tokens_for_logprob = (
-            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
-        )
+        # DRAFT_EXTEND_V2: all-token logprob calculation (pre-acceptance prune).
+        num_tokens_for_logprob = num_tokens
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
