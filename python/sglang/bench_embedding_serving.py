@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
@@ -66,14 +66,14 @@ def _range_ratio(value: str) -> float:
     return parsed
 
 
-def _json_object(value: str) -> str:
+def _json_object(value: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as exc:
         raise argparse.ArgumentTypeError(f"invalid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("must be a JSON object")
-    return value
+    return parsed
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -224,7 +224,7 @@ def _normalized_server_args(server_args: Sequence[str]) -> List[str]:
 def _build_extra_request_body(args: argparse.Namespace) -> Optional[str]:
     body = {}
     if args.extra_request_body:
-        body.update(json.loads(args.extra_request_body))
+        body.update(args.extra_request_body)
     if args.dimensions is not None:
         existing = body.get("dimensions")
         if existing is not None and existing != args.dimensions:
@@ -324,17 +324,23 @@ def _print_commands(commands: EmbeddingServingCommands) -> None:
 
 
 def _terminate_process(process: subprocess.Popen) -> None:
-    if hasattr(os, "killpg"):
-        os.killpg(process.pid, signal.SIGTERM)
-    else:
-        process.terminate()
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
     try:
         process.wait(timeout=30)
     except subprocess.TimeoutExpired:
-        if hasattr(os, "killpg"):
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
         process.wait(timeout=30)
 
 
