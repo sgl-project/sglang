@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Process-wide monotonic epoch used to derive cheap millisecond-resolution
 /// timestamps for [`Node::last_used`]. Initialised lazily on first use.
@@ -71,10 +71,29 @@ fn now_millis() -> u64 {
 /// The name is intentionally namespaced (`KvWorkerId`) to avoid collision
 /// with [`crate::core::worker_registry::WorkerId`], which is a UUID-string
 /// identity used by the worker registry.
+///
+/// # Provenance
+///
+/// Instances should only be minted by the kv_events module itself
+/// (subscriber registry → pump → tree) so the `url` always comes from
+/// the worker registry's authoritative URL. External callers can read
+/// the fields and use them to query the tree, but constructing fresh
+/// IDs from arbitrary URLs would let routing logic resolve to
+/// non-registered endpoints. Use [`KvWorkerId::new`] when constructing
+/// from a tested path; do not assemble struct literals from
+/// user-controlled input.
 #[derive(Clone, Eq, Hash, PartialEq, Debug)]
 pub struct KvWorkerId {
     pub url: String,
     pub dp_rank: u32,
+}
+
+impl KvWorkerId {
+    /// Explicit constructor — preferred over struct-literal syntax so
+    /// future tightening of provenance has a single chokepoint.
+    pub fn new(url: String, dp_rank: u32) -> Self {
+        Self { url, dp_rank }
+    }
 }
 
 /// Result of [`HashTree::match_prefix`].
@@ -194,24 +213,33 @@ impl TreeState {
     /// Insert a brand-new child under `parent_id` and wire up the reverse
     /// index. Caller is responsible for ensuring `parent_id`'s child slot
     /// for `block_hash` is empty (else this overwrites it).
+    ///
+    /// Returns `None` if `parent_id` does not exist — an invariant
+    /// violation. The pump runs in a long-lived task; panicking here would
+    /// take down the entire cache-aware path, so we log and bail.
     fn create_child(
         &mut self,
         parent_id: NodeId,
         block_hash: i64,
         parent_block_hash: Option<i64>,
-    ) -> NodeId {
+    ) -> Option<NodeId> {
         let id = self.alloc_id();
         self.nodes.insert(
             id,
             Node::new_child(block_hash, parent_block_hash, parent_id),
         );
-        self.nodes
-            .get_mut(&parent_id)
-            .expect("parent must exist")
-            .children
-            .insert(block_hash, id);
+        let Some(parent) = self.nodes.get_mut(&parent_id) else {
+            error!(
+                parent_id,
+                block_hash,
+                "tree invariant violation: create_child called with unknown parent_id; discarding new node",
+            );
+            self.nodes.remove(&id);
+            return None;
+        };
+        parent.children.insert(block_hash, id);
         self.by_hash.entry(block_hash).or_default().insert(id);
-        id
+        Some(id)
     }
 
     /// Pick the parent node id for an incoming `BlockStored` event.
@@ -274,12 +302,19 @@ impl TreeState {
                 .and_then(|n| n.children.get(&h).copied())
             {
                 Some(id) => id,
-                None => self.create_child(current, h, prev_hash),
+                None => match self.create_child(current, h, prev_hash) {
+                    Some(id) => id,
+                    None => return,
+                },
             };
-            let child = self
-                .nodes
-                .get_mut(&child_id)
-                .expect("just created or fetched");
+            let Some(child) = self.nodes.get_mut(&child_id) else {
+                error!(
+                    child_id,
+                    block_hash = h,
+                    "tree invariant violation: child node missing immediately after fetch/create; aborting chain",
+                );
+                return;
+            };
             child.workers.insert(worker.clone());
             child.last_used.store(now, Ordering::Relaxed);
             current = child_id;
@@ -350,7 +385,16 @@ impl TreeState {
             }
             // Peek at the node before removal so we know its parent + hash.
             let (parent_id, block_hash) = match self.nodes.get(&cursor) {
-                Some(n) => (n.parent.expect("non-root has parent"), n.block_hash),
+                Some(n) => match n.parent {
+                    Some(p) => (p, n.block_hash),
+                    None => {
+                        error!(
+                            cursor,
+                            "tree invariant violation: non-root node has no parent; aborting prune",
+                        );
+                        return;
+                    }
+                },
                 None => return,
             };
             // Confirm prune precondition (cheap defensive check).
@@ -613,6 +657,14 @@ impl HashTree {
     /// [`HashTree::evict_lru`].
     pub fn node_count(&self) -> usize {
         self.state.read().node_count()
+    }
+
+    /// Number of distinct block-hash keys carried by the reverse index.
+    /// Exposed for invariant tests: when `node_count() == 0` this must
+    /// also be 0. A nonzero value here with zero nodes means a `prune`
+    /// path forgot to clean up `by_hash` and the index has leaked.
+    pub fn reverse_index_size(&self) -> usize {
+        self.state.read().by_hash.len()
     }
 
     /// Evict least-recently-used nodes until `node_count() <= max_size`.

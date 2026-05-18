@@ -92,7 +92,8 @@ fn tree_survives_concurrent_inserts_removes_and_matches() {
     }
 
     for h in handles {
-        h.join().expect("worker thread panicked under concurrent load");
+        h.join()
+            .expect("worker thread panicked under concurrent load");
     }
 
     assert_eq!(
@@ -100,6 +101,16 @@ fn tree_survives_concurrent_inserts_removes_and_matches() {
         0,
         "tree must be empty after every worker was cleared; \
          residual nodes indicate a missed clear_worker path",
+    );
+
+    // The arena and the reverse index must agree: zero non-root nodes
+    // means zero `by_hash` entries. A bug that prunes the arena but not
+    // the reverse index would leak memory and corrupt future inserts;
+    // this assertion turns that into an immediate test failure.
+    assert_eq!(
+        tree.reverse_index_size(),
+        0,
+        "by_hash reverse index must be empty when no non-root nodes remain",
     );
 }
 

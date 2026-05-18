@@ -164,8 +164,22 @@ pub async fn run_with_http(
                 // KV-event index can clear its per-(url, dp_rank) state.
                 let worker_url = registry.get(&id).map(|w| w.url.clone());
                 registry.remove(&id);
-                if let (Some(idx), Some(url)) = (&kv_index, worker_url) {
-                    idx.remove_worker(&url).await;
+                match (&kv_index, worker_url) {
+                    (Some(idx), Some(url)) => {
+                        idx.remove_worker(&url).await;
+                    }
+                    (Some(_), None) => {
+                        // Registry didn't know this worker but kv-events
+                        // is enabled — duplicate Removed or out-of-order
+                        // event. KvEventIndex state for this id (if any)
+                        // leaks until process shutdown; log so it's
+                        // detectable.
+                        tracing::warn!(
+                            id = %id,
+                            "discovery: Removed without a known URL; kv-events state (if any) not cleared",
+                        );
+                    }
+                    (None, _) => {}
                 }
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
@@ -200,7 +214,7 @@ mod tests {
         CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig, ModelConfig,
         PolicyKind, ServerConfig, StaticFileDiscoveryConfig,
     };
-    use crate::discovery::{ModelId, WorkerId, WorkerMode};
+    use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
     use serde_json::{json, Value};
     use std::num::NonZeroU32;
@@ -418,5 +432,119 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    /// End-to-end wiring smoke test: spin up a fake worker, run the
+    /// manager with a real `KvEventIndex` against that worker URL, and
+    /// verify both `Added` and `Removed` propagate through to the
+    /// index's internal worker map.
+    ///
+    /// The fake worker advertises a `kv_events` block in `/server_info`,
+    /// so the manager → KvEventIndex → discovery → registry path is
+    /// exercised end-to-end. The ZMQ connect itself targets an unused
+    /// port and fails (port is closed), but the *index-level* state still
+    /// records the worker — which is exactly the invariant under test:
+    /// `add_worker` registers the worker URL in `KvEventIndex.workers`
+    /// even when the per-rank SUB connect fails.
+    #[tokio::test]
+    async fn manager_drives_kv_index_lifecycle() {
+        use tokio::time::timeout;
+
+        // The fake worker advertises both `kv_events` for KvEventIndex AND
+        // `served_model_name` so the worker-manager HTTP introspection
+        // also resolves a model id.
+        let body = json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port_base": 60000,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        });
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(body).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let kv_index = KvEventIndex::new();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_config(
+            rx,
+            registry.clone(),
+            None,
+            Some(kv_index.clone()),
+        ));
+
+        let spec = WorkerSpec {
+            id: WorkerId("w-1".into()),
+            url: worker_url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        // Wait until the manager has both registered the worker AND
+        // resolved /server_info — bound the wait so a hang surfaces.
+        let added = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&spec.id).is_some() && kv_index.known_worker_count() == 1 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(added.is_ok(), "manager failed to propagate Added");
+
+        tx.send(DiscoveryEvent::Removed {
+            id: spec.id.clone(),
+        })
+        .await
+        .unwrap();
+        let removed = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&spec.id).is_none() && kv_index.known_worker_count() == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(removed.is_ok(), "manager failed to propagate Removed");
+
+        drop(tx);
+        let _ = manager_handle.await;
+        kv_index.shutdown().await;
+    }
+
+    /// `Removed` for an unknown id with kv-events enabled must not panic.
+    /// The kv_index has no entry for that id either, so it must remain
+    /// empty after the no-op.
+    #[tokio::test]
+    async fn manager_removed_unknown_id_is_noop() {
+        use tokio::time::sleep;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let kv_index = KvEventIndex::new();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_config(
+            rx,
+            registry.clone(),
+            None,
+            Some(kv_index.clone()),
+        ));
+
+        tx.send(DiscoveryEvent::Removed {
+            id: WorkerId("never-added".into()),
+        })
+        .await
+        .unwrap();
+        // Let the manager process the event.
+        sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(kv_index.known_worker_count(), 0);
+        drop(tx);
+        let _ = manager_handle.await;
+        kv_index.shutdown().await;
     }
 }

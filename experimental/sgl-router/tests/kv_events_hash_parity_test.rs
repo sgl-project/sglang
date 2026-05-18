@@ -13,8 +13,9 @@
 //! This test consumes a fixture produced by
 //! `tests/scripts/generate_kv_events_hash_parity.py`, which replicates the
 //! SGLang algorithm verbatim (see the script's docstring for authority
-//! pointers).  CI regenerates the fixture and diffs against the committed
-//! file in M3 Task 7; this test asserts the Rust implementation matches
+//! pointers). CI regenerates the fixture (see
+//! `.github/workflows/pr-test-sgl-router.yml`) and diffs against the
+//! committed file; this test asserts the Rust implementation matches
 //! whatever fixture is checked in.
 
 use serde::Deserialize;
@@ -62,9 +63,8 @@ fn rust_block_hashes_match_python_radix_cache() {
         // block_size of 0 is rejected by `compute_block_hashes` with a
         // panic; the Python generator also rejects it.  The fixture
         // doesn't include a 0 case, so unwrap is safe.
-        let block_size = std::num::NonZeroUsize::new(case.block_size).unwrap_or_else(|| {
-            panic!("case {} has block_size=0 which is invalid", case.name)
-        });
+        let block_size = std::num::NonZeroUsize::new(case.block_size)
+            .unwrap_or_else(|| panic!("case {} has block_size=0 which is invalid", case.name));
         let got = compute_block_hashes(&case.tokens, block_size.get());
         assert_eq!(
             got, case.expected_i64_hashes,

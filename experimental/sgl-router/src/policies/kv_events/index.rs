@@ -12,18 +12,26 @@
 //! - A pump task that drains [`WorkerEvent`]s from the subscriber and applies
 //!   them to the tree.
 //!
-//! `KvEventIndex::add_worker` / `remove_worker` are called from the worker
-//! manager (`workers::manager`) on every `DiscoveryEvent::Added` /
-//! `DiscoveryEvent::Removed`.  The selector that consumes the tree (cache-
-//! aware-zmq) lands in M4.
+//! `add_worker` / `remove_worker` are driven from the worker manager on every
+//! `DiscoveryEvent::Added` / `DiscoveryEvent::Removed`.
+//!
+//! # Race avoidance
+//!
+//! The pump runs independently of the lifecycle calls, so an event can sit in
+//! the mpsc buffer while `remove_worker` is in progress. To prevent stale
+//! events from re-inserting tree state for a worker that was just torn down,
+//! [`KvEventIndex`] maintains a `live_workers` set; entries are removed
+//! **before** the subscriber tasks are joined, and the pump filters every
+//! event through this set before mutating the tree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::discovery::{fetch_event_config, EventConfig};
@@ -39,35 +47,44 @@ use super::wire::KvCacheEvent;
 const EVENT_CHANNEL_BUFFER: usize = 1024;
 
 /// Per-worker bookkeeping kept inside [`KvEventIndex`] so `remove_worker`
-/// knows the DP fan-out without re-fetching `/server_info`.
+/// knows which DP ranks were actually subscribed (not the advertised
+/// `dp_size`, which may overflow `u16` and skip ranks).
 #[derive(Debug, Clone)]
 struct WorkerEntry {
-    dp_size: u32,
+    /// DP ranks that were successfully spawned for this worker. Used by
+    /// `remove_worker` to know which `(url, dp_rank)` cursors and tree
+    /// states to clear.
+    dp_ranks: Vec<u32>,
 }
 
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
-/// manager as `Option<Arc<KvEventIndex>>` — `None` disables the cache-
-/// aware-zmq path entirely (i.e. all selection policies are pure
-/// round-robin / random / power-of-two).
+/// manager as `Option<Arc<KvEventIndex>>` — `None` disables the cache-aware
+/// routing path entirely.
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
     subscribers: Arc<KvEventSubscriberRegistry>,
     pump: Mutex<Option<JoinHandle<()>>>,
+    pump_cancel: CancellationToken,
     workers: Mutex<HashMap<String, WorkerEntry>>,
     http: reqwest::Client,
-    /// Per-`(worker_url, dp_rank)` last-applied sequence number.  The
+    /// Set of currently-attached `(worker_url, dp_rank)` pairs. The pump
+    /// drops any event whose `worker` is not in this set, so a batch
+    /// queued by a subscriber that was torn down by `remove_worker` does
+    /// not re-pollute the tree after `clear_worker` ran.
+    live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    /// Per-`(worker_url, dp_rank)` last-applied sequence number. The
     /// subscriber forwards every batch with no de-dup; this map filters
     /// any batch whose `seq` is not strictly greater than the previously
-    /// applied one.  Used for cursor recovery semantics on subscriber
-    /// restart (manager-level resume; ZMQ itself does not replay).
+    /// applied one. Cleared on `remove_worker` because a re-added worker
+    /// may legitimately have a fresh publisher whose sequence numbers
+    /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
 }
 
 impl KvEventIndex {
-    /// Build an empty index and spawn the pump task.  The pump runs until
-    /// the index is dropped or every sender to the internal mpsc closes.
+    /// Build an empty index and spawn the pump task.
     pub fn new() -> Arc<Self> {
         Self::new_with_http(
             reqwest::Client::builder()
@@ -83,25 +100,36 @@ impl KvEventIndex {
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
-        let pump = tokio::spawn(pump_loop(tree.clone(), cursors.clone(), rx));
+        let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let pump_cancel = CancellationToken::new();
+        let pump = tokio::spawn(pump_loop(
+            tree.clone(),
+            cursors.clone(),
+            live_workers.clone(),
+            pump_cancel.clone(),
+            rx,
+        ));
         Arc::new(Self {
             tree,
             subscribers,
             pump: Mutex::new(Some(pump)),
+            pump_cancel,
             workers: Mutex::new(HashMap::new()),
             http,
+            live_workers,
             cursors,
         })
     }
 
-    /// Return a clone of the underlying tree handle for cache-aware
-    /// selection (M4) and metrics.
+    /// Clone the underlying tree handle for cache-aware selection and
+    /// metrics. The pump is the sole writer; callers should treat the
+    /// returned handle as read-only.
     pub fn tree(&self) -> Arc<HashTree> {
         self.tree.clone()
     }
 
-    /// Register a worker.  Fetches `/server_info` to learn the publisher
-    /// endpoint and opens one SUB per advertised DP rank.  If the worker
+    /// Register a worker. Fetches `/server_info` to learn the publisher
+    /// endpoint and opens one SUB per advertised DP rank. If the worker
     /// is not publishing KV events (older SGLang, opt-out config), this
     /// is a logged no-op — the worker still routes via the non-cache-
     /// aware policies.
@@ -109,9 +137,9 @@ impl KvEventIndex {
         let cfg: EventConfig = match fetch_event_config(worker_url, &self.http).await {
             Ok(Some(c)) => c,
             Ok(None) => {
-                debug!(
+                info!(
                     worker_url = %worker_url,
-                    "kv-events: worker is not publishing; skipping subscriber",
+                    "kv-events: worker is not publishing; cache-aware routing disabled for this worker",
                 );
                 return;
             }
@@ -130,10 +158,37 @@ impl KvEventIndex {
             port_base = cfg.port_base,
             "kv-events: subscribing",
         );
+        // Compute the DP ranks that will actually be subscribed (skip
+        // ranks whose port overflows u16; the subscriber will warn on
+        // each skipped rank).
+        let port_base_u32 = u32::from(cfg.port_base);
+        let dp_ranks: Vec<u32> = (0..cfg.dp_size)
+            .filter(|rank| (port_base_u32 + rank) <= u32::from(u16::MAX))
+            .collect();
+        if dp_ranks.is_empty() {
+            warn!(
+                worker_url = %worker_url,
+                port_base = cfg.port_base,
+                dp_size = cfg.dp_size,
+                "kv-events: every advertised rank's port overflows u16; skipping worker",
+            );
+            return;
+        }
+        // Mark every rank live BEFORE the subscriber starts so any event
+        // it queues is accepted by the pump.
+        {
+            let mut live = self.live_workers.lock();
+            for &rank in &dp_ranks {
+                live.insert(KvWorkerId {
+                    url: worker_url.to_string(),
+                    dp_rank: rank,
+                });
+            }
+        }
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerEntry {
-                dp_size: cfg.dp_size,
+                dp_ranks: dp_ranks.clone(),
             },
         );
         self.subscribers.add_worker(worker_url, &cfg).await;
@@ -141,35 +196,63 @@ impl KvEventIndex {
 
     /// Tear down a worker's subscribers and clear it from the tree.
     /// Idempotent: a remove for a worker that was never added is a no-op.
+    ///
+    /// The live-worker entries are dropped **before** the subscriber join,
+    /// so any event still buffered in the mpsc by the time the pump
+    /// reaches it is dropped instead of re-inserted into the tree.
     pub async fn remove_worker(&self, worker_url: &str) {
         let Some(entry) = self.workers.lock().remove(worker_url) else {
             return;
         };
-        self.subscribers.remove_worker(worker_url).await;
-        // Drop each rank's tree state.  We don't retain the cursor — a
-        // re-added worker may legitimately have a fresh publisher whose
-        // sequence numbers restart from 1.
-        let mut cursors = self.cursors.lock();
-        for dp_rank in 0..entry.dp_size {
-            let id = KvWorkerId {
+        let ids: Vec<KvWorkerId> = entry
+            .dp_ranks
+            .iter()
+            .map(|&dp_rank| KvWorkerId {
                 url: worker_url.to_string(),
                 dp_rank,
-            };
-            self.tree.clear_worker(&id);
-            cursors.remove(&id);
+            })
+            .collect();
+        // 1. Mark every rank dead. Any pump-queued events arriving after
+        //    this point will be filtered.
+        {
+            let mut live = self.live_workers.lock();
+            for id in &ids {
+                live.remove(id);
+            }
+        }
+        // 2. Cancel and join the per-rank subscriber tasks. No further
+        //    events for these ranks will be queued after this returns.
+        self.subscribers.remove_worker(worker_url).await;
+        // 3. Drop each rank's tree state and cursor. Any event already in
+        //    the mpsc buffer at this point will be filtered by the
+        //    live-set check inside the pump.
+        let mut cursors = self.cursors.lock();
+        for id in &ids {
+            self.tree.clear_worker(id);
+            cursors.remove(id);
         }
     }
 
-    /// Shut down the pump task.  Must be awaited so in-flight batches are
-    /// fully applied before the runtime tears down; cancels any
-    /// outstanding SUB connections via the subscriber registry.
+    /// Number of worker URLs the index is currently subscribed to. The
+    /// count includes workers whose `/server_info` resolved but excludes
+    /// any whose discovery returned `Ok(None)` (worker reachable but not
+    /// publishing) or `Err` (transient discovery failure). Exposed for
+    /// tests + future metrics; not part of the routing hot path.
+    pub fn known_worker_count(&self) -> usize {
+        self.workers.lock().len()
+    }
+
+    /// Shut down the pump task. Cancels the subscriber registry first so no
+    /// further events are queued, then cancels the pump so any buffered
+    /// events are discarded and the task exits promptly.
     pub async fn shutdown(&self) {
         self.subscribers.shutdown().await;
+        self.pump_cancel.cancel();
         let handle = self.pump.lock().take();
         if let Some(h) = handle {
-            // The pump's mpsc rx ends when every cloned Sender drops; the
-            // registry's shutdown above releases the per-worker senders.
-            // A short timeout guards against pathological cases.
+            // 2s ceiling guards against a pathological tokio runtime
+            // teardown; under normal operation the pump exits within one
+            // poll of `pump_cancel.cancelled()`.
             match tokio::time::timeout(Duration::from_secs(2), h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!(error = %e, "kv-events pump task did not join cleanly"),
@@ -179,43 +262,85 @@ impl KvEventIndex {
     }
 }
 
-/// Drain `WorkerEvent`s and apply each batch to the tree.  Out-of-order /
-/// duplicate batches (seq ≤ last_applied) are skipped; the cursor map is
-/// updated on every applied batch.
+/// Drain `WorkerEvent`s and apply each batch to the tree. Out-of-order
+/// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches
+/// are skipped. `PublisherReset` events clear the cursor so a publisher
+/// restarting from seq=1 (after sending END_SEQ) is not filtered.
 async fn pump_loop(
     tree: Arc<HashTree>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+    live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    cancel: CancellationToken,
     mut rx: mpsc::Receiver<WorkerEvent>,
 ) {
-    while let Some(ev) = rx.recv().await {
-        let prev = cursors.lock().get(&ev.worker).copied();
-        if let Some(p) = prev {
-            if ev.seq <= p {
-                debug!(
-                    worker = ?ev.worker,
-                    seq = ev.seq,
-                    last_applied = p,
-                    "kv-events pump: out-of-order batch; skipping",
-                );
-                continue;
+    loop {
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("kv-events pump: shutdown requested; exiting");
+                return;
             }
-        }
-        for event in &ev.batch.events {
-            match event {
-                KvCacheEvent::BlockStored(b) => {
-                    tree.insert(&ev.worker, b.parent_block_hash, &b.block_hashes);
-                }
-                KvCacheEvent::BlockRemoved(b) => {
-                    tree.remove(&ev.worker, &b.block_hashes);
-                }
-                KvCacheEvent::AllBlocksCleared => {
-                    tree.clear_worker(&ev.worker);
+            recv = rx.recv() => match recv {
+                Some(ev) => ev,
+                None => {
+                    warn!("kv-events pump: receiver closed unexpectedly; exiting");
+                    return;
                 }
             }
+        };
+
+        // Filter events from workers that are no longer attached. This is
+        // load-bearing: `remove_worker` clears the live set BEFORE joining
+        // the subscriber task, so any event still buffered when the pump
+        // reaches it would otherwise re-pollute the tree.
+        let worker = ev.worker();
+        if !live_workers.lock().contains(worker) {
+            debug!(
+                worker = ?worker,
+                "kv-events pump: dropping event from detached worker",
+            );
+            continue;
         }
-        cursors.lock().insert(ev.worker.clone(), ev.seq);
+
+        match ev {
+            WorkerEvent::PublisherReset { worker } => {
+                if cursors.lock().remove(&worker).is_some() {
+                    info!(
+                        worker = ?worker,
+                        "kv-events pump: publisher reset; cursor cleared",
+                    );
+                }
+            }
+            WorkerEvent::Batch { worker, seq, batch } => {
+                let prev = cursors.lock().get(&worker).copied();
+                if let Some(p) = prev {
+                    if seq <= p {
+                        debug!(
+                            worker = ?worker,
+                            seq,
+                            last_applied = p,
+                            "kv-events pump: out-of-order batch; skipping",
+                        );
+                        continue;
+                    }
+                }
+                for event in &batch.events {
+                    match event {
+                        KvCacheEvent::BlockStored(b) => {
+                            tree.insert(&worker, b.parent_block_hash, &b.block_hashes);
+                        }
+                        KvCacheEvent::BlockRemoved(b) => {
+                            tree.remove(&worker, &b.block_hashes);
+                        }
+                        KvCacheEvent::AllBlocksCleared => {
+                            tree.clear_worker(&worker);
+                        }
+                    }
+                }
+                cursors.lock().insert(worker, seq);
+            }
+        }
     }
-    debug!("kv-events pump: receiver closed; exiting");
 }
 
 #[cfg(test)]
@@ -238,16 +363,53 @@ mod tests {
         }
     }
 
+    /// Bundle of plumbing returned by `spawn_pump` so individual tests
+    /// can destructure just the bits they need.
+    struct PumpHarness {
+        tree: Arc<HashTree>,
+        cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+        #[allow(dead_code)]
+        live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
+        #[allow(dead_code)]
+        cancel: CancellationToken,
+        tx: mpsc::Sender<WorkerEvent>,
+        pump: JoinHandle<()>,
+    }
+
+    /// Build a tree + cursors + live-set wired through `pump_loop` with
+    /// the given workers pre-marked live.
+    fn spawn_pump(live: &[KvWorkerId]) -> PumpHarness {
+        let tree = Arc::new(HashTree::new());
+        let cursors = Arc::new(Mutex::new(HashMap::new()));
+        let live_set: Arc<Mutex<HashSet<KvWorkerId>>> =
+            Arc::new(Mutex::new(live.iter().cloned().collect()));
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::channel(4);
+        let pump = tokio::spawn(pump_loop(
+            tree.clone(),
+            cursors.clone(),
+            live_set.clone(),
+            cancel.clone(),
+            rx,
+        ));
+        PumpHarness {
+            tree,
+            cursors,
+            live_set,
+            cancel,
+            tx,
+            pump,
+        }
+    }
+
     /// Direct test of the pump loop's tree application — no sockets.
     #[tokio::test]
     async fn pump_applies_block_stored_to_tree() {
-        let tree = Arc::new(HashTree::new());
-        let cursors = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::channel(4);
-        let pump = tokio::spawn(pump_loop(tree.clone(), cursors.clone(), rx));
-
         let id = worker_id("http://w1", 0);
-        tx.send(WorkerEvent {
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
             worker: id.clone(),
             seq: 1,
             batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
@@ -262,6 +424,9 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
+        // Don't cancel — let rx.recv() return None naturally so any
+        // queued events drain first. (The pump's `biased` select would
+        // otherwise preempt unprocessed events on cancel.)
         pump.await.unwrap();
 
         let m = tree.match_prefix(None, &[10, 20, 30]);
@@ -273,14 +438,12 @@ mod tests {
     /// dropped silently and does not mutate the tree.
     #[tokio::test]
     async fn pump_filters_out_of_order_seq() {
-        let tree = Arc::new(HashTree::new());
-        let cursors = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::channel(4);
-        let pump = tokio::spawn(pump_loop(tree.clone(), cursors.clone(), rx));
-
         let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, tx, pump) = (h.tree, h.cursors, h.tx, h.pump);
+
         // Apply seq=5 with block 10.
-        tx.send(WorkerEvent {
+        tx.send(WorkerEvent::Batch {
             worker: id.clone(),
             seq: 5,
             batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
@@ -294,9 +457,9 @@ mod tests {
         })
         .await
         .unwrap();
-        // Then a duplicate-style seq=3 that tries to remove block 10.  Must
+        // Then a duplicate-style seq=3 that tries to remove block 10. Must
         // be dropped.
-        tx.send(WorkerEvent {
+        tx.send(WorkerEvent::Batch {
             worker: id.clone(),
             seq: 3,
             batch: batch(vec![KvCacheEvent::BlockRemoved(BlockRemoved {
@@ -307,6 +470,9 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
+        // Don't cancel — let rx.recv() return None naturally so any
+        // queued events drain first. (The pump's `biased` select would
+        // otherwise preempt unprocessed events on cancel.)
         pump.await.unwrap();
 
         let m = tree.match_prefix(None, &[10]);
@@ -320,13 +486,11 @@ mod tests {
     /// AllBlocksCleared wipes the worker's tree state entirely.
     #[tokio::test]
     async fn pump_handles_all_blocks_cleared() {
-        let tree = Arc::new(HashTree::new());
-        let cursors = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::channel(4);
-        let pump = tokio::spawn(pump_loop(tree.clone(), cursors.clone(), rx));
-
         let id = worker_id("http://w1", 0);
-        tx.send(WorkerEvent {
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
             worker: id.clone(),
             seq: 1,
             batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
@@ -340,7 +504,7 @@ mod tests {
         })
         .await
         .unwrap();
-        tx.send(WorkerEvent {
+        tx.send(WorkerEvent::Batch {
             worker: id.clone(),
             seq: 2,
             batch: batch(vec![KvCacheEvent::AllBlocksCleared]),
@@ -348,9 +512,67 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
+        // Don't cancel — let rx.recv() return None naturally so any
+        // queued events drain first. (The pump's `biased` select would
+        // otherwise preempt unprocessed events on cancel.)
         pump.await.unwrap();
 
         let m = tree.match_prefix(None, &[1, 2]);
-        assert_eq!(m.matched_blocks, 0, "AllBlocksCleared must purge the worker");
+        assert_eq!(
+            m.matched_blocks, 0,
+            "AllBlocksCleared must purge the worker"
+        );
+    }
+
+    /// The pump drops events whose worker is not in `live_workers`. This
+    /// is the safety net against the remove-then-pump race: an event
+    /// queued before `remove_worker` clears the live set must not mutate
+    /// the tree.
+    #[tokio::test]
+    async fn pump_drops_events_from_detached_workers() {
+        let live_id = worker_id("http://live", 0);
+        let dead_id = worker_id("http://dead", 0);
+        let h = spawn_pump(std::slice::from_ref(&live_id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        // Event from a worker that was never added (or was already
+        // removed). Must be dropped.
+        tx.send(WorkerEvent::Batch {
+            worker: dead_id.clone(),
+            seq: 1,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![42],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        // Sanity: a live event still applies.
+        tx.send(WorkerEvent::Batch {
+            worker: live_id.clone(),
+            seq: 1,
+            batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![99],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        // Don't cancel — let rx.recv() return None naturally so any
+        // queued events drain first. (The pump's `biased` select would
+        // otherwise preempt unprocessed events on cancel.)
+        pump.await.unwrap();
+
+        assert_eq!(tree.match_prefix(None, &[42]).matched_blocks, 0);
+        assert_eq!(tree.match_prefix(None, &[99]).matched_blocks, 1);
     }
 }

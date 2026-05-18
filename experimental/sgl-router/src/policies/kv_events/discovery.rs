@@ -3,14 +3,21 @@
 //! Calls the worker's `/server_info` endpoint (extended on the SGLang
 //! Python side) to learn where to connect its ZMQ KV-event publisher.
 //! Returns an [`EventConfig`] on success or `Ok(None)` when the worker
-//! isn't running an event publisher (older SGLang, `kv-events-config`
-//! unset, `null` publisher, etc.). The caller is expected to fall back to
-//! a globally-configured `event_port` in that case.
+//! is reachable but explicitly does not run an event publisher (older
+//! SGLang, `kv-events-config` unset, `null` publisher, etc.).
 //!
-//! Failure semantics are deliberately permissive: any HTTP-level problem
-//! (timeout, non-200, malformed payload) maps to `Ok(None)` rather than
-//! `Err`, so that one flaky worker introspection never prevents gateway
-//! startup or worker registration.
+//! # Failure semantics
+//!
+//! - Network errors and 5xx responses are **transient** and retried
+//!   inside [`fetch_event_config`] up to [`FETCH_MAX_ATTEMPTS`] with
+//!   exponential backoff. If every attempt fails, the call returns
+//!   `Err(_)` so the caller can distinguish "definitely not publishing"
+//!   (`Ok(None)`) from "we couldn't tell" (`Err`).
+//! - 4xx responses are non-retriable (the worker answered
+//!   authoritatively) and surface as `Err`.
+//! - Caller behaviour: [`super::index::KvEventIndex::add_worker`] logs
+//!   the error and skips subscription, but the worker remains in the
+//!   broader router registry. Future re-discovery may retry.
 
 use std::time::Duration;
 
@@ -32,12 +39,14 @@ pub struct EventConfig {
     pub port_base: u16,
     /// ZMQ topic prefix the gateway should SUBSCRIBE to.
     pub topic: String,
-    /// Worker-reported `page_size`. The gateway cross-checks against its
-    /// own configured `block_size`; a mismatch is silent miscompute and
-    /// must produce a warn at the policy layer.
+    /// Worker-reported `page_size`. Callers MUST compare against their
+    /// own configured `block_size`; a mismatch produces silent
+    /// miscompute since [`super::hash::compute_block_hashes`] is keyed
+    /// on the caller's value, not on this one.
     pub block_size: u32,
     /// Number of attention-DP ranks publishing. The gateway opens this
-    /// many SUB connections (one per rank).
+    /// many SUB connections (one per rank), skipping any rank whose
+    /// `port_base + dp_rank` overflows `u16`.
     pub dp_size: u32,
 }
 
@@ -46,21 +55,30 @@ pub struct EventConfig {
 /// is generous and still bounds gateway-startup latency.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bounded retry for transient `/server_info` failures. A worker that just
+/// booted may need a few hundred ms before its HTTP server accepts
+/// requests; retry absorbs the race without permanently disabling
+/// cache-aware routing for that worker.
+const FETCH_MAX_ATTEMPTS: u32 = 3;
+const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
+
 /// Fetch the worker's KV-event publisher config via `/server_info`.
 ///
 /// Returns:
 /// - `Ok(Some(cfg))` when the worker exposed a usable `kv_events` block.
-/// - `Ok(None)` when the worker is reachable but doesn't expose one
-///   (older SGLang, `kv-events-config` unset, `null` publisher, etc.) —
-///   the caller should fall back to its globally-configured event port.
-/// - `Err(_)` only when `worker_url` itself cannot be parsed; network or
-///   parsing failures degrade to `Ok(None)` with a `warn!` log.
+/// - `Ok(None)` when the worker is **reachable** but explicitly does not
+///   expose one (older SGLang, `kv-events-config` unset, `null`
+///   publisher, etc.). Cache-aware routing is disabled for that worker.
+/// - `Err(_)` when `worker_url` cannot be parsed, OR when every transient
+///   attempt failed (network error or 5xx). Caller decides whether to
+///   retry; the worker is still added to the registry but cache-aware
+///   routing is disabled until a future re-discovery.
 pub async fn fetch_event_config(
     worker_url: &str,
     client: &reqwest::Client,
 ) -> Result<Option<EventConfig>> {
-    let parsed = Url::parse(worker_url)
-        .map_err(|e| anyhow!("invalid worker_url {worker_url}: {e}"))?;
+    let parsed =
+        Url::parse(worker_url).map_err(|e| anyhow!("invalid worker_url {worker_url}: {e}"))?;
     let worker_host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("worker_url {worker_url} has no host"))?
@@ -68,41 +86,7 @@ pub async fn fetch_event_config(
 
     let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
 
-    let resp = match client
-        .get(&server_info_url)
-        .timeout(DEFAULT_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                worker_url = worker_url,
-                error = %e,
-                "kv-events discovery: /server_info request failed; falling back to static event_port"
-            );
-            return Ok(None);
-        }
-    };
-    if !resp.status().is_success() {
-        debug!(
-            worker_url = worker_url,
-            status = resp.status().as_u16(),
-            "kv-events discovery: /server_info returned non-success; falling back"
-        );
-        return Ok(None);
-    }
-    let body: ServerInfoResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                worker_url = worker_url,
-                error = %e,
-                "kv-events discovery: /server_info JSON parse failed; falling back"
-            );
-            return Ok(None);
-        }
-    };
+    let body = fetch_with_retry(&server_info_url, worker_url, client).await?;
 
     let block = match body.kv_events {
         Some(b) => b,
@@ -118,8 +102,10 @@ pub async fn fetch_event_config(
     // Wildcard bind hosts mean "any interface" on the worker side — the
     // gateway has to connect to a routable address, which it learns from
     // the worker URL.
-    let host = if matches!(block.endpoint_host.as_str(), "*" | "0.0.0.0" | "::" | "[::]")
-    {
+    let host = if matches!(
+        block.endpoint_host.as_str(),
+        "*" | "0.0.0.0" | "::" | "[::]"
+    ) {
         worker_host
     } else {
         block.endpoint_host
@@ -134,6 +120,67 @@ pub async fn fetch_event_config(
     }))
 }
 
+/// Issue the `/server_info` request with bounded retry on transient errors
+/// (network failures, 5xx). 4xx responses and JSON-parse errors are
+/// non-retriable: the worker answered, just not with what we expect.
+async fn fetch_with_retry(
+    server_info_url: &str,
+    worker_url: &str,
+    client: &reqwest::Client,
+) -> Result<ServerInfoResponse> {
+    let mut last_err: Option<String> = None;
+    let mut delay = FETCH_BACKOFF_BASE;
+    for attempt in 1..=FETCH_MAX_ATTEMPTS {
+        match client
+            .get(server_info_url)
+            .timeout(DEFAULT_TIMEOUT)
+            .send()
+            .await
+        {
+            Err(e) => {
+                last_err = Some(format!("network error: {e}"));
+                warn!(
+                    worker_url = worker_url,
+                    attempt,
+                    error = %e,
+                    "kv-events discovery: /server_info request failed; will retry"
+                );
+            }
+            Ok(resp) if resp.status().is_server_error() => {
+                last_err = Some(format!("server error: {}", resp.status()));
+                warn!(
+                    worker_url = worker_url,
+                    attempt,
+                    status = resp.status().as_u16(),
+                    "kv-events discovery: /server_info returned 5xx; will retry"
+                );
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                // 4xx — worker answered authoritatively, retrying won't help.
+                return Err(anyhow!(
+                    "/server_info returned {} (non-retriable)",
+                    resp.status()
+                ));
+            }
+            Ok(resp) => {
+                return resp
+                    .json::<ServerInfoResponse>()
+                    .await
+                    .map_err(|e| anyhow!("/server_info JSON parse failed: {e}"));
+            }
+        }
+        if attempt < FETCH_MAX_ATTEMPTS {
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+    }
+    Err(anyhow!(
+        "/server_info failed after {} attempts: {}",
+        FETCH_MAX_ATTEMPTS,
+        last_err.unwrap_or_else(|| "unknown".into()),
+    ))
+}
+
 #[derive(Deserialize)]
 struct ServerInfoResponse {
     #[serde(default)]
@@ -142,11 +189,12 @@ struct ServerInfoResponse {
 
 #[derive(Deserialize)]
 struct KvEventsBlock {
-    // `publisher` is in the wire shape but unused on the gateway side:
-    // the only publisher implementation we support is ZMQ, and the
-    // Python side already filters non-ZMQ from the block. Keeping the
-    // field optional means we won't refuse to deserialize if future
-    // SGLang versions add a different publisher value.
+    // `publisher` is captured for forward-compatibility but unused: the
+    // only publisher implementation supported on the gateway side is
+    // ZMQ. Keeping the field optional means a future SGLang that adds a
+    // non-ZMQ publisher string won't fail this deserialize; the
+    // resulting subscriber will still try to open a ZMQ connection on
+    // `endpoint_host:endpoint_port_base` and fail visibly there.
     #[allow(dead_code)]
     #[serde(default)]
     publisher: Option<String>,
@@ -265,13 +313,26 @@ mod tests {
         assert!(got.is_none());
     }
 
-    /// Connection-refused: no server at the URL. Must degrade to
-    /// `Ok(None)` so a single flaky worker doesn't poison startup.
+    /// Connection-refused: no server at the URL. The retry loop exhausts
+    /// every attempt and propagates `Err`. The caller (KvEventIndex) logs
+    /// + skips the subscriber so a single flaky worker doesn't poison
+    /// startup, but the failure remains distinguishable from "worker
+    /// reachable but not publishing" (`Ok(None)`) so future re-discovery
+    /// can retry.
     #[tokio::test]
-    async fn fetch_returns_none_on_connection_failure() {
+    async fn fetch_returns_err_on_connection_failure() {
         let url = "http://127.0.0.1:1"; // port 1 is reserved / refused
-        let got = fetch_event_config(url, &client()).await.unwrap();
-        assert!(got.is_none());
+        let got = fetch_event_config(url, &client_fast_retry()).await;
+        assert!(got.is_err(), "expected Err on permanent connect refused");
+    }
+
+    /// HTTP client with a short timeout so the connection-failure tests don't
+    /// pay the full 2s × FETCH_MAX_ATTEMPTS budget.
+    fn client_fast_retry() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
     }
 
     /// Invalid worker URL is the one case we propagate as Err — there's

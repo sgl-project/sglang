@@ -29,8 +29,8 @@
 //! path where the first page of a freshly-stored node may have a parent block
 //! hash for the radix tree key, but the **page-hash computation itself**
 //! starts from the parent's **full hex digest** (`node.parent.hash_value[-1]`).
-//! For T2's request-side hashing, there is no parent, so we expose the
-//! "from-scratch" entry point only.
+//! For request-side hashing on the routing path, there is no parent, so we
+//! expose the "from-scratch" entry point only.
 //!
 //! ### Bigram mode
 //!
