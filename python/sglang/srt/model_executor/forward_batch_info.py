@@ -39,8 +39,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_rank,
-    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
@@ -54,9 +52,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
+from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
-    create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -443,11 +441,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     # For decode context parallel
-    dcp_kv_indptr: Optional[torch.Tensor] = None
-    dcp_kv_buffer: Optional[torch.Tensor] = None
-    dcp_kv_indices: Optional[torch.Tensor] = None
-    dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
-    dcp_extend_prefix_lens_sum: Optional[int] = None
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     @classmethod
     def init_new(
@@ -1222,133 +1216,6 @@ def compute_position_torch(
 
 def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
-@triton.jit
-def create_dcp_kv_indices(
-    kv_indptr,
-    extend_lens_ptr,
-    extend_cu_lens_ptr,
-    extend_prefix_lens_ptr,
-    extend_cu_prefix_lens_ptr,
-    kv_indices_ptr,
-    extend_prefix_lens_sum,
-    dcp_world_size: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-    prefix_len = tl.load(extend_prefix_lens_ptr + pid)
-    local_prefix_len = prefix_len // dcp_world_size
-    prefix_start = tl.load(extend_cu_prefix_lens_ptr + pid) // dcp_world_size
-    kv_ind_start = tl.load(kv_indptr + pid)
-    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < prefix_len
-        data = (
-            prefix_start
-            + (offset % dcp_world_size) * (extend_prefix_lens_sum // dcp_world_size)
-            + (offset // dcp_world_size % local_prefix_len)
-        )
-        tl.store(kv_indices_ptr + kv_ind_start + offset, data, mask=mask)
-    extend_len = tl.load(extend_lens_ptr + pid)
-    extend_start = tl.load(extend_cu_lens_ptr + pid)
-    num_loop = tl.cdiv(extend_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < extend_len
-        data = extend_prefix_lens_sum + extend_start + offset
-        tl.store(
-            kv_indices_ptr + kv_ind_start + prefix_len + offset,
-            data,
-            mask=mask,
-        )
-
-
-def update_dcp_forward_extend_info(
-    forward_batch: ForwardBatch, kv_cache_dtype, kv_cache_device
-):
-    # dcp_kv_buffer tokens' layout
-    # [ rank0_r1.prefix_tokens, rank0_r2.prefix_tokens,
-    #   ...,
-    #   rank8_r2.prefix_tokens, rank8_r3.prefix_tokens,
-    #   r1.extend_tokens, r2.extent_tokens, r3.extend_tokens ]
-    extend_prefix_starts = torch.zeros(
-        len(forward_batch.seq_lens),
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-    extend_cu_prefix_lens = torch.zeros(
-        len(forward_batch.seq_lens) + 1,
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-    extend_cu_prefix_lens[1:] = torch.cumsum(forward_batch.extend_prefix_lens, dim=0)
-    extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
-    extend_prefix_lens_sum = sum([i for i in forward_batch.extend_prefix_lens_cpu])
-
-    dcp_prefix_kv_indices = torch.empty(
-        sum(forward_batch.extend_prefix_lens_cpu),
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-    create_chunked_prefix_cache_kv_indices[(len(forward_batch.seq_lens),)](
-        forward_batch.req_to_token_pool.req_to_token,
-        forward_batch.req_pool_indices,
-        extend_prefix_starts,
-        forward_batch.extend_prefix_lens,
-        extend_cu_prefix_lens,
-        dcp_prefix_kv_indices,
-        forward_batch.req_to_token_pool.req_to_token.shape[1],
-    )
-    dcp_kv_indptr = torch.zeros(
-        len(forward_batch.seq_lens) + 1,
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-    dcp_kv_indptr[1:] = forward_batch.seq_lens.cumsum(dim=0)
-    dcp_kv_indptr = dcp_kv_indptr[: (len(forward_batch.seq_lens) + 1)]
-    dcp_kv_indices = torch.zeros(
-        forward_batch.seq_lens_sum,
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-
-    extend_cu_lens = torch.zeros(
-        len(forward_batch.seq_lens) + 1,
-        dtype=torch.int32,
-        device=get_global_server_args().device,
-    )
-    extend_cu_lens[1:] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-    extend_cu_lens = extend_cu_lens[:-1]
-
-    create_dcp_kv_indices[(len(forward_batch.seq_lens),)](
-        dcp_kv_indptr,
-        forward_batch.extend_seq_lens,
-        extend_cu_lens,
-        forward_batch.extend_prefix_lens,
-        extend_cu_prefix_lens,
-        dcp_kv_indices,
-        extend_prefix_lens_sum,
-        get_dcp_world_size(),
-    )
-    forward_batch.dcp_kv_indptr = dcp_kv_indptr
-    forward_batch.dcp_local_prefix_kv_indices = (
-        dcp_prefix_kv_indices[
-            dcp_prefix_kv_indices % get_dcp_world_size() == get_dcp_rank()
-        ]
-        // get_dcp_world_size()
-    )
-    forward_batch.dcp_kv_buffer = torch.empty(
-        (
-            forward_batch.seq_lens_sum,
-            *forward_batch.token_to_kv_pool.get_key_buffer(0).shape[1:],
-        ),
-        dtype=kv_cache_dtype,
-        device=kv_cache_device,
-    )
-    forward_batch.dcp_kv_indices = dcp_kv_indices
-    forward_batch.dcp_extend_prefix_lens_sum = extend_prefix_lens_sum
 
 
 if is_cuda() or is_hip():

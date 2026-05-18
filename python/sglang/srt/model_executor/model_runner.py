@@ -83,7 +83,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_world_size,
     monkey_patch_vllm_parallel_state,
 )
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -130,6 +129,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils.dcp_utils import prepare_decode_context_parallel_metadata
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -149,7 +149,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
-    update_dcp_forward_extend_info,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -3223,10 +3222,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Launch model forward
         if not skip_attn_backend_init:
             # prepare kv cache buffer for dcp to gather kv cache
-            if get_dcp_world_size() > 1:
-                update_dcp_forward_extend_info(
-                    forward_batch, self.kv_cache_dtype, self.device
-                )
+            prepare_decode_context_parallel_metadata(
+                forward_batch, self.kv_cache_dtype, self.device
+            )
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
