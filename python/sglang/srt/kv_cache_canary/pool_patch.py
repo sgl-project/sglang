@@ -273,31 +273,15 @@ def _attach_swa(
     V-block tail.
     """
     swa_sub_pool = pool.swa_kv_pool
-    if hasattr(swa_sub_pool, "k_buffer") and hasattr(swa_sub_pool, "v_buffer"):
-        swa_k_template = swa_sub_pool.k_buffer[0]
-        swa_v_template = swa_sub_pool.v_buffer[0]
-    elif hasattr(swa_sub_pool, "kv_buffer"):
-        swa_k_template = swa_sub_pool.kv_buffer[0]
-        swa_v_template = None
-    else:
-        raise RuntimeError(
-            f"kv-canary: SWA sub-pool {type(swa_sub_pool).__name__} has neither "
-            "k_buffer/v_buffer nor kv_buffer; cannot attach shadow"
-        )
+    swa_k_template, swa_v_template = _pull_kv_templates(
+        sub_pool=swa_sub_pool, label="SWA sub-pool"
+    )
 
     full_sub_pool = getattr(pool, "full_kv_pool", None)
     if full_sub_pool is not None:
-        if hasattr(full_sub_pool, "k_buffer") and hasattr(full_sub_pool, "v_buffer"):
-            full_k_template = full_sub_pool.k_buffer[0]
-            full_v_template = full_sub_pool.v_buffer[0]
-        elif hasattr(full_sub_pool, "kv_buffer"):
-            full_k_template = full_sub_pool.kv_buffer[0]
-            full_v_template = None
-        else:
-            raise RuntimeError(
-                f"kv-canary: SWA full sub-pool {type(full_sub_pool).__name__} has "
-                "neither k_buffer/v_buffer nor kv_buffer; cannot attach shadow"
-            )
+        full_k_template, full_v_template = _pull_kv_templates(
+            sub_pool=full_sub_pool, label="SWA full sub-pool"
+        )
     else:
         # DSV4 case: no separate full_kv_pool. Fall back to swa templates;
         # the resulting FULL group's shadow lives in the swa-sub-pool slot
@@ -333,6 +317,24 @@ def _attach_swa(
         swa_group.has_v_half,
         int(full_group.k_head.shape[0]),
         int(swa_group.k_head.shape[0]),
+    )
+
+
+def _pull_kv_templates(
+    *, sub_pool: object, label: str
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return (k_template, v_template) for an MHA-style or MLA-style sub-pool.
+
+    MHA-style sub-pools expose ``k_buffer`` + ``v_buffer``; MLA-style
+    sub-pools expose a single ``kv_buffer`` (V-half is ``None``).
+    """
+    if hasattr(sub_pool, "k_buffer") and hasattr(sub_pool, "v_buffer"):
+        return sub_pool.k_buffer[0], sub_pool.v_buffer[0]
+    if hasattr(sub_pool, "kv_buffer"):
+        return sub_pool.kv_buffer[0], None
+    raise RuntimeError(
+        f"kv-canary: {label} {type(sub_pool).__name__} has neither "
+        "k_buffer/v_buffer nor kv_buffer; cannot attach shadow"
     )
 
 
