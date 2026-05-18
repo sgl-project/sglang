@@ -455,9 +455,24 @@ class Relayer:
         return self._gpu_allocator.future_buffer_len
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
+        """Reserve ``bs`` consecutive slot indices on the ``gpu_scalar``
+        channel's circular buffer and return the handle.
+
+        The handle is the same key used by ``store_to_map`` (forward stream
+        write of token ids / draft input) and ``resolve_future`` (next-iter
+        schedule stream read). Slot numbering wraps modulo ``future_limit``
+        while the underlying buffer is ``future_limit + 2 * max_running_requests``
+        long, so an in-flight slot has at least one full iter of headroom
+        before its slot index is reused.
+        """
         return self._gpu_allocator.alloc(bs)
 
     def is_empty_slice(self, s: slice) -> bool:
+        """Return ``True`` when ``s`` is an empty / degenerate interval
+        produced by an idle DP-attention rank's zero-sized slot range.
+        Stores against such intervals are no-ops; consumers must not
+        resolve them.
+        """
         return self._gpu_allocator.is_empty(s)
 
     def resolve_future(self, batch: ScheduleBatch):
