@@ -81,10 +81,7 @@ def _run_one(
         canary_mode,
     ]
 
-    server_args = ServerArgs(
-        model_path=_MODEL,
-        base_url=DEFAULT_URL_FOR_TEST,
-    )
+    server_args = ServerArgs(model_path=_MODEL)
     bench_args = BenchArgs(
         run_name=f"canary_{canary_mode}__{scenario.label}",
         batch_size=(scenario.batch_size,),
