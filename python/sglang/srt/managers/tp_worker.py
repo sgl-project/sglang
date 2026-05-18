@@ -456,10 +456,8 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
-        # Get forward batch from schedule batch. ``batch`` is now
-        # Union[ScheduleBatch, ForwardData]: the FD path enters when the
-        # scheduler has built a ForwardData snapshot at the ownership
-        # boundary; ForwardBatch.init_new dispatches by type.
+        # batch is Union[ScheduleBatch, ForwardData]; ForwardBatch.init_new
+        # dispatches by type.
         if batch is not None:
             # update the consumer index of hicache to the running batch
             hicache_consumer = getattr(batch, "hicache_consumer_index", None)

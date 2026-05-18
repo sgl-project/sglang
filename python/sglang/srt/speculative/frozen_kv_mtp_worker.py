@@ -413,7 +413,6 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch.spec_info = spec_info_backup
 
     def forward_batch_generation(self, batch) -> GenerationBatchResult:
-        # batch is Union[ScheduleBatch, ForwardData] after FD migration.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             (
                 logits_output,

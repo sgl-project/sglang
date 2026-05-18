@@ -1109,7 +1109,6 @@ class DFlashWorker:
         )
 
     def forward_batch_generation(self, batch, **kwargs) -> GenerationBatchResult:
-        # batch is Union[ScheduleBatch, ForwardData] under the FD migration.
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."

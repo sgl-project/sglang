@@ -276,22 +276,16 @@ class NgramEmbeddingInfo:
 
 @dataclass
 class ForwardData:
-    """Output of ScheduleBatch.prepare_for_*() (introduced in step 04 of R3).
+    """Schedule -> worker handoff: snapshot of every SB field that
+    ForwardBatch.init_new consumes. Built by ScheduleBatch.to_forward_data
+    at the run_batch boundary; after that, schedule_stream does not touch
+    these fields. Worker may mutate FD during forward as its intra-pass
+    state (e.g. spec V2 draft -> verify -> extend rebinds spec_info on FD);
+    SB itself stays untouched across forward.
 
-    Carries every schedule-side field ForwardBatch.init_new currently reads
-    from ScheduleBatch. Once step 05 lands, prepare_for_* will return this
-    dataclass instead of mutating self, and ForwardBatch.init_new will
-    consume it directly. Until then, this type is constructed only by tests
-    and the new parallel ForwardBatch.init_new_from_forward_data path.
-
-    ForwardData also serves as the ownership boundary between schedule_stream
-    and forward_stream: after prepare_for_* returns, schedule_stream should
-    not read its fields. Physical mechanisms (clone / record_stream /
-    wait_stream) are layered on top in steps 08/09.
-
-    Feature-specific fields (encoder/mamba/spec/dllm/...) are kept as flat
-    fields here to mirror the current ScheduleBatch layout. Step 01/02 will
-    migrate them onto `extras: Dict[str, BatchExtra]`.
+    Sampling_info on FD is a forward-view: derive_forward_view detaches the
+    penalizer orchestrator so worker writes don't double-accumulate. SB
+    keeps the live orchestrator for cross-iter accumulation.
     """
 
     # Scheduling decision
@@ -370,7 +364,7 @@ class ForwardData:
     return_pooled_hidden_states: bool = False
     dimensions: Optional[List[int]] = None
 
-    # Reqs-derived identifiers (prepare_for_* fills these in step 05)
+    # Reqs-derived identifiers
     lora_ids: Optional[List[str]] = None
     rids: Optional[List[str]] = None
 
@@ -517,11 +511,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 
-    # Relayer plumbing for forward-stream consumers that need to read
-    # cross-iter relay state (seq_lens / new_seq_lens / accept_lens) with
-    # channel-level cross-stream sync rather than via the live SB attribute.
-    # Populated by ``ForwardBatch.init_new`` when the source SB has a Relayer
-    # ctx attached; ``None`` for non-overlap paths.
+    # Relayer ctx for forward-stream consumers that need channel-resolved
+    # reads (e.g. cuda graph replay buffer copy). None for non-overlap paths.
     relayer: Optional[Any] = None
     relayer_gpu_future_indices: Optional[Any] = None
     relayer_cpu_future_indices: Optional[Any] = None
@@ -561,11 +552,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids: Optional[List[str]] = None
 
     def relayer_resolve_seq_lens(self) -> Optional[torch.Tensor]:
-        """Channel-resolved read of ``seq_lens`` for forward-stream consumers.
-        Returns the gpu_scalar channel slot view (cross-stream-safe via the
-        cuda event recorded at store time) when a Relayer ctx is attached
-        to this ForwardBatch; falls back to ``self.seq_lens``.
-        """
+        """Channel-resolved seq_lens (cross-stream-safe); falls back to self.seq_lens."""
         if self.relayer is not None and self.relayer_gpu_future_indices is not None:
             return self.relayer.resolve_seq_lens(
                 self.relayer_gpu_future_indices.indices
@@ -593,10 +580,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         model_runner: ModelRunner,
     ):
         if isinstance(batch, ForwardData):
-            # Step 04 parallel path: ForwardData carries its own snapshot, no
-            # SB-side one-shot overrides to consume. seq_lens_cpu_cache /
-            # capture_hidden_mode wiring for FD will be added when step 05
-            # converts prepare_for_* to return ForwardData.
             return cls.init_new_from_forward_data(batch, model_runner)
 
         # Consume one-shot per-forward overrides from SB; reset to defaults so
@@ -706,11 +689,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
 
-        # Propagate the Relayer + future-indices ctx from SB so forward-side
-        # consumers (attention backends, cuda graph runner, sampling) can
-        # opt into channel-resolved reads of cross-iter relay state via
-        # ``ForwardBatch.relayer_resolve_seq_lens`` etc. Falls back to None
-        # when SB was not bound to a Relayer this iter.
+        # Propagate Relayer + future-indices ctx from SB so forward consumers
+        # can channel-resolve seq_lens. None when SB has no Relayer ctx.
         seq_ctx = getattr(batch, "_relayer_seq_lens_ctx", None)
         cpu_ctx = getattr(batch, "_relayer_ctx", None)
         if seq_ctx is not None:
@@ -851,13 +831,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_lens_cpu_cache: Optional[torch.Tensor] = None,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ):
-        """Parallel constructor for the step-04 ForwardData path.
-
-        Mirrors init_new(ScheduleBatch, ...) but sources every field from
-        ForwardData. Kept structurally close to the SB path so step 05 can
-        delete the SB constructor in one move once prepare_for_* returns
-        ForwardData.
-        """
+        """Build ForwardBatch from a ForwardData snapshot."""
         if capture_hidden_mode is None:
             if forward_data.return_hidden_states:
                 capture_hidden_mode = CaptureHiddenMode.FULL
