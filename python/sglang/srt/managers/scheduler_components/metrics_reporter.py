@@ -961,3 +961,46 @@ class SchedulerMetricsReporter:
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self.fwd_occupancy = float("nan")
+
+    def _maybe_log_idle_metrics(self):
+        """Collect and log metrics every 30 seconds during idle."""
+        if (
+            not self.current_scheduler_metrics_enabled
+            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+        ):
+            return
+
+        self.scheduler.pool_stats_observer.get_pool_stats().update_scheduler_stats(
+            self.stats
+        )
+        self.stats.num_streaming_sessions = (
+            self.scheduler.pool_stats_observer.streaming_session_count()
+        )
+        self.stats.streaming_session_held_tokens = (
+            self.scheduler.pool_stats_observer.session_held_tokens()
+        )
+
+        priority_enabled = self.scheduler.enable_priority_scheduling
+        self.stats.num_running_reqs = QueueCount.from_reqs(
+            self.scheduler.running_batch.reqs, priority_enabled
+        )
+        self.stats.gen_throughput = 0
+        self.stats.num_queue_reqs = QueueCount.from_reqs(
+            self.scheduler.waiting_queue, priority_enabled
+        )
+        self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
+                self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
+            )
+            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+            )
+        if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+            )
+            self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+                self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+            )
+        self.metrics_collector.log_stats(self.stats)
