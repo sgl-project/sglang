@@ -558,3 +558,35 @@ class Relayer:
         # cpu_action: drained at barrier in event_loop_overlap. state_obj:
         # owned references, dropped when scheduler clears them.
         pass
+
+    # ------------------------------------------------------------------
+    # Iter-pin ring: 2-iter Python ref retention for cross-stream tensor
+    # lifetime that does not (yet) flow through a channel slot pool. The
+    # canonical relay-driven design has every cross-stream tensor live in
+    # a channel slot whose pool keeps it alive automatically; this ring
+    # exists for the residual cases (e.g. a verify-phase ForwardBatch whose
+    # internal tensors are read on the forward stream after the schedule
+    # stream returns to mid-iter work) until those callsites are migrated.
+    # ------------------------------------------------------------------
+
+    def begin_iter_pin(self) -> int:
+        """Rotate to the next slot in the 2-iter pin ring and reset it.
+        Returns the slot index used by ``add_iter_pin``."""
+        if not hasattr(self, "_iter_pin_ring"):
+            self._iter_pin_ring = [None, None]
+            self._iter_pin_ct = 0
+        self._iter_pin_ct = (self._iter_pin_ct + 1) % 2
+        self._iter_pin_ring[self._iter_pin_ct] = []
+        return self._iter_pin_ct
+
+    def add_iter_pin(self, *refs):
+        """Pin ``refs`` for two iters (this slot survives until the second
+        ``begin_iter_pin`` rotation overwrites it). Used by workers to keep
+        Python refs to forward-stream-bound GPU tensors alive across the
+        schedule-side return."""
+        slot = getattr(self, "_iter_pin_ring", None)
+        if slot is None:
+            self.begin_iter_pin()
+            slot = self._iter_pin_ring
+        for ref in refs:
+            slot[self._iter_pin_ct].append(ref)

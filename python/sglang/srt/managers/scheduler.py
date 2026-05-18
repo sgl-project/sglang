@@ -3000,7 +3000,30 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, batch: ScheduleBatch):
+    def record_batch_in_overlap(self, batch: ScheduleBatch):  # noqa: D401
+        # Relayer-owned iter pin: this method now routes the legacy
+        # ``batch_record_buf`` machinery through ``Relayer.begin_iter_pin``
+        # so the 2-iter Python ref retention is a Relayer service rather
+        # than a Scheduler-local list. The legacy ``self.batch_record_buf``
+        # is kept as a thin shim writing to the relayer ring for the few
+        # remaining callsites that still index into it directly.
+        if self.relayer is not None:
+            slot = self.relayer.begin_iter_pin()
+            self.relayer.add_iter_pin(batch)
+            # Snapshot all SB fields to preserve any tensor refs that
+            # downstream forward kernels still consume by reading the SB
+            # attribute lookup pattern (legacy path).
+            attr_snapshot = [
+                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            ]
+            self.relayer.add_iter_pin(attr_snapshot)
+            self.batch_record_ct = slot
+            self.batch_record_buf[slot] = self.relayer._iter_pin_ring[slot]
+            return
+        # Legacy fallback (no relayer): retain the prior 2-iter behavior.
+        self._record_batch_in_overlap_legacy(batch)
+
+    def _record_batch_in_overlap_legacy(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
