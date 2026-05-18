@@ -110,23 +110,22 @@ class HashTopK(nn.Module):
         assert (
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
-
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            if _is_cpu and _is_cpu_amx_available:
-                # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
-                tid2eid_for_tokens = self.tid2eid[
-                    input_ids
-                ]  # [num_tokens, routed_topk]
-                topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
-                    router_logits,
-                    tid2eid_for_tokens,
-                    self.topk,
-                    self.score_func,
-                    self.num_fused_shared_experts,
-                    self.num_experts,
-                    self.routed_scaling_factor,
-                )
-            else:
+        if _is_cpu and _is_cpu_amx_available:
+            # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
+            tid2eid_for_tokens = self.tid2eid[
+                input_ids
+            ]  # [num_tokens, routed_topk]
+            topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
+                router_logits,
+                tid2eid_for_tokens,
+                self.topk,
+                self.score_func,
+                self.num_fused_shared_experts,
+                self.num_experts,
+                self.routed_scaling_factor,
+            )
+        else:
+            if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
                 from sglang.jit_kernel.deepseek_v4 import hash_topk
 
                 topk_weights, topk_ids = hash_topk(
@@ -137,8 +136,8 @@ class HashTopK(nn.Module):
                     routed_scaling_factor=self.routed_scaling_factor,
                     scoring_func=self.score_func,
                 )
-        else:
-            topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
+            else:
+                topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
