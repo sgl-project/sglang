@@ -46,7 +46,7 @@ class TreeMaskMode(IntEnum):
 
 
 def build_tree_kernel_efficient(
-    verified_id: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -59,7 +59,7 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()

@@ -30,7 +30,11 @@ class ImageEncoderLoader(TextEncoderLoader):
         return use_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str = "image_encoder",
+        cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -53,5 +57,9 @@ class ImageEncoderLoader(TextEncoderLoader):
             encoder_config,
             server_args,
             server_args.pipeline_config.image_encoder_precision,
-            cpu_offload_flag=server_args.image_encoder_cpu_offload,
+            cpu_offload_flag=(
+                cpu_offload_flag
+                if cpu_offload_flag is not None
+                else server_args.image_encoder_cpu_offload
+            ),
         )
