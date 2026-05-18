@@ -3122,6 +3122,12 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
                         batch_result.cpu_future_indices = cpu_future_indices
+                        # Attach the relayer ctx to the live SB so the next
+                        # iter's filter_batch (called on self.last_batch =
+                        # this same SB) can resolve forward-driven per-req
+                        # decisions from the cpu_value channel rather than
+                        # from the legacy in-place CPU mutation.
+                        batch.set_relayer_ctx(self.relayer, cpu_future_indices)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
