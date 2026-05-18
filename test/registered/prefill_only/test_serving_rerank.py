@@ -45,6 +45,25 @@ class _DummyTokenizerManager:
         raise AssertionError("generate_request should not be called in this unit test")
 
 
+class _ClosableAsyncGen:
+    def __init__(self, result):
+        self.result = result
+        self.closed = False
+        self._yielded = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return self.result
+
+    async def aclose(self):
+        self.closed = True
+
+
 @unittest.skipIf(OpenAIServingRerank is None, "fastapi/torch is not installed")
 class TestOpenAIServingRerankUnit(unittest.TestCase):
     def setUp(self):
@@ -75,6 +94,25 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         adapted, processed = handler._convert_to_internal_request(req)
         self.assertIs(adapted, req)
         self.assertIs(processed, req)
+
+    def test_generate_one_closes_async_generator(self):
+        class _TM(_DummyTokenizerManager):
+            def __init__(self):
+                self.server_args = object()
+                self.model_config = _DummyModelConfig()
+                self.tokenizer = _DummyTokenizer()
+                self.last_generator = None
+
+            def generate_request(self, *_args, **_kwargs):
+                self.last_generator = _ClosableAsyncGen({"ok": True})
+                return self.last_generator
+
+        tm = _TM()
+        handler = OpenAIServingRerank(tm)
+        ret = asyncio.run(handler._generate_one(Mock(), Mock()))
+        self.assertEqual(ret, {"ok": True})
+        self.assertIsNotNone(tm.last_generator)
+        self.assertTrue(tm.last_generator.closed)
 
     def test_build_rerank_response_embedding_list_uses_first_scalar(self):
         req = V1RerankReqInput(
