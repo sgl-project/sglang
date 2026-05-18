@@ -13,7 +13,7 @@ The dependencies required for the NPU runtime environment have been integrated i
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --privileged=true --net=host \
@@ -41,14 +41,14 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-910b
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --privileged=true --net=host \
@@ -68,7 +68,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-910b
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ```
 
   </Tab>

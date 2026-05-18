@@ -13,11 +13,19 @@ metatags:
 
 ## Setup environment using container
 
+<Tip>
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann8.5.0-a3`) if you need the latest development changes.
+</Tip>
+
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```shell Command
-export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
+# Stable release
+export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+# Daily build
+export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -40,7 +48,11 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
   <Tab title="Atlas 800I A2">
 
 ```shell Command
-export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-910b
+# Stable release
+export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+# Daily build
+export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-910b
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \

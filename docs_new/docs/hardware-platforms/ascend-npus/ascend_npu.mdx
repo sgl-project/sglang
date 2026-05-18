@@ -150,18 +150,30 @@ pip install -e python[all_npu]
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download SGLang image
 
+<Tip>
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann8.5.0-a3`) if you need the latest development changes.
+</Tip>
+
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull docker.io/lmsysorg/sglang:{main}-cann8.5.0-a3
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-docker pull docker.io/lmsysorg/sglang:{main}-cann8.5.0-910b
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
 ```
 
   </Tab>
