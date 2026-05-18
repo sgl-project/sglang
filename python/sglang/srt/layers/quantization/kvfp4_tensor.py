@@ -58,6 +58,9 @@ E2M1_BOUNDS = torch.tensor(
     [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32, device=_device
 )
 
+# Factor for Gaussian distribution to mxfp4 scale factor conversion, refer to: https://github.com/IST-DASLab/qutlass
+GAUSSIAN_FACTOR = 2.92247856
+
 
 class BlockFP4KVQuantizeUtil:
     """Block-wise FP4 (E2M1) quantization for KV cache.
@@ -68,6 +71,7 @@ class BlockFP4KVQuantizeUtil:
     """
 
     @staticmethod
+    @torch.compile
     def batched_quantize(
         tensor: torch.Tensor,
         block_size: Optional[int] = None,
@@ -98,7 +102,7 @@ class BlockFP4KVQuantizeUtil:
             reshaped = hadamard_transform(reshaped, scale=block_size**-0.5)
             block_std = reshaped.std(dim=-1, correction=0, keepdim=True)
             scale_exp = torch.floor(
-                torch.log2(block_std * (2.92247856 / E2M1_MAX) + 1e-8)
+                torch.log2(block_std * (GAUSSIAN_FACTOR / E2M1_MAX) + 1e-8)
             )
         else:
             block_max = reshaped.abs().max(dim=-1, keepdim=True).values

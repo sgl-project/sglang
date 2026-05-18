@@ -306,7 +306,7 @@ class NVFP4KVMethod(FP4KVCacheQuantMethod):
 
 
 class BlockFP4KVMethod(FP4KVCacheQuantMethod):
-    """Block-wise FP4 single-level scaling (similar to MXFP4 but block_size=16)."""
+    """Block-wise FP4 single-level scaling."""
 
     name = "blockfp4"
     SCALE_BLOCK_SIZE = 32
