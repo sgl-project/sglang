@@ -89,6 +89,15 @@ class GpuScalarChannel:
     def __init__(self, allocator: _SlotAllocator):
         self._allocator = allocator
         self._buffers: Dict[str, torch.Tensor] = {}
+        # Cross-stream sync: producers (forward_stream) record an event after
+        # each ``store``; consumers (schedule_stream) ``event.wait(stream)``
+        # in ``resolve_*`` so the read is correctly ordered against the
+        # producer's write across streams. We track the most recent producer
+        # event globally rather than per-slot; resolves over-wait at most by
+        # one extra producer write, which on the same producer stream has
+        # already happened-before our event-of-interest, so the wait is still
+        # correct (and the cost is one event-wait per resolve).
+        self._last_producer_event: Optional[torch.cuda.Event] = None
 
     @property
     def device(self) -> torch.device:
@@ -115,7 +124,16 @@ class GpuScalarChannel:
             )
         return self._buffers[name]
 
-    def store(self, future_indices: FutureIndices, name: str, value: torch.Tensor):
+    def _new_event(self) -> torch.cuda.Event:
+        return torch.get_device_module(self._allocator.device).Event()
+
+    def store(
+        self,
+        future_indices: FutureIndices,
+        name: str,
+        value: torch.Tensor,
+        producer_stream: Optional[torch.cuda.Stream] = None,
+    ):
         intv = future_indices.interval
         if self._allocator.is_empty(intv):
             # idle indices in dp attention do not need store info
@@ -124,13 +142,40 @@ class GpuScalarChannel:
         if name not in self._buffers:
             self.ensure_buffer(name, value.shape[1:], value.dtype)
         self._buffers[name][intv] = value
+        # Record producer-side completion event so cross-stream resolves can
+        # wait without an explicit CPU sync.
+        event = self._new_event()
+        if producer_stream is None:
+            event.record()
+        else:
+            event.record(producer_stream)
+        self._last_producer_event = event
+
+    def _wait_producer_on(self, consumer_stream: Optional[torch.cuda.Stream]):
+        if self._last_producer_event is None:
+            return
+        if consumer_stream is None:
+            consumer_stream = torch.get_device_module(
+                self._allocator.device
+            ).current_stream()
+        self._last_producer_event.wait(consumer_stream)
 
     def resolve_by_interval(
-        self, future_indices: FutureIndices, name: str
+        self,
+        future_indices: FutureIndices,
+        name: str,
+        consumer_stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
+        self._wait_producer_on(consumer_stream)
         return self._buffers[name][future_indices.interval]
 
-    def resolve_by_indices(self, indices: torch.Tensor, name: str) -> torch.Tensor:
+    def resolve_by_indices(
+        self,
+        indices: torch.Tensor,
+        name: str,
+        consumer_stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        self._wait_producer_on(consumer_stream)
         return self._buffers[name][indices]
 
     def buffer(self, name: str) -> torch.Tensor:
