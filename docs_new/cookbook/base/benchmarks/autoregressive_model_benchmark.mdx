@@ -244,9 +244,15 @@ Tools for deep performance analysis.
 
 - `--profile`: Enables Torch Profiler (Requires `SGLANG_TORCH_PROFILER_DIR` env var on server).
 - `--plot-throughput`: Generates throughput/concurrency plots (requires `termplotlib` and `gnuplot`).
-- `--profile-activities`: Activities to profile (CPU, GPU, CUDA_PROFILER).
-- `--profile-num-steps`: Number of steps to profile.
+- `--profile-activities`: Activities to profile (`CPU`, `GPU`, `CUDA_PROFILER`, ...). Defaults to the server's default (`CPU`, `GPU`) when unset.
+- `--profile-num-steps`: Cap the trace to this many forward steps. A step is one batch iteration, not one request, so with high `--max-concurrency` each step spans many requests. When set, the client skips the trailing `/stop_profile` because the server auto-stops. Useful to avoid OOM-sized traces on long benchmarks.
+- `--profile-start-step`: Start recording after this many warmup steps.
+- `--profile-merge-profiles`: Ask the server to merge per-rank traces into a single file.
+- `--profile-output-dir`: Where the server writes traces (falls back to `$SGLANG_TORCH_PROFILER_DIR`).
 - `--profile-by-stage` / `--profile-stages`: Profile specific processing stages.
+
+These mirror the equivalent flags on `sglang.bench_one_batch_server`, so the
+two scripts can be used interchangeably for profiling.
 
 #### 2.6.4 PD Disaggregation
 
