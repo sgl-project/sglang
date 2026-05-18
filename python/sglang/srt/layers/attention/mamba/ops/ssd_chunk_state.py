@@ -15,6 +15,9 @@ import triton
 import triton.language as tl
 
 from .mamba_ssm import softplus
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @triton.jit
@@ -644,3 +647,131 @@ def chunk_state_varlen(
             HAS_INITSTATES=initial_states is not None,
         )
     return states
+
+
+def _chunk_state_varlen_native(
+    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+):
+    """
+    PyTorch native implementation of chunk_state_varlen.
+    This avoids Triton compilation issues on Ascend NPU.
+    """
+    total_seqlen, nheads, headdim = x.shape
+    _, nchunks, chunk_size = dt.shape
+    _, ngroups, dstate = B.shape
+    batch = cu_seqlens.shape[0] - 1
+    cu_seqlens = cu_seqlens.contiguous()
+    assert nheads % ngroups == 0
+    assert B.shape == (total_seqlen, ngroups, dstate)
+    assert dt.shape == (nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+    assert chunk_states.shape == (nchunks, nheads, headdim, dstate)
+
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, headdim, dstate)
+
+    states = torch.empty(
+        batch,
+        nheads,
+        headdim,
+        dstate,
+        dtype=chunk_states.dtype,
+        device=chunk_states.device,
+    )
+    states.zero_()
+
+    nheads_ngroup = nheads // ngroups
+    HAS_INITSTATES = initial_states is not None
+    Block_SIZE_K = 16
+    out_dtype = chunk_states.dtype
+    compute_dtype = torch.float32  # Match Triton kernel: all intermediates in float32
+    device = chunk_states.device
+
+    x = x.contiguous()
+    B = B.contiguous()
+    dt = dt.contiguous()
+    dA_cumsum = dA_cumsum.contiguous()
+    chunk_states = chunk_states.contiguous()
+    if HAS_INITSTATES:
+        initial_states = initial_states.contiguous()
+
+    # Process each batch
+    for pid_b in range(batch):
+        start_idx = cu_seqlens[pid_b].item()
+        end_idx = cu_seqlens[pid_b + 1].item()
+        curr_seqlen = end_idx - start_idx
+        if curr_seqlen == 0:
+            continue
+
+        # Compute current chunk id
+        pid_c = (end_idx - 1) // chunk_size
+        pid_c = min(pid_c, nchunks - 1)
+        chunk_start = pid_c * chunk_size
+
+        # Compute valid length within chunk
+        chunk_size_limit = max(0, end_idx - chunk_start)
+        if chunk_size_limit <= 0:
+            continue
+        chunk_size_limit = min(chunk_size_limit, chunk_size)
+
+        # Process each head
+        for pid_h in range(nheads):
+            group_id = pid_h // nheads_ngroup
+
+            dt_chunk = dt[pid_h, pid_c, :chunk_size_limit].to(compute_dtype)
+            dA_cs_chunk = dA_cumsum[pid_h, pid_c, :chunk_size_limit].to(compute_dtype)
+            x_chunk = x[chunk_start:chunk_start+chunk_size_limit, pid_h, :].to(compute_dtype)
+            b_chunk = B[chunk_start:chunk_start+chunk_size_limit, group_id, :].to(compute_dtype)
+
+            # Initialize accumulator in float32 (matches Triton kernel)
+            acc = torch.zeros((headdim, dstate), dtype=compute_dtype, device=device)
+
+            # Iterate over chunk elements
+            for k in range(0, chunk_size_limit, Block_SIZE_K):
+                k_end = min(k + Block_SIZE_K, chunk_size_limit)
+                x_block = x_chunk[k:k_end, :]
+                b_block = b_chunk[k:k_end, :]
+                dt_block = dt_chunk[k:k_end]
+                dA_cs_k_block = dA_cs_chunk[k:k_end]
+
+                dA_cs_last = dA_cs_chunk[-1] if chunk_size_limit > 0 else torch.tensor(0.0, dtype=compute_dtype, device=device)
+
+                block_rel_pos = torch.arange(k_end - k, device=device)
+                chunk_block_start = k
+                start_idx_cur = max(start_idx - chunk_start, 0)
+                mask = block_rel_pos >= (start_idx_cur - chunk_block_start)
+                scale = torch.exp(dA_cs_last - dA_cs_k_block) * dt_block
+                scale = torch.where(mask, scale, torch.tensor(0.0, dtype=compute_dtype, device=device))
+
+                matmul_res = torch.matmul(x_block.T, b_block * scale.unsqueeze(-1))
+                acc += matmul_res
+
+            # Handle initial states / past states
+            if (start_idx < chunk_start) or HAS_INITSTATES:
+                dA_cs_boundary = torch.tensor(0.0, dtype=compute_dtype, device=device)
+
+                if not HAS_INITSTATES:
+                    past_states = chunk_states[pid_c, pid_h, :, :].to(compute_dtype)
+                else:
+                    if start_idx < chunk_start:
+                        past_states = chunk_states[pid_c, pid_h, :, :].to(compute_dtype)
+                    else:
+                        past_states = initial_states[pid_b, pid_h, :, :].to(compute_dtype)
+                        if start_idx > chunk_start:
+                            boundary_idx = start_idx - chunk_start - 1
+                            if 0 <= boundary_idx < chunk_size_limit:
+                                dA_cs_boundary = dA_cs_chunk[boundary_idx]
+
+                scale_state = torch.exp(dA_cs_last - dA_cs_boundary)
+                acc += past_states * scale_state
+
+            # Write to states (convert back to output dtype)
+            states[pid_b, pid_h, :, :] = acc.to(out_dtype)
+
+    return states
+
+
+if _is_npu:
+    from sgl_kernel_npu.mamba.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_sate_fwd
+
+    chunk_state_varlen = _chunk_state_varlen_native
