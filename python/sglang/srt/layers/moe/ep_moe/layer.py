@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
@@ -102,6 +101,19 @@ class DeepEPMoE(FusedMoE):
             and quant_config.get_name() == "modelopt_fp4"
         ):
             self.deprecate_flag = True
+        elif (
+            quant_config is None
+            and self.w13_weight.dtype == torch.bfloat16
+            and get_moe_runner_backend().is_deep_gemm()
+            and get_moe_a2a_backend().is_deepep()
+            and get_deepep_mode().enable_low_latency()
+            and not _is_npu
+            and not _is_hip
+        ):
+            assert (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ), "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 
@@ -123,15 +135,6 @@ class DeepEPMoE(FusedMoE):
             self.use_block_quant = False
 
         self.deepep_mode = get_deepep_mode()
-
-        # TODO: move this logic to process_weigths_after_loading, like:
-        # def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        #    if hasattr(layer, "dispatcher"):
-        #       layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-
-        if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
-            self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -139,7 +142,6 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
         ):
             # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
-            # Unquantized draft MoE uses BF16 DeepEP dispatch and a local fallback.
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
@@ -214,9 +216,7 @@ class DeepEPMoE(FusedMoE):
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if self.quant_config is None:
-                output = self.forward_unquantized_deepep_ll(dispatch_output)
-            elif self.use_w4afp8:
+            if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
@@ -246,37 +246,6 @@ class DeepEPMoE(FusedMoE):
             topk_weights=topk_weights,
             overlap_args=overlap_args,
         )
-
-    def forward_unquantized_deepep_ll(
-        self,
-        dispatch_output: DeepEPLLDispatchOutput,
-    ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
-        assert hidden_states_scale is None
-        assert self.moe_runner_config.activation == "silu"
-        assert self.moe_runner_config.is_gated
-        assert hidden_states.dim() == 3
-
-        num_experts, max_tokens, _ = hidden_states.shape
-        token_offsets = torch.arange(max_tokens, device=hidden_states.device)
-        valid_mask = (
-            token_offsets.unsqueeze(0) < masked_m[:num_experts].unsqueeze(1)
-        ).unsqueeze(-1)
-        hidden_states = hidden_states.masked_fill(~valid_mask, 0)
-
-        gate_up = torch.bmm(hidden_states, self.w13_weight.transpose(1, 2))
-        w13_bias = getattr(self, "w13_weight_bias", None)
-        if w13_bias is not None:
-            gate_up = gate_up + w13_bias.unsqueeze(1)
-
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden_states = F.silu(gate) * up
-
-        output = torch.bmm(hidden_states, self.w2_weight.transpose(1, 2))
-        w2_bias = getattr(self, "w2_weight_bias", None)
-        if w2_bias is not None:
-            output = output + w2_bias.unsqueeze(1)
-        return output.masked_fill(~valid_mask, 0)
 
     def forward_cutlass_w4afp8(
         self,
