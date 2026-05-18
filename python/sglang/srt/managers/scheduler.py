@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import dataclasses
 import faulthandler
 import logging
 import os
@@ -20,7 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -159,7 +160,6 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ModelWorkerBatch,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -2992,14 +2992,61 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
+    def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
+        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
+        attr_snapshot = [
+            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+        ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+        # List (not tuple) so that workers can register additional refs via
+        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+
+    @contextmanager
+    def _overlap_forward_isolation(self, batch: ScheduleBatch):
+        """Make SB transactional across one overlap forward.
+
+        1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
+           input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
+           only need sampling_info restored - V1 carries spec_info forward as
+           next-iter draft input.
+        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
+           shares the pre-accumulated penalty buffer) so V2's multiple init_new
+           calls don't double-accumulate penalties.
+        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
+           tensors in the snapshot survive the caching allocator past the
+           forward stream. Must run AFTER the sampling_info swap so the
+           forward-only copy gets pinned.
+        """
+        # 1. snapshot
+        snapshot_v2_full = batch.is_spec_v2
+        sched_snapshot = (
+            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            if snapshot_v2_full
+            else None
+        )
+        sched_sampling_info = batch.sampling_info
+
+        # 2. sampling_info substitute
+        if sched_sampling_info is not None:
+            batch.sampling_info = sched_sampling_info.copy_for_forward()
+
+        # 3. pin for 2-iter tensor lifetime
+        self.record_batch_in_overlap(batch)
+
+        try:
+            yield
+        finally:
+            if snapshot_v2_full:
+                for name, value in sched_snapshot.items():
+                    setattr(batch, name, value)
+            else:
+                batch.sampling_info = sched_sampling_info
 
     def run_batch(
         self,
@@ -3022,42 +3069,33 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
-            else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
-                worker_batch_or_batch = batch
-
             if self.enable_overlap:
-                model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                with self._overlap_forward_isolation(batch):
+                    bs = len(batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
-
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
-                        # here pp is not compatible with overlap
-                    )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(
-                            return_logprob=batch.return_logprob,
-                            return_hidden_states=batch.return_hidden_states,
-                        )
-                    else:
-                        batch_result.future_indices = future_indices
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(batch)
+                        # FIXME: pp is not compatible with overlap
+                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        # Park any refs the worker wants kept alive 2 iters
+                        # (cross-stream tensor lifetime; pinned in the same
+                        # ring slot as the SB attr snapshot).
+                        if batch_result.extra_keep_alive_refs:
+                            self.batch_record_buf[self.batch_record_ct].extend(
+                                batch_result.extra_keep_alive_refs
+                            )
+                        # FIXME(lsyin): maybe move this to forward_batch_generation
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
+                            )
+                        else:
+                            batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
@@ -3082,7 +3120,7 @@ class Scheduler(
                     else {}
                 )
                 batch_result = self.model_worker.forward_batch_generation(
-                    worker_batch_or_batch, **kwargs
+                    batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -3109,24 +3147,18 @@ class Scheduler(
 
             ret = batch_result
         else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-
             if self.enable_overlap:
-                self.record_batch_in_overlap(model_worker_batch)
+                self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    pooler_output = self.tp_worker.forward_batch_embedding(
-                        model_worker_batch
-                    )
+                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                     )
                     ret.copy_to_cpu()
             else:
-                pooler_output = self.tp_worker.forward_batch_embedding(
-                    model_worker_batch
-                )
+                pooler_output = self.tp_worker.forward_batch_embedding(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
@@ -3463,7 +3495,10 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
-            logger.info("Cache flushed successfully!")
+            # Per-DP-group leader logs once: ranks within a DP group are
+            # state-synchronous, but DP groups may diverge.
+            if self.is_stats_logging_rank:
+                logger.info("Cache flushed successfully!")
             success = True
         else:
             logging.warning(

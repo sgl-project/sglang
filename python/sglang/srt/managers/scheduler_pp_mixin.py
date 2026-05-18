@@ -613,9 +613,13 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
+                hs = (
+                    getattr(model_config, "hc_hidden_size", None)
+                    or model_config.hidden_size
+                )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (current_seq_len, model_config.hidden_size),
+                        (current_seq_len, hs),
                         dtype=model_config.dtype,
                         device=self.device,
                     ),
@@ -635,9 +639,8 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
-                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                forward_batch = ForwardBatch.init_new(batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
