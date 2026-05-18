@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,12 @@ pub struct AppContext {
     /// policy (which reads per-worker load when scoring candidates), and
     /// the stale-request janitor (which sweeps expired entries).
     pub active_load: Arc<ActiveLoadRegistry>,
+    /// Lightweight Prometheus-format metrics registry served via
+    /// `/metrics`. Shared with the chat handler (requests_total),
+    /// cache-aware-zmq policy (overlap_blocks), active-load registry
+    /// (active_load gauge + stale_requests_total), and PD resolver
+    /// (decode_affinity_total).
+    pub metrics: Arc<MetricsRegistry>,
     ready: AtomicBool,
 }
 
@@ -62,6 +69,7 @@ impl AppContext {
             registry,
             policies,
             active_load,
+            metrics: MetricsRegistry::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -100,6 +108,7 @@ impl AppContext {
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
+            metrics: MetricsRegistry::new(),
             ready: AtomicBool::new(false),
         }
     }

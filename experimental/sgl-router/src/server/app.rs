@@ -34,6 +34,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
     Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
+        .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
             "/v1/models",
             get(crate::server::routes::models::list_models),
