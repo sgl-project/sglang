@@ -341,6 +341,70 @@ def run_tail(
     runner.end_of_forward()
 
 
+def launch_canary_for_capture(runner: Optional[CanaryRunner], *, kernel_kind: int) -> None:
+    """Capture-only kernel launch: record one kernel with skip-sentinel buffers.
+
+    During ``CudaGraphRunner.capture``, the patched ``model.forward`` runs
+    inside a cuda-graph-capturing region. We CANNOT compute a real
+    ``BatchPlan`` there (it requires CPU↔GPU sync for tokens / positions,
+    which is illegal during capture). Instead, we launch the kernel reading
+    from the runner's ``CanaryLaunchBuffers`` while their
+    ``verify_mask == -1`` skip-sentinel is in place. The kernel records its
+    launch parameters (pointing at the fixed-address buffers) into the
+    graph as a no-op pass; replay-time pre-fill via :func:`prepare_replay`
+    swaps the contents to real data BEFORE ``graph.replay()`` so the same
+    recorded kernel becomes a real verify+write pass.
+    """
+    if runner is None or not runner.config.enabled:
+        return
+    runner.launch_for_capture(kernel_kind=kernel_kind)
+
+
+def prepare_replay(
+    *,
+    runner: Optional[CanaryRunner],
+    forward_batch: "ForwardBatch",
+) -> Optional[BatchPlan]:
+    """Replay-side host hook: build the plan and refill the fixed buffers.
+
+    Called by the monkey-patched ``CudaGraphRunner.replay`` BEFORE
+    ``graph.replay()``. Computes the per-forward plan (CPU work + a few
+    small D2H syncs, same as the eager wrapper) and copies it into the
+    runner's fixed launch tensors in place. The recorded canary kernel
+    launches that ``graph.replay()`` then re-issues will read the new
+    contents and produce real verify / write behavior on the cuda-graph
+    decode path.
+    """
+    if runner is None or not runner.config.enabled:
+        return None
+    plan = _plan_from_forward_batch(runner=runner, forward_batch=forward_batch)
+    if plan is None:
+        runner.reset_launch_buffers_to_skip_sentinel()
+        return None
+    runner.prepare_for_replay(plan=plan)
+    return plan
+
+
+def finalize_replay(
+    *,
+    runner: Optional[CanaryRunner],
+    plan: Optional[BatchPlan],
+) -> None:
+    """Replay-side host hook: commit and run end-of-forward AFTER replay.
+
+    ``graph.replay()`` returned synchronously w.r.t. host scheduling; the
+    canary kernel inside the graph has been launched on the compute stream.
+    We commit the host-side plan (advances ``K_req`` / ``prev_hash_tail``
+    bookkeeping) and trigger end-of-forward (event-poll, allreduce,
+    raise-or-log policy).
+    """
+    if runner is None or not runner.config.enabled:
+        return
+    if plan is not None:
+        runner.host_state.commit_plan(plan)
+    runner.end_of_forward()
+
+
 def _plan_from_forward_batch(
     *,
     runner: CanaryRunner,

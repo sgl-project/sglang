@@ -240,29 +240,42 @@ class CanaryRunner:
         """
         self._launch.fill_from_plan(plan)
 
-    def _run_kernel_pair(
-        self,
-        *,
-        plan: BatchPlan,
-        kernel_kind: int,
-        skip_fill: bool = False,
-    ) -> None:
-        """Launch the head/tail kernel pair using the fixed launch buffers.
+    def reset_launch_buffers_to_skip_sentinel(self) -> None:
+        """Reset the entire fixed launch buffer to the skip-sentinel state.
 
-        ``skip_fill=True`` is the replay path: ``prepare_for_replay`` has
-        already populated the buffers on the host side outside the captured
-        region. The eager / capture path leaves ``skip_fill=False`` and we
-        fill here on the current stream so the in-place copies get recorded
-        into the cuda graph too.
+        Replay-side pre-fill calls this when there is no plan (e.g. the
+        batch is degenerate / out_cache_loc is empty) so the recorded
+        canary kernel becomes a no-op for this replay rather than re-using
+        stale data from a prior forward.
+        """
+        self._launch.verify_mask.fill_(-1)
+        self._launch.verify_seq_positions.fill_(-1)
+
+    def launch_for_capture(self, *, kernel_kind: int) -> None:
+        """Capture-only: record one kernel launch as a no-op (skip-sentinel).
+
+        Called separately for head (before original_forward) and tail
+        (after) so the relative order of canary launches against the real
+        model forward matches the eager path. Replay refills the buffers
+        BEFORE ``graph.replay()``, so the same recorded launches become
+        real verify+write work on every replay forward.
+
+        Resets the buffers to skip-sentinel just before each launch so
+        capture never accidentally verifies / writes — replay-side
+        ``fill_from_plan`` overwrites the buffer contents at replay time
+        before ``graph.replay()`` re-executes this launch.
         """
         if not self._config.enabled:
             return
-        if not skip_fill:
-            total = plan.num_verify + plan.num_write
-            if total == 0:
-                return
-            self._launch.fill_from_plan(plan)
+        self.reset_launch_buffers_to_skip_sentinel()
+        self._launch_kernel_only(kernel_kind=kernel_kind)
 
+    def _launch_kernel_only(self, *, kernel_kind: int) -> None:
+        """Launch a single kernel reading from the current fixed-buffer contents.
+
+        Shared by capture-time recording (skip-sentinel contents) and
+        replay-graph re-launch (real contents after pre-fill).
+        """
         if kernel_kind == KERNEL_KIND_HEAD:
             src_buf_k, dst_buf_k = self._k_tail, self._k_head
             src_buf_v, dst_buf_v = self._v_tail, self._v_head
@@ -274,9 +287,6 @@ class CanaryRunner:
             slot_run_counter = self._device_state.slot_run_counter_tail
             kernel_run_counter = self._device_state.kernel_run_counter_tail
 
-        # (src_buf, dst_buf, slot_stride_bytes) per half. V half uses its own
-        # stride because some pools have head_dim != v_head_dim — sharing the
-        # K stride would index off the V slot boundary and corrupt verifies.
         buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int]] = [
             (src_buf_k, dst_buf_k, self._k_slot_stride_bytes)
         ]
@@ -304,6 +314,29 @@ class CanaryRunner:
                 kernel_run_counter=kernel_run_counter,
                 kernel_kind=kernel_kind,
             )
+
+    def _run_kernel_pair(
+        self,
+        *,
+        plan: BatchPlan,
+        kernel_kind: int,
+        skip_fill: bool = False,
+    ) -> None:
+        """Launch the head/tail kernel pair using the fixed launch buffers.
+
+        ``skip_fill=True`` is the replay path: ``prepare_for_replay`` has
+        already populated the buffers on the host side outside the captured
+        region. The eager path leaves ``skip_fill=False`` and we fill here.
+        """
+        if not self._config.enabled:
+            return
+        if not skip_fill:
+            total = plan.num_verify + plan.num_write
+            if total == 0:
+                return
+            self._launch.fill_from_plan(plan)
+
+        self._launch_kernel_only(kernel_kind=kernel_kind)
 
     def _cross_rank_max(self, local_flag: int) -> int:
         """Unconditional all-reduce-MAX on the local 1-byte flag.

@@ -6,13 +6,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_cache_canary import KERNEL_KIND_HEAD, KERNEL_KIND_TAIL
 from sglang.srt.kv_cache_canary.api import (
     attach,
+    finalize_replay,
     get_runner,
     install_req_to_token_pool_free_hook,
     install_spec_allocator_free_hook,
     install_swa_eviction_hook,
+    launch_canary_for_capture,
     maybe_perturb_req_to_token,
+    prepare_replay,
     run_head,
     run_tail,
 )
@@ -90,6 +94,7 @@ def install_on_model_runner(
     )
 
     _patch_model_forward(model_runner=model_runner)
+    _patch_cuda_graph_runner_replay_class_method()
     setattr(model_runner, _FORWARD_PATCHED_ATTR, True)
 
 
@@ -143,15 +148,23 @@ def _select_pool_kind(
 def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
     """Wrap ``model_runner.model.forward`` to run the canary kernel pair.
 
-    The wrapped function:
-      1. Pulls the canary runner off the pool (skip path if disabled);
-      2. Optionally perturbs ``req_to_token_pool`` for the self-test;
-      3. Builds a ``BatchPlan`` and launches the head kernel BEFORE the real
-         model forward (on the current stream — same stream cuda graph capture
-         records into);
-      4. Runs the real model forward;
-      5. Launches the tail kernel and triggers end-of-forward (counter
-         polling + unconditional cross-rank allreduce of the error flag).
+    Three execution paths, all routed through this single wrapper:
+
+    1. **Eager** (prefill/extend/decode outside cuda graph): builds a
+       ``BatchPlan`` from the ``ForwardBatch``, launches head kernel,
+       runs real forward, launches tail kernel, ends forward.
+    2. **CUDA graph capture**: ``is_current_stream_capturing()`` is True.
+       We CANNOT compute a real plan here (forward_batch.input_ids is
+       graph-buffer-backed dummy data; CPU sync is illegal mid-capture).
+       Instead, we launch head+tail kernels reading from the runner's
+       fixed launch buffers — their default skip-sentinel makes the
+       recorded kernel a no-op. Replay-time refill (see #3) turns the same
+       recorded launches into real verify/write work.
+    3. **CUDA graph replay**: handled by
+       :func:`_install_cuda_graph_runner_replay_hook` patching
+       ``CudaGraphRunner.replay`` — the wrapper does NOT run for replays
+       (sglang's replay calls ``graph.replay()`` directly, bypassing
+       ``model.forward``).
     """
     model = model_runner.model
     original_forward = model.forward
@@ -164,28 +177,14 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         if forward_batch is None or runner is None or not runner.config.enabled:
             return original_forward(*args, **kwargs)
 
-        # v1 LIMITATION: cuda graph capture/replay bypasses canary.
-        #
-        # During CAPTURE, the host-derived ``expected_*`` tensors are built
-        # per-forward via ``torch.tensor(..., device=cuda)``. Recording these
-        # into the graph would bake in the *capture-time* values; replays
-        # would verify against stale data and either silently pass or report
-        # a flood of false-positive mismatches. So we fall through and the
-        # captured graph contains zero canary ops.
-        #
-        # During REPLAY (``cuda_graph_runner.replay()``), ``model.forward`` is
-        # never invoked — replay calls ``cuda_graph.replay()`` directly. The
-        # wrapper does not run, ``_forward_step`` does not advance, and no
-        # canary state changes. This means production decode (~95%+ of
-        # forward passes after warmup) runs UNVERIFIED. The §5 warmup
-        # zero-check still catches "canary never started" but not "canary
-        # stopped firing after warmup" — that is tracked as a follow-up
-        # requiring a redesign of the expected_* tensor lifecycle (fixed
-        # pre-allocated host-pinned staging + per-replay host-to-device
-        # copy + actual kernel launch from a hook in
-        # ``CudaGraphRunner.replay()``).
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return original_forward(*args, **kwargs)
+        is_capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if is_capturing:
+            launch_canary_for_capture(runner, kernel_kind=KERNEL_KIND_HEAD)
+            output = original_forward(*args, **kwargs)
+            launch_canary_for_capture(runner, kernel_kind=KERNEL_KIND_TAIL)
+            return output
 
         rank = model_runner.tp_rank
         active_indices, active_seq_lens = _extract_active_rows(forward_batch)
@@ -202,6 +201,60 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         return output
 
     model.forward = patched_model_forward
+
+
+_REPLAY_CLASS_PATCHED_ATTR = "_kv_cache_canary_replay_class_patched"
+
+
+def _patch_cuda_graph_runner_replay_class_method() -> None:
+    """Wrap ``CudaGraphRunner.replay`` at the CLASS level so replay calls canary.
+
+    SGLang's ``graph_runner.replay(forward_batch, ...)`` invokes
+    ``self.graphs[bs].replay()`` directly, bypassing ``model.forward`` —
+    the wrapper installed by :func:`_patch_model_forward` never sees a
+    replay. We have to hook the replay method itself.
+
+    Why CLASS-level: the canary install runs BEFORE ``init_device_graphs``,
+    so ``model_runner.graph_runner`` doesn't exist yet at install time.
+    Patching the class method covers every ``CudaGraphRunner`` instance
+    that will be created afterwards. The patched body looks the canary
+    runner up off ``self.model_runner.token_to_kv_pool`` per-call, so
+    instances without a canary attached just delegate to the original
+    method (zero cost).
+
+    Idempotent at the class level: a second install call is a no-op.
+    """
+    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+    if getattr(CudaGraphRunner, _REPLAY_CLASS_PATCHED_ATTR, False):
+        return
+
+    original_replay = CudaGraphRunner.replay
+
+    @functools.wraps(original_replay)
+    def patched_replay(self, forward_batch, *args, **kwargs):
+        model_runner = self.model_runner
+        pool = model_runner.token_to_kv_pool
+        runner = get_runner(pool)
+        if runner is None or not runner.config.enabled:
+            return original_replay(self, forward_batch, *args, **kwargs)
+
+        rank = model_runner.tp_rank
+        active_indices, active_seq_lens = _extract_active_rows(forward_batch)
+        maybe_perturb_req_to_token(
+            runner=runner,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            rank=rank,
+            active_req_pool_indices=active_indices,
+            active_seq_lens=active_seq_lens,
+        )
+        plan = prepare_replay(runner=runner, forward_batch=forward_batch)
+        output = original_replay(self, forward_batch, *args, **kwargs)
+        finalize_replay(runner=runner, plan=plan)
+        return output
+
+    CudaGraphRunner.replay = patched_replay
+    setattr(CudaGraphRunner, _REPLAY_CLASS_PATCHED_ATTR, True)
 
 
 def _extract_forward_batch(args, kwargs):
