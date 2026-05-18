@@ -336,7 +336,7 @@ class AscendMemcacheStore(HiCacheStorage):
         trace_payload = dict(payload)
         if not self.print_sample_keys:
             trace_payload.pop("sample_keys", None)
-        logger.info("[AscendMemcacheTrace] %s", trace_payload)
+        logger.debug("[AscendMemcacheTrace] %s", trace_payload)
         self._append_trace_file(trace_payload)
 
     #与Mooncake一致
@@ -369,7 +369,7 @@ class AscendMemcacheStore(HiCacheStorage):
                     return
             except Exception:
                 pass
-            logger.info(
+            logger.debug(
                 "Waiting for Memcache metrics endpoint at %s (%.1fs elapsed).",
                 url,
                 time.perf_counter() - start,

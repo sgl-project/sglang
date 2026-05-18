@@ -2047,7 +2047,7 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                logger.info(
+                logger.debug(
                     "[prefetch_kvcache] submit rid=%s matched_len=%d new_tokens=%d "
                     "last_host_node_id=%s backuped=%s pass_prefix_keys=%s",
                     req.rid,
@@ -2065,7 +2065,7 @@ class Scheduler(
                     prefix_keys,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "[prefetch_kvcache] skip rid=%s last_host_node_id=%s backuped=%s "
                     "(eligible only when backuped or root)",
                     req.rid,

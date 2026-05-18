@@ -280,7 +280,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.dec_lock_ref(ancestor_node)
             return None
 
-        logger.debug(
+        logger.info(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
         mamba_pools = self.mamba_restore_transfers(
@@ -1486,14 +1486,14 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 mp = cc.mem_pool_host
                 n = host_indices.numel()
-                logger.info(
+                logger.debug(
                     "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
                     n,
                     mp.size,
                     mp.available_size(),
                 )
                 cc.mem_pool_host.free(host_indices)
-                logger.info(
+                logger.debug(
                     "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
                     n,
                     mp.size,

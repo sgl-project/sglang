@@ -287,7 +287,7 @@ class HostKVCache(abc.ABC):
         av_before = len(self.free_slots)
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         av_after = len(self.free_slots)
-        logger.info(
+        logger.debug(
             "[HiCachePrefetchHostMem] mem_pool_host.free pool=HostKVCache num_indices=%s size=%s available_before=%s available_after=%s",
             len(indices),
             self.size,
@@ -1402,7 +1402,7 @@ class MambaPoolHost(HostKVCache):
         av_before = len(self.free_slots)
         self.free_slots = torch.cat([self.free_slots, indices])
         av_after = len(self.free_slots)
-        logger.info(
+        logger.debug(
             "[HiCachePrefetchHostMem] mem_pool_host.free pool=MambaPoolHost num_indices=%s size=%s available_before=%s available_after=%s",
             len(indices),
             self.size,
