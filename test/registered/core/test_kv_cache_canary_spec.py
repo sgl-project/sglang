@@ -46,9 +46,16 @@ class _FakeRunner:
         self.host_state = host_state
 
 
+class _FakeSpecAlgorithm:
+    @staticmethod
+    def is_speculative() -> bool:
+        return True
+
+
 class _FakeModelRunner:
     def __init__(self, allocator: _FakeAllocator) -> None:
         self.token_to_kv_pool_allocator = allocator
+        self.spec_algorithm = _FakeSpecAlgorithm()
 
 
 class TestSpecAllocatorFreeHook(unittest.TestCase):

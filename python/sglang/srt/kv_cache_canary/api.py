@@ -147,15 +147,19 @@ def install_spec_allocator_free_hook(
 
     Eagle/MTP verify accepts a prefix of drafts; the rest are 'rejected' and
     their slots are freed via ``token_to_kv_pool_allocator.free(...)``. The
-    canary's host state (``last_committed.slot_idx`` and the prev-hash chain)
-    must rewind so the next batch doesn't try to verify against a slot we
-    just gave back. We can't enumerate which req_pool_idx owns each slot
-    here, so we use the same conservative fallback as SWA: clear all
-    last_committed on every free batch. ``K_req`` is preserved (correct
-    by-position writes are still safe).
+    canary's verify history must drop entries pointing at rejected slots so
+    the next batch doesn't read freed memory.
 
-    Idempotent. Only patches when an allocator is present.
+    GUARDED by ``spec_algorithm``: in non-spec deployments, allocator.free
+    fires on every normal request release / radix eviction, NOT just on
+    reject. Wiping history on every such call would effectively disable
+    the canary's verify path in steady state. We only patch when the
+    runner actually does speculative decoding.
+
+    Idempotent.
     """
+    if not model_runner.spec_algorithm.is_speculative():
+        return
     allocator = model_runner.token_to_kv_pool_allocator
     if allocator is None:
         return
