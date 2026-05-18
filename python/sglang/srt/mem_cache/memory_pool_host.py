@@ -37,9 +37,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_cuda_alike = is_cuda_alike()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -313,7 +314,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = _is_cuda_alike and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
 
@@ -811,7 +812,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
         )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = _is_cuda_alike and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
