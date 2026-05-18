@@ -67,6 +67,7 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
+    should_force_bfloat16_lm_head,
 )
 from sglang.srt.utils import (
     empty_context,
@@ -1182,6 +1183,13 @@ class CudaGraphRunner:
             else:
                 full_logits = None
                 next_token_logits = output.next_token_logits[: self.raw_num_token]
+                if should_force_bfloat16_lm_head(
+                    server_args=self.model_runner.server_args,
+                    use_fp32_lm_head=getattr(
+                        self.model_runner.server_args, "enable_fp32_lm_head", False
+                    ),
+                ):
+                    next_token_logits = next_token_logits.to(torch.bfloat16)
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import os
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict
@@ -34,7 +35,31 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "true_on_policy_rms_norm",
 ]
+
+_TRUE_ON_POLICY_RMSNORM_DTYPE_FP32 = 0
+_TRUE_ON_POLICY_RMSNORM_DTYPE_BF16 = 1
+_TRUE_ON_POLICY_RMSNORM_DTYPE_FP16 = 2
+
+
+def _true_on_policy_rms_norm_dtype_code(dtype: torch.dtype) -> int:
+    if dtype == torch.float32:
+        return _TRUE_ON_POLICY_RMSNORM_DTYPE_FP32
+    if dtype == torch.bfloat16:
+        return _TRUE_ON_POLICY_RMSNORM_DTYPE_BF16
+    if dtype == torch.float16:
+        return _TRUE_ON_POLICY_RMSNORM_DTYPE_FP16
+    raise TypeError(f"Unsupported true-on-policy RMSNorm dtype: {dtype}")
+
+
+def _true_on_policy_rms_norm_result_dtype(
+    lhs_dtype: torch.dtype, rhs_dtype: torch.dtype
+) -> torch.dtype:
+    return torch.result_type(
+        torch.empty((), dtype=lhs_dtype),
+        torch.empty((), dtype=rhs_dtype),
+    )
 
 
 def _matmul_launch_metadata(
@@ -905,6 +930,208 @@ def rms_norm(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return output.reshape(original_shape)
+
+
+@triton.jit
+def _true_on_policy_rms_norm_kernel(
+    input_ptr,
+    weight_ptr,
+    residual_ptr,
+    post_residual_ptr,
+    output_ptr,
+    residual_out_ptr,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    residual_row_stride: tl.constexpr,
+    post_residual_row_stride: tl.constexpr,
+    residual_out_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    HAS_POST_RESIDUAL: tl.constexpr,
+    STORE_RESIDUAL_OUT: tl.constexpr,
+    CAST_NORM_TO_ORIG_DTYPE_BEFORE_WEIGHT: tl.constexpr,
+    NORM_CAST_DTYPE: tl.constexpr,
+    WEIGHT_CAST_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    input_row = input_ptr + row_idx * input_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        x = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+
+        if HAS_RESIDUAL:
+            residual_row = residual_ptr + row_idx * residual_row_stride
+            residual = tl.load(residual_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            x += residual
+
+        if HAS_POST_RESIDUAL:
+            post_residual_row = post_residual_ptr + row_idx * post_residual_row_stride
+            post_residual = tl.load(
+                post_residual_row + col_idx, mask=mask, other=0.0
+            ).to(tl.float32)
+            x += post_residual
+
+        sum_sq += tl.sum(tl.where(mask, x * x, 0.0))
+
+    inv_rms = tl.rsqrt(sum_sq / n_cols + eps)
+
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        x = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+
+        if HAS_RESIDUAL:
+            residual_row = residual_ptr + row_idx * residual_row_stride
+            residual = tl.load(residual_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            x += residual
+
+        if HAS_POST_RESIDUAL:
+            post_residual_row = post_residual_ptr + row_idx * post_residual_row_stride
+            post_residual = tl.load(
+                post_residual_row + col_idx, mask=mask, other=0.0
+            ).to(tl.float32)
+            x += post_residual
+
+        if STORE_RESIDUAL_OUT:
+            residual_out_row = residual_out_ptr + row_idx * residual_out_row_stride
+            tl.store(residual_out_row + col_idx, x, mask=mask)
+
+        normed = x * inv_rms
+        weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0).to(tl.float32)
+
+        if CAST_NORM_TO_ORIG_DTYPE_BEFORE_WEIGHT:
+            if NORM_CAST_DTYPE == 1:
+                normed = normed.to(tl.bfloat16)
+            elif NORM_CAST_DTYPE == 2:
+                normed = normed.to(tl.float16)
+
+        if WEIGHT_CAST_DTYPE == 1:
+            weight = weight.to(tl.bfloat16)
+        elif WEIGHT_CAST_DTYPE == 2:
+            weight = weight.to(tl.float16)
+
+        output = weight * normed
+        tl.store(output_row + col_idx, output, mask=mask)
+
+
+def true_on_policy_rms_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    residual: torch.Tensor | None = None,
+    post_residual_addition: torch.Tensor | None = None,
+    cast_x_before_out_mul: bool = True,
+    norm_cast_dtype: torch.dtype | None = None,
+    weight_cast_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Fused forward for the strict true-on-policy RMSNorm formula.
+
+    This intentionally mirrors ``RMSNorm.forward_native`` for the Qwen3
+    true-on-policy contract: residual math is fp32, variance is reduced in a
+    fixed per-row order, and ``cast_x_before_out_mul`` controls the dtype
+    boundary before multiplying the fp32 weight.
+    """
+    assert input.is_cuda, "true_on_policy_rms_norm requires CUDA input"
+    assert weight.dim() == 1, "weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+    if input.shape[-1] > 8192:
+        raise ValueError("true_on_policy_rms_norm supports hidden size <= 8192")
+    if residual is not None and residual.shape != input.shape:
+        raise ValueError("residual must match input shape")
+    if (
+        post_residual_addition is not None
+        and post_residual_addition.shape != input.shape
+    ):
+        raise ValueError("post_residual_addition must match input shape")
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    weight = weight.contiguous()
+    residual_2d = (
+        residual.reshape(-1, residual.shape[-1]).contiguous()
+        if residual is not None
+        else None
+    )
+    post_residual_2d = (
+        post_residual_addition.reshape(-1, post_residual_addition.shape[-1]).contiguous()
+        if post_residual_addition is not None
+        else None
+    )
+
+    norm_cast_dtype = norm_cast_dtype or input.dtype
+    weight_cast_dtype = weight_cast_dtype or weight.dtype
+    norm_cast_code = _true_on_policy_rms_norm_dtype_code(norm_cast_dtype)
+    weight_cast_code = _true_on_policy_rms_norm_dtype_code(weight_cast_dtype)
+
+    if output_dtype is None:
+        if cast_x_before_out_mul:
+            output_dtype = _true_on_policy_rms_norm_result_dtype(
+                norm_cast_dtype, weight_cast_dtype
+            )
+        else:
+            output_dtype = norm_cast_dtype
+    output_2d = torch.empty(
+        (input_2d.shape[0], input_2d.shape[1]), device=input.device, dtype=output_dtype
+    )
+
+    residual_out_2d = None
+    if residual is not None:
+        residual_out_2d = torch.empty(
+            (input_2d.shape[0], input_2d.shape[1]),
+            device=input.device,
+            dtype=residual_dtype or input.dtype,
+        )
+
+    n_rows, n_cols = input_2d.shape
+    max_block_size = int(os.getenv("SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE", "1024"))
+    if max_block_size <= 0 or max_block_size & (max_block_size - 1):
+        raise ValueError(
+            "SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE must be a positive power of two"
+        )
+    block_size = min(max_block_size, triton.next_power_of_2(n_cols))
+    _true_on_policy_rms_norm_kernel[(n_rows,)](
+        input_2d,
+        weight,
+        residual_2d,
+        post_residual_2d,
+        output_2d,
+        residual_out_2d,
+        input_2d.stride(0),
+        output_2d.stride(0),
+        residual_2d.stride(0) if residual_2d is not None else 0,
+        post_residual_2d.stride(0) if post_residual_2d is not None else 0,
+        residual_out_2d.stride(0) if residual_out_2d is not None else 0,
+        n_cols,
+        eps,
+        HAS_RESIDUAL=residual_2d is not None,
+        HAS_POST_RESIDUAL=post_residual_2d is not None,
+        STORE_RESIDUAL_OUT=residual_out_2d is not None,
+        CAST_NORM_TO_ORIG_DTYPE_BEFORE_WEIGHT=cast_x_before_out_mul,
+        NORM_CAST_DTYPE=norm_cast_code,
+        WEIGHT_CAST_DTYPE=weight_cast_code,
+        BLOCK_SIZE=block_size,
+    )
+
+    output = output_2d.reshape(original_shape)
+    if residual_out_2d is None:
+        return output
+    return output, residual_out_2d.reshape(original_shape)
 
 
 def rms_norm_batch_invariant(

@@ -243,6 +243,9 @@ def DeterministicInferenceScope(
     )
 
     saved_deterministic_flag = server_args.enable_deterministic_inference
+    saved_flashinfer_allreduce_fusion = getattr(
+        server_args, "enable_flashinfer_allreduce_fusion", None
+    )
     batch_invariant_was_enabled = is_batch_invariant_mode_enabled()
     tp_invariant_was_enabled = is_tp_invariant_mode_enabled()
     enabled_batch_invariant_here = False
@@ -250,6 +253,8 @@ def DeterministicInferenceScope(
 
     try:
         server_args.enable_deterministic_inference = True
+        if should_disable_flashinfer_allreduce_fusion(server_args):
+            server_args.enable_flashinfer_allreduce_fusion = False
         if not batch_invariant_was_enabled:
             enable_batch_invariant_mode()
             enabled_batch_invariant_here = True
@@ -264,6 +269,10 @@ def DeterministicInferenceScope(
             yield
     finally:
         server_args.enable_deterministic_inference = saved_deterministic_flag
+        if saved_flashinfer_allreduce_fusion is not None:
+            server_args.enable_flashinfer_allreduce_fusion = (
+                saved_flashinfer_allreduce_fusion
+            )
         if enabled_batch_invariant_here:
             disable_batch_invariant_mode()
         if enabled_tp_invariant_here:

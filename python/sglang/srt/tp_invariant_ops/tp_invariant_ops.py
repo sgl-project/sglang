@@ -581,15 +581,9 @@ def matmul_tp_persistent_optim(
     )
 
 
-def stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deterministic, batch-invariant top-k with stable expert-id tie-break.
-
-    Subtracts ``expert_id * eps * |score|`` from each score so equal scores are
-    broken by the smaller expert id. Megatron keeps the same formula locally so
-    core routing does not depend on importing SGLang.
-
-    Returns the gathered original-precision scores and selected expert indices.
-    """
+def _stable_topk_torch(
+    scores: torch.Tensor, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
     scores_fp32 = scores.float()
     tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(
@@ -600,7 +594,206 @@ def stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.T
     return torch.gather(scores, dim=-1, index=selected_ids), selected_ids
 
 
-def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
+@triton.jit
+def _stable_topk_kernel(
+    scores_ptr,
+    values_ptr,
+    ids_ptr,
+    n_cols: tl.constexpr,
+    top_k: tl.constexpr,
+    scores_row_stride: tl.constexpr,
+    values_row_stride: tl.constexpr,
+    ids_row_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+
+    scores = tl.load(
+        scores_ptr + row * scores_row_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    scores_f32 = scores.to(tl.float32)
+    expert_ids = offsets.to(tl.float32)
+    min_scale = 1.0 / n_cols
+    tie_step = 1.1920928955078125e-7 * tl.maximum(tl.abs(scores_f32), min_scale)
+    adjusted = scores_f32 - expert_ids * tie_step
+    adjusted = tl.where(mask, adjusted, -float("inf"))
+
+    for topk_idx in range(0, top_k):
+        best_adjusted = tl.max(adjusted, axis=0)
+        is_best = adjusted == best_adjusted
+        best_col = tl.min(tl.where(is_best, offsets, BLOCK_SIZE), axis=0)
+        value = tl.load(scores_ptr + row * scores_row_stride + best_col)
+
+        tl.store(values_ptr + row * values_row_stride + topk_idx, value)
+        tl.store(ids_ptr + row * ids_row_stride + topk_idx, best_col)
+
+        adjusted = tl.where(offsets == best_col, -float("inf"), adjusted)
+
+
+def _stable_topk_triton(
+    scores: torch.Tensor, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scores.dim() != 2:
+        raise ValueError(f"stable_topk expects a 2D tensor, got {scores.shape}")
+    if top_k <= 0 or top_k > scores.shape[-1]:
+        raise ValueError(f"top_k must be in [1, {scores.shape[-1]}], got {top_k}")
+
+    scores_2d = scores.contiguous()
+    n_rows, n_cols = scores_2d.shape
+    block_size = triton.next_power_of_2(n_cols)
+    if block_size > 1024:
+        return _stable_topk_torch(scores, top_k)
+
+    values = torch.empty((n_rows, top_k), device=scores.device, dtype=scores.dtype)
+    ids = torch.empty((n_rows, top_k), device=scores.device, dtype=torch.long)
+    _stable_topk_kernel[(n_rows,)](
+        scores_2d,
+        values,
+        ids,
+        n_cols,
+        top_k,
+        scores_2d.stride(0),
+        values.stride(0),
+        ids.stride(0),
+        BLOCK_SIZE=block_size,
+    )
+    return values, ids
+
+
+@triton.jit
+def _stable_topk_softmax_kernel(
+    logits_ptr,
+    values_ptr,
+    ids_ptr,
+    n_cols: tl.constexpr,
+    top_k: tl.constexpr,
+    logits_row_stride: tl.constexpr,
+    values_row_stride: tl.constexpr,
+    ids_row_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+
+    logits = tl.load(
+        logits_ptr + row * logits_row_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    logits = tl.where(mask, logits, -float("inf"))
+    row_max = tl.max(logits, axis=0)
+    exp_logits = tl.exp(logits - row_max)
+    exp_logits = tl.where(mask, exp_logits, 0.0)
+    denom = tl.sum(exp_logits, axis=0)
+    scores = exp_logits / denom
+
+    expert_ids = offsets.to(tl.float32)
+    min_scale = 1.0 / n_cols
+    tie_step = 1.1920928955078125e-7 * tl.maximum(tl.abs(scores), min_scale)
+    adjusted = scores - expert_ids * tie_step
+    adjusted = tl.where(mask, adjusted, -float("inf"))
+
+    topk_sum = tl.full((), 0.0, tl.float32)
+    for topk_idx in range(0, top_k):
+        best_adjusted = tl.max(adjusted, axis=0)
+        is_best = adjusted == best_adjusted
+        best_col = tl.min(tl.where(is_best, offsets, BLOCK_SIZE), axis=0)
+        value = tl.max(tl.where(offsets == best_col, scores, 0.0), axis=0)
+
+        topk_sum += value
+        tl.store(values_ptr + row * values_row_stride + topk_idx, value)
+        tl.store(ids_ptr + row * ids_row_stride + topk_idx, best_col)
+
+        adjusted = tl.where(offsets == best_col, -float("inf"), adjusted)
+
+    for topk_idx in range(0, top_k):
+        value = tl.load(values_ptr + row * values_row_stride + topk_idx)
+        tl.store(values_ptr + row * values_row_stride + topk_idx, value / topk_sum)
+
+
+def _stable_topk_softmax_triton(
+    logits: torch.Tensor, top_k: int, ids_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits.dim() != 2:
+        raise ValueError(f"stable_topk_softmax expects a 2D tensor, got {logits.shape}")
+    if top_k <= 0 or top_k > logits.shape[-1]:
+        raise ValueError(f"top_k must be in [1, {logits.shape[-1]}], got {top_k}")
+
+    logits_2d = logits.contiguous()
+    n_rows, n_cols = logits_2d.shape
+    block_size = triton.next_power_of_2(n_cols)
+    if block_size > 1024:
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        topk_values, topk_ids = stable_topk(scores, top_k)
+        return topk_values / topk_values.sum(dim=-1, keepdim=True), topk_ids
+
+    values = torch.empty((n_rows, top_k), device=logits.device, dtype=torch.float32)
+    ids = torch.empty((n_rows, top_k), device=logits.device, dtype=ids_dtype)
+    _stable_topk_softmax_kernel[(n_rows,)](
+        logits_2d,
+        values,
+        ids,
+        n_cols,
+        top_k,
+        logits_2d.stride(0),
+        values.stride(0),
+        ids.stride(0),
+        BLOCK_SIZE=block_size,
+    )
+    return values, ids
+
+
+def stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic, batch-invariant top-k with stable expert-id tie-break.
+
+    Subtracts ``expert_id * eps * |score|`` from each score so equal scores are
+    broken by the smaller expert id. Megatron keeps the same formula locally so
+    core routing does not depend on importing SGLang.
+
+    Returns the gathered original-precision scores and selected expert indices.
+    """
+    if (
+        scores.is_cuda
+        and scores.dim() == 2
+        and not (torch.is_grad_enabled() and scores.requires_grad)
+        and os.getenv("SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON", "1") != "0"
+    ):
+        return _stable_topk_triton(scores, top_k)
+
+    return _stable_topk_torch(scores, top_k)
+
+
+def stable_topk_softmax(
+    logits: torch.Tensor, top_k: int, *, ids_dtype: torch.dtype = torch.long
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic fused softmax + stable top-k for MoE routing.
+
+    This keeps routing per-token deterministic without materializing the full
+    softmax matrix in Python.  The selected weights are renormalized over the
+    selected experts, matching the Qwen3-MoE routing contract used by SGLang and
+    Megatron's exact forward path when the opt-in env var is enabled.
+    """
+    if (
+        logits.is_cuda
+        and logits.dim() == 2
+        and not (torch.is_grad_enabled() and logits.requires_grad)
+        and os.getenv("SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX", "0") != "0"
+    ):
+        return _stable_topk_softmax_triton(logits, top_k, ids_dtype)
+
+    scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    topk_values, topk_ids = stable_topk(scores, top_k)
+    if topk_ids.dtype != ids_dtype:
+        topk_ids = topk_ids.to(ids_dtype)
+    return topk_values / topk_values.sum(dim=-1, keepdim=True), topk_ids
+
+
+def _tree_all_reduce_sum_reference(x: torch.Tensor, device_group=None) -> torch.Tensor:
     if not dist.is_initialized():
         return x.clone()
 
@@ -616,9 +809,154 @@ def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
     return _fixed_tree_sum_tensors(result)
 
 
+def _tree_sum_dtype_code(dtype: torch.dtype) -> int:
+    if dtype == torch.float32:
+        return 0
+    if dtype == torch.bfloat16:
+        return 1
+    if dtype == torch.float16:
+        return 2
+    raise TypeError(f"Unsupported tree all-reduce dtype: {dtype}")
+
+
+@triton.jit
+def _round_tree_sum_value(value, DTYPE_CODE: tl.constexpr):
+    if DTYPE_CODE == 1:
+        return value.to(tl.bfloat16).to(tl.float32)
+    if DTYPE_CODE == 2:
+        return value.to(tl.float16).to(tl.float32)
+    return value
+
+
+@triton.jit
+def _load_tree_sum_row(gather_ptr, offsets, n_elements, row: tl.constexpr, mask):
+    return tl.load(gather_ptr + row * n_elements + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+
+@triton.jit
+def _tree_sum_pair(
+    gather_ptr,
+    offsets,
+    n_elements,
+    left: tl.constexpr,
+    right: tl.constexpr,
+    mask,
+    DTYPE_CODE: tl.constexpr,
+):
+    value = _load_tree_sum_row(gather_ptr, offsets, n_elements, left, mask)
+    value += _load_tree_sum_row(gather_ptr, offsets, n_elements, right, mask)
+    return _round_tree_sum_value(value, DTYPE_CODE)
+
+
+@triton.jit
+def _tree_sum_gathered_rank0_kernel(
+    gather_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    DTYPE_CODE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    if WORLD_SIZE == 1:
+        value = _load_tree_sum_row(gather_ptr, offsets, n_elements, 0, mask)
+    elif WORLD_SIZE == 2:
+        value = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
+        )
+    elif WORLD_SIZE == 4:
+        left = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
+        )
+        right = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 2, 3, mask, DTYPE_CODE
+        )
+        value = _round_tree_sum_value(left + right, DTYPE_CODE)
+    elif WORLD_SIZE == 8:
+        left_01 = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
+        )
+        left_23 = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 2, 3, mask, DTYPE_CODE
+        )
+        right_45 = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 4, 5, mask, DTYPE_CODE
+        )
+        right_67 = _tree_sum_pair(
+            gather_ptr, offsets, n_elements, 6, 7, mask, DTYPE_CODE
+        )
+        left = _round_tree_sum_value(left_01 + left_23, DTYPE_CODE)
+        right = _round_tree_sum_value(right_45 + right_67, DTYPE_CODE)
+        value = _round_tree_sum_value(left + right, DTYPE_CODE)
+    else:
+        value = _load_tree_sum_row(gather_ptr, offsets, n_elements, 0, mask)
+
+    tl.store(output_ptr + offsets, value, mask=mask)
+
+
+def _tree_sum_gathered_rank0(
+    gather: torch.Tensor, output_shape: torch.Size
+) -> torch.Tensor:
+    world_size = gather.shape[0]
+    if world_size not in (1, 2, 4, 8):
+        raise ValueError("fused tree sum supports world_size in {1, 2, 4, 8}")
+    if not gather.is_cuda or not gather.is_contiguous():
+        raise ValueError("fused tree sum requires a contiguous CUDA gather buffer")
+
+    output = torch.empty(output_shape, device=gather.device, dtype=gather.dtype)
+    n_elements = output.numel()
+    if n_elements == 0:
+        return output
+
+    block_size = 1024
+    grid = (triton.cdiv(n_elements, block_size),)
+    _tree_sum_gathered_rank0_kernel[grid](
+        gather,
+        output,
+        n_elements,
+        WORLD_SIZE=world_size,
+        DTYPE_CODE=_tree_sum_dtype_code(gather.dtype),
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
+def _tree_sum_gathered_rank0_inplace(gather: torch.Tensor) -> torch.Tensor:
+    world_size = gather.shape[0]
+    if world_size not in (1, 2, 4, 8):
+        raise ValueError("fused tree sum supports world_size in {1, 2, 4, 8}")
+    if not gather.is_cuda or not gather.is_contiguous():
+        raise ValueError("fused tree sum requires a contiguous CUDA gather buffer")
+
+    output = gather[0]
+    n_elements = output.numel()
+    if n_elements == 0:
+        return output
+
+    block_size = 1024
+    grid = (triton.cdiv(n_elements, block_size),)
+    _tree_sum_gathered_rank0_kernel[grid](
+        gather,
+        gather,
+        n_elements,
+        WORLD_SIZE=world_size,
+        DTYPE_CODE=_tree_sum_dtype_code(gather.dtype),
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
 def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tensor:
+    if not dist.is_initialized():
+        return x.clone()
+
     if not x.is_cuda:
-        raise ValueError("x must be a CUDA tensor.")
+        return _tree_all_reduce_sum_reference(x, device_group=device_group)
     if not x.is_contiguous():
         raise ValueError(
             "x must be contiguous. Call x = x.contiguous() OUTSIDE graph capture."
@@ -628,23 +966,48 @@ def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tenso
     if world_size & (world_size - 1) != 0:
         raise ValueError("world_size must be a power of 2.")
 
-    # cache
-    if not hasattr(tree_all_reduce_sum, "_cache"):
-        tree_all_reduce_sum._cache = {}
+    cache_enabled = os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE", "1") != "0"
+    cache_max_bytes = int(
+        os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE_MAX_BYTES", str(64 * 1024 * 1024))
+    )
+    cache_max_entries = int(os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE_MAX_ENTRIES", "64"))
+    gather_num_bytes = x.numel() * world_size * x.element_size()
+    gather = None
 
-    key = (id(device_group), x.device.index, tuple(x.shape), x.dtype, world_size)
-    st = tree_all_reduce_sum._cache.get(key)
-    if st is None:
+    if cache_enabled and gather_num_bytes <= cache_max_bytes:
+        if not hasattr(tree_all_reduce_sum_optim, "_scratch_cache"):
+            tree_all_reduce_sum_optim._scratch_cache = {}
+
+        key = (id(device_group), x.device.index, tuple(x.shape), x.dtype, world_size)
+        cache = tree_all_reduce_sum_optim._scratch_cache
+        gather = cache.get(key)
+        if gather is None:
+            gather = torch.empty(
+                (world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype
+            )
+            cache[key] = gather
+            if len(cache) > cache_max_entries:
+                cache.pop(next(iter(cache)))
+
+    if gather is None:
         gather = torch.empty(
             (world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype
         )
-        out = torch.empty_like(x)
-        st = tree_all_reduce_sum._cache[key] = (gather, out)
-
-    gather, out = st
 
     # 1) all_gather into one contiguous buffer
     dist.all_gather_into_tensor(gather, x, group=device_group)
+
+    if os.getenv("TREE_ALL_REDUCE_FUSED_INPLACE_SUM", "0") != "0":
+        result = _tree_sum_gathered_rank0_inplace(gather)
+        if (
+            os.getenv("TREE_ALL_REDUCE_RETURN_VIEW_NO_GRAD", "0") != "0"
+            and not torch.is_grad_enabled()
+        ):
+            return result
+        return result.clone()
+
+    if os.getenv("TREE_ALL_REDUCE_FUSED_SUM", "0") != "0":
+        return _tree_sum_gathered_rank0(gather, x.shape)
 
     # 2) deterministic tree pairing EXACTLY like your original:
     # for level in range(1, bit_length):
@@ -660,9 +1023,25 @@ def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tenso
         # Views only (no alloc); one add_ kernel per level
         gather[0:world_size:step].add_(gather[half:world_size:step])
 
-    out.copy_(gather[0])
-    tree_all_reduce_sum._cache.clear()
-    return out
+    if (
+        os.getenv("TREE_ALL_REDUCE_RETURN_VIEW_NO_GRAD", "0") != "0"
+        and not torch.is_grad_enabled()
+    ):
+        return gather[0]
+    return gather[0].clone()
+
+
+def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
+    """All-reduce by gathering ranks and summing them in a fixed binary tree order.
+
+    The optimized CUDA path uses a contiguous ``all_gather_into_tensor`` buffer
+    and the same pairwise tree order as the reference implementation. Keep
+    ``TREE_ALL_REDUCE_OPTIM=0`` as an escape hatch while the path continues to
+    serve true-on-policy parity gates.
+    """
+    if os.getenv("TREE_ALL_REDUCE_OPTIM", "1") == "0":
+        return _tree_all_reduce_sum_reference(x, device_group=device_group)
+    return tree_all_reduce_sum_optim(x, device_group=device_group)
 
 
 _tp_inv_MODE = False
@@ -1933,8 +2312,13 @@ def moe_sum_tree_reduce_v2(
         )
         return output
 
-    # fallback: keep your existing generic path here
-    return output
+    return moe_sum_tree_reduce_v1(
+        input=input,
+        output=output,
+        curr_topk_ids=curr_topk_ids,
+        routed_scaling_factor=routed_scaling_factor,
+        E=E,
+    )
 
 
 def moe_sum_tree_reduce(
@@ -1945,7 +2329,10 @@ def moe_sum_tree_reduce(
     E: int,
 ):
     curr_topk_ids = curr_topk_ids.to(torch.int32)
-    if os.environ.get("SGLANG_MOE_TREE_REDUCE_USE_V2", "0") == "1":
+    if (
+        os.environ.get("SGLANG_MOE_TREE_REDUCE_USE_V2", "0") == "1"
+        and input.shape[1] in (8, 10)
+    ):
         return moe_sum_tree_reduce_v2(
             input=input,
             output=output,
@@ -1976,6 +2363,3 @@ def moe_sum_tree_reduce(
 #     print("using optimized moe_sum_tree_reduce_optim")
 # else:
 #     print("using original moe_sum_tree_reduce_original")
-
-if os.getenv("TREE_ALL_REDUCE_OPTIM", "0") == "1":
-    tree_all_reduce_sum = tree_all_reduce_sum_optim

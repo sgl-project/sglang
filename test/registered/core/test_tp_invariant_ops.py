@@ -16,6 +16,7 @@ All bitwise assertions use torch.equal, never approximate tolerances.
 import os
 import random
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -35,6 +36,8 @@ from sglang.srt.tp_invariant_ops.tp_invariant_ops import (
     _MATMUL_K_BLOCK,
     _fixed_tree_sum_tensors,
     _is_power_of_two,
+    _tree_sum_gathered_rank0,
+    _tree_sum_gathered_rank0_inplace,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -390,6 +393,37 @@ class TestBFloat16Ops(unittest.TestCase):
         expected = torch.tensor([[4.0, 6.0]], dtype=torch.bfloat16)
         torch.testing.assert_close(output, expected)
 
+    def test_moe_sum_tree_reduce_v2_env_falls_back_for_unsupported_topk(self):
+        input_tensor = torch.zeros(1, 3, 2)
+        curr_topk_ids = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+        output = torch.empty(1, 2)
+
+        def fake_v1(**kwargs):
+            kwargs["output"].fill_(7.0)
+            return kwargs["output"]
+
+        with (
+            patch.dict(os.environ, {"SGLANG_MOE_TREE_REDUCE_USE_V2": "1"}),
+            patch(
+                "sglang.srt.tp_invariant_ops.tp_invariant_ops.moe_sum_tree_reduce_v1",
+                side_effect=fake_v1,
+            ) as mocked_v1,
+            patch(
+                "sglang.srt.tp_invariant_ops.tp_invariant_ops.moe_sum_tree_reduce_v2"
+            ) as mocked_v2,
+        ):
+            result = moe_sum_tree_reduce(
+                input=input_tensor,
+                output=output,
+                curr_topk_ids=curr_topk_ids,
+                routed_scaling_factor=1.0,
+                E=4,
+            )
+
+        mocked_v2.assert_not_called()
+        mocked_v1.assert_called_once()
+        self.assertTrue(torch.equal(result, torch.full_like(output, 7.0)))
+
 
 # ---------------------------------------------------------------------------
 # MoE tree reduce: EP/slot invariance
@@ -561,6 +595,15 @@ class TestTreeAllReduceNonDistributed(unittest.TestCase):
         self.assertTrue(torch.equal(x, result))
         self.assertFalse(x.data_ptr() == result.data_ptr())
 
+    def test_reference_escape_hatch_returns_clone_when_dist_not_initialized(self):
+        if dist.is_initialized():
+            self.skipTest("dist already initialized")
+        x = torch.tensor([1.0, 2.0, 3.0])
+        with patch.dict(os.environ, {"TREE_ALL_REDUCE_OPTIM": "0"}):
+            result = tree_all_reduce_sum(x)
+        self.assertTrue(torch.equal(x, result))
+        self.assertFalse(x.data_ptr() == result.data_ptr())
+
     def test_fixed_tree_sum_is_order_deterministic(self):
         torch.manual_seed(50)
         world_size = 8
@@ -575,6 +618,53 @@ class TestTreeAllReduceNonDistributed(unittest.TestCase):
             shards = [torch.tensor([float(i + 1)]) for i in range(n)]
             result = _fixed_tree_sum_tensors(shards)
             self.assertAlmostEqual(result.item(), n * (n + 1) / 2, places=5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fused_tree_sum_matches_reference_buffer(self):
+        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+            for world_size in [1, 2, 4, 8]:
+                torch.manual_seed(20260515 + world_size)
+                gather = torch.randn(
+                    world_size,
+                    7,
+                    513,
+                    device="cuda",
+                    dtype=dtype,
+                )
+
+                expected = _fixed_tree_sum_tensors(
+                    [gather[rank].clone() for rank in range(world_size)]
+                )
+                actual = _tree_sum_gathered_rank0(gather.contiguous(), gather.shape[1:])
+
+                self.assertTrue(
+                    torch.equal(actual, expected),
+                    f"dtype={dtype} world_size={world_size}",
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fused_tree_sum_inplace_matches_reference_buffer(self):
+        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+            for world_size in [1, 2, 4, 8]:
+                torch.manual_seed(20260516 + world_size)
+                gather = torch.randn(
+                    world_size,
+                    7,
+                    513,
+                    device="cuda",
+                    dtype=dtype,
+                ).contiguous()
+
+                expected = _fixed_tree_sum_tensors(
+                    [gather[rank].clone() for rank in range(world_size)]
+                )
+                actual = _tree_sum_gathered_rank0_inplace(gather)
+
+                self.assertEqual(actual.data_ptr(), gather.data_ptr())
+                self.assertTrue(
+                    torch.equal(actual, expected),
+                    f"dtype={dtype} world_size={world_size}",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +915,7 @@ class TestDistributedTreeAllReduce(unittest.TestCase):
             if own_pg:
                 dist.destroy_process_group()
 
+
     @unittest.skipUnless(
         int(os.environ.get("WORLD_SIZE", "1")) > 1,
         "requires torchrun with WORLD_SIZE > 1",
@@ -889,6 +980,40 @@ class TestStableTopK(unittest.TestCase):
         b_vals, b_ids = stable_topk(scores, top_k=8)
         self.assertTrue(torch.equal(a_vals, b_vals))
         self.assertTrue(torch.equal(a_ids, b_ids))
+
+    def test_cuda_triton_matches_torch_fallback(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        torch.manual_seed(0)
+        scores = torch.randn(64, 128, device="cuda", dtype=torch.float32)
+        scores[0, :8] = 0.5
+        scores[1, :4] = scores[1, 4:8]
+
+        old_flag = os.environ.get("SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON")
+        try:
+            os.environ["SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON"] = "0"
+            ref_vals, ref_ids = stable_topk(scores, top_k=8)
+            os.environ["SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON"] = "1"
+            vals, ids = stable_topk(scores, top_k=8)
+        finally:
+            if old_flag is None:
+                os.environ.pop("SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON", None)
+            else:
+                os.environ["SGLANG_TRUE_ON_POLICY_STABLE_TOPK_TRITON"] = old_flag
+
+        self.assertTrue(torch.equal(vals, ref_vals))
+        self.assertTrue(torch.equal(ids, ref_ids))
+
+    def test_cuda_requires_grad_uses_autograd_path(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        scores = torch.randn(4, 16, device="cuda", requires_grad=True)
+        vals, _ = stable_topk(scores, top_k=4)
+        self.assertIsNotNone(vals.grad_fn)
+        vals.sum().backward()
+        self.assertIsNotNone(scores.grad)
 
 
 if __name__ == "__main__":

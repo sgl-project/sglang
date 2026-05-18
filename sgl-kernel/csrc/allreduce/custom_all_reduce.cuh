@@ -200,6 +200,34 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+template <typename P>
+DINLINE P packed_add_round(P a, P b) {
+  auto tmp = upcast(a);
+  packed_assign_add(tmp, upcast(b));
+  return downcast<P>(tmp);
+}
+
+template <typename P, int ngpus>
+DINLINE P packed_reduce_tree_exact(const P* ptrs[], int idx) {
+  if constexpr (ngpus == 2) {
+    return packed_add_round(ptrs[0][idx], ptrs[1][idx]);
+  } else if constexpr (ngpus == 4) {
+    auto left = packed_add_round(ptrs[0][idx], ptrs[1][idx]);
+    auto right = packed_add_round(ptrs[2][idx], ptrs[3][idx]);
+    return packed_add_round(left, right);
+  } else if constexpr (ngpus == 8) {
+    auto left_01 = packed_add_round(ptrs[0][idx], ptrs[1][idx]);
+    auto left_23 = packed_add_round(ptrs[2][idx], ptrs[3][idx]);
+    auto right_45 = packed_add_round(ptrs[4][idx], ptrs[5][idx]);
+    auto right_67 = packed_add_round(ptrs[6][idx], ptrs[7][idx]);
+    auto left = packed_add_round(left_01, left_23);
+    auto right = packed_add_round(right_45, right_67);
+    return packed_add_round(left, right);
+  } else {
+    return packed_reduce<P, ngpus, typename packed_t<typename P::type>::A>(ptrs, idx);
+  }
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -212,6 +240,18 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  }
+  multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_tree_exact(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+  using P = typename packed_t<T>::P;
+  auto dp = *_dp;
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
+    ((P*)result)[idx] = packed_reduce_tree_exact<P, ngpus>((const P**)&dp.ptrs[0], idx);
   }
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
@@ -494,6 +534,55 @@ class CustomAllreduce {
             std::to_string(world_size_));
     }
 #undef REDUCE_CASE
+#undef KL
+  }
+
+  template <typename T>
+  void allreduce_tree_exact(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
+    auto d = packed_t<T>::P::size;
+    if (size % d != 0)
+      throw std::runtime_error(
+          "custom tree allreduce currently requires input length to be multiple "
+          "of " +
+          std::to_string(d));
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error(
+          "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
+      ptrs = it->second;
+    }
+
+    size /= d;
+    int blocks = std::min(block_limit, (size + threads - 1) / threads);
+
+#define KL(ngpus) cross_device_reduce_1stage_tree_exact<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+    switch (world_size_) {
+      case 2:
+        KL(2)
+        break;
+      case 4:
+        KL(4)
+        break;
+      case 8:
+        KL(8)
+        break;
+      default:
+        throw std::runtime_error(
+            "custom tree allreduce only supports num gpus in (2,4,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+    }
 #undef KL
   }
 

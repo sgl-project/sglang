@@ -64,6 +64,7 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
+        self._tree_exact_warning_emitted = False
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -302,6 +303,21 @@ class CustomAllreduce:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
+    def _all_reduce_tree_exact_impl(
+        self, inp: torch.Tensor, registered: bool
+    ) -> Optional[torch.Tensor]:
+        if _is_hip or not hasattr(ops, "all_reduce_tree_exact"):
+            return None
+
+        out = torch.empty_like(inp)
+        if registered:
+            ops.all_reduce_tree_exact(self._ptr, inp, out, 0, 0)
+        else:
+            ops.all_reduce_tree_exact(
+                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+            )
+        return out
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -323,6 +339,31 @@ class CustomAllreduce:
                     return torch.zeros_like(input)
         else:
             return self._all_reduce_impl(input, registered=False)
+
+    def custom_tree_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        """Custom all-reduce matching the fixed binary tree sum contract."""
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+
+        try:
+            if self._IS_CAPTURING:
+                if torch.cuda.is_current_stream_capturing():
+                    return self._all_reduce_tree_exact_impl(
+                        input, registered=not self.tms_cudagraph
+                    )
+                if is_in_piecewise_cuda_graph():
+                    return self._all_reduce_tree_exact_impl(input, registered=False)
+                return torch.zeros_like(input)
+            return self._all_reduce_tree_exact_impl(input, registered=False)
+        except (AttributeError, RuntimeError) as exc:
+            if not self._tree_exact_warning_emitted:
+                logger.warning(
+                    "Custom tree allreduce is unavailable; falling back to "
+                    "all-gather tree reduce. Details: %s",
+                    exc,
+                )
+                self._tree_exact_warning_emitted = True
+            return None
 
     def close(self):
         if not self.disabled and self._ptr:

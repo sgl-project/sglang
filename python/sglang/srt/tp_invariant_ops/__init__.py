@@ -7,6 +7,7 @@ from .tp_invariant_ops import (
     moe_sum_tree_reduce,
     set_tp_invariant_mode,
     stable_topk,
+    stable_topk_softmax,
     tree_all_reduce_sum,
 )
 
@@ -17,6 +18,7 @@ __all__ = [
     "matmul_tp_inv",
     "moe_sum_tree_reduce",
     "stable_topk",
+    "stable_topk_softmax",
     "tree_all_reduce_sum",
     "set_tp_invariant_mode",
     "is_tp_invariant_mode_enabled",

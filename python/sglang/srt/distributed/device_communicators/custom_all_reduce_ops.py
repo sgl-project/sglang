@@ -51,6 +51,17 @@ elif _is_cuda or _is_musa:
     ) -> None:
         _custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
+    def all_reduce_tree_exact(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        _custom_ar.all_reduce_tree_exact(
+            fa, inp, out, reg_buffer, reg_buffer_sz_bytes
+        )
+
     def dispose(fa: int) -> None:
         _custom_ar.dispose(fa)
 

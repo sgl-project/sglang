@@ -16,6 +16,31 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _deterministic_moe_use_configs() -> bool:
+    return _env_flag("SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS")
+
+
+def _get_env_override_config() -> Optional[Dict[str, Any]]:
+    config_json = os.getenv("SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON")
+    if not config_json:
+        return None
+
+    try:
+        config = json.loads(config_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Invalid SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON value"
+        ) from exc
+
+    if not isinstance(config, dict):
+        raise ValueError("SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON must be a dict")
+    return config
+
+
 def get_config_file_name(
     E: int,
     N: int,
@@ -52,7 +77,10 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if get_global_server_args().enable_deterministic_inference:
+    if (
+        get_global_server_args().enable_deterministic_inference
+        and not _deterministic_moe_use_configs()
+    ):
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -145,7 +173,10 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if get_global_server_args().enable_deterministic_inference:
+    if (
+        get_global_server_args().enable_deterministic_inference
+        and not _deterministic_moe_use_configs()
+    ):
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
@@ -216,8 +247,11 @@ def try_get_optimal_moe_config(
     down_config = None
     max_block_m = None
     override_config = get_config()
+    env_override_config = _get_env_override_config()
     if override_config:
         config = override_config
+    elif env_override_config:
+        config = env_override_config
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape

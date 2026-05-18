@@ -3474,16 +3474,29 @@ class ServerArgs:
             # For VLM
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
 
+            prefill_only_fast_decode = (
+                self.enable_prefill_only_deterministic_inference
+                and not self.enable_deterministic_inference
+            )
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self)
             if (
-                resolve_true_on_policy_runtime_policy(
-                    self
-                ).disable_flashinfer_allreduce_fusion
+                true_on_policy_policy.disable_flashinfer_allreduce_fusion
                 and self.enable_flashinfer_allreduce_fusion
+                and not prefill_only_fast_decode
             ):
                 self.enable_flashinfer_allreduce_fusion = False
                 logger.warning(
                     "Disable flashinfer allreduce fusion because of "
                     "true_on_policy_contract with TP rollout."
+                )
+            elif (
+                true_on_policy_policy.disable_flashinfer_allreduce_fusion
+                and self.enable_flashinfer_allreduce_fusion
+            ):
+                logger.warning(
+                    "Keep flashinfer allreduce fusion enabled for prefill-only "
+                    "deterministic fast decode; deterministic prefill scopes "
+                    "disable it temporarily."
                 )
 
         if self.enable_deterministic_inference:
@@ -3569,10 +3582,27 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    self.disable_custom_all_reduce = True
-                    logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    custom_tree_all_reduce = (
+                        os.environ.get(
+                            "SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE", "0"
+                        )
+                        == "1"
+                        or os.environ.get(
+                            "SGLANG_TRUE_ON_POLICY_TREE_CUSTOM_ALL_REDUCE", "0"
+                        )
+                        == "1"
                     )
+                    if custom_tree_all_reduce:
+                        logger.warning(
+                            "NCCL_ALGO is set to 'allreduce:tree'; custom all "
+                            "reduce remains available only for exact true-on-policy "
+                            "tree-reduce calls."
+                        )
+                    else:
+                        self.disable_custom_all_reduce = True
+                        logger.warning(
+                            "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

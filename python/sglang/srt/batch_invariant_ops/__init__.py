@@ -16,6 +16,7 @@ from .batch_invariant_ops import (
     mean_dim,
     rms_norm_batch_invariant,
     set_batch_invariant_mode,
+    true_on_policy_rms_norm,
 )
 
 __version__ = "0.1.0"
@@ -69,4 +70,5 @@ __all__ = [
     "get_batch_invariant_attention_block_size",
     "AttentionBlockSize",
     "rms_norm_batch_invariant",
+    "true_on_policy_rms_norm",
 ]

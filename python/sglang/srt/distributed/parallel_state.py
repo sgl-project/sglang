@@ -70,6 +70,13 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 
+def _use_custom_tree_all_reduce_only() -> bool:
+    return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get() and (
+        os.environ.get("SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE", "0") == "1"
+        or os.environ.get("SGLANG_TRUE_ON_POLICY_TREE_CUSTOM_ALL_REDUCE", "0") == "1"
+    )
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -586,6 +593,7 @@ class GroupCoordinator:
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
+            and not _use_custom_tree_all_reduce_only()
         ):
             outplace_all_reduce_method = "ca"
         elif (

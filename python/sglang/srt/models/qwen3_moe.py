@@ -118,7 +118,10 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
-from sglang.srt.tp_invariant_ops import stable_topk as _stable_topk
+from sglang.srt.tp_invariant_ops import (
+    stable_topk as _stable_topk,
+    stable_topk_softmax as _stable_topk_softmax,
+)
 
 
 def compute_yarn_parameters(
@@ -337,20 +340,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             router_hidden_states = router_hidden_states.to(gate_weight.dtype)
         router_logits, _ = self.gate(router_hidden_states)
         if should_use_deterministic_moe_routing():
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
             if get_moe_topk_tiebreak() == "stable_sort":
-                routing_weights, selected_experts = _stable_topk(
-                    routing_weights, self.top_k
+                routing_weights, selected_experts = _stable_topk_softmax(
+                    router_logits, self.top_k, ids_dtype=torch.int32
                 )
             else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
                 routing_weights, selected_experts = torch.topk(
                     routing_weights, self.top_k, dim=-1
                 )
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(router_hidden_states.dtype)
             topk_output = StandardTopKOutput(
                 topk_weights=routing_weights,
-                topk_ids=selected_experts.to(torch.int32),
+                topk_ids=selected_experts,
                 router_logits=router_logits,
             )
         else:

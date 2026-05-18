@@ -1,7 +1,9 @@
 import json
 import os
 import subprocess
+import sys
 import textwrap
+import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.true_on_policy import (
+    DeterministicInferenceScope,
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     QWEN3_MOE_TRUE_ON_POLICY_V1,
     get_moe_topk_tiebreak,
@@ -208,6 +211,23 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
         self.assertFalse(result["enable_flashinfer_allreduce_fusion"])
 
+    def test_prefill_only_contract_keeps_flashinfer_fusion_for_decode(self):
+        result = _run_server_args_script(
+            [
+                "--model-path",
+                "dummy",
+                "--attention-backend",
+                "triton",
+                "--tensor-parallel-size",
+                "2",
+                "--true-on-policy-contract",
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                "--enable-prefill-only-deterministic-inference",
+                "--enable-flashinfer-allreduce-fusion",
+            ]
+        )
+        self.assertTrue(result["enable_flashinfer_allreduce_fusion"])
+
 
 class TestDefaultPathUnchanged(unittest.TestCase):
     """Default serving must not enter true-on-policy policy paths."""
@@ -373,6 +393,43 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(is_true_on_policy_enabled(server_args))
         self.assertTrue(should_use_deterministic_moe_routing(server_args))
 
+    def test_deterministic_scope_temporarily_disables_flashinfer_fusion(self):
+        server_args = self._moe_contract_args(tp_size=4, ep_size=4)
+        server_args.enable_deterministic_inference = False
+        server_args.enable_flashinfer_allreduce_fusion = True
+
+        batch_state = {"enabled": False}
+        tp_state = {"enabled": False}
+        batch_mod = types.ModuleType("sglang.srt.batch_invariant_ops")
+        batch_mod.is_batch_invariant_mode_enabled = lambda: batch_state["enabled"]
+        batch_mod.enable_batch_invariant_mode = lambda: batch_state.update(enabled=True)
+        batch_mod.disable_batch_invariant_mode = lambda: batch_state.update(
+            enabled=False
+        )
+        tp_mod = types.ModuleType("sglang.srt.tp_invariant_ops")
+        tp_mod.is_tp_invariant_mode_enabled = lambda: tp_state["enabled"]
+        tp_mod.enable_tp_invariant_mode = lambda: tp_state.update(enabled=True)
+        tp_mod.disable_tp_invariant_mode = lambda: tp_state.update(enabled=False)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.batch_invariant_ops": batch_mod,
+                "sglang.srt.tp_invariant_ops": tp_mod,
+            },
+        ):
+            with DeterministicInferenceScope(server_args):
+                self.assertTrue(server_args.enable_deterministic_inference)
+                self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
+                self.assertTrue(should_use_tp_invariant_tree_all_reduce(server_args))
+                self.assertTrue(batch_state["enabled"])
+                self.assertTrue(tp_state["enabled"])
+
+        self.assertFalse(server_args.enable_deterministic_inference)
+        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
+        self.assertFalse(batch_state["enabled"])
+        self.assertFalse(tp_state["enabled"])
+
     def test_prefill_only_deterministic_attention_backend_restores_num_splits(self):
         nested = SimpleNamespace(num_splits=3)
         root = SimpleNamespace(
@@ -479,6 +536,28 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
         self.assertIn("should_use_deterministic_moe_combine", qwen3_moe_source)
         self.assertIn("moe_expert_parallel_tree_all_reduce", qwen3_moe_source)
+
+    def test_custom_tree_all_reduce_is_opt_in(self):
+        from sglang.srt.distributed.communication_op import (
+            _maybe_custom_tree_all_reduce,
+        )
+
+        input_tensor = torch.tensor([1.0])
+        ca_comm = SimpleNamespace(custom_tree_all_reduce=lambda x: x + 1.0)
+        group = SimpleNamespace(ca_comm=ca_comm)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(_maybe_custom_tree_all_reduce(input_tensor, group))
+
+        with patch.dict(
+            os.environ, {"SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE": "1"}
+        ):
+            self.assertTrue(
+                torch.equal(
+                    _maybe_custom_tree_all_reduce(input_tensor, group),
+                    torch.tensor([2.0]),
+                )
+            )
 
     def test_true_on_policy_dp_attention_uses_max_len_padding(self):
         try:
@@ -732,6 +811,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 side_effect=AssertionError(
                     "generic TP tree reduce must not handle attention output"
                 ),
+                create=True,
             ),
         ):
             output, output_residual = (
@@ -1077,13 +1157,169 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
             return sentinel
 
         with patch(
-            "sglang.srt.batch_invariant_ops.batch_invariant_ops.matmul_persistent",
+            "sglang.srt.batch_invariant_ops.matmul_persistent",
             side_effect=fake_matmul,
         ):
             output = batch_invariant_linear(x, weight, None)
 
         self.assertEqual(output.data_ptr(), sentinel.data_ptr())
         self.assertEqual(output.shape, sentinel.shape)
+
+
+class TestDeterministicMoEConfigEnv(unittest.TestCase):
+    def test_deterministic_moe_config_guard_keeps_default_without_env(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        server_args = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                fused_moe_triton_config,
+                "get_global_server_args",
+                return_value=server_args,
+            ),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "0"},
+            ),
+        ):
+            config = fused_moe_triton_config.get_default_config(
+                M=16,
+                E=32,
+                N=1856,
+                K=2048,
+                topk=8,
+                dtype=None,
+                is_marlin=False,
+            )
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 64)
+        self.assertEqual(config["BLOCK_SIZE_K"], 32)
+
+    def test_deterministic_moe_config_can_use_standard_heuristic_by_env(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        server_args = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                fused_moe_triton_config,
+                "get_global_server_args",
+                return_value=server_args,
+            ),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "1"},
+            ),
+        ):
+            config = fused_moe_triton_config.get_default_config(
+                M=16,
+                E=32,
+                N=1856,
+                K=2048,
+                topk=8,
+                dtype=None,
+                is_marlin=False,
+            )
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 16)
+        self.assertEqual(config["BLOCK_SIZE_K"], 64)
+
+    def test_env_override_moe_config_parses_json_dict(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON": (
+                    '{"BLOCK_SIZE_M":16,"BLOCK_SIZE_N":64,'
+                    '"BLOCK_SIZE_K":128,"GROUP_SIZE_M":1}'
+                )
+            },
+        ):
+            config = fused_moe_triton_config._get_env_override_config()
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 16)
+        self.assertEqual(config["BLOCK_SIZE_K"], 128)
+
+
+class TestStableTopKSoftmax(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_matches_reference_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.tensor(
+            [
+                [1.0, 1.0, 0.5, -0.25, 0.0, 2.0, 2.0, -1.0],
+                [0.0, -0.5, 0.25, 0.25, 0.25, -1.0, 3.0, 2.0],
+            ],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 3)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(logits, 3)
+
+        torch.testing.assert_close(actual_ids, expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_can_emit_int32_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.randn(8, 16, device="cuda", dtype=torch.float32)
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 4)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(
+                logits, 4, ids_dtype=torch.int32
+            )
+
+        self.assertEqual(actual_ids.dtype, torch.int32)
+        torch.testing.assert_close(actual_ids.long(), expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+
+class TestTrueOnPolicyRMSNorm(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_accepts_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 2048, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(2048, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "2048"},
+        ):
+            out = true_on_policy_rms_norm(x, weight, eps=1e-6)
+
+        self.assertEqual(out.shape, x.shape)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_rejects_non_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "1536"},
+        ):
+            with self.assertRaisesRegex(ValueError, "positive power of two"):
+                true_on_policy_rms_norm(x, weight, eps=1e-6)
 
 
 if __name__ == "__main__":
