@@ -2340,7 +2340,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
+        # Update seq_lens after allocation.
+        #
+        # The post-decode seq_lens is driven by forward N's "did the req
+        # finish?" output: delta = 0 if finished else 1. Today the scheduler
+        # speculatively advances by +1 for every req and the consumer trims
+        # for finished ones; a future migration replaces this with
+        # ``seq_lens = old + relayer.resolve_kv_committed_delta(fi)`` (where
+        # the Relayer cpu_value channel already holds the per-req decision
+        # computed in process_batch_result). For now the in-place mutation
+        # stays so downstream consumers keep their current contract.
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
@@ -2392,6 +2401,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
+        # ``new_seq_lens`` is a Relayer ``gpu_scalar`` channel relay; the
+        # consumer reads it via ``Relayer.resolve_new_seq_lens`` on the
+        # schedule stream after the producer kernel on the forward stream
+        # has stored. The explicit CPU sync below is retained transitionally
+        # until a stream-level cross-stream barrier provides equivalent
+        # visibility; once that lands this call site disappears.
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
