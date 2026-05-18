@@ -24,29 +24,57 @@ from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_sm120 = _is_cuda and get_device_sm() // 10 == 12  # SM120/SM121
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
-
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
+_is_xpu = is_xpu()
+
 if _is_cuda:
     try:
         import deep_gemm
-    except ImportError as e:
+    except (ImportError, AssertionError) as e:
+        # AssertionError: deep_gemm init fails on SM120 (no CUDA_HOME / unsupported arch)
         deep_gemm = e
+
+if _is_sm120:
+    import os as _os
+
+    if _os.environ.get("SGLANG_SM120_MQA_FALLBACK", "0") == "1":
+        from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
+            compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
+        )
+        from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
+            sm120_fp8_mqa_logits as _sm120_fp8_mqa_logits,
+        )
+        from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
+            sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
+        )
+    else:
+        from sglang.srt.layers.attention.nsa.sm120_mqa_triton import (
+            compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
+        )
+        from sglang.srt.layers.attention.nsa.sm120_mqa_triton import (
+            sm120_fp8_mqa_logits as _sm120_fp8_mqa_logits,
+        )
+        from sglang.srt.layers.attention.nsa.sm120_mqa_triton import (
+            sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
+        )
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
@@ -153,12 +181,34 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-torch FWHT fallback for backends without a fused kernel.
+
+    Iterative Cooley-Tukey-style Walsh-Hadamard transform along the last
+    dim. Hidden size must be a power of two; same contract as the fused
+    ``hadamard_transform`` op.
+    """
+    n = x.size(-1)
+    leading = x.shape[:-1]
+    out = x.reshape(-1, n).clone()
+    h = 1
+    while h < n:
+        out = out.view(-1, n // (2 * h), 2, h)
+        a = out[:, :, 0, :]
+        b = out[:, :, 1, :]
+        out = torch.stack((a + b, a - b), dim=2).view(-1, n)
+        h *= 2
+    return out.view(*leading, n) * scale
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_cpu and _cpu_amx:
         hadamard_transform = torch.ops.sgl_kernel.fast_hadamard_transform_cpu
+    elif _is_xpu:
+        hadamard_transform = _torch_hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -206,7 +256,12 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            if _is_sm120:
+                # SM120: deep_gemm.get_num_sms() crashes; use torch native API
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                self.sm_count = props.multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -257,7 +312,7 @@ class Indexer(MultiPlatformOp):
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if self.logits_with_pp_recv:
+        if self.logits_with_pp_recv and not _is_sm120:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
@@ -472,9 +527,16 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, blocksize, self.sm_count
-                )
+                if _is_sm120:
+                    schedule_metadata = _sm120_compute_paged_mqa_schedule_metadata(
+                        seqlens_32_2d,
+                        blocksize,
+                        self.sm_count,
+                    )
+                else:
+                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32_2d, blocksize, self.sm_count
+                    )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -516,6 +578,17 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=False,
                 KVBlockSize=block_kv,
+            )
+        elif _is_sm120:
+            logits = _sm120_fp8_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -646,6 +719,15 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
+                elif _is_sm120:
+                    logits = _sm120_fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -695,6 +777,15 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                    )
+                elif _is_sm120:
+                    logits_chunk = _sm120_fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(

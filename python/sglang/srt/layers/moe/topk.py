@@ -436,6 +436,8 @@ def fused_topk_torch_native(
             return gating_output.softmax(dim=-1)
         elif scoring_func == "sigmoid":
             return gating_output.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            return torch.nn.functional.softplus(gating_output).sqrt()
         else:
             raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -451,13 +453,9 @@ def fused_topk_torch_native(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        M, _ = hidden_states.shape
-        topk_weights = torch.empty(
-            M, topk, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-        topk_weights = scoring_func_impl(gating_output.float())
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        scores = scoring_func_impl(gating_output.float())
+        topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+        topk_ids = topk_ids.to(torch.int32)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
