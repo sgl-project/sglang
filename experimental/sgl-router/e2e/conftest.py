@@ -1,19 +1,47 @@
-"""
-Session-scoped fixtures that spin up a real SGLang server and sgl-router,
-then tear them down after the test session completes.
+"""Pytest fixtures for ``experimental/sgl-router/e2e/``.
+
+Two flavors of fixtures coexist here:
+
+  1. **Session-scoped smoke fixtures** (``sglang_server`` + ``router``) —
+     launch ONE SGLang worker + ONE router on fixed ports for the whole
+     test session. Used by the lightweight ``test_chat_smoke.py`` /
+     ``test_tokenize_smoke.py`` files. These are the cheap "did the
+     binary start at all" sanity tests.
+
+  2. **Per-test M4 fixtures** (``router_binary`` + ``gpu_allocator``) —
+     just enough infra for the M4 acceptance tests in ``m4_acceptance/``
+     and ``chat_completions/`` to bring up their own multi-worker
+     topologies. Backed by the ``infra.gateway.Gateway`` and
+     ``infra.model_pool.spawn_worker`` helpers.
+
+Both sets share the same release binary; ``SGL_ROUTER_BINARY`` env var
+overrides the path for both.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
+
+logger = logging.getLogger(__name__)
+
+# Make `from infra import gateway, model_pool, model_specs` resolve from
+# tests under e2e/ without requiring a sibling `__init__.py` chain. Mirrors
+# SMG's e2e_test/conftest.py sys.path setup.
+_E2E_DIR = Path(__file__).resolve().parent
+if str(_E2E_DIR) not in sys.path:
+    sys.path.insert(0, str(_E2E_DIR))
 
 MODEL = "Qwen/Qwen3-0.6B"
 SGLANG_PORT = 30000
@@ -148,3 +176,85 @@ url = "http://localhost:{SGLANG_PORT}"
             proc.wait()
     finally:
         Path(cfg_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Per-test M4 acceptance fixtures
+# ---------------------------------------------------------------------------
+
+
+def _detect_gpu_count() -> int:
+    """Count visible GPUs via ``nvidia-smi``. Returns 0 when no NVIDIA GPU
+    is available (CI on CPU-only runners, dev laptops, etc.).
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return 0
+    return len([ln for ln in out.decode().splitlines() if ln.strip()])
+
+
+class GPUAllocator:
+    """Single-process GPU index allocator. Test-scoped; not safe for
+    cross-process use (pytest-xdist) — each worker would race over the
+    full GPU set. M4 tests run serially, so this is fine.
+    """
+
+    def __init__(self, total: int):
+        self.total = total
+        self._free: list[int] = list(range(total))
+        self._lock = threading.Lock()
+
+    def acquire(self, n: int = 1) -> list[int]:
+        with self._lock:
+            if n > len(self._free):
+                raise pytest.skip.Exception(
+                    f"requested {n} GPUs, only {len(self._free)}/{self.total} free"
+                )
+            picked = self._free[:n]
+            self._free = self._free[n:]
+            return picked
+
+    def release(self, ids: list[int]) -> None:
+        with self._lock:
+            self._free.extend(ids)
+            self._free.sort()
+
+
+@pytest.fixture(scope="session")
+def router_binary() -> Path:
+    """Locate the release ``sgl-router`` binary or skip the session.
+
+    Used by the M4 acceptance tests (which spawn their own Gateway per
+    test instead of using the session-scoped ``router`` fixture).
+    """
+    env_path = os.environ.get("SGL_ROUTER_BINARY")
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(_BINARY)
+    for c in candidates:
+        if c.exists():
+            return c
+    pytest.skip(
+        "sgl-router release binary not found at any of: "
+        + ", ".join(str(c) for c in candidates)
+        + ". Build with `cargo build --release` in experimental/sgl-router/."
+    )
+
+
+@pytest.fixture(scope="session")
+def gpu_allocator() -> Iterator[GPUAllocator]:
+    """Session-scoped GPU index allocator. Skips the entire session when
+    no GPUs are visible — M4 e2e tests are real-GPU.
+    """
+    n = _detect_gpu_count()
+    if n == 0:
+        pytest.skip(
+            "no NVIDIA GPUs visible to nvidia-smi; M4 acceptance tests are GPU-only"
+        )
+    yield GPUAllocator(n)

@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from e2e_test.infra.gateway import Gateway
-from e2e_test.infra.model_pool import spawn_worker
-from e2e_test.infra.model_specs import get_model_spec
+from infra.gateway import Gateway
+from infra.model_pool import spawn_worker
+from infra.model_specs import get_model_spec
 
 
 @pytest.mark.real_gpu
