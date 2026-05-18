@@ -57,9 +57,6 @@ jobs:
   nightly-test-general-1-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-h100')
     runs-on: 1-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -87,9 +84,6 @@ jobs:
   nightly-test-kernel-1-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-1-gpu-h100')
     runs-on: 1-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     timeout-minutes: 60
     env:
       # Full jit_kernel test grids (see sglang.jit_kernel.utils.should_run_full_tests)
@@ -123,9 +117,6 @@ jobs:
   nightly-test-kernel-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-8-gpu-h200')
     runs-on: 8-gpu-h200
-    concurrency:
-      group: nightly-hw-h200
-      cancel-in-progress: false
     timeout-minutes: 240
     env:
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
@@ -157,9 +148,6 @@ jobs:
   nightly-test-general-4-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-4-gpu-h100')
     runs-on: 4-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -185,9 +173,6 @@ jobs:
   nightly-test-general-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h200')
     runs-on: 8-gpu-h200
-    concurrency:
-      group: nightly-hw-h200
-      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -275,9 +260,6 @@ jobs:
   nightly-test-general-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
     runs-on: 8-gpu-h20
-    concurrency:
-      group: nightly-hw-h20
-      cancel-in-progress: false
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
     steps:
@@ -307,9 +289,6 @@ jobs:
   nightly-test-general-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-b200')
     runs-on: 8-gpu-b200
-    concurrency:
-      group: nightly-hw-b200
-      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -386,9 +365,6 @@ jobs:
   nightly-test-text-accuracy-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-h100')
     runs-on: 2-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -414,9 +390,6 @@ jobs:
   nightly-test-text-perf-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-h100')
     runs-on: 2-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -455,9 +428,6 @@ jobs:
   nightly-test-vlm-accuracy-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-h100')
     runs-on: 2-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -483,9 +453,6 @@ jobs:
   nightly-test-vlm-perf-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-h100')
     runs-on: 2-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -524,9 +491,6 @@ jobs:
   nightly-test-multimodal-server-1-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-1-gpu')
     runs-on: 1-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -585,9 +549,6 @@ jobs:
   nightly-test-multimodal-server-2-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-2-gpu')
     runs-on: 2-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -647,9 +608,6 @@ jobs:
   nightly-test-perf-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-b200')
     runs-on: 4-gpu-b200
-    concurrency:
-      group: nightly-hw-b200
-      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -675,9 +633,6 @@ jobs:
   nightly-test-specialized-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200' || inputs.job_filter == 'nightly-test-specialized-8-gpu-b200')
     runs-on: 8-gpu-b200
-    concurrency:
-      group: nightly-hw-b200
-      cancel-in-progress: false
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:
@@ -707,9 +662,6 @@ jobs:
   nightly-test-diffusion-comparison:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
     runs-on: 4-gpu-h100
-    concurrency:
-      group: nightly-hw-h100
-      cancel-in-progress: false
     timeout-minutes: 300
     steps:
       - name: Checkout code

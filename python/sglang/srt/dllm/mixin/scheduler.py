@@ -80,7 +80,7 @@ class SchedulerDllmMixin:
                     continue
 
                 req.fill_ids[-new_tokens:] = next_token_ids[:]
-                self.num_generated_tokens += new_tokens
+                self.metrics_reporter.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
                 req.check_finished(new_accepted_len=new_tokens)
@@ -89,11 +89,12 @@ class SchedulerDllmMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
-            self.stream_output(batch.reqs, batch.return_logprob)
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -224,7 +225,9 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
-        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
 
         new_batch.prefill_stats = PrefillStats.from_adder(
             self.adder, self.running_batch.reqs, self.enable_priority_scheduling

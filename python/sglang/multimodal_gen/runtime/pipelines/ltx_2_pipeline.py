@@ -16,12 +16,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
-from sglang.multimodal_gen.runtime.managers.component_manager import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
 )
-from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     SnapshotModuleResidency,
     SnapshotStrategy,
 )
@@ -553,11 +553,32 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             if self._module_is_on_gpu(target_module):
                 self._record_component_ready("transformer")
             elif not self._snapshot_strategy.is_ready("transformer"):
+                if self._snapshot_low_vram_mode:
+                    self._release_stage2_for_low_vram()
                 self._snapshot_strategy.prefetch_component("transformer", target_module)
         else:
             self._record_component_ready("transformer")
         self.manager._sync_refinement_stage_transformer("stage1")
         self.manager._active_phase = "stage1"
+
+    def finish_request(
+        self,
+        module: torch.nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+        *,
+        preferred: bool,
+    ) -> None:
+        if (
+            preferred
+            and state.batch_is_warmup
+            and self._snapshot_low_vram_mode
+            and self._phase(use) == "stage1"
+        ):
+            # keep the text encoder warm, but avoid stage1 DiT overlap before the first real request
+            self.manager._active_phase = None
+            return
+        super().finish_request(module, use, state, preferred=preferred)
 
     def finish_use(
         self,
@@ -604,6 +625,16 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         if stage1_param is not None and stage1_param.device.type == "cuda":
             self._release_module_to_cpu_snapshot("transformer")
 
+    def _release_stage2_for_low_vram(self) -> None:
+        stage2_module = self.pipeline.get_module("transformer_2")
+        stage2_param = (
+            next(stage2_module.parameters(), None)
+            if stage2_module is not None
+            else None
+        )
+        if stage2_param is not None and stage2_param.device.type == "cuda":
+            self._release_module_to_cpu_snapshot("transformer_2")
+
     def _record_component_ready(self, module_name: str) -> None:
         self._snapshot_strategy.record_ready(
             module_name, self.pipeline.get_module(module_name)
@@ -618,6 +649,13 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         if not self.server_args.dit_cpu_offload:
             return True
         phase = self._phase(use)
+        if (
+            self._snapshot_low_vram_mode
+            and phase == "stage1"
+            and state.current_use is not None
+            and state.current_use.component_name.startswith("text_encoder")
+        ):
+            return False
         if phase == "stage2":
             if self._snapshot_strategy.is_ready("transformer_2"):
                 return True
@@ -631,13 +669,14 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
     def _pin_stage1_transformer_if_beneficial(self) -> None:
         """Optionally pin stage-1 DiT on GPU to remove first-stage cold H2D stall.
 
-        We only do this on high-VRAM CUDA machines with CPU offload enabled and
-        without FSDP inference. It trades extra steady-state VRAM for lower
-        request latency before the first denoise step.
+        We only do this outside low-VRAM mode on high-VRAM CUDA machines with
+        CPU offload enabled and without FSDP inference. It trades extra
+        steady-state VRAM for lower request latency before the first denoise step.
         """
         if (
             not self.server_args.dit_cpu_offload
             or self.server_args.use_fsdp_inference
+            or self._snapshot_low_vram_mode
             or not current_platform.is_cuda()
             or current_platform.get_device_total_memory() / BYTES_PER_GB < 70
         ):
@@ -931,6 +970,11 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
                 # into the transformer weights. Legacy LTX-2 should keep the
                 # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                set_lora_kwargs["merge_weights"] = (
+                    self._should_merge_stage2_distilled_lora(self.server_args)
+                )
+            elif phase == "stage1" and self.pipeline_name == "LTX2TwoStageHQPipeline":
+                # Official HQ also builds stage 1 with distilled LoRA fused.
                 set_lora_kwargs["merge_weights"] = (
                     self._should_merge_stage2_distilled_lora(self.server_args)
                 )

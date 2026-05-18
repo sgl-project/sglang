@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
 
 from __future__ import annotations
@@ -78,7 +80,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
-    post_load_weights,
     set_default_torch_dtype,
 )
 
@@ -105,6 +106,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -235,6 +237,11 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -284,6 +291,15 @@ def _initialize_model(
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
     return model_class(**kwargs)
+
+
+def _post_load_weights(model: nn.Module) -> None:
+    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
+    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
+    # would normally do it internally. NextN subclasses override the method to fill in
+    # `is_nextn=True`, so the loader doesn't need to know.
+    if hasattr(model, "post_load_weights"):
+        model.post_load_weights()
 
 
 class BaseModelLoader(ABC):
@@ -515,6 +531,9 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
             prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            weight_loader_drop_cache_after_load = (
+                server_args.weight_loader_drop_cache_after_load
+            )
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -529,6 +548,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -536,6 +556,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:
@@ -1201,7 +1222,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         del current_param_data
         if is_last_update:
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
         logger.info("[QuantizedRL] Reload complete")
         return updated_param_names, is_last_update
@@ -1322,7 +1343,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            post_load_weights(model, model_config)
+            _post_load_weights(model)
 
         return model.eval()
 
@@ -1465,7 +1486,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            post_load_weights(model, model_config)
+            _post_load_weights(model)
 
         return model.eval()
 
@@ -1892,7 +1913,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
         model.load_weights(qweight_iterator)
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         param_dict = dict(model.named_parameters())
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
@@ -2179,10 +2200,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
         ):
-            self.load_model_from_modelexpress(
-                model,
-                load_config,
-                device_config,
+            try:
+                from modelexpress.engines.sglang.loader import MxModelLoader
+            except ImportError as exc:
+                raise ImportError(
+                    "ModelExpress support requires the 'modelexpress' "
+                    "package. Install it in the SGLang image."
+                ) from exc
+
+            model = MxModelLoader(load_config).load_model(
+                model=model,
+                model_config=model_config,
+                device_config=device_config,
             )
         else:
             raise ValueError("Invalid remote instance weight loader backend.")
@@ -2200,7 +2229,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         end_build_group_tic = time.time()
         logger.debug(
             f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
@@ -2226,10 +2255,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     src=0,
                     group=client._model_update_group,
                 )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
-            if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
+            _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -2238,7 +2266,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         torch.distributed.distributed_c10d.destroy_process_group(
             client._model_update_group
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
         self, model, transfer_engine, seed_url, tp_rank
@@ -2292,272 +2320,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        if hasattr(model, "post_load_weights"):
-            model.post_load_weights()
+        _post_load_weights(model)
 
         return True
-
-    def load_model_from_modelexpress(
-        self,
-        model,
-        load_config: LoadConfig,
-        device_config: DeviceConfig,
-    ):
-        """Load weights via ModelExpress coordination + RDMA transfer.
-
-        Supports two transport backends:
-        - transfer_engine: Mooncake TransferEngine (default)
-        - nixl: NIXL UCX-based RDMA
-        """
-        try:
-            import grpc
-            from modelexpress import p2p_pb2
-            from modelexpress.client import MxClient
-        except ImportError as exc:
-            raise ImportError(
-                "ModelExpress support requires the 'modelexpress' package. "
-                "Install it with: pip install modelexpress"
-            ) from exc
-
-        tp_rank = load_config.tp_rank
-        model_name = load_config.modelexpress_model_name
-        transport = load_config.modelexpress_transport
-
-        # Process quantized weights to establish final tensor layout
-        target_device = torch.device(device_config.device)
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-
-        # Register local memory for the chosen transport
-        if transport == "nixl":
-            nixl_mgr = self._init_nixl_for_target(model, load_config, device_config)
-        else:
-            transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
-            if transfer_engine is None:
-                raise RuntimeError(
-                    "TransferEngine is not initialized for modelexpress backend."
-                )
-            logger.info(
-                "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
-            )
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, transfer_engine
-            )
-
-        # --- Shared MX discovery logic ---
-        identity = p2p_pb2.SourceIdentity(
-            model_name=model_name,
-            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-            tensor_parallel_size=load_config.modelexpress_tp_size or 1,
-            pipeline_parallel_size=load_config.modelexpress_pp_size or 1,
-            expert_parallel_size=load_config.modelexpress_ep_size or 1,
-            dtype=load_config.modelexpress_dtype or "",
-            quantization=load_config.modelexpress_quantization or "",
-        )
-
-        mx_client = MxClient(server_url=load_config.modelexpress_url)
-        try:
-            logger.info(
-                "ModelExpress [%s]: looking for seed (model=%s, rank=%d)...",
-                transport,
-                model_name,
-                tp_rank,
-            )
-            try:
-                resp = mx_client.list_sources(
-                    identity=identity,
-                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
-                )
-            except grpc.RpcError as e:
-                raise RuntimeError(
-                    f"ModelExpress: cannot reach server at "
-                    f"{load_config.modelexpress_url}: "
-                    f"{e.code()}: {e.details()}"
-                ) from e
-
-            source_ref = None
-            for inst in resp.instances:
-                if inst.worker_rank == tp_rank:
-                    source_ref = inst
-                    break
-
-            if source_ref is None:
-                raise RuntimeError(
-                    f"ModelExpress: no READY source found for "
-                    f"model={model_name}, rank={tp_rank}. "
-                    f"Ensure the seed instance is running and has published metadata."
-                )
-
-            response = mx_client.get_metadata(
-                mx_source_id=source_ref.mx_source_id,
-                worker_id=source_ref.worker_id,
-            )
-            if not response.found:
-                raise RuntimeError(
-                    f"ModelExpress: no metadata found for "
-                    f"source_id={source_ref.mx_source_id}, "
-                    f"worker_id={source_ref.worker_id}"
-                )
-
-            source_worker = response.worker
-        finally:
-            mx_client.close()
-
-        # --- Transport-specific transfer ---
-        if transport == "nixl":
-            self._transfer_via_nixl(model, nixl_mgr, source_worker, tp_rank)
-        else:
-            self._transfer_via_transfer_engine(
-                model, transfer_engine, source_worker, tp_rank
-            )
-
-        if hasattr(model, "post_load_weights"):
-            model.post_load_weights()
-
-        logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
-
-    def _transfer_via_transfer_engine(
-        self, model, transfer_engine, source_worker, tp_rank
-    ):
-        """Execute weight transfer using Mooncake TransferEngine."""
-        backend_field = source_worker.WhichOneof("backend_metadata")
-        if backend_field != "transfer_engine_session_id":
-            raise RuntimeError(
-                f"ModelExpress: expected transfer_engine_session_id, "
-                f"got backend_metadata={backend_field}"
-            )
-        seed_session_id = source_worker.transfer_engine_session_id
-
-        seed_weight_info = {}
-        for td in source_worker.tensors:
-            seed_weight_info[td.name] = (td.addr, td.size)
-
-        logger.info(
-            "ModelExpress: got %d tensor descriptors from seed (session=%s)",
-            len(seed_weight_info),
-            seed_session_id,
-        )
-
-        seed_ptr_list = []
-        client_ptr_list = []
-        client_len_list = []
-        for name, tensor in model.named_parameters():
-            weight_info = seed_weight_info.get(name, None)
-            if weight_info is None:
-                raise RuntimeError(
-                    f"ModelExpress: cannot find weight info for {name} "
-                    f"in seed metadata"
-                )
-            seed_ptr, seed_size = weight_info
-            local_size = tensor.numel() * tensor.element_size()
-            if seed_size != local_size:
-                raise RuntimeError(
-                    f"ModelExpress: size mismatch for {name}: "
-                    f"seed={seed_size} bytes, local={local_size} bytes"
-                )
-            seed_ptr_list.append(seed_ptr)
-            client_ptr_list.append(tensor.data_ptr())
-            client_len_list.append(local_size)
-
-        logger.info(
-            "ModelExpress: starting TransferEngine RDMA of %d tensors...",
-            len(seed_ptr_list),
-        )
-        ret = transfer_engine.batch_transfer_sync_read(
-            seed_session_id,
-            client_ptr_list,
-            seed_ptr_list,
-            client_len_list,
-        )
-        if ret < 0:
-            raise RuntimeError(
-                f"ModelExpress: batch_transfer_sync_read failed, error={ret}"
-            )
-
-    def _init_nixl_for_target(self, model, load_config, device_config):
-        """Initialize NIXL agent and register local tensors for the target."""
-        import uuid
-
-        from modelexpress.nixl_transfer import NixlTransferManager
-
-        tp_rank = load_config.tp_rank
-        device_id = device_config.gpu_id
-
-        agent_name = f"sglang-target-rank{tp_rank}-{uuid.uuid4().hex[:8]}"
-        nixl_mgr = NixlTransferManager(agent_name, device_id)
-        nixl_mgr.initialize()
-
-        # Collect local tensors, handling non-contiguous via storage views
-        local_tensors = {}
-        seen_ptrs = set()
-        for name, param in model.named_parameters():
-            t = param.data
-            if t.is_contiguous():
-                ptr = t.data_ptr()
-                if ptr in seen_ptrs:
-                    continue
-                seen_ptrs.add(ptr)
-                local_tensors[name] = t
-            else:
-                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                    t.untyped_storage()
-                )
-                ptr = sv.data_ptr()
-                if ptr in seen_ptrs:
-                    continue
-                seen_ptrs.add(ptr)
-                local_tensors[f"{name}.__storage"] = sv
-
-        nixl_mgr.register_tensors(local_tensors)
-        logger.info(
-            "ModelExpress [nixl]: registered %d tensors for tp_rank=%d",
-            len(local_tensors),
-            tp_rank,
-        )
-        return nixl_mgr
-
-    def _transfer_via_nixl(self, model, nixl_mgr, source_worker, tp_rank):
-        """Execute weight transfer using NIXL RDMA."""
-        from modelexpress.types import TensorDescriptor
-
-        backend_field = source_worker.WhichOneof("backend_metadata")
-        if backend_field != "nixl_metadata":
-            raise RuntimeError(
-                f"ModelExpress: expected nixl_metadata, "
-                f"got backend_metadata={backend_field}"
-            )
-
-        source_tensors = [
-            TensorDescriptor(
-                name=td.name,
-                addr=td.addr,
-                size=td.size,
-                device_id=td.device_id,
-                dtype=td.dtype,
-            )
-            for td in source_worker.tensors
-        ]
-
-        logger.info(
-            "ModelExpress [nixl]: starting RDMA transfer of %d tensors...",
-            len(source_tensors),
-        )
-
-        total_bytes, matched, duration = nixl_mgr.receive_from_source(
-            source_metadata=source_worker.nixl_metadata,
-            source_tensors=source_tensors,
-            coalesce_transfers=False,
-        )
-
-        logger.info(
-            "ModelExpress [nixl]: transferred %d tensors, " "%.2f GB in %.2fs",
-            matched,
-            total_bytes / 1e9,
-            duration,
-        )
 
 
 class RemoteModelLoader(BaseModelLoader):
@@ -2645,7 +2410,7 @@ class RemoteModelLoader(BaseModelLoader):
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        post_load_weights(model, model_config)
+        _post_load_weights(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -3238,11 +3003,13 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             self.target_device_str = "cpu"
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
@@ -3260,7 +3027,15 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
-    if model_config and (
+    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
+    # to non-local loaders. These loaders own their weight transport path and still
+    # initialize the model with ModelOpt quantization config where applicable.
+    model_optloader_allowed = model_config and load_config.load_format not in (
+        LoadFormat.RUNAI_STREAMER,
+        LoadFormat.REMOTE_INSTANCE,
+    )
+
+    if model_optloader_allowed and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
@@ -3270,7 +3045,7 @@ def get_model_loader(
 
     # Use ModelOptModelLoader for unified quantization flags
     if (
-        model_config
+        model_optloader_allowed
         and hasattr(model_config, "quantization")
         and model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
