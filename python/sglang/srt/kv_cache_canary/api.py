@@ -230,12 +230,22 @@ def maybe_perturb_req_to_token(
     runner: Optional[CanaryRunner],
     req_to_token_pool: "ReqToTokenPool",
     rank: int,
+    active_req_pool_indices: Optional[List[int]] = None,
+    active_seq_lens: Optional[List[int]] = None,
 ) -> None:
     """Self-test helper: probabilistically swap slot pointers in ``req_to_token``.
 
     Per-rank stateful RNG (seeded deterministically at first use) so the
     perturbation sequence is reproducible AND advances every call instead of
     sampling the same first draw repeatedly.
+
+    Active-row-aware: when ``active_req_pool_indices`` and ``active_seq_lens``
+    are provided (the typical call path from ``_plan_from_forward_batch``),
+    the perturbation only swaps within the in-use ``[0, seq_len)`` range of
+    a randomly chosen active request — that's where the canary verify
+    actually reads, so a swap there is observable. Without this targeting,
+    swaps land in zero-padded / inactive columns and the perturb hit rate is
+    effectively zero for any realistic table size.
     """
     if runner is None:
         return
@@ -257,9 +267,23 @@ def maybe_perturb_req_to_token(
     rows, cols = int(table.shape[0]), int(table.shape[1])
     if rows <= 1 or cols <= 1:
         return
-    r = rng.randrange(1, rows)
-    a = rng.randrange(cols)
-    b = rng.randrange(cols)
+
+    if active_req_pool_indices and active_seq_lens:
+        candidates: List[Tuple[int, int]] = [
+            (int(idx), int(n))
+            for idx, n in zip(active_req_pool_indices, active_seq_lens)
+            if int(idx) > 0 and int(n) >= 2
+        ]
+        if not candidates:
+            return
+        r, active_cols = candidates[rng.randrange(len(candidates))]
+        a = rng.randrange(active_cols)
+        b = rng.randrange(active_cols)
+    else:
+        r = rng.randrange(1, rows)
+        a = rng.randrange(cols)
+        b = rng.randrange(cols)
+
     if a == b:
         return
     tmp = table[r, a].clone()

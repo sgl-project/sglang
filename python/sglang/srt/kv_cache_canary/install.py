@@ -141,10 +141,13 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
             return original_forward(*args, **kwargs)
 
         rank = getattr(model_runner, "tp_rank", 0) or 0
+        active_indices, active_seq_lens = _extract_active_rows(forward_batch)
         maybe_perturb_req_to_token(
             runner=runner,
             req_to_token_pool=model_runner.req_to_token_pool,
             rank=rank,
+            active_req_pool_indices=active_indices,
+            active_seq_lens=active_seq_lens,
         )
         plan = run_head(runner=runner, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
@@ -163,3 +166,18 @@ def _extract_forward_batch(args, kwargs):
         if isinstance(arg, ForwardBatch):
             return arg
     return None
+
+
+def _extract_active_rows(forward_batch) -> tuple:
+    """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb.
+
+    Returns ``(None, None)`` when the data isn't available — perturb falls
+    back to global random swap.
+    """
+    if forward_batch is None:
+        return None, None
+    if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
+        return None, None
+    indices = forward_batch.req_pool_indices.detach().cpu().tolist()
+    seq_lens = forward_batch.seq_lens.detach().cpu().tolist()
+    return indices, seq_lens

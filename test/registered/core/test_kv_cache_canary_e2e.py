@@ -78,22 +78,22 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
         self.assertEqual(health.status_code, 200)
 
 
-@unittest.skip(
-    "Perturb hit rate is too low to be deterministic under the current "
-    "random-cell swap; needs an active-row-aware perturb hook. Tracked as "
-    "Phase 2 follow-up."
-)
 class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
     """Perturb + raise: server must either fail to come up (canary raised
     during warmup) OR die under live traffic. Both outcomes prove the
-    raise path is wired."""
+    raise path is wired.
+
+    Hit-rate note: perturb is now active-row-aware (swap is restricted to
+    the in-use ``[0, seq_len)`` range of an active req), so it lands on a
+    column the canary actually verifies. Probability bumped to 0.1.
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
-        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN"] = "0.05:42"
+        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN"] = "0.1:42"
         cls.process = None
         cls.launch_failed_due_to_raise = False
         try:
