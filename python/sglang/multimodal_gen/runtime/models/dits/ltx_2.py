@@ -397,17 +397,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         return cos_freqs.to(dtype=out_dtype), sin_freqs.to(dtype=out_dtype)
 
 
-def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
-    if _is_npu:
-        from sgl_kernel_npu.norm.rmsnorm_without_weight import (
-            fused_rmsnorm_without_weight,
-        )
-
-        return fused_rmsnorm_without_weight(x, eps)
-    else:
-        return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
-
-
 class LTX2TextProjection(nn.Module):
     def __init__(
         self,
