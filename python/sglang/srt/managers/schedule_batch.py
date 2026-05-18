@@ -2764,6 +2764,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
+        # Cross-stream barrier: forward N may still be writing to GPU
+        # buffers that the SWA evict decision below indirectly consults
+        # (req.seqlen / kv pool bookkeeping derived from forward output).
+        # Wait on the Relayer gpu_scalar channel's last producer event so
+        # schedule_stream observes a settled view.
+        relayer = self.__dict__.get("_relayer_ctx", (None, None))[0]
+        if relayer is not None:
+            event = getattr(relayer.gpu_scalar, "_last_producer_event", None)
+            if event is not None:
+                current_stream = torch.get_device_module(self.device).current_stream()
+                event.wait(current_stream)
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
