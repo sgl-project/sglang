@@ -69,7 +69,9 @@ class SWAComponent(TreeComponent):
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -78,7 +80,7 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
-            if cd.value is None and cd.host_value is None:
+            if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
