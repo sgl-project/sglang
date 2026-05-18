@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import disable, enable, is_enabled
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -580,6 +581,9 @@ class CudaGraphRunner:
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        ) and get_tensor_model_parallel_rank() == 0
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
         )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -791,9 +795,33 @@ class CudaGraphRunner:
         )
 
     def _init_profile_context_and_memory_record(self):
+        rank = get_tensor_model_parallel_rank()
+        trace_dir = os.path.join(
+            os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
+        )
+        os.makedirs(trace_dir, exist_ok=True)
+
+        # Track which BS is currently being captured for trace file naming
+        self._profile_bs_list = list(reversed(self.capture_bs))
+        self._profile_bs_idx = 0
+
+        def on_trace_ready(prof):
+            bs = self._profile_bs_list[self._profile_bs_idx]
+            trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
+            prof.export_chrome_trace(trace_file)
+            logger.info(f"Saved trace for bs={bs} to {trace_file}")
+            self._profile_bs_idx += 1
+
+        # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1 (capture run)
+        # repeat=0 means repeat indefinitely for each batch size
         profile_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
             record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            profile_memory=True,
+            on_trace_ready=on_trace_ready,
         )
         torch.cuda.memory._record_memory_history()
         return profile_context
@@ -813,11 +841,14 @@ class CudaGraphRunner:
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+        if self.enable_shape_discovery_for_cuda_graph_profile:
+            disable()
 
     def capture(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+            self._profiler = profile_context
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
@@ -876,7 +907,7 @@ class CudaGraphRunner:
                         _capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
-            self._post_process_after_profile(prof)
+            self._post_process_after_profile(profile_context)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         if self.model_runner.server_args.debug_cuda_graph:
@@ -1132,16 +1163,31 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+            if self.enable_profile_cuda_graph:
+                # Activate kernel shape profiler AFTER warmup runs so that all
+                # lazily-imported modules (e.g. tilelang_kernel) are in sys.modules
+                # and auto-discovery can find them.
+                if (
+                    self.enable_shape_discovery_for_cuda_graph_profile
+                    and not is_enabled()
+                ):
+                    enable()
+                self._profiler.step()
             attn_backend.on_after_cuda_graph_warmup()
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
+        with torch.profiler.record_function(
+            f"capture_{num_tokens}_{self.capture_forward_mode.name}"
+        ):
+            if get_global_graph_memory_pool() is None:
+                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+            # Set graph pool id globally to be able to use symmetric memory
+            set_graph_pool_id(get_global_graph_memory_pool())
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
 
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        if self.enable_profile_cuda_graph:
+            self._profiler.step()
 
         return graph, out
 
