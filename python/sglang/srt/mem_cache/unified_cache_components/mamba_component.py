@@ -50,8 +50,13 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
+        if match_device_only:
+            return lambda node: node.component_data[ct].value is not None
+
         # HiCache: evicted + backuped (host_value present) is also a valid match
         return lambda node: (
             node.component_data[ct].value is not None
@@ -69,7 +74,10 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
 
-        if len(value_chunks) > best_value_len:
+        # HiCache can still use prefix matches and load back host-backed Mamba
+        # states. We temporarily skip branching-state fill in that mode and can
+        # add a HiCache-aware branching policy later.
+        if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
             chunk_size = get_global_server_args().mamba_cache_chunk_size
             aligned_seqlen = (
                 sum(len(v) for v in value_chunks) // chunk_size

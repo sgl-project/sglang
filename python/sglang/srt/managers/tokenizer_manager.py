@@ -398,7 +398,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
-        self.straggler_request_list: List[Tuple] = []
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -445,7 +444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -689,9 +688,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-            input_ids = encoded["input_ids"]
-            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
+
+            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
+                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                token_type_ids = None
+            else:
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                input_ids = encoded["input_ids"]
+                token_type_ids = (
+                    encoded.get("token_type_ids") if is_cross_encoder else None
+                )
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
