@@ -611,7 +611,7 @@ class DecodePreallocQueue:
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
         if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            getattr(decode_req.kv_receiver, "conclude_state", None) == KVPoll.Failed
+            decode_req.kv_receiver.conclude_state == KVPoll.Failed
             for decode_req in self.queue
         ):
             return
