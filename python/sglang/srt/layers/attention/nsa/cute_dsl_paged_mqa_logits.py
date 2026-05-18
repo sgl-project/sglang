@@ -94,9 +94,7 @@ def _is_sm_100f() -> bool:
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from sglang.srt.layers.attention.nsa.cute_dsl_kernels.blackwell.paged_mqa_logits import (
-        FP8MQALogitsKernel,
-    )
+    from sglang.jit_kernel.cutedsl_fp8_paged_mqa_logits import FP8MQALogitsKernel
 
     _TORCH_TO_CUTLASS_DTYPE = {
         torch.float16: cutlass.Float16,
