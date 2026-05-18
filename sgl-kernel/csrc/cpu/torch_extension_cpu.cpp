@@ -59,9 +59,6 @@ at::Tensor fused_add_layernorm_cpu(
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 
-// hadamard transform
-at::Tensor fast_hadamard_transform_cpu(const at::Tensor& x, double scale);
-
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 
@@ -87,43 +84,6 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t num_fused_shared_experts,
     std::optional<double> routed_scaling_factor,
     std::optional<at::Tensor> num_token_non_padded);
-
-std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
-    at::Tensor& hidden_states,
-    at::Tensor& gating_output,
-    at::Tensor& correction_bias,
-    int64_t topk,
-    bool renormalize,
-    std::string scoring_func,
-    int64_t num_fused_shared_experts,
-    std::optional<double> routed_scaling_factor,
-    bool apply_routed_scaling_factor_on_output);
-
-std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
-    at::Tensor& gating_output,
-    at::Tensor& tid2eid,
-    int64_t topk,
-    std::string scoring_func,
-    int64_t num_fused_shared_experts,
-    int64_t num_experts,
-    double routed_scaling_factor);
-
-void topk_transform_512_cpu(
-    at::Tensor& scores,
-    at::Tensor& seq_lens,
-    at::Tensor& page_tables,
-    at::Tensor& out_page_indices,
-    int64_t page_size,
-    const std::optional<at::Tensor>& out_raw_indices);
-
-at::Tensor fp8_paged_mqa_logits_cpu(
-    at::Tensor& q_fp8,
-    at::Tensor& kvcache_fp8,
-    at::Tensor& weight,
-    at::Tensor& seq_lens,
-    at::Tensor& page_table,
-    int64_t max_seq_len,
-    bool clean_logits);
 
 // attention
 void decode_attention_cpu(
@@ -168,21 +128,6 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_k,
     bool causal);
 
-// flash_mla_with_kvcache (DeepSeek FlashMLA sparse decode)
-std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
-    at::Tensor& q,
-    at::Tensor& k_cache,
-    int64_t head_dim_v,
-    double softmax_scale,
-    at::Tensor& indices,
-    std::optional<at::Tensor> topk_length,
-    std::optional<at::Tensor> attn_sink,
-    std::optional<at::Tensor> extra_k_cache,
-    std::optional<at::Tensor> extra_indices,
-    std::optional<at::Tensor> extra_topk_length,
-    bool is_fp8_kvcache,
-    int64_t fp8_layout);
-
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
@@ -205,9 +150,6 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
-std::tuple<at::Tensor, at::Tensor>
-act_quant_cpu(at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
-at::Tensor fused_scale_cpu(at::Tensor& weight, double out_scale, at::Tensor& q_scale);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -274,6 +216,68 @@ at::Tensor fused_linear_sigmoid_mul(
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+// flash_mla_with_kvcache (DeepSeek FlashMLA sparse decode)
+std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
+    at::Tensor& q,
+    at::Tensor& k_cache,
+    int64_t head_dim_v,
+    double softmax_scale,
+    at::Tensor& indices,
+    std::optional<at::Tensor> topk_length,
+    std::optional<at::Tensor> attn_sink,
+    std::optional<at::Tensor> extra_k_cache,
+    std::optional<at::Tensor> extra_indices,
+    std::optional<at::Tensor> extra_topk_length,
+    bool is_fp8_kvcache,
+    int64_t fp8_layout);
+
+// hadamard transform
+at::Tensor fast_hadamard_transform_cpu(const at::Tensor& x, double scale);
+
+// topk
+std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    at::Tensor& correction_bias,
+    int64_t topk,
+    bool renormalize,
+    std::string scoring_func,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+
+std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
+    at::Tensor& gating_output,
+    at::Tensor& tid2eid,
+    int64_t topk,
+    std::string scoring_func,
+    int64_t num_fused_shared_experts,
+    int64_t num_experts,
+    double routed_scaling_factor);
+
+void topk_transform_512_cpu(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const std::optional<at::Tensor>& out_raw_indices);
+
+at::Tensor fp8_paged_mqa_logits_cpu(
+    at::Tensor& q_fp8,
+    at::Tensor& kvcache_fp8,
+    at::Tensor& weight,
+    at::Tensor& seq_lens,
+    at::Tensor& page_table,
+    int64_t max_seq_len,
+    bool clean_logits);
+
+// quant
+std::tuple<at::Tensor, at::Tensor>
+act_quant_cpu(at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
+at::Tensor fused_scale_cpu(at::Tensor& weight, double out_scale, at::Tensor& q_scale);
+
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -294,7 +298,6 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni);
 
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -379,6 +382,91 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+at::Tensor apply_rotary_emb_interleaved_cpu(
+    at::Tensor& x,
+    at::Tensor& freqs,
+    bool inverse,
+    const std::optional<at::Tensor>& positions,
+    const std::optional<at::Tensor>& k);
+
+// set_k_and_s
+void set_k_and_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& loc,
+    at::Tensor& k_nope,
+    at::Tensor& k_rope,
+    at::Tensor& scale_k_nope,
+    int64_t page_size);
+
+// set_k
+void set_k_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k, int64_t page_size, int64_t index_head_dim);
+
+// set_s
+void set_s_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k_scale, int64_t page_size, int64_t index_head_dim);
+
+// compressor
+at::Tensor compress_decode_cpu(
+    at::Tensor& pool_kv,
+    at::Tensor& pool_score,
+    at::Tensor& kv,
+    at::Tensor& score,
+    at::Tensor& seq_lens,
+    at::Tensor& req_pool_indices,
+    at::Tensor& ape,
+    at::Tensor& norm_weight,
+    at::Tensor& freqs_cis,
+    int64_t ratio,
+    int64_t head_dim,
+    int64_t rope_head_dim,
+    bool overlap,
+    bool rotate,
+    double norm_eps);
+
+// scheduler: paged allocation
+void alloc_extend_kernel_cpu(
+    at::Tensor& pre_lens,
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
+
+void alloc_decode_kernel_cpu(
+    at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size);
+
+// mhc kernels
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
+    at::Tensor& x,
+    at::Tensor& hc_fn,
+    at::Tensor& hc_scale,
+    at::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double rms_eps,
+    double hc_eps);
+
+at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb);
+
+at::Tensor hc_head_fused_cpu(
+    at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
+
+#else
+// fused moe
+at::Tensor fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
+    const std::optional<std::vector<int64_t>> block_size,
+    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -417,30 +505,8 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
     bool mrope_interleaved,
     bool is_neox);
 
-at::Tensor apply_rotary_emb_interleaved_cpu(
-    at::Tensor& x,
-    at::Tensor& freqs,
-    bool inverse,
-    const std::optional<at::Tensor>& positions,
-    const std::optional<at::Tensor>& k);
-
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
-
-// set_k_and_s
-void set_k_and_s_cpu(
-    at::Tensor& buf,
-    at::Tensor& loc,
-    at::Tensor& k_nope,
-    at::Tensor& k_rope,
-    at::Tensor& scale_k_nope,
-    int64_t page_size);
-
-// set_k
-void set_k_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k, int64_t page_size, int64_t index_head_dim);
-
-// set_s
-void set_s_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k_scale, int64_t page_size, int64_t index_head_dim);
 
 // quant_to_nope_fp8_rope_bf16_pack
 std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
@@ -501,52 +567,6 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
-// compressor
-at::Tensor compress_decode_cpu(
-    at::Tensor& pool_kv,
-    at::Tensor& pool_score,
-    at::Tensor& kv,
-    at::Tensor& score,
-    at::Tensor& seq_lens,
-    at::Tensor& req_pool_indices,
-    at::Tensor& ape,
-    at::Tensor& norm_weight,
-    at::Tensor& freqs_cis,
-    int64_t ratio,
-    int64_t head_dim,
-    int64_t rope_head_dim,
-    bool overlap,
-    bool rotate,
-    double norm_eps);
-
-// scheduler: paged allocation
-void alloc_extend_kernel_cpu(
-    at::Tensor& pre_lens,
-    at::Tensor& seq_lens,
-    at::Tensor& last_loc,
-    at::Tensor& free_pages,
-    at::Tensor& out_indices,
-    int64_t page_size);
-
-void alloc_decode_kernel_cpu(
-    at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size);
-
-// mhc kernels
-std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
-    at::Tensor& x,
-    at::Tensor& hc_fn,
-    at::Tensor& hc_scale,
-    at::Tensor& hc_base,
-    int64_t hc_mult,
-    int64_t sinkhorn_iters,
-    double rms_eps,
-    double hc_eps);
-
-at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb);
-
-at::Tensor hc_head_fused_cpu(
-    at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
-
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -601,31 +621,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
 
-  // biased topk (flat, non-grouped)
-  m.def(
-      "biased_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
-      "renormalize, str scoring_func, int num_fused_shared_experts, float? routed_scaling_factor, "
-      "bool apply_routed_scaling_factor_on_output) -> (Tensor, Tensor)");
-  m.impl("biased_topk_cpu", torch::kCPU, &biased_topk_cpu);
-
-  // hash topk (expert IDs from lookup table)
-  m.def(
-      "hash_topk_cpu(Tensor gating_output, Tensor tid2eid, int topk, str scoring_func, "
-      "int num_fused_shared_experts, int num_experts, float routed_scaling_factor) -> (Tensor, Tensor)");
-  m.impl("hash_topk_cpu", torch::kCPU, &hash_topk_cpu);
-
-  // DeepSeek V4 compressed attention top-k transform
-  m.def(
-      "topk_transform_512_cpu(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor(a!) out_page_indices, "
-      "int page_size, Tensor(a!)? out_raw_indices) -> ()");
-  m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
-
-  // DeepSeek V4 compressed attention FP8 paged MQA logits
-  m.def(
-      "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
-      "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
-  m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
-
   // decode
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
@@ -645,13 +640,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
       "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
-  // flash mla with kvcache
-  m.def(
-      "flash_mla_with_kvcache_cpu(Tensor q, Tensor k_cache, int head_dim_v, float softmax_scale, "
-      "Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
-      "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
-      "bool is_fp8_kvcache, int fp8_layout) -> (Tensor, Tensor)");
-  m.impl("flash_mla_with_kvcache_cpu", torch::kCPU, &flash_mla_with_kvcache_cpu);
 
   // linear attn
   m.def(
@@ -671,10 +659,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
-  m.def("act_quant_cpu(Tensor x, int block_size=128, str? scale_fmt=None) -> (Tensor, Tensor)");
-  m.impl("act_quant_cpu", torch::kCPU, &act_quant_cpu);
-  m.def("fused_scale_cpu(Tensor weight, float out_scale, Tensor q_scale) -> Tensor");
-  m.impl("fused_scale_cpu", torch::kCPU, &fused_scale_cpu);
 
   // igemm
   m.def(
@@ -725,6 +709,46 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  // quant
+  m.def("act_quant_cpu(Tensor x, int block_size=128, str? scale_fmt=None) -> (Tensor, Tensor)");
+  m.impl("act_quant_cpu", torch::kCPU, &act_quant_cpu);
+  m.def("fused_scale_cpu(Tensor weight, float out_scale, Tensor q_scale) -> Tensor");
+  m.impl("fused_scale_cpu", torch::kCPU, &fused_scale_cpu);
+
+  // biased topk (flat, non-grouped)
+  m.def(
+      "biased_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
+      "renormalize, str scoring_func, int num_fused_shared_experts, float? routed_scaling_factor, "
+      "bool apply_routed_scaling_factor_on_output) -> (Tensor, Tensor)");
+  m.impl("biased_topk_cpu", torch::kCPU, &biased_topk_cpu);
+
+  // hash topk (expert IDs from lookup table)
+  m.def(
+      "hash_topk_cpu(Tensor gating_output, Tensor tid2eid, int topk, str scoring_func, "
+      "int num_fused_shared_experts, int num_experts, float routed_scaling_factor) -> (Tensor, Tensor)");
+  m.impl("hash_topk_cpu", torch::kCPU, &hash_topk_cpu);
+
+  // DeepSeek V4 compressed attention top-k transform
+  m.def(
+      "topk_transform_512_cpu(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor(a!) out_page_indices, "
+      "int page_size, Tensor(a!)? out_raw_indices) -> ()");
+  m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
+
+  // DeepSeek V4 compressed attention FP8 paged MQA logits
+  m.def(
+      "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
+      "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
+
+  // flash mla with kvcache
+  m.def(
+      "flash_mla_with_kvcache_cpu(Tensor q, Tensor k_cache, int head_dim_v, float softmax_scale, "
+      "Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
+      "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
+      "bool is_fp8_kvcache, int fp8_layout) -> (Tensor, Tensor)");
+  m.impl("flash_mla_with_kvcache_cpu", torch::kCPU, &flash_mla_with_kvcache_cpu);
+
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
@@ -733,7 +757,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "limit, bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
@@ -773,41 +796,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
-#endif
-
-  // conv3d fast path for patch embedding
-  m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");
-  m.impl("conv3d_embed_weight_pack", torch::kCPU, &conv3d_embed_weight_pack);
-  m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
-  m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
-
-  // all reduce
-  m.def("initialize(int size, int rank) -> ()");
-  m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
-  m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
-  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
-  m.impl("shm_allgather", torch::kCPU, &shm_allgather);
 
   // rope
-  m.def(
-      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
-      "bool is_neox) -> (Tensor, Tensor)");
-  m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
-  m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
   m.def(
       "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
       "k=None) -> Tensor(a!)");
   m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
-
-  // multimodal rope
-  m.def(
-      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
-  m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
-
-  // CPU and memory binding
-  m.def("init_cpu_threads_env(str cpu_ids) -> str");
 
   // hadamard transform
   m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");
@@ -834,35 +828,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant_to_nope_fp8_rope_bf16_pack
   m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
   m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
-
-  // fused_sigmoid_gating_delta_rule_update
-  m.def(
-      "fused_sigmoid_gating_delta_rule_update_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor "
-      "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
-      "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
-  m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
-  // fused_gdn_gating
-  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
-  m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
-  // fused_qkvzba_split_reshape_cat_cpu
-  m.def(
-      "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
-      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
-  m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
-  // fused_qkvzba_split_reshape_cat_contiguous_cpu
-  m.def(
-      "fused_qkvzba_split_reshape_cat_contiguous_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int "
-      "num_heads_v, int "
-      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
-  m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
-
-  // image preprocessor
-  m.def(
-      "image_preprocess_cpu(Tensor[] images, bool do_convert_rgb, bool do_resize, int shortest_edge, int longest_edge,"
-      "str interpolation, bool do_rescale, float rescale_factor, bool do_normalize, float[] image_mean, float[] "
-      "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
-      "out_dtype) -> (Tensor, Tensor)");
-  m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
 
   // compressor
   m.def(
@@ -895,6 +860,73 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "float hc_eps, float norm_eps) -> Tensor");
   m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
+#else
+  // moe
+  m.def(
+      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
+      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+  m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+#endif
+
+  // conv3d fast path for patch embedding
+  m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv3d_embed_weight_pack", torch::kCPU, &conv3d_embed_weight_pack);
+  m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
+  m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
+
+  // all reduce
+  m.def("initialize(int size, int rank) -> ()");
+  m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
+  m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
+  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
+  m.impl("shm_allgather", torch::kCPU, &shm_allgather);
+
+  // rope
+  m.def(
+      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> (Tensor, Tensor)");
+  m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
+
+  // multimodal rope
+  m.def(
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+  m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
+
+  // CPU and memory binding
+  m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // fused_sigmoid_gating_delta_rule_update
+  m.def(
+      "fused_sigmoid_gating_delta_rule_update_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor "
+      "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
+      "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
+  m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
+  // fused_gdn_gating
+  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
+  m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
+  // fused_qkvzba_split_reshape_cat_cpu
+  m.def(
+      "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
+      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+  // fused_qkvzba_split_reshape_cat_contiguous_cpu
+  m.def(
+      "fused_qkvzba_split_reshape_cat_contiguous_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int "
+      "num_heads_v, int "
+      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
+
+  // image preprocessor
+  m.def(
+      "image_preprocess_cpu(Tensor[] images, bool do_convert_rgb, bool do_resize, int shortest_edge, int longest_edge,"
+      "str interpolation, bool do_rescale, float rescale_factor, bool do_normalize, float[] image_mean, float[] "
+      "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
+      "out_dtype) -> (Tensor, Tensor)");
+  m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
