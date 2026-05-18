@@ -45,9 +45,11 @@ class CanaryRunner:
         Several pieces in this class are critical safety logic and must NOT
         be simplified away by an automated pass:
 
-        - the daemon poll thread (README §4),
-        - the §5 health monitoring (zero-counter → raise),
-        - the unconditional cross-rank allreduce in ``maybe_raise_on_step``.
+        - the daemon poll thread (README §4): ``_start_daemon`` /
+          ``_daemon_loop`` / ``_record_poll_events``,
+        - the §5 health monitoring: ``_maybe_health_check``,
+        - the unconditional cross-rank allreduce in ``_cross_rank_max``,
+          called from every ``end_of_forward``.
 
         Removing any of them silently disables the canary or produces TP
         deadlock when raising. Do not simplify away.
@@ -352,11 +354,18 @@ class CanaryRunner:
             self._raise_latch = True
             self._raise_with_first_violation()
 
-    def _handle_violation_log(self) -> None:
-        # Pull the first-violation row (synchronous D2H — only happens on the
-        # error path; the hot path stays asynchronous via the daemon).
+    def _pull_first_violation(self) -> Tuple[List[int], int]:
+        """Synchronous D2H pull of the first-violation row + ring write count.
+
+        Only called on the error path; the hot path stays asynchronous via
+        the daemon thread.
+        """
         first_violation = self._device_state.first_violation.cpu().tolist()
         write_index = int(self._device_state.violation_write_index.cpu().item())
+        return first_violation, write_index
+
+    def _handle_violation_log(self) -> None:
+        first_violation, write_index = self._pull_first_violation()
         fail_reason = int(first_violation[1])
 
         now = time.time()
@@ -367,8 +376,7 @@ class CanaryRunner:
         logger.error(self._format_violation(first_violation, write_index))
 
     def _raise_with_first_violation(self) -> None:
-        first_violation = self._device_state.first_violation.cpu().tolist()
-        write_index = int(self._device_state.violation_write_index.cpu().item())
+        first_violation, write_index = self._pull_first_violation()
         raise RuntimeError(self._format_violation(first_violation, write_index))
 
     @staticmethod
