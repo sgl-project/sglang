@@ -292,30 +292,37 @@ class Relayer:
         return self._gpu_allocator.is_empty(s)
 
     def resolve_future(self, batch: ScheduleBatch):
+        """Forward-entry resolve: rewrite non-spec input_ids in-place from
+        the gpu_scalar token_ids slot. Spec V2 draft input is resolved at
+        scheduler-side ``_apply_spec_v2_relay_outputs`` via
+        ``resolve_draft_input_from_channel``.
+        """
         if self.spec_algo.is_none():
             _resolve_future_token_ids(
                 batch.input_ids, self.gpu_scalar.buffer("token_ids")
             )
-        else:
-            draft_input: EagleDraftInput = batch.spec_info
-            if draft_input is None:
-                # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
-                return
-            indices = draft_input.future_indices.indices
-            draft_input.topk_p = self.gpu_scalar.resolve_by_indices(indices, "topk_p")
-            draft_input.topk_index = self.gpu_scalar.resolve_by_indices(
-                indices, "topk_index"
+
+    def resolve_draft_input_from_channel(self, draft_input: "EagleDraftInput"):
+        """Rebind a spec V2 draft input's tensor fields to gpu_scalar slot
+        views (cross-stream event.wait done at resolve time). The caller
+        must set ``draft_input.future_indices`` first."""
+        if draft_input is None or draft_input.future_indices is None:
+            return
+        indices = draft_input.future_indices.indices
+        draft_input.topk_p = self.gpu_scalar.resolve_by_indices(indices, "topk_p")
+        draft_input.topk_index = self.gpu_scalar.resolve_by_indices(
+            indices, "topk_index"
+        )
+        draft_input.bonus_tokens = self.gpu_scalar.resolve_by_indices(
+            indices, "bonus_tokens"
+        )
+        draft_input.new_seq_lens = self.gpu_scalar.resolve_by_indices(
+            indices, "new_seq_lens"
+        )
+        if spec_need_hidden_states():
+            draft_input.hidden_states = self.gpu_scalar.resolve_by_indices(
+                indices, "hidden_states"
             )
-            draft_input.bonus_tokens = self.gpu_scalar.resolve_by_indices(
-                indices, "bonus_tokens"
-            )
-            draft_input.new_seq_lens = self.gpu_scalar.resolve_by_indices(
-                indices, "new_seq_lens"
-            )
-            if spec_need_hidden_states():
-                draft_input.hidden_states = self.gpu_scalar.resolve_by_indices(
-                    indices, "hidden_states"
-                )
 
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult

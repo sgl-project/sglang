@@ -3020,11 +3020,21 @@ class Scheduler(
         batch_result,
         future_indices,
     ):
-        """Hand off spec V2 forward outputs (already on gpu_scalar slot) to SB
-        for the next-iter schedule consumer."""
+        """Hand off spec V2 forward outputs to SB via the gpu_scalar channel.
+
+        next_draft_input is rebound on SB.spec_info; its tensor fields
+        (topk_p / topk_index / bonus_tokens / new_seq_lens / hidden_states)
+        are then rebound to channel slot views so any subsequent SB-side
+        read (next-iter filter / prepare_for_decode) carries the per-buffer
+        cross-stream event.wait inline, removing the dependence on a
+        downstream maybe_wait_verify_done.
+        """
         batch.spec_info = batch_result.next_draft_input
         batch.spec_info.future_indices = future_indices
-        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+        self.relayer.resolve_draft_input_from_channel(batch.spec_info)
+        # batch.seq_lens is sourced from the resolved channel view so
+        # SB.seq_lens does not alias a worker-stream-produced raw tensor.
+        batch.seq_lens = batch.spec_info.new_seq_lens
 
     def run_batch(
         self,

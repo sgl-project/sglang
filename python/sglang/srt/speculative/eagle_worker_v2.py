@@ -545,10 +545,10 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
-        # Mid-forward SB rebind: ``batch.spec_info`` now points to the
-        # freshly built draft input so the next draft step kernel reads it.
-        # Relayer-side this lands in the gpu_scalar channel via
-        # ``store_to_map_for_new_batch`` at iter boundary.
+        # Worker-internal pass state: store the freshly built draft input on
+        # FD.spec_info so the next draft step reads it. SB.spec_info is not
+        # touched; the iter-boundary handoff is via gpu_scalar channel in
+        # store_to_map_for_new_batch.
         batch.spec_info = next_draft_input
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -1098,13 +1098,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verify_done=verify_done,
         )
 
-        # verify_forward_batch transitively holds verify-time GPU tensors
-        # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache,
-        # until the next iter consumes the relayed verify outputs. The
-        # Relayer iter_pin ring (set up via ``Scheduler.record_batch_in_overlap``)
-        # is the canonical owner; ``extra_keep_alive_refs`` below is the
-        # transport from worker -> scheduler -> Relayer.add_iter_pin.
+        # verify_forward_batch holds verify-time GPU tensors that must
+        # outlive the imminent batch.input_ids rebind in
+        # prepare_for_extend_to_fill_draft_kvcache. extra_keep_alive_refs
+        # routes the ref through Scheduler -> Relayer.add_iter_pin.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
