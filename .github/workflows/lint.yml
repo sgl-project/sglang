@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -21,6 +23,20 @@ jobs:
         run: |
           python -m pip install pre-commit
           pre-commit install
+
+      - name: Reject changes under legacy docs/
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "$BASE_REF" 2>/dev/null || \
+            git fetch --no-tags origin "$BASE_REF"
+          if [ -z "$(git diff --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD")" ]; then
+            echo "No changed files vs origin/${BASE_REF}; skipping."
+            exit 0
+          fi
+          git diff -z --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD" \
+            | xargs -0 python3 scripts/ci/check_no_docs_changes.py
 
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
