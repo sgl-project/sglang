@@ -129,7 +129,16 @@ def _compute_launch_capacities(
         num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
     max_running_requests = int(model_runner.req_to_token_pool.size)
     max_bs = max(int(cuda_graph_max_bs), max_running_requests)
-    write_capacity = max_bs * num_tokens_per_bs
+    # Prefill batches write one entry per extend token, not per request, so
+    # the per-forward write count is bounded by the chunked-prefill budget
+    # (or ``max_prefill_tokens`` if chunking is disabled), not by ``max_bs``.
+    chunked_prefill_size = server_args.chunked_prefill_size
+    max_prefill_tokens = int(server_args.max_prefill_tokens)
+    if chunked_prefill_size is None or chunked_prefill_size < 0:
+        max_extend_tokens_per_forward = max_prefill_tokens
+    else:
+        max_extend_tokens_per_forward = int(chunked_prefill_size)
+    write_capacity = max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
     write_req_capacity = max_bs
     verify_capacity = max(1, int(model_runner.max_total_num_tokens))
     return verify_capacity, write_capacity, write_req_capacity
