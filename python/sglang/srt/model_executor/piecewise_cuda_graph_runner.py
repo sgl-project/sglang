@@ -388,6 +388,14 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+        # Setup valid KV cache indices for warmup.
+        # The req_to_token_pool is initialized with zeros, but FA3 kernel
+        # requires valid unique indices for page_table to avoid illegal memory access.
+        # We set the first row to sequential indices [0, 1, 2, ..., num_tokens-1].
+        self.model_runner.req_to_token_pool.req_to_token[0, :num_tokens] = torch.arange(
+            num_tokens, dtype=torch.int32, device=self.device
+        )
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -562,6 +570,14 @@ class PiecewiseCudaGraphRunner:
             lora_ids = None
 
         with torch.device(self.device):
+            # Setup valid KV cache indices for capture.
+            # The req_to_token_pool is initialized with zeros, but FA3 kernel
+            # requires valid unique indices for page_table to avoid illegal memory access.
+            # We set the first row to sequential indices [0, 1, 2, ..., num_tokens-1].
+            self.model_runner.req_to_token_pool.req_to_token[0, :num_tokens] = torch.arange(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
