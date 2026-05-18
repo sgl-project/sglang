@@ -1422,6 +1422,32 @@ class Req(ReqDllmMixin):
         )
 
 
+# Strict mode: SB attributes whose value is volatile across iters and whose
+# worker-side read must instead come from ForwardData snapshot or Relayer
+# channel resolve. Reading these from a worker entry frame indicates a
+# regression of the "worker never touches live SB" invariant.
+_SB_CROSS_ITER_VOLATILE_ATTRS = frozenset(
+    {
+        "seq_lens",
+        "seq_lens_cpu",
+        "orig_seq_lens",
+        "input_ids",
+        "out_cache_loc",
+        "req_pool_indices",
+        "output_ids",
+        "spec_info",
+        "sampling_info",
+    }
+)
+_SB_STRICT_WORKER_FRAMES = frozenset(
+    {
+        "forward_batch_generation",
+        "forward_batch_split_prefill",
+        "forward_batch_embedding",
+    }
+)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1618,6 +1644,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def __getattribute__(self, name):
+        # Fast path: dunder / private / non-volatile attrs bypass entirely.
+        if name.startswith("_") or name not in _SB_CROSS_ITER_VOLATILE_ATTRS:
+            return object.__getattribute__(self, name)
+        # Strict guard runs only when env flag + overlap mode are on. Stack
+        # walk pays its cost only on volatile-attr reads in this regime.
+        if not envs.SGLANG_RELAYER_DEBUG_STRICT.get():
+            return object.__getattribute__(self, name)
+        if not object.__getattribute__(self, "enable_overlap"):
+            return object.__getattribute__(self, name)
+        import sys
+
+        f = sys._getframe(1)
+        for _ in range(40):
+            if f is None:
+                break
+            if f.f_code.co_name in _SB_STRICT_WORKER_FRAMES:
+                raise AssertionError(
+                    f"strict: ScheduleBatch.{name} read from worker stack "
+                    f"frame {f.f_code.co_name} "
+                    f"({f.f_code.co_filename}:{f.f_lineno}). Use ForwardData "
+                    f"snapshot or Relayer channel resolve "
+                    f"(forward_batch.relayer_resolve_*) instead."
+                )
+            f = f.f_back
+        return object.__getattribute__(self, name)
 
     def set_relayer_ctx(self, relayer, cpu_future_indices):
         self._relayer_ctx = (relayer, cpu_future_indices)
