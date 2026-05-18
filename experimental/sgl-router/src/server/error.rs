@@ -54,6 +54,27 @@ pub enum ApiError {
     #[error("no healthy workers for model {model}")]
     NoHealthyWorkers { model: String },
 
+    /// PD-mode deployment whose prefill pool has zero healthy workers.
+    /// Distinct from `NoHealthyWorkers` because the decode pool may
+    /// still be healthy — the failure is pool-specific, and surfacing
+    /// the distinct code lets operators alert on prefill-fleet outages
+    /// independently of full-model outages.
+    #[error("no prefill workers available for model {model}")]
+    NoPrefillWorkersAvailable { model: String },
+
+    /// PD-mode deployment whose decode pool has zero healthy workers.
+    /// Mirror of [`Self::NoPrefillWorkersAvailable`].
+    #[error("no decode workers available for model {model}")]
+    NoDecodeWorkersAvailable { model: String },
+
+    /// A request whose lifetime exceeded `stale_request_timeout` — the
+    /// active-load janitor force-expired the in-flight bookkeeping
+    /// while the request was still pending. Reserved for the M5 wire-up
+    /// path; M4 emits the warn log but does not yet plumb this back to
+    /// the client.
+    #[error("stale request expired for model {model}")]
+    StaleRequestExpired { model: String },
+
     /// The per-model policy returned `None` despite the candidate set
     /// being non-empty.  Almost always a router bug or an unsupported
     /// policy state; surfaced as 503 (not 500) so retry-on-failure clients
@@ -95,6 +116,17 @@ impl ApiError {
             ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
             ApiError::NoHealthyWorkers { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "no_healthy_workers")
+            }
+            ApiError::NoPrefillWorkersAvailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_prefill_workers_available",
+            ),
+            ApiError::NoDecodeWorkersAvailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_decode_workers_available",
+            ),
+            ApiError::StaleRequestExpired { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "stale_request_expired")
             }
             ApiError::PolicySelectionFailed { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
@@ -159,6 +191,30 @@ impl IntoResponse for ApiError {
             ApiError::NoHealthyWorkers { model } => {
                 tracing::warn!(model = %model, reason = "no_healthy_workers", "service unavailable");
                 "no healthy workers for the requested model".to_string()
+            }
+            ApiError::NoPrefillWorkersAvailable { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "no_prefill_workers_available",
+                    "service unavailable",
+                );
+                "no prefill workers available for the requested model".to_string()
+            }
+            ApiError::NoDecodeWorkersAvailable { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "no_decode_workers_available",
+                    "service unavailable",
+                );
+                "no decode workers available for the requested model".to_string()
+            }
+            ApiError::StaleRequestExpired { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "stale_request_expired",
+                    "service unavailable",
+                );
+                "request expired before completion".to_string()
             }
             ApiError::PolicySelectionFailed { model } => {
                 tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
