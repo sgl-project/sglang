@@ -1630,11 +1630,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        rank = rank_offset + self.tp_rank
+        # Linearize across (pp_rank, tp_rank) so each engine worker gets a
+        # unique rank in [rank_offset, rank_offset + pp_size*tp_size). The
+        # original formula `rank_offset + tp_rank` collided when pp_size > 1
+        # because both PP stages share the same tp_rank value. dp_rank is
+        # encoded into tp_rank via compute_dp_attention_world_info, so it
+        # does not need a separate term.
+        rank = rank_offset + self.tp_size * self.pp_rank + self.tp_rank
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}, "
+            f"pp_rank={self.pp_rank}, tp_rank={self.tp_rank}, tp_size={self.tp_size}"
         )
 
         try:
