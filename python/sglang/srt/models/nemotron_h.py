@@ -42,6 +42,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+    AscendMamba2AttnBackend,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -85,8 +88,10 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
+from sglang.srt.utils import is_npu
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class NemotronHMLP(nn.Module):
@@ -416,7 +421,10 @@ class NemotronHMambaDecoderLayer(nn.Module):
         output = torch.empty_like(hidden_states)
         attn_backend = forward_batch.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend)
-        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        if _is_npu:
+            assert isinstance(attn_backend.linear_attn_backend, AscendMamba2AttnBackend)
+        else:
+            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
             mixer=self.mixer,
             layer_id=self.layer_id,

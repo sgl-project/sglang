@@ -675,6 +675,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
             hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        elif self.moe_runner_config.activation == "relu2":
+            hidden_states = torch.relu(hidden_states) ** 2
         else:
             from sglang.srt.layers.activation import GeluAndMul
 

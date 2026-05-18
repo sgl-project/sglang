@@ -12,8 +12,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
+    Mamba2Metadata,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -205,7 +207,41 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
 
 
 class AscendMamba2AttnBackend(AscendMambaAttnBackendBase):
-    pass
+    """Ascend Attention backend wrapper for Mamba2Mixer kernels."""
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__(model_runner)
+        config = model_runner.mamba2_config
+        assert config is not None
+        self.mamba_chunk_size = config.mamba_chunk_size
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        metadata = self._forward_metadata(forward_batch)
+        self.forward_metadata = Mamba2Metadata.prepare_mixed(
+            metadata,
+            self.mamba_chunk_size,
+            forward_batch,
+        )
+
+    def forward(
+        self,
+        mixer: MambaMixer2,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        layer_id: int,
+        mup_vector: Optional[torch.Tensor] = None,
+        use_triton_causal_conv: bool = False,
+    ):
+        assert isinstance(self.forward_metadata, Mamba2Metadata)
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        return mixer.forward(
+            hidden_states=hidden_states,
+            output=output,
+            layer_cache=layer_cache,
+            metadata=self.forward_metadata,
+            mup_vector=mup_vector,
+            use_triton_causal_conv=use_triton_causal_conv,
+        )
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
