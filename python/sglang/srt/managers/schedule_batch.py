@@ -1600,52 +1600,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    # Relay fields are SB attributes whose post-iter value is driven by
-    # forward N's output. Writes to these attributes auto-mirror to the
-    # Relayer ``gpu_scalar`` channel so cross-stream consumers can resolve
-    # the same value with channel-level sync; reads stay on the local
-    # attribute since within-iter visibility is established by
-    # ``forward_stream.wait_stream(schedule_stream)`` before forward
-    # consumes them.
-    _RELAYER_GPU_FIELDS = ("seq_lens", "seq_lens_cpu", "orig_seq_lens")
-
-    def __setattr__(self, name, value):
-        super().__setattr__(name, value)
-        if name in ScheduleBatch._RELAYER_GPU_FIELDS:
-            ctx = self.__dict__.get("_relayer_seq_lens_ctx")
-            if ctx is not None:
-                relayer, fi = ctx
-                if relayer is not None and fi is not None and value is not None:
-                    getattr(relayer, f"store_{name}")(fi, value)
-
     def set_relayer_ctx(self, relayer, cpu_future_indices):
-        """Attach a Relayer + cpu_future_indices reference so filter_batch
-        (and other consumer methods) can read forward-driven per-req decisions
-        (finished status, kv_committed_delta) from the cpu_value channel
-        instead of from the legacy in-place CPU mutation.
-
-        Cleared by ``clear_relayer_ctx`` after the consumer pass is done so
-        the SB does not carry a stale relayer ref across iters.
-        """
         self._relayer_ctx = (relayer, cpu_future_indices)
 
     def set_relayer_seq_lens_ctx(self, relayer, future_indices):
-        """Attach a Relayer + gpu future_indices reference so writes to the
-        ``seq_lens`` family auto-mirror into the gpu_scalar channel. The
-        forward stream cannot see this attribute directly (Python attribute
-        on SB lives on host), so the channel mirror is what makes the new
-        post-decode lens available to forward and to the next-iter consumer
-        via a sync-correct resolve.
-        """
         self._relayer_seq_lens_ctx = (relayer, future_indices)
 
     def clear_relayer_seq_lens_ctx(self):
         self._relayer_seq_lens_ctx = (None, None)
 
     def relayer_resolve_seq_lens(self):
-        """Cross-stream-safe read of ``seq_lens``: when a Relayer ctx is set,
-        resolve from the gpu_scalar channel (which waits on the producer
-        event); otherwise return the direct attribute."""
+        """Resolve seq_lens via channel (cross-stream-safe) or fall back to attribute."""
         ctx = self.__dict__.get("_relayer_seq_lens_ctx")
         if ctx is not None:
             relayer, fi = ctx
@@ -1670,19 +1635,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.orig_seq_lens
 
     def to_forward_data(self):
-        """Build a ``ForwardData`` snapshot from current SB state.
-
-        The snapshot carries every field that
-        ``ForwardBatch.init_new_from_forward_data`` reads, so passing the
-        resulting ``ForwardData`` through ``forward_batch_generation`` →
-        ``ForwardBatch.init_new`` walks the FD path instead of the SB path.
-
-        After this call returns, ``schedule_stream`` should not touch the
-        per-iter fields embedded in the snapshot — the FD is the ownership
-        boundary that hands them off to ``forward_stream``. Cross-stream
-        lifetime / visibility is layered on top via the Relayer channel
-        events recorded at store time.
-        """
+        """Build a ForwardData snapshot of all fields ForwardBatch.init_new reads."""
         # Local import to avoid circular import at module load time.
         from sglang.srt.model_executor.forward_batch_info import ForwardData
 
@@ -1746,12 +1699,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def bind_relayer_for_iter(self, relayer):
         """Allocate this iter's relay slots (gpu_scalar for seq_lens family,
-        cpu_value for kv_committed_delta / finished_status) and attach them
-        to the SB so subsequent mutators (prepare_for_decode / filter_batch /
-        merge_batch) auto-mirror writes and channel reads target a stable
-        slot. ``run_batch`` later consumes ``self._relayer_iter_gpu_fi`` /
-        ``self._relayer_iter_cpu_fi`` instead of re-allocating.
+        cpu_value for kv_committed_delta / finished_status). Drops any
+        stale ctx from the previous iter before binding new slots.
         """
+        # Drop stale ctx so prepare_for_decode's explicit store and
+        # filter_batch's cpu_value read target this iter's fresh slots.
+        self.clear_relayer_ctx()
         if relayer is None:
             return
         bs = len(self.reqs)
@@ -1766,16 +1719,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def clear_relayer_ctx(self):
         self._relayer_ctx = (None, None)
+        self._relayer_seq_lens_ctx = (None, None)
+        self._relayer_iter_gpu_fi = None
+        self._relayer_iter_cpu_fi = None
 
     def assert_lockstep(self):
         """Per-req containers all have the same length as ``self.reqs``.
 
-        SB producer / consumer share a contract that ``filter_batch`` /
-        ``merge_batch`` / ``pop_finished_req`` / ``prepare_for_decode`` keep
-        the per-req slices aligned; drift here usually indicates a missed
-        branch in one of those mutators. Cheap to call (only checks Python
-        sequence lengths and 1-D tensor shapes); intended to be sprinkled
-        at SB-boundary inflection points in debug builds.
+        Producer / consumer contract: filter_batch / merge_batch /
+        prepare_for_decode / prepare_for_extend keep all per-req slices
+        aligned. Cheap to call (Python lengths + 1-D tensor shapes).
         """
         bs = len(self.reqs)
         if self.seq_lens is not None:
@@ -1794,6 +1747,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert (
                 self.req_pool_indices.shape[0] == bs
             ), f"req_pool_indices len {self.req_pool_indices.shape[0]} != reqs len {bs}"
+        if self.output_ids is not None:
+            assert (
+                self.output_ids.shape[0] == bs
+            ), f"output_ids len {self.output_ids.shape[0]} != reqs len {bs}"
+        if (
+            self.sampling_info is not None
+            and getattr(self.sampling_info, "temperatures", None) is not None
+        ):
+            assert len(self.sampling_info.temperatures) == bs, (
+                f"sampling_info.temperatures len {len(self.sampling_info.temperatures)}"
+                f" != reqs len {bs}"
+            )
         for attr in ("top_logprobs_nums", "token_ids_logprobs"):
             value = getattr(self, attr, None)
             if value is not None:
@@ -2303,7 +2268,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
             self.assert_lockstep()
-        return self.to_forward_data()
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -2579,27 +2543,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation.
-        #
-        # Speculative +1 per req; consumers (kv_committed_delta resolve below
-        # if a relayer ctx is set) trim back for finished reqs. The post-iter
-        # values are also stored to the Relayer ``gpu_scalar`` channel so the
-        # next iter's attention / cuda graph / sampling consumers can resolve
-        # them with cross-stream sync built in (instead of reading the live
-        # SB tensor whose visibility crosses streams).
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
-            # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-        # Mirror the new lens onto the Relayer gpu_scalar channel.
+        # Producer-side mirror onto Relayer gpu_scalar channel so next-iter
+        # cross-stream consumers can resolve with sync.
         ctx_relayer, ctx_gpu_fi = getattr(self, "_relayer_seq_lens_ctx", (None, None))
         if ctx_relayer is not None and ctx_gpu_fi is not None:
             ctx_relayer.store_seq_lens(ctx_gpu_fi, self.seq_lens)
@@ -2646,13 +2601,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
             self.assert_lockstep()
-
-        # Return ForwardData snapshot so callers that want the
-        # FD-as-explicit-output path can chain
-        # ``fd = batch.prepare_for_decode_returning_fd()``. Existing
-        # call sites that ignore the return value keep the in-place
-        # mutation semantics.
-        return self.to_forward_data()
 
     def maybe_wait_verify_done(self):
         # Stream-level wait instead of CPU sync: schedule_stream waits for
