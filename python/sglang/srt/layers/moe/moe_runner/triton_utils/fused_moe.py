@@ -547,7 +547,7 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+            assert _is_cuda or _is_hip or _is_xpu, "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -557,8 +557,8 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit_for_triton = swiglu_limit
                 else:
                     assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                        _is_cuda or _is_xpu
+                    ), "fused silu_and_mul_clamp kernel is CUDA or XPU; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2

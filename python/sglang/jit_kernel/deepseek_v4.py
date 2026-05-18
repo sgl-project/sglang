@@ -890,8 +890,12 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    module = _jit_silu_and_mul_clamp_module(input.dtype)
-    module.run(input, output, float(swiglu_limit))
+    if _is_cuda:
+        module = _jit_silu_and_mul_clamp_module(input.dtype)
+        module.run(input, output, float(swiglu_limit))
+    else:
+        from .silu_and_mul_clamp_torch import silu_and_mul_clamp_torch
+        silu_and_mul_clamp_torch(input, output, float(swiglu_limit))
 
 
 def silu_and_mul_masked_post_quant(
