@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CANARY_POOL_ATTR = "_kv_cache_canary_attached"
-_CANARY_POOL_KINDS_ATTR = "_kv_cache_canary_pool_kinds"
 _CANARY_SHADOW_GROUPS_ATTR = "_kv_cache_canary_shadow_groups"
 
 
@@ -140,7 +139,6 @@ def attach_shadow_buffers(
         )
 
     setattr(pool, _CANARY_SHADOW_GROUPS_ATTR, shadow_groups)
-    setattr(pool, _CANARY_POOL_KINDS_ATTR, tuple(shadow_groups.keys()))
     setattr(pool, _CANARY_POOL_ATTR, True)
 
     # Legacy single-canary attribute aliases (used by host-side unit tests
@@ -468,23 +466,3 @@ def get_shadow_groups(pool: "KVCache") -> Dict[PoolKind, CanaryShadowGroup]:
     if groups is None:
         return {}
     return groups
-
-
-def get_shadow_group(pool: "KVCache", kind: PoolKind) -> CanaryShadowGroup:
-    """Return the shadow group for one attention regime; raises if missing."""
-    groups = get_shadow_groups(pool)
-    if kind not in groups:
-        raise RuntimeError(
-            f"kv-canary: pool {type(pool).__name__} has no {kind.value} shadow group; "
-            f"attached kinds are {[k.value for k in groups.keys()]}"
-        )
-    return groups[kind]
-
-
-def get_pool_kinds(pool: "KVCache") -> Tuple[PoolKind, ...]:
-    """Return the tuple of :class:`PoolKind` values attached to the pool.
-
-    Useful for installation code that needs to instantiate one
-    :class:`CanaryRunner` per attached kind.
-    """
-    return tuple(get_shadow_groups(pool).keys())
