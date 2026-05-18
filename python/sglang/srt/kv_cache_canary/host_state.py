@@ -364,7 +364,7 @@ VIOLATION_KINDS: Tuple[str, str, str, str] = (
 )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryViolationSlot:
     """One independent violation-state set (ring + first_violation + is_errored).
 
@@ -410,7 +410,7 @@ class CanaryViolationSlot:
         self.violation_write_index.zero_()
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryDeviceState:
     """GPU-resident state shared across head/tail kernel invocations.
 
@@ -467,7 +467,7 @@ class CanaryDeviceState:
             slot.reset()
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryLaunchBuffers:
     """Fixed-address per-launch tensors for cuda-graph-safe kernel launches.
 
