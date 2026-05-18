@@ -930,8 +930,44 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
+            return min(
+                self.relayer_resolve_kv_committed_len(), len(self.origin_input_ids)
+            )
+        return self.relayer_resolve_kv_committed_len()
+
+    def relayer_resolve_kv_committed_len(self) -> int:
+        """Read the per-req committed-KV length with the Relayer cpu_value
+        channel as source of truth when a (relayer, cpu_future_indices,
+        slot_offset) tuple has been attached via
+        ``Req.set_relayer_kv_committed_ctx``. The fallback returns the legacy
+        attribute, so call sites do not need to know whether the channel is
+        populated.
+        """
+        ctx = self.__dict__.get("_relayer_kv_committed_ctx")
+        if ctx is not None:
+            relayer, cpu_fi, slot_offset, baseline = ctx
+            if relayer is not None and cpu_fi is not None and slot_offset is not None:
+                deltas = relayer.resolve_kv_committed_delta(cpu_fi)
+                d = deltas[slot_offset] if slot_offset < len(deltas) else 0
+                if d is not None:
+                    return baseline + d
         return self.kv_committed_len
+
+    def set_relayer_kv_committed_ctx(self, relayer, cpu_future_indices, slot_offset):
+        """Attach the Relayer + cpu_value slot key + this iter's baseline
+        kv_committed_len so subsequent ``relayer_resolve_kv_committed_len``
+        calls return ``baseline + delta`` from the channel rather than the
+        in-place mutated attribute.
+        """
+        self._relayer_kv_committed_ctx = (
+            relayer,
+            cpu_future_indices,
+            slot_offset,
+            self.kv_committed_len,
+        )
+
+    def clear_relayer_kv_committed_ctx(self):
+        self._relayer_kv_committed_ctx = None
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
