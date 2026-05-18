@@ -89,15 +89,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
 
         # get dcp info
-        try:
-            self.dcp_world_size = get_dcp_world_size()
-            self.dcp_rank = get_dcp_rank()
-        except Exception as e:
-            logger.error(
-                "dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0"
-            )
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
