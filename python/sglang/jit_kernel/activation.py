@@ -32,7 +32,7 @@ def _fast_math_flags() -> list[str]:
 def _jit_activation_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        "activation",
+        "activation_swap_halves",
         *args,
         cuda_files=["elementwise/activation.cuh"],
         extra_cuda_cflags=_fast_math_flags(),
@@ -51,13 +51,13 @@ SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
 
 @register_custom_op(mutates_args=["out"])
 def _run_activation_inplace(
-    op_name: str, input: torch.Tensor, out: torch.Tensor
+    op_name: str, input: torch.Tensor, out: torch.Tensor, swap_halves: bool
 ) -> None:
     hidden_size = input.shape[-1] // 2
     module = _jit_activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
-    module.run_activation(input_2d, out_2d, op_name)
+    module.run_activation(input_2d, out_2d, op_name, swap_halves)
 
 
 @register_custom_op(mutates_args=["out"])
@@ -67,12 +67,15 @@ def _run_activation_filtered_inplace(
     out: torch.Tensor,
     expert_ids: torch.Tensor,
     expert_step: int,
+    swap_halves: bool,
 ) -> None:
     hidden_size = input.shape[-1] // 2
     module = _jit_activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
-    module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
+    module.run_activation_filtered(
+        input_2d, out_2d, expert_ids, expert_step, op_name, swap_halves
+    )
 
 
 def run_activation(
@@ -81,22 +84,27 @@ def run_activation(
     out: Optional[torch.Tensor],
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    swap_halves: bool = False,
 ) -> torch.Tensor:
     """Apply ``op_name`` activation followed by element-wise multiplication.
 
+    ``swap_halves=False`` (default) computes ``act(first) * second`` ([Gate|Up]);
+    ``True`` computes ``act(second) * first`` ([Up|Gate]).
+
     When ``expert_ids`` is provided, output rows are skipped for tokens whose
-    routed expert id is ``-1``. ``expert_step`` is 1 for per-token routing and
-    ``BLOCK_SIZE_M`` for sorted/TMA routing — i.e. ``expert_ids[token_id //
-    expert_step]`` is consulted before computing each row.
+    routed expert id is ``-1``. ``expert_ids[token_id // expert_step]`` is
+    consulted before computing each row.
     """
     assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
     if expert_ids is None:
-        _run_activation_inplace(op_name, input, out)
+        _run_activation_inplace(op_name, input, out, swap_halves)
     else:
-        _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
+        _run_activation_filtered_inplace(
+            op_name, input, out, expert_ids, expert_step, swap_halves
+        )
     return out
 
 
@@ -105,8 +113,9 @@ def silu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    swap_halves: bool = False,
 ) -> torch.Tensor:
-    return run_activation("silu", input, out, expert_ids, expert_step)
+    return run_activation("silu", input, out, expert_ids, expert_step, swap_halves)
 
 
 def gelu_and_mul(
@@ -114,8 +123,9 @@ def gelu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    swap_halves: bool = False,
 ) -> torch.Tensor:
-    return run_activation("gelu", input, out, expert_ids, expert_step)
+    return run_activation("gelu", input, out, expert_ids, expert_step, swap_halves)
 
 
 def gelu_tanh_and_mul(
@@ -123,5 +133,6 @@ def gelu_tanh_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    swap_halves: bool = False,
 ) -> torch.Tensor:
-    return run_activation("gelu_tanh", input, out, expert_ids, expert_step)
+    return run_activation("gelu_tanh", input, out, expert_ids, expert_step, swap_halves)
