@@ -15,26 +15,31 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+        SchedulerPoolStatsObserver,
+    )
 
 logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
-    def _streaming_session_count(self: Scheduler) -> int:
+    @staticmethod
+    def streaming_session_count(self: "SchedulerPoolStatsObserver") -> int:
         return sum(
             1
             for session in self.session_controller.sessions.values()
             if session.streaming
         )
 
-    def _active_pool_idxs(self: Scheduler) -> set:
+    @staticmethod
+    def active_pool_idxs(self: "SchedulerPoolStatsObserver") -> set:
         """Pool idxs currently owned by reqs in last_batch / running_batch.
 
         Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
         """
         idxs = set()
-        for batch in [self.last_batch, self.running_batch]:
+        for batch in [self.get_last_batch(), self.get_running_batch()]:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
@@ -42,35 +47,51 @@ class SchedulerRuntimeCheckerMixin:
                     idxs.add(req.req_pool_idx)
         return idxs
 
-    def _session_held_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_tokens(self._active_pool_idxs())
+    @staticmethod
+    def session_held_tokens(self: "SchedulerPoolStatsObserver") -> int:
+        return self.tree_cache.session_held_tokens(
+            SchedulerRuntimeCheckerMixin.active_pool_idxs(self)
+        )
 
-    def _session_held_full_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
+    @staticmethod
+    def session_held_full_tokens(self: "SchedulerPoolStatsObserver") -> int:
+        return self.tree_cache.session_held_full_tokens(
+            SchedulerRuntimeCheckerMixin.active_pool_idxs(self)
+        )
 
-    def _session_held_swa_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
+    @staticmethod
+    def session_held_swa_tokens(self: "SchedulerPoolStatsObserver") -> int:
+        return self.tree_cache.session_held_swa_tokens(
+            SchedulerRuntimeCheckerMixin.active_pool_idxs(self)
+        )
 
-    def _session_held_req_count(self: Scheduler) -> int:
+    @staticmethod
+    def session_held_req_count(self: "SchedulerPoolStatsObserver") -> int:
         return self.tree_cache.session_held_req_count()
 
-    def _session_held_mamba_slots(self: Scheduler) -> int:
-        return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
+    @staticmethod
+    def session_held_mamba_slots(self: "SchedulerPoolStatsObserver") -> int:
+        return self.tree_cache.session_held_mamba_slots(
+            SchedulerRuntimeCheckerMixin.active_pool_idxs(self)
+        )
 
-    def get_pool_stats(self: Scheduler) -> PoolStats:
+    @staticmethod
+    def get_pool_stats(self: "SchedulerPoolStatsObserver") -> PoolStats:
         if self.is_hybrid_swa:
-            pool_stats = self._get_swa_token_info()
+            pool_stats = SchedulerRuntimeCheckerMixin._get_swa_token_info(self)
         elif self.is_hybrid_ssm:
-            pool_stats = self._get_mamba_token_info()
+            pool_stats = SchedulerRuntimeCheckerMixin._get_mamba_token_info(self)
         else:
-            pool_stats = self._get_token_info()
+            pool_stats = SchedulerRuntimeCheckerMixin._get_token_info(self)
 
         if self.enable_hisparse:
-            pool_stats = self._get_hisparse_token_info(pool_stats)
+            pool_stats = SchedulerRuntimeCheckerMixin._get_hisparse_token_info(
+                self, pool_stats
+            )
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
         if self.is_hybrid_ssm:
-            mamba_stats = self._get_mamba_token_info()
+            mamba_stats = SchedulerRuntimeCheckerMixin._get_mamba_token_info(self)
             pool_stats.is_hybrid_ssm = True
             pool_stats.mamba_num_used = mamba_stats.mamba_num_used
             pool_stats.mamba_usage = mamba_stats.mamba_usage
@@ -79,7 +100,8 @@ class SchedulerRuntimeCheckerMixin:
 
         return pool_stats
 
-    def _get_token_info(self: Scheduler) -> PoolStats:
+    @staticmethod
+    def _get_token_info(self: "SchedulerPoolStatsObserver") -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
@@ -91,7 +113,10 @@ class SchedulerRuntimeCheckerMixin:
             full_evictable_size=evictable_size,
         )
 
-    def _get_hisparse_token_info(self: Scheduler, pool_stats: PoolStats) -> PoolStats:
+    @staticmethod
+    def _get_hisparse_token_info(
+        self: "SchedulerPoolStatsObserver", pool_stats: PoolStats
+    ) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
             return dataclasses.replace(
@@ -104,7 +129,8 @@ class SchedulerRuntimeCheckerMixin:
             )
         return pool_stats
 
-    def _get_mamba_token_info(self: Scheduler):
+    @staticmethod
+    def _get_mamba_token_info(self: "SchedulerPoolStatsObserver"):
         is_mamba_radix_cache = (
             self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
         )
@@ -137,7 +163,8 @@ class SchedulerRuntimeCheckerMixin:
             mamba_evictable_size=mamba_evictable_size,
         )
 
-    def _get_swa_token_info(self: Scheduler) -> PoolStats:
+    @staticmethod
+    def _get_swa_token_info(self: "SchedulerPoolStatsObserver") -> PoolStats:
         full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
@@ -194,15 +221,21 @@ class SchedulerRuntimeCheckerMixin:
     ) -> Tuple[bool, str]:
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
-            session_held = self._session_held_full_tokens()
+            session_held = self.session_held_full_tokens(
+                self.pool_stats_observer,
+            )
             total = self.full_tokens_per_layer
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             protected = self.tree_cache.full_protected_size()
-            session_held = self._session_held_tokens()
+            session_held = self.session_held_tokens(
+                self.pool_stats_observer,
+            )
             total = self.token_to_kv_pool_allocator.size
         else:
             protected = self.tree_cache.protected_size()
-            session_held = self._session_held_tokens()
+            session_held = self.session_held_tokens(
+                self.pool_stats_observer,
+            )
             total = self.max_total_num_tokens
         return self._check_pool_invariant(
             "full",
@@ -222,7 +255,9 @@ class SchedulerRuntimeCheckerMixin:
             ps.swa_available_size,
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
-            self._session_held_swa_tokens(),
+            self.session_held_swa_tokens(
+                self.pool_stats_observer,
+            ),
             self.swa_tokens_per_layer,
             uncached,
         )
@@ -233,7 +268,9 @@ class SchedulerRuntimeCheckerMixin:
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            self._session_held_mamba_slots(),
+            self.session_held_mamba_slots(
+                self.pool_stats_observer,
+            ),
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -314,7 +351,9 @@ class SchedulerRuntimeCheckerMixin:
             )
             return
 
-        ps = self.get_pool_stats()
+        ps = self.get_pool_stats(
+            self.pool_stats_observer,
+        )
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
@@ -338,7 +377,9 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        session_req_count = self._session_held_req_count()
+        session_req_count = self.session_held_req_count(
+            self.pool_stats_observer,
+        )
         if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
@@ -393,9 +434,13 @@ class SchedulerRuntimeCheckerMixin:
         ):
             return
 
-        self.get_pool_stats().update_scheduler_stats(self.stats)
-        self.stats.num_streaming_sessions = self._streaming_session_count()
-        self.stats.streaming_session_held_tokens = self._session_held_tokens()
+        self.get_pool_stats(self.pool_stats_observer).update_scheduler_stats(self.stats)
+        self.stats.num_streaming_sessions = self.streaming_session_count(
+            self.pool_stats_observer,
+        )
+        self.stats.streaming_session_held_tokens = self.session_held_tokens(
+            self.pool_stats_observer,
+        )
 
         priority_enabled = self.enable_priority_scheduling
         self.stats.num_running_reqs = QueueCount.from_reqs(
@@ -437,7 +482,11 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
-        _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
+        _, messages = scheduler._check_all_pools(
+            scheduler.get_pool_stats(
+                scheduler.pool_stats_observer,
+            )
+        )
         return (
             f"{scheduler.cur_batch.batch_size()=}\n"
             f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
