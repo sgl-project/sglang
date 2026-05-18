@@ -393,7 +393,7 @@ class Compressor(nn.Module):
         )
 
 
-if _is_hip:
+if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
         CompressorHip as Compressor,
     )

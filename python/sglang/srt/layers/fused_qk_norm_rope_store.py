@@ -333,7 +333,7 @@ def fused_qk_norm_rope_swa_store(
     else:
         fp8_info = torch.finfo(torch.float8_e4m3fn)
 
-    BLOCK_SIZE_M = min(4, M) if M < 4 else 4
+    BLOCK_SIZE_M = min(4, triton.next_power_of_2(M)) if M < 4 else 4
     num_warps = 4
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)

@@ -163,7 +163,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
@@ -359,7 +359,7 @@ struct FusedNormRopeKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim})  // input
         .with_dtype<DType>()

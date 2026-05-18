@@ -104,7 +104,7 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+    uint32_t n = __shfl_up_sync(device::kFullMask, val, offset);
     if (lane_id >= offset) val += n;
   }
   return val;
@@ -115,7 +115,7 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-    val = max(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+    val = max(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
   }
   return val;
 }
@@ -123,7 +123,7 @@ SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_min_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-    val = min(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+    val = min(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
   }
   return val;
 }
@@ -452,8 +452,8 @@ inline PrefillPlan plan_compress_prefill(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu_or_gpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu_or_gpu.set_options<kDLCPU, kDLCUDA>();
-  device_.set_options<kDLCUDA>();
+  cpu_or_gpu.set_options<kDLCPU, kDLGPU>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -499,7 +499,7 @@ inline PrefillPlan plan_compress_prefill(
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
-  if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
+  if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
     // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
     // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
@@ -628,7 +628,7 @@ inline tvm::ffi::Tensor plan_compress_decode(
     const int32_t ring_size) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -691,7 +691,7 @@ inline PrefillPlan plan_compress_prefill_legacy(
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -794,7 +794,7 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
     const int32_t compress_ratio) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
