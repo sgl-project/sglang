@@ -1,7 +1,0 @@
-{
-    "meta_service_url": "tcp://127.0.0.1:5001",
-    "config_store_url": "tcp://127.0.0.1:6000",
-    "metrics_url": "http://127.0.0.1:8000",
-    "ha_enable": false,
-    "log_level": "info"
-}
