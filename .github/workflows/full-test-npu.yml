@@ -1,7 +1,7 @@
 name: Full Test (NPU)
 
 on:
-#    pull_request:
+# pull_request:
 #    branches:
 #      - main
 #      - testcases
