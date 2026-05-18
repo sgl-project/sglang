@@ -448,6 +448,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Multimodal Chat Completions
 
+<Note>
+The image URL in the example below references an external resource (`raw.githubusercontent.com`). Make sure the server has internet access so the image can be downloaded at inference time. Alternatively, you can use a locally accessible URL or base64-encoded image data.
+</Note>
+
 ```bash Command
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
