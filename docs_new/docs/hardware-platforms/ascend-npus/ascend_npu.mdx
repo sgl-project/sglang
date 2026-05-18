@@ -55,16 +55,22 @@ You can install SGLang using any of the methods below. Please go through `System
 
 You can obtain the dependency of a specified version of CANN through an image.
 
-<Note>
-CANN images and SGLang images are hosted at different registry addresses. Make sure to pull them from the correct location.
-</Note>
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
 ```bash Command
-# for Atlas 800I A3 and Ubuntu OS
 docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
-# for Atlas 800I A2 and Ubuntu OS
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
 docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 ```
+
+  </Tab>
+</Tabs>
 
 ## Preparing the Running Environment
 
@@ -143,13 +149,23 @@ pip install -e python[all_npu]
 #### Obtain Image
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download SGLang image
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
-dockerhub: docker.io/lmsysorg/sglang:$tag
-# Main-based tag, change main to specific version like v0.5.6,
-# you can get image for specific version
-Atlas 800I A3 : {main}-cann8.5.0-a3
-Atlas 800I A2: {main}-cann8.5.0-910b
+docker pull docker.io/lmsysorg/sglang:{main}-cann8.5.0-a3
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull docker.io/lmsysorg/sglang:{main}-cann8.5.0-910b
+```
+
+  </Tab>
+</Tabs>
 2. Build an image based on Dockerfile
 ```bash Command
 # Clone the SGLang repository
@@ -165,7 +181,8 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 #### Create Docker
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
-__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
 ```bash Command
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
@@ -184,6 +201,28 @@ drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for download model by SGLang.
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+  </Tab>
+</Tabs>
 
 <Tip>
 SGLang will serve on `http://127.0.0.1:30000` by default. You can change the host and port by `--host` and `--port` parameters.
@@ -234,6 +273,10 @@ python3 -m sglang.launch_server \
 
 #### PD Disaggregation Scene
 1. Launch Prefill Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
@@ -242,7 +285,30 @@ export SGLANG_SET_CPU_AFFINITY=1
 # PORT: one free port
 # all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -257,13 +323,39 @@ python3 -m sglang.launch_server \
     --port 8000
 ```
 
+  </Tab>
+</Tabs>
+
 2. Launch Decode Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
 # PIP: recommended to config first Prefill Server IP
 # PORT: one free port
 # all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8001
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -276,6 +368,9 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 \
     --port 8001
 ```
+
+  </Tab>
+</Tabs>
 
 3. Launch Router
 ```bash Command
