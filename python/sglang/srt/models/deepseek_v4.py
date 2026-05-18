@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -49,7 +58,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -62,6 +71,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -86,10 +96,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import (
-        ForwardBatch,
-        PPProxyTensors,
-    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @triton.jit
@@ -870,11 +877,15 @@ class DeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
-        )
+        self.hidden_size = config.hidden_size
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
@@ -892,17 +903,21 @@ class DeepseekV4Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
         self.gemm_output_zero_allocator_size = 0
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
-        hc_dim = hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        if self.pp_group.is_last_rank:
+            hc_dim = hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(hc_mult, hc_dim, dtype=torch.float32)
+            )
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+            self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -940,9 +955,19 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.view(
+                    hidden_states.shape[0], self.hc_mult, self.hidden_size
+                )
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -956,7 +981,8 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         for i in range(self.start_layer, self.end_layer):
@@ -969,13 +995,18 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if nsa_use_prefill_cp(forward_batch):
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        if not self.pp_group.is_last_rank:
+            # Flatten 3D mHC tensor for PP IPC.
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -1003,27 +1034,36 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(
+                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                )
             }
         )
+
+        # Expose start_layer/end_layer for model_runner PP support
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1077,8 +1117,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
-                input_ids, positions, forward_batch, input_embeds
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -1098,7 +1141,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         if is_nextn:
             layers = [self.model.decoder]
         else:
-            layers = self.model.layers
+            layers = [
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            ]
         for layer in layers:
             attn = layer.self_attn
             G = attn.n_local_groups
@@ -1121,7 +1167,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
-        for layer in self.model.layers:
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
             if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
                 self_attn.compressor.apply_ape_hotfix()
@@ -1389,7 +1436,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
-                            if ".norm." in name and not self.pp_group.is_last_rank:
+                            if (
+                                name == "model.norm.weight"
+                                and not self.pp_group.is_last_rank
+                            ):
+                                continue
+                            if (
+                                name.startswith("model.hc_head_")
+                                or name == "lm_head.weight"
+                            ) and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
                                 is_kv = name.endswith(".wkv.weight")
@@ -1493,6 +1548,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        if not self.pp_group.is_first_rank:
+            skipped_checking_patterns.append("embed_tokens")
+        if not self.pp_group.is_last_rank:
+            skipped_checking_patterns.append("model.norm.")
+            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {

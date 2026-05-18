@@ -75,12 +75,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -398,7 +398,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
-        self.straggler_request_list: List[Tuple] = []
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -445,7 +444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -780,6 +779,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
+                    if self.server_args.language_only:
+                        logger.warning(
+                            "Encoder embedding not available, "
+                            "falling back to local mm processing"
+                        )
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
@@ -1487,7 +1491,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        if not abort_all and rid not in self.rid_to_state:
+        # Empty rid would startswith-match every request on the scheduler.
+        if not abort_all and not rid:
+            logger.warning("Ignore abort_request with empty rid and abort_all=False")
+            return
+        if (
+            not abort_all
+            and self.server_args.tokenizer_worker_num == 1
+            and rid not in self.rid_to_state
+        ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
