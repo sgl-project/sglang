@@ -687,59 +687,85 @@ def _run_differential(
     _assert_states_match(cuda_state=state_cuda, ref_state=state_ref, scenario=scenario)
 
 
+def _empty_plan_lists() -> dict:
+    """Default empty-list values for every plan-list field.
+
+    Scenario builders start from this dict and overwrite only the fields
+    that are non-empty for their case; cuts down ~12 lines of boilerplate
+    per scenario.
+    """
+    return dict(
+        verify_slot_indices=[],
+        verify_positions=[],
+        verify_req_ids=[],
+        verify_prev_slot_indices=[],
+        verify_active_mask=[],
+        write_slot_indices=[],
+        write_token_ids=[],
+        write_positions=[],
+        write_req_ids=[],
+        write_req_seed_slot_indices=[],
+        write_req_entry_starts=[],
+        write_req_entry_counts=[],
+        write_req_active_mask=[],
+    )
+
+
 def _scenario_write_only_single_req() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        write_slot_indices=[0, 1, 2],
+        write_token_ids=[101, 202, 303],
+        write_positions=[0, 1, 2],
+        write_req_ids=[7, 7, 7],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[3],
+        write_req_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
         ring_capacity=8,
         kernel_kind=KERNEL_KIND_HEAD,
         prefill_writes=None,
-        plan=dict(
-            verify_slot_indices=[],
-            verify_positions=[],
-            verify_req_ids=[],
-            verify_prev_slot_indices=[],
-            verify_active_mask=[],
-            write_slot_indices=[0, 1, 2],
-            write_token_ids=[101, 202, 303],
-            write_positions=[0, 1, 2],
-            write_req_ids=[7, 7, 7],
-            write_req_seed_slot_indices=[-1],
-            write_req_entry_starts=[0],
-            write_req_entry_counts=[3],
-            write_req_active_mask=[1],
-        ),
+        plan=plan,
     )
 
 
 def _scenario_write_only_multi_req() -> dict:
     # Two reqs, each starting from kSeed -> two independent chains; chosen
     # so their write_slots do not overlap.
+    plan = _empty_plan_lists()
+    plan.update(
+        write_slot_indices=[0, 1, 2, 3],
+        write_token_ids=[10, 20, 30, 40],
+        write_positions=[0, 1, 0, 1],
+        write_req_ids=[5, 5, 9, 9],
+        write_req_seed_slot_indices=[-1, -1],
+        write_req_entry_starts=[0, 2],
+        write_req_entry_counts=[2, 2],
+        write_req_active_mask=[1, 1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
         ring_capacity=8,
         kernel_kind=KERNEL_KIND_HEAD,
         prefill_writes=None,
-        plan=dict(
-            verify_slot_indices=[],
-            verify_positions=[],
-            verify_req_ids=[],
-            verify_prev_slot_indices=[],
-            verify_active_mask=[],
-            write_slot_indices=[0, 1, 2, 3],
-            write_token_ids=[10, 20, 30, 40],
-            write_positions=[0, 1, 0, 1],
-            write_req_ids=[5, 5, 9, 9],
-            write_req_seed_slot_indices=[-1, -1],
-            write_req_entry_starts=[0, 2],
-            write_req_entry_counts=[2, 2],
-            write_req_active_mask=[1, 1],
-        ),
+        plan=plan,
     )
 
 
 def _scenario_verify_only_clean_chain() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1, 2],
+        verify_positions=[0, 1, 2],
+        verify_req_ids=[4, 4, 4],
+        verify_prev_slot_indices=[-1, 0, 1],
+        verify_active_mask=[1, 1, 1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
@@ -751,25 +777,19 @@ def _scenario_verify_only_clean_chain() -> dict:
             positions=[0, 1, 2],
             req_id=4,
         ),
-        plan=dict(
-            verify_slot_indices=[0, 1, 2],
-            verify_positions=[0, 1, 2],
-            verify_req_ids=[4, 4, 4],
-            verify_prev_slot_indices=[-1, 0, 1],
-            verify_active_mask=[1, 1, 1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
     )
 
 
 def _scenario_verify_only_req_id_mismatch() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_req_ids=[99],  # mismatch: slot stored req_id=5
+        verify_prev_slot_indices=[-1],
+        verify_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
@@ -781,26 +801,20 @@ def _scenario_verify_only_req_id_mismatch() -> dict:
             positions=[0],
             req_id=5,
         ),
-        plan=dict(
-            verify_slot_indices=[0],
-            verify_positions=[0],
-            verify_req_ids=[99],  # mismatch: slot stored req_id=5
-            verify_prev_slot_indices=[-1],
-            verify_active_mask=[1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
         expected_fail_reason=FailReason.REQ_ID,
     )
 
 
 def _scenario_verify_only_position_mismatch() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0],
+        verify_positions=[5],  # mismatch: slot stored position=0
+        verify_req_ids=[1],
+        verify_prev_slot_indices=[-1],
+        verify_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
@@ -812,26 +826,20 @@ def _scenario_verify_only_position_mismatch() -> dict:
             positions=[0],
             req_id=1,
         ),
-        plan=dict(
-            verify_slot_indices=[0],
-            verify_positions=[5],  # mismatch: slot stored position=0
-            verify_req_ids=[1],
-            verify_prev_slot_indices=[-1],
-            verify_active_mask=[1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
         expected_fail_reason=FailReason.POSITION_MONOTONIC,
     )
 
 
 def _scenario_verify_only_hash_mismatch() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_req_ids=[1],
+        verify_prev_slot_indices=[-1],
+        verify_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
@@ -845,21 +853,7 @@ def _scenario_verify_only_hash_mismatch() -> dict:
         ),
         # Post-prefill we corrupt slot[0].prev_hash; verify should fire HASH.
         corrupt_prev_hash=dict(slot=0, value=0xDEADBEEFDEADBEEF),
-        plan=dict(
-            verify_slot_indices=[0],
-            verify_positions=[0],
-            verify_req_ids=[1],
-            verify_prev_slot_indices=[-1],
-            verify_active_mask=[1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
         expected_fail_reason=FailReason.HASH,
     )
 
@@ -867,6 +861,22 @@ def _scenario_verify_only_hash_mismatch() -> dict:
 def _scenario_mixed_write_and_verify() -> dict:
     # Same forward: verify positions [0,1] (already written) and write
     # new positions [2,3] on top of them.
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1],
+        verify_positions=[0, 1],
+        verify_req_ids=[3, 3],
+        verify_prev_slot_indices=[-1, 0],
+        verify_active_mask=[1, 1],
+        write_slot_indices=[2, 3],
+        write_token_ids=[81, 82],
+        write_positions=[2, 3],
+        write_req_ids=[3, 3],
+        write_req_seed_slot_indices=[1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[2],
+        write_req_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
@@ -878,21 +888,7 @@ def _scenario_mixed_write_and_verify() -> dict:
             positions=[0, 1],
             req_id=3,
         ),
-        plan=dict(
-            verify_slot_indices=[0, 1],
-            verify_positions=[0, 1],
-            verify_req_ids=[3, 3],
-            verify_prev_slot_indices=[-1, 0],
-            verify_active_mask=[1, 1],
-            write_slot_indices=[2, 3],
-            write_token_ids=[81, 82],
-            write_positions=[2, 3],
-            write_req_ids=[3, 3],
-            write_req_seed_slot_indices=[1],
-            write_req_entry_starts=[0],
-            write_req_entry_counts=[2],
-            write_req_active_mask=[1],
-        ),
+        plan=plan,
     )
 
 
@@ -900,6 +896,14 @@ def _scenario_first_violation_latch_preserved() -> dict:
     # Two verify entries on the same req; the first hits a REQ_ID mismatch,
     # the second hits POSITION mismatch. The first-violation latch must
     # preserve the REQ_ID row.
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1],
+        verify_positions=[0, 999],
+        verify_req_ids=[42, 3],  # entry 0: REQ_ID mismatch wins latch.
+        verify_prev_slot_indices=[-1, 0],
+        verify_active_mask=[1, 1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
@@ -911,46 +915,29 @@ def _scenario_first_violation_latch_preserved() -> dict:
             positions=[0, 1],
             req_id=3,
         ),
-        plan=dict(
-            verify_slot_indices=[0, 1],
-            verify_positions=[0, 999],
-            verify_req_ids=[42, 3],  # entry 0: REQ_ID mismatch wins latch.
-            verify_prev_slot_indices=[-1, 0],
-            verify_active_mask=[1, 1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
     )
 
 
 def _scenario_small_k_req() -> dict:
+    plan = _empty_plan_lists()
+    plan.update(
+        write_slot_indices=[0],
+        write_token_ids=[7],
+        write_positions=[0],
+        write_req_ids=[1],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[1],
+        write_req_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=2,
         ring_capacity=4,
         kernel_kind=KERNEL_KIND_HEAD,
         prefill_writes=None,
-        plan=dict(
-            verify_slot_indices=[],
-            verify_positions=[],
-            verify_req_ids=[],
-            verify_prev_slot_indices=[],
-            verify_active_mask=[],
-            write_slot_indices=[0],
-            write_token_ids=[7],
-            write_positions=[0],
-            write_req_ids=[1],
-            write_req_seed_slot_indices=[-1],
-            write_req_entry_starts=[0],
-            write_req_entry_counts=[1],
-            write_req_active_mask=[1],
-        ),
+        plan=plan,
     )
 
 
@@ -964,6 +951,14 @@ def _scenario_large_k_req_1w() -> dict:
     write_slots = list(range(n))
     verify_slots = list(range(n))
     verify_prev = [-1] + list(range(n - 1))
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=verify_slots,
+        verify_positions=positions,
+        verify_req_ids=[2] * n,
+        verify_prev_slot_indices=verify_prev,
+        verify_active_mask=[1] * n,
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=n,
@@ -975,21 +970,7 @@ def _scenario_large_k_req_1w() -> dict:
             positions=positions,
             req_id=2,
         ),
-        plan=dict(
-            verify_slot_indices=verify_slots,
-            verify_positions=positions,
-            verify_req_ids=[2] * n,
-            verify_prev_slot_indices=verify_prev,
-            verify_active_mask=[1] * n,
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
     )
 
 
@@ -997,6 +978,14 @@ def _scenario_ring_buffer_small_capacity() -> dict:
     # Exactly one mismatch is enough to populate first_violation + one
     # ring row; keeps us in the single-producer-per-row regime where the
     # torch reference and the CUDA kernel agree bit-wise.
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_req_ids=[7],
+        verify_prev_slot_indices=[-1],
+        verify_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
@@ -1008,21 +997,7 @@ def _scenario_ring_buffer_small_capacity() -> dict:
             positions=[0],
             req_id=5,
         ),
-        plan=dict(
-            verify_slot_indices=[0],
-            verify_positions=[0],
-            verify_req_ids=[7],
-            verify_prev_slot_indices=[-1],
-            verify_active_mask=[1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
     )
 
 
@@ -1035,27 +1010,29 @@ def _scenario_real_kv_hash_clean_chain(*, mode_int: int, read_bytes: int) -> dic
     the same buffer, so the stored fingerprint matches the recomputed
     one and no violation should fire.
     """
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1, 2],
+        verify_positions=[0, 1, 2],
+        verify_req_ids=[3, 3, 3],
+        verify_prev_slot_indices=[-1, 0, 1],
+        verify_active_mask=[1, 1, 1],
+        write_slot_indices=[0, 1, 2],
+        write_token_ids=[101, 202, 303],
+        write_positions=[0, 1, 2],
+        write_req_ids=[3, 3, 3],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[3],
+        write_req_active_mask=[1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
         ring_capacity=8,
         kernel_kind=KERNEL_KIND_HEAD,
         prefill_writes=None,
-        plan=dict(
-            verify_slot_indices=[0, 1, 2],
-            verify_positions=[0, 1, 2],
-            verify_req_ids=[3, 3, 3],
-            verify_prev_slot_indices=[-1, 0, 1],
-            verify_active_mask=[1, 1, 1],
-            write_slot_indices=[0, 1, 2],
-            write_token_ids=[101, 202, 303],
-            write_positions=[0, 1, 2],
-            write_req_ids=[3, 3, 3],
-            write_req_seed_slot_indices=[-1],
-            write_req_entry_starts=[0],
-            write_req_entry_counts=[3],
-            write_req_active_mask=[1],
-        ),
+        plan=plan,
         real_kv=dict(
             slot_stride_bytes=64,
             read_bytes=read_bytes,
@@ -1086,6 +1063,14 @@ def _scenario_real_kv_hash_corruption_caught() -> dict:
     records a violation. The CUDA + torch reference paths must produce
     bit-identical state.
     """
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1, 2],
+        verify_positions=[0, 1, 2],
+        verify_req_ids=[3, 3, 3],
+        verify_prev_slot_indices=[-1, 0, 1],
+        verify_active_mask=[1, 1, 1],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=8,
@@ -1097,21 +1082,7 @@ def _scenario_real_kv_hash_corruption_caught() -> dict:
             positions=[0, 1, 2],
             req_id=3,
         ),
-        plan=dict(
-            verify_slot_indices=[0, 1, 2],
-            verify_positions=[0, 1, 2],
-            verify_req_ids=[3, 3, 3],
-            verify_prev_slot_indices=[-1, 0, 1],
-            verify_active_mask=[1, 1, 1],
-            write_slot_indices=[],
-            write_token_ids=[],
-            write_positions=[],
-            write_req_ids=[],
-            write_req_seed_slot_indices=[],
-            write_req_entry_starts=[],
-            write_req_entry_counts=[],
-            write_req_active_mask=[],
-        ),
+        plan=plan,
         real_kv=dict(
             slot_stride_bytes=64,
             read_bytes=16,
@@ -1130,27 +1101,29 @@ def _scenario_inactive_mask_skipped() -> dict:
     # Every active_mask = 0 -> kernel must be a no-op on slot I/O and
     # slot_run_counter, but kernel_run_counter still advances. Same
     # contract must hold for the torch reference.
+    plan = _empty_plan_lists()
+    plan.update(
+        verify_slot_indices=[0, 1],
+        verify_positions=[0, 1],
+        verify_req_ids=[1, 1],
+        verify_prev_slot_indices=[-1, 0],
+        verify_active_mask=[0, 0],
+        write_slot_indices=[0, 1],
+        write_token_ids=[10, 20],
+        write_positions=[0, 1],
+        write_req_ids=[1, 1],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[2],
+        write_req_active_mask=[0],
+    )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
         num_slots=4,
         ring_capacity=4,
         kernel_kind=KERNEL_KIND_HEAD,
         prefill_writes=None,
-        plan=dict(
-            verify_slot_indices=[0, 1],
-            verify_positions=[0, 1],
-            verify_req_ids=[1, 1],
-            verify_prev_slot_indices=[-1, 0],
-            verify_active_mask=[0, 0],
-            write_slot_indices=[0, 1],
-            write_token_ids=[10, 20],
-            write_positions=[0, 1],
-            write_req_ids=[1, 1],
-            write_req_seed_slot_indices=[-1],
-            write_req_entry_starts=[0],
-            write_req_entry_counts=[2],
-            write_req_active_mask=[0],
-        ),
+        plan=plan,
     )
 
 
