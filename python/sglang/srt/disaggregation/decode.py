@@ -1159,6 +1159,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            if self._engine_paused:
+                continue
+
             self.process_decode_queue()
 
             if self._engine_paused:
@@ -1188,6 +1191,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
 
             self.process_decode_queue()
             if self._engine_paused:
