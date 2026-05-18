@@ -124,11 +124,27 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** — push again to dispatch.';
+
+            // Status icon distinguishes live / success / gate-failed / cancelled
+            // so the body reflects the actual run state instead of looking
+            // uniformly "dispatched" even when call-gate failed.
+            function runIcon(run) {
+              if (run.status !== 'completed') return ':hourglass_flowing_sand:';
+              switch (run.conclusion) {
+                case 'success': return ':white_check_mark:';
+                case 'failure': return ':x:';
+                case 'cancelled': return ':no_entry_sign:';
+                case 'timed_out': return ':alarm_clock:';
+                case 'action_required': return ':warning:';
+                default: return ':grey_question:';
+              }
+            }
+            const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
             const ptText = isReal(ptRun)
-              ? `[Run #${ptRun.id}](${ptRun.html_url})`
+              ? runLink(ptRun)
               : (!hasCI ? missingCIText : '_Not run yet_');
             const peText = isReal(peRun)
-              ? `[Run #${peRun.id}](${peRun.html_url})`
+              ? runLink(peRun)
               : !hasCI
                 ? peBlockedByCIText
                 : !hasExtra
