@@ -363,6 +363,15 @@ class Relayer:
         # idle draft tensors stay attached to ``draft_input``.
         if indices.numel() == 0:
             return
+        # The indices tensor was allocated on the default stream but is
+        # used here on the forward stream. Meanwhile, the old spec_info
+        # holding this tensor will lose all Python references (replaced at
+        # batch.spec_info), so the caching allocator could reclaim the
+        # memory before the GPU finishes reading it.
+        # Temporary: until PR-7/8 makes future_indices a Relayer-owned
+        # handle that never gets its Python ref drop, this record_stream
+        # is needed.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
         draft_input.topk_p = self.gpu_scalar.resolve_by_indices(indices, "topk_p")
         draft_input.topk_index = self.gpu_scalar.resolve_by_indices(
             indices, "topk_index"

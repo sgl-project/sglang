@@ -60,6 +60,8 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    record_stream_each,
+    record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -967,7 +969,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
 
     def verify(self, batch: ScheduleBatch):
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        # Temporary: until PR-7/8 routes input_ids / out_cache_loc /
+        # verify_input fields through Relayer handles, mid-forward rebind
+        # in prepare_for_v2_verify / _draft_extend_for_decode drops FD's
+        # Python ref to the original tensor while fwd_stream still reads
+        # it. record_stream tells the caching allocator to defer reclaim
+        # until fwd_stream syncs.
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
@@ -988,6 +998,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+
+        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
