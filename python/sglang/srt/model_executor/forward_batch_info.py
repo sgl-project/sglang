@@ -486,25 +486,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
+        # Channel-resolve seq_lens family: when SB has a Relayer ctx, fetch
+        # from the gpu_scalar channel (cross-stream-safe via cuda event wait)
+        # rather than reading the live SB attribute. Falls back to the
+        # attribute when no relayer ctx is attached (legacy path).
+        sb_seq_lens = batch.relayer_resolve_seq_lens()
+        sb_orig_seq_lens = batch.relayer_resolve_orig_seq_lens()
+        sb_seq_lens_cpu = batch.relayer_resolve_seq_lens_cpu()
         if seq_lens_cpu_cache is not None:
             # Stale-cache guard: shape must match current GPU seq_lens. Mismatch
             # means caller forgot to refresh the override after batch size
             # changed (e.g. filter/merge_batch); using a stale cache would
             # propagate wrong CPU mirror to downstream DP / cudagraph logic.
-            assert seq_lens_cpu_cache.shape == batch.seq_lens.shape, (
+            assert seq_lens_cpu_cache.shape == sb_seq_lens.shape, (
                 f"seq_lens_cpu_cache shape {seq_lens_cpu_cache.shape} != "
-                f"seq_lens {batch.seq_lens.shape}; stale override on batch?"
+                f"seq_lens {sb_seq_lens.shape}; stale override on batch?"
             )
             seq_lens_cpu = seq_lens_cpu_cache
         else:
-            seq_lens_cpu = batch.seq_lens_cpu
+            seq_lens_cpu = sb_seq_lens_cpu
 
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
+            batch_size=len(sb_seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
+            seq_lens=sb_seq_lens,
             out_cache_loc=batch.out_cache_loc,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
@@ -516,7 +523,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
-            orig_seq_lens=batch.orig_seq_lens,
+            orig_seq_lens=sb_orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -609,7 +616,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                # Read via channel resolve when relayer ctx is set so the
+                # position computation observes the post-decode seq_lens
+                # written through the gpu_scalar channel.
+                ret.positions = clamp_position(batch.relayer_resolve_seq_lens())
         else:
             assert isinstance(extend_seq_lens, list)
             assert isinstance(extend_prefix_lens, list)
