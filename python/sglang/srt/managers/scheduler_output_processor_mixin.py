@@ -464,17 +464,25 @@ class SchedulerOutputProcessorMixin:
         # delta and apply to req.kv_committed_len in one place so consumers
         # (cache_finished_req / prepare_for_decode / SWA evict) see a
         # post-iter value derived from the channel rather than from an
-        # in-place mutation scattered across this loop.
+        # in-place mutation scattered across this loop. We also attach a
+        # per-req ``relayer_kv_committed_ctx`` so downstream callers using
+        # ``Req.relayer_resolve_kv_committed_len`` resolve the channel
+        # value directly.
         relayer = getattr(self, "relayer", None)
         if relayer is not None and result.cpu_future_indices is not None:
             relayer.store_kv_committed_delta(
                 result.cpu_future_indices, kv_committed_deltas
             )
             relayer.store_finished_status(result.cpu_future_indices, finished_status)
-            for req, delta in zip(
-                batch.reqs,
-                relayer.resolve_kv_committed_delta(result.cpu_future_indices),
+            for slot_offset, (req, delta) in enumerate(
+                zip(
+                    batch.reqs,
+                    relayer.resolve_kv_committed_delta(result.cpu_future_indices),
+                )
             ):
+                req.set_relayer_kv_committed_ctx(
+                    relayer, result.cpu_future_indices, slot_offset
+                )
                 req.kv_committed_len += delta
         else:
             for req, delta in zip(batch.reqs, kv_committed_deltas):
