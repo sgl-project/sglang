@@ -501,7 +501,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
 
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

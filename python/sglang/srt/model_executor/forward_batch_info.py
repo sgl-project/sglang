@@ -649,7 +649,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.out_cache_loc_swa = (
                 model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     ret.out_cache_loc
-                ).to(torch.int64)
+                )
             )
 
         # Init lora information

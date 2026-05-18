@@ -154,6 +154,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -413,6 +414,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:

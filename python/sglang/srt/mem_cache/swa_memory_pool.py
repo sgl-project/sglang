@@ -163,7 +163,7 @@ class SWAKVPool(BaseSWAKVPool):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def set_kv_buffer(
         self,
@@ -173,7 +173,7 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        loc_swa: torch.Tensor = None,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
 
         layer_id = layer.layer_id
