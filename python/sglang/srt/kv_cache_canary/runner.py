@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
-    CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
     canary_step,
@@ -18,11 +17,13 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryDeviceState,
     CanaryHostState,
 )
-from sglang.srt.kv_cache_canary.pool_patch import attach_shadow_buffers, get_shadow_buffers
+from sglang.srt.kv_cache_canary.pool_patch import (
+    attach_shadow_buffers,
+    get_shadow_buffers,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,9 @@ class CanaryRunner:
         self._side_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
         )
-        self._is_errored_host = torch.zeros(1, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+        self._is_errored_host = torch.zeros(
+            1, dtype=torch.uint8, pin_memory=torch.cuda.is_available()
+        )
 
         self._forward_pass_id = 0
         self._violation_already_handled = False
@@ -99,7 +102,9 @@ class CanaryRunner:
         plan: BatchPlan,
         slot_indices: torch.Tensor,
     ) -> None:
-        self._run_kernel(plan=plan, slot_indices=slot_indices, kernel_kind=KERNEL_KIND_HEAD)
+        self._run_kernel(
+            plan=plan, slot_indices=slot_indices, kernel_kind=KERNEL_KIND_HEAD
+        )
 
     def run_tail(
         self,
@@ -107,7 +112,9 @@ class CanaryRunner:
         plan: BatchPlan,
         slot_indices: torch.Tensor,
     ) -> None:
-        self._run_kernel(plan=plan, slot_indices=slot_indices, kernel_kind=KERNEL_KIND_TAIL)
+        self._run_kernel(
+            plan=plan, slot_indices=slot_indices, kernel_kind=KERNEL_KIND_TAIL
+        )
         self._forward_pass_id += 1
 
     def poll_violations(self) -> None:
@@ -118,7 +125,9 @@ class CanaryRunner:
             return
         with torch.cuda.stream(self._side_stream):
             self._side_stream.wait_stream(torch.cuda.current_stream(self._device))
-            self._is_errored_host.copy_(self._device_state.is_errored, non_blocking=True)
+            self._is_errored_host.copy_(
+                self._device_state.is_errored, non_blocking=True
+            )
         self._side_stream.synchronize()
         if int(self._is_errored_host.item()) == 0:
             return
@@ -149,11 +158,21 @@ class CanaryRunner:
             slot_run_counter = self._device_state.slot_run_counter_tail
             kernel_run_counter = self._device_state.kernel_run_counter_tail
 
-        expected_req_ids = torch.tensor(plan.expected_req_ids, dtype=torch.int64, device=self._device)
-        expected_token_ids = torch.tensor(plan.expected_token_ids, dtype=torch.int64, device=self._device)
-        expected_positions = torch.tensor(plan.expected_positions, dtype=torch.int64, device=self._device)
-        expected_prev_hashes = torch.tensor(plan.expected_prev_hashes, dtype=torch.int64, device=self._device)
-        verify_mask = torch.tensor(plan.verify_mask, dtype=torch.int32, device=self._device)
+        expected_req_ids = torch.tensor(
+            plan.expected_req_ids, dtype=torch.int64, device=self._device
+        )
+        expected_token_ids = torch.tensor(
+            plan.expected_token_ids, dtype=torch.int64, device=self._device
+        )
+        expected_positions = torch.tensor(
+            plan.expected_positions, dtype=torch.int64, device=self._device
+        )
+        expected_prev_hashes = torch.tensor(
+            plan.expected_prev_hashes, dtype=torch.int64, device=self._device
+        )
+        verify_mask = torch.tensor(
+            plan.verify_mask, dtype=torch.int32, device=self._device
+        )
 
         canary_step(
             src_buf=src_buf.view(torch.uint8).flatten(),
@@ -178,7 +197,16 @@ class CanaryRunner:
     def _handle_violation(self) -> None:
         first_violation = self._device_state.first_violation.cpu().tolist()
         write_index = int(self._device_state.violation_write_index.cpu().item())
-        kernel_kind, fail_reason, slot_idx, req_id, token_id, position, expected_hash, actual_hash = first_violation
+        (
+            kernel_kind,
+            fail_reason,
+            slot_idx,
+            req_id,
+            token_id,
+            position,
+            expected_hash,
+            actual_hash,
+        ) = first_violation
 
         message = (
             "kv-canary violation: kernel_kind={kk} fail_reason={fr} slot_idx={sl} "
@@ -213,7 +241,9 @@ class CanaryRunner:
             tp_group = get_tp_group()
             torch.distributed.all_reduce(flag, group=tp_group.device_group)
         except Exception:
-            logger.exception("kv-canary: failed to allreduce violation flag; raising locally")
+            logger.exception(
+                "kv-canary: failed to allreduce violation flag; raising locally"
+            )
         any_rank_errored = int(flag.cpu().item()) > 0
         if any_rank_errored:
             raise RuntimeError(message)

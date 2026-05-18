@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import torch
 
@@ -64,9 +63,13 @@ class CanaryHostState:
         input_tokens_per_req : the token ids being inserted for each req (length = req_token_counts[i])
         """
         if len(req_pool_indices) != len(req_token_counts):
-            raise RuntimeError("kv-canary: req_pool_indices and req_token_counts length mismatch")
+            raise RuntimeError(
+                "kv-canary: req_pool_indices and req_token_counts length mismatch"
+            )
         if len(req_pool_indices) != len(input_tokens_per_req):
-            raise RuntimeError("kv-canary: req_pool_indices and input_tokens_per_req length mismatch")
+            raise RuntimeError(
+                "kv-canary: req_pool_indices and input_tokens_per_req length mismatch"
+            )
 
         total_slots = sum(req_token_counts)
         expected_req_ids = [0] * total_slots
@@ -80,7 +83,10 @@ class CanaryHostState:
         cursor = 0
         with self._lock:
             for req_pool_idx, count, start_pos, tokens in zip(
-                req_pool_indices, req_token_counts, req_start_positions, input_tokens_per_req
+                req_pool_indices,
+                req_token_counts,
+                req_start_positions,
+                input_tokens_per_req,
             ):
                 state = self._get_or_init(req_pool_idx)
                 prev_hash = state.prev_hash_tail
@@ -96,7 +102,9 @@ class CanaryHostState:
                     prev_hash = mix_step(prev_hash, token_id, pos)
                     cursor += 1
                 new_k_req = max(k_req, start_pos + count)
-                next_state[req_pool_idx] = _RequestState(prev_hash_tail=prev_hash, k_req=new_k_req)
+                next_state[req_pool_idx] = _RequestState(
+                    prev_hash_tail=prev_hash, k_req=new_k_req
+                )
 
         return BatchPlan(
             expected_req_ids=expected_req_ids,
@@ -146,11 +154,17 @@ class CanaryDeviceState:
     kernel_run_counter_tail: torch.Tensor
 
     @classmethod
-    def allocate(cls, *, device: torch.device, ring_capacity: int) -> "CanaryDeviceState":
+    def allocate(
+        cls, *, device: torch.device, ring_capacity: int
+    ) -> "CanaryDeviceState":
         return cls(
-            violation_ring=torch.zeros(ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device),
+            violation_ring=torch.zeros(
+                ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
+            ),
             violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
-            first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device=device),
+            first_violation=torch.zeros(
+                VIOLATION_FIELDS, dtype=torch.int64, device=device
+            ),
             first_violation_set=torch.zeros(1, dtype=torch.int32, device=device),
             is_errored=torch.zeros(1, dtype=torch.uint8, device=device),
             slot_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),

@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
-    CANARY_FIELDS_PER_SLOT,
     CANARY_SLOT_BYTES,
     FAIL_REASON_HASH,
     FAIL_REASON_POSITION,
@@ -23,7 +22,9 @@ register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 
 def _alloc_state(ring_capacity: int = 64) -> dict:
     return dict(
-        violation_ring=torch.zeros(ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device="cuda"),
+        violation_ring=torch.zeros(
+            ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device="cuda"
+        ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device="cuda"),
         first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device="cuda"),
         first_violation_set=torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -57,10 +58,18 @@ def _run(
         dst_buf=dst,
         slot_stride_bytes=slot_stride_bytes,
         slot_indices=torch.tensor(slot_indices, dtype=torch.int64, device="cuda"),
-        expected_req_ids=torch.tensor(expected_req_ids, dtype=torch.int64, device="cuda"),
-        expected_token_ids=torch.tensor(expected_token_ids, dtype=torch.int64, device="cuda"),
-        expected_positions=torch.tensor(expected_positions, dtype=torch.int64, device="cuda"),
-        expected_prev_hashes=torch.tensor(expected_prev_hashes, dtype=torch.int64, device="cuda"),
+        expected_req_ids=torch.tensor(
+            expected_req_ids, dtype=torch.int64, device="cuda"
+        ),
+        expected_token_ids=torch.tensor(
+            expected_token_ids, dtype=torch.int64, device="cuda"
+        ),
+        expected_positions=torch.tensor(
+            expected_positions, dtype=torch.int64, device="cuda"
+        ),
+        expected_prev_hashes=torch.tensor(
+            expected_prev_hashes, dtype=torch.int64, device="cuda"
+        ),
         verify_mask=torch.tensor(verify_mask, dtype=torch.int32, device="cuda"),
         violation_ring=state["violation_ring"],
         violation_write_index=state["violation_write_index"],
@@ -74,7 +83,9 @@ def _run(
     torch.cuda.synchronize()
 
 
-def _read_slot(buf: torch.Tensor, slot_idx: int, slot_stride_bytes: int) -> tuple[int, int, int, int]:
+def _read_slot(
+    buf: torch.Tensor, slot_idx: int, slot_stride_bytes: int
+) -> tuple[int, int, int, int]:
     row = buf[slot_idx, :CANARY_SLOT_BYTES].clone().view(torch.int64).cpu().tolist()
     return tuple(int(x) for x in row)
 
@@ -132,7 +143,9 @@ def test_verify_round_trip_no_violation():
     positions = [0, 1, 2]
     prev_hashes: list[int] = [0]
     for i in range(1, num_slots):
-        prev_hashes.append(mix_step(prev_hashes[-1], token_ids[i - 1], positions[i - 1]))
+        prev_hashes.append(
+            mix_step(prev_hashes[-1], token_ids[i - 1], positions[i - 1])
+        )
     slot_indices = [0, 1, 2]
 
     _run(

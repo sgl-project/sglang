@@ -91,5 +91,12 @@ def _patch_get_contiguous_buf_infos(pool: "MHATokenToKVPool") -> None:
     pool.get_contiguous_buf_infos = patched_get_contiguous_buf_infos
 
 
-def get_shadow_buffers(pool: "MHATokenToKVPool") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return pool.canary_k_head, pool.canary_k_tail, pool.canary_v_head, pool.canary_v_tail
+def get_shadow_buffers(
+    pool: "MHATokenToKVPool",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        pool.canary_k_head,
+        pool.canary_k_tail,
+        pool.canary_v_head,
+        pool.canary_v_tail,
+    )

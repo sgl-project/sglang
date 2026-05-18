@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.host_state import BatchPlan
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
 
@@ -117,7 +117,6 @@ def _plan_from_forward_batch(
     forward_batch: "ForwardBatch",
 ) -> Optional[BatchPlan]:
     """Translate a ``ForwardBatch`` into the per-slot expectations the kernel needs."""
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     if forward_batch.out_cache_loc is None or forward_batch.out_cache_loc.numel() == 0:
         return None
@@ -130,7 +129,10 @@ def _plan_from_forward_batch(
         return None
     is_extend = forward_mode.is_extend() or forward_mode.is_mixed()
     if is_extend:
-        if forward_batch.extend_seq_lens is None or forward_batch.extend_prefix_lens is None:
+        if (
+            forward_batch.extend_seq_lens is None
+            or forward_batch.extend_prefix_lens is None
+        ):
             return None
         seq_lens = forward_batch.extend_seq_lens.detach().cpu().tolist()
         prefix_lens = forward_batch.extend_prefix_lens.detach().cpu().tolist()

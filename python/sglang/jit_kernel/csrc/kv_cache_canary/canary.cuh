@@ -1,5 +1,6 @@
-#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>    // For RuntimeCheck
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
+
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
 #include <dlpack/dlpack.h>
@@ -88,14 +89,15 @@ __device__ inline void store_field(uint8_t* buf, int64_t slot_idx, int64_t strid
   p[field] = value;
 }
 
-__device__ inline void record_violation(const CanaryParams& p,
-                                        int32_t fail_reason,
-                                        int64_t slot_idx,
-                                        int64_t req_id,
-                                        int64_t token_id,
-                                        int64_t position,
-                                        uint64_t expected_hash,
-                                        uint64_t actual_hash) {
+__device__ inline void record_violation(
+    const CanaryParams& p,
+    int32_t fail_reason,
+    int64_t slot_idx,
+    int64_t req_id,
+    int64_t token_id,
+    int64_t position,
+    uint64_t expected_hash,
+    uint64_t actual_hash) {
   int64_t entry[kViolationFields];
   entry[kViolationFieldKernelKind] = static_cast<int64_t>(p.kernel_kind);
   entry[kViolationFieldFailReason] = static_cast<int64_t>(fail_reason);
@@ -149,24 +151,52 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
     const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
     const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
     const int64_t actual_position = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    const uint64_t actual_prev_hash = static_cast<uint64_t>(
-        load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const uint64_t actual_prev_hash =
+        static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
 
     // (a) hash check: did the bytes get tampered with?
     if (actual_req_id != expected_req_id) {
-      record_violation(p, kFailReasonReqId, slot_idx, actual_req_id, actual_token_id, actual_position,
-                       expected_prev_hash, actual_prev_hash);
+      record_violation(
+          p,
+          kFailReasonReqId,
+          slot_idx,
+          actual_req_id,
+          actual_token_id,
+          actual_position,
+          expected_prev_hash,
+          actual_prev_hash);
     } else if (actual_token_id != expected_token_id) {
-      record_violation(p, kFailReasonTokenId, slot_idx, actual_req_id, actual_token_id, actual_position,
-                       expected_prev_hash, actual_prev_hash);
+      record_violation(
+          p,
+          kFailReasonTokenId,
+          slot_idx,
+          actual_req_id,
+          actual_token_id,
+          actual_position,
+          expected_prev_hash,
+          actual_prev_hash);
     } else if (actual_position != expected_position) {
       // (b) per-token position check: if the slot we read does not even hold our
       // own position, the slot map likely points elsewhere.
-      record_violation(p, kFailReasonPosition, slot_idx, actual_req_id, actual_token_id, actual_position,
-                       expected_prev_hash, actual_prev_hash);
+      record_violation(
+          p,
+          kFailReasonPosition,
+          slot_idx,
+          actual_req_id,
+          actual_token_id,
+          actual_position,
+          expected_prev_hash,
+          actual_prev_hash);
     } else if (actual_prev_hash != expected_prev_hash) {
-      record_violation(p, kFailReasonHash, slot_idx, actual_req_id, actual_token_id, actual_position,
-                       expected_prev_hash, actual_prev_hash);
+      record_violation(
+          p,
+          kFailReasonHash,
+          slot_idx,
+          actual_req_id,
+          actual_token_id,
+          actual_position,
+          expected_prev_hash,
+          actual_prev_hash);
     }
   }
 
@@ -191,23 +221,24 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   }
 }
 
-void canary_step(tvm::ffi::TensorView src_buf,
-                 tvm::ffi::TensorView dst_buf,
-                 int64_t slot_stride_bytes,
-                 tvm::ffi::TensorView slot_indices,
-                 tvm::ffi::TensorView expected_req_ids,
-                 tvm::ffi::TensorView expected_token_ids,
-                 tvm::ffi::TensorView expected_positions,
-                 tvm::ffi::TensorView expected_prev_hashes,
-                 tvm::ffi::TensorView verify_mask,
-                 tvm::ffi::TensorView violation_ring,
-                 tvm::ffi::TensorView violation_write_index,
-                 tvm::ffi::TensorView first_violation,
-                 tvm::ffi::TensorView first_violation_set,
-                 tvm::ffi::TensorView is_errored,
-                 tvm::ffi::TensorView slot_run_counter,
-                 tvm::ffi::TensorView kernel_run_counter,
-                 int64_t kernel_kind) {
+void canary_step(
+    tvm::ffi::TensorView src_buf,
+    tvm::ffi::TensorView dst_buf,
+    int64_t slot_stride_bytes,
+    tvm::ffi::TensorView slot_indices,
+    tvm::ffi::TensorView expected_req_ids,
+    tvm::ffi::TensorView expected_token_ids,
+    tvm::ffi::TensorView expected_positions,
+    tvm::ffi::TensorView expected_prev_hashes,
+    tvm::ffi::TensorView verify_mask,
+    tvm::ffi::TensorView violation_ring,
+    tvm::ffi::TensorView violation_write_index,
+    tvm::ffi::TensorView first_violation,
+    tvm::ffi::TensorView first_violation_set,
+    tvm::ffi::TensorView is_errored,
+    tvm::ffi::TensorView slot_run_counter,
+    tvm::ffi::TensorView kernel_run_counter,
+    int64_t kernel_kind) {
   using namespace host;
 
   SymbolicSize N = {"num_slots"};
@@ -222,18 +253,21 @@ void canary_step(tvm::ffi::TensorView src_buf,
       .verify(expected_token_ids)
       .verify(expected_positions)
       .verify(expected_prev_hashes);
-  TensorMatcher({N})
-      .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(verify_mask);
+  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_mask);
 
   const uint32_t num_slots = static_cast<uint32_t>(N.unwrap());
   const DLDevice device = device_.unwrap();
 
-  RuntimeCheck(slot_stride_bytes >= static_cast<int64_t>(kCanaryFieldsPerSlot * sizeof(int64_t)),
-               "canary: slot_stride_bytes must hold at least 32 bytes per slot, got ", slot_stride_bytes);
-  RuntimeCheck(violation_ring.shape[1] == kViolationFields, "canary: violation_ring last dim must be ",
-               kViolationFields, ", got ", violation_ring.shape[1]);
+  RuntimeCheck(
+      slot_stride_bytes >= static_cast<int64_t>(kCanaryFieldsPerSlot * sizeof(int64_t)),
+      "canary: slot_stride_bytes must hold at least 32 bytes per slot, got ",
+      slot_stride_bytes);
+  RuntimeCheck(
+      violation_ring.shape[1] == kViolationFields,
+      "canary: violation_ring last dim must be ",
+      kViolationFields,
+      ", got ",
+      violation_ring.shape[1]);
   const uint32_t ring_capacity = static_cast<uint32_t>(violation_ring.shape[0]);
   RuntimeCheck(ring_capacity > 0, "canary: violation_ring capacity must be positive");
 

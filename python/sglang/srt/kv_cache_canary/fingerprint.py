@@ -11,6 +11,8 @@ def splitmix64(value: int) -> int:
 
 
 def mix_step(prev_hash: int, token_id: int, position: int) -> int:
-    h = splitmix64(prev_hash ^ ((token_id & _U64_MASK) * 0xBF58476D1CE4E5B9 & _U64_MASK))
+    h = splitmix64(
+        prev_hash ^ ((token_id & _U64_MASK) * 0xBF58476D1CE4E5B9 & _U64_MASK)
+    )
     h = splitmix64(h ^ ((position & _U64_MASK) * 0x94D049BB133111EB & _U64_MASK))
     return h & _U64_MASK
