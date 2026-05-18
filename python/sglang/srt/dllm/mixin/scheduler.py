@@ -93,8 +93,7 @@ class SchedulerDllmMixin:
             self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
-            self.metrics_reporter,
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -226,7 +225,9 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
-        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
 
         new_batch.prefill_stats = PrefillStats.from_adder(
             self.adder, self.running_batch.reqs, self.enable_priority_scheduling
