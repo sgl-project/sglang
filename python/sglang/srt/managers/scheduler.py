@@ -3463,7 +3463,8 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
-            logger.info("Cache flushed successfully!")
+            if self.is_stats_logging_rank:
+                logger.info("Cache flushed successfully!")
             success = True
         else:
             logging.warning(
