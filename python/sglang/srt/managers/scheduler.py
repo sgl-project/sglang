@@ -3075,6 +3075,11 @@ class Scheduler(
                     batch_result = self.model_worker.forward_batch_generation(
                         forward_data
                     )
+                    # Pin FD for 2 iters: worker may bind mid-forward tensors
+                    # (verify_input, draft kernels' scratch) into FD fields;
+                    # FD must outlive the schedule-side return for the
+                    # forward_stream-queued reads to be safe.
+                    self.relayer.add_iter_pin(forward_data)
                     if batch_result.extra_keep_alive_refs:
                         self.relayer.add_iter_pin(*batch_result.extra_keep_alive_refs)
                     # FIXME(lsyin): maybe move this to forward_batch_generation
