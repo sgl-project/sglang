@@ -24,7 +24,7 @@ MAMBA_TRACK_INTERVAL = 128
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=745, stage="base-c", runner_config="8-gpu-h200")
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -72,6 +72,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "500",
                 "--max-running-requests",
                 "4",
+                "--weight-loader-prefetch-checkpoints",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
