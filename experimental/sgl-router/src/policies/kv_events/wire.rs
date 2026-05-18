@@ -2,21 +2,27 @@
 //!
 //! SGLang's `ZmqEventPublisher` (Python:
 //! `python/sglang/srt/disaggregation/kv_events.py`) encodes batches with
-//! `msgspec.msgpack` configured as `array_like=True, omit_defaults=True,
-//! gc=False, tag=True`. The combined effect on the wire:
+//! `msgspec.msgpack`. Two struct families are involved:
 //!
-//! * Each struct is a msgpack **array** of its fields in declaration order
-//!   (not a map).
-//! * `tag=True` (on the `KVCacheEvent` base class) prepends a class-name
-//!   string at index 0 of the array, so a tagged struct is
-//!   `[class_name_str, field1, field2, ...]`.
+//! * `EventBatch` (the outer payload) — declared with
+//!   `array_like=True, omit_defaults=True, gc=False` (no tag).
+//! * `KVCacheEvent` (each inner event variant) — additionally declared
+//!   with `tag=True`.
+//!
+//! The combined effect on the wire:
+//!
+//! * Each struct is a msgpack **array** of its fields in declaration
+//!   order, not a map.
+//! * `tag=True` on `KVCacheEvent` prepends a class-name string at index 0
+//!   of each inner event array, so an event is
+//!   `[class_name_str, field1, field2, ...]`. The outer `EventBatch`
+//!   array does **not** carry a tag prefix.
 //! * `omit_defaults=True` allows trailing fields whose values equal their
 //!   declared defaults to be dropped from the array. The decoder therefore
 //!   accepts variable-length sequences for each struct shape.
 //!
 //! This module deserializes those bytes into Rust types and exposes a single
-//! [`decode_event_batch`] entry point. Networking (ZMQ) and the per-DP-rank
-//! indexer live in later tasks.
+//! [`decode_event_batch`] entry point.
 
 use std::fmt;
 
@@ -25,8 +31,11 @@ use serde::Deserialize;
 
 /// Top-level batch payload published by SGLang.
 ///
-/// Wire shape (`KVEventBatch` extends `EventBatch`, both `array_like`):
-/// `[ts: f64, events: [...], attn_dp_rank: i32_or_nil_or_omitted]`.
+/// Wire shape (`EventBatch`, `array_like`):
+/// `[ts: f64, events: [...], attn_dp_rank: int_or_nil_or_omitted]`.
+/// SGLang declares `attn_dp_rank` as a Python `Optional[int]`; we decode
+/// it as `u32` since DP ranks are non-negative and bounded by the
+/// publisher's `dp_size`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvEventBatch {
     /// Wall-clock timestamp from the publisher (seconds since epoch).
@@ -137,9 +146,7 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
                 if let (Some(field), Some(len), Some(cap)) =
                     (parts.next(), parts.next(), parts.next())
                 {
-                    if let (Ok(len), Ok(cap)) =
-                        (len.parse::<usize>(), cap.parse::<usize>())
-                    {
+                    if let (Ok(len), Ok(cap)) = (len.parse::<usize>(), cap.parse::<usize>()) {
                         let field = match field {
                             "block_hashes" => "block_hashes",
                             "token_ids" => "token_ids",
@@ -813,9 +820,9 @@ mod tests {
         write_event_array(&mut event, "BlockStored", 7);
         write_i64_array(&mut event, &[42_i64]); // block_hashes (small)
         mp::write_nil(&mut event).unwrap(); // parent_block_hash
-        // Oversize token_ids: announce huge length but only write a
-        // single element. The visitor's size_hint check fires
-        // immediately and we never reach the truncated payload.
+                                            // Oversize token_ids: announce huge length but only write a
+                                            // single element. The visitor's size_hint check fires
+                                            // immediately and we never reach the truncated payload.
         mp::write_array_len(&mut event, claimed).unwrap();
         mp::write_uint(&mut event, 0).unwrap();
         // Trailing bytes after the truncated array are ignored — the

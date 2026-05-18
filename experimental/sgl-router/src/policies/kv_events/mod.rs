@@ -6,13 +6,13 @@
 //!
 //! # Submodules
 //!
-//! - [`wire`]: msgpack types and [`decode_event_batch`] — the contract
-//!   between the SGLang publisher (`msgspec.msgpack` with
-//!   `array_like=True, omit_defaults=True, gc=False, tag=True`) and this
-//!   crate. Pure decoding; no I/O.
-//!
-//! All four core submodules are now in place; M3 Task 6 wires the
-//! registry into the worker manager.
+//! - [`wire`] — msgpack types and [`decode_event_batch`]; the contract
+//!   with the SGLang publisher. Pure decoding; no I/O.
+//! - [`hash`] — block-hash compute mirroring SGLang `RadixKey.hash_page`.
+//! - [`tree`] — hash-keyed radix tree consumed by the routing path.
+//! - [`subscriber`] — per-worker ZMQ SUB tasks.
+//! - [`discovery`] — `/server_info` parse → publisher endpoint.
+//! - [`index`] — public façade bundling the tree + subscribers + pump.
 
 pub mod discovery;
 pub mod hash;
