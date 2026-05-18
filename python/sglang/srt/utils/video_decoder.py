@@ -43,7 +43,7 @@ class VideoDecoderWrapper:
         """source: file path (str) or video bytes.
         device: "cpu" or "cuda". GPU decoding only supported with torchcodec.
         num_decode_threads: number of parallel decoder instances for frame
-            extraction (torchcodec only). 0 = auto (use os.cpu_count()),
+            extraction (torchcodec only). 0 = auto (capped at 32),
             1 = single decoder. Set > 1 to split frame indices across
             multiple decoders in parallel threads.
         """
@@ -120,7 +120,7 @@ class VideoDecoderWrapper:
         ):
             num_threads = self._num_decode_threads
             if num_threads <= 0:
-                num_threads = os.cpu_count() or 4
+                num_threads = min(os.cpu_count() or 8, 32)
             num_threads = min(num_threads, len(indices))
             if num_threads > 1:
                 return self._parallel_decode(indices, num_threads)
