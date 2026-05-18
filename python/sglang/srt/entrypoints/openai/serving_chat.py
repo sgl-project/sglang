@@ -54,7 +54,7 @@ from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser, StreamingParseResult
 
 _SSE_DATA_B = b"data: "
 _SSE_NL_B = b"\n\n"
@@ -867,7 +867,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
                             content, n_prev_token, total_output_logprobs
-                        ).model_dump()
+                        )
                     n_prev_tokens[index] = total_output_logprobs
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
@@ -915,11 +915,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     delta = content["text"][offset:]
                 stream_offsets[index] = len(content["text"])
 
-                # Handle reasoning content
+                # Handle reasoning content and align logprobs with emitted content.
                 if self.reasoning_parser and request.separate_reasoning:
-                    reasoning_text, delta = self._process_reasoning_stream(
+                    parse_result = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    reasoning_text, delta = (
+                        parse_result.reasoning_text,
+                        parse_result.normal_text,
+                    )
+                    if choice_logprobs and choice_logprobs.content:
+                        clps = self._filter_content_logprobs(
+                            choice_logprobs.content, parse_result
+                        )
+                        choice_logprobs = ChoiceLogprobs(content=clps)
+
                     if reasoning_text:
                         usage = None
                         if continuous_usage_stats:
@@ -937,6 +947,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             reasoning_content=reasoning_text,
                             usage=usage,
                         )
+
+                choice_logprobs = (
+                    choice_logprobs.model_dump()
+                    if choice_logprobs and choice_logprobs.content
+                    else None
+                )
 
                 # Handle tool calls
                 if (
@@ -1158,7 +1174,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         force_reasoning=is_force_reasoning,
                         request=request,
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
+                    parse_result = parser.parse_non_stream_result(text)
+                    reasoning_text, text = (
+                        parse_result.reasoning_text,
+                        parse_result.normal_text,
+                    )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -1166,6 +1186,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         err_type="InternalServerError",
                         status_code=500,
                     )
+
+                # Align logprobs.content with message.content per OpenAI spec
+                # (the raw token stream still contains reasoning + markers).
+                if choice_logprobs is not None:
+                    clps = self._filter_content_logprobs(
+                        choice_logprobs.content, parse_result
+                    )
+                    choice_logprobs = ChoiceLogprobs(content=clps)
 
             # Handle tool calls
             tool_calls = None
@@ -1260,6 +1288,56 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         return token_logprobs
+
+    @staticmethod
+    def _filter_content_logprobs(
+        token_lps: List[ChatCompletionTokenLogprob],
+        parse_result: StreamingParseResult,
+    ) -> List[ChatCompletionTokenLogprob]:
+        """Keep logprobs aligned with parser-visible content text."""
+        if not token_lps:
+            return []
+
+        # Derive a (start, end) char-span over the token concatenation:
+        # parser-provided span is authoritative; otherwise locate normal_text
+        # within the concat as a fallback.
+        span = parse_result.normal_text_span
+        if span is None:
+            content_text = parse_result.normal_text
+            if not content_text:
+                return []
+            concat = "".join(t.token for t in token_lps)
+            start = concat.rfind(content_text)
+            if start < 0:
+                return []
+            span = (start, start + len(content_text))
+
+        span_start, span_end = span
+        if span_end <= span_start:
+            return []
+
+        content_lps, cursor = [], 0
+        for tok in token_lps:
+            s, e = cursor, cursor + len(tok.token)
+            cursor = e
+            if s >= span_end or e <= span_start:
+                continue
+            lo = max(s, span_start) - s
+            hi = min(e, span_end) - s
+            if lo == 0 and hi == len(tok.token):
+                content_lps.append(tok)
+            else:
+                sub = tok.token[lo:hi]
+                content_lps.append(
+                    tok.model_copy(
+                        update={
+                            "token": sub,
+                            "bytes": list(sub.encode("utf-8")),
+                            "top_logprobs": [],
+                        }
+                    )
+                )
+        return content_lps
 
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
@@ -1408,7 +1486,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
-    ) -> tuple[Optional[str], str]:
+    ) -> StreamingParseResult:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
@@ -1422,7 +1500,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
             )
         reasoning_parser = reasoning_parser_dict[index]
-        return reasoning_parser.parse_stream_chunk(delta)
+        return reasoning_parser.parse_stream_chunk_result(delta)
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.

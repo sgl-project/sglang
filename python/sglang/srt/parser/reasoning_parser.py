@@ -11,9 +11,11 @@ class StreamingParseResult:
         self,
         normal_text: Optional[str] = None,
         reasoning_text: Optional[str] = None,
+        normal_text_span: Optional[Tuple[int, int]] = None,
     ):
         self.normal_text = normal_text or ""
         self.reasoning_text = reasoning_text or ""
+        self.normal_text_span = normal_text_span
 
 
 class BaseReasoningFormatDetector:
@@ -70,9 +72,15 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=text)
 
         # The text is considered to be in a reasoning block.
-        processed_text = text.replace(
-            self.think_start_token + self.think_start_self_label, ""
-        ).strip()
+        think_start_text = self.think_start_token + self.think_start_self_label
+        processed_start = 0
+        start_idx = text.find(think_start_text)
+        if start_idx >= 0:
+            processed_start = start_idx + len(think_start_text)
+        processed_start, processed_end = self._trim_bounds(
+            text, processed_start, len(text)
+        )
+        processed_text = text[processed_start:processed_end]
 
         if (
             self.think_end_token not in processed_text
@@ -97,12 +105,22 @@ class BaseReasoningFormatDetector:
 
         # Extract reasoning content
         if self.think_end_token in processed_text:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
-            reasoning_text = splits[0]
-            normal_text = splits[1].strip()
+            end_idx = processed_text.find(self.think_end_token)
+            reasoning_start = processed_start
+            reasoning_end = processed_start + end_idx
+            normal_start = reasoning_end + len(self.think_end_token)
+            normal_start, normal_end = self._trim_bounds(
+                text, normal_start, processed_end
+            )
+            reasoning_text = text[reasoning_start:reasoning_end]
+            normal_text = text[normal_start:normal_end]
 
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text
+                normal_text=normal_text,
+                reasoning_text=reasoning_text,
+                normal_text_span=(
+                    (normal_start, normal_end) if normal_end > normal_start else None
+                ),
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
@@ -179,6 +197,18 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
+
+    @staticmethod
+    def _trim_bounds(
+        text: str, start: int, end: int, trim_left: bool = True, trim_right: bool = True
+    ) -> Tuple[int, int]:
+        if trim_left:
+            while start < end and text[start].isspace():
+                start += 1
+        if trim_right:
+            while end > start and text[end - 1].isspace():
+                end -= 1
+        return start, end
 
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
@@ -674,12 +704,20 @@ class ReasoningParser:
 
     def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
-        ret = self.detector.detect_and_parse(full_text)
+        ret = self.parse_non_stream_result(full_text)
         return ret.reasoning_text, ret.normal_text
+
+    def parse_non_stream_result(self, full_text: str) -> StreamingParseResult:
+        """Non-streaming call: one-time parsing with source spans."""
+        return self.detector.detect_and_parse(full_text)
 
     def parse_stream_chunk(
         self, chunk_text: str
     ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
-        ret = self.detector.parse_streaming_increment(chunk_text)
+        ret = self.parse_stream_chunk_result(chunk_text)
         return ret.reasoning_text, ret.normal_text
+
+    def parse_stream_chunk_result(self, chunk_text: str) -> StreamingParseResult:
+        """Streaming call: incremental parsing with full parse result."""
+        return self.detector.parse_streaming_increment(chunk_text)

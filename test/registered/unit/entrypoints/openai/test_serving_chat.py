@@ -1397,6 +1397,46 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(msg.content)
         self.assertEqual(msg.reasoning_content, "42")
 
+    def test_build_chat_response_filters_reasoning_logprobs_with_repeated_text(self):
+        self.tm.server_args.reasoning_parser = "deepseek-v4"
+        self.chat.reasoning_parser = "deepseek-v4"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            separate_reasoning=True,
+            logprobs=True,
+        )
+        raw_text = "<think>same</think>same"
+        ret_item = {
+            "text": raw_text,
+            "meta_info": {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "prompt_tokens": 10,
+                "completion_tokens": len(raw_text),
+                "weight_version": "default",
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [
+                    (-0.1, token_id, token) for token_id, token in enumerate(raw_text)
+                ],
+            },
+            "index": 0,
+        }
+
+        response = self.chat._build_chat_response(req, [ret_item], created=0)
+
+        choice = response.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "same")
+        self.assertEqual(choice.message.content, "same")
+        self.assertEqual(
+            "".join(token_lp.token for token_lp in choice.logprobs.content),
+            choice.message.content,
+        )
+        self.assertNotIn(
+            "reasoning_content",
+            choice.logprobs.model_dump(),
+        )
+
     # --- poolside_v1 (Laguna-XS.2) regression tests ---
 
     def test_poolside_v1_enable_thinking_dispatch(self):
