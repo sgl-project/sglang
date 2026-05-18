@@ -27,8 +27,13 @@ _MODEL = "Qwen/Qwen3-0.6B"
 register_cuda_ci(est_time=240, suite="base-b-test-1-gpu-small")
 
 
-class TestKvCacheCanaryCleanLogMode(CustomTestCase):
-    """Clean run with ``--kv-cache-canary=log``: no violation expected."""
+class TestKvCacheCanaryCleanRaiseMode(CustomTestCase):
+    """Clean run with ``--kv-cache-canary=raise``: no violation expected.
+
+    Using ``raise`` (not ``log``) on the clean path is strictly stronger:
+    any unexpected canary fire will abort the server instead of being
+    silently logged, so the test fails loudly if the canary mis-reports.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -43,7 +48,7 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--kv-cache-canary",
-                "log",
+                "raise",
                 # Shadow K/V tensors add ~4× layer-size to the pool; leave
                 # headroom so the canary tensors fit.
                 "--mem-fraction-static",
@@ -57,7 +62,7 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_clean_log_run_keeps_violation_counter_at_zero(self):
+    def test_clean_raise_run_stays_healthy(self):
         # Step 1: send a small batch of generate requests.
         for i in range(20):
             response = requests.post(
