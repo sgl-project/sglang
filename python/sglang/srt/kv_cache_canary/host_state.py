@@ -366,3 +366,23 @@ class CanaryDeviceState:
             kernel_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter_tail=torch.zeros(1, dtype=torch.int64, device=device),
         )
+
+    def reset_violation_state(self) -> None:
+        """Zero out is_errored / first_violation / ring buffer state.
+
+        Called from the LOG-mode violation handler after the first-violation
+        row has been pulled to host. Without this reset the GPU-side
+        ``is_errored`` flag stays at 1 forever, ``first_violation_set``
+        latches the first row permanently (new violations are silently
+        masked), and ``violation_ring_valid`` fills up so subsequent CAS
+        attempts all fail (= permanent ring deadlock after capacity rows).
+
+        Counters (slot/kernel run counters) are intentionally NOT reset:
+        the §5 health monitor uses their monotonic growth to detect "canary
+        stopped running".
+        """
+        self.is_errored.zero_()
+        self.first_violation_set.zero_()
+        self.first_violation.zero_()
+        self.violation_ring_valid.zero_()
+        self.violation_write_index.zero_()

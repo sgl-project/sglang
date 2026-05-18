@@ -107,6 +107,10 @@ class CanaryRunner:
         # once. ``event.query()`` on an unrecorded event is undefined; skip
         # until we've recorded once.
         self._poll_armed: bool = False
+        # README §5 warmup zero-check runs exactly once, after the latch flips.
+        # Tracked explicitly so a step skipped by cuda graph paths can't cause
+        # the check to silently leapfrog past the warmup boundary.
+        self._warmup_check_done: bool = False
 
     @property
     def config(self) -> CanaryConfig:
@@ -309,13 +313,30 @@ class CanaryRunner:
         return int(flag.item())
 
     def _maybe_health_check(self) -> None:
-        """README §5 — counter-zero detection + periodic print."""
+        """README §5 — counter-zero detection + periodic print.
+
+        The warmup zero-check uses a latch + ``>=`` trigger (not ``==``) so a
+        step that's skipped (e.g. cuda graph capture / replay does not advance
+        ``_forward_step``) cannot leapfrog past the warmup boundary and miss
+        the check.
+
+        Any raise path here MUST be cross-rank synchronized: a single-rank
+        raise on a TP group would deadlock peers in the next NCCL collective.
+        We allreduce-MAX a health flag across the TP group and only raise if
+        every rank agrees.
+        """
         step = self._forward_step
         period = max(1, self._config.health_print_every_n_forwards)
         kernel_head, kernel_tail, slot_head, slot_tail = self._latest_counters
 
-        if step == self._config.counter_zero_warmup_forwards:
-            if kernel_head == 0 or kernel_tail == 0:
+        if (
+            not self._warmup_check_done
+            and step >= self._config.counter_zero_warmup_forwards
+        ):
+            local_unhealthy = 1 if (kernel_head == 0 or kernel_tail == 0) else 0
+            global_unhealthy = self._cross_rank_max(local_unhealthy)
+            self._warmup_check_done = True
+            if global_unhealthy:
                 message = (
                     f"kv-canary: kernel never ran after warmup "
                     f"(step={step}, kernel_head={kernel_head}, kernel_tail={kernel_tail}). "
@@ -350,7 +371,7 @@ class CanaryRunner:
         """Synchronous D2H pull of the first-violation row + ring write count.
 
         Only called on the error path; the hot path stays asynchronous via
-        the daemon thread.
+        the side-stream event pump.
         """
         first_violation = self._device_state.first_violation.cpu().tolist()
         write_index = int(self._device_state.violation_write_index.cpu().item())
@@ -362,10 +383,21 @@ class CanaryRunner:
 
         now = time.time()
         last_log = self._last_log_time_per_reason.get(fail_reason, 0.0)
-        if now - last_log < _LOG_RATE_LIMIT_SECONDS:
-            return
-        self._last_log_time_per_reason[fail_reason] = now
-        logger.error(self._format_violation(first_violation, write_index))
+        emit = now - last_log >= _LOG_RATE_LIMIT_SECONDS
+        if emit:
+            self._last_log_time_per_reason[fail_reason] = now
+            logger.error(self._format_violation(first_violation, write_index))
+
+        # Reset GPU-side flag/ring so subsequent NEW violations surface.
+        # Without this, the device flag stays 1 forever (every subsequent
+        # forward re-triggers a sync D2H + allreduce); ``first_violation_set``
+        # stays latched (new violations silently masked); the ring fills up
+        # and CAS-fails all future writes.
+        # Host-cached ``_latest_is_errored`` is reset to 0 so the next
+        # ``end_of_forward`` doesn't re-enter this handler before the next
+        # async event poll catches up.
+        self._device_state.reset_violation_state()
+        self._latest_is_errored = 0
 
     def _raise_with_first_violation(self) -> None:
         first_violation, write_index = self._pull_first_violation()

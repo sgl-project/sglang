@@ -742,8 +742,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_memory_pool(pre_model_load_memory)
 
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
-        # and BEFORE init_device_graphs (so the canary kernel is captured into the
-        # cuda graph and shadow tensor pointers are baked in).
+        # and BEFORE init_device_graphs (so the patched model.forward is what
+        # ``patch_model`` yields and what runs during the warmup forward passes).
         install_on_model_runner(
             model_runner=self,
             mode=server_args.kv_cache_canary,

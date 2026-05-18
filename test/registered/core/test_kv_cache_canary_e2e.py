@@ -70,7 +70,7 @@ class TestKvCacheCanaryCleanLogMode(CustomTestCase):
             )
             self.assertEqual(response.status_code, 200, response.text)
 
-        # Step 2: allow background daemon a beat to pull counters.
+        # Step 2: allow the side-stream event pump a beat to refresh counters.
         time.sleep(2.0)
 
         # Step 3: the server should still be healthy (no raise/abort).

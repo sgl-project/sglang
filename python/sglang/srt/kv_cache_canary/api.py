@@ -72,10 +72,17 @@ def install_req_to_token_pool_free_hook(
 
     Without this, a reused ``req_pool_idx`` inherits the previous request's
     ``K_req`` / ``prev_hash_tail``, which would make the new req's first token
-    look like a verify-then-mismatch (P0-1 of host review).
+    look like a verify-then-mismatch.
+
+    NOTE: there are bypass paths that ``append`` to ``free_slots`` directly
+    without going through ``.free()`` (streaming session,
+    disaggregation/decode ``ReqToTokenPool.free``). Those call sites must
+    invoke :func:`release_req_pool_idx` to keep the canary state in sync;
+    relying on hooking ``.free()`` alone is insufficient.
     """
     if getattr(req_to_token_pool, "_kv_canary_free_patched", False):
         return
+    setattr(req_to_token_pool, "_kv_canary_runner_ref", runner)
     original_free = req_to_token_pool.free
 
     def patched_free(req) -> None:
@@ -86,6 +93,29 @@ def install_req_to_token_pool_free_hook(
 
     req_to_token_pool.free = patched_free
     setattr(req_to_token_pool, "_kv_canary_free_patched", True)
+
+
+def release_req_pool_idx(
+    req_to_token_pool: "ReqToTokenPool",
+    req_pool_idx: Optional[int],
+) -> None:
+    """Notify canary that a ``req_pool_idx`` was released via a bypass path.
+
+    Call sites that ``free_slots.append(idx)`` directly (streaming session,
+    disaggregation decode pool) MUST invoke this so the canary host state for
+    that ``req_pool_idx`` is dropped — otherwise the next request reusing the
+    same index will see a stale ``K_req`` / ``prev_hash_tail`` and the very
+    first verify entry will mismatch.
+
+    Safe no-op when the canary is disabled (no runner attached) or
+    ``req_pool_idx`` is ``None``.
+    """
+    if req_pool_idx is None:
+        return
+    runner = getattr(req_to_token_pool, "_kv_canary_runner_ref", None)
+    if runner is None:
+        return
+    runner.host_state.reset_request(int(req_pool_idx))
 
 
 def install_swa_eviction_hook(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -122,6 +123,7 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
     model = model_runner.model
     original_forward = model.forward
 
+    @functools.wraps(original_forward)
     def patched_model_forward(*args, **kwargs):
         forward_batch = _extract_forward_batch(args, kwargs)
         pool = model_runner.token_to_kv_pool

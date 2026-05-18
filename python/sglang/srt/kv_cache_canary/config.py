@@ -32,7 +32,6 @@ class CanaryConfig:
     counter_zero_warmup_forwards: int = 64
     perturb_req_to_token_prob: float = 0.0
     perturb_req_to_token_seed: int = 0
-    daemon_poll_seconds: float = 0.005
 
     @classmethod
     def from_server_args(cls, mode: str | CanaryMode | None) -> "CanaryConfig":

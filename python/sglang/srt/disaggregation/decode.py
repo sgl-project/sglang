@@ -170,6 +170,12 @@ class DecodeReqToTokenPool:
     def free(self, req: "Req"):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
+        # Notify canary (no-op when canary disabled): this overrides the base
+        # ``ReqToTokenPool.free`` so the canary's free hook doesn't see this
+        # release path.
+        from sglang.srt.kv_cache_canary.api import release_req_pool_idx
+
+        release_req_pool_idx(self, req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):

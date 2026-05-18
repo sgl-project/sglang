@@ -100,12 +100,21 @@ __device__ inline void record_violation(
 
   // First-violation latch: only the first writer wins; ensures the very first
   // mismatch is preserved verbatim even if subsequent cascades overrun the ring.
+  // We CAS-claim the set flag BEFORE writing the 8 fields, then __threadfence_system
+  // after the writes — but importantly we use a 2-stage latch (claimed → committed)
+  // so a host that races to read after seeing ``is_errored == 1`` can detect a
+  // partial write. Stage 1: CAS 0→1 (claimed). Stage 2: __threadfence_system +
+  // CAS 1→2 (committed). The later atomicOr on is_errored is fenced by the same
+  // __threadfence_system, so host that reads is_errored==1 sees ``first_violation_set
+  // >= 2`` and a complete 8-field write.
   unsigned int prev = atomicCAS(p.first_violation_set, 0u, 1u);
   if (prev == 0u) {
 #pragma unroll
     for (int i = 0; i < kViolationFields; ++i) {
       p.first_violation[i] = entry[i];
     }
+    __threadfence_system();
+    atomicExch(p.first_violation_set, 2u);
   }
 
   // Ring buffer append: atomicAdd reserves a unique sequence. Two threads with
@@ -122,7 +131,7 @@ __device__ inline void record_violation(
     for (int i = 0; i < kViolationFields; ++i) {
       row[i] = entry[i];
     }
-    __threadfence();
+    __threadfence_system();
     atomicExch(reinterpret_cast<unsigned int*>(row_valid), 2u);
   }
 
