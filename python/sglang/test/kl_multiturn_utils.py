@@ -160,42 +160,31 @@ def _generate_maybe_interleaved(
     original order so the caller always sees results[i] corresponds to
     inputs[i].
     """
+    ordered = inputs if order is None else [inputs[i] for i in order]
+    if not ordered:
+        return []
 
-    def _generate_ordered(ordered_inputs):
-        if (
-            request_batch_size is None
-            or request_batch_size <= 0
-            or request_batch_size >= len(ordered_inputs)
-        ):
-            return _generate(
+    batch_size = (
+        request_batch_size
+        if request_batch_size is not None and request_batch_size > 0
+        else len(ordered)
+    )
+    results = []
+    for start in range(0, len(ordered), batch_size):
+        results.extend(
+            _generate(
                 base_url,
-                ordered_inputs,
+                ordered[start : start + batch_size],
                 max_new_tokens,
                 return_logprob=True,
                 temperature=sampling_temperature,
             )
-
-        results = []
-        for start in range(0, len(ordered_inputs), request_batch_size):
-            end = start + request_batch_size
-            results.extend(
-                _generate(
-                    base_url,
-                    ordered_inputs[start:end],
-                    max_new_tokens,
-                    return_logprob=True,
-                    temperature=sampling_temperature,
-                )
-            )
-            if inter_batch_delay_s > 0:
-                time.sleep(inter_batch_delay_s)
-        return results
+        )
+        if batch_size < len(ordered) and inter_batch_delay_s > 0:
+            time.sleep(inter_batch_delay_s)
 
     if order is None:
-        return _generate_ordered(inputs)
-
-    ordered = [inputs[i] for i in order]
-    results = _generate_ordered(ordered)
+        return results
     unordered = [None] * len(results)
     for idx, orig in enumerate(order):
         unordered[orig] = results[idx]
