@@ -1495,7 +1495,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        # Multi-worker: rid_to_state is per-worker, always forward to scheduler.
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1
