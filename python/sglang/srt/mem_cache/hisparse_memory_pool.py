@@ -487,9 +487,7 @@ class DeepSeekV4SingleKVPoolHost:
         """Return host C4 buffers as token-linear transfer targets."""
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [
-            self.kv_cache_total_dim * self.dtype.itemsize
-        ] * self.layer_num
+        item_lens = [self.kv_cache_total_dim * self.dtype.itemsize] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def load_to_device_per_layer(

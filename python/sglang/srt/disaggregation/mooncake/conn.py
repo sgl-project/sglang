@@ -902,9 +902,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         src_pages = prefill_kv_indices.astype(np.int64, copy=False)
-        dst_pages = dst_device_kv_indices[page_index_slice].astype(
-            np.int64, copy=False
-        )
+        dst_pages = dst_device_kv_indices[page_index_slice].astype(np.int64, copy=False)
         count = min(len(src_pages), len(dst_pages))
         if count == 0:
             return 0
