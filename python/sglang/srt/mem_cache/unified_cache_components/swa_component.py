@@ -69,7 +69,9 @@ class SWAComponent(TreeComponent):
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -78,7 +80,7 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
-            if cd.value is None and cd.host_value is None:
+            if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
@@ -95,11 +97,12 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
-        node = result.last_host_node
+        node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is None and cd.host_value is not None:
+                # TODO(ispobock): refactor host_hit_length usage
                 return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
@@ -440,11 +443,14 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            # `node` is best_match_node; the SWA validator guarantees every
+            # ancestor within `sliding_window_size` has value or host_value.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
-            while node is not self.cache.root_node and n_swa < self.sliding_window_size:
-                cd = node.component_data[ct]
+            cur = node
+            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+                cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
@@ -452,9 +458,9 @@ class SWAComponent(TreeComponent):
                 else:
                     # host only, collect it
                     backed_up.append(cd.host_value)
-                    nodes.append(node)
+                    nodes.append(cur)
                     n_swa += len(cd.host_value)
-                node = node.parent
+                cur = cur.parent
 
             if not backed_up:
                 return None
