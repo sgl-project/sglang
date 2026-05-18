@@ -236,7 +236,8 @@ class BlockSparseAttentionImpl(AttentionImpl):
         block_frame_stride: int,
         sparsity: float,
     ) -> torch.Tensor:
-
+        # TODO Currently implementation for BSND input layout has quality issues
+        # When the implementation is improved, transposes can be removed
         q = query.permute(0, 2, 1, 3).contiguous()
         k = key.permute(0, 2, 1, 3).contiguous()
         v = value.permute(0, 2, 1, 3).contiguous()

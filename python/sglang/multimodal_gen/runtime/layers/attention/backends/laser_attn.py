@@ -104,6 +104,7 @@ class LaserAttentionImpl(AttentionImpl):
     def _la_preprocess_input(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Currently BSND input layout is not supported
         q = query.transpose(1, 2)
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
