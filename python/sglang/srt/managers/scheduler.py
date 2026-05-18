@@ -3495,7 +3495,10 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
-            logger.info("Cache flushed successfully!")
+            # Per-DP-group leader logs once: ranks within a DP group are
+            # state-synchronous, but DP groups may diverge.
+            if self.is_stats_logging_rank:
+                logger.info("Cache flushed successfully!")
             success = True
         else:
             logging.warning(
