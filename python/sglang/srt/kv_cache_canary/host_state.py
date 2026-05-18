@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -12,12 +12,15 @@ from sglang.srt.kv_cache_canary.fingerprint import mix_step
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _LastCommitted:
-    """Last committed write for a request — used as the (single) verify target.
+class _HistoryEntry:
+    """One historical write for a request — a single verify target.
 
-    Recording the slot index lets the verify entry read the *same physical
-    location* the kernel wrote last step, independent of any later
-    ``req_to_token_pool`` updates (perturbation, paging, etc.).
+    Recording the slot index here (independently of ``req_to_token_pool``)
+    is what makes the position-monotonic check (README §3 (b)) capable of
+    catching map perturbation: the kernel reads ``src_buf[slot_idx]`` and
+    checks that the slot's stored ``position`` field equals this entry's
+    ``position``. Any redirect of the table to a different slot will produce
+    a different ``position`` field and trip the check.
     """
 
     token_id: int
@@ -30,7 +33,10 @@ class _LastCommitted:
 class _RequestState:
     prev_hash_tail: int
     k_req: int
-    last_committed: Optional[_LastCommitted] = None
+    # Full history of committed writes for this req in position order
+    # (history[i].position == i). Verify entries cover ``[0, k_req)`` so
+    # any prior slot's content can be re-checked, not just the last one.
+    history: Tuple["_HistoryEntry", ...] = ()
 
 
 class CanaryHostState:
@@ -54,19 +60,17 @@ class CanaryHostState:
             self._states.pop(req_pool_idx, None)
 
     def reset_request_for_slot(self, slot_idx: int) -> None:
-        """Drop any host state whose last_committed lives in this physical slot.
+        """Drop any host state whose history references this physical slot.
 
         Used by SWA window-slide eviction: when a slot is evicted from the
-        sliding window, any request that thought its verify-target lived in
-        that slot must forget it (otherwise next plan_batch builds a stale
-        verify entry).
+        sliding window, any request whose verify history touches that slot
+        must forget it (otherwise the next plan_batch builds a verify entry
+        that reads a slot now reused by a stranger).
         """
         with self._lock:
             stale_req_pool_idxs: List[int] = []
             for req_pool_idx, state in self._states.items():
-                if state.last_committed is None:
-                    continue
-                if state.last_committed.slot_idx == slot_idx:
+                if any(entry.slot_idx == slot_idx for entry in state.history):
                     stale_req_pool_idxs.append(req_pool_idx)
             for req_pool_idx in stale_req_pool_idxs:
                 self._states.pop(req_pool_idx, None)
@@ -95,34 +99,40 @@ class CanaryHostState:
         """Decode side: rebuild host state from PD-transported metadata.
 
         Drops any prior state for this slot (decode never shares req_pool_idx
-        with itself; if it did, we'd just have stale data). ``last_committed``
-        is None because we don't have the last-token snapshot — the chain
+        with itself; if it did, we'd just have stale data). ``history`` is
+        empty because we don't have per-position snapshots — the chain
         continues from ``prev_hash_tail`` at position ``k_req``, but the very
-        first decode forward pure-writes (no verify entry).
+        first decode forward pure-writes (no verify entries) until enough
+        history accumulates on the decode side.
         """
         with self._lock:
             self._states[req_pool_idx] = _RequestState(
                 prev_hash_tail=prev_hash_tail & ((1 << 64) - 1),
                 k_req=int(k_req),
-                last_committed=None,
+                history=(),
             )
 
     def reset_all_last_committed(self) -> None:
-        """Drop ``last_committed`` for every tracked request.
+        """Drop the verify history of every tracked request.
 
-        Conservative SWA window-slide fallback: when we can't enumerate which
-        slots were just evicted (e.g. the free hook only fires with no
-        argument), wiping last_committed on all requests prevents stale
-        verify entries. The next forward will pure-write and re-anchor.
+        Conservative SWA window-slide / spec-reject fallback: when we can't
+        enumerate which slots were just evicted (e.g. the free hook only
+        fires with no argument), wiping history prevents stale verify
+        entries pointing at slots a stranger may now own. The next forward
+        will pure-write and re-anchor; ``prev_hash_tail`` and ``k_req`` are
+        kept so chain continuity is preserved.
+
+        Method name retained for backwards source-compat; the entire
+        history (not just the last-committed entry) is dropped.
         """
         with self._lock:
             for req_pool_idx, state in list(self._states.items()):
-                if state.last_committed is None:
+                if not state.history:
                     continue
                 self._states[req_pool_idx] = _RequestState(
                     prev_hash_tail=state.prev_hash_tail,
                     k_req=state.k_req,
-                    last_committed=None,
+                    history=(),
                 )
 
     def reset_request_to(self, *, req_pool_idx: int, k_req: int) -> None:
@@ -130,8 +140,9 @@ class CanaryHostState:
 
         Spec decoding rejects drafted tokens after the target verifies them;
         the rejected tokens' slots get freed and reused. The canary chain
-        must rewind ``K_req`` to the new low-water mark so the next batch's
-        verify target is the last *accepted* token (not the rejected ones).
+        must rewind ``K_req`` and truncate the history so the next batch's
+        verify entries don't read slots that were just returned to the
+        allocator.
         """
         with self._lock:
             existing = self._states.get(req_pool_idx)
@@ -140,16 +151,15 @@ class CanaryHostState:
             if k_req <= 0:
                 self._states.pop(req_pool_idx, None)
                 return
-            # We don't have a per-position prev_hash snapshot, so the safest
-            # behaviour is to drop last_committed (no verify entry until a
-            # fresh write commits) but keep prev_hash_tail at the new k_req
-            # boundary. Callers can pass k_req = old k_req to no-op.
-            new_state = _RequestState(
-                prev_hash_tail=existing.prev_hash_tail,
-                k_req=min(existing.k_req, k_req),
-                last_committed=None,
+            new_k_req = min(existing.k_req, int(k_req))
+            new_history = tuple(
+                entry for entry in existing.history if entry.position < new_k_req
             )
-            self._states[req_pool_idx] = new_state
+            self._states[req_pool_idx] = _RequestState(
+                prev_hash_tail=existing.prev_hash_tail,
+                k_req=new_k_req,
+                history=new_history,
+            )
 
     def has_state(self, req_pool_idx: int) -> bool:
         with self._lock:
@@ -166,20 +176,24 @@ class CanaryHostState:
     ) -> "BatchPlan":
         """Compute expected (req_id, token_id, position, prev_hash) for the batch.
 
-        The batch the kernel sees is laid out as ``[verify_entries..., write_entries...]``:
+        The batch the kernel sees is laid out as
+        ``[verify_entries..., write_entries...]``:
 
-        - **verify entries**: one per request that already has a committed write
-          (``state.last_committed is not None``). The kernel reads
-          ``src_buf[last_slot_idx]`` and checks the stored triple against the
-          stored expected values + monotonic-position constraint (see
-          ``verify_seq_position`` below).
-        - **write entries**: ``sum(req_token_counts)`` slots laid out the same
-          order as the caller's flattened ``input_ids`` / ``out_cache_loc``.
+        - **verify entries**: for every request with prior committed writes,
+          ONE verify entry per historical position ``[0, k_req)`` is emitted.
+          Each verify entry binds a ``slot_idx`` (the physical slot the
+          historical write landed in) to the expected
+          ``(req_id, token_id, position, prev_hash)`` triple, plus the
+          ``verify_seq_position`` for README §3 (b) — that field is just the
+          historical ``position`` index itself, NOT derived from any
+          ``req_to_token_pool`` lookup. So a map perturbation that redirects
+          a slot pointer cannot fake-match the position-monotonic check.
+        - **write entries**: ``sum(req_token_counts)`` slots laid out in the
+          caller's flattened ``input_ids`` / ``out_cache_loc`` order.
 
-        ``write_slot_indices_per_req`` is the list of physical slot indices for
-        this batch's writes, partitioned by request. We do not actually use them
-        for verify-target indexing here (we use ``state.last_committed.slot_idx``),
-        but we DO use them to update ``state.last_committed`` in ``commit_plan``.
+        The verify range grows with k_req — covering the entire prefix means
+        a perturbation anywhere along the chain (not just the last slot) is
+        observable on the next forward.
         """
         if not (
             len(req_pool_indices)
@@ -219,20 +233,18 @@ class CanaryHostState:
                     )
                 state = self._states.get(req_pool_idx) or self._initial_state()
 
-                if state.last_committed is not None:
-                    lc = state.last_committed
+                for entry in state.history:
                     verify_req_ids.append(req_pool_idx)
-                    verify_token_ids.append(lc.token_id)
-                    verify_positions.append(lc.position)
-                    verify_prev_hashes.append(to_signed_int64(lc.prev_hash_at_write))
-                    verify_seq_positions.append(lc.position)
-                    verify_slot_indices.append(lc.slot_idx)
+                    verify_token_ids.append(entry.token_id)
+                    verify_positions.append(entry.position)
+                    verify_prev_hashes.append(
+                        to_signed_int64(entry.prev_hash_at_write)
+                    )
+                    verify_seq_positions.append(entry.position)
+                    verify_slot_indices.append(entry.slot_idx)
 
                 prev_hash = state.prev_hash_tail
-                last_token_id = 0
-                last_position = -1
-                last_slot_idx = -1
-                last_prev_hash_at_write = state.prev_hash_tail
+                new_entries: List[_HistoryEntry] = []
                 for offset in range(count):
                     pos = start_pos + offset
                     token_id = tokens[offset]
@@ -241,23 +253,21 @@ class CanaryHostState:
                     write_token_ids.append(token_id)
                     write_positions.append(pos)
                     write_prev_hashes.append(to_signed_int64(prev_hash))
-                    last_token_id = token_id
-                    last_position = pos
-                    last_slot_idx = slot_idx
-                    last_prev_hash_at_write = prev_hash
+                    new_entries.append(
+                        _HistoryEntry(
+                            token_id=token_id,
+                            position=pos,
+                            slot_idx=slot_idx,
+                            prev_hash_at_write=prev_hash,
+                        )
+                    )
                     prev_hash = mix_step(prev_hash, token_id, pos)
 
                 if count > 0:
-                    new_last_committed = _LastCommitted(
-                        token_id=last_token_id,
-                        position=last_position,
-                        slot_idx=last_slot_idx,
-                        prev_hash_at_write=last_prev_hash_at_write,
-                    )
                     next_state[req_pool_idx] = _RequestState(
                         prev_hash_tail=prev_hash,
                         k_req=max(state.k_req, start_pos + count),
-                        last_committed=new_last_committed,
+                        history=state.history + tuple(new_entries),
                     )
                 else:
                     next_state[req_pool_idx] = state

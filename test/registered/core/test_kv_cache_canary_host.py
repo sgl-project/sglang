@@ -36,7 +36,7 @@ class TestCanaryHostState(unittest.TestCase):
             input_tokens_per_req=[[10, 20, 30, 40]],
             write_slot_indices_per_req=[[100, 101, 102, 103]],
         )
-        # First chunk has no last_committed, so no verify entries.
+        # First chunk has no history, so no verify entries.
         self.assertEqual(plan.num_verify, 0)
         self.assertEqual(plan.num_write, 4)
         self.assertEqual(plan.verify_mask, [0, 0, 0, 0])
@@ -48,7 +48,8 @@ class TestCanaryHostState(unittest.TestCase):
             plan.expected_prev_hashes[0] & ((1 << 64) - 1), state._config.seed
         )
 
-    def test_plan_emits_one_verify_entry_after_first_commit(self):
+    def test_plan_emits_full_prefix_verify_entries_after_commits(self):
+        """README §4 verify range = [0, k_req) — one verify entry per historical position."""
         state = self._make_state()
         plan1 = state.plan_batch(
             req_pool_indices=[7],
@@ -65,17 +66,16 @@ class TestCanaryHostState(unittest.TestCase):
             input_tokens_per_req=[[4]],
             write_slot_indices_per_req=[[203]],
         )
-        # One verify entry (the previously committed last slot for req 7),
-        # followed by one write entry for the new decode token.
-        self.assertEqual(plan2.num_verify, 1)
+        # 3 verify entries cover [0, 3) followed by 1 write for the new token.
+        self.assertEqual(plan2.num_verify, 3)
         self.assertEqual(plan2.num_write, 1)
-        self.assertEqual(plan2.verify_mask, [1, 0])
-        self.assertEqual(plan2.verify_slot_indices, [202])
-        self.assertEqual(plan2.verify_seq_positions, [2, -1])
-        # Verify entry's expected_token_id / expected_position come from the
-        # previous commit's last token.
-        self.assertEqual(plan2.expected_token_ids[0], 3)
-        self.assertEqual(plan2.expected_positions[0], 2)
+        self.assertEqual(plan2.verify_mask, [1, 1, 1, 0])
+        self.assertEqual(plan2.verify_slot_indices, [200, 201, 202])
+        # verify_seq_positions are the historical position indices themselves,
+        # NOT derived from any req->slot table.
+        self.assertEqual(plan2.verify_seq_positions, [0, 1, 2, -1])
+        self.assertEqual(plan2.expected_token_ids[:3], [1, 2, 3])
+        self.assertEqual(plan2.expected_positions[:3], [0, 1, 2])
 
     def test_chunked_prefill_advance_keeps_chain_continuous(self):
         state = self._make_state()
@@ -94,14 +94,14 @@ class TestCanaryHostState(unittest.TestCase):
             input_tokens_per_req=[[300, 400]],
             write_slot_indices_per_req=[[302, 303]],
         )
-        # plan_b has 1 verify (the last token of plan_a, position 1) then 2 writes.
-        self.assertEqual(plan_b.num_verify, 1)
+        # plan_b verifies the full historical prefix [0, 2) then writes 2 new tokens.
+        self.assertEqual(plan_b.num_verify, 2)
         self.assertEqual(plan_b.num_write, 2)
         h = state._config.seed
         h = mix_step(h, 100, 0)
         h = mix_step(h, 200, 1)
         # The first write entry's expected_prev_hash equals the chain hash from chunk A.
-        self.assertEqual(plan_b.expected_prev_hashes[1] & ((1 << 64) - 1), h)
+        self.assertEqual(plan_b.expected_prev_hashes[2] & ((1 << 64) - 1), h)
 
     def test_reset_request_restarts_chain_at_seed(self):
         state = self._make_state()

@@ -129,8 +129,10 @@ class TestSpecHostStateRejectReset(unittest.TestCase):
         state.commit_plan(plan)
         state.reset_request_to(req_pool_idx=7, k_req=2)
 
-        # After reset_request_to, last_committed is cleared; next plan must
-        # not emit a verify entry referencing the rejected slots.
+        # After reset_request_to(k_req=2), history is truncated to positions
+        # [0, 2): only the two accepted slots remain. The next plan therefore
+        # verifies exactly those two and never reads the freed (rejected)
+        # slots 12/13/14.
         plan2 = state.plan_batch(
             req_pool_indices=[7],
             req_token_counts=[1],
@@ -138,7 +140,8 @@ class TestSpecHostStateRejectReset(unittest.TestCase):
             input_tokens_per_req=[[2222]],
             write_slot_indices_per_req=[[15]],
         )
-        self.assertEqual(plan2.num_verify, 0)
+        self.assertEqual(plan2.num_verify, 2)
+        self.assertEqual(plan2.verify_slot_indices, [10, 11])
 
     def test_reset_request_to_zero_drops_request_completely(self) -> None:
         state = self._make_state()
