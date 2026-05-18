@@ -675,6 +675,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    kv_cache_canary: str = "off"
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -6028,6 +6029,20 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--kv-cache-canary",
+            type=str,
+            default=ServerArgs.kv_cache_canary,
+            choices=["off", "log", "raise"],
+            help=(
+                "KV cache canary mode. 'off' disables the canary (default). 'log' "
+                "records mismatches to a violation buffer and logs them while the "
+                "server keeps running (production-safe). 'raise' performs a "
+                "cross-rank allreduce of the error flag and raises on every rank "
+                "to avoid TP deadlocks (CI lane). See "
+                "python/sglang/srt/kv_cache_canary/README for details."
+            ),
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

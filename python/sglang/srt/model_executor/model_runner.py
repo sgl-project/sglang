@@ -740,6 +740,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
+        # and BEFORE init_device_graphs (so the canary kernel is captured into the
+        # cuda graph and shadow tensor pointers are baked in).
+        from sglang.srt.kv_cache_canary.install import install_on_model_runner
+
+        install_on_model_runner(
+            model_runner=self,
+            mode=getattr(server_args, "kv_cache_canary", None),
+        )
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
