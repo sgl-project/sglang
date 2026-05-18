@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -405,6 +405,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # Relayer plumbing for forward-stream consumers that need to read
+    # cross-iter relay state (seq_lens / new_seq_lens / accept_lens) with
+    # channel-level cross-stream sync rather than via the live SB attribute.
+    # Populated by ``ForwardBatch.init_new`` when the source SB has a Relayer
+    # ctx attached; ``None`` for non-overlap paths.
+    relayer: Optional[Any] = None
+    relayer_gpu_future_indices: Optional[Any] = None
+    relayer_cpu_future_indices: Optional[Any] = None
+
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -438,6 +447,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    def relayer_resolve_seq_lens(self) -> Optional[torch.Tensor]:
+        """Channel-resolved read of ``seq_lens`` for forward-stream consumers.
+        Returns the gpu_scalar channel slot view (cross-stream-safe via the
+        cuda event recorded at store time) when a Relayer ctx is attached
+        to this ForwardBatch; falls back to ``self.seq_lens``.
+        """
+        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+            return self.relayer.resolve_seq_lens(
+                self.relayer_gpu_future_indices.indices
+            )
+        return self.seq_lens
+
+    def relayer_resolve_seq_lens_cpu(self):
+        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+            return self.relayer.resolve_seq_lens_cpu(
+                self.relayer_gpu_future_indices.indices
+            )
+        return self.seq_lens_cpu
+
+    def relayer_resolve_orig_seq_lens(self):
+        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+            return self.relayer.resolve_orig_seq_lens(
+                self.relayer_gpu_future_indices.indices
+            )
+        return self.orig_seq_lens
 
     @classmethod
     def init_new(
@@ -551,6 +586,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
         )
+
+        # Propagate the Relayer + future-indices ctx from SB so forward-side
+        # consumers (attention backends, cuda graph runner, sampling) can
+        # opt into channel-resolved reads of cross-iter relay state via
+        # ``ForwardBatch.relayer_resolve_seq_lens`` etc. Falls back to None
+        # when SB was not bound to a Relayer this iter.
+        seq_ctx = getattr(batch, "_relayer_seq_lens_ctx", None)
+        cpu_ctx = getattr(batch, "_relayer_ctx", None)
+        if seq_ctx is not None:
+            ret.relayer, ret.relayer_gpu_future_indices = seq_ctx
+        if cpu_ctx is not None:
+            cpu_relayer, cpu_fi = cpu_ctx
+            ret.relayer_cpu_future_indices = cpu_fi
+            if ret.relayer is None:
+                ret.relayer = cpu_relayer
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
