@@ -46,19 +46,18 @@ def _find_attention_attr(layer: Any) -> str | None:
     return None
 
 
-def find_attention_layers(model: Any) -> tuple[list[Any], str]:
-    """Find transformer layers and the attention attribute name."""
+def find_attention_layers(model: Any) -> tuple[list[Any], list[str | None]]:
+    """Find transformer layers and per layer attention attribute names."""
     root = getattr(model, "language_model", model)
     container = getattr(root, "model", root)
     layer_list = getattr(container, "layers", None) or getattr(root, "layers", [])
 
     if layer_list:
-        for layer in layer_list:
-            attn_attr = _find_attention_attr(layer)
-            if attn_attr is not None:
-                return layer_list, attn_attr
+        attn_attrs = [_find_attention_attr(layer) for layer in layer_list]
+        if any(attr is not None for attr in attn_attrs):
+            return layer_list, attn_attrs
         raise ValueError(f"No attention attribute in layer type {type(layer_list[0])}")
-    return layer_list, "self_attn"
+    return layer_list, []
 
 
 def patch_model_attention(model: Any) -> int:
@@ -67,10 +66,9 @@ def patch_model_attention(model: Any) -> int:
     The wrapper delegates to the inner module when no BatchedDecodeContext
     is set, so it is always installed and never removed.
     """
-    layer_list, attn_attr = find_attention_layers(model)
+    layer_list, attn_attrs = find_attention_layers(model)
     patched = 0
-    for idx, layer in enumerate(layer_list):
-        attn_attr = _find_attention_attr(layer)
+    for idx, (layer, attn_attr) in enumerate(zip(layer_list, attn_attrs)):
         if attn_attr is None:
             continue
         attn = getattr(layer, attn_attr, None)

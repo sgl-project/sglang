@@ -262,13 +262,13 @@ class MlxModelRunner:
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
         """Return (n_kv_heads, head_dim, dtype) from the model."""
-        layer_list, attn_attr = find_attention_layers(self.model)
+        layer_list, attn_attrs = find_attention_layers(self.model)
         if not layer_list:
             raise RuntimeError("Cannot determine attention config: no layers found")
         sample_attn = None
-        for layer in layer_list:
-            sample_attn = getattr(layer, attn_attr, None)
-            if sample_attn is not None:
+        for layer, attn_attr in zip(layer_list, attn_attrs): # i still need this loop since the first layer can be None
+            if attn_attr is not None:
+                sample_attn = getattr(layer, attn_attr)
                 break
         if sample_attn is None:
             raise RuntimeError("Cannot determine attention config: no attention module found")
