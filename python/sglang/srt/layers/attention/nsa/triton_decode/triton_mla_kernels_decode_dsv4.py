@@ -57,27 +57,16 @@ DSV4_USE_FIXED_KERNEL_THRESHOLD = 32768
 
 @triton.autotune(
     configs=[
-        # Small block sizes for better occupancy on CDNA4 (256 CUs)
-        triton.Config({"BLOCK_TK": 8}, num_warps=1, num_stages=1),
-        triton.Config({"BLOCK_TK": 8}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_TK": 16}, num_warps=1, num_stages=1),
-        triton.Config({"BLOCK_TK": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_TK": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_TK": 32}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_TK": 32}, num_warps=4, num_stages=1),
+        # This is a pure memory-copy + FP8→BF16 dequant kernel.
+        # - BLOCK_TK controls how many (token×topk) pairs per block.
+        # - Larger BLOCK_TK amortizes launch overhead but needs more warps.
+        # - BLOCK_TK=128 is already validated as the fixed config for small workloads
+        #   (below DSV4_USE_FIXED_KERNEL_THRESHOLD = 32K elements).
+        # - BLOCK_TK=64/128: good for small/medium workloads (fewer warps, less overhead).
+        # - BLOCK_TK=256: better bandwidth utilization for large workloads.
         triton.Config({"BLOCK_TK": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_TK": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_TK": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_TK": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_TK": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_TK": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_TK": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_TK": 256}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_TK": 256}, num_warps=16, num_stages=1),
-        triton.Config({"BLOCK_TK": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_TK": 512}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_TK": 512}, num_warps=16, num_stages=1),
-        triton.Config({"BLOCK_TK": 512}, num_warps=8, num_stages=2),
     ],
     key=["total_tokens_bucket", "topk", "workload_size_cat"],
 )
