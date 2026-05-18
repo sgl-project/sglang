@@ -1491,7 +1491,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        if not abort_all and rid not in self.rid_to_state:
+        # Empty rid would startswith-match every request on the scheduler.
+        if not abort_all and not rid:
+            logger.warning("Ignore abort_request with empty rid and abort_all=False")
+            return
+        if (
+            not abort_all
+            and self.server_args.tokenizer_worker_num == 1
+            and rid not in self.rid_to_state
+        ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
