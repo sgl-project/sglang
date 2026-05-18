@@ -57,5 +57,7 @@ def create_elastic_ep_status_publisher(
         and server_args.elastic_ep_backend is not None
         and server_args.dp_size > 1
     ):
-        return ControllerElasticEPStatusPublisher(send_to_controller, server_args.dp_size)
+        return ControllerElasticEPStatusPublisher(
+            send_to_controller, server_args.dp_size
+        )
     return ElasticEPStatusPublisher()

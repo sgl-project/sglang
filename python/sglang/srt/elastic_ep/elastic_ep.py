@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Iterator, List, Optional
 
 import torch
@@ -134,9 +134,9 @@ class ElasticEPState:
         self.clear_pending_snapshots()
         for staging_active_ranks_cpu in self.staging_active_ranks_cpu_slots:
             staging_active_ranks_cpu.fill_(1)
-        for staging_global_pg_active_ranks_cpu in (
-            self.staging_global_pg_active_ranks_cpu_slots
-        ):
+        for (
+            staging_global_pg_active_ranks_cpu
+        ) in self.staging_global_pg_active_ranks_cpu_slots:
             staging_global_pg_active_ranks_cpu.fill_(1)
 
 
@@ -229,7 +229,6 @@ class ElasticEPStateManager:
 
 
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
-
 
 
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:

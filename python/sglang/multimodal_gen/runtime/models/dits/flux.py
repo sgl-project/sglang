@@ -52,7 +52,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -355,9 +357,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         freqs_cis=None,
         num_replicated_prefix: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        query, key, value, encoder_query, encoder_key, encoder_value = (
-            _get_qkv_projections(self, x, encoder_hidden_states)
-        )
+        (
+            query,
+            key,
+            value,
+            encoder_query,
+            encoder_key,
+            encoder_value,
+        ) = _get_qkv_projections(self, x, encoder_hidden_states)
 
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
@@ -658,9 +665,13 @@ class FluxTransformerBlock(nn.Module):
             hidden_states, emb=temb
         )
 
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
-            self.norm1_context(encoder_hidden_states, emb=temb)
-        )
+        (
+            norm_encoder_hidden_states,
+            c_gate_msa,
+            c_shift_mlp,
+            c_scale_mlp,
+            c_gate_mlp,
+        ) = self.norm1_context(encoder_hidden_states, emb=temb)
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         # Attention.
@@ -745,7 +756,7 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
 
