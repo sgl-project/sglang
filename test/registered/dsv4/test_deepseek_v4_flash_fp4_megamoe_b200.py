@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: stage-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
+Registry: base-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
@@ -21,27 +21,19 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="stage-c", runner_config="dsv4-4-gpu-b200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
 _W4A8_MEGAMOE_ENV = {
-    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
-    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
-    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
 }
 
 
 _W4A4_MEGAMOE_ENV = {
-    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
-    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
-    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
@@ -81,7 +73,7 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(ServerSanityMixin, CustomTestCase):
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
-                "deepep",
+                "megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
@@ -122,7 +114,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
-                "deepep",
+                "megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
