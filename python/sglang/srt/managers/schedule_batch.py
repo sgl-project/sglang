@@ -2643,6 +2643,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
             self.assert_lockstep()
 
+        # Return ForwardData snapshot so callers that want the
+        # FD-as-explicit-output path can chain
+        # ``fd = batch.prepare_for_decode_returning_fd()``. Existing
+        # call sites that ignore the return value keep the in-place
+        # mutation semantics.
+        return self.to_forward_data()
+
+    def prepare_for_decode_returning_fd(self):
+        """Variant entrance for callers that explicitly want the FD path.
+        Mutates self (legacy behavior) and returns the ForwardData snapshot.
+        """
+        return self.prepare_for_decode()
+
     def maybe_wait_verify_done(self):
         # Stream-level wait instead of CPU sync: schedule_stream waits for
         # the verify_done event on the forward_stream without blocking the
