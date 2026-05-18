@@ -152,7 +152,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
-    init_mm_embedding_cache,
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -188,9 +187,8 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -211,7 +209,6 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -430,6 +427,12 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
@@ -454,10 +457,64 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
-        self.init_cache_with_memory_pool()
+        result = kv_cache_builder.build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            page_size=self.page_size,
+            spec_algorithm=self.spec_algorithm,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            enable_metrics=self.enable_metrics,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            ps=self.ps,
+            tp_group=self.tp_group,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+
+        if self.enable_hisparse:
+            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if (
+            self.server_args.disaggregation_mode == "decode"
+            and self.server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
 
         # Register draft KV pool (when spec + HiCache co-enabled).
-        self._maybe_register_hicache_draft()
+        kv_cache_builder.maybe_register_hicache_draft(
+            tree_cache=self.tree_cache,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_overlap=self.enable_overlap,
+            page_size=self.page_size,
+        )
 
         # Init running status
         self.init_running_status()
@@ -823,257 +880,6 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
-    def init_cache_with_memory_pool(self):
-        server_args = self.server_args
-        uses_transformers_backend = (
-            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
-        )
-
-        # Hybrid memory pool
-        self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        _spec = self.tp_worker.model_runner.linear_attn_model_spec
-        _registry_needs_mamba = (
-            _spec.uses_mamba_radix_cache if _spec is not None else False
-        )
-        self.is_hybrid_ssm = (
-            self.tp_worker.model_runner.hybrid_gdn_config is not None
-            or self.tp_worker.model_runner.mamba2_config is not None
-            or _registry_needs_mamba
-        )
-
-        self.sliding_window_size = None
-        if self.is_hybrid_swa:
-            self.sliding_window_size = self.tp_worker.sliding_window_size
-            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
-                self.tp_worker.get_tokens_per_layer_info()
-            )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
-
-        self.disable_radix_cache = server_args.disable_radix_cache or (
-            self.model_config.is_multimodal and uses_transformers_backend
-        )
-        if self.disable_radix_cache and not server_args.disable_radix_cache:
-            logger.warning(
-                "Radix cache is disabled for multimodal models with the "
-                "Transformers backend to avoid multimodal prefix-cache mismatches."
-            )
-
-        # Decode radix cache is unsupported with hybrid SWA/SSM models —
-        # these use specialized memory pools incompatible with the
-        # prefix-match-and-lock allocation path.
-        if (
-            server_args.disaggregation_decode_enable_radix_cache
-            and server_args.disaggregation_mode == "decode"
-        ):
-            if self.is_hybrid_swa:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with sliding window attention (SWA) models"
-                )
-            if self.is_hybrid_ssm:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with Mamba/SSM models"
-                )
-
-        effective_chunked_prefill_size = server_args.chunked_prefill_size
-        if self.model_config.is_multimodal and uses_transformers_backend:
-            effective_chunked_prefill_size = None
-
-        params = CacheInitParams(
-            disable=self.disable_radix_cache,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
-            is_eagle=self.spec_algorithm.is_eagle(),
-            tp_cache_group=(
-                self.attn_tp_cpu_group
-                if self.server_args.enable_dp_attention
-                else self.tp_cpu_group
-            ),
-            attn_cp_cache_group=self.attn_cp_cpu_group,
-            attn_tp_cache_group=self.attn_tp_cpu_group,
-            eviction_policy=server_args.radix_eviction_policy,
-            enable_metrics=self.enable_metrics,
-            enable_kv_cache_events=self.enable_kv_cache_events,
-            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-            pp_rank=self.ps.pp_rank,
-            pp_size=self.ps.pp_size,
-            chunked_prefill_size=effective_chunked_prefill_size,
-            sliding_window_size=self.sliding_window_size,
-        )
-
-        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
-                from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-                self.tree_cache = ChunkCache(params)
-            else:
-                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-                self.tree_cache = SWAChunkCache(params)
-        else:
-            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-                # lazy import to avoid JIT overhead
-                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-                logger.info("Using experimental C++ radix tree implementation.")
-                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                from sglang.srt.mem_cache.unified_cache_components import (
-                    ComponentType,
-                )
-                from sglang.srt.mem_cache.unified_radix_cache import (
-                    UnifiedRadixCache,
-                )
-
-                tree_components = [ComponentType.FULL]
-                if self.is_hybrid_swa or self.is_hybrid_ssm:
-                    tree_components.append(
-                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
-                    )
-                params.tree_components = tuple(tree_components)
-                self.tree_cache = UnifiedRadixCache(params)
-                if self.enable_hierarchical_cache:
-                    self.tree_cache.init_hicache(server_args, params)
-                    self.tp_worker.register_hicache_layer_transfer_counter(
-                        self.tree_cache.cache_controller.layer_done_counter
-                    )
-            elif self.enable_hierarchical_cache:
-                if self.is_hybrid_ssm:
-                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
-                        HiMambaRadixCache,
-                    )
-
-                    self.tree_cache = HiMambaRadixCache(
-                        params=params, server_args=server_args
-                    )
-                else:
-                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
-                    self.tree_cache = HiRadixCache(
-                        params=params, server_args=server_args
-                    )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
-            elif self.is_hybrid_swa:
-                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-                self.tree_cache = SWARadixCache(params=params)
-            elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-                self.tree_cache = MambaRadixCache(params)
-            elif server_args.enable_lmcache:
-                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                    LMCRadixCache,
-                )
-
-                self.tree_cache = LMCRadixCache(
-                    params=params,
-                    model_config=self.model_config,
-                    tp_size=self.ps.tp_size,
-                    rank=self.ps.tp_rank,
-                    tp_group=self.tp_group,
-                )
-            else:
-                self.tree_cache = RadixCache(params)
-
-        if (
-            server_args.enable_streaming_session
-            and not self.tree_cache.supports_streaming_session()
-        ):
-            self.tree_cache = StreamingSession(self.tree_cache)
-
-        if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
-
-        if (
-            server_args.disaggregation_mode == "decode"
-            and server_args.disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=params.tp_cache_group,
-                tree_cache=self.tree_cache,
-                server_args=self.server_args,
-            )
-        else:
-            self.decode_offload_manager = None
-
-        embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
-        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
-
-    def _get_draft_kv_pool(self):
-        """Return (draft_token_to_kv_pool, draft_model_config) for the current
-        draft worker, or (None, None) when no draft KV pool is available."""
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
-            return None, None
-
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
-            return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-        return (
-            self.draft_worker.model_runner.token_to_kv_pool,
-            self.draft_worker.model_config,
-        )
-
-    def _maybe_register_hicache_draft(self) -> None:
-        """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-        if not self.enable_hierarchical_cache:
-            return
-
-        draft_kv_pool, _ = self._get_draft_kv_pool()
-        if draft_kv_pool is None:
-            return
-
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
-        )
-
-        pool = draft_kv_pool
-        if isinstance(pool, HybridLinearKVPool):
-            pool = pool.full_kv_pool
-
-        # Create host pool for draft with the same slot count as the target host pool,
-        # so that host indices stay 1-to-1 between target and draft KV caches.
-        primary = self.tree_cache.cache_controller.mem_pool_host
-        kw = dict(
-            host_to_device_ratio=primary.size / pool.size,
-            host_size=0,
-            page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
-        )
-        if isinstance(pool, MHATokenToKVPool):
-            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, MLATokenToKVPool):
-            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
-        else:
-            logger.warning(
-                "Draft pool type %s not supported for HiCache, skipping.",
-                type(pool).__name__,
-            )
-            return
-
-        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
-
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -1229,7 +1035,12 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_overlap=self.enable_overlap,
+        )
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
         # when this node runs a spec module.
