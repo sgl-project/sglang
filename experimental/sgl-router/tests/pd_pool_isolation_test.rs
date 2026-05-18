@@ -97,6 +97,7 @@ async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
         url: worker.url.clone(),
         mode: WorkerMode::Decode,
         model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
     }]);
     let app = build_router(ctx);
 
@@ -130,14 +131,17 @@ async fn no_workers_returns_no_healthy_workers() {
     );
 }
 
-/// PD-disagg deployment with both pools healthy → chat dispatch selects
-/// from the prefill pool only. Asserted by: only the prefill worker's
-/// URL is routable; if the route hit the decode worker we'd see the
-/// prefill MockWorker's `captured.last_body` stay empty, while the
-/// decode MockWorker's would fill. Pinning this in M4 covers the cross-
-/// pool selection guard.
+/// PD-disagg deployment with both pools healthy → chat dispatch fans
+/// out to BOTH the prefill and the decode worker (Pattern B: prefill
+/// in a detached task, decode awaited for the client response). Both
+/// receive the same bootstrap-injected body so the SGLang engine can
+/// match KV transfers via `bootstrap_room`. Pool *isolation* — the
+/// guarantee that the policy's prefill candidate set excludes decode
+/// workers — is exercised at the resolver layer
+/// (`policies::registry::tests::pd_resolution_returns_distinct_pools`).
+/// Here we only assert the HTTP-layer wiring of the dual dispatch.
 #[tokio::test]
-async fn pd_mode_chat_dispatch_selects_only_prefill_workers() {
+async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
     let prefill = common::mock_worker::MockWorker::start(vec![]).await;
     let decode = common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
@@ -146,40 +150,58 @@ async fn pd_mode_chat_dispatch_selects_only_prefill_workers() {
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
     ]);
     let app = build_router(ctx);
 
-    // Fire 5 requests; round-robin within the prefill pool would
-    // serve all of them from the lone prefill worker. None should
-    // reach the decode worker.
-    for _ in 0..5 {
-        let res = app.clone().oneshot(chat_request()).await.unwrap();
-        assert_eq!(
-            res.status(),
-            StatusCode::OK,
-            "chat request must succeed via the prefill worker",
+    // Fire a single request; both prefill (spawn-and-forget) and
+    // decode (awaited) must receive a body with the injected
+    // bootstrap fields. The decode body is what the client sees on
+    // the response.
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "decode response status should reach the client",
+    );
+
+    // Decode receives its body synchronously (we awaited it), so it's
+    // guaranteed captured by the time the response returned. Scope
+    // the lock guard to this block so it doesn't span the `.await`
+    // below (clippy: await_holding_lock).
+    {
+        let decode_seen = decode.captured.lock().unwrap();
+        assert!(
+            decode_seen.last_body.is_some(),
+            "decode worker must receive the bootstrap-injected request body in PD mode",
         );
     }
 
-    // Decode mock should have received zero requests — its capture
-    // buffer's `last_body` stays `None`.
-    let decode_seen = decode.captured.lock().unwrap();
-    assert!(
-        decode_seen.last_body.is_none(),
-        "decode worker must not be selected for chat (prefill) dispatch",
-    );
-    let prefill_seen = prefill.captured.lock().unwrap();
-    assert!(
-        prefill_seen.last_body.is_some(),
-        "prefill worker must have received at least one chat request",
-    );
+    // Prefill is detached; poll briefly until its capture lands. The
+    // prefill task races the HTTP response back to the client. The
+    // local binding releases the `std::sync::Mutex` guard before the
+    // `.await` — holding a sync mutex across an await would let one
+    // task pin the lock while another tries to acquire it.
+    let prefill_body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let captured = prefill.captured.lock().unwrap().last_body.clone();
+            if let Some(b) = captured {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("prefill MUST eventually receive its body via the detached task");
+    assert!(!prefill_body.is_empty());
 }
 
 /// Task C: PD-mode chat request carries an `x-sgl-decode-url` header
@@ -214,24 +236,28 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             url: prefill_a.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
         WorkerSpec {
             id: WorkerId("p2".into()),
             url: prefill_b.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode_a.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
             url: decode_b.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
     ]);
     let app = build_router(ctx);
@@ -281,6 +307,7 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
     }]);
     let app = build_router(ctx);
 
@@ -306,6 +333,7 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         url: prefill.url.clone(),
         mode: WorkerMode::Prefill,
         model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
     }]);
     let app = build_router(ctx);
 
@@ -333,18 +361,21 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
             url: decode_a.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
             url: decode_b.url.clone(),
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
         },
     ]);
     let app = build_router(ctx);
@@ -382,6 +413,7 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
     }]);
     let app = build_router(ctx);
 
