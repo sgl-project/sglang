@@ -219,10 +219,16 @@ pub async fn chat_completions(
             body,
             Some(stream_guards),
         );
+        // Bias `fetch` over the cancellation branch: a successful
+        // response that completes in the same poll as the token firing
+        // MUST win (returning 504 for a request that already has
+        // headers is a correctness regression). The cancellation
+        // branch only matters when fetch is still pending — at that
+        // point biasing the order is a wash.
         tokio::select! {
             biased;
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
         }
     } else {
         // Non-streaming: the handler awaits the full buffered response,
@@ -240,13 +246,13 @@ pub async fn chat_completions(
         );
         // Race the upstream fetch against the stale-request token. If
         // the janitor fires while we're awaiting the response, return
-        // 504 instead of leaving the client hung. `biased` makes the
-        // token branch checked first so a cancellation that occurred
-        // before the next poll is observed promptly.
+        // 504 instead of leaving the client hung. Same `biased` order
+        // as the streaming arm: a successful fetch that completes in
+        // the same poll as token cancellation MUST win.
         tokio::select! {
             biased;
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
         }
     }
 }

@@ -94,9 +94,17 @@ struct WorkerCounters {
 /// with `ApiError::StaleRequestExpired` when the token resolves —
 /// surfacing the stale-request expiry as a 504 to the client instead
 /// of leaving the handler hung on a long-lived upstream.
+///
+/// `counters` is the **exact** `WorkerCounters` instance that was
+/// incremented at register time. Holding the `Arc` directly (instead
+/// of re-looking-up `workers.get(&worker)` at sweep time) pins the
+/// decrement to the same instance — so a worker that is
+/// `forget_worker`-removed and re-added under the same `WorkerId`
+/// does not underflow the new (zero-initialized) counters slot.
 #[derive(Debug)]
 struct RequestEntry {
     worker: WorkerId,
+    counters: Arc<WorkerCounters>,
     prefill_load: usize,
     decode_load: usize,
     registered_at: Instant,
@@ -226,6 +234,7 @@ impl ActiveLoadRegistry {
             request_id.clone(),
             RequestEntry {
                 worker: worker.clone(),
+                counters,
                 prefill_load,
                 decode_load,
                 registered_at: self.clock.now(),
@@ -303,14 +312,20 @@ impl ActiveLoadRegistry {
             // entry between our scan and this point, the second remove
             // returns `None` and we skip (no double-decrement).
             if let Some((_, entry)) = self.requests.remove(&id) {
-                if let Some(counters) = self.workers.get(&entry.worker) {
-                    counters
-                        .prefill_load
-                        .fetch_sub(entry.prefill_load, Ordering::Relaxed);
-                    counters
-                        .decode_load
-                        .fetch_sub(entry.decode_load, Ordering::Relaxed);
-                }
+                // Decrement the **captured** counters Arc — the same
+                // instance the register call incremented. This stays
+                // correct across `forget_worker` + re-register cycles:
+                // even if `self.workers[&entry.worker]` now points at a
+                // brand-new `WorkerCounters`, our decrement targets the
+                // original one (still alive via this Arc clone).
+                entry
+                    .counters
+                    .prefill_load
+                    .fetch_sub(entry.prefill_load, Ordering::Relaxed);
+                entry
+                    .counters
+                    .decode_load
+                    .fetch_sub(entry.decode_load, Ordering::Relaxed);
                 // Wake the chat handler awaiting this request so it can
                 // return `ApiError::StaleRequestExpired` to the client.
                 // Cancellation is idempotent; if the handler already
@@ -412,8 +427,9 @@ pub struct ActiveLoadGuard {
     registry: Option<Arc<ActiveLoadRegistry>>,
     /// `None` after the janitor expired this request — drop becomes a
     /// no-op in that case. The guard keeps only the `RequestId`; the
-    /// per-axis amounts live in the registry's `RequestEntry` so drop
-    /// and the janitor consult the same source of truth.
+    /// per-axis amounts (and the captured `Arc<WorkerCounters>`) live
+    /// in the registry's `RequestEntry` so drop and the janitor
+    /// consult the same source of truth.
     request_id: Option<RequestId>,
     worker: WorkerId,
     /// Cancellation token mirrored from `RequestEntry::cancel`. The
@@ -447,16 +463,20 @@ impl Drop for ActiveLoadGuard {
             return;
         };
         // `remove` returns `Some` exactly once; if the janitor races us
-        // and wins, we skip the decrement here.
+        // and wins, we skip the decrement here. Decrement the **same**
+        // counters Arc the register call incremented (see
+        // `ActiveLoadGuard::counters`) — pinning the decrement to a
+        // specific WorkerCounters instance keeps the math correct
+        // across `forget_worker` + re-register cycles.
         if let Some((_, entry)) = registry.requests.remove(&id) {
-            if let Some(counters) = registry.workers.get(&entry.worker) {
-                counters
-                    .prefill_load
-                    .fetch_sub(entry.prefill_load, Ordering::Relaxed);
-                counters
-                    .decode_load
-                    .fetch_sub(entry.decode_load, Ordering::Relaxed);
-            }
+            entry
+                .counters
+                .prefill_load
+                .fetch_sub(entry.prefill_load, Ordering::Relaxed);
+            entry
+                .counters
+                .decode_load
+                .fetch_sub(entry.decode_load, Ordering::Relaxed);
         }
     }
 }
@@ -670,6 +690,41 @@ mod tests {
         registry.forget_worker(&WorkerId("never-registered".into()));
         // No assertion beyond "did not panic"; the body of the test
         // exercises the contract.
+    }
+
+    /// Task B regression: an in-flight guard must NOT underflow the
+    /// counters of a freshly re-registered worker that reuses its
+    /// predecessor's `WorkerId`. This is the exact scenario `forget_
+    /// worker` is supposed to make safe — and it requires Drop to
+    /// decrement the **captured** `Arc<WorkerCounters>`, not the
+    /// current `workers[worker]` lookup.
+    #[test]
+    fn forget_then_reregister_does_not_underflow_new_counters() {
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        let w = WorkerId("w0".into());
+        let old_guard = registry.register(w.clone(), 7, 2);
+        registry.forget_worker(&w);
+        // Re-register under the same id → brand-new WorkerCounters
+        // slot. Fresh load of 0 (we mint a no-op guard to materialize
+        // the slot without bumping any counters).
+        let _new_guard = registry.register(w.clone(), 0, 0);
+        assert_eq!(registry.prefill_load(&w), 0);
+        assert_eq!(registry.decode_load(&w), 0);
+
+        // Dropping the OLD guard must subtract from the OLD counters
+        // (which are now orphaned but kept alive via the Arc captured
+        // in the RequestEntry). The NEW counters' values are unaffected.
+        drop(old_guard);
+        assert_eq!(
+            registry.prefill_load(&w),
+            0,
+            "new worker's prefill_load must NOT underflow when old guard drops",
+        );
+        assert_eq!(
+            registry.decode_load(&w),
+            0,
+            "new worker's decode_load must NOT underflow when old guard drops",
+        );
     }
 
     /// Task D: janitor expiry fires the guard's cancellation token so
