@@ -233,7 +233,15 @@ class CanaryHostState:
                     )
                 state = self._states.get(req_pool_idx) or self._initial_state()
 
-                for entry in state.history:
+                # Bound the per-forward verify cost: full [0, K_req) is
+                # quadratic over a long req's lifetime. Verify the most
+                # recent ``max_verify_per_req_per_forward`` entries instead.
+                # 0 = unbounded.
+                cap = self._config.max_verify_per_req_per_forward
+                verify_window = (
+                    state.history if cap <= 0 else state.history[-cap:]
+                )
+                for entry in verify_window:
                     verify_req_ids.append(req_pool_idx)
                     verify_token_ids.append(entry.token_id)
                     verify_positions.append(entry.position)
@@ -264,10 +272,16 @@ class CanaryHostState:
                     prev_hash = mix_step(prev_hash, token_id, pos)
 
                 if count > 0:
+                    combined_history = state.history + tuple(new_entries)
+                    # Keep at most max_verify_per_req_per_forward entries —
+                    # older positions become unverifiable but free host memory
+                    # and avoid unbounded growth. 0 = keep all history.
+                    if cap > 0 and len(combined_history) > cap:
+                        combined_history = combined_history[-cap:]
                     next_state[req_pool_idx] = _RequestState(
                         prev_hash_tail=prev_hash,
                         k_req=max(state.k_req, start_pos + count),
-                        history=state.history + tuple(new_entries),
+                        history=combined_history,
                     )
                 else:
                     next_state[req_pool_idx] = state

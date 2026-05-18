@@ -292,15 +292,12 @@ def _patch_get_state_buf_infos_swa(pool: "BaseSWAKVPool") -> None:
 
     def patched() -> Tuple[List[int], List[int], List[int]]:
         ptrs, lens, item_lens = original()
-        page_size = getattr(pool, "swa_page_size", None) or getattr(
-            pool, "page_size", 1
-        )
         return _compose_buf_infos_with_canaries(
             data_ptrs=ptrs,
             data_lens=lens,
             item_lens=item_lens,
             pool=pool,
-            page_size=page_size,
+            page_size=pool.page_size,
             has_v_half=pool.canary_has_v_half,
         )
 

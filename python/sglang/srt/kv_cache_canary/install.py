@@ -154,7 +154,7 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return original_forward(*args, **kwargs)
 
-        rank = getattr(model_runner, "tp_rank", 0) or 0
+        rank = model_runner.tp_rank
         active_indices, active_seq_lens = _extract_active_rows(forward_batch)
         maybe_perturb_req_to_token(
             runner=runner,
@@ -182,7 +182,9 @@ def _extract_forward_batch(args, kwargs):
     return None
 
 
-def _extract_active_rows(forward_batch) -> tuple:
+def _extract_active_rows(
+    forward_batch,
+) -> tuple[Optional[list], Optional[list]]:
     """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb.
 
     Returns ``(None, None)`` when the data isn't available — perturb falls
