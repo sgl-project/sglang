@@ -345,9 +345,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
         if is_target_verify:
-            draft_token_num = forward_batch.spec_info.draft_token_num
             num_token_padding = mixed_qkv.shape[0]
-            batch_size = cache_indices.shape[0]
             if (
                 not self.graph_mode
                 and forward_batch.num_token_non_padded_cpu != num_token_padding
@@ -357,8 +355,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 b = b[: forward_batch.num_token_non_padded_cpu]
                 seq_len = forward_batch.num_token_non_padded_cpu
 
-            mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
-            num_accept_tokens = torch.full(
+            batch_size = cache_indices.shape[0]
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            num_accepted_tokens = torch.full(
                 (batch_size,),
                 draft_token_num,
                 dtype=torch.int32,
@@ -540,7 +539,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             nv=num_value_heads,
             intermediate_state=intermediate_state,
             cache_indices=cache_indices,
-            num_accept_tokens=num_accept_tokens,
+            num_accepted_tokens=num_accept_tokens,
             g=g,
         )
 
