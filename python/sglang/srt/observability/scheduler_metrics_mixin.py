@@ -694,7 +694,6 @@ class SchedulerMetricsMixin:
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
-        cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
@@ -747,7 +746,6 @@ class SchedulerMetricsMixin:
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.cache_hit_rate = cache_hit_rate
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
 
             # Memory pool usage ratios / Absolute token counts
