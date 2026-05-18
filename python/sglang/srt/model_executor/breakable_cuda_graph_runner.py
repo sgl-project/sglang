@@ -122,12 +122,17 @@ class BreakableCudaGraphRunner:
         language_model = getattr(
             model_runner.model, "language_model", model_runner.model
         )
-        self.layer_model = (
-            language_model.model
-            if hasattr(language_model, "model")
-            and hasattr(language_model.model, "layers")
-            else language_model
-        )
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            self.layer_model = language_model.model
+        else:
+            # If we can't find the inner layer_model, disable BCG.
+            self.layer_model = None
+            logger.warning(
+                "[BCG] Could not resolve inner layer_model on %s. BCG is "
+                "disabled for this model; prefill will fall back to eager.",
+                type(language_model).__name__,
+            )
+            return
 
         # Memory pool
         if get_global_graph_memory_pool() is None:
@@ -303,9 +308,11 @@ class BreakableCudaGraphRunner:
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context, enable_breakable_cuda_graph():
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+            enable_breakable_cuda_graph(),
+        ):
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
 
@@ -330,6 +337,8 @@ class BreakableCudaGraphRunner:
                 self.output_buffers[num_tokens] = output
 
     def can_run(self, forward_batch: "ForwardBatch"):
+        if self.layer_model is None:
+            return False
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.input_embeds is not None:

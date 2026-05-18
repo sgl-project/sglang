@@ -19,7 +19,7 @@ from sglang.test.test_marlin_utils import (
     marlin_quantize,
 )
 
-register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
