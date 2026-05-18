@@ -2864,6 +2864,10 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
+                # Bind Relayer ctx so prepare_for_decode's writes auto-mirror
+                # to the gpu_scalar channel; the mixed batch downstream then
+                # carries the relayer view forward.
+                self.running_batch.bind_relayer_for_iter(self.relayer)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
