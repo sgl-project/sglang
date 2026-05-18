@@ -143,6 +143,7 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     use_fast: Optional[bool] = True,
     tokenizer_backend: str = "huggingface",
+    model_name: Optional[str] = None,
     **kwargs,
 ):
     if tokenizer_backend == "fastokens":
@@ -160,12 +161,23 @@ def get_processor(
             revision=revision,
         )
     else:
-        config = AutoConfig.from_pretrained(
-            tokenizer_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        except ValueError:
+            if model_name is not None:
+                config = AutoConfig.from_pretrained(
+                    model_name,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                raise
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"
