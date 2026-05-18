@@ -316,3 +316,80 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         "no_decode_workers_available",
     );
 }
+
+/// PD-mode chat response carries `x-sgl-decode-url` so external tests
+/// can observe decode affinity end-to-end (without sniffing the proxy
+/// hop into the upstream prefill worker). Mirrors the request-side
+/// behavior asserted by `pd_mode_chat_dispatch_sets_decode_affinity_header`.
+#[tokio::test]
+async fn pd_mode_chat_response_carries_decode_affinity_header() {
+    use std::collections::HashSet;
+    let prefill = common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_a = common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_b = common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode_a.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+        },
+        WorkerSpec {
+            id: WorkerId("d2".into()),
+            url: decode_b.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let decode_urls: HashSet<String> = [decode_a.url.clone(), decode_b.url.clone()]
+        .into_iter()
+        .collect();
+    let hdr = res
+        .headers()
+        .get("x-sgl-decode-url")
+        .unwrap_or_else(|| {
+            panic!(
+                "PD-mode chat response did not carry x-sgl-decode-url; headers: {:?}",
+                res.headers(),
+            )
+        })
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        decode_urls.contains(&hdr),
+        "response carried decode hint {hdr}, expected one of {decode_urls:?}",
+    );
+}
+
+/// Plain-mode chat response does NOT carry `x-sgl-decode-url`. Pin: the
+/// response-side mirror is gated on PD-mode dispatch.
+#[tokio::test]
+async fn plain_mode_chat_response_omits_decode_affinity_header() {
+    let plain = common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: plain.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    }]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        !res.headers().contains_key("x-sgl-decode-url"),
+        "plain-mode chat response must not carry x-sgl-decode-url; headers: {:?}",
+        res.headers(),
+    );
+}
