@@ -1,7 +1,7 @@
 ---
 title: Hunyuan 3 Preview
 metatags:
-    description: "Deploy Tencent Hunyuan 3 Preview BF16 (~276B / ~20B active MoE) on NVIDIA GPUs with SGLang — hybrid thinking, native tool calling, 256K context, and built-in MTP speculative decoding."
+    description: "Deploy Tencent Hunyuan 3 Preview BF16 (~276B / ~20B active MoE) on NVIDIA and AMD GPUs with SGLang — hybrid thinking, native tool calling, 256K context, and built-in MTP speculative decoding."
 tag: NEW
 ---
 
@@ -73,10 +73,18 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA B300 / GB300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:hy3-preview-cu130`</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`rocm/sgl-dev:v0.5.10.post1-rocm720-mi30x-20260423` (or newer)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI350X / MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`rocm/sgl-dev:v0.5.10.post1-rocm720-mi35x-20260423` (or newer)</td>
+    </tr>
   </tbody>
 </table>
 
-The `hy3-preview` tag bundles the HYV3 model code, the `hunyuan` tool-call / reasoning parsers, and the MTP draft-module runtime.
+The `hy3-preview` tag (NVIDIA) bundles the HYV3 model code, the `hunyuan` tool-call / reasoning parsers, and the MTP draft-module runtime. On AMD ROCm, the same model code is added to the SGLang nightly via PR [#23533](https://github.com/sgl-project/sglang/pull/23533); until that PR merges into the published `rocm/sgl-dev` images, AMD users overlay the PR's model files onto a current `rocm/sgl-dev` image (see *AMD MI300X / MI325X / MI350X / MI355X* under [§3.2 Configuration Tips](#3-2-configuration-tips)).
 
 ## 3. Model Deployment
 
@@ -148,6 +156,87 @@ import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3
 - **A100 / H100 (80GB)**: not supported single-node — BF16 requires multi-node TP=16+ on 80GB-class GPUs.
 
 **Blackwell (B200 / B300 / GB300):** Auto-selected attention backend can mis-route for HYV3 on Blackwell. Always pass `--attention-backend trtllm_mha` explicitly on Blackwell hardware (the config generator above enforces this).
+
+**Hardware Requirements: AMD BF16 (`Hy3-preview`, ~552GB weights)**
+
+- **MI300X / MI325X (192 GB)**: TP=8 (single-node fits BF16 weights + KV cache).
+- **MI350X / MI355X (288 GB)**: TP=8 (extra VRAM headroom for longer context or higher concurrency).
+
+**AMD MI300X / MI325X / MI350X / MI355X:**
+
+Until PR [#23533](https://github.com/sgl-project/sglang/pull/23533) (Hy3-preview model code) and PR [#23581](https://github.com/sgl-project/sglang/pull/23581) (HIP CUDA-graph fix) land in the published `rocm/sgl-dev` images, AMD users need three small steps to deploy Hy3-preview:
+
+1. **Pull a current AMD nightly image**:
+
+   ```bash Command
+   docker pull rocm/sgl-dev:v0.5.10.post1-rocm720-mi30x-20260423   # MI300X / MI325X
+   docker pull rocm/sgl-dev:v0.5.10.post1-rocm720-mi35x-20260423   # MI350X / MI355X
+   ```
+
+2. **Overlay the Hy3-preview model files** from PR #23533 onto the editable `/sgl-workspace/sglang` install inside the container, then upgrade `transformers`:
+
+   ```bash Command
+   git clone -b support-hy3-preview --depth 1 \
+     https://github.com/JustinTong0323/sglang.git /work/sglang-pr
+
+   SGL=/sgl-workspace/sglang/python/sglang
+   PR=/work/sglang-pr/python/sglang
+   for f in \
+       srt/models/hunyuan_v3.py \
+       srt/models/hunyuan_v3_nextn.py \
+       srt/configs/model_config.py \
+       srt/entrypoints/openai/serving_chat.py \
+       srt/function_call/function_call_parser.py \
+       srt/function_call/hunyuan_detector.py \
+       srt/layers/quantization/fp8.py \
+       srt/layers/quantization/fp8_utils.py \
+       srt/parser/reasoning_parser.py \
+       srt/server_args.py \
+       srt/utils/common.py; do
+     mkdir -p "$(dirname "$SGL/$f")"
+     cp "$PR/$f" "$SGL/$f"
+   done
+
+   pip install -U "transformers>=5.6.0"
+   ```
+
+3. **Disable AITER's custom all-reduce** (HIP graph capture currently invalidates with it; tracked in [#23580](https://github.com/sgl-project/sglang/issues/23580), fixed in [#23581](https://github.com/sgl-project/sglang/pull/23581)):
+
+   ```bash Command
+   export SGLANG_USE_AITER_AR=0
+   ```
+
+Then launch the standard SGLang server:
+
+```bash Command
+SGLANG_USE_AITER_AR=0 python3 -m sglang.launch_server \
+  --model tencent/Hy3-preview \
+  --tp 8 \
+  --tool-call-parser hunyuan \
+  --reasoning-parser hunyuan \
+  --served-model-name hy3-preview \
+  --host 0.0.0.0 --port 30000 \
+  --mem-fraction-static 0.85
+```
+
+MTP speculative decoding works on AMD with the same flags as NVIDIA:
+
+```bash Command
+SGLANG_USE_AITER_AR=0 SGLANG_ENABLE_SPEC_V2=1 python3 -m sglang.launch_server \
+  --model tencent/Hy3-preview \
+  --tp 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2 \
+  --tool-call-parser hunyuan \
+  --reasoning-parser hunyuan \
+  --served-model-name hy3-preview \
+  --host 0.0.0.0 --port 30000 \
+  --mem-fraction-static 0.85
+```
+
+Once PRs #23533 and #23581 are released as part of `rocm/sgl-dev`, steps 2 and 3 will not be needed; the standard `python3 -m sglang.launch_server ...` invocation will work directly.
 
 **Multi-Token Prediction (MTP):** The `Hy3-preview` release bundles an MTP draft module. SGLang runs it via its EAGLE speculative-decoding path — the draft module auto-loads from the same `--model-path`. Enable with the `SGLANG_ENABLE_SPEC_V2=1` env var and the standard MTP flags:
 
