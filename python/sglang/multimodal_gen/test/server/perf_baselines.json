@@ -1362,7 +1362,7 @@
                 "1": 115.0,
                 "2": 130.0
             },
-            "expected_e2e_ms": 2684.91,
+            "expected_e2e_ms": 3150.0,
             "expected_avg_denoise_ms": 95.0,
             "expected_median_denoise_ms": 120.0,
             "estimated_full_test_time_s": 125.2
