@@ -170,6 +170,30 @@ class ReqToTokenPool:
         # Read kv_committed_len via the Relayer cpu_value channel when each
         # req has a kv_committed ctx attached (set by process_batch_result);
         # falls back to the attribute when not.
+        for _i in reusing:
+            _r = reqs[_i]
+            if not (_r.is_chunked > 0 or _r.relayer_resolve_kv_committed_len() > 0):
+                print(
+                    f"[DEBUG ALLOC FAIL] rid={_r.rid} pool_idx={_r.req_pool_idx} "
+                    f"is_chunked={_r.is_chunked} "
+                    f"kv_committed_len={_r.kv_committed_len} "
+                    f"resolve={_r.relayer_resolve_kv_committed_len()} "
+                    f"kv_allocated_len={_r.kv_allocated_len} "
+                    f"kv_committed_freed={_r.kv_committed_freed} "
+                    f"kv_overallocated_freed={_r.kv_overallocated_freed} "
+                    f"is_retracted={getattr(_r, 'is_retracted', None)} "
+                    f"retracted_stain={getattr(_r, 'retracted_stain', None)} "
+                    f"session_id={_r.session.session_id if _r.session else None} "
+                    f"session_streaming={_r.session.streaming if _r.session else None} "
+                    f"ctx={_r.__dict__.get('_relayer_kv_committed_ctx')} "
+                    f"input_len={len(_r.origin_input_ids)} "
+                    f"output_len={len(_r.output_ids)} "
+                    f"fill_len={len(getattr(_r, 'fill_ids', None) or [])} "
+                    f"extend_input_len={getattr(_r, 'extend_input_len', None)} "
+                    f"cache_protected_len={getattr(_r, 'cache_protected_len', None)} "
+                    f"prefix_indices_len={len(getattr(_r, 'prefix_indices', None) or [])}",
+                    flush=True,
+                )
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].relayer_resolve_kv_committed_len() > 0
             for i in reusing
