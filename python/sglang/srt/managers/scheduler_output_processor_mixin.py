@@ -429,6 +429,9 @@ class SchedulerOutputProcessorMixin:
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
+        kv_committed_deltas: List[int] = []
+        finished_status: List[bool] = []
+
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -436,11 +439,15 @@ class SchedulerOutputProcessorMixin:
 
             if req.is_retracted:
                 # reset_for_retract() already zeroes committed/allocated KV.
+                kv_committed_deltas.append(0)
+                finished_status.append(False)
                 continue
 
             if req.finished():
                 # -1 because prepare_for_decode pre-claimed the bonus slot.
                 req.kv_committed_len -= 1
+                kv_committed_deltas.append(-1)
+                finished_status.append(True)
                 continue
 
             # -1 because prepare_for_decode pre-claimed the bonus slot.
@@ -450,6 +457,19 @@ class SchedulerOutputProcessorMixin:
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.spec_num_correct_drafts += num_correct_drafts
             req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+            kv_committed_deltas.append(accept_lens[i] - 1)
+            finished_status.append(False)
+
+        # Mirror the per-req decisions onto the cpu_value channel. Producer
+        # side of the relay; the in-place mutations above stay until consumer
+        # sites (cache_finished_req, prepare_for_decode) read via Relayer.
+        relayer = getattr(self, "relayer", None)
+        if relayer is not None and result.cpu_future_indices is not None:
+            relayer.store_kv_committed_delta(
+                result.cpu_future_indices, kv_committed_deltas
+            )
+            relayer.store_finished_status(result.cpu_future_indices, finished_status)
 
         return predict_tokens
 
