@@ -103,7 +103,12 @@ async fn diff_and_emit(
 /// [`RELOAD_ESCALATE_AFTER`] consecutive failures.  The `kind` discriminates
 /// "read" vs "parse" in the log record so operators can grep for the right
 /// fix (file missing/permissions vs TOML typo).
-fn log_reload_failure(kind: &'static str, path: &std::path::Path, err: &dyn std::fmt::Display, consecutive: u32) {
+fn log_reload_failure(
+    kind: &'static str,
+    path: &std::path::Path,
+    err: &dyn std::fmt::Display,
+    consecutive: u32,
+) {
     if consecutive >= RELOAD_ESCALATE_AFTER {
         tracing::error!(
             kind,
@@ -179,12 +184,7 @@ pub async fn spawn(
                         }
                         Err(e) => {
                             consecutive_read_failures = consecutive_read_failures.saturating_add(1);
-                            log_reload_failure(
-                                "read",
-                                &path_clone,
-                                &e,
-                                consecutive_read_failures,
-                            );
+                            log_reload_failure("read", &path_clone, &e, consecutive_read_failures);
                             continue;
                         }
                     };
@@ -262,10 +262,7 @@ mod tests {
                 .collect();
         let (tx, mut rx) = mpsc::channel(4);
         diff_and_emit(&mut prev, next, &tx).await.unwrap();
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            DiscoveryEvent::Added(_),
-        ));
+        assert!(matches!(rx.try_recv().unwrap(), DiscoveryEvent::Added(_),));
     }
 
     #[tokio::test]
