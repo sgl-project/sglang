@@ -5,12 +5,15 @@ import numpy as np
 import torch
 
 from sglang.srt.utils import is_npu
-_is_npu = is_npu()
-if not _is_npu:
-    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
-else:
-    from sgl_kernel_npu.speculative import reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask
 
+ _is_npu = is_npu()
+ if not _is_npu:
+     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+ else:
+    from sgl_kernel_npu.speculative import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
+ 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
