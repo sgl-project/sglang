@@ -471,6 +471,7 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
         registry.clone(),
         None,
         Some(kv_index.clone()),
+        None,
     ));
 
     tx.send(DiscoveryEvent::Added(spec_for(

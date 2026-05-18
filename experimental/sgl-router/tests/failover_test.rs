@@ -90,6 +90,7 @@ model_ids = ["tiny"]
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         None,
+        None,
     ));
 
     // Give time for the registry to receive Added events.

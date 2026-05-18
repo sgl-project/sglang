@@ -228,6 +228,26 @@ impl ActiveLoadRegistry {
         }
     }
 
+    /// Drop a worker's per-worker counters entry. Called from
+    /// [`crate::workers::manager`] on `DiscoveryEvent::Removed` so the
+    /// `WorkerCounters` slot for a now-gone worker does not leak.
+    ///
+    /// Guards still alive for that worker remain valid; their drop tries
+    /// `workers.get(&entry.worker)` which returns `None`, and the
+    /// per-request `requests` entry is still removed cleanly. A subsequent
+    /// `register` for the same `WorkerId` reinitializes the slot to 0 —
+    /// the in-flight guards' loads are NOT re-added, by design (the
+    /// worker is gone, those loads no longer mean anything).
+    pub fn forget_worker(&self, id: &WorkerId) {
+        self.workers.remove(id);
+    }
+
+    /// Returns `true` if the registry currently has a per-worker
+    /// counters entry for `id`. Cheap; intended for tests + diagnostics.
+    pub fn is_known(&self, id: &WorkerId) -> bool {
+        self.workers.contains_key(id)
+    }
+
     /// Current prefill load (sum across in-flight requests) for a worker.
     pub fn prefill_load(&self, worker: &WorkerId) -> usize {
         self.workers
@@ -575,6 +595,50 @@ mod tests {
         // Verify shutdown completes within a generous bound.
         let r = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
         assert!(r.is_ok(), "janitor shutdown timed out");
+    }
+
+    /// Task B: `forget_worker` drops the per-worker counters entry so a
+    /// disappeared worker does not leak a `WorkerCounters` slot.
+    /// Existing guards still drop cleanly (no underflow / panic).
+    #[test]
+    fn forget_worker_drops_counters_entry() {
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        let w = WorkerId("w0".into());
+        let g = registry.register(w.clone(), 7, 2);
+        assert!(registry.is_known(&w), "worker is known after register");
+        assert_eq!(registry.prefill_load(&w), 7);
+
+        registry.forget_worker(&w);
+        assert!(
+            !registry.is_known(&w),
+            "worker counters entry must be removed after forget_worker",
+        );
+        // Per-worker counters are gone, so the load query reads 0.
+        assert_eq!(registry.prefill_load(&w), 0);
+        assert_eq!(registry.decode_load(&w), 0);
+
+        // The guard still has a live request entry pointing at the
+        // now-forgotten worker. Drop must NOT panic; the registry's
+        // worker map being empty for this id is treated as the
+        // "already-cleaned-up" terminal state.
+        drop(g);
+        assert_eq!(
+            registry.inflight_count(),
+            0,
+            "guard's drop must still tear down the request entry",
+        );
+    }
+
+    /// Task B: forgetting an unknown worker is a no-op (idempotent).
+    /// The manager calls `forget_worker` unconditionally on `Removed`,
+    /// so a double-Removed event or a Removed for a never-seen worker
+    /// must not panic.
+    #[test]
+    fn forget_unknown_worker_is_noop() {
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        registry.forget_worker(&WorkerId("never-registered".into()));
+        // No assertion beyond "did not panic"; the body of the test
+        // exercises the contract.
     }
 
     /// Concurrent stress: many guards on the same worker should leave the
