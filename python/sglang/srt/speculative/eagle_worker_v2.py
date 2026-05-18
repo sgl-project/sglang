@@ -547,6 +547,10 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
+        # Mid-forward SB rebind: ``batch.spec_info`` now points to the
+        # freshly built draft input so the next draft step kernel reads it.
+        # Relayer-side this lands in the gpu_scalar channel via
+        # ``store_to_map_for_new_batch`` at iter boundary.
         batch.spec_info = next_draft_input
 
         # Run forward (LAST mode: only the final hidden state per request,
