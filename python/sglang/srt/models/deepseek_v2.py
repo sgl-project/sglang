@@ -575,6 +575,11 @@ class DeepseekV2MoE(nn.Module):
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+                    apply_routed_scaling_factor_on_output=(
+                        True
+                        if _use_aiter
+                        else self.experts.should_fuse_routed_scaling_factor_in_topk
+                    ),
                 )
             self.topk = TopK(**topk_kwargs)
 
