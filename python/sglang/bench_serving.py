@@ -2224,11 +2224,17 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=None,
-        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
-        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
-        "(MEM dumps a torch.cuda.memory snapshot, viewable at "
-        "https://pytorch.org/memory_viz). Defaults to the server's default "
-        "(CPU + GPU) when unset.",
+        # Choices match the server-side accepted set; see
+        # python/sglang/srt/managers/scheduler_components/profiler_manager.py:165-175
+        # (activity_map for CPU/GPU/XPU and the RPD branch) and lines
+        # 220-227 (MEM via torch.cuda.memory._record_memory_history,
+        # CUDA_PROFILER via cudaProfilerStart).
+        choices=["CPU", "GPU", "XPU", "MEM", "CUDA_PROFILER", "RPD"],
+        help="Profiler activities to capture. Defaults to the server's "
+        "default (CPU + GPU) when unset. CPU/GPU/XPU map to torch profiler "
+        "activities; MEM dumps a torch.cuda.memory snapshot (viewable at "
+        "https://pytorch.org/memory_viz); CUDA_PROFILER calls "
+        "cudaProfilerStart; RPD is the ROCm RPD tracer.",
     )
     parser.add_argument(
         "--profile-start-step",
