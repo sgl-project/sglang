@@ -988,6 +988,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.rids is not None:
+            self.rids.extend((bs - len(self.rids)) * [""])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1078,6 +1080,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
+
+        if self.rids is not None:
+            self.rids = self.rids[:bs]
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
