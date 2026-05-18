@@ -2732,14 +2732,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
-            # Per-iter finished decision: prefer the cpu_value channel when
-            # the slot has been written. Only spec V2 (via
-            # ``_resolve_spec_overlap_tokens``) writes the channel; vanilla
-            # decode mutates ``req.finished_reason`` directly in
-            # ``process_batch_result`` and leaves the slot as None, so a None
-            # entry must fall back to ``req.finished()``. ``not bool(None)``
-            # would otherwise keep already-finished reqs and leak 1 KV token
-            # per iter in the next ``prepare_for_decode``.
+            # Per-iter finished decision: use OR of the cpu_value channel
+            # snapshot and the live ``req.finished()`` attr. The channel is
+            # written by ``_resolve_spec_overlap_tokens`` BEFORE the per-iter
+            # ``req.check_finished`` runs, so a req that finishes this iter
+            # (e.g., hits max_new_tokens after spec accept) has channel=False
+            # but live ``req.finished()``=True after cache_finished_req sets
+            # ``kv_committed_freed=True``. Channel-only would keep such reqs
+            # and ``prepare_for_decode`` would allocate KV slots for them
+            # that ``_get_total_uncached_sizes`` excludes (committed_freed),
+            # leaking pool tokens.
             ctx_relayer, ctx_cpu_fi = getattr(self, "_relayer_ctx", (None, None))
             if ctx_relayer is not None and ctx_cpu_fi is not None:
                 finished_list = ctx_relayer.resolve_finished_status(ctx_cpu_fi)
@@ -2748,11 +2750,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not (
-                    bool(finished_list[i])
-                    if finished_list[i] is not None
-                    else self.reqs[i].finished()
-                )
+                if not (bool(finished_list[i]) or self.reqs[i].finished())
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
