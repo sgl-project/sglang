@@ -2301,6 +2301,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
+        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+            self.assert_lockstep()
+        return self.to_forward_data()
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
