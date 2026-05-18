@@ -488,13 +488,10 @@ class PiecewiseCudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        # B5: lm_head LoRA pruned path raises RuntimeError under use_cuda_graph=True
-        # (lora/layers.py: ParallelLMHeadWithLoRA.apply_lora). Until that path is
-        # made graph-safe, refuse PCG when the active LoRA config targets lm_head.
-        if self.model_runner.server_args.enable_lora and "lm_head" in getattr(
-            self.model_runner.lora_manager, "target_modules", set()
-        ):
-            return False
+        # lm_head LoRA pruned path is kept graph-safe by forcing its dedicated
+        # lm_head_batch_info.use_cuda_graph=False in the backend (see
+        # triton/chunked_backend._build_lm_head_batch_info). No need to
+        # blacklist whole batches here.
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
