@@ -3023,37 +3023,35 @@ class Scheduler(
            forward stream. Must run AFTER the sampling_info swap so the
            forward-only copy gets pinned.
         """
-        # 1. snapshot
-        snapshot_v2_full = batch.is_spec_v2
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        # SB full snapshot/restore is removed: under the relayer-driven
+        # mechanism, forward writes its outputs to gpu_scalar / gpu_tensor /
+        # cpu_value channels, not to SB fields, so there are no mid-forward
+        # SB mutations to revert. The post-context ``batch.spec_info`` /
+        # ``batch.seq_lens`` assignment in run_batch is the explicit relay
+        # of forward's channel outputs back to the SB surface for the next
+        # iter, and remains required.
         sched_sampling_info = batch.sampling_info
 
-        # 2. sampling_info substitute. Also stash the live sampling_info
-        # (with its penalizer orchestrator and per-iter penalty accumulator
-        # state) on the Relayer state_obj channel so cross-iter consumers of
-        # the orchestrator state can resolve via the relayer rather than
-        # through this contextmanager's local. The relayer entry is restored
-        # transparently when this contextmanager exits (the finally block
-        # below already rebinds batch.sampling_info = sched_sampling_info).
+        # Sampling_info substitute. Stash the live sampling_info (with its
+        # penalizer orchestrator and per-iter penalty accumulator state) on
+        # the Relayer state_obj channel so cross-iter consumers of the
+        # orchestrator state can resolve via the relayer; the finally block
+        # below rebinds batch.sampling_info = sched_sampling_info on exit.
         if sched_sampling_info is not None:
             if self.relayer is not None:
                 self.relayer.stash_sampling_state("sampling_info", sched_sampling_info)
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime
+        # Pin batch for 2-iter tensor lifetime. Retained for non-relay
+        # transient tensors that schedule-side allocates and forward reads
+        # (e.g. multimodal embeds); relay-flow tensors live in channel slot
+        # pools and own their own lifetime.
         self.record_batch_in_overlap(batch)
 
         try:
             yield
         finally:
-            if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
-            else:
+            if sched_sampling_info is not None:
                 batch.sampling_info = sched_sampling_info
 
     def _relayer_barrier(self):
