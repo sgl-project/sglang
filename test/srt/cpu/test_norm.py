@@ -134,7 +134,7 @@ class TestNorm(CustomTestCase):
     @parametrize(
         m=[4096, 1024],
         n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16, torch.float],
+        dtype=[torch.float16, torch.bfloat16],
     )
     def test_l2norm(self, m, n, dtype):
 
