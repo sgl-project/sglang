@@ -665,9 +665,7 @@ def fused_rope(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
-    if _is_hip:
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
-
+    if _is_hip or _is_xpu:
         apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
         if k is not None:
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
