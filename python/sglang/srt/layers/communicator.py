@@ -305,6 +305,9 @@ class AttnTpContext:
         assert self.attn_inputs_ is not None
         return self.attn_inputs_.fetch_hidden_states()
 
+    def clear_attn_inputs(self) -> None:
+        self.attn_inputs_ = None
+
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
         flag = self.use_input_scattered(forward_batch)
