@@ -2654,12 +2654,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # mutation semantics.
         return self.to_forward_data()
 
-    def prepare_for_decode_returning_fd(self):
-        """Variant entrance for callers that explicitly want the FD path.
-        Mutates self (legacy behavior) and returns the ForwardData snapshot.
-        """
-        return self.prepare_for_decode()
-
     def maybe_wait_verify_done(self):
         # Stream-level wait instead of CPU sync: schedule_stream waits for
         # the verify_done event on the forward_stream without blocking the
@@ -2862,14 +2856,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
-        # Cross-stream barrier: forward N may still be writing to GPU
-        # buffers that the SWA evict decision below indirectly consults
-        # (req.seqlen / kv pool bookkeeping derived from forward output).
-        # Wait on the Relayer gpu_scalar channel's last producer event so
-        # schedule_stream observes a settled view.
+        # Wait on relayer seq_lens producer so schedule_stream observes
+        # the post-decode seq_lens written by forward N.
         relayer = self.__dict__.get("_relayer_ctx", (None, None))[0]
         if relayer is not None:
-            event = getattr(relayer.gpu_scalar, "_last_producer_event", None)
+            event = relayer.gpu_scalar._producer_events.get("seq_lens")
             if event is not None:
                 current_stream = torch.get_device_module(self.device).current_stream()
                 event.wait(current_stream)

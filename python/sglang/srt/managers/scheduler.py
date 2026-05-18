@@ -3117,25 +3117,6 @@ class Scheduler(
         batch.spec_info.future_indices = future_indices
         batch.seq_lens = batch_result.next_draft_input.new_seq_lens
 
-    def _relayer_barrier(self):
-        """Schedule-side cross-stream barrier.
-
-        Make schedule_stream wait for forward_stream to drain so any read of
-        shared GPU state (cuda graph fixed buffers, SWA evict bookkeeping)
-        during the next schedule pass observes a settled view. Relay data
-        flow already isolates via channel slot pools; this barrier covers
-        the residual non-relay shared buffers.
-
-        No-op when overlap is disabled or there is no forward stream to wait
-        on. Not invoked from event_loop_overlap today because an
-        unconditional schedule-side wait would serialize the streams; this
-        helper is meant to be called from specific high-risk SB-prep sites
-        once they are audited.
-        """
-        if not self.enable_overlap or not getattr(self, "forward_stream", None):
-            return
-        self.schedule_stream.wait_stream(self.forward_stream)
-
     def run_batch(
         self,
         batch: ScheduleBatch,
