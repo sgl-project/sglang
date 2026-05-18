@@ -108,6 +108,23 @@ else:
 
 @dataclass
 class FutureIndices:
+    """Slot handle returned by ``Relayer.alloc_future_indices`` and by each
+    sub-channel's ``alloc``.
+
+    - ``indices``: 1-D ``int64`` tensor of slot numbers; used by the
+      gpu_scalar channel for advanced indexing (``buffer[indices]``).
+      Lives on the channel's device for GPU channels and on CPU for the
+      cpu_value channel.
+    - ``interval``: ``slice(start, end)`` view of the same slot range.
+      Used by interval-based store/resolve when the consumer wants a
+      stacked view rather than a gather (e.g. spec V2 draft input).
+
+    Both views describe the *same* slot range; consumers pick whichever
+    fits their kernel layout. Slot numbers are 1-based (slot 0 is the
+    "no value" sentinel used by the negative-encoding ``input_ids`` trick
+    for non-spec token_id relay).
+    """
+
     indices: torch.Tensor
     interval: Optional[slice] = None
 
