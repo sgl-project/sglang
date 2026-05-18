@@ -815,7 +815,6 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
     input_scale_quant: torch.Tensor,
-    *,
     use_per_token_nvfp4: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
