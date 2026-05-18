@@ -1,8 +1,7 @@
 name: PR States
-# Maintains a CI-states block at the bottom of the PR body. Triggered by
-# `pull_request_target` (not `pull_request`) so fork PRs get a write-enabled
-# GITHUB_TOKEN. Safe because the workflow never checks out PR head code —
-# only reads metadata via API and PATCHes the PR body.
+# Maintains the CI-states block at the bottom of the PR body. Uses
+# pull_request_target (not pull_request) for fork-PR write access; safe
+# because we never check out PR head code, only API-read and PATCH the body.
 
 on:
   pull_request_target:
@@ -36,11 +35,9 @@ jobs:
             // Event-agnostic PR lookup.
             // - pull_request_target: PR is in the payload.
             // - workflow_run: pull_requests[] is populated for same-repo PRs;
-            //   for fork PRs it's empty and we reverse-lookup by head ref
-            //   ("forkOwner:branch"), which is the GH-documented fork-PR query
-            //   pattern and avoids the "commit must be in default branch" caveat
-            //   of listPullRequestsAssociatedWithCommit. Bail cleanly when no
-            //   open PR matches (e.g. workflow run from a push to main).
+            //   fork PRs need a head-ref reverse lookup ("forkOwner:branch")
+            //   because listPullRequestsAssociatedWithCommit requires the commit
+            //   to be in the default branch. Bail when no open PR matches.
             let prNumber;
             if (context.payload.pull_request) {
               prNumber = context.payload.pull_request.number;
@@ -79,7 +76,6 @@ jobs:
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
-            // Retry briefly: pr-test* may not be API-visible yet when we start.
             async function findRunBySha(workflowFile) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
@@ -99,19 +95,15 @@ jobs:
               return null;
             }
 
-            // Query unconditionally: a run may exist from before the label
-            // was removed (deleting a label does NOT cancel an in-flight
-            // workflow). Label state decides only the fallback text when no
-            // real run is found. pr-test-extra's gate requires BOTH run-ci
-            // AND run-ci-extra (see pr-test-extra.yml check-changes
-            // if-condition) -- that's enforced by the gate, not here.
+            // Query unconditionally: removing a label does NOT cancel an
+            // in-flight workflow, so a run from before label removal can
+            // still be live. Label state only picks the fallback text.
             //
             // Retry budget:
-            // - With label: pre-sleep 3s to absorb same-tick indexing lag
-            //   against a fresh push, then 3 attempts 6s apart (max 15s).
-            // - Without label: any existing run is from before label removal;
-            //   pre-sleep 6s to absorb residual API indexing lag (e.g. label
-            //   removed within seconds of push), then a single lookup.
+            // - With label: 3s pre-sleep + 3 attempts 6s apart (max 15s)
+            //   to absorb indexing lag against a fresh push.
+            // - Without label: 6s pre-sleep + 1 lookup catches the
+            //   removal-immediately-after-push edge case.
             async function findRun(workflowFile, hasLabel) {
               if (hasLabel) {
                 await new Promise(r => setTimeout(r, 3000));
@@ -121,11 +113,11 @@ jobs:
               return findRunBySha(workflowFile);
             }
             const ptRun = await findRun('pr-test.yml', hasCI);
+            // pr-test-extra gates on BOTH labels (see check-changes there).
             const peRun = await findRun('pr-test-extra.yml', hasCI && hasExtra);
 
-            // Treat a fully-skipped run as "no real run" — happens when the PR
-            // was opened without the label and label was added later (GHA does
-            // not retrigger on `labeled`).
+            // Skipped run = "no real run" -- happens when a label is added
+            // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
             const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
