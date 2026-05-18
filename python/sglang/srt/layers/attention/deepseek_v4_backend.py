@@ -61,8 +61,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
+
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_sm120 = is_sm120_supported()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +93,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120:
+    if _is_sm120 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1141,6 +1143,25 @@ class DeepseekV4AttnBackend(
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
                     softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            elif _is_xpu:
+                from .flash_mla_with_kvcache_torch import flash_mla_with_kvcache_torch
+
+                o = flash_mla_with_kvcache_torch(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     attn_sink=attn_sink,
