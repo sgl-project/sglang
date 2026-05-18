@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import get_int_env_var, is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -23,6 +23,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TRTLLMMLABackend",
     }
 )
+_DFLASH_PREFILL_REFILL_TARGET_ENV = "SGLANG_DFLASH_PREFILL_REFILL_TARGET"
 
 
 if is_cuda() or is_musa():
@@ -46,6 +47,44 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
+    """Return how many free request slots DFLASH should batch before refill.
+
+    At high decode occupancy, immediately admitting a one-request prefill each
+    time a single request finishes can reduce DFLASH throughput. This target
+    lets the scheduler wait for a small refill batch. Set
+    SGLANG_DFLASH_PREFILL_REFILL_TARGET=1 to restore immediate refill behavior.
+    """
+    override = get_int_env_var(_DFLASH_PREFILL_REFILL_TARGET_ENV, -1)
+    if override > 0:
+        return override
+
+    max_running_requests = int(max_running_requests)
+    if max_running_requests <= 8:
+        return 2
+    if max_running_requests <= 16:
+        return 3
+    return 4
+
+
+def should_delay_dflash_prefill_for_batching(
+    *,
+    running_bs: int,
+    num_allocatable_reqs: int,
+    max_running_requests: int,
+    prefill_refill_target: int,
+) -> bool:
+    """Whether to hold prefill briefly so DFLASH can refill in a small batch."""
+    if running_bs <= 0:
+        return False
+    if num_allocatable_reqs <= 0:
+        return False
+
+    target = max(1, int(prefill_refill_target))
+    target = min(target, max(1, int(max_running_requests)))
+    return int(num_allocatable_reqs) < target
 
 
 def scale_kv_cell_size_per_token_for_dflash(

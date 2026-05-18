@@ -3,29 +3,35 @@ set -euo pipefail
 
 PIP_INSTALL="python3 -m pip install --no-cache-dir"
 UV_PIP_INSTALL="uv pip install "
-DEVICE_TYPE=$1
+DEVICE_TYPE=A3
 OPTIONAL_DEPS="${2:-}"
 
+# Use China-friendly defaults for local NPU environment setup. Each value can
+# still be overridden by exporting it before running this script.
+export RUSTUP_CACHE_URL="${RUSTUP_CACHE_URL:-https://mirrors.tuna.tsinghua.edu.cn}"
+export PYPI_CACHE_URL="${PYPI_CACHE_URL:-https://mirrors.aliyun.com/pypi/simple/}"
+export PIP_INDEX_URL="${PIP_INDEX_URL:-${PYPI_CACHE_URL}}"
+export UV_INDEX_URL="${UV_INDEX_URL:-${PYPI_CACHE_URL}}"
 
 # Install the required dependencies in CI.
-apt update -y && apt install -y \
-    unzip \
-    build-essential \
-    cmake \
-    wget \
-    curl \
-    net-tools \
-    zlib1g-dev \
-    lld \
-    clang \
-    locales \
-    ccache \
-    libgl1-mesa-glx \
-    libgl1-mesa-dri \
-    ca-certificates \
-    libgl1 \
-    libglib2.0-0
-update-ca-certificates
+# apt update -y && apt install -y \
+#     unzip \
+#     build-essential \
+#     cmake \
+#     wget \
+#     curl \
+#     net-tools \
+#     zlib1g-dev \
+#     lld \
+#     clang \
+#     locales \
+#     ccache \
+#     libgl1-mesa-glx \
+#     libgl1-mesa-dri \
+#     ca-certificates \
+#     libgl1 \
+#     libglib2.0-0
+# update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 ${PIP_INSTALL} uv
 export UV_NO_CACHE=true
@@ -69,7 +75,7 @@ ${UV_PIP_INSTALL} triton-ascend
 
 ### Install sgl-kernel-npu
 SGLANG_KERNEL_NPU_TAG="2026.05.01"
-mkdir sgl-kernel-npu
+# mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \
 && ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \

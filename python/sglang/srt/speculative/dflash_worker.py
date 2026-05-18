@@ -29,7 +29,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -98,18 +98,20 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
+        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
             # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
             import torch as _torch
 
-            draft_backend = "triton" if _torch.version.hip else "flashinfer"
+            draft_backend = (
+                "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
+            )
         elif draft_backend == "trtllm_mha":
             import torch as _torch
 
-            _fb = "triton" if _torch.version.hip else "flashinfer"
+            _fb = "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
@@ -120,7 +122,7 @@ class DFlashWorker:
         elif draft_backend not in supported_draft_backends:
             import torch as _torch
 
-            _fb = "triton" if _torch.version.hip else "flashinfer"
+            _fb = "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
                 "but got %r. Falling back to '%s'.",
@@ -216,7 +218,7 @@ class DFlashWorker:
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
             draft_token_num=int(self.block_size),
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -652,7 +654,7 @@ class DFlashWorker:
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             with torch.inference_mode():

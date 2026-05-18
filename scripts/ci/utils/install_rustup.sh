@@ -46,10 +46,10 @@ if [ -n "${RUSTUP_CACHE_URL:-}" ]; then
         "${RUSTUP_UPDATE_ROOT}/dist/${RUSTUP_ARCH}/rustup-init" \
         -o "${RUSTUP_TMP}/rustup-init"
     chmod +x "${RUSTUP_TMP}/rustup-init"
-    "${RUSTUP_TMP}/rustup-init" -y --no-modify-path
+    "${RUSTUP_TMP}/rustup-init" -y --no-modify-path --profile minimal
 else
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path
+        | sh -s -- -y --no-modify-path --profile minimal
 fi
 
 rustc --version

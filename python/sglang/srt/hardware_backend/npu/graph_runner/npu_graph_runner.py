@@ -127,6 +127,7 @@ class NPUGraphRunner(CudaGraphRunner):
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
+        torch.npu.set_device(self.model_runner.gpu_id)
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 
@@ -207,10 +208,18 @@ class NPUGraphRunner(CudaGraphRunner):
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
+                full_logits = (
+                    output.full_logits[: self.raw_num_token]
+                    if output.full_logits is not None
+                    else None
+                )
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
@@ -219,6 +228,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
