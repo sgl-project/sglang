@@ -45,14 +45,6 @@ from sglang.srt.utils import is_tokenspeed_mla_available
 if is_tokenspeed_mla_available():
     import flashinfer.rope as _flashinfer_rope
     import tokenspeed_mla
-    from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
-        mla_kv_pack_quantize_fp8 as _ts_mla_kv_pack_quantize_fp8,
-    )
-
-# Crossover point measured on GB300: at bs <= this, the upstream Triton kernel
-# is ~0.1us faster than the JIT version (launch-overhead-bound regime); above
-# this, the JIT version is 2-5x faster (compute regime) or ties (HBM regime).
-_JIT_PACK_MIN_TOKENS = 32
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -269,12 +261,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
         strided ``v`` into contig FP8 V in a single kernel.
         """
-        impl = (
-            mla_kv_pack_quantize_fp8
-            if k_nope.shape[0] >= _JIT_PACK_MIN_TOKENS
-            else _ts_mla_kv_pack_quantize_fp8
+        return mla_kv_pack_quantize_fp8(
+            k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
-        return impl(k_nope, k_pe, v, enable_pdl=is_arch_support_pdl())
 
     def _run_decode_kernel(
         self,
