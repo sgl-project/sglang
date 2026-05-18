@@ -147,12 +147,19 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
     return;
   }
 
+  const int32_t do_verify = p.verify_mask[tid];
+  // verify_mask sentinel ``-1`` = padding row in a fixed-size pre-allocated
+  // launch (cuda-graph-capturable). Skip entirely: no slot I/O, no counter
+  // increment. ``0`` = write, ``1`` = verify; both real entries fall through.
+  if (do_verify < 0) {
+    return;
+  }
+
   const int64_t slot_idx = p.slot_indices[tid];
   const int64_t expected_req_id = p.expected_req_ids[tid];
   const int64_t expected_token_id = p.expected_token_ids[tid];
   const int64_t expected_position = p.expected_positions[tid];
   const uint64_t expected_prev_hash = static_cast<uint64_t>(p.expected_prev_hashes[tid]);
-  const int32_t do_verify = p.verify_mask[tid];
   const int64_t verify_seq_position = p.verify_seq_positions[tid];
 
   if (do_verify != 0) {
