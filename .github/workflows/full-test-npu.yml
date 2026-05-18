@@ -1,12 +1,12 @@
 name: Full Test (NPU)
 
 on:
-#  pull_request:
-#    branches:
-#      - main
-#      - testcases
-#    paths:
-#      - ".github/workflows/full-test-npu.yml"
+  pull_request:
+    branches:
+      - main
+      - testcases
+    paths:
+      - ".github/workflows/full-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -57,6 +57,13 @@ jobs:
       - name: Set image config
         id: set-vars
         run: |
+          echo "========== INPUT PARAMETERS =========="
+          echo "inputs.ref            = ${{ inputs.ref }}"
+          echo "inputs.job_filter     = ${{ inputs.job_filter }}"
+          echo "inputs.image_a3        = ${{ inputs.image_a3 }}"
+          echo "inputs.skip_install_flag = ${{ inputs.skip_install_flag }}"
+          echo "inputs.test_scope      = ${{ inputs.test_scope }}"
+          echo "======================================="
           if [ -z "${{ inputs.ref }}" ]; then
             echo "ref=" >> $GITHUB_OUTPUT
           else
@@ -70,7 +77,7 @@ jobs:
           fi
 
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-20260515" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
