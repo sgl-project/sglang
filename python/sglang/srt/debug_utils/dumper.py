@@ -499,11 +499,16 @@ class _Dumper:
                 meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
-        if (
-            enable_curr_grad
-            and isinstance(value, torch.Tensor)
-            and (g := value.grad) is not None
-        ):
+        if enable_curr_grad and isinstance(value, torch.Tensor):
+            g = (
+                value.grad
+                if value.grad is not None
+                else getattr(value, "main_grad", None)
+            )
+        else:
+            g = None
+
+        if g is not None:
             self._dump_single(
                 tag=grad_tag,
                 tags={**tags, "name": f"grad__{name}"},

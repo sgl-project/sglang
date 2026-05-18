@@ -78,6 +78,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -1045,7 +1046,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if is_true_on_policy_enabled()
             else {}
         )
         q_norm = RMSNorm(
@@ -1176,10 +1177,7 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
-        if (
-            get_global_server_args().rl_on_policy_target is not None
-            and position_embeddings is not None
-        ):
+        if is_true_on_policy_enabled() and position_embeddings is not None:
             assert isinstance(position_embeddings, tuple), (
                 "expected position_embeddings to be a tuple of two tensors,\n"
                 f"but got {type(position_embeddings)}, change if needed"

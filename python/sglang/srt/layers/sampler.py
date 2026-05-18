@@ -16,6 +16,7 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import resolve_true_on_policy_runtime_policy
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -72,13 +73,13 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
-        self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
+        true_on_policy = resolve_true_on_policy_runtime_policy(get_global_server_args())
         # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_global_server_args().enable_deterministic_inference
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-        self.use_log_softmax_logprob = self.rl_on_policy_target is not None
+        self.use_log_softmax_logprob = true_on_policy.enabled
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
@@ -146,7 +147,7 @@ class Sampler(nn.Module):
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
+            if self.use_log_softmax_logprob:
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(logits, dim=-1)
 
             if self.use_ascend_backend:
