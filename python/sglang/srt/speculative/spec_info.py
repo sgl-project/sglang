@@ -232,9 +232,11 @@ class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
