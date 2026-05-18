@@ -37,7 +37,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -79,8 +79,8 @@ class BaseTpWorker(ABC):
 
     def get_tokens_per_layer_info(self):
         return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+            getattr(self.model_runner, "full_max_total_num_tokens", 0),
+            getattr(self.model_runner, "swa_max_total_num_tokens", 0),
         )
 
     def get_pad_input_ids_func(self):

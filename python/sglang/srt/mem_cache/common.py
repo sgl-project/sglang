@@ -114,7 +114,10 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if (
+        support_triton(get_global_server_args().attention_backend)
+        and "cuda" in req_to_token_pool.device
+    ):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -143,11 +146,14 @@ def write_cache_indices(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
             )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
-            pt += extend_len
+            # out_cache_loc is None in the deferred-GPU-allocation path; the GPU
+            # worker will allocate and the extend slots will be synced back later.
+            if out_cache_loc is not None:
+                req_to_token_pool.write(
+                    (req_idx, slice(prefix_len, seq_len)),
+                    out_cache_loc[pt : pt + extend_len],
+                )
+                pt += extend_len
 
 
 def get_last_loc(
@@ -455,8 +461,14 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    # Allocate KV cache (throws exception on failure).
+    # When the allocator has deferred_to_gpu=True the actual slot computation is
+    # handled by TpWorkerServer._prepare_batch(); here we only write the prefix
+    # hit indices so the GPU worker can look up last_loc on its own req_to_token.
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if getattr(allocator, "deferred_to_gpu", False):
+        out_cache_loc = None
+    elif batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -532,6 +544,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
+
+    # Deferred-GPU-allocation path: slot computation is handled by the GPU worker.
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if getattr(allocator, "deferred_to_gpu", False):
+        return None
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation

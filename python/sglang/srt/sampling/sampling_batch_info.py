@@ -406,6 +406,33 @@ class SamplingBatchInfo:
         self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
 
+    def to(self, device: str) -> "SamplingBatchInfo":
+        """Return a new SamplingBatchInfo with all tensors moved to *device*.
+
+        The penalizer_orchestrator is mutated in-place (its tensors are moved
+        to *device*) and the same object is reused in the returned instance.
+        """
+
+        def _t(x):
+            return x.to(device) if isinstance(x, torch.Tensor) else x
+
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.to(device)
+
+        return dataclasses.replace(
+            self,
+            temperatures=_t(self.temperatures),
+            top_ps=_t(self.top_ps),
+            top_ks=_t(self.top_ks),
+            min_ps=_t(self.min_ps),
+            vocab_mask=_t(self.vocab_mask),
+            acc_additive_penalties=_t(self.acc_additive_penalties),
+            acc_scaling_penalties=_t(self.acc_scaling_penalties),
+            sampling_seed=_t(self.sampling_seed),
+            logit_bias=_t(self.logit_bias),
+            device=device,
+        )
+
 
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],

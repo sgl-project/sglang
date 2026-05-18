@@ -567,6 +567,9 @@ class Scheduler(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
 
+        # IPC address for the scheduler <-> TpWorkerServer channel (ZMQ PAIR)
+        self._tp_worker_ipc_name: str = port_args.tp_worker_ipc_name
+
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
@@ -639,6 +642,47 @@ class Scheduler(
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
+    def _init_trivial_distributed_env(self) -> None:
+        """Initialize a single-process gloo distributed environment.
+
+        In the Rust path, 1 scheduler manages all TP workers via ZMQ.
+        The scheduler itself has no peers to synchronize with, so we init a
+        trivial world-size-1 process group.  All subsequent ``broadcast_pyobj``
+        and ``barrier`` calls become no-ops on a group of size 1.
+        """
+        import tempfile
+
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
+        if not dist.is_initialized():
+            # Pre-initialize with gloo using a local FileStore so we don't
+            # need MASTER_ADDR / MASTER_PORT env vars.
+            store = dist.FileStore(tempfile.mktemp(prefix="sglang_sched_"), 1)
+            dist.init_process_group(
+                backend="gloo", store=store, rank=0, world_size=1
+            )
+
+        # Populate _WORLD and all model-parallel group globals (all size-1).
+        init_distributed_environment(
+            world_size=1, rank=0,
+            distributed_init_method="env://",  # skipped — already initialized
+            local_rank=0, backend="gloo",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            attention_data_parallel_size=1,
+            attention_context_model_parallel_size=1,
+            moe_data_model_parallel_size=1,
+            backend="gloo",
+        )
+
     def init_tp_model_worker(self):
         worker_kwargs = dict(
             server_args=self.server_args,
@@ -652,12 +696,33 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
-        # FIXME: move tp worker's init logic outside of the scheduler.
         if use_mlx():
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        elif envs.SGLANG_RUST_DETOKENIZER.get() and envs.SGLANG_IPC_USE_MSGPACK.get():
+            # Rust path: one scheduler per PP stage manages *all* TP workers.
+            # GPU workers are separate subprocesses already running; connect to
+            # each via ZMQ and wrap them in a fan-out group.
+            from sglang.srt.managers.tp_worker_client import (
+                TpWorkerClient,
+                TpWorkerClientGroup,
+            )
+            from sglang.srt.managers.tp_worker_server import tp_worker_ipc_for_rank
+
+            clients = []
+            for tp_rank in range(self.tp_size):
+                ipc = tp_worker_ipc_for_rank(
+                    self._tp_worker_ipc_name, tp_rank, self.pp_rank
+                )
+                clients.append(TpWorkerClient(ipc, direct_worker_ref=None))
+
+            self.tp_worker = TpWorkerClientGroup(clients)
+            self._init_trivial_distributed_env()
         else:
+            # Non-Rust path: spin up TpModelWorker + TpWorkerServer in a
+            # daemon thread, then connect via TpWorkerClient.
+            # Phase 1: direct_worker_ref bypasses pickling for GPU objects.
             from sglang.srt.managers.tp_worker import TpModelWorker
 
             self.tp_worker = TpModelWorker(**worker_kwargs)
@@ -786,6 +851,14 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def _acquire_memory_pools(self):
+        """Return (req_to_token_pool, token_to_kv_pool_allocator) from the worker.
+
+        Override in subclasses (e.g. CpuScheduler) to return CPU-resident pools
+        instead of the GPU worker's pools.
+        """
+        return self.tp_worker.get_memory_pool()
+
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
         uses_transformers_backend = (
@@ -812,7 +885,7 @@ class Scheduler(
             )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
+            self._acquire_memory_pools()
         )
 
         self.disable_radix_cache = server_args.disable_radix_cache or (
@@ -955,7 +1028,8 @@ class Scheduler(
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if self.forward_stream is not None:
+                self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -3961,7 +4035,19 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(
+        # Use CpuScheduler in the Rust/msgpack path: GPU workers are separate
+        # subprocesses and the scheduler must not own any CUDA operations.
+        _use_cpu_scheduler = (
+            envs.SGLANG_RUST_DETOKENIZER.get()
+            and envs.SGLANG_IPC_USE_MSGPACK.get()
+        )
+        if _use_cpu_scheduler:
+            from sglang.srt.managers.scheduler_cpu import CpuScheduler
+            SchedulerClass = CpuScheduler
+        else:
+            SchedulerClass = Scheduler
+
+        scheduler = SchedulerClass(
             server_args,
             port_args,
             gpu_id,

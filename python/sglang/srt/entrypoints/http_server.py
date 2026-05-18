@@ -71,9 +71,15 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
     Engine,
+    _calculate_rank_ranges,
+    _compute_parallelism_ranks,
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
+)
+from sglang.srt.managers.tp_worker_server import (
+    run_gpu_worker_process,
+    tp_worker_ipc_for_rank,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -2637,6 +2643,60 @@ def launch_server(
     )
 
 
+def _launch_gpu_workers(server_args, port_args, ctx) -> list:
+    """Start one GPU-worker subprocess per (tp_rank, pp_rank) pair and wait
+    until every worker's ZMQ PAIR socket file exists.
+
+    Returns a list of ``(tp_rank, pp_rank, Process)`` tuples.
+    """
+    from sglang.srt.utils.common import maybe_reindex_device_id
+
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+        _calculate_rank_ranges(
+            server_args.nnodes,
+            server_args.pp_size,
+            server_args.tp_size,
+            server_args.node_rank,
+        )
+    )
+    gpu_worker_procs = []
+    for pp_rank in pp_rank_range:
+        for tp_rank in tp_rank_range:
+            gpu_id = (
+                server_args.base_gpu_id
+                + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+            attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
+                server_args, tp_rank
+            )
+            with maybe_reindex_device_id(gpu_id) as gpu_id:
+                proc = ctx.Process(
+                    target=run_gpu_worker_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        None,  # dp_rank
+                    ),
+                    daemon=True,
+                )
+                proc.start()
+            gpu_worker_procs.append((tp_rank, pp_rank, proc))
+
+    for tp_rank, pp_rank, _ in gpu_worker_procs:
+        ipc = tp_worker_ipc_for_rank(port_args.tp_worker_ipc_name, tp_rank, pp_rank)
+        _wait_for_ipc_socket(ipc, timeout=300.0)  # weight loading can be slow
+        logger.info("GPU worker (tp=%d pp=%d) ready at %s", tp_rank, pp_rank, ipc)
+
+    return gpu_worker_procs
+
+
 def _wait_for_ipc_socket(ipc_addr: str, timeout: float = 30.0) -> None:
     """Block until the ipc:// socket file exists, confirming the Rust engine has bound it."""
     import time
@@ -2678,19 +2738,21 @@ def launch_rust_server(
 
     Startup order (solves ZMQ bind/connect sequencing):
       1. Rust engine starts in a subprocess — binds all ZMQ sockets
-         (scheduler_input_ipc_name, tokenizer_ipc_name, detokenizer_ipc_name)
-         within the first few milliseconds of the tokio runtime starting.
-      2. Scheduler subprocess starts — connects to already-bound sockets,
-         then loads model weights.
-      3. SIGINT/SIGTERM terminates the engine subprocess, kills the scheduler
-         subprocess tree, and exits.
+         (scheduler_input_ipc_name, tokenizer_ipc_name, detokenizer_ipc_name).
+      2. GPU worker subprocesses start (one per TP×PP rank) — each binds its
+         own ZMQ PAIR socket and initialises TpModelWorker (NCCL, weights …).
+         Process title: ``sglang::gpu_worker``.
+      3. Scheduler subprocesses start — connect to the already-bound GPU
+         worker sockets via TpWorkerClient (no GPU context needed).
+      4. SIGINT/SIGTERM terminates the engine and kills all subprocess trees.
 
     This function blocks until the Rust engine subprocess exits.
     """
     import multiprocessing
     import signal
-    import time
     import sys
+
+    from sglang.srt.utils import maybe_reindex_device_id
 
     port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
@@ -2708,19 +2770,22 @@ def launch_rust_server(
         tool_call_parser=server_args.tool_call_parser or "",
     )
 
-    # 1. Start Rust engine in a subprocess. Use 'spawn' so the child gets a
-    #    clean Python interpreter — 'fork' is unsafe after PyO3 extensions load.
+    # 1. Start Rust engine — binds all ZMQ sockets first.
     ctx = multiprocessing.get_context("spawn")
     engine_proc = ctx.Process(target=_run_rust_engine, args=(config_kwargs,), daemon=True)
     engine_proc.start()
 
-    # Wait until the scheduler input socket is reachable, confirming that the
-    # Rust tokio runtime has bound all ZMQ sockets. Probe with a PUSH socket
-    # (connect is non-blocking on ipc://) and check for a bound ipc file.
     _wait_for_ipc_socket(port_args.scheduler_input_ipc_name, timeout=30.0)
 
-    # 2. Start scheduler — sockets are already bound so connects succeed immediately.
-    port_args, _scheduler_init_result, _subprocess_watchdog = (
+    # 2. Start GPU worker subprocesses (one per TP × PP rank).
+    #    Each subprocess binds its own ZMQ PAIR socket and initialises
+    #    TpModelWorker (CUDA context, NCCL, weight loading …).
+    #    All ranks start simultaneously so NCCL rendezvous succeeds.
+    gpu_worker_procs = _launch_gpu_workers(server_args, port_args, ctx)
+
+    # 3. Start scheduler subprocesses — GPU workers are bound, so connects
+    #    from TpWorkerClient succeed immediately.
+    port_args, _, _ = (
         Engine._launch_scheduler_only(
             server_args=server_args,
             run_scheduler_process_func=run_scheduler_process_func,
@@ -2729,15 +2794,18 @@ def launch_rust_server(
     )
 
     logger.info(
-        "Rust engine on %s:%s, scheduler at %s",
+        "Rust engine on %s:%s, %d GPU worker(s), scheduler at %s",
         server_args.host,
         server_args.port,
+        len(gpu_worker_procs),
         port_args.scheduler_input_ipc_name,
     )
 
-    # 3. On Ctrl-C or SIGTERM: stop engine subprocess, kill scheduler tree, exit.
+    # 4. On Ctrl-C or SIGTERM: stop engine and all GPU workers, kill remainder.
     def _on_exit(signum, frame):
         engine_proc.terminate()
+        for _, _, proc in gpu_worker_procs:
+            proc.terminate()
         kill_process_tree(os.getpid(), include_parent=False)
         sys.exit(0)
 

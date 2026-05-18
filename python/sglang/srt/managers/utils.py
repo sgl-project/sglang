@@ -53,6 +53,14 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    # Deferred KV allocation result (CPU-scheduler path only).
+    # When the CPU scheduler sets out_cache_loc=None, the GPU worker allocates
+    # KV slots and returns the mapping here so the CPU can update its radix tree.
+    # Dict keys: 'mode' ('extend'|'decode'), 'req_pool_indices', 'out_cache_loc',
+    # plus 'prefix_lens'+'extend_lens' for extend, 'seq_lens_minus1' for decode,
+    # and 'free_pages_remaining' (int) for scheduling budget sync.
+    deferred_alloc: Optional[dict] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

@@ -319,6 +319,28 @@ def alloc_extend_kernel(
     )
 
 
+def alloc_decode_naive(
+    seq_lens,
+    last_loc,
+    free_pages,
+    out_indices,
+    page_size,
+    device,
+):
+    pre_lens = seq_lens - 1
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (pre_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    cumsum_new_pages = torch.cumsum(num_new_pages, 0)
+    start_new_pages = cumsum_new_pages - num_new_pages
+
+    for i in range(len(seq_lens)):
+        if num_new_pages[i] == 0:
+            out_indices[i] = last_loc[i] + 1
+        else:
+            out_indices[i] = free_pages[start_new_pages[i]] * page_size
+
+
 @triton.jit
 def alloc_decode_kernel(
     seq_lens_ptr,
@@ -427,15 +449,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if "cuda" in self.device:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+        else:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -468,14 +501,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if "cuda" in self.device:
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+        else:
+            alloc_decode_naive(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

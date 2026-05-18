@@ -48,6 +48,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -563,41 +564,72 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             )
 
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
+            _rust_path = (
+                envs.SGLANG_RUST_DETOKENIZER.get()
+                and envs.SGLANG_IPC_USE_MSGPACK.get()
+                and server_args.pp_size == 1  # PP>1 still needs per-TP schedulers
+            )
+
+            if _rust_path:
+                # Rust path (pp_size=1): GPU workers are separate subprocesses.
+                # One scheduler per PP rank manages all TP workers via ZMQ,
+                # eliminating the need for inter-scheduler broadcast_pyobj.
+                for pp_rank in pp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
-                    gpu_id = (
-                        server_args.base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    proc = mp.Process(
+                        target=run_scheduler_process_func,
+                        args=(
+                            server_args,
+                            port_args,
+                            0,   # gpu_id  — scheduler has no GPU in Rust path
+                            0,   # tp_rank — scheduler manages all TP ranks via ZMQ
+                            0,   # attn_cp_rank
+                            0,   # moe_dp_rank
+                            0,   # moe_ep_rank
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
                     )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
-                    )
-
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
-                        )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
-                        ):
-                            proc.start()
-
+                    proc.start()
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
+            else:
+                for pp_rank in pp_rank_range:
+                    for tp_rank in tp_rank_range:
+                        reader, writer = mp.Pipe(duplex=False)
+                        gpu_id = (
+                            server_args.base_gpu_id
+                            + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                            + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                        )
+                        attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
+                            server_args, tp_rank
+                        )
+
+                        with maybe_reindex_device_id(gpu_id) as gpu_id:
+                            proc = mp.Process(
+                                target=run_scheduler_process_func,
+                                args=(
+                                    server_args,
+                                    port_args,
+                                    gpu_id,
+                                    tp_rank,
+                                    attn_cp_rank,
+                                    moe_dp_rank,
+                                    moe_ep_rank,
+                                    pp_rank,
+                                    None,
+                                    writer,
+                                ),
+                            )
+                            with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                                server_args, gpu_id
+                            ):
+                                proc.start()
+
+                        scheduler_procs.append(proc)
+                        scheduler_pipe_readers.append(reader)
         else:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)

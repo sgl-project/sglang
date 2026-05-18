@@ -2518,6 +2518,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        # For CPU schedulers (req_to_token_pool on CPU), snapshot the active
+        # rows so the GPU worker can sync its GPU tensor before the forward pass.
+        if (
+            self.req_to_token_pool is not None
+            and self.req_to_token_pool.device == "cpu"
+            and self.req_pool_indices is not None
+            and len(self.req_pool_indices) > 0
+        ):
+            req_to_token_cpu = self.req_to_token_pool.req_to_token[
+                self.req_pool_indices.long()
+            ].clone()
+        else:
+            req_to_token_cpu = None
+
+        # Drain any KV slot indices queued for freeing on the GPU worker.
+        _allocator = getattr(self.tree_cache, "token_to_kv_pool_allocator", None)
+        indices_to_free = (
+            _allocator.drain_pending_free()
+            if _allocator is not None and hasattr(_allocator, "drain_pending_free")
+            else None
+        )
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2579,6 +2601,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            req_to_token_cpu=req_to_token_cpu,
+            indices_to_free=indices_to_free,
         )
 
     def copy(self):
@@ -2790,3 +2814,13 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # CPU-side req_to_token rows for CPU schedulers (shape: [b, max_context_len]).
+    # Set when req_to_token_pool.device == "cpu" so the GPU worker can sync its
+    # GPU tensor before calling ForwardBatch.init_new().
+    req_to_token_cpu: Optional[torch.Tensor] = None
+
+    # KV slot indices to free on the GPU worker before the next forward pass.
+    # Populated by CpuPageTracker.drain_pending_free() in the CPU-scheduler path
+    # so the GPU's PagedTokenToKVPoolAllocator stays in sync when requests finish.
+    indices_to_free: Optional[torch.Tensor] = None

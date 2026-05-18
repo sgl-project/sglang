@@ -145,6 +145,27 @@ class BatchedPenalizerOrchestrator:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
 
+    def to(self, device: str) -> None:
+        """Move all penalizer tensors to *device* in-place."""
+        self.device = device
+        for penalizer in self.penalizers.values():
+            penalizer.to(device)
+
+    # ------------------------------------------------------------------
+    # Pickle support: weakref to ScheduleBatch cannot cross process boundaries
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_batch_ref"] = None  # weakref is not picklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Restore a stub that returns None; batch is not accessible after
+        # cross-process transfer (penalizer tensors are self-contained).
+        self._batch_ref = lambda: None
+
     def merge(self, their: "BatchedPenalizerOrchestrator"):
         """
         Merge the penalizers of another orchestrator into this one.
@@ -176,6 +197,23 @@ class _BatchedPenalizer(abc.ABC):
             weakref.ref(orchestrator)
         )
         self._is_prepared = False
+
+    # ------------------------------------------------------------------
+    # Pickle support: weakref to orchestrator cannot cross process boundaries.
+    # After unpickling, _apply() works fine because it only uses the
+    # pre-computed tensor attributes (not self.orchestrator).
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_orchestrator_ref"] = None  # weakref is not picklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Stub that returns None; the orchestrator property raises if accessed,
+        # but _apply() on the GPU worker never calls self.orchestrator.
+        self._orchestrator_ref = lambda: None
 
     @property
     def orchestrator(self) -> BatchedPenalizerOrchestrator:
@@ -214,6 +252,14 @@ class _BatchedPenalizer(abc.ABC):
             return
 
         self._cumulate_output_tokens(output_ids=output_ids)
+
+    def to(self, device: str) -> None:
+        """Move all internal tensors to *device* in-place."""
+        if not self._is_prepared:
+            return
+        for attr, val in list(self.__dict__.items()):
+            if isinstance(val, torch.Tensor):
+                setattr(self, attr, val.to(device))
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
