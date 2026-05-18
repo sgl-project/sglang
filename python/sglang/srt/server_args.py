@@ -32,6 +32,10 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.true_on_policy.contracts import (
+    resolve_true_on_policy_runtime_policy,
+    validate_true_on_policy_contract,
+)
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -180,7 +184,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -669,7 +673,9 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
+    enable_prefill_only_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
+    true_on_policy_contract: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
@@ -2666,9 +2672,12 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
     def _handle_data_parallelism(self):
+        use_context_parallel_lm_head = self.enable_dp_lm_head and self.attn_cp_size > 1
+
         if self.dp_size == 1:
             self.enable_dp_attention = False
-            self.enable_dp_lm_head = False
+            if not use_context_parallel_lm_head:
+                self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -2679,9 +2688,10 @@ class ServerArgs:
             )
 
         if self.enable_dp_lm_head:
-            assert (
-                self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_lm_head. "
+            assert use_context_parallel_lm_head or self.enable_dp_attention, (
+                "Please enable dp attention when setting enable_dp_lm_head, "
+                "unless attention context parallelism is enabled."
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -3454,16 +3464,40 @@ class ServerArgs:
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
+        validate_true_on_policy_contract(self)
+
+        if self.enable_prefill_only_deterministic_inference:
+            self.enable_deterministic_inference = True
+
         if self.rl_on_policy_target is not None:
             logger.warning(
-                "Enable deterministic inference because of rl_on_policy_target."
+                "Enable deterministic inference because of legacy rl_on_policy_target."
+            )
+            self.enable_deterministic_inference = True
+
+        if self.true_on_policy_contract is not None:
+            logger.warning(
+                "Enable deterministic inference because of true_on_policy_contract."
             )
             self.enable_deterministic_inference = True
 
             # For VLM
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
-            # TODO remove this environment variable as a whole
-            os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+
+            if (
+                resolve_true_on_policy_runtime_policy(
+                    self
+                ).disable_flashinfer_allreduce_fusion
+                and self.enable_flashinfer_allreduce_fusion
+            ):
+                self.enable_flashinfer_allreduce_fusion = False
+                logger.warning(
+                    "Disable flashinfer allreduce fusion because of "
+                    "true_on_policy_contract with TP rollout."
+                )
+
+        if self.enable_deterministic_inference:
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set("1")
 
         if self.enable_deterministic_inference:
             if self.enable_aiter_allreduce_fusion:
@@ -5688,11 +5722,25 @@ class ServerArgs:
             help="Enable deterministic inference mode with batch invariant ops.",
         )
         parser.add_argument(
+            "--enable-prefill-only-deterministic-inference",
+            action="store_true",
+            help="Enable prefill-only deterministic inference mode with batch invariant ops.",
+        )
+        parser.add_argument(
             "--rl-on-policy-target",
             type=str,
             default=ServerArgs.rl_on_policy_target,
             choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
+        )
+        parser.add_argument(
+            "--true-on-policy-contract",
+            type=str,
+            default=ServerArgs.true_on_policy_contract,
+            help=(
+                "Internal true-on-policy parity contract selected by the launcher. "
+                "Normal users should prefer the Miles true_on_policy switch."
+            ),
         )
         parser.add_argument(
             "--enable-attn-tp-input-scattered",

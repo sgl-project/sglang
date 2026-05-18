@@ -160,6 +160,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -631,6 +632,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+        if is_tp_invariant_target():
+            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
+
+            enable_tp_invariant_mode()
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()

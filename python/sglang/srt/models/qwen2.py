@@ -50,7 +50,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -92,6 +95,11 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or x.dtype != self.gate_up_proj.weight.dtype
+        ):
+            x = x.to(self.gate_up_proj.weight.dtype)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -297,14 +305,7 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    cast_x_before_out_mul=True,
-                    fp32_residual=False,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
+            norm_kwargs = get_on_policy_rms_norm_kwargs()
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
             )

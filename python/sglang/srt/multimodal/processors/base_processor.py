@@ -18,7 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     envs,
     is_cpu,
@@ -403,7 +403,7 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+            if _is_cpu or is_true_on_policy_enabled():
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
