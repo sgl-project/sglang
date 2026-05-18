@@ -1797,20 +1797,21 @@ class Scheduler(
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
+            # Both paths share the same race: the broadcast source rank
+            # returns the original objects immediately while receiver ranks
+            # are still in pickle.loads (-> __setstate__ -> shm_open).
+            # Without a barrier the source can call materialize() /
+            # shm_unlink before receivers open the segment.
             #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
+            # Non-DP-attention: a single broadcast_pyobj on tp_cpu_group,
+            # so a barrier on tp_cpu_group closes the race.
+            #
+            # DP-attention: work_reqs are broadcast on attn_tp_cpu_group
+            # (and optionally attn_cp_cpu_group), not on tp_cpu_group.
+            # The later control_reqs broadcast on tp_cpu_group is on a
+            # different group and does not guarantee that attn_tp receiver
+            # ranks have completed shm_open.  An explicit barrier on
+            # attn_tp_cpu_group is therefore required when attn_tp_size > 1.
             if (
                 not self.server_args.enable_dp_attention
                 and self.ps.tp_size > 1
@@ -1818,6 +1819,13 @@ class Scheduler(
                 and has_shm_features(recv_reqs)
             ):
                 barrier(group=self.tp_cpu_group)
+            if (
+                self.server_args.enable_dp_attention
+                and has_shm_features(recv_reqs)
+                and self.model_config.is_multimodal
+                and self.attn_tp_size > 1
+            ):
+                barrier(group=self.attn_tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
