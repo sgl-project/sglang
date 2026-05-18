@@ -1873,8 +1873,8 @@ class ServerArgs:
                             "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                         )
 
-            # Set moe backend for DeepSeek
-            if is_sm100_supported():
+            # Set moe backend for DeepSeek (SM100+ includes SM120 Blackwell RTX)
+            if is_blackwell_supported():
                 quant_method = get_quantization_config(hf_config)
                 quant_cfg = getattr(hf_config, "quantization_config", None) or {}
                 config_groups = quant_cfg.get("config_groups", {})
@@ -1923,15 +1923,24 @@ class ServerArgs:
                         or self.quantization is None
                     )
                 ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    if is_kimi_k2_k25_thinking_int4:
+                    # SM120 (Blackwell RTX): trtllm MoE cubins are SM100-only.
+                    # Use flashinfer_cutlass which has SM120 JIT support and
+                    # EP all-to-all token routing.
+                    if is_sm120_supported():
+                        self.moe_runner_backend = "flashinfer_cutlass"
                         logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on Blackwell for Kimi K2 / K2.5 thinking int4"
+                            "Use flashinfer_cutlass as MoE runner backend on SM120"
                         )
                     else:
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                        )
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        if is_kimi_k2_k25_thinking_int4:
+                            logger.info(
+                                "Use flashinfer_trtllm as MoE runner backend on Blackwell for Kimi K2 / K2.5 thinking int4"
+                            )
+                        else:
+                            logger.info(
+                                "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
+                            )
             elif is_hip():
                 if not self.enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later

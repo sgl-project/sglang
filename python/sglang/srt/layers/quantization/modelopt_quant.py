@@ -1758,6 +1758,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        # Slice per-expert input scales for EP — weights are already sharded to
+        # num_local_experts, but input scales may still be at full num_experts.
+        if hasattr(layer, "moe_ep_size") and layer.moe_ep_size > 1:
+            ne = layer.num_experts
+            nle = layer.num_local_experts
+            rank = layer.moe_ep_rank
+            if w13_input_scale.ndim >= 1 and w13_input_scale.shape[0] == ne:
+                w13_input_scale = w13_input_scale[rank * nle : (rank + 1) * nle]
+            if w2_input_scale.ndim >= 1 and w2_input_scale.shape[0] == ne:
+                w2_input_scale = w2_input_scale[rank * nle : (rank + 1) * nle]
+
         # Create shared parameters
         copy_or_rebind_param(
             layer,
@@ -1958,11 +1969,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             device = layer.w13_weight.device
             inter_size = layer.w2_weight.shape[2] * 2
             hidden_size = layer.w13_weight.shape[2] * 2
+            # With EP, weights are sharded to num_local_experts — params must match
+            ep_active = hasattr(layer, "moe_ep_size") and layer.moe_ep_size > 1
+            local_num_experts = layer.num_local_experts if ep_active else layer.num_experts
             existing_params = getattr(layer, "cutlass_moe_params", None)
             if (
                 existing_params is None
                 or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
-                or existing_params.num_experts != layer.num_experts
+                or existing_params.num_experts != local_num_experts
                 or existing_params.intermediate_size_per_partition != inter_size
                 or existing_params.hidden_size != hidden_size
                 or existing_params.device != device
@@ -1970,7 +1984,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.cutlass_moe_params = CutlassMoEParams(
                     CutlassMoEType.BlockscaledFP4,
                     device,
-                    num_experts=layer.num_experts,  # global num experts
+                    num_experts=local_num_experts,
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
