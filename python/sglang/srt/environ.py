@@ -571,6 +571,13 @@ class Envs:
 
     # ====================================================================
     # DeepSeek V4
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
