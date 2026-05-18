@@ -104,7 +104,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         assert (
             stored[i] & _U64_MASK == expected_prev
         ), f"chain mismatch at slot {i}: cuda={stored[i] & _U64_MASK:#x} python={expected_prev:#x}"
-        # Cross-check via the helper used inside test_kernel.py.
+        # Cross-check via the helper used inside test_kv_cache_canary.py.
         assert stored[i] == to_signed_int64(expected_prev)
         expected_prev = splitmix64_mix(expected_prev, tokens[i], positions[i])
 
