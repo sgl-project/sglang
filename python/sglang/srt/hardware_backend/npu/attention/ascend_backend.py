@@ -2009,7 +2009,9 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-            if self.use_fia and getattr(self, "use_npu_fused_infer_attention_score", True):
+            if self.use_fia and getattr(
+                self, "use_npu_fused_infer_attention_score", True
+            ):
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:

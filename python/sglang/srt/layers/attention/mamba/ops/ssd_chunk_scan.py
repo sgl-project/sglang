@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 from packaging import version
+
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()

@@ -14,8 +14,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .mamba_ssm import softplus
 from sglang.srt.utils import is_npu
+
+from .mamba_ssm import softplus
 
 _is_npu = is_npu()
 
