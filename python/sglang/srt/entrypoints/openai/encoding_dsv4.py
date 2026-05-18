@@ -152,7 +152,10 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     try:
         arguments = json.loads(tool_call["arguments"])
     except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+        arguments = tool_call["arguments"]
+
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments if isinstance(arguments, str) else to_json(arguments)}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
