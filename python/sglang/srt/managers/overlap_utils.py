@@ -2,13 +2,12 @@
 
 A relay is a value whose producer is iter N (forward kernel output, or
 CPU branch in process_batch_result reading forward output) and whose
-consumer is iter N+1. Three channels:
+consumer is iter N+1. Two channels:
 
 - gpu_scalar: per-req GPU scalar stacked into a circular buffer indexed
   by FutureIndices. Cross-stream sync via cuda event recorded on store
   and waited on resolve.
 - cpu_value: per-req Python value (int/bool) indexed by slot.
-- state_obj: cross-iter state objects (e.g. SamplingBatchInfo).
 
 Plus an iter-pin ring for 2-iter Python ref retention of non-channel
 cross-stream tensors.
@@ -228,24 +227,11 @@ class CpuValueChannel:
         self._slots.pop(slot_index, None)
 
 
-class StateObjChannel:
-    """Name-keyed holder for cross-iter state objects (e.g. SamplingBatchInfo)."""
-
-    def __init__(self):
-        self._refs: Dict[str, Any] = {}
-
-    def put(self, name: str, obj: Any):
-        self._refs[name] = obj
-
-    def get(self, name: str) -> Optional[Any]:
-        return self._refs.get(name)
-
-
 class Relayer:
     """Scheduler-owned cross-iter relay state.
 
-    Channels: gpu_scalar (per-req GPU scalar), cpu_value (per-req Python
-    value), state_obj (named cross-iter state object).
+    Channels: gpu_scalar (per-req GPU scalar) and cpu_value (per-req
+    Python value). Plus an iter-pin ring for 2-iter Python ref retention.
     """
 
     def __init__(
@@ -277,7 +263,6 @@ class Relayer:
 
         self.gpu_scalar = GpuScalarChannel(self._gpu_allocator)
         self.cpu_value = CpuValueChannel(future_buffer_len)
-        self.state_obj = StateObjChannel()
 
         # Iter-pin ring: 2 slots of Python ref lists, rotated each iter.
         self._iter_pin_ring: list = [None, None]
@@ -401,9 +386,6 @@ class Relayer:
 
     def resolve_kv_committed_delta(self, future_indices: FutureIndices) -> list:
         return self.cpu_value.resolve(future_indices, "kv_committed_delta")
-
-    def stash_sampling_state(self, name: str, obj: Any):
-        self.state_obj.put(name, obj)
 
     # ------------------------------------------------------------------
     # Iter-pin ring: 2-iter Python ref retention for cross-stream tensors

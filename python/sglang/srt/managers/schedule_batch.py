@@ -1654,9 +1654,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.orig_seq_lens
 
     def to_forward_data(self):
-        """Build a ForwardData snapshot of all fields ForwardBatch.init_new reads."""
+        """Build a ForwardData snapshot of all fields ForwardBatch.init_new reads.
+
+        Forward-only sampling view: when the sampling_info carries a penalizer
+        orchestrator, the snapshot uses ``derive_forward_view`` so worker-side
+        sampling kernels read/write the forward view and the orchestrator state
+        on SB.sampling_info stays untouched across forward.
+        """
         # Local import to avoid circular import at module load time.
         from sglang.srt.model_executor.forward_batch_info import ForwardData
+
+        fd_sampling_info = self.sampling_info
+        if (
+            fd_sampling_info is not None
+            and getattr(fd_sampling_info, "penalizer_orchestrator", None) is not None
+        ):
+            fd_sampling_info = fd_sampling_info.derive_forward_view()
 
         return ForwardData(
             forward_mode=self.forward_mode,
@@ -1674,7 +1687,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=getattr(
                 self, "extend_input_logprob_token_ids", None
             ),
-            sampling_info=self.sampling_info,
+            sampling_info=fd_sampling_info,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,

@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -3014,29 +3014,6 @@ class Scheduler(
         ]
         self.relayer.add_iter_pin(attr_snapshot)
 
-    @contextmanager
-    def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Isolate SB across one overlap forward.
-
-        Swap sampling_info to a forward-only view (penalizer orchestrator
-        detached) so spec V2 multi-pass init_new calls don't double-
-        accumulate penalty state. Pin batch + attr snapshot for 2 iters
-        so cross-stream tensor refs survive the schedule-side return.
-        """
-        sched_sampling_info = batch.sampling_info
-        if sched_sampling_info is not None:
-            if self.relayer is not None:
-                self.relayer.stash_sampling_state("sampling_info", sched_sampling_info)
-            batch.sampling_info = sched_sampling_info.derive_forward_view()
-
-        self.record_batch_in_overlap(batch)
-
-        try:
-            yield
-        finally:
-            if sched_sampling_info is not None:
-                batch.sampling_info = sched_sampling_info
-
     def _apply_spec_v2_relay_outputs(
         self,
         batch: ScheduleBatch,
@@ -3071,44 +3048,47 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                with self._overlap_forward_isolation(batch):
-                    bs = len(batch.relayer_resolve_seq_lens())
-                    # Reuse SB-bound iter slots (from bind_relayer_for_iter
-                    # in the schedule pass); fall back to fresh alloc for
-                    # batches that bypassed it (e.g. disagg prefill).
-                    future_indices = getattr(
-                        batch, "_relayer_iter_gpu_fi", None
-                    ) or self.relayer.alloc_future_indices(bs)
-                    cpu_future_indices = getattr(
-                        batch, "_relayer_iter_cpu_fi", None
-                    ) or self.relayer.cpu_value.alloc(bs)
+                # Pin batch + attr snapshot for 2 iters so cross-stream
+                # tensor refs survive the schedule-side return.
+                self.record_batch_in_overlap(batch)
 
-                    with self.forward_stream_ctx:
-                        self.forward_stream.wait_stream(self.schedule_stream)
-                        self.relayer.resolve_future(batch)
-                        # FD snapshot is the ownership boundary: from here
-                        # forward consumes FD, not the live SB.
-                        forward_data = batch.to_forward_data()
-                        # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            forward_data
+                bs = len(batch.relayer_resolve_seq_lens())
+                # Reuse SB-bound iter slots (from bind_relayer_for_iter
+                # in the schedule pass); fall back to fresh alloc for
+                # batches that bypassed it (e.g. disagg prefill).
+                future_indices = getattr(
+                    batch, "_relayer_iter_gpu_fi", None
+                ) or self.relayer.alloc_future_indices(bs)
+                cpu_future_indices = getattr(
+                    batch, "_relayer_iter_cpu_fi", None
+                ) or self.relayer.cpu_value.alloc(bs)
+
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self.relayer.resolve_future(batch)
+                    # FD snapshot is the ownership boundary: from here
+                    # forward consumes FD, not the live SB. to_forward_data
+                    # also derives a forward-view of sampling_info so worker
+                    # writes do not touch SB.sampling_info's orchestrator.
+                    forward_data = batch.to_forward_data()
+                    # FIXME: pp is not compatible with overlap
+                    batch_result = self.model_worker.forward_batch_generation(
+                        forward_data
+                    )
+                    if batch_result.extra_keep_alive_refs:
+                        self.relayer.add_iter_pin(*batch_result.extra_keep_alive_refs)
+                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.delay_sample_func is None:
+                        self.relayer.store_to_map(future_indices, batch_result)
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
                         )
-                        if batch_result.extra_keep_alive_refs:
-                            self.relayer.add_iter_pin(
-                                *batch_result.extra_keep_alive_refs
-                            )
-                        # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
-                        if batch_result.delay_sample_func is None:
-                            self.relayer.store_to_map(future_indices, batch_result)
-                            batch_result.copy_to_cpu(
-                                return_logprob=batch.return_logprob,
-                                return_hidden_states=batch.return_hidden_states,
-                            )
-                        else:
-                            batch_result.future_indices = future_indices
-                        batch_result.cpu_future_indices = cpu_future_indices
-                        batch.set_relayer_ctx(self.relayer, cpu_future_indices)
+                    else:
+                        batch_result.future_indices = future_indices
+                    batch_result.cpu_future_indices = cpu_future_indices
+                    batch.set_relayer_ctx(self.relayer, cpu_future_indices)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
