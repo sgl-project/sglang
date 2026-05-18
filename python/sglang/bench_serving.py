@@ -838,8 +838,16 @@ def _print_profile_start_summary(body: Dict[str, Any]) -> None:
     ):
         if key in body:
             parts.append(f"{key}={body[key]!r}")
-    summary = " ".join(parts) if parts else "(server defaults)"
-    print(f"Profiling: {summary}")
+    if parts:
+        print(f"Profiling: {' '.join(parts)}")
+    else:
+        # No bounding args set -- warn the user that the trace will cover
+        # the entire benchmark run, which is the failure mode this PR
+        # exists to make easier to avoid.
+        print(
+            "Profiling: (server defaults) -- full run will be captured; "
+            "trace may be very large. Pass --profile-num-steps to bound it."
+        )
 
 
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
