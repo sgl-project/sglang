@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -380,41 +381,6 @@ class FusedMoE(torch.nn.Module):
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
 
-    def _narrow_padded_param_and_loaded_weight(
-        self,
-        param_data: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        param_data_start: int,
-        weight_start: int,
-        dim: int,
-        param_shard_size: int,
-        weight_shard_size: int,
-        narrow_weight: bool = True,
-    ):
-        if narrow_weight:
-            actual_shard_size = max(
-                min(weight_shard_size, loaded_weight.size(dim) - weight_start), 0
-            )
-            if actual_shard_size > 0:
-                loaded_weight = loaded_weight.narrow(
-                    dim, weight_start, actual_shard_size
-                )
-            else:
-                loaded_weight = torch.zeros_like(
-                    param_data.narrow(dim, param_data_start, 0)
-                )
-        else:
-            actual_shard_size = min(loaded_weight.size(dim), param_shard_size)
-
-        pad_size = param_shard_size - actual_shard_size
-        if pad_size > 0:
-            param_data.narrow(
-                dim, param_data_start + actual_shard_size, pad_size
-            ).zero_()
-
-        param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
-        return param_data, loaded_weight
-
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -492,13 +458,12 @@ class FusedMoE(torch.nn.Module):
             param_shard_size = expert_data.shape[shard_dim]
         else:
             raise NotImplementedError
+        # Keep the generic load path's historical assumption: the source
+        # shard size matches the destination param shard size. The fused
+        # FlashInfer TRTLLM W13 path below overrides this from loaded_weight
+        # because each half can have a different source and padded destination
+        # size.
         weight_shard_size = param_shard_size
-        if (
-            self.use_flashinfer_trtllm_moe
-            and not self.use_presharded_weights
-            and not is_bias
-        ):
-            weight_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -512,6 +477,10 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
+        # Hot-update can load a fused W13 tensor, while FlashInfer TRTLLM stores
+        # the destination as two separately padded halves, e.g.
+        # [W3][W3 pad][W1][W1 pad]. Copy each half separately so W1 data does
+        # not spill into W3 padding.
         if (
             self.use_flashinfer_trtllm_moe
             and shard_id == "w13"
@@ -523,39 +492,37 @@ class FusedMoE(torch.nn.Module):
             if not self.use_presharded_weights:
                 weight_shard_size //= self.moe_tp_size
             weight_half_size = weight_shard_size // 2
-            weight_start = (
-                0 if self.use_presharded_weights else weight_shard_size * tp_rank
-            )
+            weight_start = weight_shard_size * tp_rank
 
             for param_start, source_start in (
                 (0, weight_start),
                 (param_half_size, weight_start + weight_half_size),
             ):
                 half_expert_data, half_loaded_weight = (
-                    self._narrow_padded_param_and_loaded_weight(
+                    narrow_padded_param_and_loaded_weight(
                         expert_data,
                         loaded_weight,
                         param_start,
                         source_start,
                         shard_dim,
                         param_half_size,
-                        weight_half_size,
-                        not self.use_presharded_weights,
+                        narrow_weight=not self.use_presharded_weights,
+                        weight_shard_size=weight_half_size,
                     )
                 )
                 half_expert_data.copy_(half_loaded_weight)
             return
 
         if self.use_padded_loading:
-            expert_data, loaded_weight = self._narrow_padded_param_and_loaded_weight(
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 start,
                 weight_shard_size * tp_rank,
                 shard_dim,
                 param_shard_size,
-                weight_shard_size,
-                not self.use_presharded_weights,
+                narrow_weight=not self.use_presharded_weights,
+                weight_shard_size=weight_shard_size,
             )
         else:
             if not self.use_presharded_weights:
@@ -615,24 +582,20 @@ class FusedMoE(torch.nn.Module):
             # this parameter is a weight matrix
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             param_shard_size = expert_data.shape[shard_dim]
+        # Keep the generic load path's historical assumption: the source
+        # shard size matches the destination param shard size.
         weight_shard_size = param_shard_size
-        if (
-            self.use_flashinfer_trtllm_moe
-            and not self.use_presharded_weights
-            and not is_bias
-        ):
-            weight_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
 
         if self.use_padded_loading:
-            expert_data, loaded_weight = self._narrow_padded_param_and_loaded_weight(
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
                 weight_shard_size * tp_rank,
                 shard_dim,
                 param_shard_size,
-                weight_shard_size,
-                not self.use_presharded_weights,
+                narrow_weight=not self.use_presharded_weights,
+                weight_shard_size=weight_shard_size,
             )
         else:
             if not is_bias and not self.use_presharded_weights:

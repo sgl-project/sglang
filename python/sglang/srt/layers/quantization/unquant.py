@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -77,13 +78,6 @@ def _set_flashinfer_trtllm_bf16_layout_meta(
     if packed_shape is not None:
         meta["packed_shape"] = tuple(packed_shape)
     setattr(param, _FLASHINFER_TRTLLM_BF16_LAYOUT_META_ATTR, meta)
-
-
-def _product(shape: tuple[int, ...]) -> int:
-    result = 1
-    for size in shape:
-        result *= size
-    return result
 
 
 def _zero_flashinfer_trtllm_bf16_padding(layer: torch.nn.Module) -> None:
@@ -330,28 +324,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             ):
                 return
             if (
-                w13_layout == _FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED
-                or w2_layout == _FLASHINFER_TRTLLM_BF16_LAYOUT_PACKED
+                w13_layout != _FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL
+                or w2_layout != _FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL
             ):
                 raise RuntimeError(
-                    "FlashInfer TRT-LLM BF16 MoE weights must be both canonical "
-                    "or both packed before process_weights_after_loading."
+                    "FlashInfer TRT-LLM BF16 MoE weights must have canonical "
+                    "layout metadata before process_weights_after_loading."
                 )
 
+            # Ensure padded slots are zero before packing. For example, hot
+            # update may restore params back to canonical shape with a reshape,
+            # not an inverse unpack, so padding can contain old packed values.
             _zero_flashinfer_trtllm_bf16_padding(layer)
 
             canonical_shape_w13 = tuple(layer.w13_weight.data.shape)
             canonical_shape_w2 = tuple(layer.w2_weight.data.shape)
-            _set_flashinfer_trtllm_bf16_layout_meta(
-                layer.w13_weight,
-                canonical_shape=canonical_shape_w13,
-                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
-            )
-            _set_flashinfer_trtllm_bf16_layout_meta(
-                layer.w2_weight,
-                canonical_shape=canonical_shape_w2,
-                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
-            )
             self._cache_permute_indices.clear()
 
             from flashinfer.fused_moe.core import (
@@ -480,24 +467,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         meta = _get_flashinfer_trtllm_bf16_layout_meta(param)
         expected_shape = tuple(meta.get("canonical_shape", expected_shape))
         current_shape = tuple(param.data.shape)
-        if current_shape == expected_shape:
-            _set_flashinfer_trtllm_bf16_layout_meta(
-                param,
-                canonical_shape=expected_shape,
-                storage_layout=_FLASHINFER_TRTLLM_BF16_LAYOUT_CANONICAL,
-                packed_shape=meta.get("packed_shape"),
-            )
-            return
 
-        expected_numel = _product(expected_shape)
-        if param.data.numel() != expected_numel:
-            raise RuntimeError(
-                f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
-                f"current shape={current_shape}, expected shape={expected_shape}."
-            )
+        if current_shape != expected_shape:
+            expected_numel = math.prod(expected_shape)
+            if param.data.numel() != expected_numel:
+                raise RuntimeError(
+                    f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
+                    f"current shape={current_shape}, expected shape={expected_shape}."
+                )
 
-        self._cache_permute_indices.clear()
-        param.data = param.data.reshape(expected_shape)
+            self._cache_permute_indices.clear()
+            param.data = param.data.reshape(expected_shape)
+
         _set_flashinfer_trtllm_bf16_layout_meta(
             param,
             canonical_shape=expected_shape,

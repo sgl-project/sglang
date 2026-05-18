@@ -49,37 +49,15 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
         from sglang.srt.layers.moe.token_dispatcher import standard
 
+        fm = fused_moe_layer
+        std = standard
         with (
-            patch.object(
-                fused_moe_layer,
-                "get_moe_expert_parallel_world_size",
-                return_value=1,
-            ),
-            patch.object(
-                fused_moe_layer,
-                "get_moe_expert_parallel_rank",
-                return_value=0,
-            ),
-            patch.object(
-                fused_moe_layer,
-                "get_moe_tensor_parallel_world_size",
-                return_value=1,
-            ),
-            patch.object(
-                fused_moe_layer,
-                "get_moe_tensor_parallel_rank",
-                return_value=0,
-            ),
-            patch.object(
-                standard,
-                "get_moe_expert_parallel_world_size",
-                return_value=1,
-            ),
-            patch.object(
-                standard,
-                "get_moe_expert_parallel_rank",
-                return_value=0,
-            ),
+            patch.object(fm, "get_moe_expert_parallel_world_size", return_value=1),
+            patch.object(fm, "get_moe_expert_parallel_rank", return_value=0),
+            patch.object(fm, "get_moe_tensor_parallel_world_size", return_value=1),
+            patch.object(fm, "get_moe_tensor_parallel_rank", return_value=0),
+            patch.object(std, "get_moe_expert_parallel_world_size", return_value=1),
+            patch.object(std, "get_moe_expert_parallel_rank", return_value=0),
         ):
             layer = FusedMoE(
                 num_experts=self.num_experts,
@@ -133,80 +111,32 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         return loaded
 
     def _assert_canonical_update_visible(self, layer, loaded):
-        self.assertEqual(
-            tuple(layer.w13_weight.shape),
-            (
-                self.num_experts,
-                2 * self.padded_intermediate_size,
-                self.hidden_size,
-            ),
-        )
-        self.assertEqual(
-            tuple(layer.w2_weight.shape),
-            (
-                self.num_experts,
-                self.hidden_size,
-                self.padded_intermediate_size,
-            ),
-        )
+        real = self.intermediate_size
+        padded = self.padded_intermediate_size
 
         for expert_id, (w1, w3, w2) in enumerate(loaded):
             # FlashInfer TRTLLM stores W13 in W3/W1 order.
+            torch.testing.assert_close(layer.w13_weight[expert_id, :real, :], w3)
             torch.testing.assert_close(
-                layer.w13_weight[
-                    expert_id,
-                    : self.intermediate_size,
-                    :,
-                ],
-                w3,
+                layer.w13_weight[expert_id, padded : padded + real, :], w1
             )
-            torch.testing.assert_close(
-                layer.w13_weight[
-                    expert_id,
-                    self.padded_intermediate_size : self.padded_intermediate_size
-                    + self.intermediate_size,
-                    :,
-                ],
-                w1,
-            )
-            torch.testing.assert_close(
-                layer.w2_weight[
-                    expert_id,
-                    :,
-                    : self.intermediate_size,
-                ],
-                w2,
-            )
+            torch.testing.assert_close(layer.w2_weight[expert_id, :, :real], w2)
 
             self.assertTrue(
                 torch.all(
-                    layer.w13_weight[
-                        expert_id,
-                        self.intermediate_size : self.padded_intermediate_size,
-                        :,
-                    ]
+                    layer.w13_weight[expert_id, real:padded, :]
                     == 0
                 ).item()
             )
             self.assertTrue(
                 torch.all(
-                    layer.w13_weight[
-                        expert_id,
-                        self.padded_intermediate_size
-                        + self.intermediate_size : 2
-                        * self.padded_intermediate_size,
-                        :,
-                    ]
+                    layer.w13_weight[expert_id, padded + real : 2 * padded, :]
                     == 0
                 ).item()
             )
             self.assertTrue(
                 torch.all(
-                    layer.w2_weight[
-                        expert_id,
-                        :,
-                        self.intermediate_size : self.padded_intermediate_size,
-                    ]
+                    layer.w2_weight[expert_id, :, real:padded]
                     == 0
                 ).item()
             )
@@ -214,17 +144,21 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
     def test_hot_update_reloads_canonical_weights_after_flashinfer_pack(self):
         layer = self._make_layer()
 
-        initial_loaded = self._load_all_experts(layer, offset=0)
-        self._assert_canonical_update_visible(layer, initial_loaded)
-
+        self._load_all_experts(layer, offset=0)
         canonical_w13_shape = tuple(layer.w13_weight.shape)
         canonical_w2_shape = tuple(layer.w2_weight.shape)
         layer.quant_method.process_weights_after_loading(layer)
 
+        # process_weights_after_loading packs canonical weights into the
+        # FlashInfer TRTLLM runtime layout.
         self.assertNotEqual(tuple(layer.w13_weight.shape), canonical_w13_shape)
         self.assertNotEqual(tuple(layer.w2_weight.shape), canonical_w2_shape)
 
+        # Mimic hot update: params are packed, but replacement weights are
+        # canonical. The weight loader should restore canonical shape first.
         updated_loaded = self._load_all_experts(layer, offset=100)
+        self.assertEqual(tuple(layer.w13_weight.shape), canonical_w13_shape)
+        self.assertEqual(tuple(layer.w2_weight.shape), canonical_w2_shape)
         self._assert_canonical_update_visible(layer, updated_loaded)
 
         layer.quant_method.process_weights_after_loading(layer)
