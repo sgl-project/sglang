@@ -30,12 +30,17 @@ def attach(
     req_to_token_pool: "ReqToTokenPool",
     device: torch.device,
     pool_kind: PoolKind = PoolKind.FULL,
+    launch_capacity: int,
 ) -> Optional[CanaryRunner]:
     """Attach canary to ``pool`` and create a runner.
 
     Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs``
     so that the canary kernel is captured into the CUDA graph and the shadow
     tensors are baked into the graph's pointer table.
+
+    ``launch_capacity`` is the maximum ``num_verify + num_write`` slots per
+    kernel launch — pre-allocated GPU tensors at this size are baked into the
+    cuda graph so replay reuses the same buffer addresses.
     """
     if not config.enabled:
         return None
@@ -49,6 +54,7 @@ def attach(
         num_req_slots=int(req_to_token_pool.size),
         device=device,
         pool_kind=pool_kind,
+        launch_capacity=launch_capacity,
     )
     setattr(pool, _GLOBAL_RUNNER_KEY, runner)
     logger.info(

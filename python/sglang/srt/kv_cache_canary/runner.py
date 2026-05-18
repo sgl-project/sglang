@@ -17,6 +17,7 @@ from sglang.srt.kv_cache_canary.host_state import (
     BatchPlan,
     CanaryDeviceState,
     CanaryHostState,
+    CanaryLaunchBuffers,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
@@ -64,6 +65,7 @@ class CanaryRunner:
         num_req_slots: int,
         device: torch.device,
         pool_kind: PoolKind = PoolKind.FULL,
+        launch_capacity: int,
     ) -> None:
         self._config = config
         self._device = device
@@ -80,6 +82,14 @@ class CanaryRunner:
         self.host_state = CanaryHostState(config=config, num_req_slots=num_req_slots)
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
+        )
+        # Pre-allocated fixed-address launch buffers. Cuda graph capture
+        # records these specific addresses; replay-side host code refills
+        # them in-place before ``graph.replay()`` so the recorded kernel
+        # launches see the correct expected_* / slot_indices for the batch.
+        self._launch_capacity: int = int(launch_capacity)
+        self._launch = CanaryLaunchBuffers.allocate(
+            device=device, capacity=self._launch_capacity
         )
         self._side_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
@@ -121,11 +131,15 @@ class CanaryRunner:
     def pool_kind(self) -> PoolKind:
         return self._pool_kind
 
-    def run_head(self, *, plan: BatchPlan) -> None:
-        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
+    def run_head(self, *, plan: BatchPlan, skip_fill: bool = False) -> None:
+        self._run_kernel_pair(
+            plan=plan, kernel_kind=KERNEL_KIND_HEAD, skip_fill=skip_fill
+        )
 
-    def run_tail(self, *, plan: BatchPlan) -> None:
-        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_TAIL)
+    def run_tail(self, *, plan: BatchPlan, skip_fill: bool = False) -> None:
+        self._run_kernel_pair(
+            plan=plan, kernel_kind=KERNEL_KIND_TAIL, skip_fill=skip_fill
+        )
 
     def end_of_forward(self) -> None:
         """Called once per forward (after run_tail) on the compute stream.
@@ -215,19 +229,39 @@ class CanaryRunner:
                 )
                 self._counters_event.record(stream=self._side_stream)
 
+    def prepare_for_replay(self, *, plan: BatchPlan) -> None:
+        """Refill the fixed launch buffers in-place for a replay forward.
+
+        Called from the pre-replay hook on ``CudaGraphRunner.replay``. The
+        captured graph holds references to ``self._launch.*`` tensors at
+        their fixed addresses; this method copies the current batch's
+        expected_* / slot_indices into those tensors so the replayed kernel
+        launches verify and write the right slots.
+        """
+        self._launch.fill_from_plan(plan)
+
     def _run_kernel_pair(
         self,
         *,
         plan: BatchPlan,
         kernel_kind: int,
+        skip_fill: bool = False,
     ) -> None:
+        """Launch the head/tail kernel pair using the fixed launch buffers.
+
+        ``skip_fill=True`` is the replay path: ``prepare_for_replay`` has
+        already populated the buffers on the host side outside the captured
+        region. The eager / capture path leaves ``skip_fill=False`` and we
+        fill here on the current stream so the in-place copies get recorded
+        into the cuda graph too.
+        """
         if not self._config.enabled:
             return
-        total = plan.num_verify + plan.num_write
-        if total == 0:
-            return
-
-        slot_indices = self._make_slot_indices_tensor(plan=plan)
+        if not skip_fill:
+            total = plan.num_verify + plan.num_write
+            if total == 0:
+                return
+            self._launch.fill_from_plan(plan)
 
         if kernel_kind == KERNEL_KIND_HEAD:
             src_buf_k, dst_buf_k = self._k_tail, self._k_head
@@ -239,13 +273,6 @@ class CanaryRunner:
             src_buf_v, dst_buf_v = self._v_head, self._v_tail
             slot_run_counter = self._device_state.slot_run_counter_tail
             kernel_run_counter = self._device_state.kernel_run_counter_tail
-
-        expected_req_ids = _to_int64(plan.expected_req_ids, self._device)
-        expected_token_ids = _to_int64(plan.expected_token_ids, self._device)
-        expected_positions = _to_int64(plan.expected_positions, self._device)
-        expected_prev_hashes = _to_int64(plan.expected_prev_hashes, self._device)
-        verify_mask = _to_int32(plan.verify_mask, self._device)
-        verify_seq_positions = _to_int64(plan.verify_seq_positions, self._device)
 
         # (src_buf, dst_buf, slot_stride_bytes) per half. V half uses its own
         # stride because some pools have head_dim != v_head_dim — sharing the
@@ -260,13 +287,13 @@ class CanaryRunner:
                 src_buf=src_buf.view(torch.uint8).flatten(),
                 dst_buf=dst_buf.view(torch.uint8).flatten(),
                 slot_stride_bytes=stride,
-                slot_indices=slot_indices,
-                expected_req_ids=expected_req_ids,
-                expected_token_ids=expected_token_ids,
-                expected_positions=expected_positions,
-                expected_prev_hashes=expected_prev_hashes,
-                verify_mask=verify_mask,
-                verify_seq_positions=verify_seq_positions,
+                slot_indices=self._launch.slot_indices,
+                expected_req_ids=self._launch.expected_req_ids,
+                expected_token_ids=self._launch.expected_token_ids,
+                expected_positions=self._launch.expected_positions,
+                expected_prev_hashes=self._launch.expected_prev_hashes,
+                verify_mask=self._launch.verify_mask,
+                verify_seq_positions=self._launch.verify_seq_positions,
                 violation_ring=self._device_state.violation_ring,
                 violation_ring_valid=self._device_state.violation_ring_valid,
                 violation_write_index=self._device_state.violation_write_index,
@@ -277,10 +304,6 @@ class CanaryRunner:
                 kernel_run_counter=kernel_run_counter,
                 kernel_kind=kernel_kind,
             )
-
-    def _make_slot_indices_tensor(self, *, plan: BatchPlan) -> torch.Tensor:
-        flat = plan.verify_slot_indices + plan.write_slot_indices
-        return torch.tensor(flat, dtype=torch.int64, device=self._device)
 
     def _cross_rank_max(self, local_flag: int) -> int:
         """Unconditional all-reduce-MAX on the local 1-byte flag.
@@ -436,9 +459,3 @@ class CanaryRunner:
         )
 
 
-def _to_int64(values: List[int], device: torch.device) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int64, device=device)
-
-
-def _to_int32(values: List[int], device: torch.device) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, device=device)

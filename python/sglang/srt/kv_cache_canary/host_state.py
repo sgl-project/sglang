@@ -406,3 +406,106 @@ class CanaryDeviceState:
         self.first_violation.zero_()
         self.violation_ring_valid.zero_()
         self.violation_write_index.zero_()
+
+
+@dataclass(slots=True)
+class CanaryLaunchBuffers:
+    """Fixed-address per-launch tensors for cuda-graph-safe kernel launches.
+
+    These tensors are allocated once at runner-init time and their addresses
+    are baked into any captured cuda graph. Each forward fills the prefix
+    ``[0, capacity)`` via in-place ``copy_``; rows beyond the active slot
+    count are kept with ``verify_mask = -1`` so the kernel skips them.
+
+    The kernel always launches with ``num_slots = capacity`` — replay path
+    sees the SAME tensor sizes, same pointers, same launch grid as capture.
+    """
+
+    capacity: int
+    slot_indices: torch.Tensor
+    expected_req_ids: torch.Tensor
+    expected_token_ids: torch.Tensor
+    expected_positions: torch.Tensor
+    expected_prev_hashes: torch.Tensor
+    verify_mask: torch.Tensor
+    verify_seq_positions: torch.Tensor
+
+    @classmethod
+    def allocate(cls, *, device: torch.device, capacity: int) -> "CanaryLaunchBuffers":
+        if capacity <= 0:
+            raise RuntimeError(
+                f"kv-canary: CanaryLaunchBuffers capacity must be positive, got {capacity}"
+            )
+        slot_indices = torch.zeros(capacity, dtype=torch.int64, device=device)
+        expected_req_ids = torch.zeros(capacity, dtype=torch.int64, device=device)
+        expected_token_ids = torch.zeros(capacity, dtype=torch.int64, device=device)
+        expected_positions = torch.zeros(capacity, dtype=torch.int64, device=device)
+        expected_prev_hashes = torch.zeros(capacity, dtype=torch.int64, device=device)
+        # Default ``-1`` = skip-sentinel: an unfilled launch must be a no-op.
+        verify_mask = torch.full((capacity,), -1, dtype=torch.int32, device=device)
+        verify_seq_positions = torch.full(
+            (capacity,), -1, dtype=torch.int64, device=device
+        )
+        return cls(
+            capacity=int(capacity),
+            slot_indices=slot_indices,
+            expected_req_ids=expected_req_ids,
+            expected_token_ids=expected_token_ids,
+            expected_positions=expected_positions,
+            expected_prev_hashes=expected_prev_hashes,
+            verify_mask=verify_mask,
+            verify_seq_positions=verify_seq_positions,
+        )
+
+    def fill_from_plan(self, plan: "BatchPlan") -> int:
+        """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
+
+        Returns the number of active slots (verify + write). The prefix
+        ``[0, total)`` carries real data; ``[total, capacity)`` is reset to
+        the skip-sentinel so prior content from a larger batch cannot leak.
+
+        Padding semantics: ``verify_mask = -1`` makes the kernel exit before
+        any I/O; ``verify_seq_positions = -1`` is the existing "no position
+        check" sentinel and is kept consistent. Other expected_* fields'
+        residual values don't matter once ``verify_mask`` is -1.
+        """
+        total = plan.num_verify + plan.num_write
+        if total > self.capacity:
+            raise RuntimeError(
+                f"kv-canary: BatchPlan total slots {total} exceeds launch capacity "
+                f"{self.capacity}; raise max_verify_per_req_per_forward or "
+                "increase cuda_graph capture sizing."
+            )
+
+        device = self.slot_indices.device
+        slot_src = torch.tensor(
+            plan.verify_slot_indices + plan.write_slot_indices,
+            dtype=torch.int64,
+            device=device,
+        )
+        req_src = torch.tensor(plan.expected_req_ids, dtype=torch.int64, device=device)
+        token_src = torch.tensor(
+            plan.expected_token_ids, dtype=torch.int64, device=device
+        )
+        pos_src = torch.tensor(
+            plan.expected_positions, dtype=torch.int64, device=device
+        )
+        hash_src = torch.tensor(
+            plan.expected_prev_hashes, dtype=torch.int64, device=device
+        )
+        mask_src = torch.tensor(plan.verify_mask, dtype=torch.int32, device=device)
+        seq_src = torch.tensor(
+            plan.verify_seq_positions, dtype=torch.int64, device=device
+        )
+
+        self.slot_indices[:total].copy_(slot_src)
+        self.expected_req_ids[:total].copy_(req_src)
+        self.expected_token_ids[:total].copy_(token_src)
+        self.expected_positions[:total].copy_(pos_src)
+        self.expected_prev_hashes[:total].copy_(hash_src)
+        self.verify_mask[:total].copy_(mask_src)
+        self.verify_seq_positions[:total].copy_(seq_src)
+        if total < self.capacity:
+            self.verify_mask[total:].fill_(-1)
+            self.verify_seq_positions[total:].fill_(-1)
+        return total

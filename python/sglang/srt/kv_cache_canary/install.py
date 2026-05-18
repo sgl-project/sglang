@@ -62,12 +62,16 @@ def install_on_model_runner(
         return
 
     device = torch.device(model_runner.device)
+    launch_capacity = _compute_launch_capacity(
+        model_runner=model_runner, config=config
+    )
     runner = attach(
         pool=pool,
         config=config,
         req_to_token_pool=model_runner.req_to_token_pool,
         device=device,
         pool_kind=pool_kind,
+        launch_capacity=launch_capacity,
     )
     if runner is None:
         return
@@ -87,6 +91,35 @@ def install_on_model_runner(
 
     _patch_model_forward(model_runner=model_runner)
     setattr(model_runner, _FORWARD_PATCHED_ATTR, True)
+
+
+def _compute_launch_capacity(
+    *, model_runner: "ModelRunner", config: CanaryConfig
+) -> int:
+    """Pick a fixed launch-buffer capacity that covers every forward shape.
+
+    Strategy: take the largest plausible per-forward batch (cuda-graph max-bs
+    × tokens-per-bs for decode, OR ``max_running_requests`` × max sequence
+    extension for prefill — whichever is larger), then add headroom for
+    verify entries (``max_verify_per_req_per_forward`` per req).
+
+    The launch buffers are allocated up-front (~ a few MB for typical
+    configs) and the kernel always launches with ``num_slots == capacity``;
+    padding rows carry ``verify_mask = -1`` and the kernel short-circuits
+    them with zero I/O. So oversizing here is cheap and avoids the
+    "BatchPlan exceeds launch capacity" runtime error in plan_batch.
+    """
+    server_args = model_runner.server_args
+    cuda_graph_max_bs = getattr(server_args, "cuda_graph_max_bs", None) or 0
+    spec_num_draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
+    num_tokens_per_bs = 1
+    if spec_num_draft_tokens:
+        num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
+    max_running_requests = int(model_runner.req_to_token_pool.size)
+    max_bs = max(int(cuda_graph_max_bs), max_running_requests)
+    write_slots = max_bs * num_tokens_per_bs
+    verify_slots = max_bs * max(1, int(config.max_verify_per_req_per_forward))
+    return int(write_slots + verify_slots)
 
 
 def _select_pool_kind(

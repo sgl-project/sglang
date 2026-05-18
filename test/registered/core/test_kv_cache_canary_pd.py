@@ -108,6 +108,7 @@ class TestPDExportImportRoundtrip(unittest.TestCase):
             req_to_token_pool=req_to_token_pool,
             device=torch.device("cpu"),
             pool_kind=PoolKind.FULL,
+            launch_capacity=128,
         )
         return pool, runner
 
@@ -197,6 +198,7 @@ class TestMetadataBuffersSetBufWritesCanaryFromPool(unittest.TestCase):
             req_to_token_pool=_FakeReqToTokenPool(size=16),
             device=torch.device("cpu"),
             pool_kind=PoolKind.FULL,
+            launch_capacity=128,
         )
         # Plan + commit a state so the snapshot is non-zero.
         plan = runner.host_state.plan_batch(
