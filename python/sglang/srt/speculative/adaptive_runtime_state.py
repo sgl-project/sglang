@@ -125,6 +125,8 @@ class AdaptiveController:
                 "up_hysteresis": up_h,
                 "down_hysteresis": down_h,
             }
+            if "ceiling_coeff" in entry:
+                params_cfg["ceiling_coeff"] = entry["ceiling_coeff"]
             self._bs_params[bs] = AdaptiveSpeculativeParams(
                 initial_steps=initial,
                 config=params_cfg,
