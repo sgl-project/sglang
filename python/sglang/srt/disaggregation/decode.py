@@ -1258,7 +1258,12 @@ class DecodePreallocQueue:
                 extend_num_tokens=fill_len,
             )
             # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.ensure_host_slots(req.req_pool_idx, 0, fill_len)
+            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                coordinator.req_to_host_pool,
+                req.req_pool_idx,
+                0,
+                fill_len,
+            )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
