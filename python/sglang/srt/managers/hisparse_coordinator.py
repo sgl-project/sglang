@@ -601,8 +601,9 @@ class HiSparseCoordinator:
         This is a naive per-request loop implementation for debugging/validation.
         Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
 
-        Note: dsv4 hisparse is not supported here. This helper is only used as
-        a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
+        Note: dsv4 hisparse is not supported — DeepSeekV4SingleKVPoolHost has no
+        load_to_device_per_layer and indices live in compressed space. Currently
+        only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
 
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
