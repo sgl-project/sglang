@@ -188,10 +188,10 @@ class ReqToTokenPool:
                     f"ctx={_r.__dict__.get('_relayer_kv_committed_ctx')} "
                     f"input_len={len(_r.origin_input_ids)} "
                     f"output_len={len(_r.output_ids)} "
-                    f"fill_len={len(getattr(_r, 'fill_ids', None) or [])} "
+                    f"fill_len={len(_r.fill_ids) if _r.fill_ids is not None else None} "
                     f"extend_input_len={getattr(_r, 'extend_input_len', None)} "
                     f"cache_protected_len={getattr(_r, 'cache_protected_len', None)} "
-                    f"prefix_indices_len={len(getattr(_r, 'prefix_indices', None) or [])}",
+                    f"prefix_indices_len={_r.prefix_indices.shape[0] if _r.prefix_indices is not None else None}",
                     flush=True,
                 )
         assert all(
