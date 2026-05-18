@@ -16,6 +16,8 @@ import unittest
 
 import torch
 
+from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_cache_canary.host_state import _build_plan
 from sglang.srt.kv_cache_canary.pool_patch import PoolKind, attach_shadow_buffers
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -115,6 +117,61 @@ class TestSWAStateBufInfosPatch(unittest.TestCase):
         self.assertEqual(ptrs[5], pool.canary_k_tail.data_ptr())
         self.assertEqual(ptrs[10], pool.canary_v_head.data_ptr())
         self.assertEqual(ptrs[11], pool.canary_v_tail.data_ptr())
+
+
+class TestSWAVerifyWindowClipping(unittest.TestCase):
+    """SWA pool: verify range must be clipped to the most recent ``swa_window_size`` slots."""
+
+    def _build_plan_for_one_req(self, *, k_req: int, swa_window_size):
+        # Single-req batch, decode step: K_req tokens written so far, no
+        # new writes (n=0). Verify entries should cover the SWA window.
+        # Row 0 is the padding row (req_pool_idx == 0 is skipped); row 1
+        # holds this req's slot indices.
+        req_to_token = torch.zeros((2, k_req), dtype=torch.int32)
+        req_to_token[1] = torch.arange(1, k_req + 1, dtype=torch.int32)
+        return _build_plan(
+            req_pool_indices=[1],
+            seq_lens=[0],
+            prefix_lens=[k_req],
+            input_ids_list=[],
+            out_cache_loc_list=[],
+            positions_list=None,
+            req_to_token_table=req_to_token,
+            swa_window_size=swa_window_size,
+        )
+
+    def test_swa_window_caps_verify_range_to_last_window_positions(self) -> None:
+        plan = self._build_plan_for_one_req(k_req=1000, swa_window_size=128)
+        assert plan is not None
+        # Window-aware verify: 128 entries covering positions [872, 1000).
+        self.assertEqual(plan.num_verify, 128)
+        self.assertEqual(plan.verify_positions[0], 872)
+        self.assertEqual(plan.verify_positions[-1], 999)
+        # First entry has pos > 0 -> prev_slot_indices[0] must be the slot
+        # for position (872 - 1) = 871, not -1 (the kSeed sentinel).
+        expected_prev_slot = int(872)  # req_to_token[0, 871] = 871 + 1 = 872
+        self.assertEqual(plan.verify_prev_slot_indices[0], expected_prev_slot)
+
+    def test_swa_window_larger_than_k_req_uses_full_prefix(self) -> None:
+        plan = self._build_plan_for_one_req(k_req=64, swa_window_size=256)
+        assert plan is not None
+        self.assertEqual(plan.num_verify, 64)
+        self.assertEqual(plan.verify_positions[0], 0)
+        # Position 0 -> prev_slot_indices = -1 (kSeed).
+        self.assertEqual(plan.verify_prev_slot_indices[0], -1)
+
+    def test_non_swa_swa_window_size_none_walks_full_prefix(self) -> None:
+        plan = self._build_plan_for_one_req(k_req=10000, swa_window_size=None)
+        assert plan is not None
+        # No cap: every position verified (user-instruction: 10k tokens
+        # decode step verifies all 10k positions).
+        self.assertEqual(plan.num_verify, 10000)
+        self.assertEqual(plan.verify_positions[0], 0)
+        self.assertEqual(plan.verify_positions[-1], 9999)
+
+    def test_canary_config_default_swa_window_size_is_none(self) -> None:
+        cfg = CanaryConfig(mode=CanaryMode.LOG)
+        self.assertIsNone(cfg.swa_window_size)
 
 
 if __name__ == "__main__":

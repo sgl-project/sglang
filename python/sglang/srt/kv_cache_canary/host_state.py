@@ -137,6 +137,7 @@ def plan_batch_from_forward_batch(
         out_cache_loc_list=out_cache_loc_list,
         positions_list=positions_list,
         req_to_token_table=req_to_token_pool.req_to_token,
+        swa_window_size=config.swa_window_size,
     )
 
 
@@ -149,6 +150,7 @@ def _build_plan(
     out_cache_loc_list: List[int],
     positions_list: Optional[List[int]],
     req_to_token_table: torch.Tensor,
+    swa_window_size: Optional[int],
 ) -> Optional[BatchPlan]:
     verify_req_ids: List[int] = []
     verify_positions: List[int] = []
@@ -181,6 +183,7 @@ def _build_plan(
                 req_to_token_table=req_to_token_table,
                 req_pool_idx=req_pool_idx_int,
                 k_req=k_req_int,
+                swa_window_size=swa_window_size,
             )
             window_start = k_req_int - len(slot_indices_for_verify)
             for j, slot_idx in enumerate(slot_indices_for_verify):
@@ -256,16 +259,26 @@ def _pull_verify_slot_indices(
     req_to_token_table: torch.Tensor,
     req_pool_idx: int,
     k_req: int,
+    swa_window_size: Optional[int],
 ) -> List[int]:
-    """Return slot indices for the full verify range ``[0, K_req)`` of one req.
+    """Return slot indices for one req's verify range.
 
-    Every historical position is verified every forward (user requirement:
-    a 10k-prefix decode step verifies all 10k positions). SWA-pool path
-    overrides this in ``plan_batch_from_forward_batch`` to slice the range
-    down to ``[K_req - window_size, K_req)`` since older slots in the SWA
-    index space are no longer addressable.
+    Non-SWA (``swa_window_size is None``): full ``[0, K_req)`` window —
+    every historical position is verified every forward (user
+    requirement: a 10k-prefix decode step verifies all 10k positions).
+
+    SWA (``swa_window_size > 0``): clipped to
+    ``[max(0, K_req - swa_window_size), K_req)``. The SWA pool's
+    ``req_to_token`` map only addresses the most recent
+    ``swa_window_size`` slots; older positions point at slots that have
+    been evicted / reused by other reqs, so reading them would trip a
+    spurious req_id / position mismatch.
     """
-    row = req_to_token_table[req_pool_idx, :k_req]
+    if swa_window_size is not None and k_req > swa_window_size:
+        window_start = k_req - swa_window_size
+    else:
+        window_start = 0
+    row = req_to_token_table[req_pool_idx, window_start:k_req]
     return [int(x) for x in row.detach().cpu().tolist()]
 
 

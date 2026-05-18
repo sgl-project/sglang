@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -59,6 +60,22 @@ def install_on_model_runner(
 
     if getattr(model_runner, _FORWARD_PATCHED_ATTR, False):
         return
+
+    if pool_kind is PoolKind.SWA:
+        # SWA's req_to_token mapping only addresses the most recent
+        # ``sliding_window_size`` slots; the verify range must be clipped
+        # accordingly. The MHA / MLA / DRAFT / TARGET branches keep the
+        # default ``None`` (full-prefix verify).
+        window_size = model_runner.sliding_window_size
+        if window_size is None or int(window_size) <= 0:
+            logger.warning(
+                "kv-canary: SWA pool detected but model_runner.sliding_window_size "
+                "is %r; falling back to full-prefix verify (may produce spurious "
+                "violations on long prefixes).",
+                window_size,
+            )
+        else:
+            config = dataclasses.replace(config, swa_window_size=int(window_size))
 
     device = torch.device(model_runner.device)
     verify_capacity, write_capacity, write_req_capacity = _compute_launch_capacities(

@@ -4,7 +4,7 @@ import enum
 import logging
 import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,14 @@ class CanaryConfig:
     counter_zero_warmup_forwards: int = 64
     perturb_req_to_token_prob: float = 0.0
     perturb_req_to_token_seed: int = 0
+    # Sliding-window-attention window length, in tokens. Non-None ONLY for
+    # canary runners attached to a SWA pool — SWA's req_to_token mapping
+    # only addresses the most recent ``swa_window_size`` slots of a req
+    # (older positions get evicted / overwritten), so the verify range
+    # must be clipped to ``[K_req - swa_window_size, K_req)``. Reading
+    # outside that window lands on slots that belong to other reqs and
+    # would trip a (spurious) violation.
+    swa_window_size: Optional[int] = None
 
     @classmethod
     def from_server_args(cls, mode: str | CanaryMode | None) -> "CanaryConfig":
