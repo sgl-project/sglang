@@ -9,7 +9,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+
+from sglang.srt.utils import get_device, is_cuda, is_xpu
+
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
+
+device = get_device()
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
 
@@ -100,6 +107,7 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
         if _is_cuda and torch.cuda.get_device_capability()[0] < 9:
             return
+
         A, A_quant_gt, scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )
@@ -121,6 +129,7 @@ class TestW8A8BlockFP8Matmul(TestFP8Base):
             pass
         else:
             return
+
         A, A_quant_gt, A_scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )

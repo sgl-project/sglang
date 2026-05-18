@@ -23,12 +23,14 @@ RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
 USER root
 
 # Install the latest UMD driver for SYCL-TLA
-RUN apt-get install -y software-properties-common && \
+RUN apt-get update && apt-get install -y software-properties-common && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
-    apt-get update  && \
-    apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc && \
-    apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
-    apt-get install -y libze-dev intel-ocloc
+    apt-get update && \
+    apt-get install -y \
+        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
+        libze-dev intel-ocloc && \
+    rm -rf /var/lib/apt/lists/*
 
 # Switch to non-root user 'sdp'
 USER sdp
@@ -59,11 +61,11 @@ RUN --mount=type=secret,id=github_token \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
     echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
-    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
+    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install xgrammar --no-deps && \
+    pip install --no-deps xgrammar==0.1.33 && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)

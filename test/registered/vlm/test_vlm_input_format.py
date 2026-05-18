@@ -38,10 +38,13 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
-register_cuda_ci(est_time=747, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
+
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -56,6 +59,7 @@ class VLMInputTestBase:
     def setUpClass(cls):
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
+
         cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
         if _is_cuda:
             cls.device = torch.device("cuda")
@@ -68,6 +72,7 @@ class VLMInputTestBase:
         for image_url in cls.image_urls:
             response = requests.get(image_url)
             cls.main_image.append(Image.open(BytesIO(response.content)))
+
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )

@@ -42,8 +42,8 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses the checked-in nightly-aligned presets, plus `LTX-2`, `LTX-2.3` one-stage, and `LTX-2.3` two-stage benchmark recipes
-- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, and distributed overlap patterns before proposing new code
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus skill-only stress recipes such as `LTX-2.3` one-stage/two-stage, HunyuanVideo, MOVA, Helios, JoyAI/FireRed image edit, and Hunyuan3D shape
+- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; pins `--backend=sglang`, supports `--no-torch-compile`, and saves perf dumps by label for `compare_perf.py`
 
@@ -52,6 +52,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 Before calling a diffusion hotspot "new", first classify it with `existing-fast-paths.md`.
 
 Always rule out these existing families first:
+- HunyuanVideo VAE GroupNorm+SiLU
 - Z-Image residual-form modulation
 - fused diffusion `QK norm + RoPE`
 - NVFP4 / Nunchaku packed QKV

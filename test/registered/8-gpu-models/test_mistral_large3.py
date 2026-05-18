@@ -73,7 +73,6 @@ class TestMistralLarge3(unittest.TestCase):
                 MISTRAL_LARGE3_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle_args,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
             # Variant: "nvfp4" - NVFP4 model + TP=8 + trtllm_mla backend

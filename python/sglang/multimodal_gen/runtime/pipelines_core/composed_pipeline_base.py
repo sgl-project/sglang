@@ -18,8 +18,20 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
+    ComponentLoadSpec,
+    order_component_load_specs,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+    ComponentResidencyStrategy,
+    get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -91,7 +103,9 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
+        self.component_residency_manager: ComponentResidencyManager | None = None
 
         if required_config_modules is not None:
             self._required_config_modules = required_config_modules
@@ -375,10 +389,16 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading required components: %s", required_modules)
 
         loaded_components = {}
-        for module_name, (
-            transformers_or_diffusers,
-            architecture,
-        ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+        component_load_specs: list[ComponentLoadSpec] = []
+
+        # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
+        for index, (
+            module_name,
+            (
+                transformers_or_diffusers,
+                architecture,
+            ),
+        ) in enumerate(model_index.items()):
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -395,22 +415,64 @@ class ComposedPipelineBase(ABC):
                 loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
-            # we load the module from the extra config module map if it exists
             if module_name in self._extra_config_module_map:
                 load_module_name = self._extra_config_module_map[module_name]
             else:
                 load_module_name = module_name
-
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-                component_architecture=architecture,
+            # collect loading specs
+            component_load_specs.append(
+                ComponentLoadSpec(
+                    module_name=module_name,
+                    load_module_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    architecture=architecture,
+                    index=index,
+                )
             )
+
+        # reorder loading order to avoid OOM
+        component_load_specs: ComponentLoadSpec = order_component_load_specs(
+            component_load_specs
+        )
+        logger.info(
+            "Memory-aware component load order: %s",
+            [spec.module_name for spec in component_load_specs],
+        )
+
+        for spec in tqdm(
+            iterable=component_load_specs, desc="Loading required modules"
+        ):
+            module_name: str = spec.module_name
+            load_module_name: str = spec.load_module_name
+            transformers_or_diffusers: str = spec.transformers_or_diffusers
+            architecture: str = spec.architecture
+            component_model_path: str = spec.component_model_path
+
+            attn_backend, matched_backend_key = (
+                server_args.resolve_component_attention_backend(
+                    module_name, load_module_name
+                )
+            )
+            if attn_backend is not None:
+                logger.info(
+                    "Using %s backend for component: %s",
+                    attn_backend.name.lower(),
+                    matched_backend_key,
+                )
+            with component_attn_backend_context_manager(
+                attn_backend, component_name=matched_backend_key or module_name
+            ):
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                    component_architecture=architecture,
+                )
 
             self.memory_usages[load_module_name] = memory_usage
 
@@ -737,6 +799,11 @@ class ComposedPipelineBase(ABC):
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
             )
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 

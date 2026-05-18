@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,6 +59,7 @@ from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
