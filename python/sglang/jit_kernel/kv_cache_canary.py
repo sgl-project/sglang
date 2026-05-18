@@ -71,12 +71,44 @@ def canary_step(
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
 ) -> None:
-    """Launch one canary step kernel.
+    """Launch one KV-cache canary step.
 
-    Each entry is either a verify (``verify_mask == 1``, reads ``src_buf``,
-    checks fields incl. monotonic position via ``verify_seq_positions``) or a
-    write (``verify_mask == 0``, writes the expected triple into ``dst_buf``).
-    ``verify_seq_positions`` is ``-1`` for write entries.
+    Each entry is either a verify (``verify_mask == 1``, reads ``src_buf``
+    at the given slot index, checks the stored 4-int64 fingerprint against
+    expected values, including the monotonic ``input_position`` from
+    ``verify_seq_positions``) or a write (``verify_mask == 0``, writes the
+    expected fingerprint into ``dst_buf`` at the slot index).
+
+    Args:
+        src_buf:               uint8 flatten view of the source layer-shaped shadow
+                               tensor (verify path reads from here).
+        dst_buf:               uint8 flatten view of the destination shadow tensor
+                               (write path stores into here).
+        slot_stride_bytes:     bytes per logical slot in both buffers.
+        slot_indices:          int64 [num_slots]. Per-entry slot index in
+                               ``src_buf`` / ``dst_buf``.
+        expected_req_ids:      int64 [num_slots]. Expected ``req_pool_idx``.
+        expected_token_ids:    int64 [num_slots]. Expected ``input_token_id``.
+        expected_positions:    int64 [num_slots]. Expected ``input_position``.
+        expected_prev_hashes:  int64 [num_slots]. Expected chain ``prev_hash``.
+        verify_mask:           int32 [num_slots]. ``1`` = verify-then-skip-write,
+                               ``0`` = write-only.
+        verify_seq_positions:  int64 [num_slots]. Expected 0..K sequence
+                               position for verify entries (``-1`` for writes).
+                               Checked independently of any req→slot table.
+        violation_ring:        int64 [ring_capacity, 8]. Circular log of
+                               violations (ring buffer).
+        violation_ring_valid:  int32 [ring_capacity]. Per-row valid latch
+                               (0 = empty, 1 = writing, 2 = readable).
+        violation_write_index: int32 [1]. ``atomicAdd`` target for sequence #.
+        first_violation:       int64 [8]. First-violation latch (never
+                               overwritten by cascades).
+        first_violation_set:   int32 [1]. CAS guard for ``first_violation``.
+        is_errored:            int32 [1]. ``atomicOr`` flag; set when ANY
+                               thread records a violation.
+        slot_run_counter:      int64 [1]. ``+= num_slots`` per launch.
+        kernel_run_counter:    int64 [1]. ``+= 1`` per launch.
+        kernel_kind:           ``KERNEL_KIND_HEAD`` or ``KERNEL_KIND_TAIL``.
     """
     module = _jit_canary_module()
     module.canary_step(
