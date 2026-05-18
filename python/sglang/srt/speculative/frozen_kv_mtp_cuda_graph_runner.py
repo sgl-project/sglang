@@ -343,7 +343,10 @@ class FrozenKVMTPCudaGraphRunner:
             buffers.positions.zero_()
 
         num_tokens = expanded_bs
-        buffers.seq_lens[:raw_expanded_bs].copy_(forward_batch.seq_lens)
+        # Relayer channel resolve for post-decode seq_lens settled view.
+        buffers.seq_lens[:raw_expanded_bs].copy_(
+            forward_batch.relayer_resolve_seq_lens()
+        )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
         if forward_batch.mrope_positions is not None:
             buffers.mrope_positions[:, :raw_num_token].copy_(

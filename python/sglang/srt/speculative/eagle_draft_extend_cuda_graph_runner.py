@@ -458,9 +458,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
-        # Common inputs
+        # Common inputs. Read seq_lens via Relayer channel resolve so the
+        # cuda-graph replay buffer captures the post-decode settled view
+        # (cross-stream sync via cuda event); attribute fallback for no-ctx.
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.relayer_resolve_seq_lens())
         if forward_batch.extend_seq_lens is not None:
             buffers.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
         else:
