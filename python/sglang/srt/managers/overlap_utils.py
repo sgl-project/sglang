@@ -527,6 +527,10 @@ class Relayer:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
+        """Forward-stream write: non-spec -> ``token_ids`` buffer; spec V2 ->
+        delegates to ``store_to_map_for_new_batch`` for draft input fields.
+        Records a CUDA event for cross-stream resolve sync.
+        """
         if self.spec_algo.is_none():
             self.gpu_scalar.store(
                 future_indices, "token_ids", batch_result.next_token_ids
