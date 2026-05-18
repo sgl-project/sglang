@@ -479,7 +479,6 @@ class CanaryLaunchBuffers:
         the next forward's verify entries re-cover the same history positions
         from the host-side ``history`` tuple.
         """
-        total = plan.num_verify + plan.num_write
         if plan.num_write > self.capacity:
             raise RuntimeError(
                 f"kv-canary: write slot count {plan.num_write} exceeds launch "
@@ -488,62 +487,25 @@ class CanaryLaunchBuffers:
                 "forward exceeds that. Raise the canary launch capacity or "
                 "disable the canary for this deployment."
             )
-        if total > self.capacity:
-            # Prefer writes over verifies (see docstring). Truncate the
-            # verify section from the FRONT so the most recent history
-            # entries (the right end of the verify list, since plan_batch
-            # appends in order) survive.
-            max_verify = max(0, self.capacity - plan.num_write)
-            drop_verify = plan.num_verify - max_verify
-            verify_slot_indices = plan.verify_slot_indices[drop_verify:]
-            expected_req_ids = (
-                plan.expected_req_ids[drop_verify : plan.num_verify]
-                + plan.expected_req_ids[plan.num_verify :]
-            )
-            expected_token_ids = (
-                plan.expected_token_ids[drop_verify : plan.num_verify]
-                + plan.expected_token_ids[plan.num_verify :]
-            )
-            expected_positions = (
-                plan.expected_positions[drop_verify : plan.num_verify]
-                + plan.expected_positions[plan.num_verify :]
-            )
-            expected_prev_hashes = (
-                plan.expected_prev_hashes[drop_verify : plan.num_verify]
-                + plan.expected_prev_hashes[plan.num_verify :]
-            )
-            verify_mask = (
-                plan.verify_mask[drop_verify : plan.num_verify]
-                + plan.verify_mask[plan.num_verify :]
-            )
-            verify_seq_positions = (
-                plan.verify_seq_positions[drop_verify : plan.num_verify]
-                + plan.verify_seq_positions[plan.num_verify :]
-            )
-            write_slot_indices = plan.write_slot_indices
-            total = max_verify + plan.num_write
-        else:
-            verify_slot_indices = plan.verify_slot_indices
-            expected_req_ids = plan.expected_req_ids
-            expected_token_ids = plan.expected_token_ids
-            expected_positions = plan.expected_positions
-            expected_prev_hashes = plan.expected_prev_hashes
-            verify_mask = plan.verify_mask
-            verify_seq_positions = plan.verify_seq_positions
-            write_slot_indices = plan.write_slot_indices
+
+        max_verify = min(plan.num_verify, self.capacity - plan.num_write)
+        drop = plan.num_verify - max_verify
+        verify = slice(drop, plan.num_verify)
+        write = slice(plan.num_verify, plan.num_verify + plan.num_write)
+        total = max_verify + plan.num_write
 
         device = self.slot_indices.device
         slot_src = torch.tensor(
-            verify_slot_indices + write_slot_indices,
+            plan.verify_slot_indices[drop:] + plan.write_slot_indices,
             dtype=torch.int64,
             device=device,
         )
-        req_src = torch.tensor(expected_req_ids, dtype=torch.int64, device=device)
-        token_src = torch.tensor(expected_token_ids, dtype=torch.int64, device=device)
-        pos_src = torch.tensor(expected_positions, dtype=torch.int64, device=device)
-        hash_src = torch.tensor(expected_prev_hashes, dtype=torch.int64, device=device)
-        mask_src = torch.tensor(verify_mask, dtype=torch.int32, device=device)
-        seq_src = torch.tensor(verify_seq_positions, dtype=torch.int64, device=device)
+        req_src = _concat_to_int64(plan.expected_req_ids, verify, write, device)
+        token_src = _concat_to_int64(plan.expected_token_ids, verify, write, device)
+        pos_src = _concat_to_int64(plan.expected_positions, verify, write, device)
+        hash_src = _concat_to_int64(plan.expected_prev_hashes, verify, write, device)
+        mask_src = _concat_to_int32(plan.verify_mask, verify, write, device)
+        seq_src = _concat_to_int64(plan.verify_seq_positions, verify, write, device)
 
         self.slot_indices[:total].copy_(slot_src)
         self.expected_req_ids[:total].copy_(req_src)
@@ -556,3 +518,25 @@ class CanaryLaunchBuffers:
             self.verify_mask[total:].fill_(-1)
             self.verify_seq_positions[total:].fill_(-1)
         return total
+
+
+def _concat_to_int64(
+    values: List[int],
+    verify: slice,
+    write: slice,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.tensor(
+        values[verify] + values[write], dtype=torch.int64, device=device
+    )
+
+
+def _concat_to_int32(
+    values: List[int],
+    verify: slice,
+    write: slice,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.tensor(
+        values[verify] + values[write], dtype=torch.int32, device=device
+    )

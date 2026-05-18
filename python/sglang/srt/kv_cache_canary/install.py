@@ -184,14 +184,8 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
             launch_canary_for_capture(runner, kernel_kind=KERNEL_KIND_TAIL)
             return output
 
-        rank = model_runner.tp_rank
-        active_indices, active_seq_lens = _extract_active_rows(forward_batch)
-        maybe_perturb_req_to_token(
-            runner=runner,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            rank=rank,
-            active_req_pool_indices=active_indices,
-            active_seq_lens=active_seq_lens,
+        _maybe_perturb(
+            runner=runner, model_runner=model_runner, forward_batch=forward_batch
         )
         plan = run_head(runner=runner, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
@@ -199,6 +193,23 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         return output
 
     model.forward = patched_model_forward
+
+
+def _maybe_perturb(
+    *,
+    runner,
+    model_runner: "ModelRunner",
+    forward_batch,
+) -> None:
+    """Shared eager + replay self-test perturb hook."""
+    active_indices, active_seq_lens = _extract_active_rows(forward_batch)
+    maybe_perturb_req_to_token(
+        runner=runner,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        rank=model_runner.tp_rank,
+        active_req_pool_indices=active_indices,
+        active_seq_lens=active_seq_lens,
+    )
 
 
 _REPLAY_CLASS_PATCHED_ATTR = "_kv_cache_canary_replay_class_patched"
@@ -237,14 +248,8 @@ def _patch_cuda_graph_runner_replay_class_method() -> None:
         if runner is None or not runner.config.enabled:
             return original_replay(self, forward_batch, *args, **kwargs)
 
-        rank = model_runner.tp_rank
-        active_indices, active_seq_lens = _extract_active_rows(forward_batch)
-        maybe_perturb_req_to_token(
-            runner=runner,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            rank=rank,
-            active_req_pool_indices=active_indices,
-            active_seq_lens=active_seq_lens,
+        _maybe_perturb(
+            runner=runner, model_runner=model_runner, forward_batch=forward_batch
         )
         plan = prepare_replay(runner=runner, forward_batch=forward_batch)
         output = original_replay(self, forward_batch, *args, **kwargs)
