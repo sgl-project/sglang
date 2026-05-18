@@ -3249,9 +3249,7 @@ class Scheduler(
         self._prepare_pipelined_state_indices(batch)
 
         # Initialize split prefill
-        forward_batch = self.tp_worker.forward_batch_generation_split_init(
-            batch
-        )
+        forward_batch = self.tp_worker.forward_batch_generation_split_init(batch)
 
         logits_output = None
         # Grouped layer forward + per-group KV transfer
