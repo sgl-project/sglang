@@ -225,6 +225,12 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        # Mid-forward SB mutation: the draft-extend step adjusts ``seq_lens``
+        # / ``seq_lens_cpu`` by +num_draft_tokens so the draft kernel sees
+        # the right shape. When a Relayer seq_lens ctx is attached to
+        # ``batch``, the SB ``__setattr__`` mirror also writes the new values
+        # to the gpu_scalar channel, so any cross-stream consumer can
+        # resolve via channel rather than the live SB attribute.
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
