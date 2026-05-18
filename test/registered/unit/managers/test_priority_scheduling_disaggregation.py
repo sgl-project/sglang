@@ -138,7 +138,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
-        scheduler.stream_output = MagicMock()
+        scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
 
@@ -197,7 +197,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
         self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
         self.assertEqual(queue.queue, [])
-        queue.scheduler.stream_output.assert_called_once_with(
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
 
