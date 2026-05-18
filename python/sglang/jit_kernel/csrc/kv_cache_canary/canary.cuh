@@ -41,9 +41,14 @@ struct CanaryParams {
   // Bytes per slot in both src and dst (= per-slot stride of the underlying real-layer-shaped tensor).
   int64_t slot_stride_bytes;
 
-  // Per-verify-entry arrays, length == num_verify.
+  // Per-verify-entry arrays, length == num_verify. NOTE: we do NOT carry
+  // verify_token_ids — the historical tokens were written in prior forwards
+  // and are not in the current ForwardBatch.input_ids; recovering them
+  // would require maintaining host-side per-req history, which is exactly
+  // what the stateless redesign drops. Token tampering is caught indirectly
+  // via the splitmix64 chain (a corrupt token_id propagates into prev_hash
+  // for the next position) and req_id / position cross-checks below.
   const int64_t* __restrict__ verify_slot_indices;
-  const int64_t* __restrict__ verify_token_ids;
   const int64_t* __restrict__ verify_positions;
   const int64_t* __restrict__ verify_req_ids;
   // For verify entry i, the slot index of position (verify_positions[i] - 1)
@@ -178,7 +183,6 @@ __device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   }
   const int64_t slot_idx = p.verify_slot_indices[tid];
   const int64_t expected_req_id = p.verify_req_ids[tid];
-  const int64_t expected_token_id = p.verify_token_ids[tid];
   const int64_t expected_position = p.verify_positions[tid];
   const int64_t prev_slot_idx = p.verify_prev_slot_indices[tid];
 
@@ -200,13 +204,15 @@ __device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
         splitmix64_mix(prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position));
   }
 
-  // Four independent fail_reason categories (README §3):
-  // (b1) req_id, (b2) token_id, (b3) position monotonic, (a) chain hash.
+  // Three independent verify-path fail_reason categories (README §3):
+  // (b1) req_id cross-check, (b3) position monotonic, (a) chain hash.
+  // Token-id check applies only to the write path (where the host has the
+  // raw input_ids from forward_batch); on verify it's elided. Token-field
+  // tampering propagates into the chain hash via splitmix64_mix and is
+  // caught at the next position's verify.
   int32_t fail_reason = 0;
   if (actual_req_id != expected_req_id) {
     fail_reason = kFailReasonReqId;
-  } else if (actual_token_id != expected_token_id) {
-    fail_reason = kFailReasonTokenId;
   } else if (actual_position != expected_position) {
     fail_reason = kFailReasonPositionMonotonic;
   } else if (actual_prev_hash != expected_prev_hash) {
@@ -295,7 +301,6 @@ void canary_step(
     tvm::ffi::TensorView dst_buf,
     int64_t slot_stride_bytes,
     tvm::ffi::TensorView verify_slot_indices,
-    tvm::ffi::TensorView verify_token_ids,
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_req_ids,
     tvm::ffi::TensorView verify_prev_slot_indices,
@@ -330,7 +335,6 @@ void canary_step(
       .with_dtype<int64_t>()
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
-      .verify(verify_token_ids)
       .verify(verify_positions)
       .verify(verify_req_ids)
       .verify(verify_prev_slot_indices);
@@ -382,7 +386,6 @@ void canary_step(
   p.dst_buf = static_cast<uint8_t*>(dst_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
-  p.verify_token_ids = static_cast<const int64_t*>(verify_token_ids.data_ptr());
   p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
   p.verify_req_ids = static_cast<const int64_t*>(verify_req_ids.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());

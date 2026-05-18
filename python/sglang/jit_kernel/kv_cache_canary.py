@@ -55,7 +55,6 @@ def canary_step(
     dst_buf: torch.Tensor,
     slot_stride_bytes: int,
     verify_slot_indices: torch.Tensor,
-    verify_token_ids: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_req_ids: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
@@ -85,9 +84,12 @@ def canary_step(
 
     1. **Verify entries** (per-thread): read a slot's stored fingerprint,
        compute the expected ``prev_hash`` by reading the previous slot and
-       running ``splitmix64_mix`` on-device, then compare against the four
-       expected fields (``req_id``, ``token_id``, ``position``, ``prev_hash``)
-       — one independent fail_reason per field.
+       running ``splitmix64_mix`` on-device, then compare against three
+       expected fields (``req_id``, ``position``, ``prev_hash``) — one
+       independent fail_reason per field. ``token_id`` is NOT verified on
+       this path (historical tokens are not in the current
+       ``ForwardBatch.input_ids``); token tampering is caught indirectly
+       via the splitmix64 chain at the next position.
     2. **Write-req chains** (per-thread, one driver thread per request): walk
        the splitmix64 chain across all writes for that req, seeded from
        either ``kSeed`` (``write_req_seed_slot_indices == -1``) or the
@@ -126,7 +128,6 @@ def canary_step(
         dst_buf,
         slot_stride_bytes,
         verify_slot_indices,
-        verify_token_ids,
         verify_positions,
         verify_req_ids,
         verify_prev_slot_indices,
