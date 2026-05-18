@@ -82,10 +82,8 @@ jobs:
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
-            // Only `unlabeled` events have a real race against label removal
-            // vs an in-flight run. Other no-label fires (opened / synchronize /
-            // reopened / unrelated labeled / workflow_run) don't need to wait:
-            // any existing run is long-indexed or genuinely absent.
+            // Pre-sleep below only matters when a label was just removed;
+            // other no-label fires don't race against fresh indexing.
             const justRemovedLabel = context.eventName === 'pull_request_target'
                                      && context.payload.action === 'unlabeled';
 
@@ -110,14 +108,10 @@ jobs:
             }
 
             // Query unconditionally: removing a label does NOT cancel an
-            // in-flight workflow, so a run from before label removal can
-            // still be live. Label state only picks the fallback text.
-            //
-            // Retry budget:
-            // - With label: pre-sleep + retry absorb fresh-push indexing lag.
-            // - Without label + just-removed-label event: pre-sleep + 1 lookup
-            //   catches removal-immediately-after-push.
-            // - Without label + other events: 1 lookup, no wait.
+            // in-flight workflow, so a run from before removal can still be
+            // live. Label state only picks the fallback text. labelOnOpts
+            // covers fresh-push indexing race; labelOffOpts only pre-sleeps
+            // on just-removed-label to catch removal-after-push.
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
             const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
@@ -133,9 +127,8 @@ jobs:
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
 
-            // Status icon distinguishes live / success / gate-failed / cancelled
-            // so the body reflects the actual run state instead of looking
-            // uniformly "dispatched" even when call-gate failed.
+            // Status icon: body otherwise looks uniformly "dispatched" even
+            // for gate-failed runs (call-gate exits on missing label).
             function runIcon(run) {
               if (run.status !== 'completed') return ':hourglass_flowing_sand:';
               switch (run.conclusion) {
