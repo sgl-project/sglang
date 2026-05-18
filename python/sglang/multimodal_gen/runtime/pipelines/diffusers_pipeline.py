@@ -719,6 +719,7 @@ class DiffusersPipeline(ComposedPipelineBase):
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
         stage.set_registered_stage_name(stage_name)
+        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self

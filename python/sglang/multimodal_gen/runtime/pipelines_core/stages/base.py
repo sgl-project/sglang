@@ -61,6 +61,7 @@ class PipelineStage(StageDedupMixin, ABC):
         self.server_args = get_global_server_args()
         self._component_residency_manager = None
         self._registered_stage_name: str | None = None
+        self._profile_stage_name: str | None = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -119,6 +120,9 @@ class PipelineStage(StageDedupMixin, ABC):
     def set_registered_stage_name(self, stage_name: str) -> None:
         self._registered_stage_name = stage_name
 
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        self._profile_stage_name = stage_name
+
     def _component_stage_name(self, stage_name: str | None = None) -> str:
         return (
             stage_name
@@ -133,6 +137,9 @@ class PipelineStage(StageDedupMixin, ABC):
         if manager_stage_name is not None:
             return manager_stage_name
         return self._component_stage_name()
+
+    def _active_profile_stage_name(self) -> str:
+        return getattr(self, "_profile_stage_name", None) or self.__class__.__name__
 
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
@@ -277,7 +284,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Returns:
             The updated batch information after this stage's processing.
         """
-        stage_name = self._active_component_stage_name()
+        stage_name = self._active_profile_stage_name()
         # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification

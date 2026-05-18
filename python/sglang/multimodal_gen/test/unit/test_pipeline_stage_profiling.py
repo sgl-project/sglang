@@ -14,15 +14,25 @@ class NamedNoOpStage(PipelineStage):
 
 
 class TestPipelineStageProfiling(unittest.TestCase):
-    def test_profiler_uses_registered_stage_name(self):
+    def test_profiler_uses_profile_stage_name(self):
         stage = NamedNoOpStage()
-        stage.set_registered_stage_name("registered_stage")
+        stage.set_profile_stage_name("profile_stage")
         batch = Req(perf_dump_path="/tmp/unused_perf.json")
 
         stage(batch, SimpleNamespace())
 
-        self.assertIn("registered_stage", batch.metrics.stages)
+        self.assertIn("profile_stage", batch.metrics.stages)
         self.assertNotIn("NamedNoOpStage", batch.metrics.stages)
+
+    def test_registered_stage_name_does_not_change_profile_name(self):
+        stage = NamedNoOpStage()
+        stage.set_registered_stage_name("prompt_encoding_stage_primary")
+        batch = Req(perf_dump_path="/tmp/unused_perf.json")
+
+        stage(batch, SimpleNamespace())
+
+        self.assertIn("NamedNoOpStage", batch.metrics.stages)
+        self.assertNotIn("prompt_encoding_stage_primary", batch.metrics.stages)
 
 
 if __name__ == "__main__":
