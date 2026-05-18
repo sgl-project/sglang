@@ -1363,6 +1363,12 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
         )
+        # Legacy 2-iter Python ref pin storage. The Relayer now owns the
+        # canonical ``_iter_pin_ring`` (see ``Relayer.begin_iter_pin``); these
+        # attributes stay as a back-compat alias for any direct indexer that
+        # was reading ``self.batch_record_buf[ct]`` (memory checker, dumpers).
+        # Both views point to the same Python list, so external readers see
+        # the same data the Relayer ring carries.
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 

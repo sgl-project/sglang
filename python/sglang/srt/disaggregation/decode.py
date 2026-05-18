@@ -1210,7 +1210,13 @@ class DecodePreallocQueue:
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
+        # disagg-init kv_committed_len: this is the schedule-side
+        # initialization of a freshly-received KV-ready req, not a
+        # cross-iter relay value, so it remains a direct attribute write.
+        # The Relayer cpu_value channel only owns the per-iter delta
+        # produced by process_batch_result.
         req.kv_committed_len = fill_len
+        req.clear_relayer_kv_committed_ctx()
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
