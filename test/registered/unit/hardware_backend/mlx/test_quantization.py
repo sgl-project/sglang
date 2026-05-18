@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # On non-Apple-Silicon CI runners the entire TestCase class skips via the
 # @skipUnless guard below, so this registration is the harmless "yes this
 # test exists" signal the registry requires.
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = (
