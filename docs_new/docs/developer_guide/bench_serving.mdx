@@ -147,6 +147,12 @@ python3 -m sglang.bench_serving \
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
 - `--flush-cache`: call `/flush_cache` (sglang) before main run
 - `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
+- `--profile-num-steps N`: cap the trace to `N` forward steps (a step is one batch iteration; with high `--max-concurrency` a step spans many requests). When set, the client skips the trailing `/stop_profile` because the server auto-stops.
+- `--profile-start-step N`: begin recording after `N` warmup steps.
+- `--profile-activities CPU GPU XPU MEM CUDA_PROFILER RPD`: subset of activities to record. Defaults to the server's default (`CPU`, `GPU`).
+- `--profile-merge-profiles`: ask the server to merge per-rank traces into a single file.
+- `--profile-output-dir PATH`: where the server writes traces. Falls back to `$SGLANG_TORCH_PROFILER_DIR`.
+- `--profile-prefill-url URL [URL ...]` / `--profile-decode-url URL [URL ...]`: in PD-disaggregated mode, route profile start/stop POSTs to these workers instead of the main `--base-url`.
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
 
