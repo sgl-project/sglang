@@ -28,8 +28,8 @@ import dataclasses
 import unittest
 from typing import List, Tuple
 
-from sglang.test.bench_one_batch_server_internal import BenchArgs
 from sglang.srt.server_args import ServerArgs
+from sglang.test.bench_one_batch_server_internal import BenchArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -53,8 +53,15 @@ class _Scenario:
 
 
 _SCENARIOS: Tuple[_Scenario, ...] = (
-    _Scenario(label="prefill_bs32_isl16384_osl1", batch_size=32, input_len=16384, output_len=1),
-    _Scenario(label="decode_bs256_isl4096_osl1024", batch_size=256, input_len=4096, output_len=1024),
+    _Scenario(
+        label="prefill_bs32_isl16384_osl1", batch_size=32, input_len=16384, output_len=1
+    ),
+    _Scenario(
+        label="decode_bs256_isl4096_osl1024",
+        batch_size=256,
+        input_len=4096,
+        output_len=1024,
+    ),
 )
 
 

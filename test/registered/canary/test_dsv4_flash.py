@@ -43,9 +43,7 @@ _MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 # First-5 prefix of the real HF ``compress_ratios`` array; covers full
 # (ratio=0), c4 (ratio=4), and c128 (ratio=128) so all three internal
 # sub-pools get exercised even with the truncated layer count.
-_OVERRIDE_ARGS = (
-    '{"num_hidden_layers": 5, "compress_ratios": [0, 0, 4, 128, 4]}'
-)
+_OVERRIDE_ARGS = '{"num_hidden_layers": 5, "compress_ratios": [0, 0, 4, 128, 4]}'
 
 
 class TestKvCacheCanaryDSV4Flash(CustomTestCase):
