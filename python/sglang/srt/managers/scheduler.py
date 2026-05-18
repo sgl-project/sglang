@@ -3032,8 +3032,16 @@ class Scheduler(
         )
         sched_sampling_info = batch.sampling_info
 
-        # 2. sampling_info substitute
+        # 2. sampling_info substitute. Also stash the live sampling_info
+        # (with its penalizer orchestrator and per-iter penalty accumulator
+        # state) on the Relayer state_obj channel so cross-iter consumers of
+        # the orchestrator state can resolve via the relayer rather than
+        # through this contextmanager's local. The relayer entry is restored
+        # transparently when this contextmanager exits (the finally block
+        # below already rebinds batch.sampling_info = sched_sampling_info).
         if sched_sampling_info is not None:
+            if self.relayer is not None:
+                self.relayer.stash_sampling_state("sampling_info", sched_sampling_info)
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
         # 3. pin for 2-iter tensor lifetime
