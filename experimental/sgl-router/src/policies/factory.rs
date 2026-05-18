@@ -1,29 +1,90 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{Config, PolicyKind};
+use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
+    cache_aware_zmq::CacheAwareZmqPolicy, kv_events::HashTree,
     power_of_two::PowerOfTwoChoicesPolicy, random::RandomPolicy, round_robin::RoundRobinPolicy,
     Policy, PolicyRegistry,
 };
+use crate::tokenizer::TokenizerRegistry;
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn build_policy(kind: PolicyKind) -> Arc<dyn Policy> {
+/// Construct a policy for a single model from its [`ModelConfig`] and the
+/// process-shared `HashTree` + `TokenizerRegistry`.
+///
+/// The tree and tokenizer registry are only consulted by the cache-aware-zmq
+/// variant; other policies ignore them. Callers building all policies for
+/// the same process pass the same `tree` and `tokenizers` to every model.
+pub fn build_policy(
+    model: &ModelConfig,
+    tree: Arc<HashTree>,
+    tokenizers: Arc<TokenizerRegistry>,
+) -> Arc<dyn Policy> {
+    match model.policy {
+        PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+        PolicyKind::Random => Arc::new(RandomPolicy::new()),
+        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::CacheAwareZmq => {
+            let cache_cfg = model.cache_aware.unwrap_or_default();
+            Arc::new(CacheAwareZmqPolicy::new(cache_cfg, tree, tokenizers))
+        }
+    }
+}
+
+/// Compatibility shim used by tests + non-cache-aware code paths. Builds
+/// a policy without wiring the cache-aware dependencies; rejects
+/// `CacheAwareZmq` to keep the call sites that don't have a `HashTree` /
+/// `TokenizerRegistry` to hand from accidentally compiling.
+#[cfg(test)]
+pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
     match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::CacheAwareZmq => {
+            // Provide an empty tree + empty tokenizer registry so the test
+            // policy is constructible. Production callers go through
+            // `build_policy` with the real shared instances.
+            Arc::new(CacheAwareZmqPolicy::new(
+                crate::config::CacheAwareConfig::default(),
+                Arc::new(HashTree::new()),
+                Arc::new(TokenizerRegistry::default()),
+            ))
+        }
     }
 }
 
-pub fn build_registry(cfg: &Config) -> Result<PolicyRegistry> {
+pub fn build_registry(
+    cfg: &Config,
+    tree: Arc<HashTree>,
+    tokenizers: Arc<TokenizerRegistry>,
+) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     for m in &cfg.models {
-        reg.insert(ModelId(m.id.clone()), build_policy(m.policy));
+        reg.insert(
+            ModelId(m.id.clone()),
+            build_policy(m, Arc::clone(&tree), Arc::clone(&tokenizers)),
+        );
     }
     Ok(reg)
+}
+
+/// Convenience for tests + non-cache-aware callers: builds a registry with
+/// a fresh, empty `HashTree` and an empty `TokenizerRegistry`. The
+/// cache-aware-zmq policy will then degrade to min-load (no tokenizer →
+/// fallback) — which is exactly what the legacy tests assume.
+///
+/// Production callers go through [`build_registry`] with the real
+/// process-shared instances.
+pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
+    build_registry(
+        cfg,
+        Arc::new(HashTree::new()),
+        Arc::new(TokenizerRegistry::default()),
+    )
 }
 
 #[cfg(test)]
@@ -50,6 +111,7 @@ mod tests {
                     tokenizer_path: "/tmp/x".into(),
                     policy: *p,
                     circuit_breaker: None,
+                    cache_aware: None,
                 })
                 .collect(),
             discovery: DiscoveryConfig {
@@ -62,11 +124,12 @@ mod tests {
     }
 
     #[test]
-    fn build_policy_covers_all_variants() {
+    fn build_policy_kind_only_covers_all_variants() {
         // Trivially total — the match is exhaustive over `PolicyKind`.
-        let _ = build_policy(PolicyKind::RoundRobin);
-        let _ = build_policy(PolicyKind::Random);
-        let _ = build_policy(PolicyKind::PowerOfTwo);
+        let _ = build_policy_kind_only(PolicyKind::RoundRobin);
+        let _ = build_policy_kind_only(PolicyKind::Random);
+        let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
+        let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
     }
 
     #[test]
@@ -75,9 +138,28 @@ mod tests {
             ("qwen", PolicyKind::RoundRobin),
             ("deepseek", PolicyKind::Random),
         ]);
-        let reg = build_registry(&cfg).unwrap();
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("deepseek".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
+    }
+
+    #[test]
+    fn cache_aware_zmq_builds_via_factory() {
+        let cfg = cfg_with_models(&[("modelA", PolicyKind::CacheAwareZmq)]);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        // Down-cast probe via Debug — cheaper than carrying a type-tag
+        // on the trait. Pinning the debug repr is fine because the field
+        // name is part of the file's public test surface.
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("CacheAwareZmqPolicy"),
+            "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
+        );
     }
 }

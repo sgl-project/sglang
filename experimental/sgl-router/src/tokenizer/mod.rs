@@ -59,6 +59,7 @@ mod tests {
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
+                cache_aware: None,
             }],
             discovery: crate::config::DiscoveryConfig {
                 backend: crate::config::DiscoveryBackend::StaticFile(

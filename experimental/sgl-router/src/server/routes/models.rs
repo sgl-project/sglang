@@ -55,12 +55,14 @@ mod tests {
                 tokenizer_path: "x".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
+                cache_aware: None,
             },
             crate::config::ModelConfig {
                 id: "deepseek".into(),
                 tokenizer_path: "y".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
+                cache_aware: None,
             },
         ];
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));

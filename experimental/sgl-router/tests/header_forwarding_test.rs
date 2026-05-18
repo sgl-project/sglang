@@ -10,7 +10,7 @@ use sgl_router::config::{
     ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry as build_policy_registry;
+use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -34,6 +34,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
+            cache_aware: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {

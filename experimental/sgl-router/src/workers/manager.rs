@@ -239,6 +239,7 @@ mod tests {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,
                 }),
+                cache_aware: None,
             }],
             discovery: DiscoveryConfig {
                 backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
