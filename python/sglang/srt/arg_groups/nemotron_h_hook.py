@@ -37,14 +37,14 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                     f"{model_arch}"
                 )
             elif (
-                model_config.quantization == "modelopt_fp4"
+                model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
                 and is_cuda()
                 and (8, 0) <= get_device_capability() < (10, 0)
             ):
                 server_args.moe_runner_backend = "marlin"
                 logger.info(
                     "Use marlin as MoE runner backend on SM80-SM90 for "
-                    f"{model_arch} modelopt_fp4"
+                    f"{model_arch} {model_config.quantization}"
                 )
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
