@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
@@ -240,3 +242,52 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         raise NotImplementedError(
             "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
         )
+
+
+@dataclass
+class EmbeddingBatchResult:
+    """Result from an embedding/classification forward pass.
+
+    Attributes:
+        embeddings: Model output — pooled embeddings or classification logits.
+        pooled_hidden_states: Raw hidden states before the task head.  Present
+            only when the batch contained ``return_pooled_hidden_states=True``
+            requests.  Tensor (uniform shapes) or list of tensors (MIS).
+        copy_done: CUDA event recorded after the async CPU copy completes.
+    """
+
+    embeddings: torch.Tensor
+    pooled_hidden_states: Optional[torch.Tensor] = None
+    copy_done: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self):
+        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
+        if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [
+                emb.to("cpu", non_blocking=True) for emb in self.embeddings
+            ]
+
+        if self.pooled_hidden_states is not None:
+            if isinstance(self.pooled_hidden_states, list):
+                self.pooled_hidden_states = [
+                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
+                ]
+            else:
+                self.pooled_hidden_states = self.pooled_hidden_states.to(
+                    "cpu", non_blocking=True
+                )
+
+        self.copy_done.record()
+
+
+def is_health_check_generate_req(recv_req):
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
