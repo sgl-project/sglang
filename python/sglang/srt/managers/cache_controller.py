@@ -520,9 +520,12 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
+            # Backends that Put/Get using host buffer metadata (FD offsets, CUDA ptr, etc.)
+            # must use the v1 hooks; the generic path calls batch_set(keys, tensors) which
+            # is only valid for file-style single-blob keys.
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "grpc", "rpc"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))

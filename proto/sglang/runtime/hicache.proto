@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package sglang.runtime.hicache;
+
+option go_package = "github.com/sgl-project/sglang/proto/sglang/runtime/hicache";
+
+// Describe a piece of scattered buffer.
+message Iovec {
+  fixed64 offset = 1;
+  fixed32 length = 2;
+}
+
+// A single PUT or GET request.
+message Transfer {
+  bytes id = 1;
+  repeated Iovec iovec = 2;
+  int32 pool_id = 3;
+}
+
+message ExistRequest {
+  repeated bytes id = 1;
+}
+
+message ExistResponse {
+  repeated bool results = 1;
+}
+
+message BatchPutRequest {
+  repeated Transfer puts = 1;
+}
+
+message BatchPutResponse {
+  // Same length as BatchPutRequest.puts. 0 means success.
+  repeated int32 results = 1;
+}
+
+message BatchGetRequest {
+  repeated Transfer gets = 1;
+}
+
+message BatchGetResponse {
+  // Same length as BatchGetRequest.gets. 0 means success.
+  repeated int32 results = 1;
+}
+
+// StorageServer: L3 KV over gRPC; host memory is registered on a separate mempool UDS.
+service StorageServer {
+  // Check that listed cache keys exist in L3 (per-key booleans in ExistResponse).
+  rpc Exist(ExistRequest) returns (ExistResponse);
+
+  // Write host memory described by iovec (FD offsets within a registered pool) to L3.
+  rpc BatchPut(BatchPutRequest) returns (BatchPutResponse);
+
+  // Read L3 into host memory at the given iovec slots. If missing, non-zero result for that slot.
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+}

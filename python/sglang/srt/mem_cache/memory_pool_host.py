@@ -30,6 +30,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
@@ -91,7 +92,9 @@ class HostTensorAllocator(abc.ABC):
         return tensor
 
 
-def get_allocator_from_storage(allocator_type):
+def get_allocator_from_storage(
+    allocator_type: str, *, rpc_cap_bytes: Optional[int] = None
+):
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -106,6 +109,11 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    if allocator_type == "rpc":
+        from sglang.srt.mem_cache.storage.rpc.hicache_rpc_storage import (
+            MemfdTensorAllocator,
+        )
+        return MemfdTensorAllocator()
     else:
         return HostTensorAllocator()
 
@@ -170,8 +178,6 @@ class HostKVCache(abc.ABC):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
-
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
@@ -203,6 +209,8 @@ class HostKVCache(abc.ABC):
             logger.info(
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
+
+        self.allocator = get_allocator_from_storage(allocator_type)
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -1208,7 +1216,6 @@ class MambaPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
 
         self.conv_state_shapes = [
@@ -1251,6 +1258,13 @@ class MambaPoolHost(HostKVCache):
             requested_bytes / 1e9,
             self.layout,
         )
+
+        if allocator_type in ("grpc", "rpc"):
+            self.allocator = get_allocator_from_storage(
+                allocator_type, rpc_cap_bytes=requested_bytes
+            )
+        else:
+            self.allocator = get_allocator_from_storage(allocator_type)
 
         self.init_kv_buffer()
         self.lock = threading.RLock()
@@ -2322,7 +2336,6 @@ class NSAIndexerPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -2362,6 +2375,13 @@ class NSAIndexerPoolHost(HostKVCache):
             requested_bytes / 1e9,
             layout,
         )
+        if allocator_type in ("grpc", "rpc"):
+            self.allocator = get_allocator_from_storage(
+                allocator_type, rpc_cap_bytes=requested_bytes
+            )
+        else:
+            self.allocator = get_allocator_from_storage(allocator_type)
+
         self.init_kv_buffer()
         self.lock = threading.RLock()
         self.clear()

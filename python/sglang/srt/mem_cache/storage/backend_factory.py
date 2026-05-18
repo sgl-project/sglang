@@ -185,6 +185,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name in ("grpc", "rpc"):
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -228,4 +230,16 @@ StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "grpc",
+    "sglang.srt.mem_cache.storage.rpc.hicache_rpc_storage",
+    "HiCacheRpcStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "rpc",
+    "sglang.srt.mem_cache.storage.rpc.hicache_rpc_storage",
+    "HiCacheRpcStorage",
 )
