@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::ModelId;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
@@ -9,12 +9,20 @@ use crate::server::error::ApiError;
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Response};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// HTTP header carrying the decode-pool URL selected via host-affinity
+/// for a PD-disaggregated request. The prefill worker reads this on its
+/// own bootstrap path (M5 will wire `bootstrap_host` / `bootstrap_port`
+/// injection); M4 sets the header but the bootstrap injection itself
+/// is deferred. The header name uses the `x-sgl-` prefix shared with
+/// `x-sgl-router-error-code` to keep router-emitted metadata together.
+const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -102,6 +110,68 @@ pub async fn chat_completions(
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
+
+    // PD-mode decoder affinity (M4 gap-closer #3). When the selected
+    // prefill worker is part of a PD-disagg deployment, also resolve
+    // the matching decode peer (same host where possible, falling back
+    // to min-load via `select_decode_with_affinity`). The decode URL is
+    // forwarded to the prefill worker via the `x-sgl-decode-url`
+    // header — M5 will wire the bootstrap injection itself, but
+    // selecting the peer at the router edge is M4's contract
+    // ("bonus tokens decoded correctly"): the prefill→decode handoff
+    // becomes deterministic per host, removing one source of cross-
+    // worker tail latency.
+    //
+    // Plain-mode workers skip the decode resolution entirely (no
+    // decode peer to find). PD-mode requests that fail to resolve a
+    // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
+    // operators can alert on prefill-vs-decode pool imbalance.
+    let decode_hint: Option<String> = if worker.mode() == WorkerMode::Prefill {
+        Some(
+            resolver
+                .decode_with_affinity(&model_id, &worker.url)
+                .map(|d| d.url.clone())
+                .map_err(|e| match e {
+                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                        model: model_str.clone(),
+                    },
+                    PdResolveError::NoDecodeWorkersAvailable => {
+                        ApiError::NoDecodeWorkersAvailable {
+                            model: model_str.clone(),
+                        }
+                    }
+                    PdResolveError::NoPrefillWorkersAvailable => {
+                        ApiError::NoPrefillWorkersAvailable {
+                            model: model_str.clone(),
+                        }
+                    }
+                })?,
+        )
+    } else {
+        None
+    };
+    let mut request_headers = headers;
+    if let Some(url) = &decode_hint {
+        match HeaderValue::from_str(url) {
+            Ok(v) => {
+                request_headers.insert(X_SGL_DECODE_URL, v);
+            }
+            Err(e) => {
+                // Discovery emits URLs the proxy has already used; a
+                // header-value parse failure here means the URL
+                // contains a control character (e.g. CR / LF) — drop
+                // it loudly so an operator notices but don't kill the
+                // request: the M5 bootstrap can fall back to its own
+                // probing if the header is absent.
+                tracing::warn!(
+                    decode_url = %url,
+                    error = %e,
+                    "decode worker URL rejected by header parser; sending request without decode hint",
+                );
+            }
+        }
+    }
+    let headers = request_headers;
 
     // M2 per-worker active_requests guard. The M4 ActiveLoadGuard below
     // sits beside this one: both track in-flight load, but the M4 entry
