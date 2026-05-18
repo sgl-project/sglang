@@ -338,7 +338,7 @@ class CustomAllreduce:
         self.close()
 
 
-def dispatch_custom_allreduce():
+def dispatch_custom_allreduce(*args, **kwargs):
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
@@ -350,10 +350,14 @@ def dispatch_custom_allreduce():
     ``nnodes > 1`` since custom AR is intra-node only.
     """
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-        from .custom_all_reduce_v2 import CustomAllReduceV2
+        from .custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+            can_use_custom_all_reduce_v2,
+        )
 
-        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
-        return CustomAllReduceV2
+        if can_use_custom_all_reduce_v2(*args, **kwargs):
+            logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+            return CustomAllReduceV2
 
     if _is_cuda or _is_musa:
         return CustomAllreduce
