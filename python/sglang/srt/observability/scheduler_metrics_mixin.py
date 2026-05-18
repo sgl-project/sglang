@@ -26,6 +26,8 @@ from sglang.srt.observability.metrics_collector import (
     QueueCount,
     SchedulerMetricsCollector,
     SchedulerStats,
+    compute_deferred_queue_reqs,
+    compute_normalized_queue_pressure,
     compute_routing_key_stats,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
@@ -331,6 +333,26 @@ class SchedulerMetricsMixin:
             var_decode_kv_tokens=decode_q.variance(),
         )
 
+    def _update_scheduler_queue_pressure(self: Scheduler) -> None:
+        self.stats.scheduler_queue_pressure_capacity = (
+            compute_normalized_queue_pressure(
+                self.stats.num_queue_reqs.total, self.max_running_requests
+            )
+        )
+        self.stats.scheduler_queue_pressure_deferred = (
+            compute_normalized_queue_pressure(
+                compute_deferred_queue_reqs(
+                    self.disaggregation_mode,
+                    self.disagg_prefill_bootstrap_queue.queue,
+                    self.disagg_prefill_inflight_queue,
+                    self.disagg_decode_prealloc_queue.queue,
+                    self.disagg_decode_transfer_queue.queue,
+                    self.disagg_decode_prealloc_queue.retracted_queue,
+                ),
+                self.max_running_requests,
+            )
+        )
+
     def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
@@ -574,6 +596,7 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )
+            self._update_scheduler_queue_pressure()
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -593,6 +616,10 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_inflight_queue, priority_enabled
                 )
+                deferred_queue_reqs = (
+                    self.stats.num_prefill_bootstrap_queue_reqs.total
+                    + self.stats.num_prefill_inflight_queue_reqs.total
+                )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -602,6 +629,18 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+                deferred_queue_reqs = (
+                    self.stats.num_decode_prealloc_queue_reqs.total
+                    + self.stats.num_decode_transfer_queue_reqs.total
+                    + len(self.disagg_decode_prealloc_queue.retracted_queue)
+                )
+            else:
+                deferred_queue_reqs = 0
+            self.stats.scheduler_queue_pressure_deferred = (
+                compute_normalized_queue_pressure(
+                    deferred_queue_reqs, self.max_running_requests
+                )
+            )
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
@@ -745,6 +784,7 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )
+            self._update_scheduler_queue_pressure()
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
