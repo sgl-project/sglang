@@ -370,6 +370,18 @@ class ForwardData:
     lora_ids: Optional[List[str]] = None
     rids: Optional[List[str]] = None
 
+    # Transitional: spec V2 worker (eagle_worker_v2 / eagle_info_v2) is the
+    # only consumer that reads Req objects (req.grammar / req.output_ids /
+    # req.mamba_next_track_idx / req.kv_allocated_len) and schedule-side
+    # references (token_to_kv_pool_allocator for page_size, device for
+    # tensor construction) at worker time. All reads are read-only on the
+    # schedule-owned objects; same-thread Python sequential ordering keeps
+    # them race-free. Pass them through here until the spec V2 worker is
+    # refactored to consume only FD fields.
+    reqs: Optional[List[Any]] = None
+    device: Optional[Any] = None
+    token_to_kv_pool_allocator: Optional[Any] = None
+
     # Aliases let mrope / ngram helpers keep their SB-style getter names
     # (batch.extend_lens / batch.prefix_lens) without per-helper edits.
     @property

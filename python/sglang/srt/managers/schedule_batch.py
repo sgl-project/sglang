@@ -1804,6 +1804,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=getattr(self, "dimensions", None),
             lora_ids=[req.lora_id for req in self.reqs],
             rids=[req.rid for req in self.reqs],
+            # Transitional pass-through for spec V2 worker / eagle_info_v2
+            # which still read schedule-side objects (read-only).
+            reqs=self.reqs,
+            device=self.device,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
     def bind_relayer_for_iter(self, relayer):
