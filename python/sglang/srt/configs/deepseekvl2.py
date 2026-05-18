@@ -648,7 +648,7 @@ class DeepseekV2Config(PretrainedConfig):
 
 
 class DeepseekVL2Config(PretrainedConfig):
-    model_type = "deepseek_vl_v2"
+    model_type: str = "deepseek_vl_v2"
     vision_config: DeepseekVL2VisionEncoderConfig = None
     projector_config: DeepseekVL2MlpProjectorConfig = None
     language_config: DeepseekV2Config = None
