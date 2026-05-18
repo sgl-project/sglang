@@ -1761,7 +1761,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             has_grammar=self.has_grammar,
-            grammars=getattr(self, "grammars", None),
+            # Aggregate per-req grammar refs here so the FD path's
+            # init_new_from_forward_data can mirror the SB path's
+            # ``[req.grammar for req in batch.reqs]`` install onto
+            # sampling_info without needing batch.reqs at the worker side.
+            grammars=([req.grammar for req in self.reqs] if self.has_grammar else None),
             input_embeds=getattr(self, "input_embeds", None),
             replace_embeds=getattr(self, "replace_embeds", None),
             replace_positions=getattr(self, "replace_positions", None),
