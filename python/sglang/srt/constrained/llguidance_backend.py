@@ -85,12 +85,12 @@ class GuidanceGrammar(BaseGrammarObject):
     ) -> torch.Tensor:
         if self.bitmask is None or self.bitmask.shape[0] < batch_size:
             # only create bitmask when batch gets larger
-            self.bitmask = allocate_token_bitmask(batch_size, vocab_size)
+            self.bitmask = allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
             bitmask = self.bitmask
         else:
             bitmask = self.bitmask[:batch_size]
 
-        return self.move_vocab_mask(bitmask, device)
+        return bitmask
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
