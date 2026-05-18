@@ -1387,15 +1387,11 @@ class AiterAttnBackend(AttentionBackend):
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
-            # Defensive sizing: buffer is written per-token via
-            # create_flashinfer_kv_indices_triton (kv_indptr = cumsum(seq_lens)),
-            # but also viewed per-page as (-1, max_num_blocks_per_seq) by the
-            # unified path. Per-page sizing under-allocates by `page_size`x
-            # and OOBs once seq_lens_sum exceeds the buffer (ROCm:
-            # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION). max_bs *
-            # max_num_blocks_per_seq * page_size is >= max_bs * max_context_len
-            # and stays divisible by max_num_blocks_per_seq.
-            #
+            # Non-unified AITER CUDA graph paths fill this buffer with flat
+            # token-level kv_indices via create_flashinfer_kv_indices_triton
+            # (kv_indptr = cumsum(seq_lens)).  Even when the allocator is
+            # page-based, these writes are per-token, so page-sized allocation
+            # would under-allocate by page_size when page_size > 1.
             # TODO(aiter, page_size>1): root fix is to make page_size>1
             # actually engage the attention kernel (`forward_decode` still
             # calls paged_attention_ragged with view(-1, 1, ...) and
@@ -1411,6 +1407,19 @@ class AiterAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+
+        if self.use_triton_unified_attention:
+            # Keep a distinct page-table buffer for unified attention.  Sharing
+            # cuda_graph_kv_indices with non-unified token indices makes
+            # page-table width ambiguous after the token buffer is expanded.
+            max_num_blocks_per_seq = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            self.cuda_graph_page_table = torch.zeros(
+                (max_bs, max_num_blocks_per_seq),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
@@ -1508,9 +1517,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    kv_indices = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
-                    )
+                    kv_indices = self.cuda_graph_page_table
 
                     if self.use_sliding_window_kv_pool:
                         swa_page_table = self.cuda_graph_swa_page_table
@@ -1685,9 +1692,7 @@ class AiterAttnBackend(AttentionBackend):
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
                     ) // self.page_size
-                    page_table = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
-                    )[:bs]
+                    page_table = self.cuda_graph_page_table[:bs]
 
                     swa_page_table = None
 
@@ -1940,9 +1945,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    kv_indices = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
-                    )
+                    kv_indices = self.cuda_graph_page_table
 
                     if self.use_sliding_window_kv_pool:
                         swa_page_table = self.cuda_graph_swa_page_table
@@ -2119,9 +2122,7 @@ class AiterAttnBackend(AttentionBackend):
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
                     ) // self.page_size
-                    page_table = self.cuda_graph_kv_indices.view(
-                        -1, max_num_blocks_per_seq
-                    )[:bs]
+                    page_table = self.cuda_graph_page_table[:bs]
 
                     swa_page_table = None
 
