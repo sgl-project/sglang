@@ -1,4 +1,4 @@
-"""B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
+"""B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency + Balanced recipes).
 
 Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
