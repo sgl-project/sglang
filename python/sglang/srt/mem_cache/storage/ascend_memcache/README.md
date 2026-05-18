@@ -146,7 +146,7 @@ export SGLANG_HICACHE_MEMCACHE_CONFIG_PATH=${localservice_config_path}
 ### Shell 1: Start Meta service
 
 ```bash
-python python/sglang/srt/mem_cache/storage/ascend_memcache/start_meta_service.py --config_path ${metaservice_config_path}
+python -m sglang.srt.mem_cache.storage.ascend_memcache.start_meta_service --config_path "${metaservice_config_path}"
 ```
 
 ### Shell 2: Start SGLang Server
