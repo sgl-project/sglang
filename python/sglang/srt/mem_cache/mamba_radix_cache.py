@@ -660,8 +660,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx
             ] = req.mamba_ping_pong_track_buffer
         else:
-            mamba_value_donated = req.mamba_pool_idx.unsqueeze(-1).clone()
-            req.mamba_pool_idx = self._alloc_mamba_slot()[0]
+            mamba_value_donated = self._alloc_mamba_slot()
+            self.req_to_token_pool.mamba_pool.copy_from(
+                req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+            )
 
         result = self.insert(
             InsertParams(
