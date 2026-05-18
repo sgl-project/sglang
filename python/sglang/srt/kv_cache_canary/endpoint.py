@@ -11,8 +11,6 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryViolationSlot,
 )
 
-_DEFAULT_DISABLED_REAL_KV_BUF: Optional[torch.Tensor] = None
-
 
 def _empty_real_kv_buf(device: torch.device) -> torch.Tensor:
     """One-byte placeholder ``real_kv_buf`` for OFF-mode kernel launches.
