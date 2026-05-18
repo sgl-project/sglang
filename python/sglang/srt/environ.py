@@ -316,7 +316,7 @@ class Envs:
 
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
-    # Trace / debug (same role as SGLANG_MOONCAKE_* on MooncakeStore)
+    # Trace / debug
     SGLANG_ASCEND_MEMCACHE_TRACE_LOGGING = EnvBool(True)
     SGLANG_ASCEND_MEMCACHE_TRACE_MAX_KEYS = EnvInt(0)
     SGLANG_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS = EnvBool(False)
@@ -325,7 +325,6 @@ class Envs:
     SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS = EnvBool(False)
     SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST = EnvBool(False)
     SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS = EnvBool(False)
-    SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN = EnvBool(True)
     SGLANG_ASCEND_MEMCACHE_TRACE_LOG_PATH = EnvStr(None)
     SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 

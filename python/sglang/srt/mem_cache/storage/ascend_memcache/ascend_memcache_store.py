@@ -13,11 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
-import tempfile
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
@@ -40,7 +37,6 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 
 SETUP_TIMEOUT = 600  # seconds
 DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME = "ascend_memcache_trace.log"
-_HYBM_WARN_FRAGMENT = "HYBM hybm_va_manager.cpp:173 GetRank] No allocated spaces found."
 
 logger = logging.getLogger(__name__)
 
@@ -60,16 +56,15 @@ _MEMCACHE_CTRL_KEYS = frozenset(
 
 @dataclass
 class AscendMemcacheConfig:
-    """
-    Encapsulates MemCache configuration by merging a JSON file and `extra_config`, 
-    then splits the result into `local_fields` and `ctrl`.
-    """
+    """Merged Memcache LocalConfig/control fields from JSON and ``extra_config``."""
 
     local_fields: dict
     ctrl: dict
 
     @staticmethod
-    def from_sources(storage_config: Optional[HiCacheStorageConfig]) -> "AscendMemcacheConfig":
+    def from_sources(
+        storage_config: Optional[HiCacheStorageConfig],
+    ) -> "AscendMemcacheConfig":
         merged: dict = {}
         if envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.is_set():
             path = envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
@@ -97,29 +92,6 @@ class AscendMemcacheConfig:
                 unknown.append(key)
         return unknown
 
-@contextmanager
-def _capture_c_stderr() -> tuple[list[str], bool]:
-    captured_lines: list[str] = []
-    try:
-        stderr_fd = sys.stderr.fileno()
-    except Exception:
-        yield captured_lines, False
-        return
-
-    saved_fd = os.dup(stderr_fd)
-    try:
-        with tempfile.TemporaryFile(mode="w+b") as tmp:
-            os.dup2(tmp.fileno(), stderr_fd)
-            try:
-                yield captured_lines, True
-            finally:
-                os.dup2(saved_fd, stderr_fd)
-                tmp.seek(0)
-                captured = tmp.read().decode("utf-8", errors="replace")
-                if captured:
-                    captured_lines.extend(captured.splitlines())
-    finally:
-        os.close(saved_fd)
 
 class AscendMemcacheStore(HiCacheStorage):
     """HiCache storage backend backed by Ascend MemCache (`memcache_hybrid`)."""
@@ -127,11 +99,10 @@ class AscendMemcacheStore(HiCacheStorage):
     def __init__(
         self,
         storage_config: HiCacheStorageConfig = None,
-        _mem_pool: HostKVCache = None,
+        mem_pool: HostKVCache = None,
     ):
         self.store = None
         self.storage_config = storage_config
-        
 
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
@@ -252,13 +223,12 @@ class AscendMemcacheStore(HiCacheStorage):
         self.trace_batch_put_result_bools = (
             envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS.get()
         )
-        self.suppress_hybm_warn = envs.SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN.get()
         trace_path = envs.SGLANG_ASCEND_MEMCACHE_TRACE_LOG_PATH.get()
         self.trace_log_path = trace_path or os.path.join(
             os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME
         )
         logger.warning(
-            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_post_exist=%s batch_put_result_bools=%s trace_log_path=%s suppress_hybm_warn=%s",
+            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_post_exist=%s batch_put_result_bools=%s trace_log_path=%s",
             self.enable_trace_logging,
             self.trace_max_keys,
             self.print_sample_keys,
@@ -268,7 +238,6 @@ class AscendMemcacheStore(HiCacheStorage):
             self.trace_batch_put_post_exist,
             self.trace_batch_put_result_bools,
             self.trace_log_path,
-            self.suppress_hybm_warn,
         )
 
     def _trace_enabled(self) -> bool:
@@ -317,19 +286,6 @@ class AscendMemcacheStore(HiCacheStorage):
         except Exception as exc:
             logger.warning("Failed to append Ascend memcache trace file: %s", exc)
 
-    def _run_memcache_call(self, fn, *args):
-        if not self.suppress_hybm_warn:
-            return fn(*args)
-        with _capture_c_stderr() as (captured_lines, intercepted):
-            result = fn(*args)
-        if not intercepted:
-            return result
-        for line in captured_lines:
-            if _HYBM_WARN_FRAGMENT in line:
-                continue
-            print(line, file=sys.stderr)
-        return result
-
     def _trace_event(self, payload: dict) -> None:
         if not self._trace_enabled():
             return
@@ -339,7 +295,6 @@ class AscendMemcacheStore(HiCacheStorage):
         logger.debug("[AscendMemcacheTrace] %s", trace_payload)
         self._append_trace_file(trace_payload)
 
-    #与Mooncake一致
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Ascend Memcache store is not initialized.")
@@ -347,11 +302,11 @@ class AscendMemcacheStore(HiCacheStorage):
         size = tensor.numel() * tensor.element_size()
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
-            logger.error("Failed to register buffer, error code: %s", ret_code)
+            logger.error(f"Failed to register buffer, error code: {ret_code}")
             raise RuntimeError(
                 f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
             )
-    #与Mooncake一致
+
     def check_server(self) -> None:
         url = self._memcache_metrics_url
         if not url:
@@ -404,14 +359,20 @@ class AscendMemcacheStore(HiCacheStorage):
             "page_head",
             "page_first_kv_split",
         ], (
-            "ascend_memcache storage backend only supports page_first, "
-            "page_first_direct, page_head and page_first_kv_split layout"
+            "ascend_memcache storage backend only support page_first, page_first_direct, "
+            "page_head and page_first_kv_split layout"
         )
-        self.register_buffer(self.mem_pool_host.kv_buffer)
-        if self._mla_uses_kv_split():
-            self.register_buffer(self.mem_pool_host.v_buffer)
-            if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
-                self.register_buffer(self.mem_pool_host.index_k_buffer)
+        try:
+            self.register_buffer(self.mem_pool_host.kv_buffer)
+            if self._mla_uses_kv_split():
+                self.register_buffer(self.mem_pool_host.v_buffer)
+                if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
+                    self.register_buffer(self.mem_pool_host.index_k_buffer)
+        except TypeError as err:
+            logger.error("Failed to register buffer to Ascend Memcache Store: %s", err)
+            raise TypeError(
+                "Ascend Memcache Store Register Buffer Error."
+            ) from err
 
         if envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
             self.warmup()
@@ -421,9 +382,16 @@ class AscendMemcacheStore(HiCacheStorage):
         self.gb_per_page = bytes_per_page / (1 << 30)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        # KV anchor memory is already registered via register_mem_pool_host().
+        # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
+        # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
+
+        # Hybrid pools expose the tensors that memcache requires for zero-copy I/O.
+        # The storage backend only depends on this accessor, not concrete fields.
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
             self.register_buffer(buf)
@@ -443,6 +411,10 @@ class AscendMemcacheStore(HiCacheStorage):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
+        # A logical "page" may map to multiple physical objects in storage.
+        # - INDEXER: one key per page
+        # - MAMBA  : one temporal key + N conv keys per page
+        # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
         if name == PoolName.INDEXER:
@@ -512,6 +484,8 @@ class AscendMemcacheStore(HiCacheStorage):
         return PoolTransferResult(final_pages, hit_count)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+        # Unified v2 I/O path: each PoolTransfer can expand to one or more
+        # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
@@ -682,6 +656,14 @@ class AscendMemcacheStore(HiCacheStorage):
     def _batch_postprocess(
         self, results: List[int], is_set_operate: bool = False, key_multiplier=None
     ):
+        """
+        After `_get_batch_zero_copy_impl()`, each element is a positive byte length on a
+        successful read, or negative on error.
+
+        ``batch_put_from`` return codes passed into this path use 0 for success and
+        negative values for errors (`_batch_io_v2` / `batch_set_v1`).
+        """
+
         if key_multiplier is None:
             if self.is_mla_backend:
                 key_multiplier = 2 if self._mla_uses_kv_split() else 1
@@ -691,12 +673,15 @@ class AscendMemcacheStore(HiCacheStorage):
                     key_multiplier *= self.split_factor
 
         result_groups = [
-            results[i : i + key_multiplier] for i in range(0, len(results), key_multiplier)
+            results[i : i + key_multiplier]
+            for i in range(0, len(results), key_multiplier)
         ]
         return [
-            all(res == 0 for res in group)
-            if is_set_operate
-            else all(res > 0 for res in group)
+            (
+                all(res == 0 for res in group)
+                if is_set_operate
+                else all(res > 0 for res in group)
+            )
             for group in result_groups
         ]
 
@@ -706,7 +691,9 @@ class AscendMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
@@ -742,7 +729,9 @@ class AscendMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Apply extra_backend_tag prefix if available
         page_keys = self._tag_keys(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
             page_keys, host_indices
         )
@@ -1058,16 +1047,12 @@ class AscendMemcacheStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self._run_memcache_call(
-            self.store.batch_put_from, key_strs, buffer_ptrs, buffer_sizes
-        )
+        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        raw = self._run_memcache_call(
-            self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
-        )
+        raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
         out: List[int] = []
@@ -1076,11 +1061,11 @@ class AscendMemcacheStore(HiCacheStorage):
             if code == 0:
                 out.append(int(sz))
             else:
-                out.append(-abs(code))  # 所有非 0 都归一成失败
+                out.append(-abs(code))
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self._run_memcache_call(self.store.batch_is_exist, key_strs)
+        return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
