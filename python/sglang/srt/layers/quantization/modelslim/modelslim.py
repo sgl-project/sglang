@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
-        StandardDispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (

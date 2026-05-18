@@ -141,9 +141,7 @@ def process_fuseep_weights(layer: torch.nn.Module) -> None:
             w2_scale.to(torch.float32), requires_grad=False
         )
 
-        layer.w13_weight_scale = _scale_from_float_to_int64(
-            layer.w13_weight_scale.data
-        )
+        layer.w13_weight_scale = _scale_from_float_to_int64(layer.w13_weight_scale.data)
         layer.w2_weight_scale = _scale_from_float_to_int64(layer.w2_weight_scale.data)
     else:
         cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()

@@ -12,7 +12,6 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
         DispatchOutput,
-        StandardDispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
