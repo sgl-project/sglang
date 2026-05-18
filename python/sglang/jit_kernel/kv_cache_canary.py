@@ -173,7 +173,7 @@ def canary_step(
         write_req_entry_starts,
         write_req_entry_counts,
         write_req_active_mask,
-        seed,
+        to_signed_int64(int(seed)),
         violation_ring,
         violation_ring_valid,
         violation_write_index,
