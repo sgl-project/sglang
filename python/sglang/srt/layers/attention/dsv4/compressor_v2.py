@@ -10,7 +10,18 @@ from sglang.jit_kernel.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.jit_kernel.deepseek_v4 import (
+    compress_forward as legacy_compress_forward,
+    compress_fused_norm_rope_inplace,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.compressor import (
+    create_paged_compressor_data as create_legacy_paged_compressor_data,
+)
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -65,6 +76,7 @@ class CompressorBackendMixin:
         assert rotate == is_indexer == (head_dim == 128)
 
         plan = self._get_paged_compress_metadata(compress_ratio)
+        core_metadata = self.forward_metadata.core_metadata
         is_online = _use_online_compress(compress_ratio)
         if is_online:
             kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
@@ -82,6 +94,83 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=is_online,
         )
+        if kv_compressed.shape[0] == 0:
+            if (
+                getattr(core_metadata, "no_prefix_ragged_prefill", False)
+                and not plan.is_decode
+            ):
+                if is_indexer:
+                    self._current_ragged_indexer_kv_fp8 = kv_compressed
+                    self._current_ragged_indexer_kv_scale = kv_compressed.new_empty(
+                        (0, 1)
+                    )
+                else:
+                    compact_kv = kv_compressed
+                    if compact_kv.ndim == 2:
+                        compact_kv = compact_kv.unsqueeze(1)
+                    self._current_ragged_extra_kv[compress_ratio] = (
+                        compact_kv.contiguous()
+                    )
+                if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DSV4 no-prefix ragged compact kv v2: skip empty "
+                        "compress output, ratio=%s, is_indexer=%s",
+                        compress_ratio,
+                        is_indexer,
+                    )
+            return
+        if (
+            getattr(core_metadata, "no_prefix_ragged_prefill", False)
+            and not plan.is_decode
+        ):
+            compact_kv = kv_compressed.clone()
+            compress_fused_norm_rope_inplace(
+                compact_kv,
+                norm.weight,
+                norm.variance_epsilon,
+                freqs_cis_cache,
+                plan,
+            )
+            if is_indexer:
+                from sglang.srt.layers.attention.nsa.nsa_indexer import (
+                    rotate_activation,
+                )
+
+                compact_kv = rotate_activation(compact_kv).contiguous()
+                if compact_kv.numel() == 0:
+                    self._current_ragged_indexer_kv_fp8 = compact_kv
+                    self._current_ragged_indexer_kv_scale = compact_kv.new_empty((0, 1))
+                else:
+                    (
+                        self._current_ragged_indexer_kv_fp8,
+                        self._current_ragged_indexer_kv_scale,
+                    ) = act_quant(compact_kv)
+                if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DSV4 no-prefix ragged compact indexer kv v2: "
+                        "ratio=%s, compact_kv=%s",
+                        compress_ratio,
+                        tuple(compact_kv.shape),
+                    )
+            else:
+                if compact_kv.dtype != torch.bfloat16:
+                    compact_kv = compact_kv.to(torch.bfloat16)
+                if compact_kv.ndim == 2:
+                    compact_kv = compact_kv.unsqueeze(1)
+                self._current_ragged_extra_kv[compress_ratio] = compact_kv.contiguous()
+                if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DSV4 no-prefix ragged compact core kv v2: "
+                        "ratio=%s, compact_kv=%s",
+                        compress_ratio,
+                        tuple(compact_kv.shape),
+                    )
         # NOTE: we use some hack here...
         compress_norm_rope_store(
             kv_compressed,
@@ -93,6 +182,148 @@ class CompressorBackendMixin:
             kvcache=kv_cache,
             page_size=page_size,
         )
+
+    def _get_no_prefix_legacy_compress_metadata(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        compress_ratio: int,
+    ):
+        cache_name = f"_no_prefix_legacy_c{compress_ratio}_compress_metadata"
+        metadata = getattr(self.forward_metadata, cache_name, None)
+        if metadata is not None:
+            return metadata
+
+        metadata = create_legacy_paged_compressor_data(
+            compress_ratio=cast(Literal[4, 128], compress_ratio),
+            is_prefill=True,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            extend_lens=forward_batch.extend_seq_lens,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu.tolist()
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            ),
+            extend_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            use_prefill_cuda_graph=False,
+        )
+        setattr(self.forward_metadata, cache_name, metadata)
+        return metadata
+
+    def _forward_no_prefix_legacy_compress(
+        self,
+        *,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        ape: torch.Tensor,
+        head_dim: int,
+        norm: RMSNorm,
+        freqs_cis_cache: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        is_indexer: bool,
+        rotate: bool,
+        compress_ratio: int,
+    ) -> None:
+        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+
+        token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", forward_batch.token_to_kv_pool)
+        core_metadata = self.forward_metadata.core_metadata
+        metadata = self._get_no_prefix_legacy_compress_metadata(
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            compress_ratio=compress_ratio,
+        )
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        last_dim = 2 * head_dim * coff
+        assert kv_score_buffer.shape[-1] == last_dim
+        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        kv_compressed = legacy_compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=ape.view(-1, head_dim),
+            indices=metadata.write_loc,
+            plan=metadata.plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            extra_data=metadata.extra_data,
+        )
+        compress_fused_norm_rope_inplace(
+            kv_compressed,
+            norm.weight,
+            norm.variance_epsilon,
+            freqs_cis_cache,
+            metadata.plan,
+        )
+        if rotate:
+            kv_compressed = rotate_activation(kv_compressed)
+
+        emit_mask = (core_metadata.seq_lens_casual % compress_ratio) == 0
+        compact_kv = kv_compressed[emit_mask].contiguous()
+        if is_indexer:
+            if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+                if compact_kv.numel() == 0:
+                    self._current_ragged_indexer_kv_fp8 = compact_kv
+                    self._current_ragged_indexer_kv_scale = compact_kv.new_empty((0, 1))
+                else:
+                    (
+                        self._current_ragged_indexer_kv_fp8,
+                        self._current_ragged_indexer_kv_scale,
+                    ) = act_quant(compact_kv)
+                token_to_kv_pool.set_index_k_fused(
+                    layer_id=layer_id,
+                    loc=core_metadata.c4_out_loc,
+                    cache_k=kv_compressed,
+                )
+            else:
+                index_k, index_k_scale = act_quant(kv_compressed)
+                self._current_ragged_indexer_kv_fp8 = index_k[emit_mask].contiguous()
+                self._current_ragged_indexer_kv_scale = index_k_scale[
+                    emit_mask
+                ].contiguous()
+                token_to_kv_pool.set_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    loc=core_metadata.c4_out_loc,
+                    index_k=index_k,
+                    index_k_scale=index_k_scale,
+                )
+        else:
+            compact_extra = compact_kv
+            if compact_extra.dtype != torch.bfloat16:
+                compact_extra = compact_extra.to(torch.bfloat16)
+            if compact_extra.ndim == 2:
+                compact_extra = compact_extra.unsqueeze(1)
+            self._current_ragged_extra_kv[compress_ratio] = compact_extra.contiguous()
+            out_loc = (
+                core_metadata.c4_out_loc
+                if compress_ratio == 4
+                else core_metadata.c128_out_loc
+            )
+            if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+                token_to_kv_pool.set_extra_key_buffer_fused(
+                    layer_id=layer_id,
+                    loc=out_loc,
+                    cache_k=kv_compressed,
+                )
+            else:
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_compressed.bfloat16())
+                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+        if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "DSV4 no-prefix ragged legacy compressor under v2: ratio=%s, "
+                "is_indexer=%s, kv=%s, compact=%s",
+                compress_ratio,
+                is_indexer,
+                tuple(kv_compressed.shape),
+                tuple(compact_kv.shape),
+            )
 
     def forward_unified(
         self,
@@ -108,6 +339,27 @@ class CompressorBackendMixin:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        core_metadata = self.forward_metadata.core_metadata
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and getattr(core_metadata, "no_prefix_ragged_prefill", False)
+            and not _use_online_compress(compressor.ratio)
+        ):
+            state_pool = compressor.get_state_pool(forward_batch)
+            self._forward_no_prefix_legacy_compress(
+                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                kv_score_input=kv_score_input,
+                ape=compressor.ape,
+                head_dim=compressor.head_dim,
+                norm=compressor.norm,
+                freqs_cis_cache=compressor.freqs_cis,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                is_indexer=compressor.is_in_indexer,
+                rotate=compressor.rotate,
+                compress_ratio=compressor.ratio,
+            )
+            return
         state_pool = compressor.get_state_pool(forward_batch)
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)

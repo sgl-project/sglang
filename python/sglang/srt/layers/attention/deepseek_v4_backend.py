@@ -38,6 +38,7 @@ else:
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
+    RaggedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
@@ -86,6 +87,235 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+def _dsv4_use_no_prefix_bf16_sparse_prefill() -> bool:
+    return envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
+
+
+def _dsv4_pad_indices_last_dim(
+    indices: torch.Tensor, multiple: int = 128
+) -> torch.Tensor:
+    pad = (-indices.shape[-1]) % multiple
+    if pad == 0:
+        return indices
+    return F.pad(indices, (0, pad), value=-1)
+
+
+def _dsv4_get_workspace_tensor(
+    workspace: Optional[Dict[str, torch.Tensor]],
+    key: str,
+    shape: Tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    if workspace is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    cached = workspace.get(key)
+    if (
+        cached is None
+        or cached.numel() < numel
+        or cached.dtype != dtype
+        or cached.device != device
+    ):
+        cached = torch.empty((numel,), dtype=dtype, device=device)
+        workspace[key] = cached
+    return cached[:numel].view(shape)
+
+
+def _dsv4_build_no_prefix_swa_ragged_indices(
+    seq_lens_casual: torch.Tensor,
+) -> torch.Tensor:
+    token_ids = torch.arange(seq_lens_casual.numel(), device=seq_lens_casual.device).view(
+        -1, 1
+    )
+    offsets = torch.arange(SWA_WINDOW, device=seq_lens_casual.device).view(1, -1)
+    local_pos = (seq_lens_casual - 1).view(-1, 1)
+    indices = token_ids - offsets
+    indices[offsets > local_pos] = -1
+    return _pad_last_dim(indices.to(torch.int32), multiples_of=PAGE_INDEX_ALIGNED_SIZE)
+
+
+def _dsv4_build_no_prefix_c4_k_range(
+    seq_lens_casual: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    c4_local_finish = torch.div(seq_lens_casual, 4, rounding_mode="floor")
+    c4_global_finish = torch.cumsum((seq_lens_casual % 4 == 0).to(torch.int32), dim=0)
+    c4_k_start = c4_global_finish - c4_local_finish
+    return c4_k_start.to(torch.int32), c4_global_finish.to(torch.int32)
+
+
+def _dsv4_build_no_prefix_full_history_ragged_indices(
+    lengths: torch.Tensor,
+    emit_mask: torch.Tensor,
+) -> torch.Tensor:
+    assert lengths.ndim == 1
+    assert emit_mask.ndim == 1
+    assert lengths.shape == emit_mask.shape
+
+    device = lengths.device
+    lengths = lengths.to(torch.int32)
+    global_finish = torch.cumsum(emit_mask.to(torch.int32), dim=0)
+    row_starts = global_finish - lengths
+    max_len = max(int(lengths.max().item()), 1)
+    offsets = torch.arange(max_len, device=device, dtype=torch.int32).unsqueeze(0)
+    indices = row_starts.unsqueeze(1) + offsets
+    valid = offsets < lengths.unsqueeze(1)
+    indices = torch.where(
+        valid, indices, torch.full_like(indices, -1, dtype=torch.int32)
+    )
+    return _dsv4_pad_indices_last_dim(indices)
+
+
+def _dsv4_build_unified_prefill_inputs_no_prefix(
+    q: torch.Tensor,
+    swa_k: torch.Tensor,
+    swa_ragged_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    extra_k: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+    workspace: Optional[Dict[str, torch.Tensor]] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if q.ndim != 4 or q.shape[1] != 1:
+        return None
+    if swa_k.ndim != 3 or swa_k.shape[1] != 1 or swa_k.shape[-1] != q.shape[-1]:
+        return None
+    if swa_k.dtype != torch.bfloat16:
+        return None
+    if swa_topk_lengths.ndim != 1 or swa_topk_lengths.shape[0] != q.shape[0]:
+        return None
+
+    q_prefill = q.squeeze(1).contiguous()
+    kv_unified = swa_k.contiguous()
+    topk_length = swa_topk_lengths.to(torch.int32).contiguous()
+
+    if (
+        extra_k is not None
+        or extra_indices is not None
+        or extra_topk_lengths is not None
+    ):
+        if extra_k is None or extra_indices is None or extra_topk_lengths is None:
+            return None
+        if (
+            extra_k.ndim != 3
+            or extra_k.shape[1] != 1
+            or extra_k.shape[-1] != q.shape[-1]
+        ):
+            return None
+        if extra_k.dtype != torch.bfloat16:
+            return None
+        if extra_topk_lengths.ndim != 1 or extra_topk_lengths.shape[0] != q.shape[0]:
+            return None
+        if extra_k.shape[0] == 0:
+            extra_k = None
+            extra_indices = None
+            extra_topk_lengths = None
+
+    if extra_k is not None:
+        extra_offset = swa_k.shape[0]
+        kv_unified = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_kv_unified",
+            (swa_k.shape[0] + extra_k.shape[0], swa_k.shape[1], swa_k.shape[2]),
+            dtype=swa_k.dtype,
+            device=swa_k.device,
+        )
+        kv_unified[: swa_k.shape[0]].copy_(swa_k)
+        kv_unified[swa_k.shape[0] :].copy_(extra_k)
+
+        swa_width = swa_ragged_indices.shape[-1]
+        extra_width = extra_indices.shape[-1]
+        padded_width = ceil_align(swa_width + extra_width, 128)
+        extra_topk_lengths = extra_topk_lengths.to(torch.int32)
+        topk_length = (topk_length + extra_topk_lengths).contiguous()
+        indices_unified = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_indices_unified",
+            (swa_ragged_indices.shape[0], padded_width),
+            dtype=torch.int32,
+            device=swa_ragged_indices.device,
+        )
+        indices_unified.fill_(-1)
+        indices_unified[:, :swa_width].copy_(swa_ragged_indices)
+        extra_offsets = torch.arange(
+            extra_width, device=extra_indices.device, dtype=torch.int32
+        ).unsqueeze(0)
+        extra_valid = extra_offsets < extra_topk_lengths.unsqueeze(1)
+        extra_starts = topk_length - extra_topk_lengths
+        extra_positions = extra_starts.unsqueeze(1) + extra_offsets
+        extra_valid = extra_valid & (extra_positions < indices_unified.shape[-1])
+        row_ids = torch.arange(
+            extra_indices.shape[0], device=extra_indices.device
+        ).unsqueeze(1).expand_as(extra_indices)
+        extra_values = extra_indices.to(torch.int32) + torch.tensor(
+            extra_offset, device=extra_indices.device, dtype=torch.int32
+        )
+        indices_unified[row_ids[extra_valid], extra_positions[extra_valid].long()] = (
+            extra_values[extra_valid]
+        )
+
+    elif (
+        swa_ragged_indices.shape[-1] % 128 != 0
+        or swa_ragged_indices.dtype != torch.int32
+    ):
+        padded_width = ceil_align(swa_ragged_indices.shape[-1], 128)
+        padded_indices = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_indices_unified",
+            (swa_ragged_indices.shape[0], padded_width),
+            dtype=torch.int32,
+            device=swa_ragged_indices.device,
+        )
+        padded_indices.fill_(-1)
+        padded_indices[:, : swa_ragged_indices.shape[-1]].copy_(swa_ragged_indices)
+        indices_unified = padded_indices
+    else:
+        indices_unified = swa_ragged_indices
+
+    if indices_unified.ndim == 2:
+        indices_unified = indices_unified.unsqueeze(1)
+    return q_prefill, kv_unified, indices_unified, topk_length
+
+
+def _dsv4_run_bf16_sparse_prefill_attention(
+    *,
+    q_prefill: torch.Tensor,
+    kv_unified: torch.Tensor,
+    indices_unified: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    import flash_mla
+
+    if q_prefill.ndim != 3 or kv_unified.ndim != 3:
+        return None
+    if q_prefill.shape[-1] != kv_unified.shape[-1]:
+        return None
+    if indices_unified.ndim != 3 or indices_unified.shape[1] != 1:
+        return None
+    if topk_length.ndim != 1 or topk_length.shape[0] != q_prefill.shape[0]:
+        return None
+    topk_length = topk_length.to(torch.int32).contiguous()
+    if topk_length.numel() == 0 or int(topk_length.max().item()) == 0:
+        return None
+
+    return flash_mla.flash_mla_sparse_fwd(
+        q_prefill,
+        kv_unified,
+        indices_unified,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )[0]
+
+
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
@@ -104,6 +334,8 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     c4_sparse_topk: int
+    no_prefix_ragged_prefill: bool = False
+    swa_ragged_indices: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -112,6 +344,7 @@ class DSV4AttnMetadata:
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
+    c128_ragged_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -150,7 +383,9 @@ class DSV4AttnMetadata:
                 "page_table",
                 "swa_page_indices",
                 "swa_topk_lengths",
+                "swa_ragged_indices",
                 "c128_page_indices",
+                "c128_ragged_indices",
                 "c128_topk_lengths_clamp1",
                 "c4_topk_lengths_raw",
                 "c4_topk_lengths_clamp1",
@@ -158,6 +393,7 @@ class DSV4AttnMetadata:
                 "c4_sparse_page_indices",
             ],
             assign_fields=[
+                "no_prefix_ragged_prefill",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
@@ -266,7 +502,7 @@ class DSV4AttnMetadata:
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
-    indexer_metadata: Optional[PagedIndexerMetadata]
+    indexer_metadata: Optional[Union[PagedIndexerMetadata, RaggedIndexerMetadata]]
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
@@ -377,12 +613,24 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
+        self._current_ragged_extra_kv: Dict[int, torch.Tensor] = {}
+        self._current_ragged_indexer_kv_fp8: Optional[torch.Tensor] = None
+        self._current_ragged_indexer_kv_scale: Optional[torch.Tensor] = None
+        self._no_prefix_ragged_workspace: Dict[str, torch.Tensor] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
+        if core_attn_metadata.no_prefix_ragged_prefill:
+            c4_k_start, c4_k_finish = _dsv4_build_no_prefix_c4_k_range(
+                core_attn_metadata.seq_lens_casual
+            )
+            return RaggedIndexerMetadata(
+                c4_k_start=c4_k_start,
+                c4_k_finish=c4_k_finish,
+            )
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
@@ -446,6 +694,7 @@ class DeepseekV4AttnBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        enable_no_prefix_ragged: bool = False,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -462,6 +711,7 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
+            no_prefix_ragged_prefill=enable_no_prefix_ragged,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -664,6 +914,10 @@ class DeepseekV4AttnBackend(
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return
 
+        self._current_ragged_extra_kv.clear()
+        self._current_ragged_indexer_kv_fp8 = None
+        self._current_ragged_indexer_kv_scale = None
+
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -697,6 +951,27 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens_cpu is not None
             )
             is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            enable_no_prefix_ragged = (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and _dsv4_use_no_prefix_bf16_sparse_prefill()
+                and not is_draft
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and forward_batch.out_cache_loc.shape[0] == sum(extend_seq_lens_cpu)
+                and get_attention_cp_size() == 1
+            )
+            if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                logger.warning(
+                    "DSV4 no-prefix ragged metadata: enabled=%s, mode=%s, "
+                    "prefix_lens=%s, out_tokens=%s, extend_tokens=%s, "
+                    "compressor_v2=%s",
+                    enable_no_prefix_ragged,
+                    forward_batch.forward_mode,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.out_cache_loc.shape[0],
+                    sum(extend_seq_lens_cpu),
+                    envs.SGLANG_OPT_USE_COMPRESSOR_V2.get(),
+                )
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -707,6 +982,7 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 need_compress=not is_draft,
+                enable_no_prefix_ragged=enable_no_prefix_ragged,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -966,6 +1242,103 @@ class DeepseekV4AttnBackend(
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
+
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and _dsv4_use_no_prefix_bf16_sparse_prefill()
+                and core_attn_metadata.no_prefix_ragged_prefill
+                and core_attn_metadata.swa_ragged_indices is not None
+                and compress_ratio in (0, 4, 128)
+                and attn_sink is not None
+            ):
+                extra_k_bf16 = None
+                extra_indices_ragged = None
+                extra_topk_lengths = None
+                if compress_ratio == 4:
+                    extra_k_bf16 = self._current_ragged_extra_kv.get(4)
+                    extra_indices_ragged = core_attn_metadata.c4_sparse_page_indices
+                    extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
+                    if extra_k_bf16 is None:
+                        logger.warning(
+                            "DSV4 ragged prefill fallback: missing compact c4 kv for layer %s",
+                            layer_id,
+                        )
+                    elif extra_indices_ragged is None:
+                        logger.warning(
+                            "DSV4 ragged prefill fallback: missing c4 ragged indices for layer %s",
+                            layer_id,
+                        )
+                elif compress_ratio == 128:
+                    extra_k_bf16 = self._current_ragged_extra_kv.get(128)
+                    extra_indices_ragged = core_attn_metadata.c128_ragged_indices
+                    extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+                    if extra_k_bf16 is None:
+                        logger.warning(
+                            "DSV4 ragged prefill fallback: missing compact c128 kv for layer %s",
+                            layer_id,
+                        )
+                    elif extra_indices_ragged is None:
+                        logger.warning(
+                            "DSV4 ragged prefill fallback: missing c128 ragged indices for layer %s",
+                            layer_id,
+                        )
+                if compress_ratio == 0 or (
+                    extra_k_bf16 is not None and extra_indices_ragged is not None
+                ):
+                    if (
+                        compress_ratio == 128
+                        and extra_k_bf16 is not None
+                        and extra_k_bf16.shape[0] == 0
+                    ):
+                        extra_k_bf16 = None
+                        extra_indices_ragged = None
+                        extra_topk_lengths = None
+                    if compress_ratio == 128 and extra_k_bf16 is None:
+                        pass
+                    else:
+                        prefill_inputs = _dsv4_build_unified_prefill_inputs_no_prefix(
+                            q=q if q.ndim == 4 else q.unsqueeze(1),
+                            swa_k=(
+                                swa_k
+                                if swa_k.ndim == 3
+                                else swa_k.view(-1, 1, swa_k.shape[-1])
+                            ),
+                            swa_ragged_indices=core_attn_metadata.swa_ragged_indices,
+                            swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
+                            extra_k=extra_k_bf16,
+                            extra_indices=extra_indices_ragged,
+                            extra_topk_lengths=extra_topk_lengths,
+                            workspace=self._no_prefix_ragged_workspace,
+                        )
+                        if prefill_inputs is not None:
+                            (
+                                q_prefill,
+                                kv_unified,
+                                indices_unified,
+                                topk_length,
+                            ) = prefill_inputs
+                            o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
+                                q_prefill=q_prefill,
+                                kv_unified=kv_unified,
+                                indices_unified=indices_unified,
+                                sm_scale=self.softmax_scale,
+                                d_v=self.head_dim_v,
+                                attn_sink=attn_sink,
+                                topk_length=topk_length,
+                            )
+                            if o_sparse is not None:
+                                if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                                    logger.warning(
+                                        "DSV4 no-prefix ragged attention hit: "
+                                        "layer=%s, ratio=%s, q=%s, kv=%s, indices=%s",
+                                        layer_id,
+                                        compress_ratio,
+                                        tuple(q_prefill.shape),
+                                        tuple(kv_unified.shape),
+                                        tuple(indices_unified.shape),
+                                    )
+                                return o_sparse
+
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
@@ -1116,6 +1489,7 @@ class DeepseekV4AttnBackend(
         out_loc: torch.Tensor,
         need_compress: bool = True,
         is_prefill: bool = False,
+        no_prefix_ragged_prefill: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -1146,14 +1520,32 @@ class DeepseekV4AttnBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
+            no_prefix_ragged_prefill=no_prefix_ragged_prefill,
         )
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
             core_attn_metadata.init_flashmla_related()
+            if no_prefix_ragged_prefill:
+                core_attn_metadata.swa_ragged_indices = (
+                    _dsv4_build_no_prefix_swa_ragged_indices(seq_lens_casual)
+                )
+                core_attn_metadata.c128_ragged_indices = (
+                    _dsv4_build_no_prefix_full_history_ragged_indices(
+                        lengths=torch.div(
+                            seq_lens_casual, 128, rounding_mode="floor"
+                        ),
+                        emit_mask=(seq_lens_casual % 128) == 0,
+                    )
+                )
+            else:
+                core_attn_metadata.swa_ragged_indices = None
+                core_attn_metadata.c128_ragged_indices = None
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
+            core_attn_metadata.swa_ragged_indices = None
+            core_attn_metadata.c128_ragged_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
