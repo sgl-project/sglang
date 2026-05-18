@@ -1110,8 +1110,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
         # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache,
-        # until the next iter's verify_done.synchronize() in filter_batch.
-        # Scheduler pins it in batch_record_buf for the 2-iter window.
+        # until the next iter consumes the relayed verify outputs. The
+        # Relayer iter_pin ring (set up via ``Scheduler.record_batch_in_overlap``)
+        # is the canonical owner; ``extra_keep_alive_refs`` below is the
+        # transport from worker -> scheduler -> Relayer.add_iter_pin.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
