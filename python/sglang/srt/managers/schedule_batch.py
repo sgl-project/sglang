@@ -1564,6 +1564,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def assert_lockstep(self):
+        """Per-req containers all have the same length as ``self.reqs``.
+
+        SB producer / consumer share a contract that ``filter_batch`` /
+        ``merge_batch`` / ``pop_finished_req`` / ``prepare_for_decode`` keep
+        the per-req slices aligned; drift here usually indicates a missed
+        branch in one of those mutators. Cheap to call (only checks Python
+        sequence lengths and 1-D tensor shapes); intended to be sprinkled
+        at SB-boundary inflection points in debug builds.
+        """
+        bs = len(self.reqs)
+        if self.seq_lens is not None:
+            assert (
+                self.seq_lens.shape[0] == bs
+            ), f"seq_lens len {self.seq_lens.shape[0]} != reqs len {bs}"
+        if self.seq_lens_cpu is not None:
+            assert (
+                self.seq_lens_cpu.shape[0] == bs
+            ), f"seq_lens_cpu len {self.seq_lens_cpu.shape[0]} != reqs len {bs}"
+        if self.orig_seq_lens is not None:
+            assert (
+                self.orig_seq_lens.shape[0] == bs
+            ), f"orig_seq_lens len {self.orig_seq_lens.shape[0]} != reqs len {bs}"
+        if self.req_pool_indices is not None:
+            assert (
+                self.req_pool_indices.shape[0] == bs
+            ), f"req_pool_indices len {self.req_pool_indices.shape[0]} != reqs len {bs}"
+        for attr in ("top_logprobs_nums", "token_ids_logprobs"):
+            value = getattr(self, attr, None)
+            if value is not None:
+                assert len(value) == bs, f"{attr} len {len(value)} != reqs len {bs}"
+
     def is_dllm(self):
         return self.dllm_config is not None
 
