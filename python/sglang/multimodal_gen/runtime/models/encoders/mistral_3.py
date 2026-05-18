@@ -332,6 +332,63 @@ class Mistral3Model(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
+# Fields the TP-parallel Mistral transformer reads off `arch_config` at
+# construction time. When the on-disk HF config is a `Mistral3Config` (the
+# multimodal wrapper), every one of these lives under `text_config` and never
+# reaches `arch_config` via the loader's flat `setattr` loop.
+_HOISTED_TEXT_CONFIG_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "hidden_act",
+    "max_position_embeddings",
+    "rms_norm_eps",
+    "tie_word_embeddings",
+    "pad_token_id",
+    "bos_token_id",
+    "eos_token_id",
+    "attention_bias",
+    "mlp_bias",
+    "sliding_window",
+)
+
+
+def _hoist_text_config(arch_config) -> None:
+    """Promote scalar fields from a nested HF ``text_config`` onto ``arch_config``.
+
+    The loader applies the on-disk HF config with ``setattr(arch_config, k, v)``
+    for each top-level attribute. For Mistral3 (multimodal) the transformer
+    scalars live under ``arch_config.text_config`` (an HF ``MistralConfig``)
+    and are otherwise invisible to the SGLang runtime. We only copy fields
+    that are actually present on the source so that defaults declared on
+    ``Mistral3EncoderArchConfig`` are preserved when the checkpoint is a
+    plain MistralConfig (no ``text_config`` indirection).
+
+    ``rope_theta`` is hoisted into the ``rope_parameters`` dict shape that
+    SGLang's ``get_rope(...)`` expects.
+    """
+    text_config = getattr(arch_config, "text_config", None)
+    if text_config is None:
+        return
+    for field_name in _HOISTED_TEXT_CONFIG_FIELDS:
+        if hasattr(text_config, field_name):
+            value = getattr(text_config, field_name)
+            if value is not None:
+                setattr(arch_config, field_name, value)
+    rope_theta = getattr(text_config, "rope_theta", None)
+    if rope_theta is not None:
+        rope_params = dict(getattr(arch_config, "rope_parameters", None) or {})
+        rope_params["rope_theta"] = float(rope_theta)
+        rope_scaling = getattr(text_config, "rope_scaling", None)
+        if rope_scaling:
+            rope_params.update(rope_scaling)
+        arch_config.rope_parameters = rope_params
+
+
 class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMixin):
     _checkpoint_conversion_mapping = {
         "^language_model.model": "model.language_model",
@@ -347,9 +404,15 @@ class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMi
 
     def __init__(self, config: Mistral3EncoderConfig) -> None:
         super().__init__(config)
-        # `config` is the wrapping `TextEncoderConfig`; `__getattr__` falls
-        # through to `config.arch_config` so model code can read fields like
-        # `hidden_size` / `num_attention_heads` directly.
+        # The text-encoder loader overlays the on-disk HF Mistral3 config
+        # (Mistral3Config / LlavaConfig) onto `arch_config` via
+        # `setattr(arch_config, key, value)` for each top-level HF attr. For
+        # the multimodal Mistral3 variant the scalar transformer params
+        # (hidden_size, num_attention_heads, intermediate_size, ...) live
+        # under a nested `text_config` PretrainedConfig and never reach
+        # `arch_config` directly, leaving stale defaults in place. Hoist them
+        # so the TP-parallel layers below see real checkpoint shapes.
+        _hoist_text_config(config.arch_config)
         self.model = Mistral3Model(config, prefix="model")
 
     @property
