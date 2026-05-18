@@ -32,7 +32,7 @@ from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTokenizerManager:
@@ -119,9 +119,12 @@ class ServingChatTestCase(unittest.TestCase):
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = conv_ins.audio_data = None
