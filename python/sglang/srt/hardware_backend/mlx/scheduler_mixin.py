@@ -136,9 +136,8 @@ class SchedulerMlxOverlapMixin:
             self.process_batch_result(pending.batch_copy, result)
 
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
-            mwb = batch.get_model_worker_batch()
             lazy_tokens, prefills, extends, decode, mode = (
-                self.tp_worker.async_forward_batch_generation_mlx(mwb)
+                self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
             return MlxPendingJob(
                 lazy_tokens=lazy_tokens,

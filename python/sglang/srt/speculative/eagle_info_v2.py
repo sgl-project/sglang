@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -212,7 +212,7 @@ class EagleDraftInputV2(EagleDraftInput):
     def prepare_for_v2_draft(
         self,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_runner: ModelRunner,
         topk: int,
@@ -246,8 +246,8 @@ class EagleDraftInputV2(EagleDraftInput):
             if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
@@ -274,7 +274,7 @@ class EagleDraftExtendInputV2(EagleDraftExtendInput):
 
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
         draft_runner: Any,
@@ -289,20 +289,20 @@ class EagleDraftExtendInputV2(EagleDraftExtendInput):
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
+        batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
@@ -323,7 +323,7 @@ class EagleVerifyInputV2(EagleVerifyInput):
     def prepare_for_v2_verify(
         self,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_worker: TpModelWorker,
     ):
         if not batch.forward_mode.is_idle():
@@ -396,7 +396,7 @@ class EagleVerifyInputV2(EagleVerifyInput):
 
     def sample(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
     ) -> EagleVerifyOutputV2:

@@ -18,7 +18,7 @@ from sglang.srt.speculative.spec_registry import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -264,11 +264,11 @@ class SpecInput(ABC):
         pass
 
     def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> Tuple[List[int], List[int]]:
         c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
+        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
         global_num_tokens_for_logprob = [
-            x * c2 for x in forward_batch.global_num_tokens_for_logprob
+            x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob

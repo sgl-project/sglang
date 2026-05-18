@@ -127,10 +127,8 @@ class SpecCoordinator(ABC):
         """
         pass
 
-    # NOTE: `forward_batch_generation(...)` is the pipeline entry point but its
-    # signature is split (`ScheduleBatch` on V1 / `NGRAM`, `ModelWorkerBatch` on
-    # V2 / DFlash). Formalizing it as abstract is left to a later step that
-    # unifies the input type.
+    # NOTE: `forward_batch_generation(batch: ScheduleBatch)` is the pipeline
+    # entry point. Formalizing it as abstract is left to a later step.
 
 
 # Backward-compat alias; pre-existing call sites keep working.

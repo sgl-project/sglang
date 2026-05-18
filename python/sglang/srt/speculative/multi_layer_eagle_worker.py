@@ -414,15 +414,14 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        model_worker_batch.capture_hidden_mode = capture_mode
-        model_worker_batch.return_hidden_states_before_norm = True
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        batch.capture_hidden_mode = capture_mode
+        batch.return_hidden_states_before_norm = True
+        batch_result = self.target_worker.forward_batch_generation(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -430,7 +429,7 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
 
@@ -467,11 +466,8 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         batch.return_hidden_states = False
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == draft_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
+        assert forward_batch.capture_hidden_mode == draft_capture_mode
         forward_batch.can_run_dp_cuda_graph = False
         forward_batch.return_hidden_states_before_norm = True
 
@@ -581,12 +577,6 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
             else ForwardMode.IDLE
         )
 
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-        model_worker_batch.return_hidden_states_before_norm = True
-
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
@@ -595,8 +585,10 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
             ).cpu()
 
         # Forward
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+        batch.return_hidden_states_before_norm = True
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -701,9 +693,8 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         """Run draft model extend. Returns next-iter `EagleDraftInput`;
         scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
 
-        We mutate `batch.spec_info` transiently so the forward kernel can read
-        the draft input via `batch.get_model_worker_batch`, then restore on
-        return.
+        We mutate `batch.spec_info` transiently so `ForwardBatch.init_new`
+        picks it up, then restore on return.
         """
         next_draft_input = EagleDraftInput(
             hidden_states=hidden_states,
@@ -724,12 +715,8 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         )
         next_draft_input.capture_hidden_mode = capture_mode
         try:
-            model_worker_batch = batch.get_model_worker_batch(
-                seq_lens_cpu_cache=seq_lens_cpu
-            )
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.mtp_model_runner(0)
-            )
+            batch.seq_lens_cpu_cache = seq_lens_cpu
+            forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
             forward_batch.return_logprob = False
             forward_batch.return_hidden_states_before_norm = True
             topk_p_list = []
@@ -799,11 +786,9 @@ class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         )
 
         batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
+        draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
+        forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
+        assert forward_batch.capture_hidden_mode == draft_extend_capture_mode
         forward_batch.return_hidden_states_before_norm = True
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()

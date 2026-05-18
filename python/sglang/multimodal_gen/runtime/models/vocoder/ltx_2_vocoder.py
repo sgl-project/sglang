@@ -539,7 +539,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     LTX 2.0 vocoder for converting generated mel spectrograms back to audio waveforms.
     """
 
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = [
         "upsamplers",
         "resnets",
