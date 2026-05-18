@@ -769,45 +769,90 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
+def _build_start_profile_body() -> Dict[str, Any]:
+    """Build the JSON body for a POST to /start_profile.
+
+    Only includes keys the user explicitly set so the server can apply its
+    own defaults for everything else. See
+    docs/developer_guide/benchmark_and_profiling.mdx for the server-side
+    parameters.
+    """
+    body: Dict[str, Any] = {}
+
+    # output_dir: --profile-output-dir wins, otherwise SGLANG_TORCH_PROFILER_DIR.
+    # If neither is set, the key is omitted and the server's default applies.
+    output_dir = getattr(args, "profile_output_dir", None) or os.getenv(
+        "SGLANG_TORCH_PROFILER_DIR"
+    )
+    if output_dir:
+        output_dir_path = Path(
+            os.path.abspath(os.path.normpath(output_dir))
+        ) / str(time.time())
+        output_dir_path.mkdir(exist_ok=True, parents=True)
+        body["output_dir"] = str(output_dir_path)
+
+    num_steps = getattr(args, "profile_num_steps", None)
+    profile_by_stage = getattr(args, "profile_by_stage", False)
+    # profile-by-stage requires a step bound to know when to stop.
+    if profile_by_stage and num_steps is None:
+        num_steps = 5
+    if num_steps is not None:
+        body["num_steps"] = int(num_steps)
+
+    start_step = getattr(args, "profile_start_step", None)
+    if start_step is not None:
+        body["start_step"] = int(start_step)
+
+    activities = getattr(args, "profile_activities", None)
+    if activities:
+        body["activities"] = list(activities)
+
+    if profile_by_stage:
+        body["profile_by_stage"] = True
+
+    stages = getattr(args, "profile_stages", None)
+    if stages:
+        body["profile_stages"] = list(stages)
+
+    prefix = getattr(args, "profile_prefix", None)
+    if prefix:
+        body["profile_prefix"] = prefix
+
+    if getattr(args, "profile_merge_profiles", False):
+        body["merge_profiles"] = True
+
+    return body
+
+
+def _print_profile_start_summary(body: Dict[str, Any]) -> None:
+    parts = []
+    for key in (
+        "start_step",
+        "num_steps",
+        "activities",
+        "output_dir",
+        "merge_profiles",
+        "profile_by_stage",
+        "profile_stages",
+        "profile_prefix",
+    ):
+        if key in body:
+            parts.append(f"{key}={body[key]!r}")
+    summary = " ".join(parts) if parts else "(server defaults)"
+    print(f"Profiling: {summary}")
+
+
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
             if api_url.endswith("/start_profile"):
-                num_steps = getattr(args, "profile_num_steps", None)
-                profile_by_stage = getattr(args, "profile_by_stage", None)
-                if profile_by_stage and num_steps is None:
-                    num_steps = 5
-
-                output_dir = getattr(args, "profile_output_dir", None)
-                if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-                output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
-                    time.time()
-                )
-                output_dir.mkdir(exist_ok=True, parents=True)
-                output_dir = str(output_dir)
-
-                body = {
-                    "activities": getattr(args, "profile_activities", []),
-                    "num_steps": num_steps,
-                    "profile_by_stage": profile_by_stage,
-                    "profile_stages": getattr(args, "profile_stages", None),
-                    "output_dir": output_dir,
-                    "profile_prefix": getattr(args, "profile_prefix", None),
-                }
+                body = _build_start_profile_body()
+                _print_profile_start_summary(body)
             else:
                 # stop_profile doesn't need any parameters
                 body = {}
             print(f"async_request_profile {api_url=} {body=}")
-            # Add optional profiling parameters if provided
-            if (
-                hasattr(args, "profile_start_step")
-                and args.profile_start_step is not None
-            ):
-                body["start_step"] = str(args.profile_start_step)
-            if hasattr(args, "profile_steps") and args.profile_steps is not None:
-                body["num_steps"] = str(args.profile_steps)
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -1415,21 +1460,19 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
-    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
-    if profile and not (
-        hasattr(args, "profile_steps") and args.profile_steps is not None
-    ):
+    # Stop profiler (skip when --profile-num-steps was set, as it auto-stops)
+    profile_auto_stops = getattr(args, "profile_num_steps", None) is not None
+    if profile and not profile_auto_stops:
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
         else:
-            if getattr(args, "profile_num_steps", None) is None:
-                print("Stopping profiler...")
-                profile_output = await async_request_profile(
-                    api_url=base_url + "/stop_profile"
-                )
-                if profile_output.success:
-                    print("Profiler stopped")
+            print("Stopping profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -2174,15 +2217,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
     )
-    # TODO unify all these
+    # Bounded-step profiling knobs (mirror sglang.bench_one_batch_server).
+    # All are optional and only meaningful with --profile.
     parser.add_argument(
         "--profile-activities",
         type=str,
         nargs="+",
-        default=["CPU", "GPU"],
+        default=None,
         choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
         help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
-        "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
+        "(MEM dumps a torch.cuda.memory snapshot, viewable at "
+        "https://pytorch.org/memory_viz). Defaults to the server's default "
+        "(CPU + GPU) when unset.",
     )
     parser.add_argument(
         "--profile-start-step",
@@ -2191,19 +2237,41 @@ if __name__ == "__main__":
         help="Start profiling after this many forward steps. Useful for warmup.",
     )
     parser.add_argument(
+        "--profile-num-steps",
         "--profile-steps",
+        dest="profile_num_steps",
         type=int,
         default=None,
-        help="Number of steps to profile. If specified, profiling stops automatically after this many steps.",
+        help="Number of forward steps to record. A step is one batch iteration, "
+        "NOT one request; with high --max-concurrency a step spans many requests. "
+        "When set, the client skips /stop_profile because the server auto-stops "
+        "after this many steps. (--profile-steps is a deprecated alias.)",
     )
-    parser.add_argument("--profile-num-steps", type=int, default=None)
-    parser.add_argument("--profile-by-stage", action="store_true", default=False)
-    parser.add_argument("--profile-stages", nargs="+", default=None)
+    parser.add_argument(
+        "--profile-by-stage",
+        action="store_true",
+        default=False,
+        help="Profile each stage (prefill/decode) separately.",
+    )
+    parser.add_argument(
+        "--profile-stages",
+        nargs="+",
+        default=None,
+        help="When used with --profile-by-stage, restricts profiling to these "
+        "stages.",
+    )
+    parser.add_argument(
+        "--profile-merge-profiles",
+        action="store_true",
+        default=False,
+        help="Ask the server to merge per-rank traces into a single file.",
+    )
     parser.add_argument(
         "--profile-output-dir",
         type=str,
         default=None,
-        help="Output directory for profile traces.",
+        help="Output directory for profile traces. Falls back to "
+        "$SGLANG_TORCH_PROFILER_DIR, otherwise the server's default.",
     )
     parser.add_argument(
         "--profile-prefix",
