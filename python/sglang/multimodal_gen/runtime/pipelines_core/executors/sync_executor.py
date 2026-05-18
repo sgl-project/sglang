@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 
 
 class SyncExecutor(PipelineExecutor):
@@ -29,11 +30,24 @@ class SyncExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
+        # Match the warmup gating used inside DenoisingStage so the executor
+        # wrappers don't leak a stage_<Name> range during server-side warmup.
+        # ``payload`` can be a single Req or a list of Req (execute_group);
+        # treat the group as warmup only if all entries agree.
+        if isinstance(payload, list):
+            is_warmup = bool(payload) and all(
+                getattr(p, "is_warmup", False) for p in payload
+            )
+        else:
+            is_warmup = getattr(payload, "is_warmup", False)
+        use_nvtx = server_args.enable_layerwise_nvtx_marker and not is_warmup
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             for stage_index, stage in enumerate(stages):
+                stage_name = stage.__class__.__name__
                 self.before_stage(stage, stage_index, payload, server_args)
-                payload = run_stage(stage, payload)
+                with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                    payload = run_stage(stage, payload)
                 self.after_stage(stage_index)
                 profiler = SGLDiffusionProfiler.get_instance()
                 if profiler:
