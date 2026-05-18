@@ -1724,8 +1724,11 @@ class SchedulerDisaggregationDecodeMixin:
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_ids to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (fill_ids includes one uncommitted token).
-                if req.kv_committed_len is not None:
-                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                # Route through Relayer cpu_value channel when a kv_committed
+                # ctx is attached to the req; falls back to the attribute.
+                committed_len = req.relayer_resolve_kv_committed_len()
+                if committed_len is not None:
+                    req.fill_ids = req.fill_ids[:committed_len]
                     req.set_extend_input_len(
                         len(req.fill_ids) - len(req.prefix_indices)
                     )
