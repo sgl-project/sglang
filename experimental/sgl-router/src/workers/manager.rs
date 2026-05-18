@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::discovery::{DiscoveryEvent, ModelId, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::WorkerRegistry;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// The slice of `/server_info` consumed by the worker manager.  We don't
 /// share any other module's `ServerInfo` struct because each consumer
@@ -134,6 +136,19 @@ pub async fn run_with_config(
 /// Internal entry point used by tests so they can supply a custom HTTP
 /// client (e.g. a shorter timeout, or a fake transport).  Production
 /// callers use [`run_with_config`].
+///
+/// # Concurrency model
+///
+/// - **Added(spec):** spawned onto a `tokio::task` so multiple workers
+///   can fetch `/server_info` and register concurrently.  Without this,
+///   a burst of N workers would serialize N × `SERVER_INFO_TIMEOUT`
+///   worth of registration latency on the event loop.
+/// - **Removed / ModeChanged:** processed sequentially on the event
+///   loop, but first **await** any in-flight `Added` task for the same
+///   id so the mutation observes the post-Added registry state.
+///   Without this await, a `Removed` queued while `Added` is still
+///   fetching would no-op (registry empty), then the deferred Added
+///   write would leak the worker indefinitely.
 pub async fn run_with_http(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
@@ -141,25 +156,43 @@ pub async fn run_with_http(
     kv_index: Option<Arc<KvEventIndex>>,
     http: Arc<reqwest::Client>,
 ) {
+    // In-flight `Added` registrations, keyed by worker id. Subsequent
+    // `Removed` / `ModeChanged` events for the same id `await` the
+    // handle so they observe the registry write the spawned task is
+    // about to perform.
+    let mut pending: HashMap<WorkerId, JoinHandle<()>> = HashMap::new();
+
     while let Some(event) = rx.recv().await {
+        // Reap finished handles so the map doesn't grow unboundedly
+        // under steady-state churn. O(map.len()) but the map only holds
+        // in-flight Added events (typically << total workers).
+        pending.retain(|_, h| !h.is_finished());
+
         match event {
-            DiscoveryEvent::Added(mut spec) => {
+            DiscoveryEvent::Added(spec) => {
                 tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
-                // Resolve the served model name via HTTP introspection.
-                // Failure registers the worker with empty `model_ids`
-                // (the failure path is logged inside `fetch_…`).
-                if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
-                    spec.model_ids = vec![ModelId(name)];
+                let id = spec.id.clone();
+                // Drain a still-in-flight prior Added for the same id
+                // so the upsert observes a consistent pre-state.
+                if let Some(prev) = pending.remove(&id) {
+                    let _ = prev.await;
                 }
-                let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-                let worker_url = spec.url.clone();
-                registry.add_with_cb(spec, cb);
-                if let Some(idx) = &kv_index {
-                    idx.add_worker(&worker_url).await;
-                }
+                let registry_t = registry.clone();
+                let cfg_t = cfg.clone();
+                let kv_index_t = kv_index.clone();
+                let http_t = http.clone();
+                let handle = tokio::spawn(async move {
+                    register_one(spec, registry_t, cfg_t, kv_index_t, http_t).await;
+                });
+                pending.insert(id, handle);
             }
             DiscoveryEvent::Removed { id } => {
                 tracing::info!("discovery: -worker {id}");
+                if let Some(prev) = pending.remove(&id) {
+                    // Wait for the matching Added's registry write to
+                    // land so this Removed actually clears it.
+                    let _ = prev.await;
+                }
                 // Look up the URL before dropping the entry so the
                 // KV-event index can clear its per-(url, dp_rank) state.
                 let worker_url = registry.get(&id).map(|w| w.url.clone());
@@ -183,6 +216,11 @@ pub async fn run_with_http(
                 }
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
+                if let Some(prev) = pending.remove(&id) {
+                    // Wait for the registry write so the mode flip
+                    // lands on the new entry, not the empty slot.
+                    let _ = prev.await;
+                }
                 // Mutate mode in place — preserves active_requests counter
                 // (in-flight LoadGuards stay valid) and CircuitBreaker state
                 // (open/half-open survives PD role flips).
@@ -204,6 +242,35 @@ pub async fn run_with_http(
                 }
             }
         }
+    }
+
+    // Drain any still-running registration tasks so callers `await`ing
+    // the manager handle (tests, shutdown paths) see every registry
+    // mutation land before the future resolves.
+    for (_, h) in pending.drain() {
+        let _ = h.await;
+    }
+}
+
+/// Onboard a single worker: fetch `served_model_name`, write to the
+/// registry, and (if enabled) attach to the KV-event index. Failure of
+/// the HTTP introspection still registers the worker with empty
+/// `model_ids` so the rest of the proxy plane treats it as reachable.
+async fn register_one(
+    mut spec: WorkerSpec,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    http: Arc<reqwest::Client>,
+) {
+    if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
+        spec.model_ids = vec![ModelId(name)];
+    }
+    let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
+    let worker_url = spec.url.clone();
+    registry.add_with_cb(spec, cb);
+    if let Some(idx) = kv_index {
+        idx.add_worker(&worker_url).await;
     }
 }
 
