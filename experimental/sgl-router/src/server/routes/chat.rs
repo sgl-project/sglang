@@ -6,6 +6,7 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -195,7 +196,17 @@ pub async fn chat_completions(
     // the request mid-flight.
     let stale_token = active_guard.cancel_token().clone();
 
-    if streaming {
+    // Snapshot the labels we need for metrics BEFORE moving the worker
+    // / model_str values into the per-branch fetch futures.
+    let metrics_worker_url = worker.url.clone();
+    let metrics_mode = match worker.mode() {
+        WorkerMode::Prefill => WorkerModeLabel::Prefill,
+        WorkerMode::Decode => WorkerModeLabel::Decode,
+        WorkerMode::Plain => WorkerModeLabel::Plain,
+    };
+    let metrics_model = model_str.clone();
+
+    let result = if streaming {
         // Hand BOTH guards to the streaming body task. They are held
         // until the SSE pump finishes (last byte / client disconnect /
         // upstream error), not just until this handler returns (which
@@ -254,7 +265,32 @@ pub async fn chat_completions(
             r = fetch => r,
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
         }
-    }
+    };
+
+    // Record the dispatch outcome AFTER we know whether the upstream
+    // accepted the request. A 504 from the stale-request branch counts as
+    // `cancelled` — semantically distinct from upstream errors that bubble
+    // through as `error`. The metric is per-worker so the M4 convergence
+    // tests can scrape `/metrics` and assert that ≥N requests landed on
+    // a single prefill worker.
+    let outcome = match &result {
+        Ok(_) => RequestOutcome::Success,
+        Err(ApiError::StaleRequestExpired { .. }) => {
+            // The janitor fired the stale-cancel and we observed it
+            // user-side; record both the per-request `cancelled` outcome
+            // AND the global `expired` count. The two views are useful for
+            // different alerts: per-worker request_total{cancelled} flags a
+            // worker that's hanging, while stale_requests_total{expired}
+            // tracks the global health of the janitor.
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            RequestOutcome::Cancelled
+        }
+        Err(_) => RequestOutcome::Error,
+    };
+    ctx.metrics
+        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+    result
 }
 
 /// Estimate prefill-token count from the raw request body for use as
