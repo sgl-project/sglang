@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 register_npu_ci(
-    est_time=1800,
-    suite="nightly-4-npu-a3",
+    est_time=3600,
+    suite="",
     nightly=True,
-    disabled="Currently it is executed by the npu performance workflow.",
+    disabled="performance testcase",
 )
 
 ENVS = {

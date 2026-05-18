@@ -5,6 +5,14 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V32_W8A8_MODEL_PATH,
     TestAscendPerfMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(
+    est_time=3600,
+    suite="",
+    nightly=True,
+    disabled="performance testcase",
+)
 
 MODEL_CONFIG = {
     "model_path": DEEPSEEK_V32_W8A8_MODEL_PATH,
