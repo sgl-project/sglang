@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -169,6 +170,26 @@ def compute_normalized_queue_pressure(queued_reqs: int, capacity: int) -> float:
     if capacity <= 0:
         return 0.0
     return queued_reqs / capacity
+
+
+def compute_deferred_queue_reqs(
+    disaggregation_mode: DisaggregationMode,
+    prefill_bootstrap_queue: list,
+    prefill_inflight_queue: list,
+    decode_prealloc_queue: list,
+    decode_transfer_queue: list,
+    decode_retracted_queue: Optional[list] = None,
+) -> int:
+    """Returns the number of deferred requests behind disaggregation queues."""
+    if disaggregation_mode == DisaggregationMode.PREFILL:
+        return len(prefill_bootstrap_queue) + len(prefill_inflight_queue)
+    if disaggregation_mode == DisaggregationMode.DECODE:
+        return (
+            len(decode_prealloc_queue)
+            + len(decode_transfer_queue)
+            + len(decode_retracted_queue or [])
+        )
+    return 0
 
 
 @dataclass
