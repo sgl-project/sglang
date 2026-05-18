@@ -72,6 +72,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "500",
                 "--max-running-requests",
                 "4",
+                "--weight-loader-prefetch-checkpoints",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
