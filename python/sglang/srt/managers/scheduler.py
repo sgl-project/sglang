@@ -3242,8 +3242,13 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                # Non-overlap path: forward sees a ForwardData snapshot the
+                # same way the overlap path does. This is the unified
+                # ownership-boundary entry: after to_forward_data() returns,
+                # SB-side mutations are not visible to forward.
+                forward_data = batch.to_forward_data()
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
+                    forward_data, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
