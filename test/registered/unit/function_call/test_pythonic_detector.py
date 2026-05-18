@@ -107,7 +107,7 @@ class TestPythonicDetector(CustomTestCase):
         text = "[get_weather('Tokyo')]"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].parameters, '{}')
+        self.assertEqual(result.calls[0].parameters, "{}")
 
     def test_multiple_tool_calls(self):
         text = "[get_weather(city='Tokyo'), search(query='restaurants')]"
@@ -248,7 +248,9 @@ class TestPythonicDetector(CustomTestCase):
 
         # Test with leading text
         detector2 = PythonicDetector()
-        result = detector2.parse_streaming_increment("Hello! [search(query=", self.tools)
+        result = detector2.parse_streaming_increment(
+            "Hello! [search(query=", self.tools
+        )
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "Hello! ")
 
