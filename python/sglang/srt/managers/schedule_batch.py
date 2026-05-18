@@ -1628,29 +1628,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def clear_relayer_seq_lens_ctx(self):
         self._relayer_seq_lens_ctx = (None, None)
 
-    def relayer_resolve_seq_lens(self):
-        """Resolve seq_lens via channel (cross-stream-safe) or fall back to attribute."""
+    def _relayer_buffer_ready(self, name: str) -> bool:
         ctx = self.__dict__.get("_relayer_seq_lens_ctx")
-        if ctx is not None:
-            relayer, fi = ctx
-            if relayer is not None and fi is not None:
-                return relayer.resolve_seq_lens(fi.indices)
+        if ctx is None:
+            return False
+        relayer, fi = ctx
+        if relayer is None or fi is None:
+            return False
+        return relayer.gpu_scalar.has_buffer(name)
+
+    def relayer_resolve_seq_lens(self):
+        """Resolve seq_lens via channel (cross-stream-safe) when the slot has
+        been written; fall back to the direct attribute otherwise.
+
+        Schedule-side callers (alloc_for_decode, prepare_for_decode early
+        phase) read seq_lens before prepare_for_decode stores the post-iter
+        value to the channel; for them the channel buffer may not exist
+        yet on the first decode iter, so fall back to attribute.
+        """
+        if self._relayer_buffer_ready("seq_lens"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_seq_lens(fi.indices)
         return self.seq_lens
 
     def relayer_resolve_seq_lens_cpu(self):
-        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
-        if ctx is not None:
-            relayer, fi = ctx
-            if relayer is not None and fi is not None:
-                return relayer.resolve_seq_lens_cpu(fi.indices)
+        if self._relayer_buffer_ready("seq_lens_cpu"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_seq_lens_cpu(fi.indices)
         return self.seq_lens_cpu
 
     def relayer_resolve_orig_seq_lens(self):
-        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
-        if ctx is not None:
-            relayer, fi = ctx
-            if relayer is not None and fi is not None:
-                return relayer.resolve_orig_seq_lens(fi.indices)
+        if self._relayer_buffer_ready("orig_seq_lens"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_orig_seq_lens(fi.indices)
         return self.orig_seq_lens
 
     def to_forward_data(self):

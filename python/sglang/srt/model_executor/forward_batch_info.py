@@ -551,23 +551,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    def _relayer_buffer_ready(self, name: str) -> bool:
+        if self.relayer is None or self.relayer_gpu_future_indices is None:
+            return False
+        return self.relayer.gpu_scalar.has_buffer(name)
+
     def relayer_resolve_seq_lens(self) -> Optional[torch.Tensor]:
-        """Channel-resolved seq_lens (cross-stream-safe); falls back to self.seq_lens."""
-        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+        """Channel-resolved seq_lens (cross-stream-safe); falls back to
+        self.seq_lens when the channel buffer has not been written yet
+        (e.g. first decode iter, schedule-side callers before the channel
+        store in prepare_for_decode).
+        """
+        if self._relayer_buffer_ready("seq_lens"):
             return self.relayer.resolve_seq_lens(
                 self.relayer_gpu_future_indices.indices
             )
         return self.seq_lens
 
     def relayer_resolve_seq_lens_cpu(self):
-        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+        if self._relayer_buffer_ready("seq_lens_cpu"):
             return self.relayer.resolve_seq_lens_cpu(
                 self.relayer_gpu_future_indices.indices
             )
         return self.seq_lens_cpu
 
     def relayer_resolve_orig_seq_lens(self):
-        if self.relayer is not None and self.relayer_gpu_future_indices is not None:
+        if self._relayer_buffer_ready("orig_seq_lens"):
             return self.relayer.resolve_orig_seq_lens(
                 self.relayer_gpu_future_indices.indices
             )
@@ -831,7 +840,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_lens_cpu_cache: Optional[torch.Tensor] = None,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ):
-        """Build ForwardBatch from a ForwardData snapshot."""
+        """Build ForwardBatch from a ForwardData snapshot.
+
+        Worker may set dynamic per-forward overrides on FD between
+        ``to_forward_data`` and forward (e.g. ``capture_hidden_mode`` for
+        target prefill, ``return_hidden_states_before_norm`` for the draft
+        runner). Consumed here in the same one-shot fashion as the SB path.
+        """
+        if capture_hidden_mode is None:
+            capture_hidden_mode = getattr(forward_data, "capture_hidden_mode", None)
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = getattr(forward_data, "seq_lens_cpu_cache", None)
+        return_hidden_states_before_norm = getattr(
+            forward_data, "return_hidden_states_before_norm", False
+        )
+
         if capture_hidden_mode is None:
             if forward_data.return_hidden_states:
                 capture_hidden_mode = CaptureHiddenMode.FULL
@@ -901,6 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=forward_data.spec_algorithm,
             spec_info=forward_data.spec_info,
             capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
             input_embeds=forward_data.input_embeds,
             replace_embeds=forward_data.replace_embeds,
             replace_positions=forward_data.replace_positions,
