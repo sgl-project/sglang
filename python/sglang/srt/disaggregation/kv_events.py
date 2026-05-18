@@ -414,6 +414,40 @@ class KVEventsConfig(BaseModel):
         """Parse the CLI value for the event publisher config."""
         return KVEventsConfig.model_validate_json(cli_value)
 
+    def resolved_block(self, block_size: int, dp_size: int) -> dict:
+        """Project this config into the wire shape consumed by external
+        introspectors (e.g. sgl-router's ``/server_info`` fetch).
+
+        The raw ``endpoint`` string ``tcp://<host>:<port>`` is split into
+        ``endpoint_host`` and ``endpoint_port_base``; ``endpoint_host`` keeps
+        the literal wildcard ``*`` / ``0.0.0.0`` etc. so the consumer can
+        substitute its own routable address (the worker's URL host).
+
+        ``block_size`` (radix tree page size) and ``dp_size`` are scheduler-
+        level facts not stored on the config itself; the caller supplies
+        them from ``ServerArgs.page_size`` / ``ServerArgs.dp_size`` so the
+        consumer can size its index correctly.
+        """
+        host = ""
+        port_base = 0
+        ep = self.endpoint or ""
+        if ep.startswith("tcp://") and ":" in ep[len("tcp://") :]:
+            tail = ep[len("tcp://") :]
+            last_colon = tail.rfind(":")
+            host = tail[:last_colon]
+            try:
+                port_base = int(tail[last_colon + 1 :])
+            except ValueError:
+                port_base = 0
+        return {
+            "publisher": self.publisher,
+            "endpoint_host": host,
+            "endpoint_port_base": port_base,
+            "topic": self.topic,
+            "block_size": block_size,
+            "dp_size": dp_size,
+        }
+
 
 class EventPublisherFactory:
     _registry: dict[str, Callable[..., EventPublisher]] = {

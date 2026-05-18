@@ -635,13 +635,45 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
+    server_args = _global_state.tokenizer_manager.server_args
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+    payload: Dict[str, Any] = {
+        **dataclasses.asdict(server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
     }
+
+    # Surface the resolved kv_events block when --kv-events-config is set, so
+    # external introspectors (e.g. sgl-router) can subscribe without parsing
+    # the raw CLI JSON themselves. The key is absent (not null) when the flag
+    # is unset to keep the contract crisp on the consumer side.
+    kv_events_block = _resolve_kv_events_block(server_args)
+    if kv_events_block is not None:
+        payload["kv_events"] = kv_events_block
+
+    return payload
+
+
+def _resolve_kv_events_block(server_args) -> Optional[Dict[str, Any]]:
+    """Project ``server_args.kv_events_config`` (raw JSON CLI string) into the
+    flat dict shape consumed by router-side introspectors. Returns ``None``
+    when the flag is unset or unparsable so the caller can omit the key.
+    """
+    raw = getattr(server_args, "kv_events_config", None)
+    if not raw:
+        return None
+    try:
+        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+
+        cfg = KVEventsConfig.from_cli(raw)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Failed to parse --kv-events-config for /server_info: %s", e)
+        return None
+    return cfg.resolved_block(
+        block_size=int(getattr(server_args, "page_size", 0) or 0),
+        dp_size=int(getattr(server_args, "dp_size", 1) or 1),
+    )
 
 
 @app.get("/get_load")
