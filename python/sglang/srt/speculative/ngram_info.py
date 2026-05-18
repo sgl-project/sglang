@@ -172,7 +172,7 @@ class NgramVerifyInput(SpecInput):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break

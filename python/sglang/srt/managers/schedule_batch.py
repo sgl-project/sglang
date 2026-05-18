@@ -1222,7 +1222,7 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def check_finished(self, new_accepted_len: int = 1):
+    def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
