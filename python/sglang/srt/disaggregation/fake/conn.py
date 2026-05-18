@@ -51,14 +51,14 @@ class FakeKVSender(BaseKVSender):
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
-        if self.has_sent is False:
+        if not self.has_sent:
             # Assume handshake completed instantly
             return KVPoll.WaitingForInput
-        else:
-            # Assume transfer completed instantly
-            logger.debug("FakeKVSender poll success")
-            self.conclude_state = KVPoll.Success
-            return KVPoll.Success
+
+        # Assume transfer completed instantly
+        logger.debug("FakeKVSender poll success")
+        self.conclude_state = KVPoll.Success
+        return KVPoll.Success
 
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
