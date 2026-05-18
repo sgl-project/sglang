@@ -10,9 +10,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
     FailReason,
-    canary_step,
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_cache_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KIND_HEAD_K,
     VIOLATION_KIND_HEAD_V,
@@ -81,15 +81,43 @@ class CanaryRunner:
         self._pool_kind = pool_kind
 
         attach_shadow_buffers(pool, pool_kind=pool_kind)
-        self._k_slot_stride_bytes = pool.canary_k_slot_stride_bytes
-        self._v_slot_stride_bytes = pool.canary_v_slot_stride_bytes
-        self._k_head, self._k_tail, self._v_head, self._v_tail = get_shadow_buffers(
-            pool
-        )
+        k_slot_stride_bytes = pool.canary_k_slot_stride_bytes
+        v_slot_stride_bytes = pool.canary_v_slot_stride_bytes
+        k_head, k_tail, v_head, v_tail = get_shadow_buffers(pool)
         self._has_v_half: bool = pool.canary_has_v_half
 
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
+        )
+        self._head_endpoint = CanaryEndpoint(
+            kernel_kind=KERNEL_KIND_HEAD,
+            k_shadow=k_head,
+            v_shadow=v_head,
+            k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_K),
+            v_violation=(
+                self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_V)
+                if self._has_v_half
+                else None
+            ),
+            slot_run_counter=self._device_state.slot_run_counter_head,
+            kernel_run_counter=self._device_state.kernel_run_counter_head,
+            k_slot_stride_bytes=k_slot_stride_bytes,
+            v_slot_stride_bytes=v_slot_stride_bytes,
+        )
+        self._tail_endpoint = CanaryEndpoint(
+            kernel_kind=KERNEL_KIND_TAIL,
+            k_shadow=k_tail,
+            v_shadow=v_tail,
+            k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_K),
+            v_violation=(
+                self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_V)
+                if self._has_v_half
+                else None
+            ),
+            slot_run_counter=self._device_state.slot_run_counter_tail,
+            kernel_run_counter=self._device_state.kernel_run_counter_tail,
+            k_slot_stride_bytes=k_slot_stride_bytes,
+            v_slot_stride_bytes=v_slot_stride_bytes,
         )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
         # records these specific addresses; replay-side host code refills
@@ -252,58 +280,16 @@ class CanaryRunner:
         Shared by capture-time recording (skip-sentinel contents) and
         replay-graph re-launch (real contents after pre-fill). K-half and
         V-half each get their own ``CanaryViolationSlot`` so the
-        first-violation latch / ring / is_errored never cross-pollinate.
+        first-violation latch / ring / is_errored never cross-pollinate;
+        head/tail symmetry is captured by :class:`CanaryEndpoint` (each
+        endpoint owns the destination shadows + violation buckets; the peer
+        supplies the source).
         """
         if kernel_kind == KERNEL_KIND_HEAD:
-            src_buf_k, dst_buf_k = self._k_tail, self._k_head
-            src_buf_v, dst_buf_v = self._v_tail, self._v_head
-            slot_run_counter = self._device_state.slot_run_counter_head
-            kernel_run_counter = self._device_state.kernel_run_counter_head
-            kind_k = VIOLATION_KIND_HEAD_K
-            kind_v = VIOLATION_KIND_HEAD_V
+            dst, src = self._head_endpoint, self._tail_endpoint
         else:
-            src_buf_k, dst_buf_k = self._k_head, self._k_tail
-            src_buf_v, dst_buf_v = self._v_head, self._v_tail
-            slot_run_counter = self._device_state.slot_run_counter_tail
-            kernel_run_counter = self._device_state.kernel_run_counter_tail
-            kind_k = VIOLATION_KIND_TAIL_K
-            kind_v = VIOLATION_KIND_TAIL_V
-
-        buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int, str]] = [
-            (src_buf_k, dst_buf_k, self._k_slot_stride_bytes, kind_k)
-        ]
-        if self._has_v_half and src_buf_v is not None and dst_buf_v is not None:
-            buf_specs.append((src_buf_v, dst_buf_v, self._v_slot_stride_bytes, kind_v))
-        for src_buf, dst_buf, stride, kind in buf_specs:
-            slot = self._device_state.get_violation_slot(kind)
-            canary_step(
-                src_buf=src_buf.view(torch.uint8).flatten(),
-                dst_buf=dst_buf.view(torch.uint8).flatten(),
-                slot_stride_bytes=stride,
-                verify_slot_indices=self._launch.verify_slot_indices,
-                verify_positions=self._launch.verify_positions,
-                verify_req_ids=self._launch.verify_req_ids,
-                verify_prev_slot_indices=self._launch.verify_prev_slot_indices,
-                verify_active_mask=self._launch.verify_active_mask,
-                write_slot_indices=self._launch.write_slot_indices,
-                write_token_ids=self._launch.write_token_ids,
-                write_positions=self._launch.write_positions,
-                write_req_ids=self._launch.write_req_ids,
-                write_req_seed_slot_indices=self._launch.write_req_seed_slot_indices,
-                write_req_entry_starts=self._launch.write_req_entry_starts,
-                write_req_entry_counts=self._launch.write_req_entry_counts,
-                write_req_active_mask=self._launch.write_req_active_mask,
-                seed=int(self._config.seed),
-                violation_ring=slot.violation_ring,
-                violation_ring_valid=slot.violation_ring_valid,
-                violation_write_index=slot.violation_write_index,
-                first_violation=slot.first_violation,
-                first_violation_set=slot.first_violation_set,
-                is_errored=slot.is_errored,
-                slot_run_counter=slot_run_counter,
-                kernel_run_counter=kernel_run_counter,
-                kernel_kind=kernel_kind,
-            )
+            dst, src = self._tail_endpoint, self._head_endpoint
+        dst.launch(src=src, launch_buffers=self._launch, seed=int(self._config.seed))
 
     def _run_kernel_pair(
         self,
