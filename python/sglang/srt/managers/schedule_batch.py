@@ -1022,11 +1022,11 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
+        del max_prefix_len
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
-            max_prefix_len = 0
             token_ids = []
 
         if tree_cache is not None:
