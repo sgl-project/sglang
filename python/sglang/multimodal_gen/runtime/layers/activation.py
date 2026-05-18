@@ -16,8 +16,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
-if _is_cuda or _is_hip:
+if _is_cuda:
+    from sglang.jit_kernel.activation import silu_and_mul
+elif _is_hip:
     from sgl_kernel import silu_and_mul
+
 
 if _is_npu:
     import torch_npu
@@ -78,6 +81,15 @@ class GeluAndMul(CustomOp):
 
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, _ = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
+        return y_npu
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""

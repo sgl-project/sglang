@@ -155,14 +155,16 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
             latent_shape = server_args.pipeline_config.prepare_latent_shape(
                 batch, batch_size, num_frames
             )
+            packed_video_shape = self._packed_video_latent_shape(
+                latent_shape, server_args.pipeline_config
+            )
             latents = randn_tensor(
-                self._packed_video_latent_shape(
-                    latent_shape, server_args.pipeline_config
-                ),
+                packed_video_shape,
                 generator=generator,
                 device=device,
                 dtype=dtype,
             )
+            batch.extra["ltx2_stage1_packed_video_shape"] = tuple(packed_video_shape)
 
             latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
             if latent_ids is not None:
@@ -196,13 +198,14 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
             latent_shape = server_args.pipeline_config.prepare_audio_latent_shape(
                 batch, batch_size, batch.num_frames
             )
-
+            packed_audio_shape = self._packed_audio_latent_shape(latent_shape)
             audio_latents = randn_tensor(
-                self._packed_audio_latent_shape(latent_shape),
+                packed_audio_shape,
                 generator=generator,
                 device=device,
                 dtype=dtype,
             )
+            batch.extra["ltx2_stage1_packed_audio_shape"] = tuple(packed_audio_shape)
         else:
             audio_latents = audio_latents.to(device)
             audio_latents = server_args.pipeline_config.maybe_pack_audio_latents(

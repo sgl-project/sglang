@@ -37,13 +37,12 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
-    x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
+    x = x.flatten().contiguous()
+    output = torch.empty_like(x)
+    # USP calls this collective many times per denoising step and waits
+    # immediately, so avoid the extra wrapper overhead of functional collectives.
+    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    return output.reshape(x_shape)
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
