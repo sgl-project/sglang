@@ -20,14 +20,21 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 )
 
 
-# Scripting this brings model speed up 1.4x
-@torch.jit.script
 def snake(x, alpha):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
     x = x.reshape(shape)
     return x
+
+
+# Scripting `snake` brings ~1.4x speed up on CUDA. On ROCm the TensorExpr
+# fuser emits a fused HIPRTC kernel whose `__bfloat162float` helper uses
+# bare `uint32_t`, but HIPRTC's runtime header only exports
+# `__hip_internal::uint32_t`, so compilation fails with bf16 `alpha`
+# (sgl-project/sglang ci-monitor cluster R53). Skip scripting on ROCm.
+if torch.version.hip is None:
+    snake = torch.jit.script(snake)
 
 
 class Snake1d(nn.Module):
