@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::workers::{manager, WorkerRegistry};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -287,6 +287,126 @@ async fn manager_handles_duplicate_added_as_upsert() {
         registry.workers_for(&ModelId("m1".into())).len(),
         1,
         "w1 still serves m1 after the second Added",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// Spawn a fake worker whose `/server_info` returns `body` only after
+/// sleeping for `delay`. Returns the worker URL and a shutdown channel.
+async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Sender<()>) {
+    let body = Arc::new(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let body = body.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                Json((*body).clone())
+            }
+        }),
+    );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), tx)
+}
+
+/// Registration must run in parallel across multiple `Added` events.
+/// Each fake worker delays its `/server_info` by 200ms; with sequential
+/// processing the manager would take ≥1000ms for 5 workers. We allow
+/// up to 600ms (3x the per-fetch delay) as a generous bound that still
+/// rejects the sequential implementation.
+#[tokio::test]
+async fn added_events_run_in_parallel() {
+    let delay = Duration::from_millis(200);
+    let n = 5;
+    let mut workers = Vec::new();
+    for _ in 0..n {
+        workers.push(spawn_slow_worker(json!({"served_model_name": "m"}), delay).await);
+    }
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    let start = Instant::now();
+    for (i, (url, _s)) in workers.iter().enumerate() {
+        tx.send(DiscoveryEvent::Added(spec_for(
+            &format!("w{i}"),
+            url,
+            WorkerMode::Plain,
+        )))
+        .await
+        .unwrap();
+    }
+    let registered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("m".into())).len() == n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let elapsed = start.elapsed();
+    assert!(registered.is_ok(), "manager failed to register {n} workers");
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "registration of {n} workers took {elapsed:?}; sequential per-worker /server_info \
+         fetches would take ≥1000ms — parallel spawn is required"
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A `Removed` issued while the matching `Added` is still mid-fetch
+/// must await the in-flight registration handle before removing.
+/// Without that ordering the removal runs first (registry has nothing
+/// to remove), then the Added's deferred registry write leaks the
+/// worker.
+#[tokio::test]
+async fn removed_awaits_pending_added() {
+    let (url, _s) = spawn_slow_worker(
+        json!({"served_model_name": "m"}),
+        Duration::from_millis(300),
+    )
+    .await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-slow",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tx.send(DiscoveryEvent::Removed {
+        id: WorkerId("w-slow".into()),
+    })
+    .await
+    .unwrap();
+
+    // Wait long enough for the Added's /server_info to complete (300ms),
+    // then assert the worker is gone. If Removed ran before Added's
+    // registry write, the post-fetch write would leak the entry.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        registry.get(&WorkerId("w-slow".into())).is_none(),
+        "Removed must await the in-flight Added; otherwise the deferred \
+         registry write leaks the worker"
     );
 
     drop(tx);
