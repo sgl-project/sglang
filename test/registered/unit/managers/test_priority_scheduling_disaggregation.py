@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -226,8 +225,8 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         )
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.policy.calc_priority.side_effect = (
-            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()

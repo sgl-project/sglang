@@ -204,6 +204,13 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    # Internal PD retract/rebootstrap support. The router injects the selected
+    # prefill HTTP URL so a decode worker can ask the same prefill worker to
+    # recompute stale KV after pause_generation(mode="retract") and cache flush.
+    pd_rebootstrap_prefill_url: Optional[Union[List[str], str]] = None
+    # Internal prefill-only override used by decode rebootstrap to replay the
+    # last already-emitted token while recomputing KV under newer weights.
+    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -607,6 +614,16 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+        # Normalize pd_rebootstrap_prefill_url
+        if self.pd_rebootstrap_prefill_url is None:
+            self.pd_rebootstrap_prefill_url = [None] * num
+        elif not isinstance(self.pd_rebootstrap_prefill_url, list):
+            self.pd_rebootstrap_prefill_url = [self.pd_rebootstrap_prefill_url] * num
+        elif isinstance(self.pd_rebootstrap_prefill_url, list):
+            self.pd_rebootstrap_prefill_url = (
+                self.pd_rebootstrap_prefill_url * self.parallel_sample_num
+            )
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -685,6 +702,12 @@ class GenerateReqInput(BaseReq):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            pd_rebootstrap_prefill_url=(
+                self.pd_rebootstrap_prefill_url[i]
+                if self.pd_rebootstrap_prefill_url is not None
+                else None
+            ),
+            pd_rebootstrap_forced_output_id=self.pd_rebootstrap_forced_output_id,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -761,6 +784,8 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    pd_rebootstrap_prefill_url: Optional[str] = None
+    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False

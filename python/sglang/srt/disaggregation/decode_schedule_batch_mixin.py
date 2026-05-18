@@ -64,6 +64,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len
             req.is_retracted = False
+            if getattr(req, "pd_rebootstrap_in_progress", False):
+                req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
 
