@@ -104,7 +104,11 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(device::kFullMask, val, offset);
+#else
+    uint32_t n = __shfl_up(val, offset, 32);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
@@ -115,7 +119,11 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
+#ifndef USE_ROCM
     val = max(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
+#else
+    val = max(val, __shfl_xor(val, mask, 32));
+#endif
   }
   return val;
 }
@@ -123,7 +131,11 @@ SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_min_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
+#ifndef USE_ROCM
     val = min(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
+#else
+    val = min(val, __shfl_xor(val, mask, 32));
+#endif
   }
   return val;
 }

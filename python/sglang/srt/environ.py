@@ -639,6 +639,9 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    # Use JIT fused_norm_rope kernel on HIP (faster but ~2% accuracy difference
+    # vs Triton due to FP reduction order). Set False for V1-parity precision.
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph
