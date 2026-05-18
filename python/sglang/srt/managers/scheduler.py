@@ -3228,8 +3228,6 @@ class Scheduler(
         # Capture prefill start time
         set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
-        model_worker_batch = batch.get_model_worker_batch()
-
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
 
@@ -3252,7 +3250,7 @@ class Scheduler(
 
         # Initialize split prefill
         forward_batch = self.tp_worker.forward_batch_generation_split_init(
-            model_worker_batch
+            batch
         )
 
         logits_output = None

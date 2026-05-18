@@ -540,7 +540,7 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation_split_init(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
     ) -> ForwardBatch:
         """Initialize a ForwardBatch for layer-pipelined split prefill.
 
@@ -548,7 +548,7 @@ class TpModelWorker(BaseTpWorker):
         extracts last-token logits. The split is controlled solely via
         split_index, not forward_mode.
         """
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.split_index = 0
         return forward_batch
 
