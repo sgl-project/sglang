@@ -189,26 +189,25 @@ class GpuScalarChannel:
 class CpuValueChannel:
     """Per-req CPU value relay (Python int / bool / small object).
 
-    Backing store: ``slot_index -> Dict[name, value]``. Producers write after
-    they know the value (e.g. ``process_batch_result`` decides ``finished`` /
-    ``kv_committed_len`` increment); consumers in the next iter read by slot
-    index.
+    Backing store: ``slot_index -> Dict[name, value]``. Wraparound semantics
+    mirror the GPU ``_SlotAllocator``: ``future_ct`` wraps at
+    ``future_limit`` while the buffer holds ``future_buffer_len = future_limit
+    + headroom`` so an in-flight slot's interval never straddles the wrap
+    boundary, keeping ``intv.indices(future_buffer_len)`` aligned with the
+    stored slot keys.
     """
 
-    def __init__(self, future_buffer_len: int):
+    def __init__(self, future_limit: int, future_buffer_len: int):
+        self.future_limit = future_limit
         self.future_buffer_len = future_buffer_len
         self.future_ct = 0
         self._slots: Dict[int, Dict[str, Any]] = {}
 
     def alloc(self, bs: int) -> FutureIndices:
         cur = self.future_ct
-        self.future_ct = (cur + bs) % self.future_buffer_len
+        self.future_ct = (cur + bs) % self.future_limit
         start = cur + 1
         end = cur + 1 + bs
-        # CPU channel: indices is a plain Python list-backed tensor only for
-        # parity with the GPU channels; consumers use ``.interval`` for slot
-        # lookup. We keep an int64 tensor on CPU so it's cheap and the
-        # FutureIndices dataclass is reusable.
         indices = torch.arange(start, end, dtype=torch.int64)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
@@ -262,7 +261,7 @@ class Relayer:
         self._gpu_allocator = _SlotAllocator(future_limit, future_buffer_len, device)
 
         self.gpu_scalar = GpuScalarChannel(self._gpu_allocator)
-        self.cpu_value = CpuValueChannel(future_buffer_len)
+        self.cpu_value = CpuValueChannel(future_limit, future_buffer_len)
 
         # Iter-pin ring: 2 slots of Python ref lists, rotated each iter.
         self._iter_pin_ring: list = [None, None]
