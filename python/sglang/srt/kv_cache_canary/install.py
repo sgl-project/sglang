@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -201,6 +201,22 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
 _REPLAY_CLASS_PATCHED_ATTR = "_kv_cache_canary_replay_class_patched"
 
 
+_OPTIONAL_GRAPH_RUNNER_CLASSES: Tuple[Tuple[str, str], ...] = (
+    (
+        "sglang.srt.speculative.eagle_draft_cuda_graph_runner",
+        "EAGLEDraftCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner",
+        "EAGLEDraftExtendCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.model_executor.piecewise_cuda_graph_runner",
+        "PiecewiseCudaGraphRunner",
+    ),
+)
+
+
 def _patch_cuda_graph_runner_replay_class_method() -> None:
     """Wrap ``replay`` at the CLASS level for every graph-runner family.
 
@@ -218,36 +234,23 @@ def _patch_cuda_graph_runner_replay_class_method() -> None:
     """
     from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
-    classes_to_patch: list[type] = [CudaGraphRunner]
-    try:
-        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-            EAGLEDraftCudaGraphRunner,
-        )
-
-        classes_to_patch.append(EAGLEDraftCudaGraphRunner)
-    except ImportError:
-        logger.debug("kv-canary: EAGLEDraftCudaGraphRunner not available; skipping")
-    try:
-        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-            EAGLEDraftExtendCudaGraphRunner,
-        )
-
-        classes_to_patch.append(EAGLEDraftExtendCudaGraphRunner)
-    except ImportError:
-        logger.debug(
-            "kv-canary: EAGLEDraftExtendCudaGraphRunner not available; skipping"
-        )
-    try:
-        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-            PiecewiseCudaGraphRunner,
-        )
-
-        classes_to_patch.append(PiecewiseCudaGraphRunner)
-    except ImportError:
-        logger.debug("kv-canary: PiecewiseCudaGraphRunner not available; skipping")
+    classes_to_patch: List[type] = [CudaGraphRunner]
+    for module_path, class_name in _OPTIONAL_GRAPH_RUNNER_CLASSES:
+        optional_cls = _try_import_class(module_path, class_name)
+        if optional_cls is not None:
+            classes_to_patch.append(optional_cls)
 
     for cls in classes_to_patch:
         _patch_graph_runner_class_replay(cls)
+
+
+def _try_import_class(module_path: str, class_name: str) -> Optional[type]:
+    try:
+        module = __import__(module_path, fromlist=[class_name])
+    except ImportError:
+        logger.debug("kv-canary: %s not available; skipping", class_name)
+        return None
+    return getattr(module, class_name, None)
 
 
 def _patch_graph_runner_class_replay(cls: type) -> None:
