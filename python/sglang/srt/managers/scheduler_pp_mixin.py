@@ -639,9 +639,8 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
-                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                forward_batch = ForwardBatch.init_new(batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
