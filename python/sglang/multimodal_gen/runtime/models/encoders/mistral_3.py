@@ -319,7 +319,7 @@ class MistralModel(nn.Module):
 
 
 class Mistral3Model(nn.Module):
-    """Thin wrapper preserving the HF Mistral3 module layout (`model.language_model.*`)."""
+    """Module-layout wrapper: exposes `language_model.*` under `model.*`."""
 
     def __init__(self, config: Mistral3EncoderConfig, prefix: str = "") -> None:
         super().__init__()
@@ -332,10 +332,7 @@ class Mistral3Model(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-# Fields the TP-parallel Mistral transformer reads off `arch_config` at
-# construction time. When the on-disk HF config is a `Mistral3Config` (the
-# multimodal wrapper), every one of these lives under `text_config` and never
-# reaches `arch_config` via the loader's flat `setattr` loop.
+# Scalars that may live under Mistral3Config.text_config and must be hoisted.
 _HOISTED_TEXT_CONFIG_FIELDS = (
     "vocab_size",
     "hidden_size",
@@ -358,19 +355,7 @@ _HOISTED_TEXT_CONFIG_FIELDS = (
 
 
 def _hoist_text_config(arch_config) -> None:
-    """Promote scalar fields from a nested HF ``text_config`` onto ``arch_config``.
-
-    The loader applies the on-disk HF config with ``setattr(arch_config, k, v)``
-    for each top-level attribute. For Mistral3 (multimodal) the transformer
-    scalars live under ``arch_config.text_config`` (an HF ``MistralConfig``)
-    and are otherwise invisible to the SGLang runtime. We only copy fields
-    that are actually present on the source so that defaults declared on
-    ``Mistral3EncoderArchConfig`` are preserved when the checkpoint is a
-    plain MistralConfig (no ``text_config`` indirection).
-
-    ``rope_theta`` is hoisted into the ``rope_parameters`` dict shape that
-    SGLang's ``get_rope(...)`` expects.
-    """
+    """Lift nested HF Mistral3Config.text_config scalars onto arch_config."""
     text_config = getattr(arch_config, "text_config", None)
     if text_config is None:
         return
@@ -395,7 +380,7 @@ class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMi
         "^multi_modal_projector": "model.multi_modal_projector",
         "^language_model.lm_head": "lm_head",
     }
-    uses_sglang_forward_context = False
+    uses_sglang_forward_context = True
     layerwise_offload_dit_group_enabled = False
     layer_names = ["model.language_model.layers"]
     _supported_attention_backends = (
@@ -404,14 +389,6 @@ class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMi
 
     def __init__(self, config: Mistral3EncoderConfig) -> None:
         super().__init__(config)
-        # The text-encoder loader overlays the on-disk HF Mistral3 config
-        # (Mistral3Config / LlavaConfig) onto `arch_config` via
-        # `setattr(arch_config, key, value)` for each top-level HF attr. For
-        # the multimodal Mistral3 variant the scalar transformer params
-        # (hidden_size, num_attention_heads, intermediate_size, ...) live
-        # under a nested `text_config` PretrainedConfig and never reach
-        # `arch_config` directly, leaving stale defaults in place. Hoist them
-        # so the TP-parallel layers below see real checkpoint shapes.
         _hoist_text_config(config.arch_config)
         self.model = Mistral3Model(config, prefix="model")
 
@@ -431,7 +408,6 @@ class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMi
         output_hidden_states: bool | None = True,
         **kwargs,
     ) -> BaseEncoderOutput:
-        # FLUX.2 always wants hidden_states for layer-skip selection.
         return self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -449,15 +425,12 @@ class Mistral3ForConditionalGeneration(TextEncoder, LayerwiseOffloadableModuleMi
         stacked_params_mapping = self.config.arch_config.stacked_params_mapping
         for name, loaded_weight in weights:
             name_lower = name.lower()
-            # Text-encoder-only path: drop vision / projector / lm_head shards.
             if (
                 "vision" in name_lower
                 or "multi" in name_lower
                 or "lm_head" in name_lower
             ):
                 continue
-            # HF Mistral3 nests the LLM as `language_model.model.*`; SGLang's
-            # module tree exposes it as `model.language_model.*`.
             name = name.replace("language_model.model.", "model.language_model.")
             if "rotary_emb.inv_freq" in name:
                 continue
