@@ -80,7 +80,7 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
+                    recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -214,7 +214,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -230,7 +230,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -360,7 +360,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -639,9 +639,8 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
-                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                forward_batch = ForwardBatch.init_new(batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(

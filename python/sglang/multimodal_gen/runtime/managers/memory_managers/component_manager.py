@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
     LayerwiseOffloadStrategy,
     ResidentStrategy,
     VanillaD2HStrategy,
+    is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
@@ -91,10 +92,6 @@ class ComponentResidencyPipeline(Protocol):
     modules: Mapping[str, object]
     _stage_name_mapping: Mapping[str, ComponentResidencyStage]
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
-
-
-def is_fsdp_managed_module(module: nn.Module) -> bool:
-    return module.__class__.__name__.startswith("FSDP")
 
 
 def should_cpu_offload_component(

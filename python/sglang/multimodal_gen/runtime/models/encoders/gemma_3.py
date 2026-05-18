@@ -941,7 +941,7 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
     # HF source keys back into our nested namespace when transferring weights.
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["language_model.layers"]
 
     param_names_mapping = {
