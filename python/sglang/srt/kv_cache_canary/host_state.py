@@ -238,16 +238,12 @@ class CanaryHostState:
                 # recent ``max_verify_per_req_per_forward`` entries instead.
                 # 0 = unbounded.
                 cap = self._config.max_verify_per_req_per_forward
-                verify_window = (
-                    state.history if cap <= 0 else state.history[-cap:]
-                )
+                verify_window = state.history if cap <= 0 else state.history[-cap:]
                 for entry in verify_window:
                     verify_req_ids.append(req_pool_idx)
                     verify_token_ids.append(entry.token_id)
                     verify_positions.append(entry.position)
-                    verify_prev_hashes.append(
-                        to_signed_int64(entry.prev_hash_at_write)
-                    )
+                    verify_prev_hashes.append(to_signed_int64(entry.prev_hash_at_write))
                     verify_seq_positions.append(entry.position)
                     verify_slot_indices.append(entry.slot_idx)
 
