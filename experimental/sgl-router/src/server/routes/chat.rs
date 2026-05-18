@@ -290,7 +290,34 @@ pub async fn chat_completions(
     };
     ctx.metrics
         .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
-    result
+
+    // Mirror the upstream `x-sgl-decode-url` hint onto the response so
+    // external tests / sidecars can observe PD decode affinity without
+    // sniffing the proxy hop. The request-side header was set above for
+    // the prefill worker; copying it here makes the affinity observable
+    // end-to-end. Plain-mode requests skip this (no decode peer was
+    // resolved). A malformed URL was already rejected at the
+    // request-side parse — we only reach this branch when the URL was
+    // header-valid, so the second parse is safe.
+    match (result, decode_hint) {
+        (Ok(mut response), Some(url)) => {
+            match HeaderValue::from_str(&url) {
+                Ok(v) => {
+                    response.headers_mut().insert(X_SGL_DECODE_URL, v);
+                }
+                Err(e) => {
+                    // Already-validated upstream; defensive log only.
+                    tracing::warn!(
+                        decode_url = %url,
+                        error = %e,
+                        "decode worker URL rejected by header parser on response; omitting response-side hint",
+                    );
+                }
+            }
+            Ok(response)
+        }
+        (other, _) => other,
+    }
 }
 
 /// Estimate prefill-token count from the raw request body for use as
