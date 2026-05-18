@@ -417,6 +417,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weight_indices=weight_indices,
             permutation=permutation,
             expected_tokens=expected_tokens,
+            # lm_head LoRA pruned path runs eager (outside captured PCG region),
+            # so its batch_info must NOT advertise use_cuda_graph=True — that
+            # is what layers.py:_get_lm_head_batch_info refuses.
+            use_cuda_graph=False,
         )
 
     @staticmethod

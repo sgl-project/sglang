@@ -375,6 +375,10 @@ class TritonLoRABackend(BaseLoRABackend):
             max_len=max(seg_lens_cpu),
             seg_lens=seg_lens,
             seg_indptr=seg_indptr,
+            # lm_head LoRA pruned path runs eager (outside captured PCG region),
+            # so its batch_info must NOT advertise use_cuda_graph=True — that
+            # is what layers.py:_get_lm_head_batch_info refuses.
+            use_cuda_graph=False,
             weight_indices=torch.tensor(
                 seg_weight_indices_cpu, dtype=torch.int32, device=self.device
             ),

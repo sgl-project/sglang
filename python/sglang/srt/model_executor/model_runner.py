@@ -2810,18 +2810,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # B5: PCG capture path triggers `lm_head LoRA with pruned batch info`
-        # RuntimeError (lora/layers.py:319-325) inside warmup_compile. Skip PCG
-        # when the active LoRA config targets lm_head until that path is made
-        # graph-safe.
-        if self.server_args.enable_lora and "lm_head" in getattr(
-            getattr(self, "lora_manager", None), "target_modules", set()
-        ):
-            logger.warning(
-                "Disable piecewise CUDA graph because --enable-lora targets lm_head; "
-                "the lm_head LoRA pruned path is not yet graph-safe."
-            )
-            return
+        # Note: lm_head LoRA pruned path is kept compatible with PCG by forcing
+        # its dedicated lm_head_batch_info.use_cuda_graph=False in
+        # triton/chunked backends (the pruned compute runs eager OUTSIDE the
+        # captured graph region, so it does not need cuda-graph metadata).
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
