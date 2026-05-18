@@ -85,6 +85,7 @@ jobs:
               "diffusers": [
                   "flux_2_image_t2i",
                   "flux_2_klein_image_t2i",
+                  "flux_2_klein_base_image_t2i",
                   "flux_2_ti2i",
                   "flux_image_t2i",
                   "qwen_image_edit_2509_ti2i",
@@ -120,6 +121,7 @@ jobs:
           h200_cases = {
               "flux_2_image_t2i",
               "flux_2_klein_image_t2i",
+              "flux_2_klein_base_image_t2i",
               "flux_2_ti2i",
           }
           include = []
