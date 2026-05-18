@@ -92,6 +92,11 @@ def _set_canary_shadow(
     sub-pool supplied the templates). ``v_template=None`` means the pool
     has no V half (MLA latent rep, DSV4 single kv_buffer); only the K-half
     shadow gets allocated and ``canary_has_v_half`` is False.
+
+    K and V halves get INDEPENDENT per-slot strides because some pool
+    flavours (e.g. DeepSeek MLA, certain SWA layouts) use different
+    ``head_dim`` for K vs V — sharing the K stride to index V causes
+    cross-slot byte aliasing.
     """
     dtype = k_template.dtype
     device = k_template.device
@@ -99,17 +104,22 @@ def _set_canary_shadow(
 
     target.canary_k_head = torch.zeros(k_shape, dtype=dtype, device=device)
     target.canary_k_tail = torch.zeros(k_shape, dtype=dtype, device=device)
+    target.canary_k_slot_stride_bytes = int(k_template[0].nbytes)
     if v_template is None:
         target.canary_v_head = None
         target.canary_v_tail = None
         target.canary_has_v_half = False
+        target.canary_v_slot_stride_bytes = 0
     else:
         v_shape = tuple(v_template.shape)
         target.canary_v_head = torch.zeros(v_shape, dtype=dtype, device=device)
         target.canary_v_tail = torch.zeros(v_shape, dtype=dtype, device=device)
         target.canary_has_v_half = True
+        target.canary_v_slot_stride_bytes = int(v_template[0].nbytes)
 
-    target.canary_slot_stride_bytes = int(k_template[0].nbytes)
+    # Legacy alias: callers can still read ``canary_slot_stride_bytes`` for
+    # the K-half stride. Prefer the explicit K/V fields above.
+    target.canary_slot_stride_bytes = target.canary_k_slot_stride_bytes
 
 
 def _attach_mha(pool: "MHATokenToKVPool") -> None:

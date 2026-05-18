@@ -70,7 +70,8 @@ class CanaryRunner:
         self._pool_kind = pool_kind
 
         attach_shadow_buffers(pool, pool_kind=pool_kind)
-        self._slot_stride_bytes = pool.canary_slot_stride_bytes
+        self._k_slot_stride_bytes = pool.canary_k_slot_stride_bytes
+        self._v_slot_stride_bytes = pool.canary_v_slot_stride_bytes
         self._k_head, self._k_tail, self._v_head, self._v_tail = get_shadow_buffers(
             pool
         )
@@ -246,14 +247,19 @@ class CanaryRunner:
         verify_mask = _to_int32(plan.verify_mask, self._device)
         verify_seq_positions = _to_int64(plan.verify_seq_positions, self._device)
 
-        buf_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = [(src_buf_k, dst_buf_k)]
+        # (src_buf, dst_buf, slot_stride_bytes) per half. V half uses its own
+        # stride because some pools have head_dim != v_head_dim — sharing the
+        # K stride would index off the V slot boundary and corrupt verifies.
+        buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int]] = [
+            (src_buf_k, dst_buf_k, self._k_slot_stride_bytes)
+        ]
         if self._has_v_half and src_buf_v is not None and dst_buf_v is not None:
-            buf_pairs.append((src_buf_v, dst_buf_v))
-        for src_buf, dst_buf in buf_pairs:
+            buf_specs.append((src_buf_v, dst_buf_v, self._v_slot_stride_bytes))
+        for src_buf, dst_buf, stride in buf_specs:
             canary_step(
                 src_buf=src_buf.view(torch.uint8).flatten(),
                 dst_buf=dst_buf.view(torch.uint8).flatten(),
-                slot_stride_bytes=self._slot_stride_bytes,
+                slot_stride_bytes=stride,
                 slot_indices=slot_indices,
                 expected_req_ids=expected_req_ids,
                 expected_token_ids=expected_token_ids,
