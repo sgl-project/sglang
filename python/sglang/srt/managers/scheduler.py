@@ -3149,7 +3149,11 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
-                    bs = len(batch.seq_lens)
+                    # Read SB size via channel-resolved view so the
+                    # batch-size measurement uses the same seq_lens slot
+                    # forward will consume from the Relayer; equivalent to
+                    # ``len(batch.seq_lens)`` when no ctx is bound.
+                    bs = len(batch.relayer_resolve_seq_lens())
                     # Prefer SB-attached iter slots (set by
                     # ``ScheduleBatch.bind_relayer_for_iter`` during the
                     # schedule pass) so prepare_for_decode's writes have
