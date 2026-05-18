@@ -2749,6 +2749,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.assert_lockstep()
 
     def merge_batch(self, other: "ScheduleBatch"):
+        # Drop any pre-merge relayer ctx: cpu_value slot has only self's
+        # pre-merge bs entries, and is no longer aligned with the post-merge
+        # reqs. filter_batch on the merged batch must fall back to
+        # req.finished() until a fresh bind_relayer_for_iter rebinds.
+        self.clear_relayer_ctx()
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
