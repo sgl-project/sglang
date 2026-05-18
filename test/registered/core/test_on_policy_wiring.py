@@ -1,7 +1,9 @@
 import json
 import os
 import subprocess
+import sys
 import textwrap
+import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,13 +13,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.true_on_policy import (
+    DeterministicInferenceScope,
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     QWEN3_MOE_TRUE_ON_POLICY_V1,
     get_moe_topk_tiebreak,
-    get_rl_on_policy_target,
     get_true_on_policy_contract,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
+    override_true_on_policy_runtime_policy_enabled,
+    patch_prefill_only_deterministic_attention_backend,
     patch_prefill_only_deterministic_inference_for_cuda_graph,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
@@ -32,8 +36,6 @@ from sglang.srt.true_on_policy import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
-
-_PATCH_TARGET = "sglang.srt.server_args.get_global_server_args"
 
 
 def _run_server_args_script(argv: list[str]) -> dict[str, object]:
@@ -118,7 +120,6 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
                     "enable_deterministic_inference": server_args.enable_deterministic_inference,
                     "enable_prefill_only_deterministic_inference": server_args.enable_prefill_only_deterministic_inference,
                     "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
-                    "rl_on_policy_target": server_args.rl_on_policy_target,
                     "true_on_policy_contract": server_args.true_on_policy_contract,
                     "sampling_backend": server_args.sampling_backend,
                 }
@@ -156,38 +157,7 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
 
         self.assertTrue(result["enable_prefill_only_deterministic_inference"])
-        self.assertTrue(result["enable_deterministic_inference"])
-        self.assertIsNone(result["rl_on_policy_target"])
-        self.assertEqual(result["sampling_backend"], "pytorch")
-
-    def test_cli_accepts_fsdp_and_fsdp_tp_targets(self):
-        fsdp_tp_result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--rl-on-policy-target",
-                "fsdp_tp",
-            ]
-        )
-        self.assertEqual(fsdp_tp_result["rl_on_policy_target"], "fsdp_tp")
-        self.assertIsNone(fsdp_tp_result["true_on_policy_contract"])
-        self.assertTrue(fsdp_tp_result["enable_deterministic_inference"])
-
-        fsdp_result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--rl-on-policy-target",
-                "fsdp",
-            ]
-        )
-        self.assertEqual(fsdp_result["rl_on_policy_target"], "fsdp")
-        self.assertIsNone(fsdp_result["true_on_policy_contract"])
-        self.assertTrue(fsdp_result["enable_deterministic_inference"])
+        self.assertFalse(result["enable_deterministic_inference"])
 
     def test_cli_accepts_explicit_true_on_policy_contract(self):
         result = _run_server_args_script(
@@ -201,11 +171,29 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             ]
         )
 
-        self.assertIsNone(result["rl_on_policy_target"])
         self.assertEqual(
             result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
         )
         self.assertTrue(result["enable_deterministic_inference"])
+
+    def test_prefill_only_contract_does_not_force_decode_deterministic(self):
+        result = _run_server_args_script(
+            [
+                "--model-path",
+                "dummy",
+                "--attention-backend",
+                "triton",
+                "--true-on-policy-contract",
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                "--enable-prefill-only-deterministic-inference",
+            ]
+        )
+
+        self.assertEqual(
+            result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
+        )
+        self.assertTrue(result["enable_prefill_only_deterministic_inference"])
+        self.assertFalse(result["enable_deterministic_inference"])
 
     def test_contract_tp_rollout_disables_flashinfer_allreduce_fusion(self):
         result = _run_server_args_script(
@@ -223,117 +211,117 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
         self.assertFalse(result["enable_flashinfer_allreduce_fusion"])
 
-    def test_legacy_target_keeps_flashinfer_allreduce_fusion_available(self):
+    def test_prefill_only_contract_keeps_flashinfer_fusion_for_decode(self):
         result = _run_server_args_script(
             [
                 "--model-path",
                 "dummy",
                 "--attention-backend",
                 "triton",
-                "--rl-on-policy-target",
-                "fsdp_tp",
+                "--tensor-parallel-size",
+                "2",
+                "--true-on-policy-contract",
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                "--enable-prefill-only-deterministic-inference",
                 "--enable-flashinfer-allreduce-fusion",
             ]
         )
         self.assertTrue(result["enable_flashinfer_allreduce_fusion"])
 
 
-def _mock_args(**kwargs):
-    defaults = dict(
-        rl_on_policy_target=None,
-        true_on_policy_contract=None,
-        tp_size=1,
-    )
-    defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
-
-
-def _contract_args(*, tp_size: int = 1):
-    return _mock_args(
-        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-        tp_size=tp_size,
-    )
-
-
-def _moe_contract_args(*, tp_size: int = 1, ep_size: int = 1):
-    return _mock_args(
-        true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
-        tp_size=tp_size,
-        ep_size=ep_size,
-    )
-
-
 class TestDefaultPathUnchanged(unittest.TestCase):
     """Default serving must not enter true-on-policy policy paths."""
 
     def setUp(self):
-        self.default_args = _mock_args()
+        self.default_args = SimpleNamespace(
+            true_on_policy_contract=None,
+            tp_size=1,
+        )
 
     def test_default_args_no_on_policy(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertIsNone(get_rl_on_policy_target())
-            self.assertFalse(is_true_on_policy_enabled())
-            self.assertFalse(is_tp_invariant_target())
+        self.assertFalse(is_true_on_policy_enabled(self.default_args))
+        self.assertFalse(is_tp_invariant_target(self.default_args))
 
     def test_default_args_row_linear_uses_quant_method(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(
-                    256,
-                    row_linear_enable_inv=True,
-                )
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=self.default_args,
+                row_linear_enable_inv=True,
             )
+        )
 
     def test_default_args_tree_allreduce_not_selected(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(
-                should_use_tp_invariant_tree_all_reduce(
-                    accl_binary_tree_enabled=False,
-                )
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self.default_args,
+                accl_binary_tree_enabled=False,
             )
+        )
 
     def test_default_args_moe_combine_uses_standard_allreduce(self):
         self.assertFalse(should_use_deterministic_moe_combine(self.default_args))
 
     def test_default_args_reduce_scatter_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_reduce_scatter_for_on_policy())
+        self.assertFalse(should_disable_reduce_scatter_for_on_policy(self.default_args))
 
     def test_default_args_mlp_fusion_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_mlp_allreduce_fusion_for_on_policy())
+        self.assertFalse(
+            should_disable_mlp_allreduce_fusion_for_on_policy(self.default_args)
+        )
 
     def test_default_args_flashinfer_fusion_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_flashinfer_allreduce_fusion())
+        self.assertFalse(should_disable_flashinfer_allreduce_fusion(self.default_args))
 
     def test_default_server_args_cli_no_on_policy_flags(self):
         result = _run_server_args_script(
             ["--model-path", "dummy", "--attention-backend", "triton"]
         )
-        self.assertIsNone(result["rl_on_policy_target"])
         self.assertFalse(result["enable_deterministic_inference"])
         self.assertFalse(result["enable_prefill_only_deterministic_inference"])
 
 
 class TestOnPolicyHelpers(unittest.TestCase):
+    def _contract_args(self, *, tp_size: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            tp_size=tp_size,
+            ep_size=1,
+        )
+
+    def _moe_contract_args(
+        self, *, tp_size: int = 1, ep_size: int = 1
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
+            tp_size=tp_size,
+            ep_size=ep_size,
+        )
+
     def test_tp_invariant_row_linear_selection(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=self._contract_args(tp_size=2),
+                row_linear_enable_inv=True,
+            )
+        )
+
+    def test_tp_invariant_row_linear_selection_is_contract_owned(self):
+        with patch.dict(os.environ, {"ROW_LINEAR_ENABLE_INV": "0"}):
             self.assertTrue(
                 should_use_tp_invariant_row_linear(
                     256,
-                    row_linear_enable_inv=True,
+                    server_args=self._contract_args(tp_size=2),
                 )
             )
 
-    def test_tp_invariant_row_linear_selection_is_contract_owned(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            with patch.dict(os.environ, {"ROW_LINEAR_ENABLE_INV": "0"}):
-                self.assertTrue(should_use_tp_invariant_row_linear(256))
-
-    def test_contract_resolver_ignores_legacy_target_without_contract(self):
+    def test_contract_resolver_no_contract_disables_policy(self):
         policy = resolve_true_on_policy_runtime_policy(
-            _mock_args(rl_on_policy_target="fsdp_tp", tp_size=2)
+            SimpleNamespace(
+                true_on_policy_contract=None,
+                tp_size=2,
+            )
         )
 
         self.assertIsNone(policy.contract_name)
@@ -342,30 +330,131 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertFalse(policy.deterministic_tree_all_reduce)
 
     def test_contract_resolver_accepts_explicit_qwen3_dense_contract(self):
-        args_tp1 = _contract_args(tp_size=1)
-        policy = resolve_true_on_policy_runtime_policy(args_tp1)
+        policy = resolve_true_on_policy_runtime_policy(self._contract_args(tp_size=1))
 
         self.assertTrue(policy.enabled)
         self.assertTrue(policy.force_bfloat16_dense_tensor_math)
         self.assertFalse(policy.tp_invariant_row_linear)
-        with patch(_PATCH_TARGET, return_value=args_tp1):
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(
-                    96,
-                    row_linear_enable_inv=True,
-                )
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                96,
+                server_args=self._contract_args(tp_size=1),
+                row_linear_enable_inv=True,
             )
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(
-                    256,
-                    row_linear_enable_inv=True,
-                )
+        )
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=self._contract_args(tp_size=1),
+                row_linear_enable_inv=True,
             )
+        )
+
+    def test_runtime_policy_override_disables_contract_paths_in_decode_context(self):
+        server_args = self._moe_contract_args(tp_size=1, ep_size=4)
+
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
+
+        with override_true_on_policy_runtime_policy_enabled(False):
+            policy = resolve_true_on_policy_runtime_policy(server_args)
+
+            self.assertFalse(policy.enabled)
+            self.assertFalse(is_true_on_policy_enabled(server_args))
+            self.assertFalse(should_use_deterministic_moe_routing(server_args))
+
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
+
+    def test_prefill_only_cuda_graph_patch_disables_contract_runtime_policy(self):
+        server_args = self._moe_contract_args(tp_size=4, ep_size=4)
+        server_args.enable_prefill_only_deterministic_inference = True
+        attn_backend = SimpleNamespace(num_splits=7)
+
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(256, server_args=server_args)
+        )
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
+
+        with patch_prefill_only_deterministic_inference_for_cuda_graph(
+            server_args,
+            attn_backend=attn_backend,
+        ) as patched:
+            self.assertTrue(patched)
+            self.assertEqual(attn_backend.num_splits, 0)
+            self.assertFalse(is_true_on_policy_enabled(server_args))
+            self.assertFalse(
+                should_use_tp_invariant_row_linear(256, server_args=server_args)
+            )
+            self.assertFalse(should_use_deterministic_moe_routing(server_args))
+
+        self.assertEqual(attn_backend.num_splits, 7)
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
+
+    def test_deterministic_scope_temporarily_disables_flashinfer_fusion(self):
+        server_args = self._moe_contract_args(tp_size=4, ep_size=4)
+        server_args.enable_deterministic_inference = False
+        server_args.enable_flashinfer_allreduce_fusion = True
+
+        batch_state = {"enabled": False}
+        tp_state = {"enabled": False}
+        batch_mod = types.ModuleType("sglang.srt.batch_invariant_ops")
+        batch_mod.is_batch_invariant_mode_enabled = lambda: batch_state["enabled"]
+        batch_mod.enable_batch_invariant_mode = lambda: batch_state.update(enabled=True)
+        batch_mod.disable_batch_invariant_mode = lambda: batch_state.update(
+            enabled=False
+        )
+        tp_mod = types.ModuleType("sglang.srt.tp_invariant_ops")
+        tp_mod.is_tp_invariant_mode_enabled = lambda: tp_state["enabled"]
+        tp_mod.enable_tp_invariant_mode = lambda: tp_state.update(enabled=True)
+        tp_mod.disable_tp_invariant_mode = lambda: tp_state.update(enabled=False)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.batch_invariant_ops": batch_mod,
+                "sglang.srt.tp_invariant_ops": tp_mod,
+            },
+        ):
+            with DeterministicInferenceScope(server_args):
+                self.assertTrue(server_args.enable_deterministic_inference)
+                self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
+                self.assertTrue(should_use_tp_invariant_tree_all_reduce(server_args))
+                self.assertTrue(batch_state["enabled"])
+                self.assertTrue(tp_state["enabled"])
+
+        self.assertFalse(server_args.enable_deterministic_inference)
+        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
+        self.assertFalse(batch_state["enabled"])
+        self.assertFalse(tp_state["enabled"])
+
+    def test_prefill_only_deterministic_attention_backend_restores_num_splits(self):
+        nested = SimpleNamespace(num_splits=3)
+        root = SimpleNamespace(
+            num_splits=0,
+            prefill_backend=SimpleNamespace(num_splits=5),
+            decode_backend=SimpleNamespace(num_splits=8),
+            attn_backend_list=[nested],
+        )
+        nested.primary = root
+
+        with patch_prefill_only_deterministic_attention_backend(root):
+            self.assertEqual(root.num_splits, 1)
+            self.assertEqual(root.prefill_backend.num_splits, 1)
+            self.assertEqual(root.decode_backend.num_splits, 1)
+            self.assertEqual(nested.num_splits, 1)
+
+        self.assertEqual(root.num_splits, 0)
+        self.assertEqual(root.prefill_backend.num_splits, 5)
+        self.assertEqual(root.decode_backend.num_splits, 8)
+        self.assertEqual(nested.num_splits, 3)
 
     def test_contract_object_owns_sglang_runtime_policy_values(self):
         contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
 
-        policy = contract.policy_for(_contract_args(tp_size=2))
+        policy = contract.policy_for(self._contract_args(tp_size=2))
 
         self.assertEqual(contract.schema.name, QWEN3_DENSE_TRUE_ON_POLICY_V1)
         self.assertEqual(contract.schema.model_family, "qwen3_dense")
@@ -382,7 +471,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
     def test_qwen3_moe_contract_splits_tp_and_ep_policy_values(self):
         policy = resolve_true_on_policy_runtime_policy(
-            _moe_contract_args(tp_size=1, ep_size=4)
+            self._moe_contract_args(tp_size=1, ep_size=4)
         )
 
         self.assertEqual(policy.contract_name, QWEN3_MOE_TRUE_ON_POLICY_V1)
@@ -394,17 +483,19 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(policy.ep_invariant_moe)
         self.assertTrue(policy.deterministic_moe_dispatch)
         self.assertTrue(policy.deterministic_moe_combine)
-        self.assertTrue(should_use_deterministic_moe_routing(_moe_contract_args()))
+        self.assertTrue(should_use_deterministic_moe_routing(self._moe_contract_args()))
         self.assertTrue(
             should_use_deterministic_moe_combine(
-                _moe_contract_args(tp_size=1, ep_size=4)
+                self._moe_contract_args(tp_size=1, ep_size=4)
             )
         )
-        self.assertEqual(get_moe_topk_tiebreak(_moe_contract_args()), "stable_sort")
+        self.assertEqual(
+            get_moe_topk_tiebreak(self._moe_contract_args()), "stable_sort"
+        )
 
     def test_qwen3_moe_rollout_tp_still_enables_tp_policy_values(self):
         policy = resolve_true_on_policy_runtime_policy(
-            _moe_contract_args(tp_size=8, ep_size=1)
+            self._moe_contract_args(tp_size=8, ep_size=1)
         )
 
         self.assertTrue(policy.tp_invariant_row_linear)
@@ -420,7 +511,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertIn("weight_dtype=torch.float32", qwen3_moe_source)
         self.assertIn("fp32_residual=True", qwen3_moe_source)
         self.assertIn("override_orig_dtype=torch.float32", qwen3_moe_source)
-        self.assertIn("should_force_bfloat16_dense_tensor_math", qwen3_moe_source)
+        self.assertIn(
+            "hidden_states.dtype != self.qkv_proj.weight.dtype", qwen3_moe_source
+        )
         self.assertIn("q = q.to(v.dtype)", qwen3_moe_source)
         self.assertIn("k = k.to(v.dtype)", qwen3_moe_source)
 
@@ -444,12 +537,36 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertIn("should_use_deterministic_moe_combine", qwen3_moe_source)
         self.assertIn("moe_expert_parallel_tree_all_reduce", qwen3_moe_source)
 
+    def test_custom_tree_all_reduce_is_opt_in(self):
+        from sglang.srt.distributed.communication_op import (
+            _maybe_custom_tree_all_reduce,
+        )
+
+        input_tensor = torch.tensor([1.0])
+        ca_comm = SimpleNamespace(custom_tree_all_reduce=lambda x: x + 1.0)
+        group = SimpleNamespace(ca_comm=ca_comm)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(_maybe_custom_tree_all_reduce(input_tensor, group))
+
+        with patch.dict(
+            os.environ, {"SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE": "1"}
+        ):
+            self.assertTrue(
+                torch.equal(
+                    _maybe_custom_tree_all_reduce(input_tensor, group),
+                    torch.tensor([2.0]),
+                )
+            )
+
     def test_true_on_policy_dp_attention_uses_max_len_padding(self):
         try:
             from sglang.srt.layers import dp_attention
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         with (
@@ -513,7 +630,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         batch = ForwardBatch(
@@ -576,7 +695,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             from sglang.srt.layers.dp_attention import DpPaddingMode
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         communicator = object.__new__(LayerCommunicator)
@@ -610,36 +731,47 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertFalse(allow_reduce_scatter)
 
     def test_reduce_scatter_and_fusion_are_disabled_for_contract(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertTrue(should_disable_reduce_scatter_for_on_policy())
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertTrue(should_disable_mlp_allreduce_fusion_for_on_policy())
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertFalse(should_disable_reduce_scatter_for_on_policy())
+        self.assertTrue(
+            should_disable_reduce_scatter_for_on_policy(self._contract_args(tp_size=1))
+        )
+        self.assertTrue(
+            should_disable_mlp_allreduce_fusion_for_on_policy(
+                self._contract_args(tp_size=2)
+            )
+        )
+        self.assertFalse(
+            should_disable_reduce_scatter_for_on_policy(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
 
     def test_tree_all_reduce_selection_requires_tp_rollout_and_no_accl(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertTrue(
-                should_use_tp_invariant_tree_all_reduce(
-                    accl_binary_tree_enabled=False,
-                )
+        self.assertTrue(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=2),
+                accl_binary_tree_enabled=False,
             )
-            self.assertFalse(
-                should_use_tp_invariant_tree_all_reduce(
-                    accl_binary_tree_enabled=True,
-                )
+        )
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=2),
+                accl_binary_tree_enabled=True,
             )
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertFalse(
-                should_use_tp_invariant_tree_all_reduce(
-                    accl_binary_tree_enabled=False,
-                )
+        )
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=1),
+                accl_binary_tree_enabled=False,
             )
+        )
 
     def test_tree_all_reduce_selection_is_contract_owned(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            with patch.dict(os.environ, {"ACCL_BINARY_TREE_ENABLE": "1"}):
-                self.assertTrue(should_use_tp_invariant_tree_all_reduce())
+        with patch.dict(os.environ, {"ACCL_BINARY_TREE_ENABLE": "1"}):
+            self.assertTrue(
+                should_use_tp_invariant_tree_all_reduce(
+                    server_args=self._contract_args(tp_size=2),
+                )
+            )
 
     def test_attention_handoff_tree_reduce_uses_attention_tp_group(self):
         from sglang.srt.layers.communicator import (
@@ -667,9 +799,20 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.layers.communicator.attention_tensor_model_parallel_all_reduce",
+                "sglang.srt.layers.communicator.should_use_tp_invariant_tree_all_reduce",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.attention_tensor_model_parallel_tree_all_reduce",
                 side_effect=lambda x: x + 10.0,
             ) as attn_tree_reduce,
+            patch(
+                "sglang.srt.layers.communicator.tensor_model_parallel_tree_all_reduce",
+                side_effect=AssertionError(
+                    "generic TP tree reduce must not handle attention output"
+                ),
+                create=True,
+            ),
         ):
             output, output_residual = (
                 CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
@@ -760,7 +903,13 @@ class TestOnPolicyHelpers(unittest.TestCase):
             enable_prefill_only_deterministic_inference=True,
             enable_deterministic_inference=True,
             enable_flashinfer_allreduce_fusion=False,
-            rl_on_policy_target="fsdp_tp",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            disable_custom_all_reduce=True,
+        )
+        global_server_args = SimpleNamespace(
+            enable_prefill_only_deterministic_inference=True,
+            enable_deterministic_inference=True,
+            enable_flashinfer_allreduce_fusion=False,
             true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
             disable_custom_all_reduce=True,
         )
@@ -778,13 +927,17 @@ class TestOnPolicyHelpers(unittest.TestCase):
             with patch_prefill_only_deterministic_inference_for_cuda_graph(
                 server_args,
                 attn_backend=attn_backend,
+                global_server_args=global_server_args,
             ) as patched:
                 self.assertTrue(patched)
                 self.assertTrue(server_args.enable_deterministic_inference)
                 self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
-                self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
                 self.assertEqual(
                     server_args.true_on_policy_contract,
+                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                )
+                self.assertEqual(
+                    global_server_args.true_on_policy_contract,
                     QWEN3_DENSE_TRUE_ON_POLICY_V1,
                 )
                 self.assertEqual(attn_backend.num_splits, 0)
@@ -796,9 +949,12 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
             self.assertTrue(server_args.enable_deterministic_inference)
             self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
-            self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
             self.assertEqual(
                 server_args.true_on_policy_contract,
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            )
+            self.assertEqual(
+                global_server_args.true_on_policy_contract,
                 QWEN3_DENSE_TRUE_ON_POLICY_V1,
             )
             self.assertTrue(server_args.disable_custom_all_reduce)
@@ -808,85 +964,104 @@ class TestOnPolicyHelpers(unittest.TestCase):
             self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
 
     def test_row_linear_k_alignment_edge_cases(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(64, row_linear_enable_inv=True),
-            )
-            self.assertTrue(
-                should_use_tp_invariant_row_linear(128, row_linear_enable_inv=True),
-            )
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(300, row_linear_enable_inv=True),
-            )
-            self.assertTrue(
-                should_use_tp_invariant_row_linear(3584, row_linear_enable_inv=True),
-            )
+        server_args = self._contract_args(tp_size=2)
+
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                64,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(
+                128,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                300,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(
+                3584,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
 
     def test_row_linear_explicit_override_can_disable(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(256, row_linear_enable_inv=False)
+        server_args = self._contract_args(tp_size=2)
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=server_args,
+                row_linear_enable_inv=False,
             )
+        )
 
     def test_flashinfer_allreduce_fusion_helpers(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertTrue(should_disable_flashinfer_allreduce_fusion())
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertFalse(should_disable_flashinfer_allreduce_fusion())
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertFalse(should_disable_flashinfer_allreduce_fusion())
+        self.assertTrue(
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=2))
+        )
+        self.assertFalse(
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=1))
+        )
+        self.assertFalse(
+            should_disable_flashinfer_allreduce_fusion(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
 
     def test_fused_qk_norm_mrope_helper_follows_true_on_policy_contract(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertTrue(should_disable_fused_qk_norm_mrope())
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertFalse(should_disable_fused_qk_norm_mrope())
-
-    def test_get_rl_on_policy_target_returns_correct_value(self):
-        with patch(
-            _PATCH_TARGET, return_value=_mock_args(rl_on_policy_target="fsdp_tp")
-        ):
-            self.assertEqual(get_rl_on_policy_target(), "fsdp_tp")
-        with patch(_PATCH_TARGET, return_value=_mock_args(rl_on_policy_target="fsdp")):
-            self.assertEqual(get_rl_on_policy_target(), "fsdp")
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertIsNone(get_rl_on_policy_target())
+        self.assertTrue(
+            should_disable_fused_qk_norm_mrope(self._contract_args(tp_size=1))
+        )
+        self.assertFalse(
+            should_disable_fused_qk_norm_mrope(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
 
     def test_is_true_on_policy_enabled_for_both_targets(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertTrue(is_true_on_policy_enabled())
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertTrue(is_true_on_policy_enabled())
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertFalse(is_true_on_policy_enabled())
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=1)))
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=2)))
+        self.assertFalse(
+            is_true_on_policy_enabled(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
 
     def test_is_tp_invariant_target_only_fsdp_tp(self):
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=2)):
-            self.assertTrue(is_tp_invariant_target())
-        with patch(_PATCH_TARGET, return_value=_contract_args(tp_size=1)):
-            self.assertFalse(is_tp_invariant_target())
-        with patch(_PATCH_TARGET, return_value=_mock_args()):
-            self.assertFalse(is_tp_invariant_target())
+        self.assertTrue(is_tp_invariant_target(self._contract_args(tp_size=2)))
+        self.assertFalse(is_tp_invariant_target(self._contract_args(tp_size=1)))
+        self.assertFalse(
+            is_tp_invariant_target(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
 
     def test_cuda_graph_patch_noop_when_disabled(self):
         server_args = SimpleNamespace(
             enable_prefill_only_deterministic_inference=False,
             enable_deterministic_inference=True,
-            rl_on_policy_target="fsdp_tp",
         )
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
             server_args,
         ) as patched:
             self.assertFalse(patched)
             self.assertTrue(server_args.enable_deterministic_inference)
-            self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
 
     def test_cuda_graph_patch_noop_when_dvr_verify(self):
         server_args = SimpleNamespace(
             enable_prefill_only_deterministic_inference=True,
             enable_deterministic_inference=True,
             enable_flashinfer_allreduce_fusion=False,
-            rl_on_policy_target="fsdp_tp",
             disable_custom_all_reduce=True,
         )
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
@@ -895,7 +1070,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
         ) as patched:
             self.assertFalse(patched)
             self.assertTrue(server_args.enable_deterministic_inference)
-            self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
 
     def test_tp_invariant_ops_import_is_available(self):
         import sglang.srt.tp_invariant_ops as tp_invariant_ops
@@ -924,7 +1098,9 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
             from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         method = UnquantizedLinearMethod()
@@ -932,29 +1108,26 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
         x = torch.empty(4, 2)
         sentinel = torch.empty(4, 3)
 
-        with patch.object(
-            unquant_module, "_should_use_batch_invariant_linear", return_value=True
-        ), patch.object(
-            unquant_module, "_apply_batch_invariant_linear", return_value=sentinel
-        ) as apply_batch_invariant_linear:
+        with (
+            patch.object(
+                unquant_module, "_should_use_batch_invariant_linear", return_value=True
+            ),
+            patch(
+                "sglang.srt.batch_invariant_ops.batch_invariant_linear",
+                return_value=sentinel,
+            ) as mock_bi_linear,
+        ):
             output = method.apply(layer, x)
 
         self.assertEqual(output.data_ptr(), sentinel.data_ptr())
         self.assertEqual(output.shape, sentinel.shape)
-        apply_batch_invariant_linear.assert_called_once_with(layer, x, None)
+        mock_bi_linear.assert_called_once_with(x, layer.weight, None)
 
     def test_batch_invariant_linear_casts_weight_to_input_dtype(self):
-        try:
-            from sglang.srt.layers.quantization import unquant as unquant_module
-        except ModuleNotFoundError as exc:
-            if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
-            raise
+        from sglang.srt.batch_invariant_ops import batch_invariant_linear
 
-        layer = SimpleNamespace(
-            weight=torch.tensor(
-                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16
-            )
+        weight = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16
         )
         x = torch.tensor(
             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
@@ -963,22 +1136,17 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
 
         with patch(
             "sglang.srt.batch_invariant_ops.batch_invariant_ops.matmul_persistent",
-            side_effect=AssertionError("fp32 router linears must not JIT persistent matmul"),
+            side_effect=AssertionError("fp32 must not use persistent matmul"),
         ):
-            output = unquant_module._apply_batch_invariant_linear(layer, x, None)
+            output = batch_invariant_linear(x, weight, None)
 
         self.assertEqual(output.dtype, torch.float32)
-        torch.testing.assert_close(output, torch.einsum("bi,oi->bo", x, layer.weight.float()))
+        torch.testing.assert_close(output, torch.einsum("bi,oi->bo", x, weight.float()))
 
     def test_batch_invariant_linear_uses_persistent_for_non_fp32(self):
-        try:
-            from sglang.srt.layers.quantization import unquant as unquant_module
-        except ModuleNotFoundError as exc:
-            if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
-            raise
+        from sglang.srt.batch_invariant_ops import batch_invariant_linear
 
-        layer = SimpleNamespace(weight=torch.empty(3, 2, dtype=torch.bfloat16))
+        weight = torch.empty(3, 2, dtype=torch.bfloat16)
         x = torch.empty(4, 2, dtype=torch.bfloat16)
         sentinel = torch.empty(4, 3, dtype=torch.bfloat16)
 
@@ -989,13 +1157,169 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
             return sentinel
 
         with patch(
-            "sglang.srt.batch_invariant_ops.batch_invariant_ops.matmul_persistent",
+            "sglang.srt.batch_invariant_ops.matmul_persistent",
             side_effect=fake_matmul,
         ):
-            output = unquant_module._apply_batch_invariant_linear(layer, x, None)
+            output = batch_invariant_linear(x, weight, None)
 
         self.assertEqual(output.data_ptr(), sentinel.data_ptr())
         self.assertEqual(output.shape, sentinel.shape)
+
+
+class TestDeterministicMoEConfigEnv(unittest.TestCase):
+    def test_deterministic_moe_config_guard_keeps_default_without_env(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        server_args = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                fused_moe_triton_config,
+                "get_global_server_args",
+                return_value=server_args,
+            ),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "0"},
+            ),
+        ):
+            config = fused_moe_triton_config.get_default_config(
+                M=16,
+                E=32,
+                N=1856,
+                K=2048,
+                topk=8,
+                dtype=None,
+                is_marlin=False,
+            )
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 64)
+        self.assertEqual(config["BLOCK_SIZE_K"], 32)
+
+    def test_deterministic_moe_config_can_use_standard_heuristic_by_env(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        server_args = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                fused_moe_triton_config,
+                "get_global_server_args",
+                return_value=server_args,
+            ),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "1"},
+            ),
+        ):
+            config = fused_moe_triton_config.get_default_config(
+                M=16,
+                E=32,
+                N=1856,
+                K=2048,
+                topk=8,
+                dtype=None,
+                is_marlin=False,
+            )
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 16)
+        self.assertEqual(config["BLOCK_SIZE_K"], 64)
+
+    def test_env_override_moe_config_parses_json_dict(self):
+        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON": (
+                    '{"BLOCK_SIZE_M":16,"BLOCK_SIZE_N":64,'
+                    '"BLOCK_SIZE_K":128,"GROUP_SIZE_M":1}'
+                )
+            },
+        ):
+            config = fused_moe_triton_config._get_env_override_config()
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 16)
+        self.assertEqual(config["BLOCK_SIZE_K"], 128)
+
+
+class TestStableTopKSoftmax(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_matches_reference_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.tensor(
+            [
+                [1.0, 1.0, 0.5, -0.25, 0.0, 2.0, 2.0, -1.0],
+                [0.0, -0.5, 0.25, 0.25, 0.25, -1.0, 3.0, 2.0],
+            ],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 3)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(logits, 3)
+
+        torch.testing.assert_close(actual_ids, expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_can_emit_int32_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.randn(8, 16, device="cuda", dtype=torch.float32)
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 4)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(
+                logits, 4, ids_dtype=torch.int32
+            )
+
+        self.assertEqual(actual_ids.dtype, torch.int32)
+        torch.testing.assert_close(actual_ids.long(), expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+
+class TestTrueOnPolicyRMSNorm(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_accepts_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 2048, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(2048, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "2048"},
+        ):
+            out = true_on_policy_rms_norm(x, weight, eps=1e-6)
+
+        self.assertEqual(out.shape, x.shape)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_rejects_non_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "1536"},
+        ):
+            with self.assertRaisesRegex(ValueError, "positive power of two"):
+                true_on_policy_rms_norm(x, weight, eps=1e-6)
 
 
 if __name__ == "__main__":

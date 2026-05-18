@@ -38,6 +38,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+  m.def(
+      "all_reduce_tree_exact(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  m.impl("all_reduce_tree_exact", torch::kCUDA, &all_reduce_tree_exact);
+
   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
   m.def(
       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
