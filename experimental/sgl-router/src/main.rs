@@ -85,6 +85,20 @@ async fn main() -> Result<()> {
         .context("build policy registry")?,
     );
 
+    // M4: shared ActiveLoadRegistry + janitor task. The janitor reaps
+    // request entries whose lifetime exceeded `stale_request_timeout`,
+    // so a leaked guard (proxy task panic, etc.) does not inflate a
+    // worker's load forever. The registry is built BEFORE the manager
+    // is spawned so the manager can call `forget_worker` on
+    // `DiscoveryEvent::Removed`.
+    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::with_defaults();
+    // Sweep cadence = 30 s (1 / 10 of the default 5-minute timeout) is
+    // a comfortable compromise between detection latency and noise.
+    let janitor_handle = sgl_router::policies::active_load::spawn_janitor(
+        Arc::clone(&active_load),
+        std::time::Duration::from_secs(30),
+    );
+
     // Spawn discovery + manager tasks.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
@@ -96,23 +110,12 @@ async fn main() -> Result<()> {
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
+        Some(Arc::clone(&active_load)),
     ));
 
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(60))
             .context("build proxy client")?,
-    );
-
-    // M4: shared ActiveLoadRegistry + janitor task. The janitor reaps
-    // request entries whose lifetime exceeded `stale_request_timeout`,
-    // so a leaked guard (proxy task panic, etc.) does not inflate a
-    // worker's load forever.
-    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::with_defaults();
-    // Sweep cadence = 30 s (1 / 10 of the default 5-minute timeout) is
-    // a comfortable compromise between detection latency and noise.
-    let janitor_handle = sgl_router::policies::active_load::spawn_janitor(
-        Arc::clone(&active_load),
-        std::time::Duration::from_secs(30),
     );
 
     let ctx = Arc::new(

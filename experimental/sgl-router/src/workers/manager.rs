@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::WorkerIntrospector;
 use crate::workers::WorkerRegistry;
@@ -32,15 +33,21 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
 }
 
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_config(rx, registry, None, None).await;
+    run_with_config(rx, registry, None, None, None).await;
 }
 
 /// Run the worker manager, optionally honoring per-model circuit-breaker
-/// configuration from `cfg` and an optional KV-event index that is
-/// notified on every worker add / remove.  When `kv_index` is `None` the
-/// cache-aware-zmq path is disabled (selection falls through to the
-/// non-cache-aware policies); when `cfg` is `None` the default CB config
-/// is used for every worker (threshold = 3).
+/// configuration from `cfg`, an optional KV-event index that is notified
+/// on every worker add / remove, and an optional active-load registry
+/// (M4) that is asked to forget per-worker counters on `Removed`.
+///
+/// When `kv_index` is `None` the cache-aware-zmq path is disabled
+/// (selection falls through to the non-cache-aware policies); when
+/// `active_load` is `None` the M4 active-load bookkeeping is not pruned
+/// on worker removal (leaks one `WorkerCounters` slot per departed
+/// worker — fine for tests, but production passes `Some(...)`); when
+/// `cfg` is `None` the default CB config is used for every worker
+/// (threshold = 3).
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
 /// introspection.  Tests that want a tighter timeout call
@@ -50,12 +57,14 @@ pub async fn run_with_config(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
 ) {
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
+        active_load,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -82,6 +91,7 @@ pub async fn run_with_introspector(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     // In-flight `Added` registrations, keyed by worker id. Subsequent
@@ -145,6 +155,18 @@ pub async fn run_with_introspector(
                         );
                     }
                     (None, _) => {}
+                }
+                // M4: drop the active-load per-worker counters slot.
+                // Idempotent on the registry side, so we call it
+                // unconditionally — a Removed for an unknown worker
+                // (duplicate event) is a no-op. In-flight guards
+                // pointing at this id are NOT invalidated; their drop
+                // still removes the per-request entry cleanly, but the
+                // per-worker counters slot will not be re-created
+                // (selectors no longer see the worker, so no new
+                // requests can register against it).
+                if let Some(al) = &active_load {
+                    al.forget_worker(&id);
                 }
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
@@ -315,6 +337,7 @@ mod tests {
             registry.clone(),
             None,
             None,
+            None,
             fast_introspector(),
         ));
 
@@ -355,6 +378,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             fast_introspector(),
@@ -401,6 +425,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             fast_introspector(),
@@ -473,6 +498,7 @@ mod tests {
             registry.clone(),
             None,
             Some(kv_index.clone()),
+            None,
         ));
 
         let spec = WorkerSpec {
@@ -531,6 +557,7 @@ mod tests {
             registry.clone(),
             None,
             Some(kv_index.clone()),
+            None,
         ));
 
         tx.send(DiscoveryEvent::Removed {
@@ -545,5 +572,81 @@ mod tests {
         drop(tx);
         let _ = manager_handle.await;
         kv_index.shutdown().await;
+    }
+
+    /// Task B: `DiscoveryEvent::Removed` calls
+    /// `ActiveLoadRegistry::forget_worker` so the per-worker counters
+    /// slot is reaped. Without this, a long-lived cluster with worker
+    /// churn would leak one `WorkerCounters` entry per departed worker.
+    #[tokio::test]
+    async fn manager_calls_active_load_forget_on_removed() {
+        use tokio::time::timeout;
+
+        // Fake worker is needed so the introspection step succeeds and
+        // the Removed path observes a known URL — same shape as the
+        // existing `manager_drives_kv_index_lifecycle` test.
+        let (worker_url, _shutdown) =
+            spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let active_load = ActiveLoadRegistry::with_defaults();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            Some(Arc::clone(&active_load)),
+            fast_introspector(),
+        ));
+
+        let id = WorkerId("w-1".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        // Wait for the manager to land the registry write so the
+        // subsequent register/forget round trip exercises a live slot.
+        let added = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(added.is_ok(), "manager failed to register worker");
+
+        // Mint a guard to force the active-load registry to create a
+        // per-worker counters slot for this id.
+        let _g = active_load.register(id.clone(), 10, 1);
+        assert!(active_load.is_known(&id));
+
+        // Now drive the Removed event and assert the counters slot is
+        // gone.  We tear down the guard last so the request entry is
+        // exercised on the post-forget path.
+        tx.send(DiscoveryEvent::Removed { id: id.clone() })
+            .await
+            .unwrap();
+        let removed = timeout(Duration::from_secs(2), async {
+            loop {
+                if !active_load.is_known(&id) && registry.get(&id).is_none() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "manager must call active_load.forget_worker on Removed",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
     }
 }
