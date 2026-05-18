@@ -2433,16 +2433,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        # ``new_seq_lens`` is a Relayer ``gpu_scalar`` channel relay; the
-        # consumer reads it via ``Relayer.resolve_new_seq_lens`` on the
-        # schedule stream after the producer kernel on the forward stream
-        # has stored. The explicit CPU sync below is retained transitionally
-        # until a stream-level cross-stream barrier provides equivalent
-        # visibility; once that lands this call site disappears.
+        # Stream-level wait instead of CPU sync: schedule_stream waits for
+        # the verify_done event on the forward_stream without blocking the
+        # host. Visibility of new_seq_lens / output_ids / accept_lens on
+        # schedule_stream is established by the wait; subsequent reads here
+        # are race-free. The Relayer ``gpu_scalar`` channel additionally
+        # records its own per-store event for resolves that happen on a
+        # different stream than the one that called this method.
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+                current_stream = torch.get_device_module(self.device).current_stream()
+                draft_input.verify_done.wait(current_stream)
 
     def filter_batch(
         self,
