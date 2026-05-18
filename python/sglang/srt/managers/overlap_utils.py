@@ -1,3 +1,72 @@
+"""Relayer: scheduler-owned cross-iter relay services.
+
+A "relay" is any value whose producer phase is forward N's completion
+(model kernel output, or CPU branch in ``process_batch_result`` that
+observes forward output) and whose consumer phase lives in iter N+1
+(``filter_batch`` / ``merge_batch`` / ``prepare_for_decode`` /
+``cache_finished_req`` / next ``forward_batch_generation``). Examples:
+
+- ``output_ids`` (non-spec) — model output -> next iter input_ids
+- ``new_seq_lens`` (spec V2 verify) -> next iter schedule prep
+- ``kv_committed_len`` increment -> next iter cache release
+- ``finished`` status -> next iter ``filter_batch`` keep mask
+- Sampling penalizer accumulator state -> next iter sampling
+
+Pre-Relayer, each of these relays had its own ad-hoc mechanism:
+``FutureMap`` for token ids, in-place ``seq_lens.add_(1)`` for seq_lens,
+``req.kv_committed_len += accept_lens[i] - 1`` for KV commit,
+``verify_done.synchronize()`` CPU sync for visibility, ``batch_record_buf``
+ring for lifetime, ``copy_for_forward`` for sampling penalizer. Reviewers
+could not derive race-freedom from reading the code; each ad-hoc mechanism
+covered one subset of the four axes (GPU memory race / GPU lifetime / CPU
+TOCTOU / Lockstep) and the overall invariant lived only in design docs.
+
+The ``Relayer`` is the single named home for every relay. Each relay
+funnels through one of five typed sub-channels (see classes below) and
+exposes a uniform ``alloc -> store -> resolve`` API, plus cross-stream
+sync (``GpuScalarChannel.store`` records a cuda event; ``resolve_*``
+event-waits on the consumer stream). The scheduler becomes the single
+explicit producer of "what next iter's forward needs", and consumer-side
+visibility is established by channel semantics rather than ad-hoc CPU
+syncs scattered across the codebase.
+
+Five sub-channels:
+
+- ``gpu_scalar``: per-req GPU scalar / small tensor stacked into a
+  circular buffer indexed by ``FutureIndices``. Today carries
+  ``token_ids`` (non-spec) and the spec V2 draft input fields
+  (``topk_p`` / ``topk_index`` / ``bonus_tokens`` / ``new_seq_lens`` /
+  ``hidden_states``); future migrations route ``seq_lens`` / ``seq_lens_cpu``
+  / ``orig_seq_lens`` here.
+- ``gpu_tensor``: per-req GPU tensor relay for payloads too irregular
+  for the stacked layout (placeholder for now; e.g. variable-length
+  per-req tensors).
+- ``cpu_value``: per-req Python value relay (``int`` / ``bool``).
+  Holds ``kv_committed_delta`` and ``finished`` status today.
+- ``cpu_action``: deferred CPU action queue for side-effect relays
+  (page release / pool free) — producer enqueues, scheduler drains
+  at the post-barrier point.
+- ``state_obj``: cross-iter state objects (e.g. SamplingBatchInfo with
+  its penalizer orchestrator).
+
+Cross-stream sync: ``GpuScalarChannel.store`` records a CUDA event on
+the producer stream after each write; ``resolve_by_*`` calls
+``event.wait(consumer_stream)`` so the read is correctly ordered against
+the producer's write across streams without an explicit CPU sync. This
+replaces the role of legacy mechanisms like
+``EagleDraftInput.verify_done.synchronize()``.
+
+Iter-pin ring: 2-iter Python ref retention for non-channel tensor
+lifetime (e.g. a verify-phase ForwardBatch whose internal tensors are
+read on the forward stream after schedule_stream returns to mid-iter
+work). ``Scheduler.batch_record_buf`` is a thin alias over
+``Relayer._iter_pin_ring`` for back-compat with direct indexers.
+
+This module is intentionally short and reads top-to-bottom; the
+class hierarchy reflects the relay axis (GPU vs CPU, value vs action vs
+state) directly without further dispatch indirection.
+"""
+
 from __future__ import annotations
 
 from collections import deque
