@@ -88,11 +88,7 @@ class CanaryShadowGroup:
         return self.v_head is not None
 
 
-def attach_shadow_buffers(
-    pool: "KVCache",
-    *,
-    pool_kind: PoolKind = PoolKind.FULL,
-) -> None:
+def attach_shadow_buffers(pool: "KVCache") -> None:
     """Attach canary shadow buffers + monkey-patch buf_info methods on the pool.
 
     Dispatches on the pool type:
@@ -111,15 +107,10 @@ def attach_shadow_buffers(
       PD takes SWA via the latter, and each patch splices in all attached
       groups' shadows.
 
-    The ``pool_kind`` argument is accepted only for backward compatibility
-    with single-attach callers (mostly host-side unit tests); the dispatch
-    decides the actual set of attached groups regardless. Idempotent: a
-    second call on the same pool is a no-op.
+    Idempotent: a second call on the same pool is a no-op.
     """
     if getattr(pool, _CANARY_POOL_ATTR, False):
         return
-
-    _ = pool_kind  # see docstring — dispatch is structural, not parameter-driven.
 
     shadow_groups: Dict[PoolKind, CanaryShadowGroup] = {}
 

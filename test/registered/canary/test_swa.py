@@ -88,7 +88,7 @@ class _FakeSWAPool:
 class TestSWAShadowAttach(unittest.TestCase):
     def test_attach_creates_both_full_and_swa_shadow_groups(self) -> None:
         pool = _FakeSWAPool(layer_num=3, slot_count=24, head_num=1, head_dim=8)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
+        attach_shadow_buffers(pool)
 
         # SWA-system pools always get TWO independent canaries: FULL + SWA.
         groups = get_shadow_groups(pool)
@@ -109,16 +109,16 @@ class TestSWAShadowAttach(unittest.TestCase):
 
     def test_attach_is_idempotent_on_swa_pool(self) -> None:
         pool = _FakeSWAPool(layer_num=2, slot_count=16, head_num=1, head_dim=8)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
+        attach_shadow_buffers(pool)
         first_ptr = pool.canary_k_head.data_ptr()
-        attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
+        attach_shadow_buffers(pool)
         self.assertEqual(pool.canary_k_head.data_ptr(), first_ptr)
 
 
 class TestSWAStateBufInfosPatch(unittest.TestCase):
     def test_patched_get_state_buf_infos_preserves_kv_midpoint(self) -> None:
         pool = _FakeSWAPool(layer_num=4, slot_count=32, head_num=2, head_dim=16)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
+        attach_shadow_buffers(pool)
         ptrs, lens, item_lens = pool.get_state_buf_infos()
 
         # Original [K*4, V*4] = 8 entries -> with TWO shadow groups

@@ -58,7 +58,7 @@ class _FakeMLAPool:
 class TestMLAShadowAttach(unittest.TestCase):
     def test_mla_attach_allocates_only_k_half(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
 
         groups = get_shadow_groups(pool)
         # MLA-style pools get exactly one FULL group.
@@ -77,16 +77,16 @@ class TestMLAShadowAttach(unittest.TestCase):
 
     def test_mla_attach_is_idempotent(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=16, kv_cache_dim=128)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
         first_ptr = pool.canary_k_head.data_ptr()
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
         self.assertEqual(pool.canary_k_head.data_ptr(), first_ptr)
 
 
 class TestMLAContiguousBufInfosPatch(unittest.TestCase):
     def test_patched_appends_k_head_and_k_tail(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
 
         # Original 4 entries (one per layer), +2 canary entries = 6 total.
@@ -100,7 +100,7 @@ class TestMLAContiguousBufInfosPatch(unittest.TestCase):
 
     def test_slot_stride_bytes_matches_canary_slot_bytes(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=8, kv_cache_dim=512)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
         self.assertEqual(pool.canary_slot_stride_bytes, CANARY_SLOT_BYTES)
 
 
@@ -120,7 +120,7 @@ class TestMLADispatchFallthroughForNSAAndFP4(unittest.TestCase):
         pool.index_k_with_scale_buffer = [
             torch.zeros(4, 256, dtype=torch.uint8) for _ in range(3)
         ]
-        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        attach_shadow_buffers(pool)
 
         self.assertFalse(pool.canary_has_v_half)
         # Index buffer is unchanged; canary doesn't touch it.
