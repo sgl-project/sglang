@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 
@@ -47,6 +47,11 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # Refs the worker wants scheduler to keep alive for the same 2-iter window
+    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
+    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
