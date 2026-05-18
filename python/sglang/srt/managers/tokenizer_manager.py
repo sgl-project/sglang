@@ -2162,8 +2162,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         valid_draft_tokens = recv_obj.spec_valid_draft_tokens[i]
         valid_accepted_tokens = recv_obj.spec_valid_accepted_tokens[i]
+        valid_draft_tokens_by_position = (
+            list(recv_obj.spec_valid_draft_tokens_by_position[i])
+            if recv_obj.spec_valid_draft_tokens_by_position is not None
+            else []
+        )
+        valid_accepted_tokens_by_position = (
+            list(recv_obj.spec_valid_accepted_tokens_by_position[i])
+            if recv_obj.spec_valid_accepted_tokens_by_position is not None
+            else []
+        )
+        spec_steps = int(self.server_args.speculative_num_steps or 0)
+        if spec_steps <= 0:
+            spec_steps = max(
+                0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
+            )
+        valid_draft_tokens_by_position = (
+            valid_draft_tokens_by_position + [0] * spec_steps
+        )[:spec_steps]
+        valid_accepted_tokens_by_position = (
+            valid_accepted_tokens_by_position + [0] * spec_steps
+        )[:spec_steps]
         meta_info["spec_valid_draft_token_num"] = valid_draft_tokens
         meta_info["spec_valid_accept_token_num"] = valid_accepted_tokens
+        meta_info["spec_valid_draft_token_num_by_position"] = (
+            valid_draft_tokens_by_position
+        )
+        meta_info["spec_valid_accept_token_num_by_position"] = (
+            valid_accepted_tokens_by_position
+        )
+        meta_info["spec_valid_accept_rate_by_position"] = [
+            (
+                (
+                    valid_accepted_tokens_by_position[index]
+                    if index < len(valid_accepted_tokens_by_position)
+                    else 0
+                )
+                / draft_tokens
+                if draft_tokens > 0
+                else 0
+            )
+            for index, draft_tokens in enumerate(valid_draft_tokens_by_position)
+        ]
         # `spec_valid_accept_rate` uses the drafter's own denominator: only the
         # real draft tokens present in verifier snapshots (excludes padded
         # slots from short tails). Reflects the drafter's intrinsic hit rate.

@@ -865,6 +865,16 @@ class Req(ReqDllmMixin):
         # Decoupled-speculation metric: Number of accepted tokens among valid draft tokens (excludes the bonus token).
         self.spec_valid_accepted_tokens: int = 0
 
+        # Decoupled-speculation metric: Per draft-position valid token counts.
+        # List index = draft token position within one verifier snapshot.
+        # In decoupled verifier, length is fixed to speculative_num_steps.
+        self.spec_valid_draft_tokens_by_position: List[int] = []
+
+        # Decoupled-speculation metric: Per draft-position accepted token counts.
+        # List index = draft token position within one verifier snapshot.
+        # In decoupled verifier, length is fixed to speculative_num_steps.
+        self.spec_valid_accepted_tokens_by_position: List[int] = []
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.

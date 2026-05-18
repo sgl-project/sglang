@@ -1309,13 +1309,31 @@ class SchedulerDecoupledSpecMixin:
                 "Decoupled verify returned extra verified ids: "
                 f"consumed={offset} total={len(verified_ids)}"
             )
+
+        spec_steps = int(self.server_args.speculative_num_steps or 0)
+        if spec_steps <= 0:
+            spec_steps = max(
+                0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
+            )
         for (
             req,
             valid_draft_tokens,
             valid_accepted_tokens,
         ) in valid_draft_metric_updates:
+            valid_draft_tokens = min(valid_draft_tokens, spec_steps)
+            valid_accepted_tokens = min(valid_accepted_tokens, valid_draft_tokens)
             req.spec_valid_draft_tokens += valid_draft_tokens
             req.spec_valid_accepted_tokens += valid_accepted_tokens
+            req.spec_valid_draft_tokens_by_position = (
+                req.spec_valid_draft_tokens_by_position + [0] * spec_steps
+            )[:spec_steps]
+            req.spec_valid_accepted_tokens_by_position = (
+                req.spec_valid_accepted_tokens_by_position + [0] * spec_steps
+            )[:spec_steps]
+            for pos in range(valid_draft_tokens):
+                req.spec_valid_draft_tokens_by_position[pos] += 1
+            for pos in range(valid_accepted_tokens):
+                req.spec_valid_accepted_tokens_by_position[pos] += 1
 
     def is_verify_entry_rank(self) -> bool:
         return (

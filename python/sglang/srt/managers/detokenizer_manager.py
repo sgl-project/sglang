@@ -366,6 +366,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,
             spec_valid_draft_tokens=recv_obj.spec_valid_draft_tokens,
             spec_valid_accepted_tokens=recv_obj.spec_valid_accepted_tokens,
+            spec_valid_draft_tokens_by_position=(
+                recv_obj.spec_valid_draft_tokens_by_position
+            ),
+            spec_valid_accepted_tokens_by_position=(
+                recv_obj.spec_valid_accepted_tokens_by_position
+            ),
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,

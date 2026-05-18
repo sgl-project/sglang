@@ -1,59 +1,60 @@
 from __future__ import annotations
 
 import argparse
-import ast
-import json
+import ipaddress
 import os
-import re
 import socket
-from dataclasses import dataclass
 from typing import Any
 
-import ray
-from ray.util.scheduling_strategies import (
-    NodeAffinitySchedulingStrategy,
-    PlacementGroupSchedulingStrategy,
-)
+try:
+    import ray
+    from ray.util.scheduling_strategies import (
+        NodeAffinitySchedulingStrategy,
+        PlacementGroupSchedulingStrategy,
+    )
+except ImportError:
 
-import sglang as sgl
-from sglang.srt.utils.network import is_valid_ipv6_address
+    class _MissingRay:
+        def remote(self, obj=None, **_kwargs):
+            if obj is None:
+                return lambda inner: inner
+            return obj
 
-DEFAULT_PROMPT_COLUMN_CANDIDATES = [
-    "prompt",
-    "messages",
-    "chat",
-    "conversations",
-    "text",
-    "question",
-    "instruction",
-    "input",
-    "query",
-]
-DAPO_MATH_17K_DEFAULT_PROMPT_COLUMN = "prompt"
+        def __getattr__(self, name: str):
+            raise ImportError(
+                "ray is required for Ray-based decoupled speculation helpers"
+            ) from None
+
+    ray = _MissingRay()
+    NodeAffinitySchedulingStrategy = None
+    PlacementGroupSchedulingStrategy = None
+
+try:
+    import sglang as sgl
+    from sglang.srt.utils.network import is_valid_ipv6_address
+except ImportError:
+
+    class _MissingSGLang:
+        def __getattr__(self, name: str):
+            raise ImportError(
+                "sglang is required for engine-based decoupled speculation helpers"
+            ) from None
+
+    sgl = _MissingSGLang()
+
+    def is_valid_ipv6_address(ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip).version == 6
+        except ValueError:
+            return False
+
+from .types import DecoupledSpecEndpointConfig, DecoupledSpecTopology
 
 
 def format_tcp_address(ip: str, port: int | str) -> str:
     """Return a ZMQ TCP endpoint, preserving IPv6 bracket formatting."""
     host = f"[{ip}]" if is_valid_ipv6_address(ip) else ip
     return f"tcp://{host}:{port}"
-
-
-@dataclass
-class DecoupledSpecEndpointConfig:
-    """Bind/connect endpoint config for one decoupled-spec instance."""
-
-    bind_endpoint: str
-    connect_endpoints: list[str]
-    rank: int
-
-
-@dataclass
-class DecoupledSpecTopology:
-    """Endpoint topology and actor handles for a decoupled-spec run."""
-
-    drafter_configs: list[DecoupledSpecEndpointConfig]
-    verifier_configs: list[DecoupledSpecEndpointConfig]
-    draft_actors: list[Any] | None = None
 
 
 def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
@@ -612,232 +613,3 @@ class TargetActor:
         self.engine.shutdown()
         return True
 
-
-def infer_prompt_column(
-    available_columns: list[str],
-) -> str:
-    """Choose a prompt column from common names in a parquet schema."""
-    for candidate in DEFAULT_PROMPT_COLUMN_CANDIDATES:
-        if candidate in available_columns:
-            return candidate
-
-    raise ValueError(
-        "Unable to auto-detect the prompt column. "
-        f"Available columns: {available_columns}"
-    )
-
-
-def resolve_dapo_math_17k_prompt_column(
-    available_columns: list[str],
-    prompt_column: str | None = None,
-) -> str:
-    """Validate and return the DAPO-Math-17k column that stores chat prompts."""
-    selected_column = prompt_column or DAPO_MATH_17K_DEFAULT_PROMPT_COLUMN
-    if selected_column not in available_columns:
-        raise ValueError(
-            "dataset-format=dapo_math_17k requires a prompt-style column with "
-            "chat messages. "
-            f"Requested column: {selected_column!r}. "
-            f"Available columns: {available_columns}"
-        )
-    return selected_column
-
-
-def _looks_like_chat_message(value: Any) -> bool:
-    """Return whether a value resembles a single chat message dict."""
-    return isinstance(value, dict) and "role" in value and "content" in value
-
-
-def _is_chat_message_list(value: Any) -> bool:
-    """Return whether a value is a non-empty list of chat message dicts."""
-    return (
-        isinstance(value, list)
-        and len(value) > 0
-        and all(_looks_like_chat_message(item) for item in value)
-    )
-
-
-def _flatten_message_content(content: Any) -> str:
-    """Flatten string or multimodal-style message content into plain text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_segments: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text_segments.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                text_segments.append(item["text"])
-        return "".join(text_segments)
-    return str(content)
-
-
-def _messages_to_fallback_text(messages: list[dict[str, Any]]) -> str:
-    """Render chat messages into a simple role-prefixed text fallback."""
-    lines: list[str] = []
-    for message in messages:
-        role = str(message.get("role", "user"))
-        content = _flatten_message_content(message.get("content", ""))
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _get_real_verify_acceptance_stats(
-    meta_info: dict[str, Any],
-) -> tuple[float | None, float | None, int, int, int]:
-    """Extract draft-token acceptance metrics from current SGLang meta_info."""
-    verify_ct = meta_info.get("spec_verify_ct")
-    accepted_tokens = meta_info.get("spec_accepted_drafts")
-    draft_tokens = meta_info.get("spec_proposed_drafts")
-    if verify_ct is None or accepted_tokens is None or draft_tokens is None:
-        return None, None, 0, 0, 0
-
-    verify_ct = int(verify_ct)
-    accepted_tokens = int(accepted_tokens)
-    draft_tokens = int(draft_tokens)
-    if verify_ct <= 0 or draft_tokens <= 0:
-        return None, None, 0, 0, 0
-
-    # Acclen reports accepted draft tokens only; the verifier-sampled bonus
-    # token is intentionally excluded.
-    accept_length = accepted_tokens / verify_ct
-    accept_rate = accepted_tokens / draft_tokens
-    return accept_length, accept_rate, accepted_tokens, draft_tokens, verify_ct
-
-
-def _maybe_parse_json_prompt(value: Any) -> Any:
-    """Parse prompt strings that contain JSON or Python literal structures."""
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if not stripped or stripped[0] not in "[{":
-        return value
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-    try:
-        return ast.literal_eval(stripped)
-    except (SyntaxError, ValueError):
-        return value
-
-
-_CHATML_ROLE_PATTERN = re.compile(r"<\|im_start\|>(system|user|assistant)\n")
-
-
-def _maybe_append_chatml_generation_prompt(
-    prompt: str, *, enable_thinking: bool = False
-) -> str:
-    """Ensure ChatML text prompts end with an assistant generation prefix."""
-    stripped = prompt.rstrip()
-    if "<|im_start|>" not in stripped or "<|im_end|>" not in stripped:
-        return prompt
-
-    role_matches = list(_CHATML_ROLE_PATTERN.finditer(stripped))
-    if not role_matches:
-        return prompt
-
-    last_role = role_matches[-1].group(1)
-    thinking_suffix = "<think>\n" if enable_thinking else ""
-
-    # The prompt already ends with an assistant generation prefix.
-    if last_role == "assistant" and not stripped.endswith("<|im_end|>"):
-        if enable_thinking and not stripped.endswith("<think>"):
-            return stripped + thinking_suffix
-        return stripped
-
-    # ChatML user/system turns should terminate with an assistant prefix for generation.
-    if last_role in {"system", "user"} and stripped.endswith("<|im_end|>"):
-        return stripped + "\n<|im_start|>assistant\n" + thinking_suffix
-
-    return prompt
-
-
-def _build_chat_template_renderer(model_path: str, *, enable_thinking: bool = False):
-    """Create a tokenizer-backed chat-template renderer when available."""
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        return None
-
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-    except Exception:
-        return None
-    if not getattr(tokenizer, "chat_template", None):
-        return None
-
-    def render(messages: list[dict[str, Any]]) -> str:
-        """Render chat messages through the loaded tokenizer chat template."""
-        try:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            prompt = _maybe_append_chatml_generation_prompt(
-                prompt, enable_thinking=enable_thinking
-            )
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError("tokenizer.apply_chat_template returned an empty prompt")
-        return prompt
-
-    return render
-
-
-def _normalize_prompt(
-    value: Any,
-    row_index: int,
-    column_name: str,
-    chat_template_renderer,
-    *,
-    enable_thinking: bool = False,
-) -> str:
-    """Normalize a raw dataset value into the final string prompt."""
-    if value is None:
-        raise ValueError(
-            f"Row {row_index} in column {column_name!r} is null, cannot build a prompt."
-        )
-    value = _maybe_parse_json_prompt(value)
-    if isinstance(value, str):
-        return _maybe_append_chatml_generation_prompt(
-            value, enable_thinking=enable_thinking
-        )
-    if _is_chat_message_list(value):
-        if chat_template_renderer is not None:
-            try:
-                return chat_template_renderer(value)
-            except Exception:
-                pass
-        return _messages_to_fallback_text(value)
-    return str(value)
-
-
-def _build_dapo_math_17k_prompt(
-    row: dict[str, Any],
-    *,
-    row_index: int,
-    prompt_column: str,
-    chat_template_renderer,
-    enable_thinking: bool = False,
-) -> str:
-    """Build one prompt from a DAPO-Math-17k parquet row."""
-    if prompt_column not in row:
-        raise ValueError(
-            f"Row {row_index} is missing DAPO-Math prompt column {prompt_column!r}."
-        )
-    return _normalize_prompt(
-        row.get(prompt_column),
-        row_index,
-        prompt_column,
-        chat_template_renderer,
-        enable_thinking=enable_thinking,
-    )

@@ -106,6 +106,18 @@ class SpeculativeDecodingMetricsMixin:
     # (excludes the bonus token)
     spec_valid_accepted_tokens: Optional[List[int]]
 
+    # Decoupled-speculation metric: Per draft-position valid token counts.
+    # None when decoupled speculative decoding is disabled.
+    # Outer list is per request; inner list index is draft token position.
+    # Inner list length is fixed to speculative_num_steps.
+    spec_valid_draft_tokens_by_position: Optional[List[List[int]]]
+
+    # Decoupled-speculation metric: Per draft-position accepted token counts.
+    # None when decoupled speculative decoding is disabled.
+    # Outer list is per request; inner list index is draft token position.
+    # Inner list length is fixed to speculative_num_steps.
+    spec_valid_accepted_tokens_by_position: Optional[List[List[int]]]
+
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.

@@ -1086,6 +1086,17 @@ class SchedulerOutputProcessorMixin:
         is_decoupled_verify = self.spec_algorithm.is_decoupled_verify()
         spec_valid_draft_tokens = [] if is_decoupled_verify else None
         spec_valid_accepted_tokens = [] if is_decoupled_verify else None
+        spec_valid_draft_tokens_by_position = [] if is_decoupled_verify else None
+        spec_valid_accepted_tokens_by_position = [] if is_decoupled_verify else None
+        spec_steps = (
+            int(self.server_args.speculative_num_steps or 0)
+            if is_decoupled_verify
+            else 0
+        )
+        if is_decoupled_verify and spec_steps <= 0:
+            spec_steps = max(
+                0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
+            )
         retraction_counts = []
         output_hidden_states = None
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
@@ -1204,9 +1215,25 @@ class SchedulerOutputProcessorMixin:
                     if is_decoupled_verify:
                         assert spec_valid_draft_tokens is not None
                         assert spec_valid_accepted_tokens is not None
+                        assert spec_valid_draft_tokens_by_position is not None
+                        assert spec_valid_accepted_tokens_by_position is not None
                         spec_valid_draft_tokens.append(req.spec_valid_draft_tokens)
                         spec_valid_accepted_tokens.append(
                             req.spec_valid_accepted_tokens
+                        )
+                        draft_tokens_by_position = (
+                            list(req.spec_valid_draft_tokens_by_position)
+                            + [0] * spec_steps
+                        )[:spec_steps]
+                        accepted_tokens_by_position = (
+                            list(req.spec_valid_accepted_tokens_by_position)
+                            + [0] * spec_steps
+                        )[:spec_steps]
+                        spec_valid_draft_tokens_by_position.append(
+                            draft_tokens_by_position
+                        )
+                        spec_valid_accepted_tokens_by_position.append(
+                            accepted_tokens_by_position
                         )
 
                 if return_logprob:
@@ -1319,6 +1346,12 @@ class SchedulerOutputProcessorMixin:
                     spec_correct_drafts_histogram=spec_correct_drafts_histogram,
                     spec_valid_draft_tokens=spec_valid_draft_tokens,
                     spec_valid_accepted_tokens=spec_valid_accepted_tokens,
+                    spec_valid_draft_tokens_by_position=(
+                        spec_valid_draft_tokens_by_position
+                    ),
+                    spec_valid_accepted_tokens_by_position=(
+                        spec_valid_accepted_tokens_by_position
+                    ),
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
