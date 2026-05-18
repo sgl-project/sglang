@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+import sglang.srt.utils.kernel_shape_profiler as kernel_shape_profiler
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -60,6 +61,7 @@ class SchedulerProfilerMixin:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.merge_profiles = False
+        self.shape_discovery: bool = False
 
         # For ROCM
         self.rpd_profiler = None
@@ -76,6 +78,7 @@ class SchedulerProfilerMixin:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        shape_discovery: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
@@ -91,6 +94,7 @@ class SchedulerProfilerMixin:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                shape_discovery=shape_discovery,
             )
 
         if self.profile_in_progress:
@@ -113,6 +117,7 @@ class SchedulerProfilerMixin:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.shape_discovery = shape_discovery
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
@@ -202,6 +207,10 @@ class SchedulerProfilerMixin:
                     )
                 ),
             )
+
+            if record_shapes and self.shape_discovery:
+                kernel_shape_profiler.enable()
+
             self.torch_profiler.start()
             self.profile_in_progress = True
 
@@ -334,6 +343,9 @@ class SchedulerProfilerMixin:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        if self.torch_profiler_record_shapes and self.shape_discovery:
+            kernel_shape_profiler.disable()
+
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self: Scheduler, batch: ScheduleBatch):
@@ -390,6 +402,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.shape_discovery,
                     recv_req.profile_stages,
                 )
             else:
@@ -404,6 +417,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.shape_discovery,
                 )
                 return self.start_profile()
         else:
