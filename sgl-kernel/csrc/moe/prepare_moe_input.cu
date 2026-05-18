@@ -255,7 +255,7 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
   return;
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename factor_t>
 __global__ void apply_shuffle_mul_sum_kernel(
     const scalar_t* __restrict__ input_tensor,  // [m * topk, k] (expert-major layout)
     scalar_t* __restrict__ output_tensor,       // [m, k] (token-major layout)
@@ -263,7 +263,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
     int m,
     int topk,
     int row_stride,
-    const scalar_t* __restrict__ factors)  // [m * topk] (topk_weights, token-major layout)
+    const factor_t* __restrict__ factors)  // [m * topk] (topk_weights, token-major layout)
 {
   int i = blockIdx.x;
   if (i >= m) {
@@ -290,7 +290,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
 
       t factor = 1.0;
       if (factors != nullptr) {
-        factor = factors[token_major_idx];
+        factor = static_cast<t>(factors[token_major_idx]);
       }
 
 #pragma unroll
@@ -312,7 +312,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
 
       t factor = 1.0;
       if (factors != nullptr) {
-        factor = factors[token_major_idx];
+        factor = static_cast<t>(factors[token_major_idx]);
       }
       sum_val += factor * val;
     }
@@ -324,7 +324,7 @@ void get_apply_shuffle_mul_sum_caller(
     const torch::Tensor& input_tensor,                // [m * topk, row_stride], bf16/f16
     torch::Tensor& output_tensor,                     // [m, row_stride], bf16/f16
     const torch::Tensor& permutation,                 // [m * topk], int32
-    const std::optional<torch::Tensor>& factors_opt)  // optional [m * topk], bf16/f16
+    const std::optional<torch::Tensor>& factors_opt)  // optional [m * topk], bf16/f16/fp32
 {
   TORCH_CHECK(input_tensor.dim() == 2, "input_tensor must be 2D [m * topk, row_stride]");
   TORCH_CHECK(output_tensor.dim() == 2, "output_tensor must be 2D [m, row_stride]");
@@ -347,21 +347,36 @@ void get_apply_shuffle_mul_sum_caller(
   const int32_t* perm_ptr = permutation.data_ptr<int32_t>();
 
   void* factors_ptr = nullptr;
+  bool factors_are_fp32 = false;
   if (factors_opt.has_value()) {
-    TORCH_CHECK(factors_opt->dtype() == output_tensor.dtype(), "Factors must match output dtype");
+    TORCH_CHECK(
+        factors_opt->dtype() == output_tensor.dtype() || factors_opt->dtype() == torch::kFloat32,
+        "Factors must match output dtype or be float32");
     TORCH_CHECK(factors_opt->numel() == m * topk, "Factors must have shape [m * topk]");
+    factors_are_fp32 = factors_opt->dtype() == torch::kFloat32;
     factors_ptr = factors_opt->data_ptr();
   }
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(output_tensor.scalar_type(), scalar_t, [&] {
-    apply_shuffle_mul_sum_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<const scalar_t*>(input_tensor.data_ptr()),
-        static_cast<scalar_t*>(output_tensor.data_ptr()),
-        perm_ptr,
-        m,
-        topk,
-        row_stride,
-        static_cast<const scalar_t*>(factors_ptr));
+    if (factors_are_fp32) {
+      apply_shuffle_mul_sum_kernel<scalar_t, float><<<grid, block, 0, stream>>>(
+          static_cast<const scalar_t*>(input_tensor.data_ptr()),
+          static_cast<scalar_t*>(output_tensor.data_ptr()),
+          perm_ptr,
+          m,
+          topk,
+          row_stride,
+          static_cast<const float*>(factors_ptr));
+    } else {
+      apply_shuffle_mul_sum_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+          static_cast<const scalar_t*>(input_tensor.data_ptr()),
+          static_cast<scalar_t*>(output_tensor.data_ptr()),
+          perm_ptr,
+          m,
+          topk,
+          row_stride,
+          static_cast<const scalar_t*>(factors_ptr));
+    }
     return true;
   });
 }
@@ -371,7 +386,7 @@ void get_apply_shuffle_mul_sum_caller(
  *
  * This function performs the equivalent of the following PyTorch expression:
  *
- *     (c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1).to(out_dtype)).sum(dim=1)
+ *     (c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1)).sum(dim=1).to(out_dtype)
  *
  * Specifically:
  * - `input` is shuffled using the `permutation` tensor.
@@ -382,6 +397,7 @@ void get_apply_shuffle_mul_sum_caller(
  * @param output       Output tensor of shape (m, k), where the final reduced results are stored.
  * @param permutation  Index tensor (e.g., c_map) that maps positions in `input` to shuffled layout.
  * @param factors      Optional scaling factors (e.g., top-k weights), shape (m * topk) or (m, topk).
+ *                     May match output dtype or be float32.
  */
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,

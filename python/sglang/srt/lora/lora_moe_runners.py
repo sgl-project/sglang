@@ -175,7 +175,7 @@ class LoRAInfo:
 
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
-    adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    adapter_enabled: torch.Tensor  # [num_loras] - requested adapters with rank > 0
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
@@ -188,6 +188,12 @@ class LoRAInfo:
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
+    # Set by the runner when its GEMM outputs are in expert-sorted layout.
+    # When ``sorted_layout`` is True and ``c_map`` is set, hook kernels
+    # address rows via ``c_map[pair_idx]`` and the runner applies router
+    # weights once over (base + delta) instead of the kernel doing it.
+    c_map: torch.Tensor | None = None
+    sorted_layout: bool = False
 
 @dataclass
 class LoRAHooks:
@@ -214,7 +220,11 @@ def _compute_token_lora_mapping(
         token_positions,
         right=True,
     )
-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
+    mapping = lora_info.req_to_lora.to(torch.int32)[req_indices]
+    valid = mapping >= 0
+    safe_mapping = mapping.clamp_min(0).long()
+    active = lora_info.adapter_enabled[safe_mapping] > 0
+    return torch.where(valid & active, mapping, torch.full_like(mapping, -1))
 
 
 def _compute_lora_alignment(
@@ -421,6 +431,7 @@ def _add_lora_gate_up_delta(
             expand_num_stages=2,
             expand_split_k=1,
             fully_sharded=lora_info.fully_sharded,
+            c_map=lora_info.c_map,
         )
 
 
@@ -475,6 +486,11 @@ def _add_lora_down_delta(
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
+        # Sorted-layout callers apply router weights *after* the LoRA delta is
+        # accumulated into the expert-sorted output; running mul_routed_weight
+        # inside the kernel here would double-weight (Bug 4 reborn under the
+        # new layout). Token-major callers keep the existing single-weighting.
+        kernel_mul_routed_weight = not lora_info.sorted_layout
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,
@@ -502,9 +518,10 @@ def _add_lora_down_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            mul_routed_weight=True,
+            mul_routed_weight=kernel_mul_routed_weight,
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
+            c_map=lora_info.c_map,
         )
 
 

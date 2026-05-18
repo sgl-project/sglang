@@ -63,6 +63,7 @@ class MarlinLoraRunnerCore:
         quant_info: MarlinMoeQuantInfo,
         runner_config: MoeRunnerConfig,
         hooks=None,
+        lora_info=None,  # accepted for interface uniformity; Marlin uses hooks directly
     ) -> StandardCombineInput:
         global _MARLIN_WORKSPACE
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
