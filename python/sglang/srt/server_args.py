@@ -2356,6 +2356,7 @@ class ServerArgs:
                     )
 
         elif model_arch in [
+            "BambaForCausalLM",
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
