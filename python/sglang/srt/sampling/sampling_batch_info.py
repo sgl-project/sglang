@@ -401,8 +401,16 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+    def derive_forward_view(self):
+        """Produce a forward-stream view of this SamplingBatchInfo:
+        accumulate per-iter penalties into the pre-allocated buffer and
+        return a shallow clone with ``penalizer_orchestrator=None`` so the
+        forward path does not re-accumulate. The live orchestrator state is
+        retained on the schedule side (it is stashed onto the Relayer
+        ``state_obj`` channel in ``_overlap_forward_isolation`` so any
+        cross-iter consumer can resolve via the channel rather than holding
+        a contextmanager-local ref).
+        """
         self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
 

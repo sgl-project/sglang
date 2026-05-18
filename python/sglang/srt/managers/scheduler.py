@@ -3071,7 +3071,7 @@ class Scheduler(
         if sched_sampling_info is not None:
             if self.relayer is not None:
                 self.relayer.stash_sampling_state("sampling_info", sched_sampling_info)
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
+            batch.sampling_info = sched_sampling_info.derive_forward_view()
 
         # Pin batch for 2-iter tensor lifetime. Retained for non-relay
         # transient tensors that schedule-side allocates and forward reads
