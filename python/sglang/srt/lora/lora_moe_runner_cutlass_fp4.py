@@ -12,7 +12,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.lora.triton_ops import (
+    cutlass_fp4_lora_shuffle_mul_sum,
+    cutlass_fp4_lora_silu_and_mul,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -20,18 +23,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
-
-
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-
-# Use the JIT silu_and_mul: it carries the ``swap_halves`` flag (the AOT
-# sgl_kernel build doesn't expose it yet) for Kimi-K2.5's ``[Up|Gate]`` W13.
-if _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
-elif _is_hip:
-    # SM100+ only; this import is here for symmetry and should never run.
-    from vllm._custom_ops import silu_and_mul
 
 
 @dataclass
@@ -69,7 +60,7 @@ class CutlassFp4LoraRunnerCore:
         hooks: Optional["LoRAHooks"] = None,
         lora_info=None,
     ) -> "StandardCombineInput":
-        from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input
+        from sgl_kernel import prepare_moe_input
 
         from sglang.srt.layers.moe.cutlass_moe import (
             cutlass_fp4_group_mm,
@@ -168,7 +159,9 @@ class CutlassFp4LoraRunnerCore:
         # ``w13_swap_halves=True`` selects the ``[up | gate]`` convention
         # (silu(second) * first) for FlashInfer-CUTLASS NVFP4 W13 loaders.
         intermediate = torch.empty(total_tokens, N // 2, dtype=out_dtype, device=device)
-        silu_and_mul(gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves)
+        cutlass_fp4_lora_silu_and_mul(
+            gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves
+        )
 
         # ---- GEMM 2 (w2)
         int_fp4, int_blockscale = scaled_fp4_experts_quant(
@@ -197,7 +190,7 @@ class CutlassFp4LoraRunnerCore:
         # ---- combine: un-sort, weight (base + delta), sum. Router weights stay
         # fp32 to match FlashInfer-CUTLASS fused MoE's final accumulation.
         output = torch.empty((m_a, K), dtype=out_dtype, device=device)
-        apply_shuffle_mul_sum(
+        cutlass_fp4_lora_shuffle_mul_sum(
             out_flat,
             output,
             c_map,
@@ -206,5 +199,6 @@ class CutlassFp4LoraRunnerCore:
                 if runner_config.apply_router_weight_on_input
                 else local_weights.reshape(-1)
             ),
+            num_topk,
         )
         return StandardCombineInput(hidden_states=output)
