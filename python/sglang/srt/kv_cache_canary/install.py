@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -11,9 +11,6 @@ from sglang.srt.kv_cache_canary.api import (
     attach,
     finalize_replay,
     get_runner,
-    install_req_to_token_pool_free_hook,
-    install_spec_allocator_free_hook,
-    install_swa_eviction_hook,
     launch_canary_for_capture,
     maybe_perturb_req_to_token,
     prepare_replay,
@@ -51,8 +48,6 @@ def install_on_model_runner(
     if not config.enabled:
         return
 
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-
     pool = model_runner.token_to_kv_pool
     pool_kind = _select_pool_kind(model_runner=model_runner, pool=pool)
     if pool_kind is None:
@@ -66,51 +61,41 @@ def install_on_model_runner(
         return
 
     device = torch.device(model_runner.device)
-    launch_capacity = _compute_launch_capacity(model_runner=model_runner, config=config)
+    verify_capacity, write_capacity, write_req_capacity = _compute_launch_capacities(
+        model_runner=model_runner, config=config
+    )
     runner = attach(
         pool=pool,
         config=config,
-        req_to_token_pool=model_runner.req_to_token_pool,
         device=device,
         pool_kind=pool_kind,
-        launch_capacity=launch_capacity,
+        verify_capacity=verify_capacity,
+        write_capacity=write_capacity,
+        write_req_capacity=write_req_capacity,
     )
     if runner is None:
         return
-
-    install_req_to_token_pool_free_hook(
-        runner=runner,
-        req_to_token_pool=model_runner.req_to_token_pool,
-    )
-
-    if isinstance(pool, BaseSWAKVPool):
-        install_swa_eviction_hook(runner=runner, pool=pool)
-
-    install_spec_allocator_free_hook(
-        runner=runner,
-        model_runner=model_runner,
-    )
 
     _patch_model_forward(model_runner=model_runner)
     _patch_cuda_graph_runner_replay_class_method()
     setattr(model_runner, _FORWARD_PATCHED_ATTR, True)
 
 
-def _compute_launch_capacity(
+def _compute_launch_capacities(
     *, model_runner: "ModelRunner", config: CanaryConfig
-) -> int:
-    """Pick a fixed launch-buffer capacity that covers every forward shape.
+) -> Tuple[int, int, int]:
+    """Pick fixed launch-buffer capacities that cover every forward shape.
 
-    Strategy: take the largest plausible per-forward batch (cuda-graph max-bs
-    × tokens-per-bs for decode, OR ``max_running_requests`` × max sequence
-    extension for prefill — whichever is larger), then add headroom for
-    verify entries (``max_verify_per_req_per_forward`` per req).
+    Returns ``(verify_capacity, write_capacity, write_req_capacity)``. Each
+    is sized off the largest plausible per-forward batch:
 
-    The launch buffers are allocated up-front (~ a few MB for typical
-    configs) and the kernel always launches with ``num_slots == capacity``;
-    padding rows carry ``verify_mask = -1`` and the kernel short-circuits
-    them with zero I/O. So oversizing here is cheap and avoids the
-    "BatchPlan exceeds launch capacity" runtime error in plan_batch.
+    - ``write_capacity`` = max_bs * num_tokens_per_bs (extend tokens or
+      spec_num_draft_tokens).
+    - ``write_req_capacity`` = max_bs.
+    - ``verify_capacity`` = max_bs * max_verify_per_req_per_forward.
+
+    Padding rows past ``num_active_*`` carry ``*_active_mask == 0`` and the
+    kernel short-circuits them with zero I/O, so oversizing is cheap.
     """
     server_args = model_runner.server_args
     cuda_graph_max_bs = getattr(server_args, "cuda_graph_max_bs", None) or 0
@@ -120,9 +105,10 @@ def _compute_launch_capacity(
         num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
     max_running_requests = int(model_runner.req_to_token_pool.size)
     max_bs = max(int(cuda_graph_max_bs), max_running_requests)
-    write_slots = max_bs * num_tokens_per_bs
-    verify_slots = max_bs * max(1, int(config.max_verify_per_req_per_forward))
-    return int(write_slots + verify_slots)
+    write_capacity = max_bs * num_tokens_per_bs
+    write_req_capacity = max_bs
+    verify_capacity = max_bs * max(1, int(config.max_verify_per_req_per_forward))
+    return verify_capacity, write_capacity, write_req_capacity
 
 
 def _select_pool_kind(
@@ -152,17 +138,14 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
        ``BatchPlan`` from the ``ForwardBatch``, launches head kernel,
        runs real forward, launches tail kernel, ends forward.
     2. **CUDA graph capture**: ``is_current_stream_capturing()`` is True.
-       We CANNOT compute a real plan here (forward_batch.input_ids is
-       graph-buffer-backed dummy data; CPU sync is illegal mid-capture).
-       Instead, we launch head+tail kernels reading from the runner's
-       fixed launch buffers — their default skip-sentinel makes the
-       recorded kernel a no-op. Replay-time refill (see #3) turns the same
-       recorded launches into real verify/write work.
+       We CANNOT compute a real plan here. Instead, we launch head+tail
+       kernels reading from the runner's fixed launch buffers — their
+       default skip-sentinel makes the recorded kernel a no-op. Replay-time
+       refill (see #3) turns the same recorded launches into real
+       verify/write work.
     3. **CUDA graph replay**: handled by
-       :func:`_install_cuda_graph_runner_replay_hook` patching
-       ``CudaGraphRunner.replay`` — the wrapper does NOT run for replays
-       (sglang's replay calls ``graph.replay()`` directly, bypassing
-       ``model.forward``).
+       :func:`_patch_cuda_graph_runner_replay_class_method` patching
+       ``CudaGraphRunner.replay``.
     """
     model = model_runner.model
     original_forward = model.forward
@@ -189,7 +172,7 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         )
         plan = run_head(runner=runner, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
-        run_tail(runner=runner, forward_batch=forward_batch, plan=plan)
+        run_tail(runner=runner, plan=plan)
         return output
 
     model.forward = patched_model_forward
@@ -220,22 +203,13 @@ def _patch_cuda_graph_runner_replay_class_method() -> None:
 
     SGLang has several independent graph-runner classes that each manage
     their own captured CUDA graphs and bypass ``model.forward`` by calling
-    ``self.graphs[bs].replay()`` directly (or by replaying a piecewise
-    sub-graph). Patching only the base ``CudaGraphRunner`` leaves the spec
-    decoding draft worker and piecewise hot paths uninstrumented — the
-    canary kernel would never run during replay there. So we enumerate the
-    full family.
+    ``self.graphs[bs].replay()`` directly. Patching only the base
+    ``CudaGraphRunner`` leaves the spec decoding draft worker and piecewise
+    hot paths uninstrumented; we enumerate the full family.
 
     Why CLASS-level: the canary install runs BEFORE ``init_device_graphs``,
     so the per-instance graph runners don't exist yet at install time.
     Patching the class method covers every instance created afterwards.
-    The patched body looks the canary runner up off
-    ``self.model_runner.token_to_kv_pool`` per-call, so instances without a
-    canary attached just delegate to the original method (zero cost).
-
-    Each subclass below defines its own ``replay`` method (verified at
-    import time), so patching the base class alone would NOT cover them —
-    each class must be patched individually.
 
     Idempotent at the class level: a second install call is a no-op.
     """
@@ -313,11 +287,7 @@ def _extract_forward_batch(args, kwargs):
 def _extract_active_rows(
     forward_batch,
 ) -> tuple[Optional[list], Optional[list]]:
-    """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb.
-
-    Returns ``(None, None)`` when the data isn't available — perturb falls
-    back to global random swap.
-    """
+    """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb."""
     if forward_batch is None:
         return None, None
     if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:

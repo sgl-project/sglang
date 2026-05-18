@@ -21,7 +21,6 @@ from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KINDS,
     BatchPlan,
     CanaryDeviceState,
-    CanaryHostState,
     CanaryLaunchBuffers,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
@@ -42,10 +41,14 @@ _LOG_RATE_LIMIT_SECONDS: float = 5.0
 class CanaryRunner:
     """Top-level orchestrator for KV cache canary.
 
-    One instance lives on each rank. Owns the host-side request state, the
-    GPU-side violation buffer + counters, the side stream that asynchronously
-    copies the ``is_errored`` flag and health counters back to host, and the
-    log/raise policy.
+    One instance lives on each rank. Owns the GPU-side violation buffer +
+    counters, the side stream that asynchronously copies the ``is_errored``
+    flag and health counters back to host, and the log/raise policy.
+
+    Per-request host state is intentionally absent: every forward derives
+    its plan from the sglang ``ForwardBatch`` (req_to_token_pool, input_ids,
+    positions, seq_lens) and the splitmix64 chain hash is computed on
+    device.
 
     .. warning::
         Several pieces in this class are critical safety logic and must NOT
@@ -67,10 +70,11 @@ class CanaryRunner:
         *,
         config: CanaryConfig,
         pool: "KVCache",
-        num_req_slots: int,
         device: torch.device,
         pool_kind: PoolKind = PoolKind.FULL,
-        launch_capacity: int,
+        verify_capacity: int,
+        write_capacity: int,
+        write_req_capacity: int,
     ) -> None:
         self._config = config
         self._device = device
@@ -84,7 +88,6 @@ class CanaryRunner:
         )
         self._has_v_half: bool = pool.canary_has_v_half
 
-        self.host_state = CanaryHostState(config=config, num_req_slots=num_req_slots)
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
         )
@@ -92,16 +95,15 @@ class CanaryRunner:
         # records these specific addresses; replay-side host code refills
         # them in-place before ``graph.replay()`` so the recorded kernel
         # launches see the correct expected_* / slot_indices for the batch.
-        self._launch_capacity: int = int(launch_capacity)
         self._launch = CanaryLaunchBuffers.allocate(
-            device=device, capacity=self._launch_capacity
+            device=device,
+            verify_capacity=verify_capacity,
+            write_capacity=write_capacity,
+            write_req_capacity=write_req_capacity,
         )
         self._side_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
         )
-        # Per-kind pinned host buffers; the side stream copies each kind's
-        # is_errored into its own slot so the main thread can OR them in
-        # ``end_of_forward`` without losing the K/V distinction.
         self._is_errored_host_per_kind: Dict[str, torch.Tensor] = {
             kind: torch.zeros(
                 1, dtype=torch.int32, pin_memory=torch.cuda.is_available()
@@ -119,8 +121,6 @@ class CanaryRunner:
             torch.cuda.Event() if torch.cuda.is_available() else None
         )
 
-        # Latest values pulled by the side-stream events; main inference
-        # thread reads these inside ``end_of_forward``.
         self._latest_is_errored_per_kind: Dict[str, int] = {
             kind: 0 for kind in VIOLATION_KINDS
         }
@@ -128,13 +128,7 @@ class CanaryRunner:
         self._raise_latch: bool = False
         self._last_log_time_per_reason: Dict[Tuple[str, int], float] = {}
         self._forward_step: int = 0
-        # Whether ``_record_poll_events`` has armed the cudaEvent at least
-        # once. ``event.query()`` on an unrecorded event is undefined; skip
-        # until we've recorded once.
         self._poll_armed: bool = False
-        # README §5 warmup zero-check runs exactly once, after the latch flips.
-        # Tracked explicitly so a step skipped by cuda graph paths can't cause
-        # the check to silently leapfrog past the warmup boundary.
         self._warmup_check_done: bool = False
 
     @property
@@ -178,11 +172,7 @@ class CanaryRunner:
             self._handle_violation_global()
 
     def _pull_latest_from_events(self) -> None:
-        """Non-blocking event.query() — if done, refresh host-cached values.
-
-        Called from the main inference thread only (never from another
-        thread) so we never query while another thread is mid-capture.
-        """
+        """Non-blocking event.query() — if done, refresh host-cached values."""
         try:
             for kind in VIOLATION_KINDS:
                 event = self._is_errored_event_per_kind[kind]
@@ -204,9 +194,6 @@ class CanaryRunner:
     def _record_poll_events(self) -> None:
         if self._side_stream is None:
             return
-        # Skip during cuda graph capture: side-stream operations and
-        # event.record / event.query interact badly with the captured stream
-        # (CUDA refuses these ops mid-capture).
         if torch.cuda.is_current_stream_capturing():
             return
         compute_stream = torch.cuda.current_stream(self._device)
@@ -245,53 +232,26 @@ class CanaryRunner:
                 self._counters_event.record(stream=self._side_stream)
 
     def prepare_for_replay(self, *, plan: BatchPlan) -> None:
-        """Refill the fixed launch buffers in-place for a replay forward.
-
-        Called from the pre-replay hook on ``CudaGraphRunner.replay``. The
-        captured graph holds references to ``self._launch.*`` tensors at
-        their fixed addresses; this method copies the current batch's
-        expected_* / slot_indices into those tensors so the replayed kernel
-        launches verify and write the right slots.
-        """
+        """Refill the fixed launch buffers in-place for a replay forward."""
         self._launch.fill_from_plan(plan)
 
     def reset_launch_buffers_to_skip_sentinel(self) -> None:
-        """Reset the entire fixed launch buffer to the skip-sentinel state.
-
-        Replay-side pre-fill calls this when there is no plan (e.g. the
-        batch is degenerate / out_cache_loc is empty) so the recorded
-        canary kernel becomes a no-op for this replay rather than reusing
-        stale data from a prior forward.
-        """
-        self._launch.verify_mask.fill_(-1)
-        self._launch.verify_seq_positions.fill_(-1)
+        """Reset the launch buffers to skip-sentinel state (kernel no-op)."""
+        self._launch.reset_to_skip_sentinel()
 
     def launch_for_capture(self, *, kernel_kind: int) -> None:
-        """Capture-only: record one kernel launch as a no-op (skip-sentinel).
-
-        Called separately for head (before original_forward) and tail
-        (after) so the relative order of canary launches against the real
-        model forward matches the eager path. Replay refills the buffers
-        BEFORE ``graph.replay()``, so the same recorded launches become
-        real verify+write work on every replay forward.
-
-        Resets the buffers to skip-sentinel just before each launch so
-        capture never accidentally verifies / writes — replay-side
-        ``fill_from_plan`` overwrites the buffer contents at replay time
-        before ``graph.replay()`` re-executes this launch.
-        """
+        """Capture-only: record one kernel launch as a no-op (skip-sentinel)."""
         if not self._config.enabled:
             return
         self.reset_launch_buffers_to_skip_sentinel()
         self._launch_kernel_only(kernel_kind=kernel_kind)
 
     def _launch_kernel_only(self, *, kernel_kind: int) -> None:
-        """Launch a single kernel reading from the current fixed-buffer contents.
+        """Launch one kernel pair from the current fixed-buffer contents.
 
         Shared by capture-time recording (skip-sentinel contents) and
-        replay-graph re-launch (real contents after pre-fill).
-
-        K-half and V-half each get their own ``CanaryViolationSlot`` so the
+        replay-graph re-launch (real contents after pre-fill). K-half and
+        V-half each get their own ``CanaryViolationSlot`` so the
         first-violation latch / ring / is_errored never cross-pollinate.
         """
         if kernel_kind == KERNEL_KIND_HEAD:
@@ -320,13 +280,20 @@ class CanaryRunner:
                 src_buf=src_buf.view(torch.uint8).flatten(),
                 dst_buf=dst_buf.view(torch.uint8).flatten(),
                 slot_stride_bytes=stride,
-                slot_indices=self._launch.slot_indices,
-                expected_req_ids=self._launch.expected_req_ids,
-                expected_token_ids=self._launch.expected_token_ids,
-                expected_positions=self._launch.expected_positions,
-                expected_prev_hashes=self._launch.expected_prev_hashes,
-                verify_mask=self._launch.verify_mask,
-                verify_seq_positions=self._launch.verify_seq_positions,
+                verify_slot_indices=self._launch.verify_slot_indices,
+                verify_positions=self._launch.verify_positions,
+                verify_req_ids=self._launch.verify_req_ids,
+                verify_prev_slot_indices=self._launch.verify_prev_slot_indices,
+                verify_active_mask=self._launch.verify_active_mask,
+                write_slot_indices=self._launch.write_slot_indices,
+                write_token_ids=self._launch.write_token_ids,
+                write_positions=self._launch.write_positions,
+                write_req_ids=self._launch.write_req_ids,
+                write_req_seed_slot_indices=self._launch.write_req_seed_slot_indices,
+                write_req_entry_starts=self._launch.write_req_entry_starts,
+                write_req_entry_counts=self._launch.write_req_entry_counts,
+                write_req_active_mask=self._launch.write_req_active_mask,
+                seed=int(self._config.seed),
                 violation_ring=slot.violation_ring,
                 violation_ring_valid=slot.violation_ring_valid,
                 violation_write_index=slot.violation_write_index,
@@ -344,11 +311,7 @@ class CanaryRunner:
         plan: BatchPlan,
         kernel_kind: int,
     ) -> None:
-        """Eager-path launch: fill the fixed buffers from the plan, then launch.
-
-        The replay path bypasses this and goes through ``prepare_for_replay``
-        + recorded-graph launches instead.
-        """
+        """Eager-path launch: fill the fixed buffers from the plan, then launch."""
         if not self._config.enabled:
             return
         total = plan.num_verify + plan.num_write
@@ -394,18 +357,7 @@ class CanaryRunner:
         return int(flag.item())
 
     def _maybe_health_check(self) -> None:
-        """README §5 — counter-zero detection + periodic print.
-
-        The warmup zero-check uses a latch + ``>=`` trigger (not ``==``) so a
-        step that's skipped (e.g. cuda graph capture / replay does not advance
-        ``_forward_step``) cannot leapfrog past the warmup boundary and miss
-        the check.
-
-        Any raise path here MUST be cross-rank synchronized: a single-rank
-        raise on a TP group would deadlock peers in the next NCCL collective.
-        We allreduce-MAX a health flag across the TP group and only raise if
-        every rank agrees.
-        """
+        """README §5 — counter-zero detection + periodic print."""
         step = self._forward_step
         period = max(1, self._config.health_print_every_n_forwards)
         kernel_head, kernel_tail, slot_head, slot_tail = self._latest_counters
@@ -449,11 +401,7 @@ class CanaryRunner:
             self._raise_with_first_violation()
 
     def _pull_first_violation(self, kind: str) -> Tuple[List[int], int]:
-        """Synchronous D2H pull of one kind's first-violation row + write count.
-
-        Only called on the error path; the hot path stays asynchronous via
-        the side-stream event pump.
-        """
+        """Synchronous D2H pull of one kind's first-violation row + write count."""
         slot = self._device_state.get_violation_slot(kind)
         first_violation = slot.first_violation.cpu().tolist()
         write_index = int(slot.violation_write_index.cpu().item())
@@ -477,14 +425,6 @@ class CanaryRunner:
                 self._last_log_time_per_reason[key] = now
                 logger.error(self._format_violation(kind, first_violation, write_index))
 
-        # Reset GPU-side flags/rings so subsequent NEW violations surface.
-        # Without this, each kind's device flag stays 1 forever (every
-        # subsequent forward re-triggers a sync D2H + allreduce);
-        # ``first_violation_set`` stays latched (new violations silently
-        # masked); the ring fills up and CAS-fails all future writes.
-        # Host-cached ``_latest_is_errored_per_kind`` is reset to 0 so the
-        # next ``end_of_forward`` doesn't re-enter this handler before the
-        # next async event poll catches up.
         self._device_state.reset_violation_state()
         for kind in VIOLATION_KINDS:
             self._latest_is_errored_per_kind[kind] = 0
@@ -492,9 +432,6 @@ class CanaryRunner:
     def _raise_with_first_violation(self) -> None:
         kinds = self._kinds_with_violation()
         if not kinds:
-            # Defensive: global flag was set (e.g. peer rank fired the
-            # allreduce) but our own pumps haven't surfaced any per-kind
-            # flag yet. Fall back to scanning every kind synchronously.
             kinds = list(VIOLATION_KINDS)
         messages: List[str] = []
         for kind in kinds:

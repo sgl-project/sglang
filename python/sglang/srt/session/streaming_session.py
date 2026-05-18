@@ -408,12 +408,6 @@ class StreamingSession(BasePrefixCache):
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
-            # Notify canary (no-op when canary disabled): this is a bypass
-            # path around ``ReqToTokenPool.free`` so the canary's free hook
-            # doesn't fire automatically here.
-            from sglang.srt.kv_cache_canary.api import release_req_pool_idx
-
-            release_req_pool_idx(self.req_to_token_pool, slot.req_pool_idx)
 
         self._free_slot_mamba(slot)
 

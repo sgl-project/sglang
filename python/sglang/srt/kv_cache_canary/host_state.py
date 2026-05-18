@@ -1,307 +1,295 @@
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import VIOLATION_FIELDS
 from sglang.srt.kv_cache_canary.config import CanaryConfig
-from sglang.srt.kv_cache_canary.fingerprint import mix_step
 
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _HistoryEntry:
-    """One historical write for a request — a single verify target.
-
-    Recording the slot index here (independently of ``req_to_token_pool``)
-    is what makes the position-monotonic check (README §3 (b)) capable of
-    catching map perturbation: the kernel reads ``src_buf[slot_idx]`` and
-    checks that the slot's stored ``position`` field equals this entry's
-    ``position``. Any redirect of the table to a different slot will produce
-    a different ``position`` field and trip the check.
-    """
-
-    token_id: int
-    position: int
-    slot_idx: int
-    prev_hash_at_write: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _RequestState:
-    prev_hash_tail: int
-    k_req: int
-    # Full history of committed writes for this req in position order
-    # (history[i].position == i). Verify entries cover ``[0, k_req)`` so
-    # any prior slot's content can be re-checked, not just the last one.
-    history: Tuple["_HistoryEntry", ...] = ()
-
-
-class CanaryHostState:
-    """Per-request canary high-water-mark, chain-hash tail, and verify target.
-
-    Indexed by ``req_pool_idx`` (the stable per-request index assigned by
-    ``ReqToTokenPool``). The GPU side only sees the expected fingerprints we
-    compute here; this class owns the host bookkeeping.
-    """
-
-    def __init__(self, *, config: CanaryConfig, num_req_slots: int) -> None:
-        self._config = config
-        self._states: Dict[int, _RequestState] = {}
-        self._lock = threading.Lock()
-
-    def _initial_state(self) -> _RequestState:
-        return _RequestState(prev_hash_tail=self._config.seed, k_req=0)
-
-    def reset_request(self, req_pool_idx: int) -> None:
-        with self._lock:
-            self._states.pop(req_pool_idx, None)
-
-    def reset_request_for_slot(self, slot_idx: int) -> None:
-        """Drop any host state whose history references this physical slot.
-
-        Used by SWA window-slide eviction: when a slot is evicted from the
-        sliding window, any request whose verify history touches that slot
-        must forget it (otherwise the next plan_batch builds a verify entry
-        that reads a slot now reused by a stranger).
-        """
-        with self._lock:
-            stale_req_pool_idxs: List[int] = []
-            for req_pool_idx, state in self._states.items():
-                if any(entry.slot_idx == slot_idx for entry in state.history):
-                    stale_req_pool_idxs.append(req_pool_idx)
-            for req_pool_idx in stale_req_pool_idxs:
-                self._states.pop(req_pool_idx, None)
-
-    def reset_all_last_committed(self) -> None:
-        """Drop the verify history of every tracked request.
-
-        Conservative SWA window-slide / spec-reject fallback: when we can't
-        enumerate which slots were just evicted (e.g. the free hook only
-        fires with no argument), wiping history prevents stale verify
-        entries pointing at slots a stranger may now own. The next forward
-        will pure-write and re-anchor; ``prev_hash_tail`` and ``k_req`` are
-        kept so chain continuity is preserved.
-
-        Method name retained for backwards source-compat; the entire
-        history (not just the last-committed entry) is dropped.
-        """
-        with self._lock:
-            for req_pool_idx, state in list(self._states.items()):
-                if not state.history:
-                    continue
-                self._states[req_pool_idx] = _RequestState(
-                    prev_hash_tail=state.prev_hash_tail,
-                    k_req=state.k_req,
-                    history=(),
-                )
-
-    def reset_request_to(self, *, req_pool_idx: int, k_req: int) -> None:
-        """Roll a request's high-water mark back to ``k_req`` (spec reject path).
-
-        Spec decoding rejects drafted tokens after the target verifies them;
-        the rejected tokens' slots get freed and reused. The canary chain
-        must rewind ``K_req`` and truncate the history so the next batch's
-        verify entries don't read slots that were just returned to the
-        allocator.
-        """
-        with self._lock:
-            existing = self._states.get(req_pool_idx)
-            if existing is None:
-                return
-            if k_req <= 0:
-                self._states.pop(req_pool_idx, None)
-                return
-            new_k_req = min(existing.k_req, int(k_req))
-            new_history = tuple(
-                entry for entry in existing.history if entry.position < new_k_req
-            )
-            self._states[req_pool_idx] = _RequestState(
-                prev_hash_tail=existing.prev_hash_tail,
-                k_req=new_k_req,
-                history=new_history,
-            )
-
-    def has_state(self, req_pool_idx: int) -> bool:
-        with self._lock:
-            return req_pool_idx in self._states
-
-    def plan_batch(
-        self,
-        *,
-        req_pool_indices: List[int],
-        req_token_counts: List[int],
-        req_start_positions: List[int],
-        input_tokens_per_req: List[List[int]],
-        write_slot_indices_per_req: List[List[int]],
-    ) -> "BatchPlan":
-        """Compute expected (req_id, token_id, position, prev_hash) for the batch.
-
-        The batch the kernel sees is laid out as
-        ``[verify_entries..., write_entries...]``:
-
-        - **verify entries**: for every request with prior committed writes,
-          ONE verify entry per historical position ``[0, k_req)`` is emitted.
-          Each verify entry binds a ``slot_idx`` (the physical slot the
-          historical write landed in) to the expected
-          ``(req_id, token_id, position, prev_hash)`` triple, plus the
-          ``verify_seq_position`` for README §3 (b) — that field is just the
-          historical ``position`` index itself, NOT derived from any
-          ``req_to_token_pool`` lookup. So a map perturbation that redirects
-          a slot pointer cannot fake-match the position-monotonic check.
-        - **write entries**: ``sum(req_token_counts)`` slots laid out in the
-          caller's flattened ``input_ids`` / ``out_cache_loc`` order.
-
-        The verify range grows with k_req — covering the entire prefix means
-        a perturbation anywhere along the chain (not just the last slot) is
-        observable on the next forward.
-        """
-        if not (
-            len(req_pool_indices)
-            == len(req_token_counts)
-            == len(req_start_positions)
-            == len(input_tokens_per_req)
-            == len(write_slot_indices_per_req)
-        ):
-            raise RuntimeError(
-                "kv-canary: plan_batch input lists have mismatched lengths"
-            )
-
-        verify_req_ids: List[int] = []
-        verify_token_ids: List[int] = []
-        verify_positions: List[int] = []
-        verify_prev_hashes: List[int] = []
-        verify_seq_positions: List[int] = []
-        verify_slot_indices: List[int] = []
-
-        write_req_ids: List[int] = []
-        write_token_ids: List[int] = []
-        write_positions: List[int] = []
-        write_prev_hashes: List[int] = []
-        next_state: Dict[int, _RequestState] = {}
-
-        with self._lock:
-            for req_pool_idx, count, start_pos, tokens, write_slots in zip(
-                req_pool_indices,
-                req_token_counts,
-                req_start_positions,
-                input_tokens_per_req,
-                write_slot_indices_per_req,
-            ):
-                if count != len(tokens) or count != len(write_slots):
-                    raise RuntimeError(
-                        "kv-canary: per-request count must match tokens and write_slots length"
-                    )
-                state = self._states.get(req_pool_idx) or self._initial_state()
-
-                # Bound the per-forward verify cost: full [0, K_req) is
-                # quadratic over a long req's lifetime. Verify the most
-                # recent ``max_verify_per_req_per_forward`` entries instead.
-                # 0 = unbounded.
-                cap = self._config.max_verify_per_req_per_forward
-                verify_window = state.history if cap <= 0 else state.history[-cap:]
-                for entry in verify_window:
-                    verify_req_ids.append(req_pool_idx)
-                    verify_token_ids.append(entry.token_id)
-                    verify_positions.append(entry.position)
-                    verify_prev_hashes.append(to_signed_int64(entry.prev_hash_at_write))
-                    verify_seq_positions.append(entry.position)
-                    verify_slot_indices.append(entry.slot_idx)
-
-                prev_hash = state.prev_hash_tail
-                new_entries: List[_HistoryEntry] = []
-                for offset in range(count):
-                    pos = start_pos + offset
-                    token_id = tokens[offset]
-                    slot_idx = write_slots[offset]
-                    write_req_ids.append(req_pool_idx)
-                    write_token_ids.append(token_id)
-                    write_positions.append(pos)
-                    write_prev_hashes.append(to_signed_int64(prev_hash))
-                    new_entries.append(
-                        _HistoryEntry(
-                            token_id=token_id,
-                            position=pos,
-                            slot_idx=slot_idx,
-                            prev_hash_at_write=prev_hash,
-                        )
-                    )
-                    prev_hash = mix_step(prev_hash, token_id, pos)
-
-                if count > 0:
-                    combined_history = state.history + tuple(new_entries)
-                    # Keep at most max_verify_per_req_per_forward entries —
-                    # older positions become unverifiable but free host memory
-                    # and avoid unbounded growth. 0 = keep all history.
-                    if cap > 0 and len(combined_history) > cap:
-                        combined_history = combined_history[-cap:]
-                    next_state[req_pool_idx] = _RequestState(
-                        prev_hash_tail=prev_hash,
-                        k_req=max(state.k_req, start_pos + count),
-                        history=combined_history,
-                    )
-                else:
-                    next_state[req_pool_idx] = state
-
-        num_verify = len(verify_req_ids)
-        num_write = len(write_req_ids)
-        write_slot_indices_flat: List[int] = []
-        for w in write_slot_indices_per_req:
-            write_slot_indices_flat.extend(int(s) for s in w)
-
-        expected_req_ids = verify_req_ids + write_req_ids
-        expected_token_ids = verify_token_ids + write_token_ids
-        expected_positions = verify_positions + write_positions
-        expected_prev_hashes = verify_prev_hashes + write_prev_hashes
-        verify_mask = [1] * num_verify + [0] * num_write
-        verify_seq_positions_full = verify_seq_positions + [-1] * num_write
-
-        return BatchPlan(
-            expected_req_ids=expected_req_ids,
-            expected_token_ids=expected_token_ids,
-            expected_positions=expected_positions,
-            expected_prev_hashes=expected_prev_hashes,
-            verify_mask=verify_mask,
-            verify_seq_positions=verify_seq_positions_full,
-            verify_slot_indices=verify_slot_indices,
-            write_slot_indices=write_slot_indices_flat,
-            num_verify=num_verify,
-            num_write=num_write,
-            next_state=next_state,
-        )
-
-    def commit_plan(self, plan: "BatchPlan") -> None:
-        with self._lock:
-            for req_pool_idx, new_state in plan.next_state.items():
-                self._states[req_pool_idx] = new_state
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BatchPlan:
-    expected_req_ids: List[int]
-    expected_token_ids: List[int]
-    expected_positions: List[int]
-    expected_prev_hashes: List[int]
-    verify_mask: List[int]
-    verify_seq_positions: List[int]
+    """Per-forward layout the canary kernel consumes.
+
+    All per-req information is derived from the sglang ``ForwardBatch`` at
+    plan time — there is no host-side per-request state. The host emits raw
+    ``(req_id, token_id, position, slot_idx)`` arrays plus per-write-req
+    chain-seed pointers; the kernel walks the splitmix64 chain itself.
+
+    Layout:
+
+    - **Per-verify-entry** (length ``num_verify``):
+      ``verify_slot_indices`` / ``verify_positions`` / ``verify_req_ids`` /
+      ``verify_prev_slot_indices``. ``verify_prev_slot_indices[i] == -1``
+      means "this is position 0 of its req; expected prev_hash = kSeed".
+      Otherwise it's the slot index for position ``verify_positions[i] - 1``
+      of the same req.
+    - **Per-write-entry** (length ``num_write``):
+      ``write_slot_indices`` / ``write_token_ids`` / ``write_positions`` /
+      ``write_req_ids``.
+    - **Per-write-req** (length ``num_write_reqs``):
+      ``write_req_seed_slot_indices`` (-1 = K_req_old == 0 -> kSeed),
+      ``write_req_entry_starts`` (offset into per-write-entry arrays),
+      ``write_req_entry_counts``.
+
+    The kernel grid spans ``num_verify + num_write_reqs`` threads — one
+    verify thread per entry plus one driver thread per write-req that walks
+    its chain sequentially.
+    """
+
+    verify_req_ids: List[int]
+    verify_positions: List[int]
     verify_slot_indices: List[int]
+    verify_prev_slot_indices: List[int]
+
+    write_req_ids: List[int]
+    write_token_ids: List[int]
+    write_positions: List[int]
     write_slot_indices: List[int]
+
+    write_req_seed_slot_indices: List[int]
+    write_req_entry_starts: List[int]
+    write_req_entry_counts: List[int]
+
     num_verify: int
     num_write: int
-    next_state: Dict[int, _RequestState]
+    num_write_reqs: int
 
 
-def to_signed_int64(unsigned_value: int) -> int:
-    assert (
-        0 <= unsigned_value < (1 << 64)
-    ), f"kv-canary: prev_hash out of unsigned-64 range: {unsigned_value:#x}"
-    mask = (1 << 64) - 1
-    value = unsigned_value & mask
-    if value >= (1 << 63):
-        value -= 1 << 64
-    return value
+def plan_batch_from_forward_batch(
+    *,
+    forward_batch: "ForwardBatch",
+    config: CanaryConfig,
+) -> Optional[BatchPlan]:
+    """Translate a ``ForwardBatch`` into per-slot kernel expectations.
+
+    Every per-req field is read fresh from ``forward_batch`` — no canary
+    host-side state is maintained. The chain hash is computed by the kernel
+    on device using slot[i-1]'s stored ``(prev_hash, token, position)``.
+
+    K_req (already-written token count per req) is recovered as
+    ``extend_prefix_lens`` (chunked prefill) or ``seq_lens - 1`` (decode /
+    target_verify). The verify range is ``[0, K_req)``, capped by
+    ``config.max_verify_per_req_per_forward``. Slot indices for the verify
+    range are pulled from ``forward_batch.req_to_token_pool.req_to_token``
+    (the canary trusts this map; cross-checks come from the kernel side
+    via req_id and position fields stored in the slot itself).
+
+    Returns ``None`` when the plan would be empty (no out_cache_loc, unknown
+    forward mode, etc.).
+    """
+    if forward_batch.out_cache_loc is None or forward_batch.out_cache_loc.numel() == 0:
+        return None
+
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is None:
+        return None
+
+    req_pool_indices = forward_batch.req_pool_indices.detach().cpu().tolist()
+    input_ids_list: List[int] = forward_batch.input_ids.detach().cpu().tolist()
+    out_cache_loc_list: List[int] = forward_batch.out_cache_loc.detach().cpu().tolist()
+    positions_list: Optional[List[int]] = (
+        forward_batch.positions.detach().cpu().tolist()
+        if forward_batch.positions is not None
+        else None
+    )
+
+    is_extend = forward_mode.is_extend() or forward_mode.is_mixed()
+    if is_extend:
+        if (
+            forward_batch.extend_seq_lens is None
+            or forward_batch.extend_prefix_lens is None
+        ):
+            return None
+        seq_lens = forward_batch.extend_seq_lens.detach().cpu().tolist()
+        prefix_lens = forward_batch.extend_prefix_lens.detach().cpu().tolist()
+    elif forward_mode.is_decode() or forward_mode.is_target_verify():
+        seq_lens = [1] * len(req_pool_indices)
+        full_seq_lens = forward_batch.seq_lens.detach().cpu().tolist()
+        prefix_lens = [int(s) - 1 for s in full_seq_lens]
+    else:
+        return None
+
+    num_real_tokens = _num_real_tokens(forward_batch, len(input_ids_list))
+    if sum(seq_lens) != num_real_tokens:
+        return None
+    if len(out_cache_loc_list) != num_real_tokens:
+        return None
+
+    req_to_token_pool = forward_batch.req_to_token_pool
+    if req_to_token_pool is None:
+        return None
+    cap = int(config.max_verify_per_req_per_forward)
+
+    return _build_plan(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        input_ids_list=input_ids_list,
+        out_cache_loc_list=out_cache_loc_list,
+        positions_list=positions_list,
+        req_to_token_table=req_to_token_pool.req_to_token,
+        verify_cap=cap,
+    )
+
+
+def _build_plan(
+    *,
+    req_pool_indices: List[int],
+    seq_lens: List[int],
+    prefix_lens: List[int],
+    input_ids_list: List[int],
+    out_cache_loc_list: List[int],
+    positions_list: Optional[List[int]],
+    req_to_token_table: torch.Tensor,
+    verify_cap: int,
+) -> Optional[BatchPlan]:
+    verify_req_ids: List[int] = []
+    verify_positions: List[int] = []
+    verify_slot_indices: List[int] = []
+    verify_prev_slot_indices: List[int] = []
+
+    write_req_ids: List[int] = []
+    write_token_ids: List[int] = []
+    write_positions: List[int] = []
+    write_slot_indices: List[int] = []
+
+    write_req_seed_slot_indices: List[int] = []
+    write_req_entry_starts: List[int] = []
+    write_req_entry_counts: List[int] = []
+
+    cursor = 0
+    for req_pool_idx, n, k_req in zip(req_pool_indices, seq_lens, prefix_lens):
+        next_cursor = cursor + n
+        req_pool_idx_int = int(req_pool_idx)
+        # Padding row in ReqToTokenPool lives at index 0 (cuda-graph padded
+        # batches set padding rows' req_pool_indices to 0). Skipping avoids
+        # writing synthetic data into the padding slot's shadow.
+        if req_pool_idx_int == 0:
+            cursor = next_cursor
+            continue
+
+        k_req_int = int(k_req)
+        if k_req_int > 0:
+            slot_indices_for_verify = _pull_verify_slot_indices(
+                req_to_token_table=req_to_token_table,
+                req_pool_idx=req_pool_idx_int,
+                k_req=k_req_int,
+                cap=verify_cap,
+            )
+            window_start = k_req_int - len(slot_indices_for_verify)
+            for j, slot_idx in enumerate(slot_indices_for_verify):
+                pos = window_start + j
+                verify_req_ids.append(req_pool_idx_int)
+                verify_positions.append(pos)
+                verify_slot_indices.append(int(slot_idx))
+                if pos == 0:
+                    verify_prev_slot_indices.append(-1)
+                elif j > 0:
+                    verify_prev_slot_indices.append(
+                        int(slot_indices_for_verify[j - 1])
+                    )
+                else:
+                    # Truncated window head: prev slot lives at column
+                    # (pos - 1) of the same req in req_to_token.
+                    prev_slot = int(req_to_token_table[req_pool_idx_int, pos - 1])
+                    verify_prev_slot_indices.append(prev_slot)
+
+        if n > 0:
+            seed_slot = -1
+            if k_req_int > 0:
+                seed_slot = int(
+                    req_to_token_table[req_pool_idx_int, k_req_int - 1]
+                )
+            entry_start = len(write_slot_indices)
+            write_req_seed_slot_indices.append(seed_slot)
+            write_req_entry_starts.append(entry_start)
+            write_req_entry_counts.append(n)
+
+            for offset in range(n):
+                pos = k_req_int + offset
+                token_id = input_ids_list[cursor + offset]
+                slot_idx = out_cache_loc_list[cursor + offset]
+                write_req_ids.append(req_pool_idx_int)
+                write_token_ids.append(int(token_id))
+                # ForwardBatch.positions carries the canonical position for
+                # each new token. Fall back to the prefix+offset derivation
+                # when the tensor is unavailable (e.g. some test paths).
+                if positions_list is not None:
+                    write_positions.append(int(positions_list[cursor + offset]))
+                else:
+                    write_positions.append(pos)
+                write_slot_indices.append(int(slot_idx))
+
+        cursor = next_cursor
+
+    num_verify = len(verify_req_ids)
+    num_write = len(write_req_ids)
+    num_write_reqs = len(write_req_seed_slot_indices)
+    if num_verify == 0 and num_write == 0:
+        return None
+
+    return BatchPlan(
+        verify_req_ids=verify_req_ids,
+        verify_positions=verify_positions,
+        verify_slot_indices=verify_slot_indices,
+        verify_prev_slot_indices=verify_prev_slot_indices,
+        write_req_ids=write_req_ids,
+        write_token_ids=write_token_ids,
+        write_positions=write_positions,
+        write_slot_indices=write_slot_indices,
+        write_req_seed_slot_indices=write_req_seed_slot_indices,
+        write_req_entry_starts=write_req_entry_starts,
+        write_req_entry_counts=write_req_entry_counts,
+        num_verify=num_verify,
+        num_write=num_write,
+        num_write_reqs=num_write_reqs,
+    )
+
+
+def _pull_verify_slot_indices(
+    *,
+    req_to_token_table: torch.Tensor,
+    req_pool_idx: int,
+    k_req: int,
+    cap: int,
+) -> List[int]:
+    """Return slot indices for the verify range of one req.
+
+    Bounds the per-forward verify cost: the full ``[0, K_req)`` range grows
+    linearly with the req's lifetime. When capped, the TAIL ``cap``
+    positions are verified (most likely to surface a fresh-write bug); the
+    older positions become unverifiable this forward but the next forward
+    re-walks the same window.
+    """
+    if cap > 0 and k_req > cap:
+        window_start = k_req - cap
+    else:
+        window_start = 0
+    row = req_to_token_table[req_pool_idx, window_start:k_req]
+    return [int(x) for x in row.detach().cpu().tolist()]
+
+
+def _num_real_tokens(forward_batch: "ForwardBatch", total_input_len: int) -> int:
+    """Strip cuda-graph padding from token-aligned arrays.
+
+    ``num_token_non_padded_cpu`` (when present) tells us how many leading
+    tokens of ``input_ids`` / ``out_cache_loc`` are real; the remainder is
+    cuda-graph tail padding.
+    """
+    if hasattr(forward_batch, "num_token_non_padded_cpu"):
+        value = forward_batch.num_token_non_padded_cpu
+        if value is not None:
+            try:
+                return int(value)
+            except TypeError:
+                pass
+    return total_input_len
 
 
 VIOLATION_KIND_HEAD_K: str = "head_k"
@@ -423,131 +411,175 @@ class CanaryDeviceState:
 class CanaryLaunchBuffers:
     """Fixed-address per-launch tensors for cuda-graph-safe kernel launches.
 
-    These tensors are allocated once at runner-init time and their addresses
-    are baked into any captured cuda graph. Each forward fills the prefix
-    ``[0, capacity)`` via in-place ``copy_``; rows beyond the active slot
-    count are kept with ``verify_mask = -1`` so the kernel skips them.
+    Holds three tile sets:
 
-    The kernel always launches with ``num_slots = capacity`` — replay path
-    sees the SAME tensor sizes, same pointers, same launch grid as capture.
+    1. **Per-verify-entry** (capacity ``verify_capacity``):
+       ``verify_slot_indices`` / ``verify_positions`` / ``verify_req_ids`` /
+       ``verify_prev_slot_indices`` / ``verify_active_mask``.
+    2. **Per-write-entry** (capacity ``write_capacity``):
+       ``write_slot_indices`` / ``write_token_ids`` / ``write_positions`` /
+       ``write_req_ids``.
+    3. **Per-write-req** (capacity ``write_req_capacity``):
+       ``write_req_seed_slot_indices`` / ``write_req_entry_starts`` /
+       ``write_req_entry_counts`` / ``write_req_active_mask``.
+
+    Per-write-entry rows are pure data driven by the write-req chains; the
+    grid is sized by ``verify_capacity + write_req_capacity``.
     """
 
-    capacity: int
-    slot_indices: torch.Tensor
-    expected_req_ids: torch.Tensor
-    expected_token_ids: torch.Tensor
-    expected_positions: torch.Tensor
-    expected_prev_hashes: torch.Tensor
-    verify_mask: torch.Tensor
-    verify_seq_positions: torch.Tensor
+    verify_capacity: int
+    write_capacity: int
+    write_req_capacity: int
+    verify_slot_indices: torch.Tensor
+    verify_positions: torch.Tensor
+    verify_req_ids: torch.Tensor
+    verify_prev_slot_indices: torch.Tensor
+    verify_active_mask: torch.Tensor
+    write_slot_indices: torch.Tensor
+    write_token_ids: torch.Tensor
+    write_positions: torch.Tensor
+    write_req_ids: torch.Tensor
+    write_req_seed_slot_indices: torch.Tensor
+    write_req_entry_starts: torch.Tensor
+    write_req_entry_counts: torch.Tensor
+    write_req_active_mask: torch.Tensor
 
     @classmethod
-    def allocate(cls, *, device: torch.device, capacity: int) -> "CanaryLaunchBuffers":
-        if capacity <= 0:
-            raise RuntimeError(
-                f"kv-canary: CanaryLaunchBuffers capacity must be positive, got {capacity}"
-            )
-        slot_indices = torch.zeros(capacity, dtype=torch.int64, device=device)
-        expected_req_ids = torch.zeros(capacity, dtype=torch.int64, device=device)
-        expected_token_ids = torch.zeros(capacity, dtype=torch.int64, device=device)
-        expected_positions = torch.zeros(capacity, dtype=torch.int64, device=device)
-        expected_prev_hashes = torch.zeros(capacity, dtype=torch.int64, device=device)
-        # Default ``-1`` = skip-sentinel: an unfilled launch must be a no-op.
-        verify_mask = torch.full((capacity,), -1, dtype=torch.int32, device=device)
-        verify_seq_positions = torch.full(
-            (capacity,), -1, dtype=torch.int64, device=device
-        )
+    def allocate(
+        cls,
+        *,
+        device: torch.device,
+        verify_capacity: int,
+        write_capacity: int,
+        write_req_capacity: int,
+    ) -> "CanaryLaunchBuffers":
+        for name, cap in [
+            ("verify_capacity", verify_capacity),
+            ("write_capacity", write_capacity),
+            ("write_req_capacity", write_req_capacity),
+        ]:
+            if cap <= 0:
+                raise RuntimeError(
+                    f"kv-canary: CanaryLaunchBuffers {name} must be positive, got {cap}"
+                )
+
+        def zeros_i64(n: int) -> torch.Tensor:
+            return torch.zeros(n, dtype=torch.int64, device=device)
+
+        def zeros_i32(n: int) -> torch.Tensor:
+            return torch.zeros(n, dtype=torch.int32, device=device)
+
         return cls(
-            capacity=int(capacity),
-            slot_indices=slot_indices,
-            expected_req_ids=expected_req_ids,
-            expected_token_ids=expected_token_ids,
-            expected_positions=expected_positions,
-            expected_prev_hashes=expected_prev_hashes,
-            verify_mask=verify_mask,
-            verify_seq_positions=verify_seq_positions,
+            verify_capacity=int(verify_capacity),
+            write_capacity=int(write_capacity),
+            write_req_capacity=int(write_req_capacity),
+            verify_slot_indices=zeros_i64(verify_capacity),
+            verify_positions=zeros_i64(verify_capacity),
+            verify_req_ids=zeros_i64(verify_capacity),
+            verify_prev_slot_indices=zeros_i64(verify_capacity),
+            verify_active_mask=zeros_i32(verify_capacity),
+            write_slot_indices=zeros_i64(write_capacity),
+            write_token_ids=zeros_i64(write_capacity),
+            write_positions=zeros_i64(write_capacity),
+            write_req_ids=zeros_i64(write_capacity),
+            write_req_seed_slot_indices=zeros_i64(write_req_capacity),
+            write_req_entry_starts=zeros_i64(write_req_capacity),
+            write_req_entry_counts=zeros_i64(write_req_capacity),
+            write_req_active_mask=zeros_i32(write_req_capacity),
         )
 
-    def fill_from_plan(self, plan: "BatchPlan") -> int:
+    def fill_from_plan(self, plan: "BatchPlan") -> Tuple[int, int]:
         """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
 
-        Returns the number of active slots (verify + write) actually copied.
-        The prefix ``[0, total)`` carries real data; ``[total, capacity)`` is
-        reset to the skip-sentinel so prior content from a larger batch
-        cannot leak.
+        Returns ``(num_active_verify, num_active_write_reqs)``. Rows past
+        the active count are reset to inactive (mask = 0) so the kernel
+        skips them. The write-entry tile is also reset past
+        ``plan.num_write`` so a write-req driver that reads
+        ``write_*[entry_start + j]`` cannot pick up stale data.
 
-        Padding semantics: ``verify_mask = -1`` makes the kernel exit before
-        any I/O; ``verify_seq_positions = -1`` is the existing "no position
-        check" sentinel and is kept consistent. Other expected_* fields'
-        residual values don't matter once ``verify_mask`` is -1.
-
-        When ``num_verify + num_write`` exceeds capacity (e.g. an eager
-        prefill batch larger than what the install-time sizing anticipated),
-        the verify entries are TRUNCATED to whatever fits: writes are
-        prioritized because they advance the chain hash; dropping writes
-        would force every subsequent forward to see a broken chain.
-        Truncating verifies merely reduces this forward's verify coverage —
-        the next forward's verify entries re-cover the same history positions
-        from the host-side ``history`` tuple.
+        When the verify plan exceeds capacity, the TAIL is kept and the
+        head is truncated: writes are prioritised (they advance the chain);
+        the next forward's verify entries re-cover the older history.
         """
-        if plan.num_write > self.capacity:
+        if plan.num_write > self.write_capacity:
             raise RuntimeError(
-                f"kv-canary: write slot count {plan.num_write} exceeds launch "
-                f"capacity {self.capacity}. The fixed buffer is sized for "
-                "cuda_graph_max_bs * num_tokens_per_bs writes; this eager "
-                "forward exceeds that. Raise the canary launch capacity or "
-                "disable the canary for this deployment."
+                f"kv-canary: write entry count {plan.num_write} exceeds "
+                f"write_capacity {self.write_capacity}. Raise canary launch "
+                "capacity or disable the canary for this deployment."
+            )
+        if plan.num_write_reqs > self.write_req_capacity:
+            raise RuntimeError(
+                f"kv-canary: write req count {plan.num_write_reqs} exceeds "
+                f"write_req_capacity {self.write_req_capacity}."
             )
 
-        max_verify = min(plan.num_verify, self.capacity - plan.num_write)
-        drop = plan.num_verify - max_verify
-        verify = slice(drop, plan.num_verify)
-        write = slice(plan.num_verify, plan.num_verify + plan.num_write)
-        total = max_verify + plan.num_write
+        num_active_verify = min(plan.num_verify, self.verify_capacity)
+        drop = plan.num_verify - num_active_verify
+        v = slice(drop, plan.num_verify)
 
-        device = self.slot_indices.device
-        slot_src = torch.tensor(
-            plan.verify_slot_indices[drop:] + plan.write_slot_indices,
-            dtype=torch.int64,
-            device=device,
-        )
-        req_src = _concat_to_int64(plan.expected_req_ids, verify, write, device)
-        token_src = _concat_to_int64(plan.expected_token_ids, verify, write, device)
-        pos_src = _concat_to_int64(plan.expected_positions, verify, write, device)
-        hash_src = _concat_to_int64(plan.expected_prev_hashes, verify, write, device)
-        mask_src = _concat_to_int32(plan.verify_mask, verify, write, device)
-        seq_src = _concat_to_int64(plan.verify_seq_positions, verify, write, device)
+        device = self.verify_slot_indices.device
 
-        self.slot_indices[:total].copy_(slot_src)
-        self.expected_req_ids[:total].copy_(req_src)
-        self.expected_token_ids[:total].copy_(token_src)
-        self.expected_positions[:total].copy_(pos_src)
-        self.expected_prev_hashes[:total].copy_(hash_src)
-        self.verify_mask[:total].copy_(mask_src)
-        self.verify_seq_positions[:total].copy_(seq_src)
-        if total < self.capacity:
-            self.verify_mask[total:].fill_(-1)
-            self.verify_seq_positions[total:].fill_(-1)
-        return total
+        def to_i64(values: List[int], sl: slice) -> torch.Tensor:
+            return torch.tensor(values[sl], dtype=torch.int64, device=device)
 
+        if num_active_verify > 0:
+            self.verify_slot_indices[:num_active_verify].copy_(
+                to_i64(plan.verify_slot_indices, v)
+            )
+            self.verify_positions[:num_active_verify].copy_(
+                to_i64(plan.verify_positions, v)
+            )
+            self.verify_req_ids[:num_active_verify].copy_(
+                to_i64(plan.verify_req_ids, v)
+            )
+            self.verify_prev_slot_indices[:num_active_verify].copy_(
+                to_i64(plan.verify_prev_slot_indices, v)
+            )
+            self.verify_active_mask[:num_active_verify].fill_(1)
+        if num_active_verify < self.verify_capacity:
+            self.verify_active_mask[num_active_verify:].fill_(0)
 
-def _concat_to_int64(
-    values: List[int],
-    verify: slice,
-    write: slice,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.tensor(
-        values[verify] + values[write], dtype=torch.int64, device=device
-    )
+        nw = plan.num_write
+        if nw > 0:
+            self.write_slot_indices[:nw].copy_(
+                to_i64(plan.write_slot_indices, slice(0, nw))
+            )
+            self.write_token_ids[:nw].copy_(
+                to_i64(plan.write_token_ids, slice(0, nw))
+            )
+            self.write_positions[:nw].copy_(
+                to_i64(plan.write_positions, slice(0, nw))
+            )
+            self.write_req_ids[:nw].copy_(
+                to_i64(plan.write_req_ids, slice(0, nw))
+            )
+        if nw < self.write_capacity:
+            self.write_slot_indices[nw:].zero_()
+            self.write_token_ids[nw:].zero_()
+            self.write_positions[nw:].zero_()
+            self.write_req_ids[nw:].zero_()
 
+        nwr = plan.num_write_reqs
+        if nwr > 0:
+            self.write_req_seed_slot_indices[:nwr].copy_(
+                to_i64(plan.write_req_seed_slot_indices, slice(0, nwr))
+            )
+            self.write_req_entry_starts[:nwr].copy_(
+                to_i64(plan.write_req_entry_starts, slice(0, nwr))
+            )
+            self.write_req_entry_counts[:nwr].copy_(
+                to_i64(plan.write_req_entry_counts, slice(0, nwr))
+            )
+            self.write_req_active_mask[:nwr].fill_(1)
+        if nwr < self.write_req_capacity:
+            self.write_req_active_mask[nwr:].fill_(0)
 
-def _concat_to_int32(
-    values: List[int],
-    verify: slice,
-    write: slice,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.tensor(
-        values[verify] + values[write], dtype=torch.int32, device=device
-    )
+        return num_active_verify, nwr
+
+    def reset_to_skip_sentinel(self) -> None:
+        """Reset all active masks so the recorded kernel becomes a no-op.
+
+        Used at capture time and at replay-time when no valid plan exists.
+        """
+        self.verify_active_mask.zero_()
+        self.write_req_active_mask.zero_()

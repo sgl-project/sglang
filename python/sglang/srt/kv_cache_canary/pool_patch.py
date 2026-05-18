@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -325,29 +325,3 @@ def get_pool_kind(pool: "KVCache") -> PoolKind:
     return kind
 
 
-def install_swa_free_hook(
-    *, pool: "BaseSWAKVPool", on_free: Callable[[], None]
-) -> None:
-    """Wrap SWA allocator/pool ``free`` so window-slide evictions trigger reset.
-
-    SWA evicts slots that fall outside the sliding window. When that happens,
-    any host-side state that thinks those slots are 'still valid' (high water
-    mark, prev_hash_tail) must be cleared so the canary doesn't try to verify
-    against an evicted slot. ``on_free`` is called with no args after every
-    eviction batch.
-    """
-    if getattr(pool, "_kv_canary_swa_free_patched", False):
-        return
-    if not hasattr(pool, "free_swa"):
-        return
-    original_free_swa = pool.free_swa
-
-    def patched_free_swa(free_index: torch.Tensor) -> None:
-        original_free_swa(free_index)
-        try:
-            on_free()
-        except Exception:
-            logger.exception("kv-canary: SWA free_swa eviction hook failed")
-
-    pool.free_swa = patched_free_swa
-    setattr(pool, "_kv_canary_swa_free_patched", True)

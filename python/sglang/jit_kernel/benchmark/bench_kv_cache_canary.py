@@ -25,6 +25,8 @@ NUM_SLOTS_LIST = get_benchmark_range(
 
 configs = list(itertools.product(NUM_SLOTS_LIST))
 
+_SEED = 0xC0FFEE1234567890
+
 
 def _build_state(num_slots: int, ring_capacity: int = 256) -> dict:
     return dict(
@@ -42,7 +44,6 @@ def _build_state(num_slots: int, ring_capacity: int = 256) -> dict:
         is_errored=torch.zeros(1, dtype=torch.int32, device=DEFAULT_DEVICE),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device=DEFAULT_DEVICE),
         kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=DEFAULT_DEVICE),
-        ring_capacity=ring_capacity,
     )
 
 
@@ -56,49 +57,81 @@ def _canary_step(num_slots: int, slot_stride_bytes: int, mode: str) -> None:
     )
     state = _build_state(num_slots)
 
-    slot_indices = torch.arange(num_slots, dtype=torch.int64, device=DEFAULT_DEVICE)
-    expected_req_ids = torch.zeros(num_slots, dtype=torch.int64, device=DEFAULT_DEVICE)
-    expected_token_ids = torch.arange(
-        num_slots, dtype=torch.int64, device=DEFAULT_DEVICE
+    if mode == "write":
+        num_verify = 0
+        num_write = num_slots
+        num_write_reqs = 1
+    elif mode == "verify":
+        num_verify = num_slots
+        num_write = 0
+        num_write_reqs = 0
+    else:  # mixed: half verify, half write
+        num_verify = num_slots // 2
+        num_write = num_slots - num_verify
+        num_write_reqs = 1
+
+    verify_slot_indices = torch.arange(
+        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
     )
-    expected_positions = torch.arange(
-        num_slots, dtype=torch.int64, device=DEFAULT_DEVICE
+    verify_positions = torch.arange(
+        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
     )
-    expected_prev_hashes = torch.zeros(
-        num_slots, dtype=torch.int64, device=DEFAULT_DEVICE
+    verify_req_ids = torch.zeros(
+        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    verify_prev_slot_indices = torch.full(
+        (max(num_verify, 1),), -1, dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    verify_active_mask = torch.zeros(
+        max(num_verify, 1), dtype=torch.int32, device=DEFAULT_DEVICE
+    )
+    verify_active_mask[:num_verify] = 1
+
+    write_slot_indices = torch.arange(
+        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_token_ids = torch.arange(
+        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_positions = torch.arange(
+        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_req_ids = torch.zeros(
+        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
     )
 
-    if mode == "write":
-        verify_mask = torch.zeros(num_slots, dtype=torch.int32, device=DEFAULT_DEVICE)
-        verify_seq_positions = torch.full(
-            (num_slots,), -1, dtype=torch.int64, device=DEFAULT_DEVICE
-        )
-    elif mode == "verify":
-        verify_mask = torch.ones(num_slots, dtype=torch.int32, device=DEFAULT_DEVICE)
-        verify_seq_positions = torch.arange(
-            num_slots, dtype=torch.int64, device=DEFAULT_DEVICE
-        )
-    else:  # mixed: half verify, half write
-        verify_mask = torch.zeros(num_slots, dtype=torch.int32, device=DEFAULT_DEVICE)
-        verify_mask[: num_slots // 2] = 1
-        verify_seq_positions = torch.full(
-            (num_slots,), -1, dtype=torch.int64, device=DEFAULT_DEVICE
-        )
-        verify_seq_positions[: num_slots // 2] = torch.arange(
-            num_slots // 2, dtype=torch.int64, device=DEFAULT_DEVICE
-        )
+    write_req_seed_slot_indices = torch.full(
+        (max(num_write_reqs, 1),), -1, dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_req_entry_starts = torch.zeros(
+        max(num_write_reqs, 1), dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_req_entry_counts = torch.full(
+        (max(num_write_reqs, 1),), num_write, dtype=torch.int64, device=DEFAULT_DEVICE
+    )
+    write_req_active_mask = torch.zeros(
+        max(num_write_reqs, 1), dtype=torch.int32, device=DEFAULT_DEVICE
+    )
+    write_req_active_mask[:num_write_reqs] = 1
 
     canary_step(
         src_buf=src.flatten(),
         dst_buf=dst.flatten(),
         slot_stride_bytes=slot_stride_bytes,
-        slot_indices=slot_indices,
-        expected_req_ids=expected_req_ids,
-        expected_token_ids=expected_token_ids,
-        expected_positions=expected_positions,
-        expected_prev_hashes=expected_prev_hashes,
-        verify_mask=verify_mask,
-        verify_seq_positions=verify_seq_positions,
+        verify_slot_indices=verify_slot_indices,
+        verify_positions=verify_positions,
+        verify_req_ids=verify_req_ids,
+        verify_prev_slot_indices=verify_prev_slot_indices,
+        verify_active_mask=verify_active_mask,
+        write_slot_indices=write_slot_indices,
+        write_token_ids=write_token_ids,
+        write_positions=write_positions,
+        write_req_ids=write_req_ids,
+        write_req_seed_slot_indices=write_req_seed_slot_indices,
+        write_req_entry_starts=write_req_entry_starts,
+        write_req_entry_counts=write_req_entry_counts,
+        write_req_active_mask=write_req_active_mask,
+        seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],
         violation_write_index=state["violation_write_index"],
