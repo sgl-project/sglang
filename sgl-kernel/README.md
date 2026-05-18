@@ -44,6 +44,22 @@ make build MAX_JOBS=2
 make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
+#### Peak memory on low-memory and unified-memory hosts
+
+`nvcc --threads` parallelizes the `-gencode` targets within each nvcc invocation; together with `MAX_JOBS` (ninja's `-j`) the effective concurrency is roughly `MAX_JOBS × SGL_KERNEL_COMPILE_THREADS` simultaneous compile workers. On heavy CUTLASS-template files each worker can consume several GB of RAM, so on Jetson, on hosts with limited RAM, or on unified-memory GPUs (NVIDIA GB10 / DGX Spark) the default can OOM-kill the build during the `common_ops` compile phase. The kernel ring buffer signature is:
+
+```
+oom-kill:constraint=CONSTRAINT_NONE,...,task=cicc,oom_score_adj=200
+Out of memory: Killed process <pid> (cicc) ...
+```
+
+Observed peak cgroup memory on a 121 GiB unified-memory NVIDIA GB10 host, building with `TORCH_CUDA_ARCH_LIST=12.1a` (compiling sm_90 + sm_100 + sm_121a gencodes per `.cu`):
+
+- `SGL_KERNEL_COMPILE_THREADS=32` (the default), `CMAKE_BUILD_PARALLEL_LEVEL` from 4 to 20: cgroup memory crossed ~100 GiB during the `common_ops` compile phase and the kernel OOM-killed `cicc`. Same outcome with TEI/other sidecars stopped.
+- `SGL_KERNEL_COMPILE_THREADS=2`, `CMAKE_BUILD_PARALLEL_LEVEL=6`: peak ~82 GiB cgroup, build completes cleanly in ~90 min wall.
+
+If the build OOM-kills mid-compile, reduce `SGL_KERNEL_COMPILE_THREADS` before `MAX_JOBS` — it is the larger lever (each integer reduction roughly halves the per-`.cu` worker peak by lowering simultaneous gencode parallelism inside each nvcc).
+
 ## Contribution
 
 ### Steps to add a new kernel:
