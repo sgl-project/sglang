@@ -815,44 +815,32 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
     input_scale_quant: torch.Tensor,
-    use_per_token_nvfp4: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize hidden states to FP4 for TRTLLM MoE.
 
-    Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading
-    unless per-token activation scaling is enabled. Only block scales are computed
-    at runtime for the standard path.
+    Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading.
+    Only block scales are computed at runtime for efficiency.
 
-    Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, per_token_scale_or_none)
+    Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime)
     """
-    per_token_scale = None
-    if use_per_token_nvfp4:
-        from flashinfer import SfLayout, nvfp4_quantize
 
-        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            1.0 / (448.0 * 6.0),
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-        )
-    else:
-        # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
-        # Only the block scales are computed at runtime
-        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-            hidden_states,
-            input_scale_quant,
-            16,  # sf_vec_size
-            False,  # use_ue8m0
-            False,  # is_sf_swizzled_layout
-        )
+    # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
+    # Only the block scales are computed at runtime
+    hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+        hidden_states,
+        input_scale_quant,
+        16,  # sf_vec_size
+        False,  # use_ue8m0
+        False,  # is_sf_swizzled_layout
+    )
 
     seq_len, hidden_size = hidden_states.shape
     hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
     # TRT-LLM expects hidden state scales shaped as [seq_len, hidden_size // 16]
     hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16)
 
-    return hs_fp4, hs_sf, per_token_scale
+    return hs_fp4, hs_sf
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp4(
@@ -884,14 +872,27 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    use_per_token_nvfp4 = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-
     # Quantize hidden states to FP4
-    hs_fp4, hs_scale_linear, per_token_scale = quantize_hidden_states_fp4(
-        hidden_states,
-        quant_info.w13_input_scale_quant,
-        use_per_token_nvfp4=use_per_token_nvfp4,
-    )
+    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            1.0 / (448.0 * 6.0),
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+        )
+
+        seq_len, hidden_size = hidden_states.shape
+        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // 16
+        )
+    else:
+        per_token_scale = None
+        hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
