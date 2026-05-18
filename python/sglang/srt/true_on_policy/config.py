@@ -5,47 +5,52 @@ from typing import Any, Iterator, Optional
 
 import torch
 
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 ROW_LINEAR_INV_BLOCK_K = 128
 
 
+def _get_global_server_args() -> Any:
+    from sglang.srt.server_args import get_global_server_args
+
+    return get_global_server_args()
+
+
 def get_rl_on_policy_target() -> Optional[str]:
-    return getattr(get_global_server_args(), "rl_on_policy_target", None)
+    return getattr(_get_global_server_args(), "rl_on_policy_target", None)
 
 
 def is_true_on_policy_enabled() -> bool:
-    return resolve_true_on_policy_runtime_policy(get_global_server_args()).enabled
+    return resolve_true_on_policy_runtime_policy(_get_global_server_args()).enabled
 
 
 def is_tp_invariant_target() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).tp_invariant_row_linear
 
 
 def should_disable_reduce_scatter_for_on_policy() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).disable_reduce_scatter
 
 
 def should_disable_mlp_allreduce_fusion_for_on_policy() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).disable_mlp_allreduce_fusion
 
 
 def should_disable_flashinfer_allreduce_fusion() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).disable_flashinfer_allreduce_fusion
 
 
 def should_force_bfloat16_dense_tensor_math() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).force_bfloat16_dense_tensor_math
 
 
@@ -55,7 +60,7 @@ def should_force_bfloat16_lm_head(
 ) -> bool:
     return (
         resolve_true_on_policy_runtime_policy(
-            get_global_server_args()
+            _get_global_server_args()
         ).force_bfloat16_lm_head
         and not use_fp32_lm_head
     )
@@ -63,7 +68,7 @@ def should_force_bfloat16_lm_head(
 
 def should_disable_fused_qk_norm_mrope() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).disable_fused_qk_norm_mrope
 
 
@@ -92,7 +97,7 @@ def should_use_tp_invariant_row_linear(
     row_linear_enable_inv: Optional[bool] = None,
 ) -> bool:
     policy_enabled = resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).tp_invariant_row_linear
     if row_linear_enable_inv is not None:
         policy_enabled = policy_enabled and row_linear_enable_inv
@@ -108,7 +113,7 @@ def should_use_tp_invariant_tree_all_reduce(
     accl_binary_tree_enabled: Optional[bool] = None,
 ) -> bool:
     policy_enabled = resolve_true_on_policy_runtime_policy(
-        get_global_server_args()
+        _get_global_server_args()
     ).deterministic_tree_all_reduce
     if accl_binary_tree_enabled is not None:
         policy_enabled = policy_enabled and not accl_binary_tree_enabled

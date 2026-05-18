@@ -32,7 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.true_on_policy import (
+from sglang.srt.true_on_policy.contracts import (
     resolve_true_on_policy_runtime_policy,
     validate_true_on_policy_contract,
 )
