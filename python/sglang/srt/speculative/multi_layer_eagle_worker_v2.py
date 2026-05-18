@@ -669,7 +669,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch):
+        # batch is Union[ScheduleBatch, ForwardData] after FD migration;
+        # both expose the fields this spec V2 pipeline consults.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
