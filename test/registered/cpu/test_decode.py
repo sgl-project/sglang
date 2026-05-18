@@ -61,7 +61,9 @@ class TestDecodeAttention(CustomTestCase):
 
         return output
 
-    def _test_grouped_decode_attention_once(self, B, H_Q, H_KV, D, D_V, dtype, device):
+    def _test_grouped_decode_attention_once(
+        self, B, H_Q, H_KV, D, D_V, dtype, kvcache_dtype, device
+    ):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
         total_tokens = B * seq_len
@@ -76,6 +78,26 @@ class TestDecodeAttention(CustomTestCase):
         # k_buffer and v_buffer represent all previous tokens
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
         v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        k_scale = None
+        v_scale = None
+        if kvcache_dtype == torch.float8_e4m3fn:
+            k_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+            v_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+            k_buffer_fp8, k_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
+                k_buffer
+            )
+            v_buffer_fp8, v_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
+                v_buffer
+            )
+            k_scale.copy_(k_scale0)
+            v_scale.copy_(v_scale0)
+            k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
+            v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
+        elif kvcache_dtype == torch.float8_e5m2:
+            k_buffer_fp8 = k_buffer.to(torch.float8_e5m2)
+            v_buffer_fp8 = v_buffer.to(torch.float8_e5m2)
+            k_buffer = k_buffer_fp8.to(dtype)
+            v_buffer = v_buffer_fp8.to(dtype)
 
         key = torch.randn(B, H_KV, D, dtype=dtype)
         value = torch.randn(B, H_KV, D_V, dtype=dtype)
@@ -111,8 +133,18 @@ class TestDecodeAttention(CustomTestCase):
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
         torch.ops.sgl_kernel.decode_attention_cpu(
             q,
-            k_buffer,
-            v_buffer,
+            (
+                k_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else k_buffer_fp8
+            ),
+            (
+                v_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else v_buffer_fp8
+            ),
+            k_scale,
+            v_scale,
             o,
             key,
             value,
@@ -143,7 +175,7 @@ class TestDecodeAttention(CustomTestCase):
         self.assertGreater(cos_sim.item(), 0.99)
         torch.testing.assert_close(o, o_grouped, atol=3e-2, rtol=1e-6)
 
-    def _test_grouped_decode_attention(self, device="cpu"):
+    def _test_grouped_decode_attention(self, device="cuda"):
         configs = [
             (2, 16, 16, 64, 64),
             (2, 16, 1, 16, 16),
@@ -160,9 +192,21 @@ class TestDecodeAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D, D_V in configs:
             for dtype in [torch.bfloat16, torch.float16]:
-                self._test_grouped_decode_attention_once(
-                    B, H_Q, H_KV, D, D_V, dtype=dtype, device=device
-                )
+                for kvcache_dtype in [
+                    torch.float16,
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ]:
+                    self._test_grouped_decode_attention_once(
+                        B,
+                        H_Q,
+                        H_KV,
+                        D,
+                        D_V,
+                        dtype=dtype,
+                        kvcache_dtype=kvcache_dtype,
+                        device=device,
+                    )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")
