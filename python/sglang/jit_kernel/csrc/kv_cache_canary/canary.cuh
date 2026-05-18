@@ -32,23 +32,6 @@ constexpr int kFailReasonPosition = 3;
 constexpr int kFailReasonHash = 4;
 constexpr int kFailReasonPositionMonotonic = 5;
 
-constexpr uint64_t kSplitmixGoldenGamma = 0x9E3779B97F4A7C15ULL;
-constexpr uint64_t kSplitmixMixA = 0xBF58476D1CE4E5B9ULL;
-constexpr uint64_t kSplitmixMixB = 0x94D049BB133111EBULL;
-
-__device__ inline uint64_t splitmix64_step(uint64_t value) {
-  uint64_t x = value + kSplitmixGoldenGamma;
-  x = (x ^ (x >> 30)) * kSplitmixMixA;
-  x = (x ^ (x >> 27)) * kSplitmixMixB;
-  return x ^ (x >> 31);
-}
-
-__device__ inline uint64_t canary_mix(uint64_t prev_hash, int64_t token_id, int64_t position) {
-  uint64_t h = splitmix64_step(prev_hash ^ (static_cast<uint64_t>(token_id) * kSplitmixMixA));
-  h = splitmix64_step(h ^ (static_cast<uint64_t>(position) * kSplitmixMixB));
-  return h;
-}
-
 struct CanaryParams {
   // Source buffer: read prior canary slots from here (verification target).
   const uint8_t* __restrict__ src_buf;
@@ -197,15 +180,15 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
           actual_prev_hash);
     }
   } else {
-    // do_verify == 0 means "write-only" entry. Compute new prev_hash from the
-    // expected chain (not from the slot's stored value, so a single mismatch
-    // doesn't silently self-heal the downstream tail kernel).
-    const uint64_t new_prev_hash = canary_mix(expected_prev_hash, expected_token_id, expected_position);
-
+    // do_verify == 0 means "write-only" entry. Per README §2, slot[i] stores
+    // the chain hash *before* position i (= ``expected_prev_hash``); the host
+    // advances the chain itself, so we do NOT mix the current token into the
+    // value we store.
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, expected_req_id);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, expected_token_id);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, expected_position);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(new_prev_hash));
+    store_field(
+        p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(expected_prev_hash));
   }
 
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
@@ -259,15 +242,15 @@ void canary_step(
       "canary: slot_stride_bytes must hold at least 32 bytes per slot, got ",
       slot_stride_bytes);
   RuntimeCheck(
-      violation_ring.shape[1] == kViolationFields,
+      violation_ring.size(1) == kViolationFields,
       "canary: violation_ring last dim must be ",
       kViolationFields,
       ", got ",
-      violation_ring.shape[1]);
-  const uint32_t ring_capacity = static_cast<uint32_t>(violation_ring.shape[0]);
+      violation_ring.size(1));
+  const uint32_t ring_capacity = static_cast<uint32_t>(violation_ring.size(0));
   RuntimeCheck(ring_capacity > 0, "canary: violation_ring capacity must be positive");
   RuntimeCheck(
-      violation_ring_valid.shape[0] == static_cast<int64_t>(ring_capacity),
+      violation_ring_valid.size(0) == static_cast<int64_t>(ring_capacity),
       "canary: violation_ring_valid first dim must equal ring_capacity");
 
   if (num_slots == 0) {

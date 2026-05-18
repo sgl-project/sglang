@@ -17,6 +17,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     canary_step,
 )
 from sglang.srt.kv_cache_canary.fingerprint import mix_step
+from sglang.srt.kv_cache_canary.host_state import _to_signed_int64
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -74,7 +75,9 @@ def _run(
             expected_positions, dtype=torch.int64, device="cuda"
         ),
         expected_prev_hashes=torch.tensor(
-            expected_prev_hashes, dtype=torch.int64, device="cuda"
+            [_to_signed_int64(h) for h in expected_prev_hashes],
+            dtype=torch.int64,
+            device="cuda",
         ),
         verify_mask=torch.tensor(verify_mask, dtype=torch.int32, device="cuda"),
         verify_seq_positions=torch.tensor(
