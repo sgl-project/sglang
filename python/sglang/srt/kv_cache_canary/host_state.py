@@ -106,7 +106,6 @@ class CanaryHostState:
         write_positions: List[int] = []
         write_prev_hashes: List[int] = []
         next_state: Dict[int, _RequestState] = {}
-        next_last_committed: Dict[int, _LastCommitted] = {}
 
         with self._lock:
             for req_pool_idx, count, start_pos, tokens, write_slots in zip(
@@ -150,9 +149,8 @@ class CanaryHostState:
                     last_prev_hash_at_write = prev_hash
                     prev_hash = mix_step(prev_hash, token_id, pos)
 
-                new_k_req = max(state.k_req, start_pos + count)
                 if count > 0:
-                    next_last_committed[req_pool_idx] = _LastCommitted(
+                    new_last_committed = _LastCommitted(
                         token_id=last_token_id,
                         position=last_position,
                         slot_idx=last_slot_idx,
@@ -160,8 +158,8 @@ class CanaryHostState:
                     )
                     next_state[req_pool_idx] = _RequestState(
                         prev_hash_tail=prev_hash,
-                        k_req=new_k_req,
-                        last_committed=next_last_committed[req_pool_idx],
+                        k_req=max(state.k_req, start_pos + count),
+                        last_committed=new_last_committed,
                     )
                 else:
                     next_state[req_pool_idx] = state
