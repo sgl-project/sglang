@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - test infra not installed
         pass
 
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _make_args(**overrides) -> argparse.Namespace:
