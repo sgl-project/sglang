@@ -158,20 +158,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
 
-    def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
-        if (
-            self._tokenspeed_workspace is None
-            or self._tokenspeed_workspace.device != device
-        ):
-            self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                device, self.num_q_heads, self.kv_lora_rank
-            )
-        return self._tokenspeed_workspace
-
-    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
-        """Skip parent's flashinfer wrapper plan()."""
-        return None
-
     def _fused_rope_fp8_quantize(
         self,
         q_nope: torch.Tensor,
