@@ -2565,6 +2565,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+            self.assert_lockstep()
+
     def maybe_wait_verify_done(self):
         # Stream-level wait instead of CPU sync: schedule_stream waits for
         # the verify_done event on the forward_stream without blocking the
@@ -2731,6 +2734,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+            self.assert_lockstep()
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
