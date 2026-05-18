@@ -65,14 +65,21 @@ struct CanaryParams {
   const int64_t* __restrict__ expected_prev_hashes;
   // 1 = verify-then-write, 0 = write-only (first-write skip)
   const int32_t* __restrict__ verify_mask;
+  // Per-verify-slot 0..K monotonic expected position; -1 for write-only slots.
+  // Position-monotonic check (README §3 (b)) compares the slot's stored
+  // ``input_position`` against this value WITHOUT consulting any expected
+  // table that derives from the request→token map. It is the indirection-free
+  // check that catches map-pointing-wrong bugs.
+  const int64_t* __restrict__ verify_seq_positions;
   uint32_t num_slots;
 
   // Violation ring + first-violation slot + is_errored flag.
   int64_t* __restrict__ violation_ring;          // [ring_capacity, kViolationFields]
+  int32_t* __restrict__ violation_ring_valid;    // [ring_capacity] per-row valid latch
   uint32_t* __restrict__ violation_write_index;  // [1], atomicAdd target
   int64_t* __restrict__ first_violation;         // [kViolationFields]
   uint32_t* __restrict__ first_violation_set;    // [1], 0/1
-  uint8_t* __restrict__ is_errored;              // [1]
+  int32_t* __restrict__ is_errored;              // [1] (32-bit so atomicOr is in-bounds)
   uint64_t* __restrict__ slot_run_counter;       // [1], +num_slots
   uint64_t* __restrict__ kernel_run_counter;     // [1], +1
   uint32_t ring_capacity;
@@ -118,13 +125,22 @@ __device__ inline void record_violation(
     }
   }
 
-  // Ring buffer append via atomicAdd to grab a unique sequence number.
+  // Ring buffer append: atomicAdd reserves a unique sequence. Two threads with
+  // colliding ``seq % capacity`` would otherwise tear each other's 8-field
+  // stores, so we per-row CAS-latch the valid-flag (0=empty→1=writing) and
+  // only flip to 2 (=readable) after all 8 fields are stored.
   unsigned int seq = atomicAdd(p.violation_write_index, 1u);
   unsigned int idx = seq % p.ring_capacity;
-  int64_t* row = p.violation_ring + static_cast<int64_t>(idx) * kViolationFields;
+  int32_t* row_valid = p.violation_ring_valid + idx;
+  unsigned int prev_valid = atomicCAS(reinterpret_cast<unsigned int*>(row_valid), 0u, 1u);
+  if (prev_valid == 0u) {
+    int64_t* row = p.violation_ring + static_cast<int64_t>(idx) * kViolationFields;
 #pragma unroll
-  for (int i = 0; i < kViolationFields; ++i) {
-    row[i] = entry[i];
+    for (int i = 0; i < kViolationFields; ++i) {
+      row[i] = entry[i];
+    }
+    __threadfence();
+    atomicExch(reinterpret_cast<unsigned int*>(row_valid), 2u);
   }
 
   // Order: violation buffer writes must be visible before is_errored is set,
@@ -145,6 +161,7 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   const int64_t expected_position = p.expected_positions[tid];
   const uint64_t expected_prev_hash = static_cast<uint64_t>(p.expected_prev_hashes[tid]);
   const int32_t do_verify = p.verify_mask[tid];
+  const int64_t verify_seq_position = p.verify_seq_positions[tid];
 
   if (do_verify != 0) {
     const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
@@ -154,7 +171,12 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
         static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
 
     int32_t fail_reason = 0;
-    if (actual_req_id != expected_req_id) {
+    // (b) position monotonic check. Independent of any req→token table:
+    // the slot's stored ``input_position`` field must equal the expected
+    // sequence index 0..K we baked into the verify entry.
+    if (verify_seq_position >= 0 && actual_position != verify_seq_position) {
+      fail_reason = kFailReasonPositionMonotonic;
+    } else if (actual_req_id != expected_req_id) {
       fail_reason = kFailReasonReqId;
     } else if (actual_token_id != expected_token_id) {
       fail_reason = kFailReasonTokenId;
@@ -174,14 +196,17 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
           expected_prev_hash,
           actual_prev_hash);
     }
+  } else {
+    // do_verify == 0 means "write-only" entry. Compute new prev_hash from the
+    // expected chain (not from the slot's stored value, so a single mismatch
+    // doesn't silently self-heal the downstream tail kernel).
+    const uint64_t new_prev_hash = canary_mix(expected_prev_hash, expected_token_id, expected_position);
+
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, expected_req_id);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, expected_token_id);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, expected_position);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(new_prev_hash));
   }
-
-  const uint64_t new_prev_hash = canary_mix(expected_prev_hash, expected_token_id, expected_position);
-
-  store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, expected_req_id);
-  store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, expected_token_id);
-  store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, expected_position);
-  store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(new_prev_hash));
 
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
   if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -199,7 +224,9 @@ void canary_step(
     tvm::ffi::TensorView expected_positions,
     tvm::ffi::TensorView expected_prev_hashes,
     tvm::ffi::TensorView verify_mask,
+    tvm::ffi::TensorView verify_seq_positions,
     tvm::ffi::TensorView violation_ring,
+    tvm::ffi::TensorView violation_ring_valid,
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView first_violation,
     tvm::ffi::TensorView first_violation_set,
@@ -220,7 +247,8 @@ void canary_step(
       .verify(expected_req_ids)
       .verify(expected_token_ids)
       .verify(expected_positions)
-      .verify(expected_prev_hashes);
+      .verify(expected_prev_hashes)
+      .verify(verify_seq_positions);
   TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_mask);
 
   const uint32_t num_slots = static_cast<uint32_t>(N.unwrap());
@@ -238,6 +266,9 @@ void canary_step(
       violation_ring.shape[1]);
   const uint32_t ring_capacity = static_cast<uint32_t>(violation_ring.shape[0]);
   RuntimeCheck(ring_capacity > 0, "canary: violation_ring capacity must be positive");
+  RuntimeCheck(
+      violation_ring_valid.shape[0] == static_cast<int64_t>(ring_capacity),
+      "canary: violation_ring_valid first dim must equal ring_capacity");
 
   if (num_slots == 0) {
     return;
@@ -253,12 +284,14 @@ void canary_step(
   p.expected_positions = static_cast<const int64_t*>(expected_positions.data_ptr());
   p.expected_prev_hashes = static_cast<const int64_t*>(expected_prev_hashes.data_ptr());
   p.verify_mask = static_cast<const int32_t*>(verify_mask.data_ptr());
+  p.verify_seq_positions = static_cast<const int64_t*>(verify_seq_positions.data_ptr());
   p.num_slots = num_slots;
   p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());
+  p.violation_ring_valid = static_cast<int32_t*>(violation_ring_valid.data_ptr());
   p.violation_write_index = static_cast<uint32_t*>(violation_write_index.data_ptr());
   p.first_violation = static_cast<int64_t*>(first_violation.data_ptr());
   p.first_violation_set = static_cast<uint32_t*>(first_violation_set.data_ptr());
-  p.is_errored = static_cast<uint8_t*>(is_errored.data_ptr());
+  p.is_errored = static_cast<int32_t*>(is_errored.data_ptr());
   p.slot_run_counter = static_cast<uint64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<uint64_t*>(kernel_run_counter.data_ptr());
   p.ring_capacity = ring_capacity;

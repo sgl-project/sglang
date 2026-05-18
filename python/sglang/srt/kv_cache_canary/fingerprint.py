@@ -11,6 +11,9 @@ def splitmix64(value: int) -> int:
 
 
 def mix_step(prev_hash: int, token_id: int, position: int) -> int:
+    assert 0 <= prev_hash <= _U64_MASK, (
+        f"kv-canary: mix_step prev_hash {prev_hash:#x} out of uint64 range"
+    )
     h = splitmix64(
         prev_hash ^ ((token_id & _U64_MASK) * 0xBF58476D1CE4E5B9 & _U64_MASK)
     )

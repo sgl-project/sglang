@@ -129,6 +129,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.kv_cache_canary.install import install_on_model_runner
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.breakable_cuda_graph_runner import (
@@ -743,8 +744,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the canary kernel is captured into the
         # cuda graph and shadow tensor pointers are baked in).
-        from sglang.srt.kv_cache_canary.install import install_on_model_runner
-
         install_on_model_runner(
             model_runner=self,
             mode=server_args.kv_cache_canary,
