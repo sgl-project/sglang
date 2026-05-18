@@ -1472,7 +1472,9 @@ def select_experts(
         num_experts = router_logits.shape[1]
         offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
         steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
-        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(topk_ids.dtype)
+        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
+            topk_ids.dtype
+        )
         topk_weights = torch.ones_like(topk_weights) / k
 
     topk_ids, topk_weights = _post_process_topk_ids(
