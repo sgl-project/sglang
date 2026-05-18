@@ -1468,6 +1468,8 @@ def select_experts(
         )
 
     if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
+        # Benchmark-only: override gating with uniform round-robin expert assignment
+        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
         num_tokens, k = topk_ids.shape
         num_experts = router_logits.shape[1]
         offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
