@@ -113,14 +113,14 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "--nnodes",
     2,
     "--dp-size",
-    32,
+    8,
     "--ep-size",
     32,
     "--enable-dp-attention",
     "--mem-fraction-static",
     0.87,
     "--max-running-requests",
-    96,
+    24,
     "--attention-backend",
     "ascend",
     "--device",
@@ -169,7 +169,7 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
     "decode_args": GLM_5_1_PD_SEP_DECODE_ARGS,
     "prefill_envs": GLM_5_1_PD_SEP_PREFILL_ENVS,
     "decode_envs": GLM_5_1_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -181,13 +181,13 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestAscendPerfMultiNodePdSepTestCas
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
     dataset_name = "random"
-    max_concurrency = 128
-    num_prompts = 512
+    max_concurrency = 112
+    num_prompts = 448
     input_len = 16384
     output_len = 1024
     random_range_ratio = 1
     tpot = 20
-    output_token_throughput = 1202
+    output_token_throughput = 3000
 
     def test_npu_glm5_1_w4a8_pd_sep_in3k5_out1k5(self):
         """Run NPU performance test for GLM-5.1-w4a8 PD separation"""

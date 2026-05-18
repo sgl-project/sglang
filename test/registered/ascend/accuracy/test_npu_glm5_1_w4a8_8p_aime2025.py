@@ -82,7 +82,7 @@ class TestNPUGLM5_1_W4A8_32P_AIME2025(TestAscendAccuracyTestCaseBase):
     dataset_type = "aime2025"
     dataset_name = "aime2025_gen"
     max_concurrency = 16
-    out_len = 65536
+    output_len = 65536
     generation_kwargs = "dict(temperature=1.0, top_p=0.95)"
 
     def test_npu_glm5_1_w4a8_8p_aime2025(self):
