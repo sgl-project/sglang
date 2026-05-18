@@ -1,3 +1,21 @@
+"""KV cache canary kernel benchmarks.
+
+Three axes are covered (user-instruction L73-75):
+
+1. ``context_len`` — single-req decode that verifies the FULL prefix
+   every forward (Fix 1: 1w-token prefix verifies all 1w positions);
+2. ``extend_chunk`` — single-req extend writes a chunk of new tokens
+   per forward;
+3. ``decode_bs`` — many concurrent decode reqs, each contributing a
+   short history + 1 new write per forward (bs up to 1024).
+
+All scenarios use ``triton.testing.do_bench_cudagraph`` so we measure
+the same code path that ships in production (kernel inside a captured
+CUDA graph).
+"""
+
+from __future__ import annotations
+
 import itertools
 
 import torch
@@ -10,25 +28,37 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     VIOLATION_FIELDS,
     canary_step,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
-
-NUM_SLOTS_LIST = get_benchmark_range(
-    full_range=[2**n for n in range(4, 14)],
-    ci_range=[64, 1024],
-)
-
-configs = list(itertools.product(NUM_SLOTS_LIST))
+register_cuda_ci(est_time=20, suite="base-b-kernel-benchmark-1-gpu-large")
 
 _SEED = 0xC0FFEE1234567890
 
+CONTEXT_LEN_LIST = get_benchmark_range(
+    full_range=[128, 512, 1024, 4096, 10240],
+    ci_range=[128, 1024],
+)
+EXTEND_CHUNK_LIST = get_benchmark_range(
+    full_range=[256, 1024, 2048, 4096],
+    ci_range=[256, 1024],
+)
+DECODE_BS_LIST = get_benchmark_range(
+    full_range=[16, 64, 256, 1024],
+    ci_range=[16, 64],
+)
 
-def _build_state(num_slots: int, ring_capacity: int = 256) -> dict:
+# Per-req decode history depth in the decode_bs sweep. Short enough to
+# keep the GPU-resident verify entry count manageable (bs * history)
+# while still exercising the verify path.
+_DECODE_HISTORY = 64
+
+
+def _build_state(*, num_slots: int, ring_capacity: int = 256) -> dict:
     return dict(
         violation_ring=torch.zeros(
             ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=DEFAULT_DEVICE
@@ -47,90 +77,52 @@ def _build_state(num_slots: int, ring_capacity: int = 256) -> dict:
     )
 
 
-def _canary_step(num_slots: int, slot_stride_bytes: int, mode: str) -> None:
-    """One canary step launch under the given mode (all-write / all-verify / mixed)."""
-    src = torch.zeros(
-        num_slots * 2, slot_stride_bytes, dtype=torch.uint8, device=DEFAULT_DEVICE
-    )
-    dst = torch.zeros(
-        num_slots * 2, slot_stride_bytes, dtype=torch.uint8, device=DEFAULT_DEVICE
-    )
-    state = _build_state(num_slots)
+def _i64(values: list[int]) -> torch.Tensor:
+    return torch.tensor(values, dtype=torch.int64, device=DEFAULT_DEVICE)
 
-    if mode == "write":
-        num_verify = 0
-        num_write = num_slots
-        num_write_reqs = 1
-    elif mode == "verify":
-        num_verify = num_slots
-        num_write = 0
-        num_write_reqs = 0
-    else:  # mixed: half verify, half write
-        num_verify = num_slots // 2
-        num_write = num_slots - num_verify
-        num_write_reqs = 1
 
-    verify_slot_indices = torch.arange(
-        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    verify_positions = torch.arange(
-        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    verify_req_ids = torch.zeros(
-        max(num_verify, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    verify_prev_slot_indices = torch.full(
-        (max(num_verify, 1),), -1, dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    verify_active_mask = torch.zeros(
-        max(num_verify, 1), dtype=torch.int32, device=DEFAULT_DEVICE
-    )
-    verify_active_mask[:num_verify] = 1
+def _i32(values: list[int]) -> torch.Tensor:
+    return torch.tensor(values, dtype=torch.int32, device=DEFAULT_DEVICE)
 
-    write_slot_indices = torch.arange(
-        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_token_ids = torch.arange(
-        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_positions = torch.arange(
-        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_req_ids = torch.zeros(
-        max(num_write, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
 
-    write_req_seed_slot_indices = torch.full(
-        (max(num_write_reqs, 1),), -1, dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_req_entry_starts = torch.zeros(
-        max(num_write_reqs, 1), dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_req_entry_counts = torch.full(
-        (max(num_write_reqs, 1),), num_write, dtype=torch.int64, device=DEFAULT_DEVICE
-    )
-    write_req_active_mask = torch.zeros(
-        max(num_write_reqs, 1), dtype=torch.int32, device=DEFAULT_DEVICE
-    )
-    write_req_active_mask[:num_write_reqs] = 1
-
+def _launch(
+    *,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    slot_stride: int,
+    verify_slot_indices: list[int],
+    verify_positions: list[int],
+    verify_req_ids: list[int],
+    verify_prev_slot_indices: list[int],
+    write_slot_indices: list[int],
+    write_token_ids: list[int],
+    write_positions: list[int],
+    write_req_ids: list[int],
+    write_req_seed_slot_indices: list[int],
+    write_req_entry_starts: list[int],
+    write_req_entry_counts: list[int],
+    state: dict,
+) -> None:
+    n_verify = len(verify_slot_indices)
+    n_write = len(write_slot_indices)
+    n_write_reqs = len(write_req_seed_slot_indices)
     canary_step(
         src_buf=src.flatten(),
         dst_buf=dst.flatten(),
-        slot_stride_bytes=slot_stride_bytes,
-        verify_slot_indices=verify_slot_indices,
-        verify_positions=verify_positions,
-        verify_req_ids=verify_req_ids,
-        verify_prev_slot_indices=verify_prev_slot_indices,
-        verify_active_mask=verify_active_mask,
-        write_slot_indices=write_slot_indices,
-        write_token_ids=write_token_ids,
-        write_positions=write_positions,
-        write_req_ids=write_req_ids,
-        write_req_seed_slot_indices=write_req_seed_slot_indices,
-        write_req_entry_starts=write_req_entry_starts,
-        write_req_entry_counts=write_req_entry_counts,
-        write_req_active_mask=write_req_active_mask,
+        slot_stride_bytes=slot_stride,
+        verify_slot_indices=_i64(verify_slot_indices or [0]),
+        verify_positions=_i64(verify_positions or [0]),
+        verify_req_ids=_i64(verify_req_ids or [0]),
+        verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
+        verify_active_mask=_i32([1] * n_verify if n_verify else [0]),
+        write_slot_indices=_i64(write_slot_indices or [0]),
+        write_token_ids=_i64(write_token_ids or [0]),
+        write_positions=_i64(write_positions or [0]),
+        write_req_ids=_i64(write_req_ids or [0]),
+        write_req_seed_slot_indices=_i64(write_req_seed_slot_indices or [-1]),
+        write_req_entry_starts=_i64(write_req_entry_starts or [0]),
+        write_req_entry_counts=_i64(write_req_entry_counts or [0]),
+        write_req_active_mask=_i32([1] * n_write_reqs if n_write_reqs else [0]),
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],
@@ -144,31 +136,181 @@ def _canary_step(num_slots: int, slot_stride_bytes: int, mode: str) -> None:
     )
 
 
+def _context_len_step(context_len: int) -> None:
+    """Single decode step on a req with ``context_len`` already written.
+
+    Mimics user-instruction L53: the verify path covers ALL positions,
+    plus the canary writes the new decode token at the tail.
+    """
+    num_slots = context_len + 2
+    slot_stride = CANARY_SLOT_BYTES
+    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    state = _build_state(num_slots=num_slots)
+
+    verify_slot_indices = list(range(context_len))
+    verify_positions = list(range(context_len))
+    verify_prev_slot_indices = [-1] + list(range(context_len - 1))
+    _launch(
+        src=buf,
+        dst=buf,
+        slot_stride=slot_stride,
+        verify_slot_indices=verify_slot_indices,
+        verify_positions=verify_positions,
+        verify_req_ids=[1] * context_len,
+        verify_prev_slot_indices=verify_prev_slot_indices,
+        write_slot_indices=[context_len],
+        write_token_ids=[1234],
+        write_positions=[context_len],
+        write_req_ids=[1],
+        write_req_seed_slot_indices=[context_len - 1] if context_len > 0 else [-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[1],
+        state=state,
+    )
+
+
+def _extend_chunk_step(chunk_size: int) -> None:
+    """Single req writes ``chunk_size`` new tokens (chunked prefill)."""
+    num_slots = chunk_size + 2
+    slot_stride = CANARY_SLOT_BYTES
+    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    state = _build_state(num_slots=num_slots)
+
+    _launch(
+        src=buf,
+        dst=buf,
+        slot_stride=slot_stride,
+        verify_slot_indices=[],
+        verify_positions=[],
+        verify_req_ids=[],
+        verify_prev_slot_indices=[],
+        write_slot_indices=list(range(chunk_size)),
+        write_token_ids=[(i * 17) & 0xFFFF for i in range(chunk_size)],
+        write_positions=list(range(chunk_size)),
+        write_req_ids=[1] * chunk_size,
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[chunk_size],
+        state=state,
+    )
+
+
+def _decode_bs_step(batch_size: int) -> None:
+    """``batch_size`` concurrent decode reqs, each verifies a short history + writes 1 token."""
+    history = _DECODE_HISTORY
+    slot_stride = CANARY_SLOT_BYTES
+    total_slots_per_req = history + 1
+    num_slots = batch_size * total_slots_per_req
+    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    state = _build_state(num_slots=num_slots)
+
+    verify_slot_indices: list[int] = []
+    verify_positions: list[int] = []
+    verify_req_ids: list[int] = []
+    verify_prev_slot_indices: list[int] = []
+    write_slot_indices: list[int] = []
+    write_token_ids: list[int] = []
+    write_positions: list[int] = []
+    write_req_ids: list[int] = []
+    write_req_seed_slot_indices: list[int] = []
+    write_req_entry_starts: list[int] = []
+    write_req_entry_counts: list[int] = []
+    for r in range(batch_size):
+        base = r * total_slots_per_req
+        for j in range(history):
+            slot = base + j
+            verify_slot_indices.append(slot)
+            verify_positions.append(j)
+            verify_req_ids.append(r + 1)
+            verify_prev_slot_indices.append(-1 if j == 0 else base + j - 1)
+        write_req_seed_slot_indices.append(base + history - 1)
+        write_req_entry_starts.append(len(write_slot_indices))
+        write_req_entry_counts.append(1)
+        write_slot_indices.append(base + history)
+        write_token_ids.append(((r + 1) * 5) & 0xFFFF)
+        write_positions.append(history)
+        write_req_ids.append(r + 1)
+
+    _launch(
+        src=buf,
+        dst=buf,
+        slot_stride=slot_stride,
+        verify_slot_indices=verify_slot_indices,
+        verify_positions=verify_positions,
+        verify_req_ids=verify_req_ids,
+        verify_prev_slot_indices=verify_prev_slot_indices,
+        write_slot_indices=write_slot_indices,
+        write_token_ids=write_token_ids,
+        write_positions=write_positions,
+        write_req_ids=write_req_ids,
+        write_req_seed_slot_indices=write_req_seed_slot_indices,
+        write_req_entry_starts=write_req_entry_starts,
+        write_req_entry_counts=write_req_entry_counts,
+        state=state,
+    )
+
+
+_context_len_configs = list(itertools.product(CONTEXT_LEN_LIST))
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_slots"],
-        x_vals=configs,
+        x_names=["context_len"],
+        x_vals=_context_len_configs,
         line_arg="provider",
-        line_vals=["write_only", "verify_only", "mixed"],
-        line_names=["Write only", "Verify only", "Mixed 50/50"],
-        styles=[("blue", "-"), ("green", "-"), ("red", "--")],
+        line_vals=["full_prefix_verify"],
+        line_names=["Full-prefix verify"],
+        styles=[("blue", "-")],
         ylabel="us",
-        plot_name="kv-cache-canary-performance",
+        plot_name="kv-cache-canary-context-len",
         args={},
     )
 )
-def benchmark(num_slots: int, provider: str):
-    slot_stride_bytes = 256
+def benchmark_context_len(context_len: int, provider: str):
+    return run_benchmark(lambda: _context_len_step(context_len))
 
-    if provider == "write_only":
-        fn = lambda: _canary_step(num_slots, slot_stride_bytes, "write")
-    elif provider == "verify_only":
-        fn = lambda: _canary_step(num_slots, slot_stride_bytes, "verify")
-    else:
-        fn = lambda: _canary_step(num_slots, slot_stride_bytes, "mixed")
 
-    return run_benchmark(fn)
+_extend_chunk_configs = list(itertools.product(EXTEND_CHUNK_LIST))
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["chunk_size"],
+        x_vals=_extend_chunk_configs,
+        line_arg="provider",
+        line_vals=["chunk_write"],
+        line_names=["Chunk write"],
+        styles=[("green", "-")],
+        ylabel="us",
+        plot_name="kv-cache-canary-extend-chunk",
+        args={},
+    )
+)
+def benchmark_extend_chunk(chunk_size: int, provider: str):
+    return run_benchmark(lambda: _extend_chunk_step(chunk_size))
+
+
+_decode_bs_configs = list(itertools.product(DECODE_BS_LIST))
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],
+        x_vals=_decode_bs_configs,
+        line_arg="provider",
+        line_vals=["decode_step"],
+        line_names=["Decode step"],
+        styles=[("red", "-")],
+        ylabel="us",
+        plot_name="kv-cache-canary-decode-bs",
+        args={},
+    )
+)
+def benchmark_decode_bs(batch_size: int, provider: str):
+    return run_benchmark(lambda: _decode_bs_step(batch_size))
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark_context_len.run(print_data=True)
+    benchmark_extend_chunk.run(print_data=True)
+    benchmark_decode_bs.run(print_data=True)
