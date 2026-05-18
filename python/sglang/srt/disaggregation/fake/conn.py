@@ -46,14 +46,18 @@ class FakeKVSender(BaseKVSender):
     ):
         self.kv_mgr = mgr
         self.has_sent = False
+        self.conclude_state: Optional[KVPoll] = None
 
     def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
         if self.has_sent is False:
             # Assume handshake completed instantly
             return KVPoll.WaitingForInput
         else:
             # Assume transfer completed instantly
             logger.debug("FakeKVSender poll success")
+            self.conclude_state = KVPoll.Success
             return KVPoll.Success
 
     def get_transfer_metric(self) -> KVTransferMetric:
@@ -82,6 +86,9 @@ class FakeKVSender(BaseKVSender):
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
+    def abort(self):
+        self.conclude_state = KVPoll.Failed
+
 
 class FakeKVReceiver(BaseKVReceiver):
     def __init__(
@@ -93,13 +100,17 @@ class FakeKVReceiver(BaseKVReceiver):
         self.bootstrap_done = False
         self.has_sent_metadata = False
         self.require_staging: bool = False
+        self.conclude_state: Optional[KVPoll] = None
 
     def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
         if not self.bootstrap_done:
             return KVPoll.Bootstrapping
         if not self.has_sent_metadata:
             return KVPoll.WaitingForInput
         logger.debug("FakeKVReceiver poll success")
+        self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
     def init(
@@ -122,3 +133,6 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def abort(self):
+        self.conclude_state = KVPoll.Failed
