@@ -412,7 +412,28 @@ class Glm47MoeDetector(BaseFormatDetector):
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        content = self._xml_tag_buffer
+                        # The buffer is not a prefix of "</arg_value>", but a
+                        # proper suffix of it might still be. Slide forward to
+                        # the smallest k > 0 such that buffer[k:] is a prefix
+                        # of the closing tag and keep that suffix buffered;
+                        # everything before it is real value content. Without
+                        # this, a value ending with "<" (e.g. ".<") followed
+                        # immediately by "</arg_value>" would yield buffer
+                        # "<<", get ejected wholesale, and the actual closing
+                        # tag would never match — leaking "</arg_value>" into
+                        # the emitted JSON arguments.
+                        kept_suffix = ""
+                        for k in range(1, len(self._xml_tag_buffer)):
+                            candidate = self._xml_tag_buffer[k:]
+                            if closing_tag.startswith(candidate):
+                                kept_suffix = candidate
+                                break
+                        content = (
+                            self._xml_tag_buffer[: -len(kept_suffix)]
+                            if kept_suffix
+                            else self._xml_tag_buffer
+                        )
+
                         # Use cached value type for consistency
                         value_type = self._cached_value_type or "string"
 
@@ -425,14 +446,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                                     1:-1
                                 ]
                                 self._current_value += content
-                                self._xml_tag_buffer = ""
                         elif value_type == "number":
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
                                 json_output += content
                                 self._current_value += content
-                                self._xml_tag_buffer = ""
                         else:
                             # For object/array types, output as-is
                             if content:
@@ -440,7 +459,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                                     self._value_started = True
                                 json_output += content
                                 self._current_value += content
-                                self._xml_tag_buffer = ""
+
+                        self._xml_tag_buffer = kept_suffix
 
         return json_output
 
