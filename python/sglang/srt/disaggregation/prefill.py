@@ -252,7 +252,9 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.stream_output([req], req.return_logprob)
+            self.scheduler.stream_output(
+                self.scheduler.output_streamer, [req], req.return_logprob
+            )
             return True
         return False
 
@@ -309,7 +311,9 @@ class PrefillBootstrapQueue:
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                self.scheduler.stream_output([req], req.return_logprob)
+                self.scheduler.stream_output(
+                    self.scheduler.output_streamer, [req], req.return_logprob
+                )
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
                 if self.scheduler.metrics_reporter.enable_metrics:
@@ -691,6 +695,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # Stream requests which have finished transfer
         self.stream_output(
+            self.output_streamer,
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,
