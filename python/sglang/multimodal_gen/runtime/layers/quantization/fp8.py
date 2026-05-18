@@ -83,6 +83,7 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -91,6 +92,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.packed_modules_mapping = packed_modules_mapping or {}
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -147,7 +149,11 @@ class Fp8Config(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         return None

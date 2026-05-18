@@ -129,7 +129,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.needs_quant_draft = (
-            get_global_server_args().speculative_draft_model_quantization
+            get_global_server_args().speculative_draft_model_quantization is not None
+            or quant_config is not None
         )
         quant_config = quant_config if self.needs_quant_draft else None
         self.model = Glm4MoeModelNextN(
@@ -159,9 +160,11 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         if self.needs_quant_draft:
             cxt = contextlib.nullcontext()
         else:
+            # SGLANG_DEEPEP_BF16_DISPATCH is deprecated, will need
+            # to be removed in the future and moved to a new
+            # --deepep-dispatcher-output-dtype server argument.
             unquant_patch = {
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
-                "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
             }
             cxt = temp_set_env(allow_sglang=True, **unquant_patch)
 

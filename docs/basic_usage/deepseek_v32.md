@@ -66,14 +66,14 @@ To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
 - **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
-  - `flashmla_auto`: enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
+  - `flashmla_auto`: enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. With BF16 KV cache, `flashmla_sparse` is always used on both Hopper and Blackwell. With FP8 KV cache: On Hopper (SM90), it unconditionally uses `flashmla_kv`; On Blackwell (SM100), it uses `flashmla_sparse` when `total_kv_tokens < total_q_tokens * 512`, otherwise falls back to `flashmla_kv`. The heuristics may need to be tuned if the performance of either kernel changes significantly.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
   - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires q,k,v to be uniformly bf16 or fp8_e4m3 format.
   - On the basis of performance benchmarks, the default configuration of DSA kernels on Hopper and Blackwell are set as follows :
     - Bfloat 16 kv cache: On Hopper, `flashmla_sparse` prefill attention, `fa3` decode attention; On Blackwell, `flashmla_sparse` prefill attention, `trtllm` decode attention
-    - Float8_e4m3fn KV cache: On Hopper, `flashmla_auto` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
+    - Float8_e4m3fn KV cache: On Hopper, `flashmla_kv` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
 - **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  For **GLM-5** model, we recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
 
 ## Multi-token Prediction

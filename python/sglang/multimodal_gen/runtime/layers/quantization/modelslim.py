@@ -21,10 +21,11 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
+
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,11 @@ class ModelSlimConfig(QuantizationConfig):
     - W8A8 dynamic linear
     """
 
-    def __init__(self, quant_config: Dict[str, Any] = {}):
+    def __init__(
+        self,
+        quant_config: Dict[str, Any] = {},
+        reverse_param_names_mapping: dict = None,
+    ):
         super().__init__()
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
@@ -48,6 +53,11 @@ class ModelSlimConfig(QuantizationConfig):
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
+        )
+        self._name_mapper = (
+            get_param_names_mapping(reverse_param_names_mapping)
+            if reverse_param_names_mapping is not None
+            else None
         )
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
@@ -71,8 +81,10 @@ class ModelSlimConfig(QuantizationConfig):
         return filenames
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
-        return cls(config)
+    def from_config(
+        cls, config: Dict[str, Any], reverse_param_names_mapping: dict = None
+    ) -> ModelSlimConfig:
+        return cls(config, reverse_param_names_mapping)
 
     def get_quant_method(
         self,
@@ -109,16 +121,24 @@ class ModelSlimConfig(QuantizationConfig):
         self,
         layer_name: str,
     ) -> ModelSlimLinearScheme:
+        full_weight_name = layer_name + ".weight"
+        if self._name_mapper is not None:
+            mapped_name, _, _ = self._name_mapper(full_weight_name)
+        else:
+            mapped_name = full_weight_name
 
-        quant_type = self.quant_description.get(layer_name + ".weight", "")
+        quant_type = self.quant_description.get(mapped_name, "")
+        prefix = mapped_name.removesuffix(".weight")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
-            return ModelSlimW8A8Int8(
-                quant_config=self.quant_description, prefix=layer_name
-            )
+            return ModelSlimW8A8Int8(quant_config=self.quant_description, prefix=prefix)
         elif quant_type == "W4A4_DYNAMIC":
-            return ModelSlimW4A4Int4(
-                quant_config=self.quant_description, prefix=layer_name
+            return ModelSlimW4A4Int4(quant_config=self.quant_description, prefix=prefix)
+        elif quant_type == "W8A8_MXFP8":
+            from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp8_scheme import (
+                ModelSlimMXFP8Scheme,
             )
+
+            return ModelSlimMXFP8Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(

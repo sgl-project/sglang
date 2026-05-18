@@ -32,6 +32,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
     """
 
     models = [Lfm2VlForConditionalGeneration]
+    gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

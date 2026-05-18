@@ -12,7 +12,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_HOST_IP`                          | Host IP address for the server                                                                                                   | `0.0.0.0`                    |
 | `SGLANG_PORT`                             | Port for the server                                                                                                              | auto-detected                |
 | `SGLANG_LOGGING_CONFIG_PATH`              | Custom logging configuration path                                                                                                | Not set                      |
-| `SGLANG_DISABLE_REQUEST_LOGGING`          | Disable request logging                                                                                                          | `false`                      |
 | `SGLANG_LOG_REQUEST_HEADERS`              | Comma-separated list of additional HTTP headers to log when `--log-requests` is enabled. Appends to the default `x-smg-routing-key`. | Not set                      |
 | `SGLANG_HEALTH_CHECK_TIMEOUT`             | Timeout for health check in seconds                                                                                              | `20`                         |
 | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` | The interval of passes to collect the metric of selected count of physical experts on each layer and GPU rank. 0 means disabled. | `0`                          |
@@ -20,6 +19,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
 | `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
+| `SGLANG_PREFETCH_BLOCK_SIZE_MB`           | Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap | `16` |
 
 ## Performance Tuning
 
@@ -32,6 +32,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_IS_FLASHINFER_AVAILABLE` | Control FlashInfer availability check | `true` |
 | `SGLANG_SKIP_P2P_CHECK` | Skip P2P (peer-to-peer) access check | `false` |
 | `SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD` | Sets the threshold for enabling chunked prefix caching | `8192` |
+| `SGLANG_MAX_KV_CHUNK_CAPACITY` | Maximum number of tokens in each KV chunk for DeepSeek MHA chunked prefix cache | `131072` |
 | `SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION` | Enable RoPE fusion in Fused Multi-Layer Attention | `1` |
 | `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` | Disable overlap schedule for consecutive prefill batches | `false` |
 | `SGLANG_SCHEDULER_MAX_RECV_PER_POLL` | Set the maximum number of requests per poll, with a negative value indicating no limit | `-1` |
@@ -68,7 +69,6 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_DEEPEP_BF16_DISPATCH` | Use Bfloat16 for dispatch | `"false"` |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each GPU | `"128"` |
 | `SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer | `"1024"` |
 | `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` | Number of SMs used for DeepEP combine when single batch overlap is enabled | `"32"` |
@@ -83,6 +83,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
 | `SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS` | This argument devives `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default `0` means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow. | `0` |
+| `SGLANG_MORI_MOE_MAX_INPUT_TOKENS` | Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be >= the actual number of received tokens (`totalRecvTokenNum`); setting it too small causes incorrect results. `0` disables truncation (use full buffer). | `0` |
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
@@ -114,6 +115,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_USE_AITER` | Use AITER optimize implementation | `false` |
+| `SGLANG_ROCM_USE_MULTI_STREAM` | Allocate alt CUDA/HIP stream on ROCm/AITER to overlap shared and routed experts in DeepseekV2 MoE. Requires the HIP env `GPU_MAX_HW_QUEUES>=5` (default `4`, the cap on HSA/ROCr HW queues HIP creates) so the alt stream gets its own queue instead of serializing with the main stream. Best paired with `--deepep-mode low_latency` so Mori's AsyncLL kernel offloads dispatch/combine to copy engines and frees CUs. | `false` |
 | `SGLANG_MOE_PADDING` | Enable MoE padding (sets padding size to 128 if value is `1`, often set to `1` in Docker builds) | `false` |
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
 
@@ -122,7 +124,6 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_INT4_WEIGHT` | Enable INT4 weight quantization | `false` |
-| `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` | Apply per token group quantization kernel with fused silu and mul and masked m | `false` |
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |

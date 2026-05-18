@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, suite="stage-c-test-4-gpu-gb200")
+register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb200")
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
@@ -46,12 +46,14 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "modelopt_fp4",
             "--attention-backend",
             "trtllm_mla",
-            "--moe-a2a-backend",
-            "deepep",
             "--moe-runner-backend",
             "flashinfer_cutedsl",
+            "--moe-a2a-backend",
+            "deepep",
             "--deepep-mode",
             "low_latency",
+            "--deepep-dispatcher-output-dtype",
+            "bf16",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -60,7 +62,6 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
@@ -117,12 +118,14 @@ class TestDummyWithSBO(CustomTestCase):
             "modelopt_fp4",
             "--attention-backend",
             "trtllm_mla",
-            "--moe-a2a-backend",
-            "deepep",
             "--moe-runner-backend",
             "flashinfer_cutedsl",
+            "--moe-a2a-backend",
+            "deepep",
             "--deepep-mode",
             "low_latency",
+            "--deepep-dispatcher-output-dtype",
+            "bf16",
             "--json-model-override-args",
             '{"num_hidden_layers": 1, "first_k_dense_replace": 0, "n_routed_experts": 24}',
             "--enable-single-batch-overlap",
@@ -136,7 +139,6 @@ class TestDummyWithSBO(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },

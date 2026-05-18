@@ -59,9 +59,7 @@ class Ngram {
 
   void clearExternalCorpus();
 
-  std::vector<std::string> listExternalCorpora() const;
-
-  Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
+  std::vector<std::pair<std::string, int64_t>> listExternalCorpora() const;
 
   Result batchMatch(
       const std::vector<int64_t>& state_ids,

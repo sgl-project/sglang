@@ -15,7 +15,6 @@ from sglang.jit_kernel.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
@@ -29,9 +28,14 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
-if _is_cuda:
+_is_cpu = current_platform.is_cpu()
+_is_xpu = current_platform.is_xpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
@@ -39,6 +43,13 @@ if _is_npu:
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
+
+if _use_aiter:
+    from aiter import rmsnorm2d_fwd as rms_norm
+    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+if not _is_cpu:
+    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -66,6 +77,8 @@ class RMSNorm(CustomOp):
         )
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
+        elif _use_aiter:
+            self._forward_method = self.forward_aiter
 
     def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         return rms_norm_fn(
@@ -173,6 +186,47 @@ class RMSNorm(CustomOp):
         # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
         return self.forward_native(x, residual)
 
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Fall back to the native fp32 path for cases aiter cannot serve:
+        #   - fp32 input  (CK kernel is templated on fp16/bf16 only;
+        #                  out.dtype check rejects fp32 with "not support output type: float")
+        if (
+            x.dtype not in (torch.float16, torch.bfloat16)
+            or self.variance_size_override is not None
+        ):
+            return self.forward_native(x, residual)
+
+        weight = self._get_weight(x.dtype)
+
+        shape = x.shape
+        x_2d = x.reshape(
+            -1, shape[-1]
+        )  # (bs, seq_len, hidden_size) -> (bs*seq_len, hidden_size)
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+
+        if residual is not None:
+            residual_shape = residual.shape
+            residual_2d = residual.reshape(-1, shape[-1])
+            if not residual_2d.is_contiguous():
+                residual_2d = residual_2d.contiguous()
+            output = torch.empty_like(x_2d)
+            residual_out = torch.empty_like(x_2d)
+            fused_add_rms_norm(
+                output,
+                x_2d,
+                residual_2d,
+                residual_out,
+                weight,
+                self.variance_epsilon,
+            )
+            return output.view(shape), residual_out.view(residual_shape)
+        return rms_norm(x_2d, weight, self.variance_epsilon).view(shape)
+
     def _get_weight(self, dtype: torch.dtype) -> torch.Tensor:
         """Return weight matched to *dtype*.
 
@@ -209,6 +263,27 @@ class RMSNorm(CustomOp):
         else:
             weight = self._get_weight(x.dtype)
             out = F.rms_norm(x, (self.hidden_size,), weight, self.variance_epsilon)
+        out = out.view(shape)
+        return out
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        elif residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x.view(shape), residual.view(residual_shape)
+        else:
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -410,6 +485,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -438,6 +519,38 @@ class _ScaleResidualNormScaleShift(CustomOp):
             raise ValueError(f"Gate type {type(gate)} not supported")
         normalized = self.norm(residual_output)
         modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated, residual_output
+
+    def forward_npu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+        # x.shape: [batch_size, seq_len, inner_dim]
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = residual + x * gate
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        normalized = self.norm(residual_output)
+        modulated = fused_scale_shift(normalized, scale, shift)
         return modulated, residual_output
 
 
@@ -514,11 +627,26 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         normalized = self.norm(x)
         modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated.to(x.dtype)
+
+    def forward_npu(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+        normalized = self.norm(x)
+        modulated = fused_scale_shift(normalized, scale, shift)
         return modulated.to(x.dtype)
 
 
@@ -589,6 +717,7 @@ class _NormTanhMulAdd(CustomOp):
         # Fallback to native because ROCm does not support CuTeDSL.
         return self.forward_native(*args, **kwargs)
 
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
@@ -817,9 +946,19 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     src_dtype = x.dtype
     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
     x_fp32 = x.float()
-    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    if _is_npu:
+        from sgl_kernel_npu.norm.rmsnorm_split import fused_rsqrt_mul, fused_variance
+
+        variance = fused_variance(x_fp32)
+    else:
+        variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+
     variance = get_tp_group().all_reduce(
         variance, op=torch._C._distributed_c10d.ReduceOp.AVG
     )
-    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+
+    if _is_npu:
+        output = fused_rsqrt_mul(x_fp32, variance, weight, norm.variance_epsilon)
+    else:
+        output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
     return output.to(dtype=src_dtype)
