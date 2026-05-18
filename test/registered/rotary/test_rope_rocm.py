@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -27,6 +28,11 @@ _CASES = [
 
 @unittest.skipIf(_use_aiter, reason="SGLANG_USE_AITER=1 will not use vllm path.")
 class TestRotaryEmbeddingNative(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        super().setUpClass()
+
     # Compare RotaryEmbedding.forward_hip() to forward_native().
     def _run_case(
         self,
@@ -72,6 +78,11 @@ class TestRotaryEmbeddingNative(CustomTestCase):
 
 @unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
 class TestRotaryEmbeddingAITer(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        super().setUpClass()
+
     # NOTE: Slightly relaxed tolerance (2e-2 vs 1e-2) for AITER RoPE kernel.
     # Minor precision differences under investigation.
     # See: https://github.com/sgl-project/sglang/pull/15318
