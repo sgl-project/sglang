@@ -317,6 +317,16 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.utils import is_npu
+
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+                maybe_apply_fuseep_weights,
+            )
+
+            if maybe_apply_fuseep_weights(layer):
+                return
+
         layer.scheme.process_weights_after_loading(layer)
 
     def create_weights(

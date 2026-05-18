@@ -30,6 +30,7 @@ from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
         DispatchOutput,
     )
@@ -255,7 +256,7 @@ class DeepEPMoE(FusedMoE):
 
     def forward_cutlass_w4afp8_masked(
         self,
-        dispatch_output: DeepEPNormalDispatchOutput,
+        dispatch_output: DeepEPLLDispatchOutput,
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
