@@ -1669,6 +1669,81 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 return relayer.resolve_orig_seq_lens(fi.indices)
         return self.orig_seq_lens
 
+    def to_forward_data(self):
+        """Build a ``ForwardData`` snapshot from current SB state.
+
+        The snapshot carries every field that
+        ``ForwardBatch.init_new_from_forward_data`` reads, so passing the
+        resulting ``ForwardData`` through ``forward_batch_generation`` →
+        ``ForwardBatch.init_new`` walks the FD path instead of the SB path.
+
+        After this call returns, ``schedule_stream`` should not touch the
+        per-iter fields embedded in the snapshot — the FD is the ownership
+        boundary that hands them off to ``forward_stream``. Cross-stream
+        lifetime / visibility is layered on top via the Relayer channel
+        events recorded at store time.
+        """
+        # Local import to avoid circular import at module load time.
+        from sglang.srt.model_executor.forward_batch_info import ForwardData
+
+        return ForwardData(
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            seq_lens_sum=self.seq_lens_sum,
+            out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=self.seq_lens_cpu,
+            orig_seq_lens=self.orig_seq_lens,
+            extend_seq_lens=getattr(self, "extend_lens", None),
+            extend_prefix_lens=getattr(self, "prefix_lens", None),
+            extend_num_tokens=getattr(self, "extend_num_tokens", None),
+            extend_logprob_start_lens=getattr(self, "extend_logprob_start_lens", None),
+            extend_input_logprob_token_ids=getattr(
+                self, "extend_input_logprob_token_ids", None
+            ),
+            sampling_info=self.sampling_info,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            has_grammar=self.has_grammar,
+            grammars=getattr(self, "grammars", None),
+            input_embeds=getattr(self, "input_embeds", None),
+            replace_embeds=getattr(self, "replace_embeds", None),
+            replace_positions=getattr(self, "replace_positions", None),
+            token_type_ids=getattr(self, "token_type_ids", None),
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            global_forward_mode=getattr(self, "global_forward_mode", None),
+            multimodal_inputs=getattr(self, "multimodal_inputs", None),
+            multi_item_delimiter_indices=getattr(
+                self, "multi_item_delimiter_indices", None
+            ),
+            encoder_cached=getattr(self, "encoder_cached", None),
+            encoder_lens=getattr(self, "encoder_lens", None),
+            encoder_lens_cpu=getattr(self, "encoder_lens_cpu", None),
+            encoder_out_cache_loc=getattr(self, "encoder_out_cache_loc", None),
+            mamba_track_indices=getattr(self, "mamba_track_indices", None),
+            mamba_track_mask=getattr(self, "mamba_track_mask", None),
+            mamba_track_seqlens=getattr(self, "mamba_track_seqlens", None),
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            dllm_config=getattr(self, "dllm_config", None),
+            dllm_block_offsets=getattr(self, "dllm_block_offsets", None),
+            ne_token_table=getattr(self, "ne_token_table", None),
+            tbo_split_seq_index=getattr(self, "tbo_split_seq_index", None),
+            is_prefill_only=self.is_prefill_only,
+            return_hidden_states=getattr(self, "return_hidden_states", False),
+            return_pooled_hidden_states=getattr(
+                self, "return_pooled_hidden_states", False
+            ),
+            dimensions=getattr(self, "dimensions", None),
+            lora_ids=[req.lora_id for req in self.reqs],
+            rids=[req.rid for req in self.reqs],
+        )
+
     def bind_relayer_for_iter(self, relayer):
         """Allocate this iter's relay slots (gpu_scalar for seq_lens family,
         cpu_value for kv_committed_delta / finished_status) and attach them
