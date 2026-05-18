@@ -20,6 +20,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.managers.io_struct import (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -751,3 +755,48 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_lens=accept_length,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        from sglang.srt.utils.multiprocessing_serializer import MultiprocessingSerializer
+        from sglang.srt.utils.torch_mp_patch import monkey_patch_torch_reductions
+
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.target_worker.tp_rank]
+        )
+        for runner in self.draft_worker.model_runner_list:
+            success, message = runner.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
+            if not success:
+                return success, message
+
+        success, message = self.target_worker.model_runner.update_weights_from_tensor(
+            named_tensors=named_tensors,
+            load_format=recv_req.load_format,
+        )
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        for runner in self.draft_worker.model_runner_list:
+            success, message = runner.update_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+                recv_req.load_format,
+            )
+            if not success:
+                return success, message
+
+        success, message = self.target_worker.model_runner.update_weights_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
+        )
+        return success, message

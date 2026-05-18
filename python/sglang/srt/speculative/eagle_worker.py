@@ -15,7 +15,10 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
-from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+from sglang.srt.managers.io_struct import (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -1034,6 +1037,28 @@ class EAGLEWorker(TpModelWorker):
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
+        )
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
+        )
+        if not success:
+            return success, message
+
+        success, message = self.target_worker.model_runner.update_weights_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
         )
         return success, message
 

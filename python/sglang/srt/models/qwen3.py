@@ -636,6 +636,10 @@ class Qwen3ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            # MTP/draft-model weights belong to the separate Qwen3ForCausalLMMTP;
+            # the target model should ignore them during weight update.
+            if "mtp" in name:
+                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             if "scale" in name:
