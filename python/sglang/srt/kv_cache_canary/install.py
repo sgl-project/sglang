@@ -131,12 +131,26 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
         if forward_batch is None or runner is None or not runner.config.enabled:
             return original_forward(*args, **kwargs)
 
-        # During cuda graph CAPTURE, the expected_* host-derived tensors would
-        # be frozen into the graph and replays would reuse stale values.
-        # v1 limitation: skip the canary kernel inside captured regions; the
-        # eager (extend / prefill / out-of-graph decode) path still runs it,
-        # and the §5 health check distinguishes "kernel never ran" from
-        # "kernel ran only on eager".
+        # v1 LIMITATION: cuda graph capture/replay bypasses canary.
+        #
+        # During CAPTURE, the host-derived ``expected_*`` tensors are built
+        # per-forward via ``torch.tensor(..., device=cuda)``. Recording these
+        # into the graph would bake in the *capture-time* values; replays
+        # would verify against stale data and either silently pass or report
+        # a flood of false-positive mismatches. So we fall through and the
+        # captured graph contains zero canary ops.
+        #
+        # During REPLAY (``cuda_graph_runner.replay()``), ``model.forward`` is
+        # never invoked — replay calls ``cuda_graph.replay()`` directly. The
+        # wrapper does not run, ``_forward_step`` does not advance, and no
+        # canary state changes. This means production decode (~95%+ of
+        # forward passes after warmup) runs UNVERIFIED. The §5 warmup
+        # zero-check still catches "canary never started" but not "canary
+        # stopped firing after warmup" — that is tracked as a follow-up
+        # requiring a redesign of the expected_* tensor lifecycle (fixed
+        # pre-allocated host-pinned staging + per-replay host-to-device
+        # copy + actual kernel launch from a hook in
+        # ``CudaGraphRunner.replay()``).
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return original_forward(*args, **kwargs)
 
