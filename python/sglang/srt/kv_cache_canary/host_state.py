@@ -71,6 +71,42 @@ class CanaryHostState:
             for req_pool_idx in stale_req_pool_idxs:
                 self._states.pop(req_pool_idx, None)
 
+    def export_pd_snapshot(self, req_pool_idx: int) -> Optional["PDSnapshot"]:
+        """Return ``(k_req, prev_hash_tail)`` for PD transport.
+
+        Prefill side calls this when packing ``MetadataBuffers``. ``None``
+        means the request was never seen (e.g. zero-length prefill, canary
+        kernel didn't run yet) — caller stores 0/0 in the metadata buffer and
+        decode side treats it as a fresh chain.
+        """
+        with self._lock:
+            state = self._states.get(req_pool_idx)
+            if state is None:
+                return None
+            return PDSnapshot(k_req=state.k_req, prev_hash_tail=state.prev_hash_tail)
+
+    def import_pd_snapshot(
+        self,
+        *,
+        req_pool_idx: int,
+        k_req: int,
+        prev_hash_tail: int,
+    ) -> None:
+        """Decode side: rebuild host state from PD-transported metadata.
+
+        Drops any prior state for this slot (decode never shares req_pool_idx
+        with itself; if it did, we'd just have stale data). ``last_committed``
+        is None because we don't have the last-token snapshot — the chain
+        continues from ``prev_hash_tail`` at position ``k_req``, but the very
+        first decode forward pure-writes (no verify entry).
+        """
+        with self._lock:
+            self._states[req_pool_idx] = _RequestState(
+                prev_hash_tail=prev_hash_tail & ((1 << 64) - 1),
+                k_req=int(k_req),
+                last_committed=None,
+            )
+
     def reset_all_last_committed(self) -> None:
         """Drop ``last_committed`` for every tracked request.
 
@@ -257,6 +293,14 @@ class CanaryHostState:
         with self._lock:
             for req_pool_idx, new_state in plan.next_state.items():
                 self._states[req_pool_idx] = new_state
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PDSnapshot:
+    """K_req + prev_hash_tail packed into MetadataBuffers for PD transport."""
+
+    k_req: int
+    prev_hash_tail: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -1397,6 +1397,8 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
+            output_canary_k_req,
+            output_canary_prev_hash_tail,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
@@ -1456,6 +1458,21 @@ class DecodeTransferQueue:
             )
             decode_req.req.output_top_logprobs_idx.append(
                 output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            )
+
+        # KV cache canary: rebuild host state on the decode side so the chain
+        # continues across PD. No-op if the local pool has no canary attached
+        # or the prefill side sent (0, 0) (fresh chain / canary disabled
+        # there).
+        if decode_req.req.req_pool_idx is not None:
+            from sglang.srt.kv_cache_canary.api import apply_pd_canary_snapshot
+
+            apply_pd_canary_snapshot(
+                pool=self.scheduler.token_to_kv_pool_allocator.get_kvcache(),
+                req_pool_idx=int(decode_req.req.req_pool_idx),
+                k_req=int(output_canary_k_req[0].item()),
+                prev_hash_tail=int(output_canary_prev_hash_tail[0].item())
+                & ((1 << 64) - 1),
             )
 
         decode_req.kv_receiver.clear()

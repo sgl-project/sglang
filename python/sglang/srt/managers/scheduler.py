@@ -1243,6 +1243,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
             )
 
             # The decode requests polling kv cache
@@ -1298,6 +1299,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

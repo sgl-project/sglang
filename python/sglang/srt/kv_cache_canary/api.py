@@ -146,6 +146,52 @@ def install_spec_allocator_free_hook(
     setattr(allocator, "_kv_canary_free_patched", True)
 
 
+def export_pd_canary_snapshot(
+    *,
+    pool: "KVCache",
+    req_pool_idx: int,
+) -> tuple[int, int]:
+    """Prefill side: return ``(k_req, prev_hash_tail)`` for MetadataBuffers.
+
+    Returns ``(0, 0)`` if the pool has no canary attached or the request was
+    never seen. The decode side treats ``(0, 0)`` as "fresh chain" — pure
+    writes from the start, no verify entries. This keeps PD transport
+    behaviour identical when the canary is disabled on one or both sides.
+    """
+    runner = get_runner(pool)
+    if runner is None:
+        return 0, 0
+    snapshot = runner.host_state.export_pd_snapshot(req_pool_idx)
+    if snapshot is None:
+        return 0, 0
+    return snapshot.k_req, snapshot.prev_hash_tail
+
+
+def apply_pd_canary_snapshot(
+    *,
+    pool: "KVCache",
+    req_pool_idx: int,
+    k_req: int,
+    prev_hash_tail: int,
+) -> None:
+    """Decode side: rebuild canary host state from PD-transported metadata.
+
+    No-op if the pool has no canary attached. ``k_req == 0`` means the
+    prefill side had no canary state (fresh chain); we leave host state
+    untouched so the next plan_batch initializes from seed.
+    """
+    runner = get_runner(pool)
+    if runner is None:
+        return
+    if k_req <= 0:
+        return
+    runner.host_state.import_pd_snapshot(
+        req_pool_idx=req_pool_idx,
+        k_req=k_req,
+        prev_hash_tail=prev_hash_tail,
+    )
+
+
 _PERTURB_RNG_CACHE: dict = {}
 
 
