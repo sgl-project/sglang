@@ -5,92 +5,13 @@ use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::kv_events::KvEventIndex;
+use crate::workers::introspect::WorkerIntrospector;
 use crate::workers::WorkerRegistry;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-
-/// The slice of `/server_info` consumed by the worker manager.  We don't
-/// share any other module's `ServerInfo` struct because each consumer
-/// projects a different subset of the response, and coupling them would
-/// force every new field used by one consumer to be plumbed through all.
-#[derive(Debug, Deserialize)]
-struct ServerInfoResponse {
-    #[serde(default)]
-    served_model_name: Option<String>,
-}
-
-/// Default timeout for the `/server_info` fetch — conservative for a
-/// small JSON read served by SGLang's HTTP server.
-const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Build the default HTTP client used by `run` and `run_with_config`.
-fn default_http_client() -> Arc<reqwest::Client> {
-    Arc::new(
-        reqwest::Client::builder()
-            .timeout(SERVER_INFO_TIMEOUT)
-            .build()
-            .expect("default http client builds"),
-    )
-}
-
-/// Fetch the worker's `served_model_name` via `GET <worker_url>/server_info`.
-///
-/// Returns `Some(name)` only when the response is a 2xx with a non-empty
-/// `served_model_name`.  All other outcomes — network error, non-2xx,
-/// malformed JSON, missing or empty field — return `None` and emit a
-/// `warn!` carrying enough context (url + error) for an operator to find
-/// the misbehaving worker in the logs.
-///
-/// Failure semantics are intentional: workers are still registered with
-/// `model_ids = []` so the rest of the proxy plane treats them as
-/// reachable; the resolved-zero-model state is observable via the
-/// registry's `model_ids` field.
-async fn fetch_served_model_name(worker_url: &str, http: &reqwest::Client) -> Option<String> {
-    let url = format!("{}/server_info", worker_url.trim_end_matches('/'));
-    let resp = match http.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                worker_url = %worker_url,
-                error = %e,
-                "manager: /server_info request failed; registering worker with empty model_ids"
-            );
-            return None;
-        }
-    };
-    if !resp.status().is_success() {
-        tracing::warn!(
-            worker_url = %worker_url,
-            status = %resp.status(),
-            "manager: /server_info returned non-2xx; registering worker with empty model_ids"
-        );
-        return None;
-    }
-    let parsed: ServerInfoResponse = match resp.json().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                worker_url = %worker_url,
-                error = %e,
-                "manager: /server_info JSON parse failed; registering worker with empty model_ids"
-            );
-            return None;
-        }
-    };
-    let name = parsed.served_model_name.unwrap_or_default();
-    if name.is_empty() {
-        tracing::warn!(
-            worker_url = %worker_url,
-            "manager: /server_info has no `served_model_name`; registering worker with empty model_ids"
-        );
-        return None;
-    }
-    Some(name)
-}
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
@@ -123,19 +44,26 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
 /// introspection.  Tests that want a tighter timeout call
-/// [`run_with_http`] directly.
+/// [`run_with_introspector`] directly.
 pub async fn run_with_config(
     rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
 ) {
-    run_with_http(rx, registry, cfg, kv_index, default_http_client()).await
+    run_with_introspector(
+        rx,
+        registry,
+        cfg,
+        kv_index,
+        Arc::new(WorkerIntrospector::default()),
+    )
+    .await
 }
 
-/// Internal entry point used by tests so they can supply a custom HTTP
-/// client (e.g. a shorter timeout, or a fake transport).  Production
-/// callers use [`run_with_config`].
+/// Internal entry point used by tests so they can supply a custom
+/// [`WorkerIntrospector`] (e.g. shorter timeout, fake transport).
+/// Production callers use [`run_with_config`].
 ///
 /// # Concurrency model
 ///
@@ -149,48 +77,52 @@ pub async fn run_with_config(
 ///   Without this await, a `Removed` queued while `Added` is still
 ///   fetching would no-op (registry empty), then the deferred Added
 ///   write would leak the worker indefinitely.
-pub async fn run_with_http(
+pub async fn run_with_introspector(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    http: Arc<reqwest::Client>,
+    introspector: Arc<WorkerIntrospector>,
 ) {
     // In-flight `Added` registrations, keyed by worker id. Subsequent
     // `Removed` / `ModeChanged` events for the same id `await` the
     // handle so they observe the registry write the spawned task is
-    // about to perform.
+    // about to perform.  Entries are removed on completion (Added's
+    // own task drops the slot before returning).
     let mut pending: HashMap<WorkerId, JoinHandle<()>> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
-        // Reap finished handles so the map doesn't grow unboundedly
-        // under steady-state churn. O(map.len()) but the map only holds
-        // in-flight Added events (typically << total workers).
+        // Opportunistically reap handles whose tasks have already
+        // completed so the map doesn't grow without bound under steady-
+        // state churn.  This is O(map.len()) per event but the map only
+        // holds in-flight Added events (typically << total workers).
         pending.retain(|_, h| !h.is_finished());
 
         match event {
             DiscoveryEvent::Added(spec) => {
                 tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
                 let id = spec.id.clone();
-                // Drain a still-in-flight prior Added for the same id
-                // so the upsert observes a consistent pre-state.
+                // If a previous Added for the same id is still in-flight,
+                // drain it first so the upsert observes a consistent
+                // pre-state (and so the new spawn doesn't race with the
+                // old).
                 if let Some(prev) = pending.remove(&id) {
                     let _ = prev.await;
                 }
                 let registry_t = registry.clone();
                 let cfg_t = cfg.clone();
                 let kv_index_t = kv_index.clone();
-                let http_t = http.clone();
+                let introspector_t = introspector.clone();
                 let handle = tokio::spawn(async move {
-                    register_one(spec, registry_t, cfg_t, kv_index_t, http_t).await;
+                    register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
                 });
                 pending.insert(id, handle);
             }
             DiscoveryEvent::Removed { id } => {
                 tracing::info!("discovery: -worker {id}");
                 if let Some(prev) = pending.remove(&id) {
-                    // Wait for the matching Added's registry write to
-                    // land so this Removed actually clears it.
+                    // Wait for the matching Added to finish its registry
+                    // write so the Removed observes (and clears) it.
                     let _ = prev.await;
                 }
                 // Look up the URL before dropping the entry so the
@@ -217,8 +149,8 @@ pub async fn run_with_http(
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
                 if let Some(prev) = pending.remove(&id) {
-                    // Wait for the registry write so the mode flip
-                    // lands on the new entry, not the empty slot.
+                    // Same rationale as Removed: wait for the registry
+                    // write so the mode flip lands on the new entry.
                     let _ = prev.await;
                 }
                 // Mutate mode in place — preserves active_requests counter
@@ -245,32 +177,36 @@ pub async fn run_with_http(
     }
 
     // Drain any still-running registration tasks so callers `await`ing
-    // the manager handle (tests, shutdown paths) see every registry
-    // mutation land before the future resolves.
+    // the manager handle (tests, shutdown paths) see all registry
+    // mutations land before the future resolves.
     for (_, h) in pending.drain() {
         let _ = h.await;
     }
 }
 
-/// Onboard a single worker: fetch `served_model_name`, write to the
-/// registry, and (if enabled) attach to the KV-event index. Failure of
-/// the HTTP introspection still registers the worker with empty
-/// `model_ids` so the rest of the proxy plane treats it as reachable.
+/// Onboard a single worker: introspect once, then dispatch the result
+/// to the registry and (if enabled) the KV-event index. Failure of any
+/// step is logged inside the call chain; we still register the worker
+/// with empty `model_ids` so the rest of the proxy plane treats it as
+/// reachable.
 async fn register_one(
     mut spec: WorkerSpec,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    http: Arc<reqwest::Client>,
+    introspector: Arc<WorkerIntrospector>,
 ) {
-    if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
+    let worker_url = spec.url.clone();
+    let info = introspector.fetch(&worker_url).await;
+    if let Some(name) = info.served_model_name {
         spec.model_ids = vec![ModelId(name)];
     }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    let worker_url = spec.url.clone();
     registry.add_with_cb(spec, cb);
     if let Some(idx) = kv_index {
-        idx.add_worker(&worker_url).await;
+        // Pass the pre-resolved EventConfig so the KvEventIndex does
+        // not issue a second `/server_info` round-trip.
+        idx.add_worker(&worker_url, info.event_config).await;
     }
 }
 
@@ -360,13 +296,8 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
-    fn fast_http_client() -> Arc<reqwest::Client> {
-        Arc::new(
-            reqwest::Client::builder()
-                .timeout(Duration::from_millis(500))
-                .build()
-                .unwrap(),
-        )
+    fn fast_introspector() -> Arc<WorkerIntrospector> {
+        Arc::new(WorkerIntrospector::new(Duration::from_millis(500)))
     }
 
     /// `/server_info` returns `served_model_name` => the registry entry
@@ -378,12 +309,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(
+        let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            fast_http_client(),
+            fast_introspector(),
         ));
 
         let spec = WorkerSpec {
@@ -420,12 +351,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(
+        let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            fast_http_client(),
+            fast_introspector(),
         ));
 
         let spec = WorkerSpec {
@@ -466,12 +397,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(
+        let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            fast_http_client(),
+            fast_introspector(),
         ));
 
         for (id, url) in [("w-no-field", no_field_url), ("w-empty", empty_url)] {

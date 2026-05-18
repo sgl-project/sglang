@@ -5,6 +5,7 @@ use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::workers::{manager, WorkerRegistry};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -152,8 +153,7 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
 
     // Grab a handle, bump active_requests, and open the breaker.
     let w = registry.get(&WorkerId("w1".into())).unwrap();
-    w.active_requests
-        .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+    w.active_requests.fetch_add(5, Ordering::Relaxed);
     // Default threshold is 3 — record 10 failures to guarantee Open state.
     for _ in 0..10 {
         w.breaker.record_failure();
@@ -182,9 +182,7 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
         "mode should have flipped to Decode"
     );
     assert_eq!(
-        w_after
-            .active_requests
-            .load(std::sync::atomic::Ordering::Relaxed),
+        w_after.active_requests.load(Ordering::Relaxed),
         5,
         "active_requests should be preserved across mode change"
     );
@@ -320,6 +318,37 @@ async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Se
     (format!("http://127.0.0.1:{port}"), tx)
 }
 
+/// Spawn a fake worker that counts each `GET /server_info` hit in the
+/// returned `AtomicUsize`.  Used to assert the manager makes exactly
+/// one round-trip per worker.
+async fn spawn_counting_worker(body: Value) -> (String, Arc<AtomicUsize>, oneshot::Sender<()>) {
+    let body = Arc::new(body);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let body = body.clone();
+            let counter = counter_clone.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json((*body).clone())
+            }
+        }),
+    );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), counter, tx)
+}
+
 /// Registration must run in parallel across multiple `Added` events.
 /// Each fake worker delays its `/server_info` by 200ms; with sequential
 /// processing the manager would take ≥1000ms for 5 workers. We allow
@@ -411,4 +440,70 @@ async fn removed_awaits_pending_added() {
 
     drop(tx);
     h.await.unwrap();
+}
+
+/// The manager must make exactly ONE `/server_info` request per worker.
+/// Before this fix the worker manager fetched `served_model_name` and
+/// `KvEventIndex::add_worker` fetched the `kv_events` block
+/// independently — 2N round-trips for N workers.
+#[tokio::test]
+async fn manager_emits_single_server_info_fetch_per_worker() {
+    use sgl_router::policies::kv_events::KvEventIndex;
+
+    let body = json!({
+        "served_model_name": "m",
+        "kv_events": {
+            "publisher": "zmq",
+            "endpoint_host": "127.0.0.1",
+            "endpoint_port_base": 60100,
+            "topic": "",
+            "block_size": 64,
+            "dp_size": 1,
+        }
+    });
+    let (url, counter, _s) = spawn_counting_worker(body).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let kv_index = KvEventIndex::new();
+    let h = tokio::spawn(manager::run_with_config(
+        rx,
+        registry.clone(),
+        None,
+        Some(kv_index.clone()),
+    ));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    // Wait for both the registry and kv-events index to reflect the worker.
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if registry.get(&WorkerId("w1".into())).is_some() && kv_index.known_worker_count() == 1
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "manager did not finish onboarding the worker"
+    );
+
+    let hits = counter.load(Ordering::SeqCst);
+    assert_eq!(
+        hits, 1,
+        "manager must fetch /server_info exactly once per worker (got {hits})"
+    );
+
+    drop(tx);
+    h.await.unwrap();
+    kv_index.shutdown().await;
 }
