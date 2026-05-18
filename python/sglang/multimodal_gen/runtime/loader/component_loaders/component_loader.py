@@ -31,8 +31,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
-    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
-    layerwise_component_matches_selection,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    layerwise_component_matches_any_selection,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -115,18 +116,19 @@ class ComponentLoader(ABC):
         server_args: ServerArgs, component_name: str
     ) -> bool:
         """if a component should be loaded in a layerwise-fashion"""
-        selected_component_names = server_args.layerwise_offload_components
+        selected_component_names = normalize_layerwise_offload_components(
+            server_args.layerwise_offload_components
+        )
         if selected_component_names is None:
             return False
         selected_component_names = set(selected_component_names)
         if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
             return True
         explicit_component_names = selected_component_names - {
-            LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+            LAYERWISE_OFFLOAD_DIT_GROUP
         }
-        return any(
-            layerwise_component_matches_selection(component_name, selected_component)
-            for selected_component in explicit_component_names
+        return layerwise_component_matches_any_selection(
+            component_name, explicit_component_names
         )
 
     def _maybe_configure_layerwise_after_startup_cpu_staging(
