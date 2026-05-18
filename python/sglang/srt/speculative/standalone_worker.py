@@ -9,6 +9,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+)
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
@@ -48,6 +51,9 @@ class StandaloneWorker(EAGLEWorker):
             server_args.speculative_algorithm
         )
 
+        # TODO: Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -71,7 +77,11 @@ class StandaloneWorker(EAGLEWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             TpModelWorker.__init__(
                 self,
                 server_args=server_args,
@@ -96,9 +106,11 @@ class StandaloneWorker(EAGLEWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
