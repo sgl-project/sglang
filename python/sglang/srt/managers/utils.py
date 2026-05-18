@@ -54,8 +54,10 @@ class GenerationBatchResult:
     next_draft_input: Optional[EagleDraftInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
-    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
-    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    # as the legacy ``batch_record_buf`` shim. Routed through
+    # ``Relayer.add_iter_pin`` in run_batch so the Relayer owns the lifetime
+    # window rather than the Scheduler-local list; kept on this dataclass
+    # only as a transport between the worker and the run_batch wiring.
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling

@@ -3173,6 +3173,14 @@ class Scheduler(
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
                         if batch_result.extra_keep_alive_refs:
+                            # Route worker-registered keep-alive refs through
+                            # the Relayer iter pin so the lifetime owner is
+                            # the Relayer (not the Scheduler-local
+                            # batch_record_buf). The legacy list is still
+                            # updated as a shim for any direct indexer.
+                            self.relayer.add_iter_pin(
+                                *batch_result.extra_keep_alive_refs
+                            )
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
