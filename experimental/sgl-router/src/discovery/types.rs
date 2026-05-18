@@ -40,12 +40,24 @@ pub enum WorkerMode {
 /// Backends emit [`DiscoveryEvent::Added`] carrying a `WorkerSpec` when a
 /// new worker becomes available, and [`DiscoveryEvent::Removed`] when it
 /// leaves.
+///
+/// `bootstrap_port` is the SGLang disagg bootstrap server port for
+/// prefill workers (set via `--disaggregation-bootstrap-port` at worker
+/// startup, surfaced through K8s annotation `sglang.ai/bootstrap-port`
+/// or the static-config bootstrap_port field). `None` for decode and
+/// plain workers — they don't own a bootstrap server. The router copies
+/// the selected prefill worker's `bootstrap_host`/`bootstrap_port` plus
+/// a random `bootstrap_room` u64 onto every PD-disagg request body so
+/// the prefill engine can match incoming KV-transfer requests from the
+/// decode peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,
     pub url: String,
     pub mode: WorkerMode,
     pub model_ids: Vec<ModelId>,
+    #[serde(default)]
+    pub bootstrap_port: Option<u16>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -84,10 +96,36 @@ mod tests {
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("qwen".into())],
+            bootstrap_port: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
         assert_eq!(w, d);
+    }
+
+    #[test]
+    fn worker_spec_with_bootstrap_port_round_trip() {
+        let w = WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("qwen".into())],
+            bootstrap_port: Some(8997),
+        };
+        let s = serde_json::to_string(&w).unwrap();
+        assert!(s.contains("\"bootstrap_port\":8997"));
+        let d: WorkerSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(w, d);
+    }
+
+    #[test]
+    fn worker_spec_deserializes_with_missing_bootstrap_port() {
+        // Older configs / hand-written JSON without the field should
+        // still parse — bootstrap_port defaults to None for non-PD
+        // deployments.
+        let json = r#"{"id":"w","url":"http://x","mode":"plain","model_ids":["m"]}"#;
+        let w: WorkerSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(w.bootstrap_port, None);
     }
 
     #[test]
@@ -113,6 +151,7 @@ mod tests {
             url: "http://x:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m1".into())],
+            bootstrap_port: None,
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

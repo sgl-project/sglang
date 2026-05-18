@@ -16,9 +16,10 @@ pub struct Config {
 ///
 /// Serialised as `"round_robin"` / `"random"` / `"power_of_two"` /
 /// `"cache_aware_zmq"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
+    #[default]
     RoundRobin,
     Random,
     PowerOfTwo,
@@ -26,12 +27,6 @@ pub enum PolicyKind {
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
     CacheAwareZmq,
-}
-
-impl Default for PolicyKind {
-    fn default() -> Self {
-        PolicyKind::RoundRobin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

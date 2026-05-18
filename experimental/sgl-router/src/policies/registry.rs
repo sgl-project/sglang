@@ -277,6 +277,7 @@ mod tests {
             url: format!("http://{id}"),
             mode,
             model_ids: vec![ModelId(model.into())],
+            bootstrap_port: None,
         }
     }
 
@@ -425,6 +426,7 @@ mod tests {
             url: url.into(),
             mode,
             model_ids: vec![ModelId(model.into())],
+            bootstrap_port: None,
         }
     }
 

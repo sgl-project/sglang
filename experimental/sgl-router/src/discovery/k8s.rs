@@ -118,6 +118,7 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 url,
                 mode,
                 model_ids: Vec::new(),
+                bootstrap_port: None,
             });
         }
     }

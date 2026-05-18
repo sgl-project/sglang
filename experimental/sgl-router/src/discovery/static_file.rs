@@ -52,6 +52,7 @@ fn parse(content: &str) -> Result<HashMap<WorkerId, WorkerSpec>> {
                 url: w.url,
                 mode: w.mode,
                 model_ids: w.model_ids.into_iter().map(ModelId).collect(),
+                bootstrap_port: None,
             },
         );
     }
@@ -236,6 +237,7 @@ mod tests {
                 url: url.into(),
                 mode,
                 model_ids: vec![ModelId("m1".into())],
+                bootstrap_port: None,
             },
         )
     }
