@@ -191,10 +191,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages, request_prompts, engine_prompts = (
                     self._make_request_with_harmony(request, prev_response)
                 )
+                processed_messages = None
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
-                    request, prev_response, tokenizer
-                )
+                (
+                    messages,
+                    request_prompts,
+                    engine_prompts,
+                    processed_messages,
+                ) = await self._make_request(request, prev_response, tokenizer)
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -275,9 +279,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
-                    # Create GenerateReqInput for SGLang
+                    # Create GenerateReqInput for SGLang. For multimodal models,
+                    # _make_request returns the rendered template string (not token
+                    # ids) so it must be passed via `text=`, along with the
+                    # image/video/audio data extracted by the chat template.
+                    if processed_messages is not None and isinstance(
+                        engine_prompt, str
+                    ):
+                        prompt_kwargs = {
+                            "text": engine_prompt,
+                            "image_data": processed_messages.image_data,
+                            "video_data": processed_messages.video_data,
+                            "audio_data": processed_messages.audio_data,
+                            "modalities": processed_messages.modalities,
+                        }
+                    else:
+                        prompt_kwargs = {"input_ids": engine_prompt}
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -409,8 +428,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_ids = tokenizer.encode(prompt_text)
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
+            processed_messages = None
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, processed_messages
 
     def _make_request_with_harmony(
         self,
