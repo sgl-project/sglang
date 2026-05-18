@@ -164,6 +164,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_to_device_buffer.zero_()
         self.coordinator.req_device_buffer_size.zero_()
         self.coordinator.req_to_host_pool.fill_(-1)
+        self.coordinator.req_to_host_pool_allocated_len.zero_()
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
@@ -244,6 +245,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertIsNotNone(host_indices, "Host alloc failed")
         host_indices = host_indices.to(device="cuda")
         self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx] = fill_len
         for lid in range(LAYER_NUM):
             for i in range(fill_len):
                 host_pool.kv_buffer[lid][host_indices[i]] = self._kv_pattern(lid, i)
@@ -579,11 +581,28 @@ class TestHiSparseUnit(unittest.TestCase):
         host_row = self.coordinator.req_to_host_pool[req.req_pool_idx, :rounded_len]
         self.assertTrue(torch.all(host_row >= 0))
         self.assertEqual(torch.unique(host_row).numel(), rounded_len)
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            rounded_len,
+        )
+
+        available_size = self.coordinator.mem_pool_host.available_size()
+        next_host_index = self.coordinator.mem_pool_host.alloc_paged_token_slots(
+            self.coordinator.req_to_host_pool,
+            self.coordinator.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            fill_len,
+            1,
+        )
+        self.assertEqual(
+            self.coordinator.mem_pool_host.available_size(), available_size
+        )
+        self.assertTrue(torch.all(next_host_index >= 0))
 
         allocated_host_indices = self.coordinator.mem_pool_host.allocated_host_indices(
             self.coordinator.req_to_host_pool,
             req.req_pool_idx,
-            fill_len,
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
         )
         self.assertEqual(allocated_host_indices.numel(), rounded_len)
 
@@ -663,10 +682,14 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertEqual(req.extend_input_len, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            rounded_len,
+        )
         allocated_host_indices = self.coordinator.mem_pool_host.allocated_host_indices(
             self.coordinator.req_to_host_pool,
             req.req_pool_idx,
-            fill_len,
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
         )
         self.assertEqual(allocated_host_indices.numel(), rounded_len)
 

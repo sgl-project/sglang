@@ -118,6 +118,9 @@ class HiSparseCoordinator:
             dtype=torch.int64,
             device=device,
         )
+        self.req_to_host_pool_allocated_len = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -205,6 +208,7 @@ class HiSparseCoordinator:
         prefill_len = len(device_indices)
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
             req.req_pool_idx,
             0,
             prefill_len,
@@ -546,13 +550,13 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        actual_compressed_pos_cpu = actual_compressed_pos.cpu()
         host_locs_list = []
-        for j, i in enumerate(backup_indices):
+        for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
-            start_pos = int(actual_compressed_pos_cpu[j])
+            start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
             host_locs = self.mem_pool_host.alloc_paged_token_slots(
                 self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
                 req_idx,
                 start_pos,
                 1,
@@ -704,11 +708,12 @@ class HiSparseCoordinator:
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
             req.req_pool_idx,
-            req.kv_allocated_len // self.compress_ratio,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -751,7 +756,7 @@ class HiSparseCoordinator:
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
             req.req_pool_idx,
-            allocated_len // self.compress_ratio,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
@@ -762,6 +767,7 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 

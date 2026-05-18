@@ -1260,6 +1260,7 @@ class DecodePreallocQueue:
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
+                coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
                 fill_len,
