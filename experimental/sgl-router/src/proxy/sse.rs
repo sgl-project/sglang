@@ -33,13 +33,21 @@ use tokio_stream::wrappers::ReceiverStream;
 /// this, the body would EOF cleanly and clients couldn't distinguish that from
 /// success — the worst failure class (truncated output that looks complete).
 ///
-/// # Load guard
-/// When `load_guard` is `Some`, the guard is **moved into the spawned task**
+/// # Stream guards
+/// When `stream_guards` is `Some`, the value is **moved into the spawned task**
 /// and held for the entire body lifetime.  It is dropped only when the SSE
-/// pump finishes (stream exhausted or client disconnects).  Pass `None` for
-/// callers that manage the guard externally (e.g. non-streaming paths where
-/// the handler itself is the guard scope).
-pub fn bytes_stream_to_body<S, E>(stream: S, load_guard: Option<crate::workers::LoadGuard>) -> Body
+/// pump finishes (stream exhausted, client disconnects, or upstream errors).
+/// The opaque `Box<dyn Send + 'static>` accepts any drop-only payload — most
+/// commonly a tuple of the M2 [`crate::workers::LoadGuard`] and the M4
+/// [`crate::policies::active_load::ActiveLoadGuard`]. The proxy does not
+/// inspect the value; it relies entirely on `Drop` semantics, so callers can
+/// pack arbitrary cleanup state in. Pass `None` for callers that manage the
+/// guard externally (e.g. non-streaming paths where the handler itself is the
+/// guard scope).
+pub fn bytes_stream_to_body<S, E>(
+    stream: S,
+    stream_guards: Option<Box<dyn Send + 'static>>,
+) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
@@ -48,11 +56,11 @@ where
     tokio::spawn(async move {
         let tx_for_panic = tx.clone();
         let pump = AssertUnwindSafe(async move {
-            // Hold the guard for the task's lifetime — dropped when this block
-            // exits (stream done or client disconnect).  Leading underscore
-            // suppresses the "unused variable" lint while keeping intent
-            // explicit.
-            let _hold = load_guard;
+            // Hold the guards for the task's lifetime — dropped when this
+            // block exits (stream done or client disconnect).  Leading
+            // underscore suppresses the "unused variable" lint while
+            // keeping intent explicit.
+            let _hold = stream_guards;
             let mut s = stream;
             while let Some(chunk) = s.next().await {
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {

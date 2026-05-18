@@ -6,6 +6,7 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
@@ -14,6 +15,16 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Coarse char-count → token-count divisor used to estimate prefill load
+/// from the request body when no real tokenizer count is available. Four
+/// bytes per token is the standard SGLang upstream estimate; it
+/// overcounts ASCII and undercounts CJK but stays within an order of
+/// magnitude of the real token count, which is plenty for load
+/// scoring. The active-load counters' role is relative ordering across
+/// workers — not absolute accuracy — so the estimate is fit for
+/// purpose.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Per-route body-size cap on `/v1/chat/completions`. 1 MiB is comfortable
 /// for normal chat traffic (a 200 k-token context tokenized as JSON is well
@@ -92,12 +103,30 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             })?;
 
+    // M2 per-worker active_requests guard. The M4 ActiveLoadGuard below
+    // sits beside this one: both track in-flight load, but the M4 entry
+    // is per-request (with timeout-based janitor) while the M2 entry is
+    // a worker-scoped counter the cache-aware policy reads. Both must
+    // drop at the same time — when the response stream ends, the client
+    // disconnects, or the handler returns an error. We bundle them
+    // together for the streaming pump task so the two lifetimes are
+    // tied. Decode-load contribution is 0 here: the active-load
+    // registry's decode axis is exclusively driven by M5's decode-pool
+    // dispatch (not implemented yet — prefill-only routing in M4 means
+    // every chat request adds to prefill_load and nothing else).
     let guard = worker.load_guard();
+    let prefill_load = estimate_prefill_tokens(&body);
+    let active_guard = ctx.active_load.register(worker.id.clone(), prefill_load, 0);
 
     if streaming {
-        // Hand the guard to the streaming body task; it is held until the
-        // SSE pump finishes (last byte or client disconnect), not just until
-        // this handler returns (which happens when headers arrive).
+        // Hand BOTH guards to the streaming body task. They are held
+        // until the SSE pump finishes (last byte / client disconnect /
+        // upstream error), not just until this handler returns (which
+        // happens when headers arrive). Without the M4 guard here, a
+        // long-running stream would under-report active-load to the
+        // cache-aware policy and over-attract new requests to the same
+        // worker.
+        let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
@@ -105,13 +134,16 @@ pub async fn chat_completions(
                 "/v1/chat/completions",
                 &headers,
                 body,
-                Some(guard),
+                Some(stream_guards),
             )
             .await
     } else {
-        // Non-streaming: the handler awaits the full buffered response, so
-        // the guard lives correctly in this scope.
-        let _hold = guard;
+        // Non-streaming: the handler awaits the full buffered response,
+        // so both guards live correctly in this scope. The tuple binding
+        // exists only to extend the guards' lifetime to the end of the
+        // function — the `forward_json_to` future does not need them
+        // (it does not return until the body is buffered).
+        let _holds: (LoadGuard, _) = (guard, active_guard);
         ctx.proxy
             .forward_json_to(
                 &worker.url,
@@ -122,6 +154,21 @@ pub async fn chat_completions(
             )
             .await
     }
+}
+
+/// Estimate prefill-token count from the raw request body for use as
+/// the M4 active-load `prefill_load` counter. Returns 1 at minimum so
+/// a registered request always shows up as "load > 0" — under-counting
+/// to zero would hide the request from the cache-aware policy's
+/// load-imbalance fast-path.
+///
+/// This is a coarse approximation: we count the body length in bytes
+/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future M5+ improvement
+/// is to thread the tokenizer's actual token count through (the
+/// cache-aware-zmq policy already tokenizes the prompt for tree
+/// matching — that count could be reused here).
+fn estimate_prefill_tokens(body: &Bytes) -> usize {
+    (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {

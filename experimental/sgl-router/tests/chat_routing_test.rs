@@ -857,3 +857,229 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         "load should be 0 after stream completes"
     );
 }
+
+/// Task A: the chat handler mints an `ActiveLoadGuard` from the shared
+/// `ActiveLoadRegistry` and drops it when the request completes. The
+/// non-streaming path drops the guard on handler exit; this test
+/// asserts the round-trip increment → 0 across a single request.
+#[tokio::test]
+async fn non_streaming_active_load_increments_then_returns_to_zero() {
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let active_load = Arc::clone(&ctx.active_load);
+    let app = build_router(ctx);
+
+    assert_eq!(
+        active_load.inflight_count(),
+        0,
+        "registry must start with no in-flight requests",
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Drain the body so any pending background work runs to completion.
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    // The handler has returned, so the active-load guard must have
+    // dropped — counters are back to zero.
+    assert_eq!(
+        active_load.inflight_count(),
+        0,
+        "active-load registry must be empty after non-streaming handler returns",
+    );
+    let w_id = WorkerId("w1".into());
+    assert_eq!(
+        active_load.prefill_load(&w_id),
+        0,
+        "prefill_load must decrement on response end",
+    );
+}
+
+/// Task A: the streaming path holds the M4 `ActiveLoadGuard` until the
+/// SSE pump finishes. Mid-stream the registry shows `inflight_count >= 1`;
+/// after the body drains it returns to 0. This is the M4 counterpart
+/// to the existing M2 `streaming_load_guard_persists_for_body_lifetime`
+/// test — both guards must live for the FULL response lifetime.
+#[tokio::test]
+async fn streaming_active_load_persists_for_body_lifetime() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker =
+        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(50)).await;
+
+    let cfg = config_for(&worker.url);
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+    ));
+    let active_load = Arc::clone(&ctx.active_load);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    // The handler has returned (headers arrived). The streaming pump is
+    // still running, so the registry's per-request entry must remain.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        active_load.inflight_count() >= 1,
+        "registry inflight must be >= 1 mid-stream, got {}",
+        active_load.inflight_count(),
+    );
+    let w_id = WorkerId("w1".into());
+    assert!(
+        active_load.prefill_load(&w_id) >= 1,
+        "prefill_load must be > 0 mid-stream, got {}",
+        active_load.prefill_load(&w_id),
+    );
+
+    // Drain the body — drives the SSE pump to completion.
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(
+        active_load.inflight_count(),
+        0,
+        "registry must be empty after stream drains",
+    );
+    assert_eq!(
+        active_load.prefill_load(&w_id),
+        0,
+        "prefill_load must be 0 after stream drains",
+    );
+}
+
+/// Task A: a streaming client that disconnects mid-stream still drops
+/// both guards. The SSE pump's `tx.send().await.is_err()` branch is what
+/// triggers the drop — when the axum Body is dropped on the client side,
+/// the channel receiver closes and the pump exits.
+#[tokio::test]
+async fn streaming_active_load_drops_on_client_disconnect() {
+    // Slow stream: 4 chunks × 100 ms each. The test only reads the
+    // first chunk then drops the body, simulating a client disconnect.
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker =
+        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(100))
+            .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let active_load = Arc::clone(&ctx.active_load);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    // Read one chunk to confirm the stream is live, then drop the body.
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    let _first = data_stream.next().await;
+    drop(data_stream);
+
+    // Wait long enough for the SSE pump to notice the receiver-drop and
+    // exit (per `bytes_stream_to_body_breaks_on_client_disconnect` test
+    // in sse.rs, that takes well under 200 ms).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        active_load.inflight_count(),
+        0,
+        "client disconnect must drop the streaming pump's guards within one tick",
+    );
+}
+
+/// Task A: a non-streaming request that errors out (upstream
+/// unreachable) still drops the active-load guard. The handler's normal
+/// return path is the only drop point — confirming the guard is on the
+/// stack (not inside a long-lived future) is what this test pins.
+#[tokio::test]
+async fn non_streaming_error_path_drops_active_load_guard() {
+    // Dead upstream — first connect attempt fails fast.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let ctx = build_ctx_with_worker(&dead_url);
+    let active_load = Arc::clone(&ctx.active_load);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    // Drain so any drop-on-body-end work runs.
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        active_load.inflight_count(),
+        0,
+        "error path must drop the active-load guard",
+    );
+}

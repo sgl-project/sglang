@@ -147,11 +147,15 @@ impl Proxy {
     /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
     /// success/failure, and returns `ApiError::BreakerOpen` when Open.
     ///
-    /// `load_guard` — when `Some`, the guard is threaded into the SSE pump
-    /// task and held for the entire body lifetime (headers → last byte /
-    /// client disconnect).  This ensures `worker.active_load()` stays > 0 for
-    /// long-running streams, which is required for power-of-two routing
-    /// accuracy.  Pass `None` if the caller manages the guard externally.
+    /// `stream_guards` — when `Some`, the value is threaded into the SSE
+    /// pump task and held for the entire body lifetime (headers → last byte
+    /// / client disconnect).  The proxy does not inspect the boxed value; it
+    /// relies entirely on `Drop` semantics, so callers typically pack
+    /// `(LoadGuard, ActiveLoadGuard)` here. This keeps both the M2 per-worker
+    /// `active_requests` counter and the M4 per-request active-load entry
+    /// alive for the full streaming lifetime — without which a long-running
+    /// SSE response would under-report load (M2 LoadGuard had been threaded
+    /// since M2; the M4 ActiveLoadGuard is new in this commit).
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
@@ -159,7 +163,7 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
-        load_guard: Option<crate::workers::LoadGuard>,
+        stream_guards: Option<Box<dyn Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -200,7 +204,7 @@ impl Proxy {
         } else {
             upstream_ct
         };
-        let body = sse::bytes_stream_to_body(resp.bytes_stream(), load_guard);
+        let body = sse::bytes_stream_to_body(resp.bytes_stream(), stream_guards);
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(
