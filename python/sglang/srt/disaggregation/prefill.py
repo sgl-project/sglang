@@ -536,6 +536,7 @@ class SchedulerDisaggregationPrefillMixin:
                     extend_input_len = extend_input_len_per_req[i]
                     num_input_logprobs = extend_input_len - extend_logprob_start_len
                     self.add_logprob_return_values(
+                        self.logprob_result_processor,
                         i,
                         req,
                         logprob_pt,
@@ -573,6 +574,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.add_input_logprob_return_values(
+                            self.logprob_result_processor,
                             i,
                             req,
                             logits_output,
