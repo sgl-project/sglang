@@ -568,127 +568,206 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Send both requests concurrently
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
-
-        events::RequestReceivedEvent {}.emit();
-
-        // Process decode response
-        match decode_result {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                debug!("Decode response status: {}", status);
-
-                if !status.is_success() {
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
-
-                    return self
-                        .handle_decode_error_response(res, &context, prefill, decode)
-                        .await;
+        // TTFT Optimization: For streaming requests without logprobs (the common case),
+        // fire prefill in background and only await decode's response.
+        // This avoids blocking the decode stream proxy on prefill's HTTP response latency.
+        if context.is_stream && !context.return_logprob {
+            // Send prefill request in background — don't block decode's stream on it
+            let prefill_url_for_log = prefill.url().to_string();
+            tokio::spawn(async move {
+                match prefill_request.send().await {
+                    Ok(res) => {
+                        let status = res.status();
+                        if !status.is_success() {
+                            error!(
+                                "Prefill server returned error (background) prefill_url={} status={}",
+                                prefill_url_for_log, status
+                            );
+                        }
+                        // Consume response body to release the HTTP connection back to pool
+                        let _ = res.bytes().await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Prefill request failed (background) prefill_url={} error={}",
+                            prefill_url_for_log, e
+                        );
+                    }
                 }
+            });
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
+            // Only await decode response — start proxying immediately
+            let decode_result = decode_request.send().await;
 
-                if context.is_stream {
-                    // Streaming response
-                    let prefill_logprobs = if context.return_logprob {
-                        prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
-                    } else {
-                        None
-                    };
+            events::RequestReceivedEvent {}.emit();
+
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status (fast path): {}", status);
+
+                    if !status.is_success() {
+                        error!(
+                            "Decode server returned error decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
+                    }
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
                     self.create_streaming_response(
                         res.bytes_stream(),
                         status,
-                        prefill_logprobs,
-                        context.return_logprob,
+                        None,
+                        false,
                         None,
                         Some(response_headers),
                         prefill,
                         decode,
                     )
-                } else {
-                    // Non-streaming response
-                    if context.return_logprob {
-                        self.process_non_streaming_response(
-                            res,
-                            status,
-                            context.return_logprob,
-                            prefill_body,
-                        )
-                        .await
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    )
+                }
+            }
+        } else {
+            // Original path: wait for both prefill and decode responses.
+            // Used for non-streaming requests and streaming requests with logprobs
+            // (which need prefill's response body for logprob merging).
+            let (prefill_result, decode_result) =
+                tokio::join!(prefill_request.send(), decode_request.send());
+
+            events::RequestReceivedEvent {}.emit();
+
+            // Process decode response
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
+
+                    if !status.is_success() {
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
+                    }
+
+                    // Process prefill response
+                    let prefill_body = if context.return_logprob {
+                        match self
+                            .process_prefill_response(
+                                prefill_result,
+                                prefill.url(),
+                                context.return_logprob,
+                            )
+                            .await
+                        {
+                            Ok((_, body)) => body,
+                            Err(error_response) => return error_response,
+                        }
                     } else {
-                        // Direct passthrough when no logprobs needed
+                        // Even if we don't need logprobs, we should check prefill status
+                        match self
+                            .process_prefill_response(prefill_result, prefill.url(), false)
+                            .await
+                        {
+                            Ok((_, body)) => body,
+                            Err(error_response) => return error_response,
+                        }
+                    };
+
+                    if context.is_stream {
+                        // Streaming response with logprobs
+                        let prefill_logprobs = prefill_body
+                            .as_ref()
+                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                            .and_then(|json| {
+                                json.pointer("/meta_info/input_token_logprobs").cloned()
+                            });
+
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
-                        match res.bytes().await {
-                            Ok(decode_body) => {
-                                let mut response = Response::new(Body::from(decode_body));
-                                *response.status_mut() = status;
-                                *response.headers_mut() = response_headers;
-                                response
-                            }
-                            Err(e) => {
-                                error!("Failed to read decode response: {}", e);
-                                error::internal_error(
-                                    "read_response_failed",
-                                    "Failed to read response",
-                                )
+                        self.create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            prefill_logprobs,
+                            context.return_logprob,
+                            None,
+                            Some(response_headers),
+                            prefill,
+                            decode,
+                        )
+                    } else {
+                        // Non-streaming response
+                        if context.return_logprob {
+                            self.process_non_streaming_response(
+                                res,
+                                status,
+                                context.return_logprob,
+                                prefill_body,
+                            )
+                            .await
+                        } else {
+                            // Direct passthrough when no logprobs needed
+                            let response_headers =
+                                header_utils::preserve_response_headers(res.headers());
+
+                            match res.bytes().await {
+                                Ok(decode_body) => {
+                                    let mut response = Response::new(Body::from(decode_body));
+                                    *response.status_mut() = status;
+                                    *response.headers_mut() = response_headers;
+                                    response
+                                }
+                                Err(e) => {
+                                    error!("Failed to read decode response: {}", e);
+                                    error::internal_error(
+                                        "read_response_failed",
+                                        "Failed to read response",
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                error!(
-                    decode_url = %decode.url(),
-                    error = %e,
-                    "Decode request failed"
-                );
-                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    )
+                }
             }
         }
     }
