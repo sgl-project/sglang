@@ -1564,6 +1564,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    # Relay fields are SB attributes whose post-iter value is driven by
+    # forward N's output. Writes to these attributes auto-mirror to the
+    # Relayer ``gpu_scalar`` channel so cross-stream consumers can resolve
+    # the same value with channel-level sync; reads stay on the local
+    # attribute since within-iter visibility is established by
+    # ``forward_stream.wait_stream(schedule_stream)`` before forward
+    # consumes them.
+    _RELAYER_GPU_FIELDS = ("seq_lens", "seq_lens_cpu", "orig_seq_lens")
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name in ScheduleBatch._RELAYER_GPU_FIELDS:
+            ctx = self.__dict__.get("_relayer_seq_lens_ctx")
+            if ctx is not None:
+                relayer, fi = ctx
+                if relayer is not None and fi is not None and value is not None:
+                    getattr(relayer, f"store_{name}")(fi, value)
+
     def set_relayer_ctx(self, relayer, cpu_future_indices):
         """Attach a Relayer + cpu_future_indices reference so filter_batch
         (and other consumer methods) can read forward-driven per-req decisions
@@ -1574,6 +1592,66 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         the SB does not carry a stale relayer ref across iters.
         """
         self._relayer_ctx = (relayer, cpu_future_indices)
+
+    def set_relayer_seq_lens_ctx(self, relayer, future_indices):
+        """Attach a Relayer + gpu future_indices reference so writes to the
+        ``seq_lens`` family auto-mirror into the gpu_scalar channel. The
+        forward stream cannot see this attribute directly (Python attribute
+        on SB lives on host), so the channel mirror is what makes the new
+        post-decode lens available to forward and to the next-iter consumer
+        via a sync-correct resolve.
+        """
+        self._relayer_seq_lens_ctx = (relayer, future_indices)
+
+    def clear_relayer_seq_lens_ctx(self):
+        self._relayer_seq_lens_ctx = (None, None)
+
+    def relayer_resolve_seq_lens(self):
+        """Cross-stream-safe read of ``seq_lens``: when a Relayer ctx is set,
+        resolve from the gpu_scalar channel (which waits on the producer
+        event); otherwise return the direct attribute."""
+        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
+        if ctx is not None:
+            relayer, fi = ctx
+            if relayer is not None and fi is not None:
+                return relayer.resolve_seq_lens(fi.indices)
+        return self.seq_lens
+
+    def relayer_resolve_seq_lens_cpu(self):
+        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
+        if ctx is not None:
+            relayer, fi = ctx
+            if relayer is not None and fi is not None:
+                return relayer.resolve_seq_lens_cpu(fi.indices)
+        return self.seq_lens_cpu
+
+    def relayer_resolve_orig_seq_lens(self):
+        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
+        if ctx is not None:
+            relayer, fi = ctx
+            if relayer is not None and fi is not None:
+                return relayer.resolve_orig_seq_lens(fi.indices)
+        return self.orig_seq_lens
+
+    def bind_relayer_for_iter(self, relayer):
+        """Allocate this iter's relay slots (gpu_scalar for seq_lens family,
+        cpu_value for kv_committed_delta / finished_status) and attach them
+        to the SB so subsequent mutators (prepare_for_decode / filter_batch /
+        merge_batch) auto-mirror writes and channel reads target a stable
+        slot. ``run_batch`` later consumes ``self._relayer_iter_gpu_fi`` /
+        ``self._relayer_iter_cpu_fi`` instead of re-allocating.
+        """
+        if relayer is None:
+            return
+        bs = len(self.reqs)
+        if bs == 0:
+            return
+        gpu_fi = relayer.alloc_future_indices(bs)
+        cpu_fi = relayer.cpu_value.alloc(bs)
+        self._relayer_iter_gpu_fi = gpu_fi
+        self._relayer_iter_cpu_fi = cpu_fi
+        self.set_relayer_seq_lens_ctx(relayer, gpu_fi)
+        self.set_relayer_ctx(relayer, cpu_fi)
 
     def clear_relayer_ctx(self):
         self._relayer_ctx = (None, None)

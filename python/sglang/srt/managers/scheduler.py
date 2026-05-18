@@ -2988,6 +2988,14 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        # Bind this iter's Relayer slots BEFORE prepare_for_decode so its
+        # writes to ``seq_lens`` / ``seq_lens_cpu`` / ``orig_seq_lens``
+        # auto-mirror into the gpu_scalar channel via ScheduleBatch
+        # ``__setattr__``. The same slots are consumed downstream by
+        # ``run_batch`` (no re-allocation) and by ``process_batch_result``
+        # (kv_committed_delta / finished_status store).
+        batch.bind_relayer_for_iter(self.relayer)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -3097,13 +3105,19 @@ class Scheduler(
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
-                    future_indices = self.relayer.alloc_future_indices(bs)
-                    # Allocate a parallel slot range on the cpu_value channel
-                    # so process_batch_result can store kv_committed_delta /
-                    # finished status under a slot key that's stable across
-                    # the iter boundary. Carried alongside the GPU future
-                    # indices on batch_result.
-                    cpu_future_indices = self.relayer.cpu_value.alloc(bs)
+                    # Prefer SB-attached iter slots (set by
+                    # ``ScheduleBatch.bind_relayer_for_iter`` during the
+                    # schedule pass) so prepare_for_decode's writes have
+                    # already mirrored to the same gpu_scalar slot. Fall
+                    # back to fresh alloc for batches that did not flow
+                    # through the relayer-aware schedule pass (e.g. some
+                    # disagg prefill paths).
+                    future_indices = getattr(
+                        batch, "_relayer_iter_gpu_fi", None
+                    ) or self.relayer.alloc_future_indices(bs)
+                    cpu_future_indices = getattr(
+                        batch, "_relayer_iter_cpu_fi", None
+                    ) or self.relayer.cpu_value.alloc(bs)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
