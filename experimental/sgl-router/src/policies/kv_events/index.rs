@@ -128,29 +128,36 @@ impl KvEventIndex {
         self.tree.clone()
     }
 
-    /// Register a worker. Fetches `/server_info` to learn the publisher
-    /// endpoint and opens one SUB per advertised DP rank. If the worker
-    /// is not publishing KV events (older SGLang, opt-out config), this
-    /// is a logged no-op — the worker still routes via the non-cache-
-    /// aware policies.
-    pub async fn add_worker(&self, worker_url: &str) {
-        let cfg: EventConfig = match fetch_event_config(worker_url, &self.http).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                info!(
-                    worker_url = %worker_url,
-                    "kv-events: worker is not publishing; cache-aware routing disabled for this worker",
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    worker_url = %worker_url,
-                    error = %e,
-                    "kv-events: /server_info introspection failed; skipping subscriber",
-                );
-                return;
-            }
+    /// Register a worker. If `preresolved` is `Some`, the caller has
+    /// already fetched `/server_info` (worker manager path) and we skip
+    /// the internal HTTP round-trip; otherwise (standalone callers,
+    /// e.g. integration tests) we fall back to `fetch_event_config`.
+    ///
+    /// Opens one ZMQ SUB per advertised DP rank. If the worker is not
+    /// publishing KV events (older SGLang, opt-out config), this is a
+    /// logged no-op — the worker still routes via the non-cache-aware
+    /// policies.
+    pub async fn add_worker(&self, worker_url: &str, preresolved: Option<EventConfig>) {
+        let cfg: EventConfig = match preresolved {
+            Some(c) => c,
+            None => match fetch_event_config(worker_url, &self.http).await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    info!(
+                        worker_url = %worker_url,
+                        "kv-events: worker is not publishing; cache-aware routing disabled for this worker",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker_url,
+                        error = %e,
+                        "kv-events: /server_info introspection failed; skipping subscriber",
+                    );
+                    return;
+                }
+            },
         };
         info!(
             worker_url = %worker_url,
