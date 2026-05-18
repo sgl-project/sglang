@@ -2923,20 +2923,24 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
 
-        if (
+        self._maybe_report_active_ranks()
+
+        return ret
+
+    def _maybe_report_active_ranks(self) -> None:
+        if not (
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
-            # Get the tensors indicating rank activeness
-            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-            tp_active_ranks &= tp_active_ranks_cpu
-            dp_active_ranks = tp_active_ranks.reshape(self.ps.dp_size, -1).prod(axis=1)
-            self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(status=dp_active_ranks.tolist())
-            )
-
-        return ret
+            return
+        # Get the tensors indicating rank activeness
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        dp_active_ranks = tp_active_ranks.reshape(self.ps.dp_size, -1).prod(axis=1)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            ActiveRanksOutput(status=dp_active_ranks.tolist())
+        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
