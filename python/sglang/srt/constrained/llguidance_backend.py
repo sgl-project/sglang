@@ -23,6 +23,7 @@ from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
 from llguidance.hf import from_tokenizer
 from llguidance.torch import (
     allocate_token_bitmask,
+    apply_token_bitmask_inplace,
     fill_next_token_bitmask,
 )
 
@@ -31,11 +32,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.utils import (
-    apply_packed_vocab_mask,
-    is_legacy_structural_tag,
-    set_token_filter,
-)
+from sglang.srt.constrained.utils import is_legacy_structural_tag, set_token_filter
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +86,13 @@ class GuidanceGrammar(BaseGrammarObject):
         if self.bitmask is None or self.bitmask.shape[0] < batch_size:
             # only create bitmask when batch gets larger
             self.bitmask = allocate_token_bitmask(
-                batch_size, self.llguidance_tokenizer.vocab_size
+                batch_size, vocab_size, device=device
             )
             bitmask = self.bitmask
         else:
             bitmask = self.bitmask[:batch_size]
 
-        return bitmask
+        return self.move_vocab_mask(bitmask, device)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -103,7 +100,7 @@ class GuidanceGrammar(BaseGrammarObject):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_packed_vocab_mask(logits, vocab_mask)
+        apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         return GuidanceGrammar(
@@ -151,20 +148,6 @@ class GuidanceBackend(BaseGrammarBackend):
     def is_support_token_filter(self):
         return True
 
-    def allocate_vocab_mask(
-        self, vocab_size: int, batch_size: int, device
-    ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
-
-    @staticmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
-
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_packed_vocab_mask(logits, vocab_mask)
-
-    @staticmethod
     def set_token_filter(
         vocab_mask: torch.Tensor,
         token_ids: List[int],
@@ -173,6 +156,20 @@ class GuidanceBackend(BaseGrammarBackend):
         reset_vocab_mask: bool = True,
     ):
         set_token_filter(vocab_mask, token_ids, batch_idx, is_allowed, reset_vocab_mask)
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        bitmask = allocate_token_bitmask(batch_size, vocab_size)
+        return self.move_vocab_mask(bitmask, device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        apply_token_bitmask_inplace(logits, vocab_mask)
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:

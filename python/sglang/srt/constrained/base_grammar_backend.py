@@ -145,10 +145,6 @@ class BaseGrammarBackend:
 
     @property
     def is_support_token_filter(self):
-        """Whether backend-level strict-thinking token filtering is supported.
-
-        Backends that return True must implement set_token_filter
-        """
         return False
 
     def set_token_filter(
@@ -160,20 +156,14 @@ class BaseGrammarBackend:
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        """Allocate a backend-level vocab mask for strict-only reasoner objects.
-
-        The returned mask uses the backend's native mask representation.
-        """
         raise NotImplementedError()
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        """Move a backend-level vocab mask to the target device."""
         raise NotImplementedError()
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        """Apply a backend-level vocab mask to logits in-place."""
         raise NotImplementedError()
 
     def init_strict_reasoning_grammar(self, reasoning: bool):

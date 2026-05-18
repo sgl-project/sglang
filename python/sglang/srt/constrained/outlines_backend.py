@@ -147,18 +147,6 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         return True
 
     @staticmethod
-    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
-
-    @staticmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
-
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
-        logits.masked_fill_(vocab_mask, float("-inf"))
-
-    @staticmethod
     def set_token_filter(
         vocab_mask: torch.Tensor,
         token_ids: List[int],
@@ -175,6 +163,17 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             token_ids, dtype=torch.int64, device=vocab_mask.device
         )
         row[token_ids_tensor] = not is_allowed
+
+    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
+        logits.masked_fill_(vocab_mask, float("-inf"))
 
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
