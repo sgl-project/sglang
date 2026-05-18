@@ -33,7 +33,7 @@ from sglang.omni.model_adapters.sensenova_u1.context import (
     load_u1_native_image,
 )
 from sglang.omni.model_adapters.sensenova_u1.session_adapter import (
-    U1OmniSessionModelPolicy,
+    U1OmniSessionModelHooks,
 )
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
@@ -118,19 +118,19 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertNotIn("<think>\n\n</think>\n\n", think_prepared.input_text)
         self.assertIn("<think>\n\n</think>\n\n", non_think_prepared.input_text)
 
-    def test_policy_interleave_think_flag_reaches_prepared_prompt(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
-        policy.native_generation_mode = "interleave"
+    def test_hooks_interleave_think_flag_reaches_prepared_prompt(self):
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
+        hooks.native_generation_mode = "interleave"
         messages = [OmniInterleavedMessage(type="text", content="hi")]
 
-        policy.native_interleave_think_mode = True
-        think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+        hooks.native_interleave_think_mode = True
+        think_prepared = hooks.prepare_srt_ar_interleaved_inputs(
             session=None,
             messages=messages,
             state=OmniSegmentState.AR_PREFILL,
         )
-        policy.native_interleave_think_mode = False
-        non_think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+        hooks.native_interleave_think_mode = False
+        non_think_prepared = hooks.prepare_srt_ar_interleaved_inputs(
             session=None,
             messages=messages,
             state=OmniSegmentState.AR_PREFILL,
@@ -151,19 +151,19 @@ class TestSenseNovaU1Context(unittest.TestCase):
             ]
         )
 
-    def test_policy_t2i_think_flag_reaches_prepared_prompt(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
-        policy.native_generation_mode = "t2i"
+    def test_hooks_t2i_think_flag_reaches_prepared_prompt(self):
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
+        hooks.native_generation_mode = "t2i"
         messages = [OmniInterleavedMessage(type="text", content="hi")]
 
-        policy.native_interleave_think_mode = True
-        think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+        hooks.native_interleave_think_mode = True
+        think_prepared = hooks.prepare_srt_ar_interleaved_inputs(
             session=None,
             messages=messages,
             state=OmniSegmentState.AR_PREFILL,
         )
-        policy.native_interleave_think_mode = False
-        non_think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+        hooks.native_interleave_think_mode = False
+        non_think_prepared = hooks.prepare_srt_ar_interleaved_inputs(
             session=None,
             messages=messages,
             state=OmniSegmentState.AR_PREFILL,
@@ -244,7 +244,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
 
     def test_t2i_think_decode_appends_image_marker_after_think(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _NativeThinkRuntime(output_ids=[42, 124])
         session = OmniSessionHandle(
             session_id="s0",
@@ -253,7 +253,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
             context_version=1,
         )
 
-        result = policy.decode_vlm_text(
+        result = hooks.decode_vlm_text(
             runtime=runtime,
             session=session,
             max_new_tokens=8,
@@ -266,7 +266,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertTrue(runtime.model_state_updates[-1]["u1"]["open_image_marker"])
 
     def test_t2i_think_decode_streams_tokens_before_image_marker(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _NativeThinkRuntime(output_ids=[42, 124])
         session = OmniSessionHandle(
             session_id="s0",
@@ -276,7 +276,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
         stream_sink = _TextDeltaSink()
 
-        result = policy.decode_vlm_text(
+        result = hooks.decode_vlm_text(
             runtime=runtime,
             session=session,
             max_new_tokens=8,
@@ -308,14 +308,14 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertEqual((4, 12), tuple(pixel_values.shape))
         self.assertEqual([[2, 2]], grid_hw.tolist())
 
-    def test_policy_owns_u1_image_boundary_token(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+    def test_hooks_owns_u1_image_boundary_token(self):
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
 
-        self.assertTrue(policy.is_image_generation_boundary_token(123))
-        self.assertFalse(policy.is_image_generation_boundary_token(124))
+        self.assertTrue(hooks.is_image_generation_boundary_token(123))
+        self.assertFalse(hooks.is_image_generation_boundary_token(124))
 
     def test_interleave_decode_positions_follow_official_next_output_semantics(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _DecodeRuntime(output_ids=[123])
         session = OmniSessionHandle(
             session_id="s0",
@@ -324,7 +324,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
             context_version=1,
         )
 
-        result = policy._decode_native_interleave_next_segment(
+        result = hooks._decode_native_interleave_next_segment(
             runtime=runtime,
             session=session,
             u1_state={
@@ -350,7 +350,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
 
     def test_interleave_decode_text_then_image_marker_positions(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _DecodeRuntime(output_ids=[42, 123])
         session = OmniSessionHandle(
             session_id="s0",
@@ -359,7 +359,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
             context_version=1,
         )
 
-        result = policy._decode_native_interleave_next_segment(
+        result = hooks._decode_native_interleave_next_segment(
             runtime=runtime,
             session=session,
             u1_state={
@@ -391,7 +391,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
 
     def test_interleave_think_role_survives_image_handoff_until_think_end(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _DecodeRuntime(output_ids=[42, 124])
         session = OmniSessionHandle(
             session_id="s0",
@@ -401,7 +401,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
         stream_sink = _TextDeltaSink()
 
-        result = policy._decode_native_interleave_next_segment(
+        result = hooks._decode_native_interleave_next_segment(
             runtime=runtime,
             session=session,
             u1_state={
@@ -426,7 +426,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
 
     def test_interleave_text_after_think_end_is_user_visible(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_Tokenizer())
         runtime = _DecodeRuntime(output_ids=[42, 999])
         session = OmniSessionHandle(
             session_id="s0",
@@ -435,7 +435,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
             context_version=1,
         )
 
-        result = policy._decode_native_interleave_next_segment(
+        result = hooks._decode_native_interleave_next_segment(
             runtime=runtime,
             session=session,
             u1_state={
@@ -451,7 +451,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertNotIn(TEXT_ROLE_METADATA_KEY, result.metadata)
 
     def test_interleave_planning_after_think_end_stays_hidden(self):
-        policy = U1OmniSessionModelPolicy(native_tokenizer=_PlanningTokenizer())
+        hooks = U1OmniSessionModelHooks(native_tokenizer=_PlanningTokenizer())
         runtime = _DecodeRuntime(output_ids=[42, 999])
         session = OmniSessionHandle(
             session_id="s0",
@@ -461,7 +461,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
         stream_sink = _TextDeltaSink()
 
-        result = policy._decode_native_interleave_next_segment(
+        result = hooks._decode_native_interleave_next_segment(
             runtime=runtime,
             session=session,
             u1_state={

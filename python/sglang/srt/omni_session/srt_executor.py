@@ -89,7 +89,7 @@ class OmniSRTTemporaryForwardBatch:
 
 
 class OmniSRTSchedulerExecutor:
-    """Execute materialized omni session requests through the SRT scheduler.
+    """Owned by OmniSessionRuntime, executes materialized omni session requests through the SRT scheduler.
 
     this executor enqueues the reqs created with runtime, runs them
     through scheduler-native batching when called from an async omni task,

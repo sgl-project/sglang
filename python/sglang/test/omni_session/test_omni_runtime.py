@@ -12,7 +12,7 @@ from sglang.srt.omni_session.runtime import (
 def test_omni_session_runtime_opens_streaming_srt_session():
     controller = _FakeSessionController()
     runtime = OmniSessionRuntime(
-        model_policy=_FakeModelPolicy(),
+        model_hooks=_FakeModelHooks(),
         session_controller=controller,
         capacity_of_str_len=8192,
     )
@@ -29,7 +29,7 @@ def test_omni_session_runtime_drains_srt_executor_after_close():
     controller.sessions.add("session-a")
     executor = _FakeSRTExecutor(controller)
     runtime = OmniSessionRuntime(
-        model_policy=_FakeModelPolicy(),
+        model_hooks=_FakeModelHooks(),
         session_controller=controller,
         srt_request_executor=executor,
     )
@@ -46,7 +46,7 @@ def test_append_ar_input_tokens_preserves_explicit_positions():
     controller.session_objects["session-a"] = srt_session
     controller.sessions.add("session-a")
     runtime = OmniSessionRuntime(
-        model_policy=_FakeModelPolicy(),
+        model_hooks=_FakeModelHooks(),
         session_controller=controller,
         tokenizer=_FakeTokenizer(),
     )
@@ -109,7 +109,7 @@ class _FakeOpenResult:
         self.success = success
 
 
-class _FakeModelPolicy:
+class _FakeModelHooks:
     def close_session(self, *, session_id):
         self.closed_session_id = session_id
 

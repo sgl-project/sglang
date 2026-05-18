@@ -12,7 +12,10 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from sglang.omni.core.interleaved import INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY
+from sglang.omni.core.interleaved import (
+    GenerationBoundaryMetadata,
+    INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+)
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
     OmniSRTPreparedInput,
@@ -105,7 +108,7 @@ class U1ModelStateUpdate:
     native_generated_image_commit: bool | None = None
     segments: tuple[U1GeneratedImageSegmentState | dict[str, Any], ...] | None = None
     session_id: str | None = None
-    generation_boundary_metadata: dict[str, Any] | None = None
+    generation_boundary_metadata: GenerationBoundaryMetadata | None = None
 
     def with_context(
         self,
@@ -171,8 +174,8 @@ class U1ModelStateUpdate:
                 for segment in self.segments
             ]
         if self.generation_boundary_metadata is not None:
-            state[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = dict(
-                self.generation_boundary_metadata
+            state[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = (
+                self.generation_boundary_metadata.to_metadata()
             )
         return state
 
@@ -226,7 +229,7 @@ U1_INTERLEAVE_SYSTEM_MESSAGE = (
     "images naturally alongside the text.\n\n"
     "After the think block, always provide a concise, user-facing final answer. "
     "The final answer must not include hidden reasoning, planning steps, numbered "
-    "analysis, explicit image prompts, or phrases like \"I will\". The answer may "
+    'analysis, explicit image prompts, or phrases like "I will". The answer may '
     "include text, images, or both. Match the user's language in both reasoning "
     "and the final answer."
 )

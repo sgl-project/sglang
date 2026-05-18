@@ -30,7 +30,7 @@ DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 
 
 class SRTBackedOmniSessionAdapter:
-    """Concrete adapter from generic omni AR semantics to SRT session operations.
+    """Owned by AR backenmd, SRTBackedOmniSessionAdapter is a concrete adapter from generic omni AR semantics to SRT session operations, providing utilities
 
     It keeps SRT as the session/KV owner and asks the runtime to
     prefill/decode/commit AR-side chunks. For interleaved generation this path is:
@@ -220,7 +220,7 @@ class SRTBackedOmniSessionAdapter:
                 f"omni think text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
         try:
-            return self.runtime.model_policy.decode_vlm_text(
+            return self.runtime.model_hooks.decode_vlm_text(
                 runtime=self.runtime,
                 session=session,
                 max_new_tokens=max_new_tokens,
@@ -228,7 +228,7 @@ class SRTBackedOmniSessionAdapter:
             )
         except NotImplementedError as exc:
             raise RuntimeError(
-                f"{self.runtime.model_policy.__class__.__name__} does not support "
+                f"{self.runtime.model_hooks.__class__.__name__} does not support "
                 "omni think text generation"
             ) from exc
 
@@ -250,7 +250,7 @@ class SRTBackedOmniSessionAdapter:
             normalize_omni_interleaved_messages(messages)
         )
         try:
-            return self.runtime.model_policy.decode_vlm_text(
+            return self.runtime.model_hooks.decode_vlm_text(
                 runtime=self.runtime,
                 session=session,
                 max_new_tokens=max_new_tokens,

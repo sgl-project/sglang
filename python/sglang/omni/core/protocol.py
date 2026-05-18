@@ -152,7 +152,7 @@ class OmniBoundary:
 
 @dataclass(frozen=True, slots=True)
 class GeneratedSegment:
-    """Media/text segment returned by a generation backend.
+    """Media/text segment returned by a generation backend (ar or multimodal_gen).
 
     `commit_payload` may differ from the user-visible segment. U1 uses this to
     commit native pixel tensors back into SRT without re-encoding the PNG output.
@@ -243,7 +243,11 @@ class OmniResponse:
 
 
 class ContextOps(ABC):
-    """Narrow live-context capability exposed to generation backends."""
+    """Generic live-context view exposed to media generation backends.
+
+    This base surface is intentionally model-agnostic: it can describe an AR
+    session without requiring the media backend to share process memory with SRT.
+    """
 
     @property
     @abstractmethod
@@ -261,14 +265,23 @@ class ContextOps(ABC):
     def get_role(self, name: str, default: str) -> str: ...
 
     @abstractmethod
-    def get_model(self) -> Any: ...
-
-    @abstractmethod
     def get_position_count(
         self,
         *,
         condition_path_role: str | None = None,
     ) -> int | None: ...
+
+
+class ColocatedContextOps(ContextOps):
+    """Same-process context capability for backends that borrow SRT internals.
+
+    Colocated models such as U1 can read the live SRT model/session/KV state
+    during media generation. Standalone serving runtimes should depend only on
+    `ContextOps` and pass serializable context references instead.
+    """
+
+    @abstractmethod
+    def get_model(self) -> Any: ...
 
     @abstractmethod
     def run_temporary_forward(

@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.omni.core.protocol import (
+    ColocatedContextOps,
     ContextOps,
     GeneratedSegment,
     TemporaryForwardPrepared,
@@ -649,10 +650,15 @@ def _require_context(
     )
 
 
-def _require_context_ops(batch: Req) -> ContextOps:
+def _require_context_ops(batch: Req) -> ColocatedContextOps:
     context_ops = batch.omni_context_ops
     if context_ops is None:
         raise RuntimeError("SenseNova U1 pixel-flow requires batch.omni_context_ops")
+    if not isinstance(context_ops, ColocatedContextOps):
+        raise TypeError(
+            "SenseNova U1 pixel-flow requires colocated context ops because it "
+            "borrows the live SRT model and temporary KV slots during denoise"
+        )
     if context_ops.generation_kind != "pixel_flow":
         raise ValueError(
             "SenseNova U1 pixel-flow requires generation_kind='pixel_flow', got "
@@ -857,11 +863,11 @@ def _model_dtype(model: Any) -> Any:
     return next(model.parameters()).dtype
 
 
-def _require_model(context_ops: ContextOps) -> Any:
+def _require_model(context_ops: ColocatedContextOps) -> Any:
     return context_ops.get_model()
 
 
-def _require_temporary_forward_runner(context_ops: ContextOps) -> Any:
+def _require_temporary_forward_runner(context_ops: ColocatedContextOps) -> Any:
     return context_ops.run_temporary_forward
 
 

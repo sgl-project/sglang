@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Policy layer between model-specific AR/generation code and omni session runtime."""
+"""Model hooks between model-specific code and the omni session runtime."""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,8 +16,8 @@ from sglang.srt.omni_session.runtime_types import OmniSessionHandle
 
 
 @dataclass(frozen=True, slots=True)
-class OmniModelSessionView:
-    """Narrow SRT-owned session view exposed to omni model policies."""
+class OmniSessionModelView:
+    """Narrow SRT-owned session view exposed to omni session model hooks."""
 
     handle: OmniSessionHandle
     state: OmniSegmentState
@@ -29,50 +29,57 @@ class OmniModelSessionView:
 
 
 @dataclass(frozen=True, slots=True)
-class OmniModelPrefillResult:
+class OmniSessionPrefillResult:
     added_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
-class OmniModelAppendImageResult:
+class OmniSessionAppendImageResult:
     added_tokens: int
 
 
-class OmniModelPolicy:
-    """Base class for model-specific omni session policies.
+class OmniSessionModelHooks:
+    """Base class for model-specific hooks called by `OmniSessionRuntime`.
 
-    Subclasses implement the model-native prompt formatting and decode rules.
-    Most hooks receive only a narrow session view; runtime-aware hooks are
-    reserved for model rules that must run SRT decode or update condition paths.
-    `OmniSessionRuntime` owns mutable records and passes this view to keep model
-    code away from SRT session internals.
+    Hooks define model-specific AR session behavior:
+      - message-to-SRT prepared inputs
+      - prefill accounting
+      - next-segment decode
+      - VLM text decode
+      - generated media commit accounting
+      - ession close cleanup.
+
+    Different from the session adapter which owns request-level mode selection, these hooks only own token grammar and state patches for one model.
     """
 
     def prepare_srt_ar_message_inputs(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
+        """prepare one SRT input chunk for an appended non-text message"""
         return None
 
     def prepare_srt_ar_interleaved_inputs(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
+        """prepare SRT input chunks for a new user turn"""
         return None
 
     def on_prefill_finished(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         messages: list[OmniInterleavedMessage],
-    ) -> OmniModelPrefillResult:
-        return OmniModelPrefillResult(
+    ) -> OmniSessionPrefillResult:
+        """account for model-specific token growth after SRT prefill"""
+        return OmniSessionPrefillResult(
             added_tokens=max(
                 0,
                 int(session.srt_last_origin_input_len)
@@ -84,7 +91,7 @@ class OmniModelPolicy:
         self,
         *,
         runtime: OmniSessionRuntime,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         stream_sink: Any | None = None,
     ) -> OmniDecodeResult:
         """decode with live runtime access until the next text/media boundary"""
@@ -108,12 +115,12 @@ class OmniModelPolicy:
     def append_generated_image(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         image: Any | None,
-    ) -> OmniModelAppendImageResult:
-        """call back for committing a generated media after SRT has materialized it."""
+    ) -> OmniSessionAppendImageResult:
+        """account for model-specific token growth after generated media commit"""
 
-        return OmniModelAppendImageResult(
+        return OmniSessionAppendImageResult(
             added_tokens=max(
                 0,
                 int(session.srt_last_origin_input_len)
@@ -122,4 +129,5 @@ class OmniModelPolicy:
         )
 
     def close_session(self, *, session_id: str) -> None:
+        """release model-specific side state associated with a session id"""
         pass

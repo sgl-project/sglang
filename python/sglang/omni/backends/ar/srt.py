@@ -15,14 +15,14 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from sglang.omni.core.interleaved import (
-    INTERLEAVED_BOUNDARY_MODALITY_KEY,
+    GenerationBoundaryMetadata,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
     TEXT_ROLE_METADATA_KEY,
 )
 from sglang.omni.core.protocol import (
     ARBackend,
-    ContextOps,
+    ColocatedContextOps,
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,
@@ -53,7 +53,7 @@ class _VLMBackendContext:
 
 
 @dataclass(slots=True)
-class SRTBackedContextOps(ContextOps):
+class SRTBackedContextOps(ColocatedContextOps):
     """Expose live SRT context operations to a colocated generation backend."""
 
     session_adapter: SRTBackedOmniSessionAdapter
@@ -204,7 +204,7 @@ class SRTARBackend(ARBackend):
             request.metadata.get("finish_turn_after_generation")
             and request.max_text_segments == 0
         ):
-            # 1. only force-close when the caller explicitly disables post-image AR
+            # only force-close when the caller explicitly disables post-image AR
             self.session_adapter.finish_generated_segment_turn(
                 contexts=_srt_backend_context(context)
             )
@@ -294,8 +294,11 @@ def _record_generation_boundary(
 ) -> OmniBoundary:
     if boundary.type not in {"image", "audio", "video"}:
         return boundary
-    metadata = dict(boundary.metadata)
-    metadata.setdefault(INTERLEAVED_BOUNDARY_MODALITY_KEY, boundary.type)
+    boundary_metadata = GenerationBoundaryMetadata.from_metadata(
+        boundary.metadata,
+        default_modality=boundary.type,
+    )
+    metadata = boundary_metadata.to_metadata()
     context.metadata[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = metadata
     backend_context = context.backend_context
     if isinstance(backend_context, SRTOmniContextBundle):

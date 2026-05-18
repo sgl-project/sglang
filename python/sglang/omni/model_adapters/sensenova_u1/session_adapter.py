@@ -13,22 +13,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sglang.omni.core.interleaved import (
+    GenerationBoundaryMetadata,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
     TEXT_ROLE_METADATA_KEY,
     TEXT_ROLE_THINK,
     ar_appended_token_positions,
     ar_output_position,
-    build_generation_boundary_metadata,
     get_ar_decode_input_position,
     get_ar_next_output_position,
 )
 from sglang.omni.core.protocol import GeneratedSegment
-from sglang.omni.model_adapters.model_policy import (
-    OmniModelAppendImageResult,
-    OmniModelPolicy,
-    OmniModelPrefillResult,
-    OmniModelSessionView,
+from sglang.omni.model_adapters.session_model_hooks import (
+    OmniSessionAppendImageResult,
+    OmniSessionPrefillResult,
+    OmniSessionModelView,
+    OmniSessionModelHooks,
 )
 from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
@@ -108,7 +108,7 @@ def build_sensenova_u1_srt_session_adapter(
     session_controller = srt_request_executor.session_controller
     tokenizer = scheduler.tokenizer
     runtime = OmniSessionRuntime(
-        model_policy=U1OmniSessionModelPolicy(native_tokenizer=tokenizer),
+        model_hooks=U1OmniSessionModelHooks(native_tokenizer=tokenizer),
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
         tokenizer=tokenizer,
@@ -147,11 +147,12 @@ def _u1_text_looks_like_planning(text: str) -> bool:
     return any(phrase in normalized[:512] for phrase in planning_phrases)
 
 
-class U1OmniSessionModelPolicy(OmniModelPolicy):
-    """SenseNova U1 policy shell for SRT-owned omni sessions.
+class U1OmniSessionModelHooks(OmniSessionModelHooks):
+    """SenseNova U1 model hooks for SRT-owned omni sessions.
 
-    U1 uses pixel-flow generation mechanics; image-generation math stays in the
-    generation backend while this policy owns token grammar and session commits.
+    These hooks define how U1 maps omni session actions to tokens, embeddings,
+    position ids, boundary detection, hidden-thinking roles, and model-state
+    patches. Request-level mode selection stays in `SenseNovaU1SessionAdapter`.
     """
 
     generation_kind: str = "pixel_flow"
@@ -183,7 +184,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
     def prepare_srt_ar_interleaved_inputs(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
@@ -274,7 +275,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
     def prepare_srt_ar_message_inputs(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
@@ -296,10 +297,10 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
     def on_prefill_finished(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         messages: list[OmniInterleavedMessage],
-    ) -> OmniModelPrefillResult:
-        return OmniModelPrefillResult(
+    ) -> OmniSessionPrefillResult:
+        return OmniSessionPrefillResult(
             added_tokens=self._added_tokens_from_srt_session_view(session)
         )
 
@@ -307,7 +308,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         self,
         *,
         runtime: OmniSessionRuntime,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         stream_sink: OmniStreamSink | None = None,
     ) -> OmniDecodeResult:
         u1_state = (session.metadata or {}).get("omni_model_state", {}).get("u1", {})
@@ -373,13 +374,9 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         # 2. keep it in session state because image generation can reset adapter temps
         inside_interleave_think = bool(
             u1_state.get("interleave_think_mode")
-        ) and not bool(
-            u1_state.get("interleave_thinking_done")
-        )
+        ) and not bool(u1_state.get("interleave_thinking_done"))
         # guarded_post_think_text is U1 final-answer text that may still leak planning
-        guarded_post_think_text = bool(
-            u1_state.get("interleave_think_mode")
-        ) and bool(
+        guarded_post_think_text = bool(u1_state.get("interleave_think_mode")) and bool(
             u1_state.get("interleave_thinking_done")
         )
         stream_text_deltas = stream_sink is not None and not guarded_post_think_text
@@ -446,7 +443,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             # 3. the sampled token is committed later at the next logical position
             output_position = ar_output_position(decode_input_position)
             if self.is_image_generation_boundary_token(token_id):
-                boundary_metadata = build_generation_boundary_metadata(
+                boundary_metadata = GenerationBoundaryMetadata(
                     modality="image",
                     token_id=token_id,
                     position_id=output_position,
@@ -486,7 +483,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     )
                 return OmniDecodeResult(
                     type="image_marker",
-                    metadata=boundary_metadata,
+                    metadata=boundary_metadata.to_metadata(),
                 )
             if token_id in eos_token_ids:
                 self._merge_runtime_u1_state(
@@ -769,17 +766,17 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
     def append_generated_image(
         self,
         *,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
         image: Any | None,
-    ) -> OmniModelAppendImageResult:
-        return OmniModelAppendImageResult(
+    ) -> OmniSessionAppendImageResult:
+        return OmniSessionAppendImageResult(
             added_tokens=self._added_tokens_from_srt_session_view(session)
         )
 
     def close_session(self, *, session_id: str) -> None:
         return None
 
-    def _has_generated_image_commit(self, session: OmniModelSessionView) -> bool:
+    def _has_generated_image_commit(self, session: OmniSessionModelView) -> bool:
         model_state = (session.metadata or {}).get("omni_model_state") or {}
         u1_state = model_state.get("u1") or {}
         if bool(u1_state.get("last_generated_image_commit")):
@@ -791,7 +788,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
 
     def _added_tokens_from_srt_session_view(
         self,
-        session: OmniModelSessionView,
+        session: OmniSessionModelView,
     ) -> int:
         previous_length = int(session.handle.context_length or 0)
         srt_length = int(session.srt_last_origin_input_len or 0)
@@ -801,7 +798,12 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
 
 
 class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
-    """Pixel-flow U1 session adapter backed by the common SRT omni session runtime."""
+    """U1 request-level facade over the generic SRT omni session runtime.
+
+    The adapter chooses mode, think behavior, CFG condition paths, and generated
+    image commit behavior. It delegates generic session lifecycle to
+    `OmniSessionRuntime`, whose `U1OmniSessionModelHooks` define token grammar.
+    """
 
     generation_kind: str = "pixel_flow"
     condition_path_roles = {
@@ -817,16 +819,15 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
         *,
         max_pre_image_decode_steps: int = 8192,
     ) -> None:
-        self.runtime = runtime
-        self._session_adapter = SRTBackedOmniSessionAdapter(
+        super().__init__(
             runtime,
             max_pre_image_decode_steps=max_pre_image_decode_steps,
         )
 
-    def _u1_policy(self) -> U1OmniSessionModelPolicy | None:
-        policy = self.runtime.model_policy
-        if isinstance(policy, U1OmniSessionModelPolicy):
-            return policy
+    def _u1_hooks(self) -> U1OmniSessionModelHooks | None:
+        hooks = self.runtime.model_hooks
+        if isinstance(hooks, U1OmniSessionModelHooks):
+            return hooks
         return None
 
     def prefill_and_decode_to_image_boundary(
@@ -860,7 +861,7 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
                 session_adapter_think_max_new_tokens = (
                     DEFAULT_U1_IMAGE_THINK_MAX_NEW_TOKENS
                 )
-            contexts = self._session_adapter.prefill_and_decode_to_image_boundary(
+            contexts = super().prefill_and_decode_to_image_boundary(
                 messages=messages,
                 think=session_adapter_think,
                 think_max_new_tokens=session_adapter_think_max_new_tokens,
@@ -877,15 +878,15 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
         *,
         think: bool,
     ):
-        policy = self._u1_policy()
+        hooks = self._u1_hooks()
         mode = None if sampling_params is None else sampling_params.omni_generation_mode
-        if policy is not None:
-            old_cfg = policy.include_t2i_cfg_uncondition
-            old_interleave_text_uncondition = policy.include_interleave_text_uncondition
-            old_edit_img_condition = policy.include_edit_img_condition
-            old_edit_uncondition = policy.include_edit_uncondition
-            old_mode = policy.native_generation_mode
-            old_interleave_think_mode = policy.native_interleave_think_mode
+        if hooks is not None:
+            old_cfg = hooks.include_t2i_cfg_uncondition
+            old_interleave_text_uncondition = hooks.include_interleave_text_uncondition
+            old_edit_img_condition = hooks.include_edit_img_condition
+            old_edit_uncondition = hooks.include_edit_uncondition
+            old_mode = hooks.native_generation_mode
+            old_interleave_think_mode = hooks.native_interleave_think_mode
             needs_cfg = _u1_needs_any_cfg(sampling_params)
             cfg_text_scale = (
                 1.0
@@ -895,35 +896,35 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
             cfg_img_scale = (
                 1.0 if sampling_params is None else float(sampling_params.cfg_img_scale)
             )
-            policy.include_t2i_cfg_uncondition = (
+            hooks.include_t2i_cfg_uncondition = (
                 _u1_needs_text_cfg(sampling_params)
                 and mode not in {"edit", "interleave"}
             ) or (mode == "interleave" and cfg_img_scale != 1.0)
-            policy.include_interleave_text_uncondition = (
+            hooks.include_interleave_text_uncondition = (
                 mode == "interleave" and _u1_needs_text_cfg(sampling_params)
             )
-            policy.include_edit_img_condition = (
+            hooks.include_edit_img_condition = (
                 mode == "edit"
                 and needs_cfg
                 and (cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale)
             )
-            policy.include_edit_uncondition = (
+            hooks.include_edit_uncondition = (
                 mode == "edit" and needs_cfg and cfg_img_scale != 1.0
             )
-            policy.native_generation_mode = mode
-            policy.native_interleave_think_mode = bool(think)
+            hooks.native_generation_mode = mode
+            hooks.native_interleave_think_mode = bool(think)
         try:
             yield
         finally:
-            if policy is not None:
-                policy.include_t2i_cfg_uncondition = old_cfg
-                policy.include_interleave_text_uncondition = (
+            if hooks is not None:
+                hooks.include_t2i_cfg_uncondition = old_cfg
+                hooks.include_interleave_text_uncondition = (
                     old_interleave_text_uncondition
                 )
-                policy.include_edit_img_condition = old_edit_img_condition
-                policy.include_edit_uncondition = old_edit_uncondition
-                policy.native_generation_mode = old_mode
-                policy.native_interleave_think_mode = old_interleave_think_mode
+                hooks.include_edit_img_condition = old_edit_img_condition
+                hooks.include_edit_uncondition = old_edit_uncondition
+                hooks.native_generation_mode = old_mode
+                hooks.native_interleave_think_mode = old_interleave_think_mode
 
     def commit_generated_segment(
         self,
@@ -931,7 +932,7 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
         contexts: OmniContextBundle,
         segment: GeneratedSegment,
     ) -> None:
-        self._session_adapter.commit_generated_segment(
+        super().commit_generated_segment(
             contexts=contexts,
             segment=segment,
         )
@@ -946,8 +947,8 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
         contexts: OmniContextBundle,
     ) -> None:
         """close a persistent U1 assistant turn after generated image commit"""
-        policy = self._u1_policy()
-        tokenizer = None if policy is None else policy.native_tokenizer
+        hooks = self._u1_hooks()
+        tokenizer = None if hooks is None else hooks.native_tokenizer
         if tokenizer is None or contexts.full.session is None:
             return
         u1_state = self.runtime.get_model_state(
@@ -982,28 +983,14 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
         contexts.text_cfg.session = session
         contexts.image_cfg.session = session
 
-    def release(self, contexts: OmniContextBundle) -> None:
-        self._session_adapter.release(contexts)
-
-    def continue_ar_decode(
-        self,
-        *,
-        contexts: OmniContextBundle,
-        stream_sink: OmniStreamSink | None = None,
-    ) -> OmniDecodeResult:
-        return self._session_adapter.continue_ar_decode(
-            contexts=contexts,
-            stream_sink=stream_sink,
-        )
-
     def _commit_interleave_text_uncondition_path(
         self,
         *,
         contexts: OmniContextBundle,
         segment: GeneratedSegment,
     ) -> None:
-        policy = self._u1_policy()
-        tokenizer = None if policy is None else policy.native_tokenizer
+        hooks = self._u1_hooks()
+        tokenizer = None if hooks is None else hooks.native_tokenizer
         if tokenizer is None or contexts.full.session is None:
             return
         image = segment.commit_image
@@ -1036,16 +1023,4 @@ class SenseNovaU1SessionAdapter(SRTBackedOmniSessionAdapter):
             contexts.full.session,
             prepared,
             state=OmniSegmentState.APPEND_IMAGE,
-        )
-
-    def generate_vlm_answer(
-        self,
-        *,
-        messages: list[OmniInterleavedMessage | dict[str, Any]],
-        max_new_tokens: int,
-    ) -> OmniVLMTextGenerationResult:
-        """delegate U1 VLM QA to the SRT-backed adapter"""
-        return self._session_adapter.generate_vlm_answer(
-            messages=messages,
-            max_new_tokens=max_new_tokens,
         )

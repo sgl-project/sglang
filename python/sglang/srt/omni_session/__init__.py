@@ -12,7 +12,12 @@ Layering:
 ARBackend: Autoregressive text/session backend used by omni coordinator
   -> SRTBackedOmniSessionAdapter: concrete translator from generic omni AR semantics into SRT session operations
     -> OmniSessionRuntime
-         - model_policy: `sglang.omni.model_adapters` contract for model-specific prompt/decode/accounting rules
+         - model_hooks: model-specific prompt/decode/accounting hooks
          - OmniSRTSchedulerExecutor: concrete SRT scheduler execution owned by the runtime
             -> SRT scheduler
+
+Session adapters own request-level choices such as mode, think flag, condition
+paths, and generated-media commit policy. Model hooks own token grammar and the
+small callbacks that turn those choices into SRT prepared inputs, segment
+boundaries, VLM decode, and model-state patches.
 """

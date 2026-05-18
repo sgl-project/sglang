@@ -3,7 +3,7 @@
 
 The runtime is below the generic omni coordinator. It materializes model-
 specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
-KV bindings, and owns the scheduler executor used by runtime-aware policy hooks.
+KV bindings, and owns the scheduler executor used by runtime-aware model hooks.
 """
 
 import uuid
@@ -27,9 +27,9 @@ from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
     from sglang.omni.entrypoints.streaming import OmniStreamSink
-    from sglang.omni.model_adapters.model_policy import (
-        OmniModelPolicy,
-        OmniModelSessionView,
+    from sglang.omni.model_adapters.session_model_hooks import (
+        OmniSessionModelHooks,
+        OmniSessionModelView,
     )
 
 
@@ -161,18 +161,18 @@ class OmniSessionRecord:
 
 
 class OmniSessionRuntime:
-    """Lightweight omni state machine layered on top of SRT sessions.
+    """Generic SRT session state machine used by model-specific session adapters.
 
-    The runtime owns session state, asks `model_policy` for model-specific
+    The runtime owns session state, asks `model_hooks` for model-specific
     prompt/decode rules, and owns the SRT scheduler executor that runs concrete
-    SRT `Req` objects. Most policy hooks receive only a session view; hooks that
-    need live SRT decode or condition-path mutation receive this runtime.
+    SRT `Req` objects. Session adapters select request-level mode/options;
+    hooks define token grammar and state patches for one model.
     """
 
     def __init__(
         self,
         *,
-        model_policy: "OmniModelPolicy",
+        model_hooks: "OmniSessionModelHooks",
         session_controller: SessionController | None = None,
         srt_request_executor: OmniSRTSchedulerExecutor | None = None,
         capacity_of_str_len: int = 4096,
@@ -180,7 +180,7 @@ class OmniSessionRuntime:
         vocab_size: int = 32000,
         srt_ar_decode_max_new_tokens: int = 0,
     ) -> None:
-        self.model_policy: "OmniModelPolicy" = model_policy
+        self.model_hooks: "OmniSessionModelHooks" = model_hooks
         self.session_controller = session_controller
         self.srt_request_executor = srt_request_executor
         self.capacity_of_str_len = capacity_of_str_len
@@ -202,10 +202,12 @@ class OmniSessionRuntime:
             messages.append(OmniInterleavedMessage(type="text", content=prompt_text))
         return messages
 
-    def _model_session_view(self, record: OmniSessionRecord) -> "OmniModelSessionView":
-        from sglang.omni.model_adapters.model_policy import OmniModelSessionView
+    def _model_session_view(self, record: OmniSessionRecord) -> "OmniSessionModelView":
+        from sglang.omni.model_adapters.session_model_hooks import (
+            OmniSessionModelView,
+        )
 
-        return OmniModelSessionView(
+        return OmniSessionModelView(
             handle=record.handle(),
             state=record.state,
             srt_request_count=record.srt_request_count,
@@ -264,7 +266,7 @@ class OmniSessionRuntime:
             messages,
             request_id=next_anchor_request_id,
         )
-        prefill_result = self.model_policy.on_prefill_finished(
+        prefill_result = self.model_hooks.on_prefill_finished(
             session=self._model_session_view(record), messages=messages
         )
         record.context_length += prefill_result.added_tokens
@@ -279,14 +281,14 @@ class OmniSessionRuntime:
         *,
         stream_sink: "OmniStreamSink | None" = None,
     ) -> OmniDecodeResult:
-        """advance an AR session until model policy returns the next segment boundary"""
+        """advance an AR session until model hooks return the next segment boundary"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
                 f"Cannot decode AR segment from state {record.state} "
                 f"for omni session {handle.session_id}"
             )
-        result = self.model_policy.decode_next_segment_with_runtime(
+        result = self.model_hooks.decode_next_segment_with_runtime(
             runtime=self,
             session=self._model_session_view(record),
             stream_sink=stream_sink,
@@ -484,8 +486,8 @@ class OmniSessionRuntime:
             [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
         )
-        # 2. model policy accounts for model-specific context growth after SRT commit
-        append_result = self.model_policy.append_generated_image(
+        # 2. model hooks account for model-specific context growth after SRT commit
+        append_result = self.model_hooks.append_generated_image(
             session=self._model_session_view(record), image=image
         )
         record.context_length += append_result.added_tokens
@@ -507,7 +509,7 @@ class OmniSessionRuntime:
             condition_path_session_ids = set(record.condition_path_session_ids)
         else:
             condition_path_session_ids = set()
-        self.model_policy.close_session(session_id=session_id)
+        self.model_hooks.close_session(session_id=session_id)
         self._close_srt_session(session_id)
         for condition_path_session_id in sorted(condition_path_session_ids):
             self._close_srt_session(condition_path_session_id)
@@ -654,7 +656,7 @@ class OmniSessionRuntime:
             return
 
         # prepare inputs for ar
-        prepared_inputs = self._prepare_srt_ar_inputs(
+        prepared_inputs: list[OmniSRTPreparedInput] = self._prepare_srt_ar_inputs(
             record,
             messages,
             state=record.state,
@@ -798,10 +800,11 @@ class OmniSessionRuntime:
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput]:
         """
+        Convert message in an OmniRequest to OmniSRTPreparedInput (format recognized in OmniSRT runtime)
         image -> [IMG_START?] + IMG_CONTEXT_TOKEN * N + [IMG_END]
         """
         session_view = self._model_session_view(record)
-        custom_inputs = self.model_policy.prepare_srt_ar_interleaved_inputs(
+        custom_inputs = self.model_hooks.prepare_srt_ar_interleaved_inputs(
             session=session_view, messages=messages, state=state
         )
         if custom_inputs is not None:
@@ -809,15 +812,16 @@ class OmniSessionRuntime:
 
         prepared_inputs: list[OmniSRTPreparedInput] = []
         for message in messages:
-            custom = self.model_policy.prepare_srt_ar_message_inputs(
+            # OmniRequest -> OmniSRTPreparedInput
+            custom_input = self.model_hooks.prepare_srt_ar_message_inputs(
                 session=session_view, message=message, state=state
             )
-            if custom is None:
+            if custom_input is None:
                 raise RuntimeError(
-                    f"{self.model_policy.__class__.__name__} did not prepare omni "
+                    f"{self.model_hooks.__class__.__name__} did not prepare omni "
                     f"SRT input for message type {message.type!r}"
                 )
-            prepared_inputs.extend(custom)
+            prepared_inputs.extend(custom_input)
         if not prepared_inputs:
             raise RuntimeError("omni SRT prepared inputs must not be empty")
         return prepared_inputs

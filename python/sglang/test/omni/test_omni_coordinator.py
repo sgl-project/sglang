@@ -29,14 +29,8 @@ class _InMemoryContextOps:
     def get_role(self, name: str, default: str):
         return default
 
-    def get_model(self):
-        return None
-
     def get_position_count(self, *, condition_path_role: str | None = None):
         return 0
-
-    def run_temporary_forward(self, *, prepared, forward):
-        raise RuntimeError("no temporary forward backend")
 
 
 class _ScriptedARBackend:

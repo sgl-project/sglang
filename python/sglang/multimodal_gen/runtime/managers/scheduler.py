@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import concurrent.futures
 import dataclasses
 import os
 import pickle
@@ -45,6 +46,7 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
@@ -150,6 +152,10 @@ class Scheduler(SchedulerDisaggMixin):
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
+        self._input_prefetch_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            None
+        )
+        self._input_prefetch_futures: dict[int, concurrent.futures.Future] = {}
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -275,6 +281,102 @@ class Scheduler(SchedulerDisaggMixin):
         if len(reqs) > 1:
             return [self._dispatch_single_request(req) for req in reqs]
         return self._dispatch_single_request(reqs[0])
+
+    @staticmethod
+    def _iter_generation_reqs(req_or_group: Any):
+        if isinstance(req_or_group, Req):
+            yield req_or_group
+        elif isinstance(req_or_group, list):
+            for req in req_or_group:
+                if isinstance(req, Req):
+                    yield req
+
+    @staticmethod
+    def _load_condition_images_for_prefetch(image_path):
+        if isinstance(image_path, list):
+            condition_images = [
+                load_video(path)[0] if path.endswith(".mp4") else load_image(path)
+                for path in image_path
+            ]
+            first_image = condition_images[0]
+            return condition_images, (first_image.width, first_image.height)
+
+        image = (
+            load_video(image_path)[0]
+            if image_path.endswith(".mp4")
+            else load_image(image_path)
+        )
+        return image, image.size
+
+    def _should_prefetch_input(self, req: Req) -> bool:
+        return (
+            not req.is_warmup
+            and req.image_path is not None
+            and req.condition_image is None
+            and id(req) not in self._input_prefetch_futures
+        )
+
+    def _get_input_prefetch_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        if self._input_prefetch_executor is None:
+            self._input_prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="sgl-diffusion-input-prefetch",
+            )
+        return self._input_prefetch_executor
+
+    def _start_input_prefetch_for_waiting_queue(self) -> None:
+        for _identity, req_or_group, _enqueue_ts in self.waiting_queue:
+            for req in self._iter_generation_reqs(req_or_group):
+                if not self._should_prefetch_input(req):
+                    continue
+                self._input_prefetch_futures[id(req)] = (
+                    self._get_input_prefetch_executor().submit(
+                        self._load_condition_images_for_prefetch, req.image_path
+                    )
+                )
+
+    def _apply_completed_input_prefetch(self, req: Req) -> None:
+        future = self._input_prefetch_futures.get(id(req))
+        if future is None or not future.done():
+            return
+
+        self._input_prefetch_futures.pop(id(req), None)
+        if req.condition_image is not None:
+            return
+
+        try:
+            condition_image, original_size = future.result()
+        except Exception as e:
+            logger.debug(
+                "Input prefetch failed for request %s; falling back to stage load: %s",
+                req.request_id,
+                e,
+            )
+            return
+
+        req.condition_image = condition_image
+        req.original_condition_image_size = original_size
+        req.extra["_input_prefetch_condition_image"] = True
+
+    def _apply_completed_input_prefetch_to_items(
+        self, items: list[tuple[bytes | None, Any]]
+    ) -> None:
+        for _identity, req_or_group in items:
+            for req in self._iter_generation_reqs(req_or_group):
+                future = self._input_prefetch_futures.get(id(req))
+                if future is not None and not future.done():
+                    future.cancel()
+                    self._input_prefetch_futures.pop(id(req), None)
+                    continue
+                self._apply_completed_input_prefetch(req)
+
+    def _shutdown_input_prefetch(self) -> None:
+        for future in self._input_prefetch_futures.values():
+            future.cancel()
+        self._input_prefetch_futures.clear()
+        if self._input_prefetch_executor is not None:
+            self._input_prefetch_executor.shutdown(wait=False, cancel_futures=True)
+            self._input_prefetch_executor = None
 
     def _log_warmup_result(self, output_batch: OutputBatch, is_warmup: bool) -> None:
         if not is_warmup:
@@ -1149,6 +1251,7 @@ class Scheduler(SchedulerDisaggMixin):
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                self._start_input_prefetch_for_waiting_queue()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
@@ -1158,6 +1261,9 @@ class Scheduler(SchedulerDisaggMixin):
                     elif remaining_ms > 0:
                         time.sleep(remaining_ms / 1000.0)
                 continue
+
+            self._apply_completed_input_prefetch_to_items(items)
+            self._start_input_prefetch_for_waiting_queue()
 
             try:
                 handler_result = self._dispatch_items(items)
@@ -1204,6 +1310,7 @@ class Scheduler(SchedulerDisaggMixin):
                 continue
 
         self._log_batch_metrics_summary()
+        self._shutdown_input_prefetch()
 
         if self.receiver is not None:
             self.receiver.close()
