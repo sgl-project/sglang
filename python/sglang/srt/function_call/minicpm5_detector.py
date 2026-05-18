@@ -61,7 +61,7 @@ def parse_arguments(json_value):
         return json_value, False
 
 
-class MiniCPM4XmlFormatDetector(BaseFormatDetector):
+class MiniCPM5Detector(BaseFormatDetector):
     """
     Detector for MiniCPM-4 models (V3 schema) adapted to the new chat template.
 

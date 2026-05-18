@@ -1,8 +1,8 @@
 import json
 import pytest
 
-from sglang.srt.function_call.minicpm4_xml_detector import (
-    MiniCPM4XmlFormatDetector,
+from sglang.srt.function_call.minicpm5_detector import (
+    MiniCPM5Detector,
 )
 from sglang.srt.entrypoints.openai.protocol import Tool, Function
 
@@ -76,7 +76,7 @@ def make_tools_no_required():
 
 
 def test_detect_and_parse_single_call_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         "Intro before.\n"
@@ -96,7 +96,7 @@ def test_detect_and_parse_single_call_v3():
 
 
 def test_detect_and_parse_cdata_multiline_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -112,7 +112,7 @@ def test_detect_and_parse_cdata_multiline_v3():
 
 
 def test_unknown_tool_block_preserved_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="unknown">'
@@ -125,7 +125,7 @@ def test_unknown_tool_block_preserved_v3():
 
 
 def test_non_string_types_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_sum()
     text = (
         '<function name="sum_values">'
@@ -141,7 +141,7 @@ def test_non_string_types_v3():
 
 
 def test_multiple_calls_interleaved_text_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather() + make_tools_sum()
     text = (
         "Head\n"
@@ -162,7 +162,7 @@ def test_multiple_calls_interleaved_text_v3():
 
 
 def test_incomplete_missing_function_end_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -174,7 +174,7 @@ def test_incomplete_missing_function_end_v3():
 
 
 def test_param_missing_name_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -188,7 +188,7 @@ def test_param_missing_name_invalid_v3():
 
 
 def test_duplicate_param_names_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -201,7 +201,7 @@ def test_duplicate_param_names_invalid_v3():
 
 
 def test_case_sensitive_param_name_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -213,7 +213,7 @@ def test_case_sensitive_param_name_invalid_v3():
 
 
 def test_no_required_and_zero_param_valid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_no_required()
     text = '<function name="noop"></function>\n'
     res = detector.detect_and_parse(text, tools)
@@ -223,7 +223,7 @@ def test_no_required_and_zero_param_valid_v3():
 
 
 def test_streaming_increment_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     c1 = "Hello\n<function name=\"get_weather\">\n  <param name=\"city\">"
     c2 = "北京</param>\n  <param name=\"date\">2024-06-27</param>\n</function>\n"
