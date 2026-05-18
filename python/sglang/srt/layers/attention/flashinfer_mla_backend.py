@@ -22,8 +22,8 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.utils import update_kv_lens_and_indices
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils.dcp_utils import update_kv_lens_and_indices
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
