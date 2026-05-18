@@ -23,6 +23,7 @@ breaks are inserted eagerly via :func:`eager_on_graph` decorated callables
 from __future__ import annotations
 
 import bisect
+import inspect
 import logging
 from typing import TYPE_CHECKING, Union
 
@@ -35,10 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.dp_attention import (
-    set_dp_buffer_len,
-    set_is_extend_in_batch,
-)
+from sglang.srt.layers.dp_attention import set_dp_buffer_len, set_is_extend_in_batch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
@@ -52,9 +50,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
     set_global_graph_memory_pool,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     freeze_gc,
@@ -133,6 +129,9 @@ class BreakableCudaGraphRunner:
                 type(language_model).__name__,
             )
             return
+        self.layer_forward_accepts_input_embeds = (
+            "input_embeds" in inspect.signature(self.layer_model.forward).parameters
+        )
 
         # Memory pool
         if get_global_graph_memory_pool() is None:
@@ -146,6 +145,20 @@ class BreakableCudaGraphRunner:
         self._capture_all()
 
         self.raw_num_tokens = 0
+
+    def _has_inactive_dp_rank(self, forward_batch: "ForwardBatch") -> bool:
+        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        if global_num_tokens is None:
+            return False
+
+        if hasattr(global_num_tokens, "tolist"):
+            global_num_tokens = global_num_tokens.tolist()
+        # DSV4 DP attention / DeepEP collectives need every DP rank to enter
+        # the same replay path. Sparse-DP batches fall back to eager to avoid
+        # hanging ranks that have zero local tokens.
+        return len(global_num_tokens) > 1 and any(
+            int(num_tokens) == 0 for num_tokens in global_num_tokens
+        )
 
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
@@ -161,7 +174,7 @@ class BreakableCudaGraphRunner:
                 dtype=torch.int64 if not is_npu() else torch.int32,
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -217,11 +230,19 @@ class BreakableCudaGraphRunner:
             self.moe_layers,
             self.moe_fusions,
         ):
-            output = self.layer_model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
+            if self.layer_forward_accepts_input_embeds:
+                output = self.layer_model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    input_embeds=forward_batch.input_embeds,
+                )
+            else:
+                output = self.layer_model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
         return output
 
     def _build_capture_forward_batch(self, num_tokens):
@@ -344,6 +365,14 @@ class BreakableCudaGraphRunner:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
+            return False
+        if self._has_inactive_dp_rank(forward_batch):
+            return False
+        if getattr(
+            forward_batch, "global_num_tokens_cpu", None
+        ) is not None and not getattr(
+            forward_batch, "can_run_dp_piecewise_cuda_graph", False
+        ):
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:

@@ -25,6 +25,11 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
@@ -67,6 +72,12 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -77,12 +88,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    log_info_on_rank0,
-    make_layers,
-)
+from sglang.srt.utils import LazyValue, add_prefix, log_info_on_rank0, make_layers
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -91,12 +98,72 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def deepseek_v4_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    query = query[:real_num_tokens]
+    key_value = key_value[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_out_cache_loc_swa is not None:
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
+        if hasattr(token_to_kv_pool, "set_swa_loc"):
+            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+
+    try:
+        ret = forward_batch.attn_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+        if original_out_cache_loc_swa is not None and hasattr(
+            token_to_kv_pool, "set_swa_loc"
+        ):
+            token_to_kv_pool.set_swa_loc(original_swa_loc)
+
+    assert (
+        output[:real_num_tokens].numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    return
+
+
+bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_attention_with_output
+)
 
 
 @triton.jit
@@ -563,17 +630,40 @@ class MQALayer(nn.Module):
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
+        attn_q = q_padded if q_padded is not None else q
         attn_k = kv if kv is not None else q
-        o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
-            k=attn_k,
-            v=attn_k,
-            layer=self.attn_mqa,
-            forward_batch=forward_batch,
-            compress_ratio=self.compress_ratio,
-            attn_sink=self.attn_sink,
-            save_kv_cache=False,
-        )
+        save_kv_cache = False
+        if forward_batch.forward_mode.is_extend() and (
+            is_in_breakable_cuda_graph() or is_in_piecewise_cuda_graph()
+        ):
+            o = attn_q.new_empty(
+                (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+            )
+            attn_fn = (
+                bcg_deepseek_v4_attention_with_output
+                if is_in_breakable_cuda_graph()
+                else deepseek_v4_attention_with_output
+            )
+            attn_fn(
+                attn_q,
+                attn_k,
+                o,
+                self.attn_mqa.layer_id,
+                self.compress_ratio,
+                self.attn_sink,
+                save_kv_cache,
+            )
+        else:
+            o = attn_backend.forward(
+                q=attn_q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=save_kv_cache,
+            )
         o = o[:, tp_slice, :]
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
