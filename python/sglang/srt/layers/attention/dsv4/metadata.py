@@ -128,7 +128,9 @@ class PagedIndexerMetadata:
 
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not (
+            is_cpu() and cpu_has_amx_support()
+        ):
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))

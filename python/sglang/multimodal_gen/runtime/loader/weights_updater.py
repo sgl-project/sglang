@@ -53,7 +53,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -114,7 +116,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     update_cpu_weights(); non-offloaded parameters use in-place copy.
     """
     offload_managers: list = []
-    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+    if is_layerwise_offloaded_module(module):
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
 
     if offload_managers:
