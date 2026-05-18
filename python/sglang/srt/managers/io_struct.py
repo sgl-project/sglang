@@ -1528,6 +1528,25 @@ class UpdateWeightsFromIPCReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromWPIReqInput(BaseReq):
+    update_info: Dict[str, Any]
+    buffer_id: Optional[str] = "slime-weights"
+    buffer_size: Optional[int] = 20 * 1024**3
+    socket_dir: Optional[str] = "/run/wpi/sockets"
+    driver_port: Optional[int] = 50051
+    flush_cache: bool = True
+    torch_empty_cache: bool = False
+    prepare_only: bool = False
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromWPIReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str

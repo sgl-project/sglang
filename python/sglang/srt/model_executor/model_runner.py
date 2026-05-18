@@ -3402,6 +3402,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
+    def update_weights_from_wpi(self, recv_req):
+        """Update weights from WPI."""
+        try:
+            from sglang.srt.checkpoint_engine.wpi_worker import (
+                SGLangWPIWorkerExtension,
+            )
+
+            if not hasattr(self, "_wpi_worker"):
+                self._wpi_worker = SGLangWPIWorkerExtension(self)
+                buffer_id = getattr(recv_req, "buffer_id", "slime-weights")
+                buffer_size = getattr(recv_req, "buffer_size", 20 * 1024**3)
+                socket_dir = getattr(recv_req, "socket_dir", "/run/wpi/sockets")
+                driver_port = getattr(recv_req, "driver_port", 50051)
+                
+                self._wpi_worker.init_wpi(buffer_id, buffer_size, socket_dir, driver_port)
+                
+            if getattr(recv_req, "prepare_only", False):
+                return True, "WPI prepared successfully"
+                
+            self._wpi_worker.update_weights_from_wpi(recv_req.update_info)
+            return True, "WPI weight update completed successfully"
+        except Exception as e:
+            logger.error(f"WPI weight update failed: {e}")
+            return False, str(e)
+
     def prealloc_symmetric_memory_pool(self):
         # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
         if (

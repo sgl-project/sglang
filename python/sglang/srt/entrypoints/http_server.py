@@ -138,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromWPIReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -1217,6 +1218,21 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     if success:
         if _global_state.tokenizer_manager.initial_weights_loaded is False:
             _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_wpi")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_wpi(obj: UpdateWeightsFromWPIReqInput, request: Request):
+    """Update the weights from WPI."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_wpi(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    if success:
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)

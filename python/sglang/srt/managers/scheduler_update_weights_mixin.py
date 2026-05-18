@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromWPIReqInput,
+    UpdateWeightsFromWPIReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -119,6 +121,24 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
+
+    def update_weights_from_wpi(
+        self: Scheduler, recv_req: UpdateWeightsFromWPIReqInput
+    ):
+        """Update the online model parameter from WPI."""
+        success, message = self.tp_worker.update_weights_from_wpi(recv_req)
+        tp_success = success
+        if success and self.draft_worker is not None:
+            success, message = self.draft_worker.update_weights_from_wpi(recv_req)
+        if tp_success and recv_req.flush_cache:
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
+            assert flush_cache_success, "Cache flush failed after updating weights"
+        if not success:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromWPIReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
