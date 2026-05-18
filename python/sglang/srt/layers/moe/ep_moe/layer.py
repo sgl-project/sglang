@@ -25,12 +25,6 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsFusedMoEMethod,
-)
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    NPUCompressedTensorsW4A16Int4DynamicMoE,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -47,9 +41,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _is_npu:
-    import torch_npu
 
 
 logger = logging.getLogger(__name__)
@@ -133,8 +124,13 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
+        # TODO: move this logic to process_weigths_after_loading, like:
+        # def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        #    if hasattr(layer, "dispatcher"):
+        #       layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
-            self.dispatcher.set_quant_config({"bf16_dispatch": True})
+            self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         if (
             self.deepep_mode.enable_low_latency()
@@ -338,17 +334,6 @@ class DeepEPMoE(FusedMoE):
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
-                input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
-                if not input_quant and not isinstance(
-                    self.quant_method,
-                    (
-                        NPUCompressedTensorsW4A16Int4DynamicMoE,
-                        CompressedTensorsFusedMoEMethod,
-                    ),
-                ):
-                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
-                        hidden_states
-                    )
                 hidden_states = self.quant_method.apply_without_routing_weights(
                     self,
                     hidden_states,
