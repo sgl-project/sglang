@@ -2040,6 +2040,11 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _get_req_pp_prefix_len_cap(self, req: Req) -> Optional[int]:
+        if self.pp_size <= 1 or not self.enable_hierarchical_cache:
+            return None
+        return req.pp_prefix_len_cap
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -2550,7 +2555,10 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache,
+                prefix_len_cap=self._get_req_pp_prefix_len_cap(req),
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

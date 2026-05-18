@@ -745,7 +745,8 @@ class SchedulerPPMixin:
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
+                pp_prefix_len_caps,
+            ) = self._pp_pd_unpack_bootstrapped_info(bootstrapped_rids)
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
@@ -753,9 +754,65 @@ class SchedulerPPMixin:
                     + bad_consensus_bootstrapped_rids,
                 )
             )
+            for req in good_reqs:
+                req.pp_prefix_len_cap = pp_prefix_len_caps.get(req.rid)
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                [req.rid for req in failed_reqs],
+                {
+                    req.rid: req.pp_prefix_len_cap
+                    for req in good_reqs
+                    if req.pp_prefix_len_cap is not None
+                },
+            ]
         return None
+
+    def _pp_pd_unpack_bootstrapped_info(self: Scheduler, bootstrapped_info):
+        if len(bootstrapped_info) == 2:
+            good_bootstrapped_rids, bad_bootstrapped_rids = bootstrapped_info
+            pp_prefix_len_caps = {}
+        else:
+            (
+                good_bootstrapped_rids,
+                bad_bootstrapped_rids,
+                pp_prefix_len_caps,
+            ) = bootstrapped_info
+            pp_prefix_len_caps = pp_prefix_len_caps or {}
+        return good_bootstrapped_rids, bad_bootstrapped_rids, pp_prefix_len_caps
+
+    def _pp_pd_get_local_prefix_len_caps(self: Scheduler, rids: List[str]):
+        if not self.enable_hierarchical_cache:
+            return {}
+
+        rid_set = set(rids)
+        prefix_len_caps = {}
+        for req in self.disagg_prefill_bootstrap_queue.queue:
+            if req.rid not in rid_set:
+                continue
+            req.init_next_round_input(self.tree_cache)
+            prefix_len_caps[req.rid] = len(req.prefix_indices) + req.host_hit_length
+        return prefix_len_caps
+
+    def _pp_pd_merge_prefix_len_caps(
+        self: Scheduler,
+        rids: List[str],
+        prev_prefix_len_caps: Dict[str, int],
+        curr_prefix_len_caps: Dict[str, int],
+    ):
+        prefix_len_caps = {}
+        for rid in rids:
+            prev_len = prev_prefix_len_caps.get(rid)
+            curr_len = curr_prefix_len_caps.get(rid)
+            if prev_len is None:
+                cap = curr_len
+            elif curr_len is None:
+                cap = prev_len
+            else:
+                cap = min(prev_len, curr_len)
+            if cap is not None:
+                prefix_len_caps[rid] = cap
+        return prefix_len_caps
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
@@ -767,12 +824,17 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
+            pp_prefix_len_caps = self._pp_pd_get_local_prefix_len_caps(
+                good_bootstrapped_rids
+            )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
+            (
+                prev_good_bootstrapped_rids,
+                prev_bad_bootstrapped_rids,
+                prev_prefix_len_caps,
+            ) = self._pp_pd_unpack_bootstrapped_info(prev_bootstrapped_rids)
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
                 True,
@@ -785,7 +847,15 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+            curr_prefix_len_caps = self._pp_pd_get_local_prefix_len_caps(
+                good_bootstrapped_rids
+            )
+            pp_prefix_len_caps = self._pp_pd_merge_prefix_len_caps(
+                good_bootstrapped_rids,
+                prev_prefix_len_caps,
+                curr_prefix_len_caps,
+            )
+        return [good_bootstrapped_rids, bad_bootstrapped_rids, pp_prefix_len_caps]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success

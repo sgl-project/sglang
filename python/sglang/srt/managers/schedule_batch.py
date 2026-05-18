@@ -739,6 +739,9 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # In PP prefill, all stages must agree on the prefix length to skip.
+        # This cap is populated by PP bootstrap consensus when needed.
+        self.pp_prefix_len_cap: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -979,6 +982,7 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        prefix_len_cap: Optional[int] = None,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1009,6 +1013,8 @@ class Req(ReqDllmMixin):
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
+        if prefix_len_cap is not None:
+            max_prefix_len = min(max_prefix_len, prefix_len_cap)
         token_ids = self.fill_ids[:max_prefix_len]
 
         # Disable prefix caching when embed overrides are present: same token IDs
@@ -1242,6 +1248,9 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        self.last_host_node = None
+        self.host_hit_length = 0
+        self.pp_prefix_len_cap = None
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0
