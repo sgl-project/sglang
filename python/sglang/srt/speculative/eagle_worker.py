@@ -218,9 +218,11 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
             if self.adaptive_controller is not None:
@@ -459,9 +461,11 @@ class EAGLEWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -478,9 +482,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -502,9 +508,11 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
@@ -575,14 +583,13 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        model_worker_batch.capture_hidden_mode = capture_mode
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        batch.capture_hidden_mode = capture_mode
+        batch_result = self.target_worker.forward_batch_generation(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -590,7 +597,7 @@ class EAGLEWorker(TpModelWorker):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
 
@@ -768,11 +775,8 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == draft_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        assert forward_batch.capture_hidden_mode == draft_capture_mode
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -936,11 +940,6 @@ class EAGLEWorker(TpModelWorker):
             else ForwardMode.IDLE
         )
 
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
@@ -949,8 +948,9 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1128,12 +1128,8 @@ class EAGLEWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         batch.spec_info.capture_hidden_mode = capture_mode
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
-        )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        batch.seq_lens_cpu_cache = seq_lens_cpu
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -1161,8 +1157,11 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
-            # All reqs finished this verify; swap to an idle ExtendInput.
+        if draft_extend_input.input_ids.shape[0] == 0:
+            # Single source for hidden_size via hidden_size_for(self) (incl.
+            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
+            # batch (DP attn rank w/o reqs) and active batch with all reqs
+            # finished. prepare_for_idle() is idempotent on already-idle.
             batch = batch.copy()
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
@@ -1188,14 +1187,11 @@ class EAGLEWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         # Verify-time construction of EagleDraftExtendInput uses the dataclass
-        # default (LAST); the worker overrides here so get_model_worker_batch()
-        # propagates the correct mode (NULL for STANDALONE).
+        # default (LAST); override here so ForwardBatch.init_new picks up the
+        # correct mode (NULL for STANDALONE).
         draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        assert forward_batch.capture_hidden_mode == draft_extend_capture_mode
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +29,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.deepseek_v4 import (
+    silu_and_mul_clamp,
+    silu_and_mul_contig_post_quant,
+)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -107,6 +113,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
@@ -269,13 +278,51 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        if self.swiglu_limit is not None:
-            _g, _u = gate_up.chunk(2, dim=-1)
-            _lim = float(self.swiglu_limit)
-            gate_up = torch.cat(
-                [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+        # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
+        # Only valid when down_proj does NOT need an all-reduce and its weights
+        # are fp8 (uint8 storage with weight_scale_inv).
+        if (
+            self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.uint8
+            and hasattr(self.down_proj, "weight_scale_inv")
+        ):
+            M, N = gate_up.shape
+            down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
+            scale_block_size = 128
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                x_shape=(M, N // 2),
+                device=gate_up.device,
+                group_size=scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-        x = self.act_fn(gate_up)
+            silu_and_mul_contig_post_quant(
+                input=gate_up,
+                output=down_input_fp8,
+                output_scale=down_input_scale,
+                quant_group_size=scale_block_size,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                swiglu_limit=float(self.swiglu_limit),
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (down_input_fp8, down_input_scale),
+                (self.down_proj.weight, self.down_proj.weight_scale_inv),
+                down_output,
+            )
+            return down_output
+        # Fallback: fused silu+clamp kernel (still faster than unfused)
+        if self.swiglu_limit is not None:
+            M, N = gate_up.shape
+            x = gate_up.new_empty((M, N // 2))
+            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
@@ -554,6 +601,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_mori()
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -779,10 +827,9 @@ class DeepseekV2MoE(nn.Module):
             if server_args.enable_eplb
             else None
         )
+        defer_shared = not self.experts.moe_runner_config.inplace
         if hidden_states.shape[0] > 0:
-            if (
-                not self._fuse_shared_experts_inside_sbo
-            ):  # TODO: check if it supports mtp
+            if not defer_shared and not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -846,6 +893,15 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+
+        if (
+            defer_shared
+            and hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+        ):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
@@ -965,16 +1021,6 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
-                n = self.num_fused_shared_experts
-                topk_output = topk_output._replace(
-                    topk_ids=topk_output.topk_ids.new_empty(
-                        (0, topk_output.topk_ids.shape[-1] + n)
-                    ),
-                    topk_weights=topk_output.topk_weights.new_empty(
-                        (0, topk_output.topk_weights.shape[-1] + n)
-                    ),
-                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1687,11 +1733,15 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        # When the module is wrapped with LoRA, the fused GEMM fast-path would
+        # bypass the adapter because it reads weight.T directly.
+        lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
+            and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
@@ -1881,6 +1931,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        hidden_states_orig = hidden_states
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -1901,6 +1952,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1920,13 +1972,24 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and not self.mlp.experts.moe_runner_config.inplace
+        ):
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        else:
+            _mlp_ctx = nullcontext()
+
+        with _mlp_ctx:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2306,6 +2369,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "kv_a_proj_with_mqa",
             ]
 
+        # Quant configs like Quark may rely on the model to provide fused-module
+        # mappings so exclusion checks can unfuse derived names back to the
+        # checkpoint's source layer names.
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
+
         self.pp_group = get_pp_group()
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -2364,25 +2433,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if server_args.disable_shared_experts_fusion:
             return
 
-        # DeepEP + enforce: the only path that enables fusion under DeepEP.
-        if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
-            log_info_on_rank0(
-                logger,
-                "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                "at home EP rank local slot (--enforce-shared-experts-fusion).",
-            )
-            self.num_fused_shared_experts = self.config.n_shared_experts
-            return
-
-        # Check all conditions that disable fusion.
         disable_reason = None
-        if is_sbo_enabled() or is_tbo_enabled():
+        if server_args.enforce_shared_experts_fusion:
+            pass
+        elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
         elif is_deepep_class_backend():
             disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
         elif (
             self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 256
+            # Allow-list of n_routed_experts values that have been validated
+            # for shared-experts fusion under this code path. Currently:
+            #   256 -> DeepSeek-V3 / R1
+            #   384 -> Kimi-K2.5 (text_config wraps DeepseekV3ForCausalLM)
+            or self.config.n_routed_experts not in (256, 384)
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."

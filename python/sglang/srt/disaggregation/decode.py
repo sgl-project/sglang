@@ -252,6 +252,10 @@ class DecodeRequest:
     def seqlen(self) -> int:
         return self.req.seqlen
 
+    @property
+    def priority(self) -> Optional[int]:
+        return self.req.priority
+
 
 class DecodePreallocQueue:
     """
@@ -374,7 +378,7 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
@@ -416,7 +420,7 @@ class DecodePreallocQueue:
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.gpu_id = self.scheduler.ps.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -741,6 +745,7 @@ class DecodePreallocQueue:
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         swa_allocatable_tokens = 0
         if uses_swa_tail_prealloc:
@@ -759,6 +764,15 @@ class DecodePreallocQueue:
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
+
+        # Sort by priority before any index-based bookkeeping so that both the
+        # abort-scan loop and the preallocation loop operate on the same order.
+        if self.scheduler.enable_priority_scheduling:
+            priority_sign = (
+                1 if self.scheduler.schedule_low_priority_values_first else -1
+            )
+            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1670,6 +1684,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if len(self.waiting_queue) == 0:
             return None
+
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
 
