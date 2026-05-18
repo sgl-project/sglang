@@ -141,8 +141,8 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         canonical_w2_shape = tuple(layer.w2_weight.shape)
         layer.quant_method.process_weights_after_loading(layer)
 
-        # process_weights_after_loading packs canonical weights into the
-        # FlashInfer TRTLLM runtime layout.
+        # Test precondition: hot update below must start from packed params,
+        # otherwise it would not exercise restore-before-load.
         self.assertNotEqual(tuple(layer.w13_weight.shape), canonical_w13_shape)
         self.assertNotEqual(tuple(layer.w2_weight.shape), canonical_w2_shape)
 
