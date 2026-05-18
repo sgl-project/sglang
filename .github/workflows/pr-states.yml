@@ -107,13 +107,16 @@ jobs:
             // if-condition) -- that's enforced by the gate, not here.
             //
             // Retry budget:
-            // - With label: race against fresh pr-test* indexing after push,
-            //   so retry briefly (3 attempts, 6s apart).
+            // - With label: pre-sleep 3s to absorb same-tick indexing lag
+            //   against a fresh push, then 3 attempts 6s apart (max 15s).
             // - Without label: any existing run is from before label removal;
             //   pre-sleep 6s to absorb residual API indexing lag (e.g. label
             //   removed within seconds of push), then a single lookup.
             async function findRun(workflowFile, hasLabel) {
-              if (hasLabel) return findRunWithRetry(workflowFile, 3, 6000);
+              if (hasLabel) {
+                await new Promise(r => setTimeout(r, 3000));
+                return findRunWithRetry(workflowFile, 3, 6000);
+              }
               await new Promise(r => setTimeout(r, 6000));
               return findRunBySha(workflowFile);
             }
