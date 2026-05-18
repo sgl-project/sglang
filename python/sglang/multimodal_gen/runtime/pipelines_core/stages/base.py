@@ -267,7 +267,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Returns:
             The updated batch information after this stage's processing.
         """
-        stage_name = self.__class__.__name__
+        stage_name = self._active_component_stage_name()
         # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
