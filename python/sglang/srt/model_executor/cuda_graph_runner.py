@@ -311,10 +311,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.out_cache_loc[:raw_num_token],
             self.positions[:raw_num_token],
         ]
+        # Route seq_lens read through Relayer channel resolve so the
+        # cuda-graph replay buffer copy sees the post-decode settled view
+        # (cross-stream sync via cuda event); attribute fallback when no
+        # relayer ctx is attached to ForwardBatch.
         srcs = [
             forward_batch.input_ids,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            forward_batch.relayer_resolve_seq_lens(),
             forward_batch.out_cache_loc,
             forward_batch.positions,
         ]
