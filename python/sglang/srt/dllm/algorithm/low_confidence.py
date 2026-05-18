@@ -37,7 +37,10 @@ class LowConfidence(DllmAlgorithm):
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             next_token_ids = []
+            self._attach_forward_counts_per_request(logits_output, [1] * batch_size)
             return logits_output, next_token_ids, can_run_cuda_graph
+
+        forward_counts_per_request = [0] * batch_size
 
         # Calculate start positions for each block
         for block_id in range(batch_size):
@@ -53,6 +56,11 @@ class LowConfidence(DllmAlgorithm):
             if torch.sum(mask_index).item() == 0:
                 break
 
+            # The current scheduler makes all requests in a batch wait for the slowest request,
+            # so every request has the same forward count.
+            forward_counts_per_request = [
+                count + 1 for count in forward_counts_per_request
+            ]
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
@@ -89,6 +97,7 @@ class LowConfidence(DllmAlgorithm):
 
                 block_input_ids[transfer_index] = x[transfer_index]
 
+        forward_counts_per_request = [count + 1 for count in forward_counts_per_request]
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
@@ -97,6 +106,9 @@ class LowConfidence(DllmAlgorithm):
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+        self._attach_forward_counts_per_request(
+            logits_output, forward_counts_per_request
+        )
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

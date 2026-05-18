@@ -34,7 +34,10 @@ class JointThreshold(DllmAlgorithm):
         mask_index = forward_batch.input_ids == self.mask_id
         if not mask_index.any():
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            self._attach_forward_counts_per_request(out.logits_output, [1] * batch_size)
             return out.logits_output, [], out.can_run_graph
+
+        forward_counts_per_request = [0] * batch_size
 
         start_list = []
         prompt_masks = []
@@ -60,6 +63,9 @@ class JointThreshold(DllmAlgorithm):
             if finished.all():
                 break
 
+            forward_counts_per_request = [
+                count + 1 for count in forward_counts_per_request
+            ]
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
@@ -125,6 +131,9 @@ class JointThreshold(DllmAlgorithm):
                 any_changed_in_last_step = True
 
         if any_changed_in_last_step:
+            forward_counts_per_request = [
+                count + 1 for count in forward_counts_per_request
+            ]
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
@@ -132,6 +141,9 @@ class JointThreshold(DllmAlgorithm):
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+        self._attach_forward_counts_per_request(
+            logits_output, forward_counts_per_request
+        )
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

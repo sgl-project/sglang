@@ -1,5 +1,6 @@
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.server_args import ServerArgs
 
 
@@ -16,3 +17,12 @@ class DllmAlgorithm:
     def from_server_args(server_args: ServerArgs):
         config = DllmConfig.from_server_args(server_args)
         return get_algorithm(config)
+
+    @staticmethod
+    def _attach_forward_counts_per_request(
+        logits_output: LogitsProcessorOutput, counts: list[int]
+    ):
+        assert isinstance(logits_output, LogitsProcessorOutput)
+        if logits_output.customized_info is None:
+            logits_output.customized_info = {}
+        logits_output.customized_info["dllm_forward_counts"] = counts

@@ -89,6 +89,8 @@ class SchedulerDllmMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
+                self.maybe_collect_customized_info(idx, req, result.logits_output)
+
             self.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
