@@ -1998,14 +1998,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         max_bs = self.server_args.cuda_graph_max_bs
         max_loras = self.server_args.max_loras_per_batch
+        # Token-axis upper bound for prefill-PCG-aware MoE buffer sizing.
+        # When PCG is disabled this is None and the legacy max_bs-only sizing
+        # is preserved.
+        pcg_tokens = self.server_args.piecewise_cuda_graph_tokens
+        max_num_tokens_pcg = (
+            max(pcg_tokens)
+            if pcg_tokens and not self.server_args.disable_piecewise_cuda_graph
+            else None
+        )
         for module in self.model.modules():
             if isinstance(module, FusedMoEWithLoRA):
                 self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
+                    max_bs,
+                    max_loras,
+                    self.dtype,
+                    module,
+                    max_num_tokens_pcg=max_num_tokens_pcg,
                 )
                 logger.info(
                     f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                    f"(max_bs={max_bs}, max_loras={max_loras}, "
+                    f"max_num_tokens_pcg={max_num_tokens_pcg})"
                 )
                 break
 

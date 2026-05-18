@@ -131,18 +131,29 @@ class LoRAManager:
         )
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
         Called before init_memory_pool() so memory profiling accounts for them.
         Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+
+        Args:
+            max_num_tokens_pcg: PCG token bucket upper bound so MoE LoRA
+                token-axis buffers also cover prefill capture/replay.
+                Pass None when PCG is disabled.
         """
         self.lora_backend.init_cuda_graph_moe_buffers(
             max_bs=max_bs,
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            max_num_tokens_pcg=max_num_tokens_pcg,
         )
 
     def create_lora_update_result(
