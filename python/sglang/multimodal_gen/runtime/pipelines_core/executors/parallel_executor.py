@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 
 logger = init_logger(__name__)
 
@@ -67,20 +68,33 @@ class ParallelExecutor(PipelineExecutor):
             rank = get_world_rank()
         cfg_group = get_cfg_group()
         group = get_world_group()
+        # Match the warmup gating used inside DenoisingStage so the executor
+        # wrappers don't leak a stage_<Name> range during server-side warmup.
+        # ``batch`` can be a single Req or a list of Req (execute_group);
+        # treat the group as warmup only if all entries agree.
+        if isinstance(batch, list):
+            is_warmup = bool(batch) and all(
+                getattr(b, "is_warmup", False) for b in batch
+            )
+        else:
+            is_warmup = getattr(batch, "is_warmup", False)
+        use_nvtx = server_args.enable_layerwise_nvtx_marker and not is_warmup
 
         self.begin_component_residency_request(stages, batch, server_args)
         try:
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
                 paradigm = stage.parallelism_type
+                stage_name = stage.__class__.__name__
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = self.run_stage_with_context(
-                            stage, batch, server_args, run_stage
-                        )
+                        with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                            batch = self.run_stage_with_context(
+                                stage, batch, server_args, run_stage
+                            )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
 
@@ -96,26 +110,29 @@ class ParallelExecutor(PipelineExecutor):
                     if rank != 0:
                         batch = broadcasted_list[0]
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = self.run_stage_with_context(
-                        stage, batch, server_args, run_stage
-                    )
+                    with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                     self.after_stage(stage_index)
 
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = self.run_stage_with_context(
-                        stage, batch, server_args, run_stage
-                    )
+                    with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                     self.after_stage(stage_index)
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = self.run_stage_with_context(
-                            stage, batch, server_args, run_stage
-                        )
+                        with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                            batch = self.run_stage_with_context(
+                                stage, batch, server_args, run_stage
+                            )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
 
