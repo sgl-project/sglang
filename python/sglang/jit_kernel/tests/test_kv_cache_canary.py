@@ -9,6 +9,7 @@ latch.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
@@ -18,6 +19,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
     FailReason,
     canary_step,
+    canary_step_torch_reference,
 )
 from sglang.srt.kv_cache_canary.fingerprint import splitmix64_mix, to_signed_int64
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -498,3 +500,645 @@ def test_first_violation_preserved_across_cascading_mismatches():
     assert first_after_initial == first_after_cascade
     # The write_index has advanced past ring capacity.
     assert int(state["violation_write_index"].item()) > 4
+
+
+# ---------------------------------------------------------------------------
+# Differential tests: every scenario calls both ``canary_step`` (CUDA) and
+# ``canary_step_torch_reference`` (pure-torch) with byte-identical inputs
+# and asserts bitwise equality on all output tensors (the kernel mutates
+# dst_buf + violation state + counters in place). User-instruction L73:
+# "对各种各样的场景，都双调用，然后 assert 双方结果 bitwise eq".
+# ---------------------------------------------------------------------------
+
+
+_DIFFERENTIAL_OUTPUT_FIELDS = (
+    "dst_buf",
+    "violation_ring",
+    "violation_ring_valid",
+    "violation_write_index",
+    "first_violation",
+    "first_violation_set",
+    "is_errored",
+    "slot_run_counter",
+    "kernel_run_counter",
+)
+
+
+def _alloc_diff_state(
+    *,
+    num_slots: int,
+    slot_stride: int,
+    ring_capacity: int,
+    device: str,
+) -> dict:
+    """One bag of mutable tensors that ``canary_step`` will write into."""
+    return dict(
+        dst_buf=torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=device),
+        violation_ring=torch.zeros(
+            ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
+        ),
+        violation_ring_valid=torch.zeros(
+            ring_capacity, dtype=torch.int32, device=device
+        ),
+        violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
+        first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device=device),
+        first_violation_set=torch.zeros(1, dtype=torch.int32, device=device),
+        is_errored=torch.zeros(1, dtype=torch.int32, device=device),
+        slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
+        kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
+    )
+
+
+def _clone_state_for_reference(state: dict, *, device: str) -> dict:
+    """Deep-clone every mutable tensor so the reference run is independent."""
+    return {k: v.detach().clone().to(device) for k, v in state.items()}
+
+
+def _i64(values: list[int], device: str) -> torch.Tensor:
+    return torch.tensor(values or [0], dtype=torch.int64, device=device)
+
+
+def _i32(values: list[int], device: str) -> torch.Tensor:
+    return torch.tensor(values or [0], dtype=torch.int32, device=device)
+
+
+def _build_inputs_on(device: str, **plan_lists) -> dict:
+    return dict(
+        verify_slot_indices=_i64(plan_lists["verify_slot_indices"], device),
+        verify_positions=_i64(plan_lists["verify_positions"], device),
+        verify_req_ids=_i64(plan_lists["verify_req_ids"], device),
+        verify_prev_slot_indices=_i64(plan_lists["verify_prev_slot_indices"], device),
+        verify_active_mask=_i32(plan_lists["verify_active_mask"], device),
+        write_slot_indices=_i64(plan_lists["write_slot_indices"], device),
+        write_token_ids=_i64(plan_lists["write_token_ids"], device),
+        write_positions=_i64(plan_lists["write_positions"], device),
+        write_req_ids=_i64(plan_lists["write_req_ids"], device),
+        write_req_seed_slot_indices=_i64(
+            plan_lists["write_req_seed_slot_indices"] or [-1], device
+        ),
+        write_req_entry_starts=_i64(plan_lists["write_req_entry_starts"], device),
+        write_req_entry_counts=_i64(plan_lists["write_req_entry_counts"], device),
+        write_req_active_mask=_i32(plan_lists["write_req_active_mask"], device),
+    )
+
+
+def _assert_states_match(
+    *,
+    cuda_state: dict,
+    ref_state: dict,
+    scenario: str,
+) -> None:
+    for field in _DIFFERENTIAL_OUTPUT_FIELDS:
+        cuda_tensor = cuda_state[field].detach().to("cpu")
+        ref_tensor = ref_state[field].detach().to("cpu")
+        assert torch.equal(
+            cuda_tensor, ref_tensor
+        ), f"{scenario}: field {field!r} diverges between CUDA and torch reference"
+
+
+def _run_differential(
+    *,
+    scenario: str,
+    src_initial: torch.Tensor,
+    state_cuda: dict,
+    state_ref: dict,
+    inputs_cuda: dict,
+    inputs_ref: dict,
+    slot_stride: int,
+    kernel_kind: int,
+    seed: int = _SEED,
+) -> None:
+    """Drive both implementations and bit-wise compare every output field."""
+    src_cuda = src_initial.detach().clone().to(state_cuda["dst_buf"].device)
+    src_ref = src_initial.detach().clone().to(state_ref["dst_buf"].device)
+
+    canary_step(
+        src_buf=src_cuda.flatten(),
+        dst_buf=state_cuda["dst_buf"].flatten(),
+        slot_stride_bytes=slot_stride,
+        seed=seed,
+        kernel_kind=kernel_kind,
+        violation_ring=state_cuda["violation_ring"],
+        violation_ring_valid=state_cuda["violation_ring_valid"],
+        violation_write_index=state_cuda["violation_write_index"],
+        first_violation=state_cuda["first_violation"],
+        first_violation_set=state_cuda["first_violation_set"],
+        is_errored=state_cuda["is_errored"],
+        slot_run_counter=state_cuda["slot_run_counter"],
+        kernel_run_counter=state_cuda["kernel_run_counter"],
+        **inputs_cuda,
+    )
+    torch.cuda.synchronize()
+
+    canary_step_torch_reference(
+        src_buf=src_ref.flatten(),
+        dst_buf=state_ref["dst_buf"].flatten(),
+        slot_stride_bytes=slot_stride,
+        seed=seed,
+        kernel_kind=kernel_kind,
+        violation_ring=state_ref["violation_ring"],
+        violation_ring_valid=state_ref["violation_ring_valid"],
+        violation_write_index=state_ref["violation_write_index"],
+        first_violation=state_ref["first_violation"],
+        first_violation_set=state_ref["first_violation_set"],
+        is_errored=state_ref["is_errored"],
+        slot_run_counter=state_ref["slot_run_counter"],
+        kernel_run_counter=state_ref["kernel_run_counter"],
+        **inputs_ref,
+    )
+
+    _assert_states_match(cuda_state=state_cuda, ref_state=state_ref, scenario=scenario)
+
+
+def _scenario_write_only_single_req() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=None,
+        plan=dict(
+            verify_slot_indices=[],
+            verify_positions=[],
+            verify_req_ids=[],
+            verify_prev_slot_indices=[],
+            verify_active_mask=[],
+            write_slot_indices=[0, 1, 2],
+            write_token_ids=[101, 202, 303],
+            write_positions=[0, 1, 2],
+            write_req_ids=[7, 7, 7],
+            write_req_seed_slot_indices=[-1],
+            write_req_entry_starts=[0],
+            write_req_entry_counts=[3],
+            write_req_active_mask=[1],
+        ),
+    )
+
+
+def _scenario_write_only_multi_req() -> dict:
+    # Two reqs, each starting from kSeed -> two independent chains; chosen
+    # so their write_slots do not overlap.
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=None,
+        plan=dict(
+            verify_slot_indices=[],
+            verify_positions=[],
+            verify_req_ids=[],
+            verify_prev_slot_indices=[],
+            verify_active_mask=[],
+            write_slot_indices=[0, 1, 2, 3],
+            write_token_ids=[10, 20, 30, 40],
+            write_positions=[0, 1, 0, 1],
+            write_req_ids=[5, 5, 9, 9],
+            write_req_seed_slot_indices=[-1, -1],
+            write_req_entry_starts=[0, 2],
+            write_req_entry_counts=[2, 2],
+            write_req_active_mask=[1, 1],
+        ),
+    )
+
+
+def _scenario_verify_only_clean_chain() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=[0, 1, 2],
+            tokens=[11, 22, 33],
+            positions=[0, 1, 2],
+            req_id=4,
+        ),
+        plan=dict(
+            verify_slot_indices=[0, 1, 2],
+            verify_positions=[0, 1, 2],
+            verify_req_ids=[4, 4, 4],
+            verify_prev_slot_indices=[-1, 0, 1],
+            verify_active_mask=[1, 1, 1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+    )
+
+
+def _scenario_verify_only_req_id_mismatch() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=4,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=[0],
+            tokens=[42],
+            positions=[0],
+            req_id=5,
+        ),
+        plan=dict(
+            verify_slot_indices=[0],
+            verify_positions=[0],
+            verify_req_ids=[99],  # mismatch: slot stored req_id=5
+            verify_prev_slot_indices=[-1],
+            verify_active_mask=[1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+        expected_fail_reason=FailReason.REQ_ID,
+    )
+
+
+def _scenario_verify_only_position_mismatch() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=4,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=[0],
+            tokens=[42],
+            positions=[0],
+            req_id=1,
+        ),
+        plan=dict(
+            verify_slot_indices=[0],
+            verify_positions=[5],  # mismatch: slot stored position=0
+            verify_req_ids=[1],
+            verify_prev_slot_indices=[-1],
+            verify_active_mask=[1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+        expected_fail_reason=FailReason.POSITION_MONOTONIC,
+    )
+
+
+def _scenario_verify_only_hash_mismatch() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=4,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=[0],
+            tokens=[42],
+            positions=[0],
+            req_id=1,
+        ),
+        # Post-prefill we corrupt slot[0].prev_hash; verify should fire HASH.
+        corrupt_prev_hash=dict(slot=0, value=0xDEADBEEFDEADBEEF),
+        plan=dict(
+            verify_slot_indices=[0],
+            verify_positions=[0],
+            verify_req_ids=[1],
+            verify_prev_slot_indices=[-1],
+            verify_active_mask=[1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+        expected_fail_reason=FailReason.HASH,
+    )
+
+
+def _scenario_mixed_write_and_verify() -> dict:
+    # Same forward: verify positions [0,1] (already written) and write
+    # new positions [2,3] on top of them.
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=dict(
+            slots=[0, 1],
+            tokens=[71, 72],
+            positions=[0, 1],
+            req_id=3,
+        ),
+        plan=dict(
+            verify_slot_indices=[0, 1],
+            verify_positions=[0, 1],
+            verify_req_ids=[3, 3],
+            verify_prev_slot_indices=[-1, 0],
+            verify_active_mask=[1, 1],
+            write_slot_indices=[2, 3],
+            write_token_ids=[81, 82],
+            write_positions=[2, 3],
+            write_req_ids=[3, 3],
+            write_req_seed_slot_indices=[1],
+            write_req_entry_starts=[0],
+            write_req_entry_counts=[2],
+            write_req_active_mask=[1],
+        ),
+    )
+
+
+def _scenario_first_violation_latch_preserved() -> dict:
+    # Two verify entries on the same req; the first hits a REQ_ID mismatch,
+    # the second hits POSITION mismatch. The first-violation latch must
+    # preserve the REQ_ID row.
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=[0, 1],
+            tokens=[71, 72],
+            positions=[0, 1],
+            req_id=3,
+        ),
+        plan=dict(
+            verify_slot_indices=[0, 1],
+            verify_positions=[0, 999],
+            verify_req_ids=[42, 3],  # entry 0: REQ_ID mismatch wins latch.
+            verify_prev_slot_indices=[-1, 0],
+            verify_active_mask=[1, 1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+    )
+
+
+def _scenario_small_k_req() -> dict:
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=2,
+        ring_capacity=4,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=None,
+        plan=dict(
+            verify_slot_indices=[],
+            verify_positions=[],
+            verify_req_ids=[],
+            verify_prev_slot_indices=[],
+            verify_active_mask=[],
+            write_slot_indices=[0],
+            write_token_ids=[7],
+            write_positions=[0],
+            write_req_ids=[1],
+            write_req_seed_slot_indices=[-1],
+            write_req_entry_starts=[0],
+            write_req_entry_counts=[1],
+            write_req_active_mask=[1],
+        ),
+    )
+
+
+def _scenario_large_k_req_1w() -> dict:
+    # User-instruction L53: a single decode step on a 10k-token prefix
+    # must verify ALL 10k positions. Use a 10k-long write chain followed
+    # by a verify launch over the full prefix in the same scenario.
+    n = 10_000
+    tokens = [(i * 31) & 0xFFFF for i in range(n)]
+    positions = list(range(n))
+    write_slots = list(range(n))
+    verify_slots = list(range(n))
+    verify_prev = [-1] + list(range(n - 1))
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=n,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_TAIL,
+        prefill_writes=dict(
+            slots=write_slots,
+            tokens=tokens,
+            positions=positions,
+            req_id=2,
+        ),
+        plan=dict(
+            verify_slot_indices=verify_slots,
+            verify_positions=positions,
+            verify_req_ids=[2] * n,
+            verify_prev_slot_indices=verify_prev,
+            verify_active_mask=[1] * n,
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+    )
+
+
+def _scenario_ring_buffer_small_capacity() -> dict:
+    # Exactly one mismatch is enough to populate first_violation + one
+    # ring row; keeps us in the single-producer-per-row regime where the
+    # torch reference and the CUDA kernel agree bit-wise.
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=1,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=dict(
+            slots=[0],
+            tokens=[42],
+            positions=[0],
+            req_id=5,
+        ),
+        plan=dict(
+            verify_slot_indices=[0],
+            verify_positions=[0],
+            verify_req_ids=[7],
+            verify_prev_slot_indices=[-1],
+            verify_active_mask=[1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+    )
+
+
+def _scenario_inactive_mask_skipped() -> dict:
+    # Every active_mask = 0 -> kernel must be a no-op on slot I/O and
+    # slot_run_counter, but kernel_run_counter still advances. Same
+    # contract must hold for the torch reference.
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=4,
+        ring_capacity=4,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=None,
+        plan=dict(
+            verify_slot_indices=[0, 1],
+            verify_positions=[0, 1],
+            verify_req_ids=[1, 1],
+            verify_prev_slot_indices=[-1, 0],
+            verify_active_mask=[0, 0],
+            write_slot_indices=[0, 1],
+            write_token_ids=[10, 20],
+            write_positions=[0, 1],
+            write_req_ids=[1, 1],
+            write_req_seed_slot_indices=[-1],
+            write_req_entry_starts=[0],
+            write_req_entry_counts=[2],
+            write_req_active_mask=[0],
+        ),
+    )
+
+
+_DIFFERENTIAL_SCENARIOS = {
+    "write_only_single_req": _scenario_write_only_single_req,
+    "write_only_multi_req": _scenario_write_only_multi_req,
+    "verify_only_clean_chain": _scenario_verify_only_clean_chain,
+    "verify_only_req_id_mismatch": _scenario_verify_only_req_id_mismatch,
+    "verify_only_position_mismatch": _scenario_verify_only_position_mismatch,
+    "verify_only_hash_mismatch": _scenario_verify_only_hash_mismatch,
+    "mixed_write_and_verify": _scenario_mixed_write_and_verify,
+    "first_violation_latch_preserved": _scenario_first_violation_latch_preserved,
+    "small_k_req": _scenario_small_k_req,
+    "large_k_req_1w": _scenario_large_k_req_1w,
+    "ring_buffer_small_capacity": _scenario_ring_buffer_small_capacity,
+    "inactive_mask_skipped": _scenario_inactive_mask_skipped,
+}
+
+
+def _prefill_buffer_with_chain(
+    *,
+    buf: torch.Tensor,
+    slots: list[int],
+    tokens: list[int],
+    positions: list[int],
+    req_id: int,
+    slot_stride: int,
+) -> None:
+    """Drive a clean chain into ``buf`` via the CUDA kernel (used to set up
+    the source buffer for verify-only differential scenarios)."""
+    n = len(slots)
+    state = _alloc_diff_state(
+        num_slots=buf.shape[0],
+        slot_stride=slot_stride,
+        ring_capacity=4,
+        device=buf.device.type,
+    )
+    inputs = _build_inputs_on(
+        buf.device.type,
+        verify_slot_indices=[],
+        verify_positions=[],
+        verify_req_ids=[],
+        verify_prev_slot_indices=[],
+        verify_active_mask=[],
+        write_slot_indices=slots,
+        write_token_ids=tokens,
+        write_positions=positions,
+        write_req_ids=[req_id] * n,
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[n],
+        write_req_active_mask=[1],
+    )
+    # Use canary_step itself; result lives in state["dst_buf"], copy to buf.
+    canary_step(
+        src_buf=state["dst_buf"].flatten(),
+        dst_buf=state["dst_buf"].flatten(),
+        slot_stride_bytes=slot_stride,
+        seed=_SEED,
+        kernel_kind=KERNEL_KIND_HEAD,
+        violation_ring=state["violation_ring"],
+        violation_ring_valid=state["violation_ring_valid"],
+        violation_write_index=state["violation_write_index"],
+        first_violation=state["first_violation"],
+        first_violation_set=state["first_violation_set"],
+        is_errored=state["is_errored"],
+        slot_run_counter=state["slot_run_counter"],
+        kernel_run_counter=state["kernel_run_counter"],
+        **inputs,
+    )
+    torch.cuda.synchronize()
+    buf.copy_(state["dst_buf"])
+
+
+@pytest.mark.parametrize("scenario_name", sorted(_DIFFERENTIAL_SCENARIOS.keys()))
+def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
+    """CUDA ``canary_step`` and ``canary_step_torch_reference`` agree bitwise."""
+    scenario = _DIFFERENTIAL_SCENARIOS[scenario_name]()
+    slot_stride = scenario["slot_stride"]
+    num_slots = scenario["num_slots"]
+    ring_capacity = scenario["ring_capacity"]
+    kernel_kind = scenario["kernel_kind"]
+    plan_lists = scenario["plan"]
+    prefill = scenario.get("prefill_writes")
+    corrupt = scenario.get("corrupt_prev_hash")
+
+    src_initial = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device="cuda")
+    if prefill is not None:
+        _prefill_buffer_with_chain(
+            buf=src_initial,
+            slots=prefill["slots"],
+            tokens=prefill["tokens"],
+            positions=prefill["positions"],
+            req_id=prefill["req_id"],
+            slot_stride=slot_stride,
+        )
+    if corrupt is not None:
+        slot_idx = int(corrupt["slot"])
+        value = to_signed_int64(int(corrupt["value"]) & ((1 << 64) - 1))
+        src_view = src_initial.view(torch.int64).view(num_slots, slot_stride // 8)
+        src_view[slot_idx, 3] = value
+
+    state_cuda = _alloc_diff_state(
+        num_slots=num_slots,
+        slot_stride=slot_stride,
+        ring_capacity=ring_capacity,
+        device="cuda",
+    )
+    state_ref = _clone_state_for_reference(state_cuda, device="cuda")
+
+    inputs_cuda = _build_inputs_on("cuda", **plan_lists)
+    inputs_ref = {k: v.detach().clone().to("cuda") for k, v in inputs_cuda.items()}
+
+    _run_differential(
+        scenario=scenario_name,
+        src_initial=src_initial,
+        state_cuda=state_cuda,
+        state_ref=state_ref,
+        inputs_cuda=inputs_cuda,
+        inputs_ref=inputs_ref,
+        slot_stride=slot_stride,
+        kernel_kind=kernel_kind,
+    )
+
+    expected_fail_reason = scenario.get("expected_fail_reason")
+    if expected_fail_reason is not None:
+        assert int(state_cuda["is_errored"].item()) == 1
+        assert int(state_cuda["first_violation"][1].item()) == int(expected_fail_reason)
