@@ -1,7 +1,7 @@
-from typing import Optional, Tuple
-
 import math
 import struct
+from typing import Optional, Tuple
+
 import torch
 
 from sglang.jit_kernel.utils import (
@@ -162,7 +162,7 @@ def fused_q_indexer_rope_hadamard_quant(
             freqs_real,
             positions,
         )
-    else:
+    elif _is_cuda:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
         module.forward(
             q_input,
@@ -172,6 +172,12 @@ def fused_q_indexer_rope_hadamard_quant(
             float(weight_scale),
             freqs_real,
             positions,
+    else:
+        from .fused_q_indexer_rope_hadamard_quant_torch import (
+            fused_q_indexer_rope_hadamard_quant_torch,
+        )
+        fused_q_indexer_rope_hadamard_quant_torch(
+            q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
         )
     return q_fp8, weights_out
 
