@@ -78,6 +78,19 @@ def test_cache_aware_zmq_converges_to_one_worker(
                 time.sleep(0.5)
                 metrics = gw.metrics_text()
                 assert metrics is not None, "router did not serve /metrics"
+                # Persist the metrics snapshot for the M4 E2E artifact log
+                # whenever the test reaches this point — captures the
+                # convergence test's per-worker requests_total distribution.
+                import os as _os
+
+                dump_path = _os.environ.get(
+                    "SGL_E2E_METRICS_DUMP_PATH", "/tmp/m4-metrics.txt"
+                )
+                try:
+                    with open(dump_path, "w", encoding="utf-8") as _f:
+                        _f.write(metrics)
+                except OSError:
+                    pass
                 counts = _parse_requests_total_by_worker(metrics)
                 assert counts, (
                     f"no successful request counters seen in metrics; "

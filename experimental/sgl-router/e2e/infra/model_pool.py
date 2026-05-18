@@ -38,9 +38,25 @@ logger = logging.getLogger(__name__)
 
 
 def _get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """Allocate an ephemeral TCP port in the range [20000, 55535].
+
+    SGLang derives its internal gRPC port as ``http_port + 10000``; if the
+    kernel hands us an ephemeral port above 55535, that derivation overflows
+    65535 and ``ServerArgs.__post_init__`` rejects it. Retrying a bounded
+    number of times keeps us safely below the ceiling without hand-rolling
+    a port registry.
+    """
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if 20000 <= port <= 55535:
+            return port
+    raise RuntimeError(
+        "could not allocate an ephemeral port in [20000, 55535] after 50 tries; "
+        "SGLang derives its internal gRPC port as http_port + 10000 and "
+        "rejects values above 65535"
+    )
 
 
 @dataclass
