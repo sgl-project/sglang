@@ -112,8 +112,6 @@ class AdaptiveSpeculativeParams:
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
 
-        self.min_steps = self.candidate_steps[0]
-        self.max_steps = self.candidate_steps[-1]
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
         self.warmup_batches = cfg.get("warmup_batches", 10)
