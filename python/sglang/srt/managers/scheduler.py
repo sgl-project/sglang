@@ -2900,7 +2900,12 @@ class Scheduler(
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2:
+                # Spec V2 relay rebind requires the gpu_scalar buffers to
+                # have been populated by store_to_map first; only invoke it
+                # in the non-delay branch here. The delay-sample branch
+                # routes through launch_batch_sample_if_needed, which runs
+                # store_to_map and then applies the relay outputs.
+                if batch.is_spec_v2 and batch_result.delay_sample_func is None:
                     self._apply_spec_v2_relay_outputs(
                         batch, batch_result, future_indices
                     )
@@ -3006,6 +3011,15 @@ class Scheduler(
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
+            )
+
+        # Spec V2 relay rebind deferred from run_batch: store_to_map just
+        # populated the gpu_scalar buffers, so it is now safe to rebind
+        # SB.spec_info / SB.seq_lens to the channel views before the next
+        # iter's prepare_for_decode reads them.
+        if self.cur_batch is not None and self.cur_batch.is_spec_v2:
+            self._apply_spec_v2_relay_outputs(
+                self.cur_batch, batch_result, batch_result.future_indices
             )
 
         # Release the delay_sample_func closure (captures forward_batch +
