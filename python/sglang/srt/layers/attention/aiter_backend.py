@@ -484,8 +484,8 @@ class AiterAttnBackend(AttentionBackend):
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
-        kvlen_granularity = max(128, self.page_size)
-        block_size = self.page_size
+        kvlen_granularity = 128
+        block_size = 1
 
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
         kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
@@ -1399,11 +1399,15 @@ class AiterAttnBackend(AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
+            if not self.use_triton_unified_attention:
+                kv_indices_buffer_size = max_bs * self.max_context_len
+            else:
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                kv_indices_buffer_size = max_bs * max_num_blocks_per_seq
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * max_num_blocks_per_seq),
+                (kv_indices_buffer_size,),
                 dtype=torch.int32,
                 device=self.device,
             )
