@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import torch
 
@@ -90,7 +90,9 @@ class CanaryHostState:
             == len(input_tokens_per_req)
             == len(write_slot_indices_per_req)
         ):
-            raise RuntimeError("kv-canary: plan_batch input lists have mismatched lengths")
+            raise RuntimeError(
+                "kv-canary: plan_batch input lists have mismatched lengths"
+            )
 
         verify_req_ids: List[int] = []
         verify_token_ids: List[int] = []
@@ -208,9 +210,9 @@ class BatchPlan:
 
 
 def _to_signed_int64(unsigned_value: int) -> int:
-    assert 0 <= unsigned_value < (1 << 64), (
-        f"kv-canary: prev_hash out of unsigned-64 range: {unsigned_value:#x}"
-    )
+    assert (
+        0 <= unsigned_value < (1 << 64)
+    ), f"kv-canary: prev_hash out of unsigned-64 range: {unsigned_value:#x}"
     mask = (1 << 64) - 1
     value = unsigned_value & mask
     if value >= (1 << 63):

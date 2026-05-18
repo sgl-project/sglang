@@ -66,7 +66,9 @@ class CanaryRunner:
 
         attach_shadow_buffers(pool)
         self._slot_stride_bytes = pool.canary_slot_stride_bytes
-        self._k_head, self._k_tail, self._v_head, self._v_tail = get_shadow_buffers(pool)
+        self._k_head, self._k_tail, self._v_head, self._v_tail = get_shadow_buffers(
+            pool
+        )
 
         self.host_state = CanaryHostState(config=config, num_req_slots=num_req_slots)
         self._device_state = CanaryDeviceState.allocate(
@@ -190,14 +192,14 @@ class CanaryRunner:
         poll_interval = max(0.001, self._config.daemon_poll_seconds)
         while not self._daemon_stop.is_set():
             try:
-                if self._is_errored_event is not None and self._is_errored_event.query():
+                if (
+                    self._is_errored_event is not None
+                    and self._is_errored_event.query()
+                ):
                     flag = int(self._is_errored_host.item())
                     with self._daemon_lock:
                         self._latest_is_errored = flag
-                if (
-                    self._counters_event is not None
-                    and self._counters_event.query()
-                ):
+                if self._counters_event is not None and self._counters_event.query():
                     counters = tuple(int(x) for x in self._counters_host.tolist())
                     with self._daemon_lock:
                         self._latest_counters = counters  # type: ignore[assignment]

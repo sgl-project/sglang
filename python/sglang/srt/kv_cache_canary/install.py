@@ -114,7 +114,7 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
             return original_forward(*args, **kwargs)
 
         # During cuda graph CAPTURE, the expected_* host-derived tensors would
-        # be frozen into the graph and replays would re-use stale values.
+        # be frozen into the graph and replays would reuse stale values.
         # v1 limitation: skip the canary kernel inside captured regions; the
         # eager (extend / prefill / out-of-graph decode) path still runs it,
         # and the §5 health check distinguishes "kernel never ran" from

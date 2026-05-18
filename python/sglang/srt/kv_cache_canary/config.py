@@ -4,7 +4,7 @@ import enum
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 

@@ -101,9 +101,7 @@ class TestCanaryHostState(unittest.TestCase):
         h = mix_step(h, 100, 0)
         h = mix_step(h, 200, 1)
         # The first write entry's expected_prev_hash equals the chain hash from chunk A.
-        self.assertEqual(
-            plan_b.expected_prev_hashes[1] & ((1 << 64) - 1), h
-        )
+        self.assertEqual(plan_b.expected_prev_hashes[1] & ((1 << 64) - 1), h)
 
     def test_reset_request_restarts_chain_at_seed(self):
         state = self._make_state()

@@ -61,7 +61,7 @@ def install_req_to_token_pool_free_hook(
 ) -> None:
     """Wrap ``ReqToTokenPool.free`` so canary state is dropped on req release.
 
-    Without this, a re-used ``req_pool_idx`` inherits the previous request's
+    Without this, a reused ``req_pool_idx`` inherits the previous request's
     ``K_req`` / ``prev_hash_tail``, which would make the new req's first token
     look like a verify-then-mismatch (P0-1 of host review).
     """
@@ -96,7 +96,9 @@ def maybe_perturb_req_to_token(
     if prob <= 0.0:
         return
 
-    rng = random.Random(_rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank))
+    rng = random.Random(
+        _rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank)
+    )
     if rng.random() >= prob:
         return
     table = req_to_token_pool.req_to_token
@@ -123,7 +125,9 @@ def maybe_perturb_req_to_token(
 
 
 def _rng_seed_for_rank(base_seed: int, rank: int) -> int:
-    return ((base_seed & 0xFFFFFFFF) * 0x9E3779B1 + rank * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    return (
+        (base_seed & 0xFFFFFFFF) * 0x9E3779B1 + rank * 0xBF58476D1CE4E5B9
+    ) & 0xFFFFFFFFFFFFFFFF
 
 
 def run_head(
