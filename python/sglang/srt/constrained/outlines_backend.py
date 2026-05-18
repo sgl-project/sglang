@@ -164,7 +164,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         )
         row[token_ids_tensor] = not is_allowed
 
-    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
 
     @staticmethod

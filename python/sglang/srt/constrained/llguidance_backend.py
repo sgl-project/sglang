@@ -147,6 +147,7 @@ class GuidanceBackend(BaseGrammarBackend):
         return True
 
     def set_token_filter(
+        self,
         vocab_mask: torch.Tensor,
         token_ids: List[int],
         batch_idx: int,
