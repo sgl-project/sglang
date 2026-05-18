@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -33,36 +34,36 @@ _is_npu = is_npu()
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
-    # Sylvester-construction Walsh-Hadamard matrix; n must be a power of 2.
-    # Cached per (n, dtype, device) so the rebuild cost is paid once.
+    # iforgetmyname/dsv4_release hardware_backend/npu/utils.py:get_had_pow2.
+    # bf16 Sylvester matrix with the n**-0.5 norm factor baked in by dividing
+    # by sqrt(2) at each doubling (log2(n) steps total). `dtype` is accepted
+    # for backward-compat with callers; ascend builds in bf16 only.
     cache = _walsh_hadamard_matrix._cache  # type: ignore[attr-defined]
-    key = (n, dtype, str(device))
+    key = (n, str(device))
     cached = cache.get(key)
     if cached is not None:
         return cached
-    H = torch.tensor([[1.0]], dtype=torch.float32)
-    while H.size(0) < n:
-        H = torch.cat(
-            [torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)],
-            dim=0,
-        )
-    H = H.to(dtype=dtype, device=device).contiguous()
-    cache[key] = H
-    return H
+    if not ((n & (n - 1) == 0) and (n > 0)):
+        raise ValueError(f"n must be a positive power of 2, got {n}")
+    had = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+    while had.shape[0] != n:
+        had = torch.cat((torch.cat([had, had], 1), torch.cat([had, -had], 1)), 0)
+        had /= math.sqrt(2)
+    had = had.contiguous()
+    cache[key] = had
+    return had
 
 
 _walsh_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
 
 
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
-    # Match rotate_activation()'s scale=hidden_size**-0.5 so the indexer's
-    # dot products are on the same magnitude scale as the CUDA reference.
+    # iforgetmyname/dsv4_release nsa_indexer.py:apply_hadamard. The n**-0.5
+    # scale is already baked into `hadamard_matrix` (see _walsh_hadamard_matrix
+    # above), so this is just `inp @ H` followed by bf16 cast.
     init_shape = inp.shape
-    n = hadamard_matrix.shape[0]
-    flat = inp.reshape(-1, n)
-    return (
-        (flat.matmul(hadamard_matrix) * (n**-0.5)).view(init_shape).to(torch.bfloat16)
-    )
+    flat = inp.view(-1, hadamard_matrix.shape[0])
+    return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
 
 
 if TYPE_CHECKING:
@@ -486,7 +487,7 @@ class Compressor(nn.Module):
         step 2 — until they exist this function fails AttributeError, which
         is fine because ``SGLANG_DSV4_NPU_REAL_COMPRESSOR`` is off by default.
         """
-        from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
+        import torch_npu  # local: NPU-only, used for npu_rotary_mul below
 
         ratio, overlap, d = self.ratio, self.overlap, self.head_dim
         if forward_batch.forward_mode.is_idle():
@@ -691,12 +692,30 @@ class Compressor(nn.Module):
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = self.norm(kv_out)
-            _v4_rope_inplace_npu(
-                kv_out[..., -self.rope_head_dim :].unsqueeze(1),
-                None,
-                self.freqs_cis,
-                pos_out,
+            # iforgetmyname compressor rope: ComplexExpRotaryEmbedding.forward
+            # calls torch_npu.npu_rotary_mul with cos/sin in repeat_interleave(2)
+            # layout reshaped to (T, 1, 1, rope_dim). freqs_cis here is the
+            # complex polar(1, theta) tensor built by precompute_freqs_cis;
+            # cos=real, sin=imag at the rope_dim/2 frequency pair resolution.
+            rope_dim = self.rope_head_dim
+            cos_half = self.freqs_cis.real[pos_out].to(kv_out.dtype)
+            sin_half = self.freqs_cis.imag[pos_out].to(kv_out.dtype)
+            cos = (
+                cos_half.repeat_interleave(2, dim=-1)
+                .view(-1, 1, 1, rope_dim)
+                .contiguous()
             )
+            sin = (
+                sin_half.repeat_interleave(2, dim=-1)
+                .view(-1, 1, 1, rope_dim)
+                .contiguous()
+            )
+            rope_slice = kv_out[..., -rope_dim:]
+            rope_view = rope_slice.unsqueeze(-2).unsqueeze(1)  # (T, 1, 1, rope_dim)
+            rope_rot = torch_npu.npu_rotary_mul(
+                rope_view, cos, sin, rotary_mode="interleave"
+            )
+            rope_slice.copy_(rope_rot.view_as(rope_slice))
             if self.rotate:
                 kv_out = _apply_hadamard(kv_out, self.hadamard_matrix)
             # Slab → c{N}_kv_pool slot for each compressed token.
