@@ -20,6 +20,82 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+# int32 suffices for all 6 packed fields (token counts, bools, forward-mode enum)
+# and halves the all_gather wire size vs int64.
+_INFO_DTYPE = torch.int32
+
+
+@dataclass
+class _MLPSyncBuffers:
+    """Persistent pre-allocated tensors reused across steps.
+
+    Avoids per-step CUDA/CPU malloc for the three tensors that are identical
+    in shape and device across every call to prepare_mlp_sync_batch_raw.
+    One instance per process (module-level singleton, see _get_or_init_mlp_sync_buffers).
+    """
+
+    local_tensor: torch.Tensor  # shape (6,) – filled in-place each step
+    global_tensor: torch.Tensor  # shape (dp_size, tp_size*cp_size, 6)
+    global_tensor_flat: torch.Tensor  # contiguous view of global_tensor for all_gather
+    fallback_tensor: torch.Tensor  # shape (6,) – constant fallback for inactive ranks
+    has_inactive_ranks: bool  # pre-computed; False in homogeneous deployments
+
+
+_mlp_sync_buffers: Optional[_MLPSyncBuffers] = None
+# Cached across steps; TboDPAttentionPreparer carries only within-step state
+# (set by prepare_all_gather, consumed by compute_output) so reuse is safe.
+_tbo_preparer: Optional[TboDPAttentionPreparer] = None
+
+
+def _get_tbo_preparer() -> TboDPAttentionPreparer:
+    global _tbo_preparer
+    if _tbo_preparer is None:
+        _tbo_preparer = TboDPAttentionPreparer()
+    return _tbo_preparer
+
+
+def _get_or_init_mlp_sync_buffers(
+    dp_size: int,
+    tp_size: int,
+    cp_size: int,
+    device,
+    dtype: torch.dtype,
+) -> _MLPSyncBuffers:
+    global _mlp_sync_buffers
+    if _mlp_sync_buffers is None:
+        tp_group = get_tp_group()
+        active_ranks = (
+            tp_group.active_ranks_cpu if device == "cpu" else tp_group.active_ranks
+        )
+        has_inactive = bool((active_ranks == 0).any().item())
+
+        fallback_values = [
+            0,  # num_tokens
+            0,  # num_tokens_for_logprob
+            1,  # can_cuda_graph
+            0,  # is_extend_in_batch
+            1,  # local_can_run_tbo
+            ForwardMode.IDLE.value,  # local_forward_mode
+        ]
+
+        # Pin CPU tensors so that any future async H2D copy (e.g. to GPU buffer)
+        # can use DMA without an extra staging bounce.
+        use_pin = device == "cpu" and torch.cuda.is_available()
+        global_tensor = torch.empty(
+            (dp_size, tp_size * cp_size, 6),
+            dtype=dtype,
+            device=device,
+            pin_memory=use_pin,
+        )
+        _mlp_sync_buffers = _MLPSyncBuffers(
+            local_tensor=torch.zeros(6, dtype=dtype, device=device),
+            global_tensor=global_tensor,
+            global_tensor_flat=global_tensor.flatten(),
+            fallback_tensor=torch.tensor(fallback_values, dtype=dtype, device=device),
+            has_inactive_ranks=has_inactive,
+        )
+    return _mlp_sync_buffers
+
 
 @dataclass
 class MLPSyncBatchInfo:
@@ -36,72 +112,57 @@ class MLPSyncBatchInfo:
 
     # some gathered elements
     tp0_info: torch.Tensor = None
+    cpu_tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
-    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-            ],
-            device=device,
-            dtype=dtype,
-        )
-
-    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-            ],
-            device=device,
-            dtype=dtype,
-        )
-
-    def all_gather(self, device, group: torch.distributed.ProcessGroup):
-        local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
-            dtype=torch.int64,
-            device=device,
-        )
+    def all_gather(
+        self,
+        device,
+        group: torch.distributed.ProcessGroup,
+        buffers: _MLPSyncBuffers,
+    ):
+        buf = buffers.local_tensor
+        buf[0] = self.num_tokens
+        buf[1] = self.num_tokens_for_logprob
+        buf[2] = int(self.can_cuda_graph)
+        buf[3] = int(self.is_extend_in_batch)
+        buf[4] = int(self.local_can_run_tbo)
+        buf[5] = self.local_forward_mode
 
         torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
+            buffers.global_tensor_flat,
+            buffers.local_tensor,
             group=group,
         )
-        if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
-        else:
-            tp_active_ranks = get_tp_group().active_ranks
 
-        # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        # Fast path: skip inactive-rank fixup when all ranks are active (common case).
+        if buffers.has_inactive_ranks:
+            tp_group = get_tp_group()
+            tp_active_ranks = (
+                tp_group.active_ranks_cpu if device == "cpu" else tp_group.active_ranks
+            )
+            tp_info = buffers.global_tensor.view(
+                self.dp_size * self.tp_size * self.cp_size, 6
+            )
+            tp_info[tp_active_ranks == 0] = buffers.fallback_tensor
 
-        tp0_info = global_info_tensor[:, 0, :]
+        tp0_info = buffers.global_tensor[:, 0, :]
         self.tp0_info = tp0_info
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
-        self.global_num_tokens = cpu_data[:, 0].tolist()
-        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+
+        cpu_tp0_info = tp0_info if device == "cpu" else tp0_info.cpu()
+        self.cpu_tp0_info = cpu_tp0_info
+        self.global_num_tokens = cpu_tp0_info[:, 0].tolist()
+        self.global_num_tokens_for_logprob = cpu_tp0_info[:, 1].tolist()
+        self.can_cuda_graph = bool(cpu_tp0_info[:, 2].min().item())
+        self.is_extend_in_batch = bool(cpu_tp0_info[:, 3].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                cpu_tp0_info[:, 5].tolist()
+            )
 
 
 def _update_gather_batch(
@@ -173,7 +234,6 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
-    tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
@@ -184,6 +244,7 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    tbo_preparer = _get_tbo_preparer()
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
     mlp_sync_info = MLPSyncBatchInfo(
@@ -199,11 +260,15 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
-        mlp_sync_info.all_gather(device=device, group=group)
+        buffers = _get_or_init_mlp_sync_buffers(
+            dp_size, attn_tp_size, attn_cp_size, device, _INFO_DTYPE
+        )
+        mlp_sync_info.all_gather(device=device, group=group, buffers=buffers)
 
+        # cpu_tp0_info[:, 4:6] is already on CPU – no extra D2H in compute_output.
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info[:, 4:6],
+                mlp_sync_info.cpu_tp0_info[:, 4:6],
             )
         )
 
