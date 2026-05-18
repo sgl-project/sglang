@@ -1774,9 +1774,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        out_cache_loc, req_pool_indices_tensor, _ = alloc_for_extend(self)
 
         # Set fields
         input_embeds = []
@@ -1792,7 +1790,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
             req.extend_batch_idx += 1
