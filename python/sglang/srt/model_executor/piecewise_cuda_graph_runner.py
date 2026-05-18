@@ -388,6 +388,17 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+
+        # During warmup_compile (torch.compile JIT trace) we need LoRA kernels
+        # to appear in the FX graph if --enable-lora is set; otherwise the
+        # compiled model will be missing LoRA ops and capture/replay will mismatch.
+        # Mirror the capture path: empty LoRA ids — kernels still launch, early
+        # return on rank=0. bs=1 for warmup.
+        if self.model_runner.server_args.enable_lora:
+            warmup_lora_ids = [None]
+        else:
+            warmup_lora_ids = None
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -429,8 +440,13 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=warmup_lora_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+            )
+
+        if warmup_lora_ids is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
             )
 
         # Attention backend
@@ -471,6 +487,13 @@ class PiecewiseCudaGraphRunner:
             return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        # B5: lm_head LoRA pruned path raises RuntimeError under use_cuda_graph=True
+        # (lora/layers.py: ParallelLMHeadWithLoRA.apply_lora). Until that path is
+        # made graph-safe, refuse PCG when the active LoRA config targets lm_head.
+        if self.model_runner.server_args.enable_lora and "lm_head" in getattr(
+            self.model_runner.lora_manager, "target_modules", set()
+        ):
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -602,13 +625,15 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                lora_ids=lora_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -817,6 +842,19 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # Re-run prepare_lora_batch with force_cuda_graph=True so the backend
+        # writes batch metadata into the pinned cuda_graph_batch_info buffer
+        # whose address was baked into the captured graph. The upstream call in
+        # forward_batch_info.init_new ran with use_cuda_graph=False (EXTEND is
+        # not in is_cuda_graph()), so we overwrite its fresh allocations here.
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
+
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
