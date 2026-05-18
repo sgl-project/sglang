@@ -18,6 +18,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -262,6 +263,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     layer.w2_weight_bias.float(), requires_grad=False
                 )
 
+        if (
+            self.use_deep_gemm
+            and layer.w13_weight.dtype == torch.bfloat16
+            and get_moe_a2a_backend().is_deepep()
+            and get_deepep_mode().enable_low_latency()
+            and not _is_npu
+            and not _is_hip
+            and hasattr(layer, "dispatcher")
+        ):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
             from flashinfer.fused_moe.core import (
@@ -405,7 +417,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
             )
-            and get_moe_a2a_backend().is_none()
+            and get_moe_a2a_backend().supports_aiter()
         ):
             self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
@@ -498,7 +510,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return self.runner.run(dispatch_output, quant_info)
         else:
             if self._aiter_runner is not None:
-                from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    AiterMoeQuantInfo,
+                )
 
                 try:
                     quant_info = AiterMoeQuantInfo(
