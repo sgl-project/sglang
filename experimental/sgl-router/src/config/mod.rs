@@ -370,7 +370,9 @@ namespace = "default"
     /// setting plain mode. The empty-rejection is a PD-mode-only safeguard.
     #[test]
     fn k8s_mode_accepts_empty_plain_label_selector() {
-        let mode = k8s_cfg(Some(""), None, None).mode().expect("plain mode valid");
+        let mode = k8s_cfg(Some(""), None, None)
+            .mode()
+            .expect("plain mode valid");
         match mode {
             K8sDiscoveryMode::Plain { label_selector } => {
                 assert_eq!(label_selector, "");
