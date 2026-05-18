@@ -10,6 +10,8 @@ from torch.nn.parameter import Parameter
 # Import to register custom ops for torch.compile compatibility
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
+    is_tensor_in_symmetric_mempool,
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -21,6 +23,7 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
+    _moe_output_buf,
     register_fused_func,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -877,14 +880,29 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     )
     activation_type = get_activation_type(runner_config.activation)
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        num_tokens = hs_fp4.shape[0]
-        hidden_size = (
-            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    num_tokens = hs_fp4.shape[0]
+    hidden_size = (
+        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    )
+    _provided = _moe_output_buf.get()
+    _symm_required = is_allocation_symmetric()
+    if (
+        _provided is not None
+        and _provided.shape == (num_tokens, hidden_size)
+        and _provided.dtype == hidden_states.dtype
+        and _provided.device == hs_fp4.device
+        and (
+            not _symm_required
+            or not is_symmetric_memory_enabled()
+            or is_tensor_in_symmetric_mempool(_provided)
         )
-        symm_output = torch.empty(
-            num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
-        )
+    ):
+        symm_output = _provided
+    else:
+        with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
+            )
 
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
