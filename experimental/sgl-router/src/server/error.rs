@@ -69,9 +69,15 @@ pub enum ApiError {
 
     /// A request whose lifetime exceeded `stale_request_timeout` — the
     /// active-load janitor force-expired the in-flight bookkeeping
-    /// while the request was still pending. Reserved for the M5 wire-up
-    /// path; M4 emits the warn log but does not yet plumb this back to
-    /// the client.
+    /// AND fired the per-request cancellation token, which the chat
+    /// handler `select!`-races against the upstream fetch.  When the
+    /// token wins, the handler returns this variant → HTTP 504 →
+    /// client sees `stale_request_expired`.
+    ///
+    /// Mapped to 504 (not 503) because the failure is a router-side
+    /// gateway timeout from the client's perspective: the upstream
+    /// worker is still potentially fine, the router gave up because
+    /// the per-request budget elapsed.
     #[error("stale request expired for model {model}")]
     StaleRequestExpired { model: String },
 
@@ -126,7 +132,7 @@ impl ApiError {
                 "no_decode_workers_available",
             ),
             ApiError::StaleRequestExpired { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, "stale_request_expired")
+                (StatusCode::GATEWAY_TIMEOUT, "stale_request_expired")
             }
             ApiError::PolicySelectionFailed { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
@@ -212,7 +218,7 @@ impl IntoResponse for ApiError {
                 tracing::warn!(
                     model = %model,
                     reason = "stale_request_expired",
-                    "service unavailable",
+                    "stale-request janitor expired in-flight request",
                 );
                 "request expired before completion".to_string()
             }
