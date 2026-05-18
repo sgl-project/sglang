@@ -152,7 +152,8 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)

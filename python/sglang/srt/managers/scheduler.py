@@ -2577,7 +2577,7 @@ class Scheduler(
             self._chunked_req_scheduled_last_iter = True
 
         if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+            self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
