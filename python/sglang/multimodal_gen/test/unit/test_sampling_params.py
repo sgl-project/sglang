@@ -280,20 +280,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("height", explicit_fields)
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
-        """Regression test for the DiffGenerator.generate() per-prompt loop.
-
-        DiffGenerator clones the user-built SamplingParams via
-        ``dataclasses.replace`` to override prompt/output_file_name/image_path.
-        Because ``dataclasses.replace`` only copies dataclass fields, the
-        dynamically-set ``_explicit_fields`` attribute used to be silently
-        dropped on the cloned instance. Downstream stages (e.g.
-        InputValidationStage) consume ``_explicit_fields`` to decide whether
-        to honor user-supplied ``width``/``height`` or replace them with
-        aspect-ratio-derived defaults.
-
-        DiffGenerator must restore ``_explicit_fields`` after the replace,
-        and add the keys it overrode.
-        """
+        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
         import dataclasses
 
         server_args = MagicMock()
@@ -315,11 +302,9 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
                 height=512,
             )
 
-        # Sanity check: original has user-explicit width/height tracked.
         self.assertIn("width", sampling_params_orig._explicit_fields)
         self.assertIn("height", sampling_params_orig._explicit_fields)
 
-        # Plain dataclasses.replace drops the dynamic attribute.
         cloned = dataclasses.replace(
             sampling_params_orig,
             prompt="new",
@@ -328,17 +313,14 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         )
         self.assertFalse(hasattr(cloned, "_explicit_fields"))
 
-        # Mirror the fix in DiffGenerator.generate(): restore the set, plus
-        # the keys we just overrode.
+        # Mirror the restore done in DiffGenerator.generate().
         cloned._explicit_fields = getattr(
             sampling_params_orig, "_explicit_fields", set()
         ) | {"prompt", "output_file_name", "image_path"}
 
         explicit = set(cloned.build_request_extra()["explicit_fields"])
-        # User-supplied dims must survive so InputValidationStage honors them.
         self.assertIn("width", explicit)
         self.assertIn("height", explicit)
-        # And the overridden keys must be marked explicit too.
         self.assertIn("prompt", explicit)
         self.assertIn("image_path", explicit)
 
