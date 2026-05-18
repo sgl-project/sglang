@@ -151,8 +151,10 @@ class DecodeReqToTokenPool:
         assert (
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
+        # Relayer cpu_value channel resolve when kv_committed ctx is set.
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].is_chunked > 0 or reqs[i].relayer_resolve_kv_committed_len() > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)

@@ -167,8 +167,12 @@ class ReqToTokenPool:
         #     assert (
         #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
+        # Read kv_committed_len via the Relayer cpu_value channel when each
+        # req has a kv_committed ctx attached (set by process_batch_result);
+        # falls back to the attribute when not.
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].is_chunked > 0 or reqs[i].relayer_resolve_kv_committed_len() > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
