@@ -359,11 +359,13 @@ class MiMoProcessor:
         pad_token_id=None,
         rope_type="rope",
         video_process_num_threads=16,
+        video_decode_num_threads=0,
         device=None,
         **kwargs,
     ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
+        self.video_decode_num_threads = video_decode_num_threads
 
         if device is None:
             self.device = None
@@ -546,6 +548,20 @@ class MiMoProcessor:
         if "sampling_rate" in audio_cfg and "audio_sampling_rate" not in kwargs:
             kwargs["audio_sampling_rate"] = audio_cfg["sampling_rate"]
 
+        image_cfg = (mm_config or {}).get("image", {})
+        if "device" in image_cfg:
+            kwargs["device"] = image_cfg["device"]
+
+        video_cfg = (mm_config or {}).get("video", {})
+        if "video_decode_num_threads" in video_cfg:
+            kwargs["video_decode_num_threads"] = video_cfg["video_decode_num_threads"]
+        else:
+            from sglang.srt.utils.common import get_int_env_var
+
+            kwargs["video_decode_num_threads"] = get_int_env_var(
+                "SGLANG_ENCODER_VIDEO_DECODE_NUM_THREADS", 0
+            )
+
         kwargs.update(overrides)
         return cls(**kwargs)
 
@@ -591,7 +607,10 @@ class MiMoProcessor:
                     f"Unsupported video input type for EPD encoder: {type(video_data)}"
                 )
 
-        vdw = VideoDecoderWrapper(video_blob, device="cpu")
+        vdw = VideoDecoderWrapper(
+            video_blob, device="cpu",
+            num_decode_threads=self.video_decode_num_threads,
+        )
         try:
             video_tuple = _decode_frames_and_timestamps(
                 vdw, self.default_video_processor_kwargs
@@ -616,7 +635,8 @@ class MiMoProcessor:
             all_patches, all_grids = [], []
             for img in mm_data:
                 img_tensor, _, _ = self.get_visual_transform(
-                    img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+                    img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
+                    device=self.device,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
                 all_patches.append(patches)
