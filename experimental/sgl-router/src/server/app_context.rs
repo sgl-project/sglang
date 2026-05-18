@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::tokenizer::TokenizerRegistry;
@@ -16,6 +17,11 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
+    /// Per-worker active-load bookkeeping (M4). Shared between the proxy
+    /// (which mints guards on the request hot path), the cache-aware
+    /// policy (which reads per-worker load when scoring candidates), and
+    /// the stale-request janitor (which sweeps expired entries).
+    pub active_load: Arc<ActiveLoadRegistry>,
     ready: AtomicBool,
 }
 
@@ -27,12 +33,35 @@ impl AppContext {
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
     ) -> Self {
+        Self::with_active_load(
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            ActiveLoadRegistry::with_defaults(),
+        )
+    }
+
+    /// Construct an [`AppContext`] with an explicit [`ActiveLoadRegistry`].
+    /// Production wires the default (5-minute timeout, SystemTimeClock)
+    /// via [`Self::new`]; tests that exercise the janitor pass a registry
+    /// built with a `MockClock`.
+    pub fn with_active_load(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        active_load: Arc<ActiveLoadRegistry>,
+    ) -> Self {
         Self {
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            active_load,
             ready: AtomicBool::new(false),
         }
     }
@@ -67,11 +96,10 @@ impl AppContext {
                 },
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
-            proxy: Arc::new(
-                Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy"),
-            ),
+            proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
+            active_load: ActiveLoadRegistry::with_defaults(),
             ready: AtomicBool::new(false),
         }
     }
