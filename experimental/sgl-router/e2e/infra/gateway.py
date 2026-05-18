@@ -48,14 +48,44 @@ DEFAULT_BINARY = (
 
 
 def _get_open_port() -> int:
-    """Reserve an ephemeral TCP port. Returns the port and closes the socket
-    so the caller can immediately bind it. Small race window — acceptable
-    for test infra; production code would pass `port=0` to the binder
-    directly.
+    """Reserve an ephemeral TCP port in [20000, 55535].
+
+    The router itself doesn't have the ``port + 10000`` gRPC-derivation
+    constraint that SGLang's launch_server does, but we cap the range
+    anyway so the e2e helpers behave consistently across components.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if 20000 <= port <= 55535:
+            return port
+    raise RuntimeError(
+        "could not allocate an ephemeral port in [20000, 55535] after 50 tries"
+    )
+
+
+def _resolve_tokenizer_path(tokenizer_path: str) -> str:
+    """Resolve a HuggingFace repo ID to a local ``tokenizer.json`` path.
+
+    sgl-router's tokenizer loader treats the input as a filesystem path and
+    inspects its extension; a bare HF id like ``Qwen/Qwen3-0.6B`` looks
+    like a file with extension ``.6B`` and is rejected. When the HF Hub
+    cache already has the tokenizer, point the loader at the on-disk
+    ``tokenizer.json`` directly. Pass paths/URLs through unchanged.
+    """
+    p = Path(tokenizer_path)
+    if p.exists():
+        return str(p)
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import]
+
+        cached = try_to_load_from_cache(tokenizer_path, "tokenizer.json")
+        if cached and Path(cached).is_file():
+            return str(cached)
+    except Exception:  # noqa: BLE001
+        pass
+    return tokenizer_path
 
 
 @dataclass
@@ -248,7 +278,7 @@ class Gateway:
         # the router. We write that file as well and reference it from the
         # main config.
         workers_toml = "\n".join(
-            f'[[workers]]\nid = "w{i}"\nurl = "{u}"\nmode = "Plain"\nmodel_ids = ["{model_id}"]'
+            f'[[workers]]\nid = "w{i}"\nurl = "{u}"\nmode = "plain"\nmodel_ids = ["{model_id}"]'
             for i, u in enumerate(worker_urls)
         )
         return self._compose_main_config(
@@ -271,11 +301,11 @@ class Gateway:
         entries = []
         for i, u in enumerate(prefill_urls):
             entries.append(
-                f'[[workers]]\nid = "p{i}"\nurl = "{u}"\nmode = "Prefill"\nmodel_ids = ["{model_id}"]'
+                f'[[workers]]\nid = "p{i}"\nurl = "{u}"\nmode = "prefill"\nmodel_ids = ["{model_id}"]'
             )
         for i, u in enumerate(decode_urls):
             entries.append(
-                f'[[workers]]\nid = "d{i}"\nurl = "{u}"\nmode = "Decode"\nmodel_ids = ["{model_id}"]'
+                f'[[workers]]\nid = "d{i}"\nurl = "{u}"\nmode = "decode"\nmodel_ids = ["{model_id}"]'
             )
         workers_toml = "\n".join(entries)
         return self._compose_main_config(
@@ -306,9 +336,11 @@ class Gateway:
         for em in extra_models:
             extra_model_toml += (
                 f'\n[[models]]\nid = "{em["id"]}"\n'
-                f'tokenizer_path = "{em["tokenizer_path"]}"\n'
+                f'tokenizer_path = "{_resolve_tokenizer_path(em["tokenizer_path"])}"\n'
                 f'policy = "{em.get("policy", policy)}"\n'
             )
+
+        resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
         return f"""\
 [server]
@@ -317,7 +349,7 @@ port = {self.port}
 
 [[models]]
 id = "{model_id}"
-tokenizer_path = "{tokenizer_path}"
+tokenizer_path = "{resolved_tokenizer}"
 policy = "{policy}"
 {extra_model_toml}
 
