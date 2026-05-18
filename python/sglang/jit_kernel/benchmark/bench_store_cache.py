@@ -14,7 +14,7 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.kvcache import store_cache
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=9, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
 def sglang_jit_store_cache(

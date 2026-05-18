@@ -112,7 +112,6 @@ class TestH200Fp8FlashCP(DSV4FlashAime25TestBase):
     ]
     EXTRA_ENV = {
         **H200_FP8_ENV,
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }
 

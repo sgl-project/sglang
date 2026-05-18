@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
+import torch
+
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -15,7 +17,8 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -108,6 +111,26 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def supports_target_verify_for_draft(self) -> bool:
+        return self.is_dflash()
+
+    def create_future_map(
+        self,
+        max_running_requests: int,
+        chunked_prefill_size: int,
+        context_len: int,
+        device: torch.device,
+    ) -> FutureMap:
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            max_running_requests,
+            chunked_prefill_size,
+            context_len,
+            device,
+            self,
+        )
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
@@ -233,11 +256,11 @@ class SpecInput(ABC):
         pass
 
     def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> Tuple[List[int], List[int]]:
         c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
+        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
         global_num_tokens_for_logprob = [
-            x * c2 for x in forward_batch.global_num_tokens_for_logprob
+            x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
