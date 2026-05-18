@@ -772,6 +772,6 @@ def _chunk_state_varlen_native(
 
 
 if _is_npu:
-    from sgl_kernel_npu.mamba.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_sate_fwd
+    from sgl_kernel_npu.mamba.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 
     chunk_state_varlen = _chunk_state_varlen_native
