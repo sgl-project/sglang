@@ -148,14 +148,8 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
-        token_to_kv_pool: object = None,
     ):
         self.custom_mem_pool = custom_mem_pool
-        # Optional ref to the local rank's KV pool — used to pull the canary
-        # snapshot (k_req + prev_hash_tail) for each prefilled req so the
-        # decode side can continue the chain. None means "no canary"; set_buf
-        # then just writes zeros into the canary metadata slots.
-        self.token_to_kv_pool = token_to_kv_pool
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -207,15 +201,6 @@ class MetadataBuffers:
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
-            # KV cache canary: K_req (high-water mark) + prev_hash_tail
-            # transported from prefill to decode so the canary chain continues
-            # across the PD boundary. Padded to 8 elements to satisfy the
-            # RDMA 64-byte minimum (8 * int64 = 64 bytes). Slot [0] is the
-            # actual value; slots [1..7] are reserved.
-            self.canary_k_req = torch.zeros((size, 8), dtype=torch.int64, device=device)
-            self.canary_prev_hash_tail = torch.zeros(
-                (size, 8), dtype=torch.int64, device=device
-            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -229,8 +214,6 @@ class MetadataBuffers:
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
             self.bootstrap_room.data_ptr(),
-            self.canary_k_req.data_ptr(),
-            self.canary_prev_hash_tail.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -243,8 +226,6 @@ class MetadataBuffers:
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
             self.bootstrap_room.nbytes,
-            self.canary_k_req.nbytes,
-            self.canary_prev_hash_tail.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -257,8 +238,6 @@ class MetadataBuffers:
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
-            self.canary_k_req[0].nbytes,
-            self.canary_prev_hash_tail[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -274,8 +253,6 @@ class MetadataBuffers:
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
-            self.canary_k_req[idx].clone(),
-            self.canary_prev_hash_tail[idx].clone(),
         )
 
     def set_buf(self, req: Req):
@@ -325,21 +302,6 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
-        # KV cache canary: snapshot K_req + prev_hash_tail so the decode side
-        # can continue the chain across the PD boundary. Pool may not have a
-        # canary attached (returns 0/0 → decode treats as fresh chain).
-        if self.token_to_kv_pool is not None and req.req_pool_idx is not None:
-            from sglang.srt.kv_cache_canary.api import export_pd_canary_snapshot
-            from sglang.srt.kv_cache_canary.host_state import to_signed_int64
-
-            k_req, prev_hash_tail = export_pd_canary_snapshot(
-                pool=self.token_to_kv_pool,
-                req_pool_idx=int(req.req_pool_idx),
-            )
-            self.canary_k_req[req.metadata_buffer_index, 0] = k_req
-            self.canary_prev_hash_tail[req.metadata_buffer_index, 0] = to_signed_int64(
-                prev_hash_tail
-            )
 
 
 #########################
