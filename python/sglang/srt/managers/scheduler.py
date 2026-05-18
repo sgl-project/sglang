@@ -1363,14 +1363,16 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
         )
-        # Legacy 2-iter Python ref pin storage. The Relayer now owns the
-        # canonical ``_iter_pin_ring`` (see ``Relayer.begin_iter_pin``); these
-        # attributes stay as a back-compat alias for any direct indexer that
-        # was reading ``self.batch_record_buf[ct]`` (memory checker, dumpers).
-        # Both views point to the same Python list, so external readers see
-        # the same data the Relayer ring carries.
-        self.batch_record_buf = [None] * 2
-        self.batch_record_ct = 0
+
+    @property
+    def batch_record_buf(self):
+        # Alias of the Relayer iter-pin ring. None in non-overlap / MLX
+        # paths where ref retention is not driven by the ring.
+        return self.relayer._iter_pin_ring if self.relayer is not None else None
+
+    @property
+    def batch_record_ct(self):
+        return self.relayer._iter_pin_ct if self.relayer is not None else 0
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -2870,9 +2872,6 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                # Bind Relayer ctx so prepare_for_decode's writes auto-mirror
-                # to the gpu_scalar channel; the mixed batch downstream then
-                # carries the relayer view forward.
                 self.running_batch.bind_relayer_for_iter(self.relayer)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
@@ -2998,95 +2997,38 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Bind this iter's Relayer slots BEFORE prepare_for_decode so its
-        # writes to ``seq_lens`` / ``seq_lens_cpu`` / ``orig_seq_lens``
-        # auto-mirror into the gpu_scalar channel via ScheduleBatch
-        # ``__setattr__``. The same slots are consumed downstream by
-        # ``run_batch`` (no re-allocation) and by ``process_batch_result``
-        # (kv_committed_delta / finished_status store).
+        # Bind Relayer slots before prepare_for_decode so its explicit
+        # store of seq_lens family lands on this iter's slot; run_batch
+        # and process_batch_result reuse the same slots.
         batch.bind_relayer_for_iter(self.relayer)
-
-        # Update batch tensors
         batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):  # noqa: D401
-        # Relayer-owned iter pin: this method now routes the legacy
-        # ``batch_record_buf`` machinery through ``Relayer.begin_iter_pin``
-        # so the 2-iter Python ref retention is a Relayer service rather
-        # than a Scheduler-local list. The legacy ``self.batch_record_buf``
-        # is kept as a thin shim writing to the relayer ring for the few
-        # remaining callsites that still index into it directly.
-        if self.relayer is not None:
-            slot = self.relayer.begin_iter_pin()
-            self.relayer.add_iter_pin(batch)
-            # Snapshot all SB fields to preserve any tensor refs that
-            # downstream forward kernels still consume by reading the SB
-            # attribute lookup pattern (legacy path).
-            attr_snapshot = [
-                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-            ]
-            self.relayer.add_iter_pin(attr_snapshot)
-            self.batch_record_ct = slot
-            self.batch_record_buf[slot] = self.relayer._iter_pin_ring[slot]
-            return
-        # Legacy fallback (no relayer): retain the prior 2-iter behavior.
-        self._record_batch_in_overlap_legacy(batch)
-
-    def _record_batch_in_overlap_legacy(self, batch: ScheduleBatch):
-        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
-        # NOTE: More Reliable: record all tensors into the forward stream
-        # NOTE: - for all future tensors, we shall always read from future map
-        #       - for all non-future tensors (produced only by schedule stream),
-        #       we shall keep its reference not being release during all the forwarding pass
-        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
+        # Pin batch + SB attr snapshot for 2 iters via Relayer iter-pin ring
+        # so cross-stream tensor refs survive the schedule-side return.
+        self.relayer.begin_iter_pin()
+        self.relayer.add_iter_pin(batch)
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        # List (not tuple) so that workers can register additional refs via
-        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
-        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+        self.relayer.add_iter_pin(attr_snapshot)
 
     @contextmanager
     def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Make SB transactional across one overlap forward.
+        """Isolate SB across one overlap forward.
 
-        1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
-           input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
-           only need sampling_info restored - V1 carries spec_info forward as
-           next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
-           shares the pre-accumulated penalty buffer) so V2's multiple init_new
-           calls don't double-accumulate penalties.
-        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
-           tensors in the snapshot survive the caching allocator past the
-           forward stream. Must run AFTER the sampling_info swap so the
-           forward-only copy gets pinned.
+        Swap sampling_info to a forward-only view (penalizer orchestrator
+        detached) so spec V2 multi-pass init_new calls don't double-
+        accumulate penalty state. Pin batch + attr snapshot for 2 iters
+        so cross-stream tensor refs survive the schedule-side return.
         """
-        # SB full snapshot/restore is removed: under the relayer-driven
-        # mechanism, forward writes its outputs to gpu_scalar / gpu_tensor /
-        # cpu_value channels, not to SB fields, so there are no mid-forward
-        # SB mutations to revert. The post-context ``batch.spec_info`` /
-        # ``batch.seq_lens`` assignment in run_batch is the explicit relay
-        # of forward's channel outputs back to the SB surface for the next
-        # iter, and remains required.
         sched_sampling_info = batch.sampling_info
-
-        # Sampling_info substitute. Stash the live sampling_info (with its
-        # penalizer orchestrator and per-iter penalty accumulator state) on
-        # the Relayer state_obj channel so cross-iter consumers of the
-        # orchestrator state can resolve via the relayer; the finally block
-        # below rebinds batch.sampling_info = sched_sampling_info on exit.
         if sched_sampling_info is not None:
             if self.relayer is not None:
                 self.relayer.stash_sampling_state("sampling_info", sched_sampling_info)
             batch.sampling_info = sched_sampling_info.derive_forward_view()
 
-        # Pin batch for 2-iter tensor lifetime. Retained for non-relay
-        # transient tensors that schedule-side allocates and forward reads
-        # (e.g. multimodal embeds); relay-flow tensors live in channel slot
-        # pools and own their own lifetime.
         self.record_batch_in_overlap(batch)
 
         try:
@@ -3101,18 +3043,8 @@ class Scheduler(
         batch_result,
         future_indices,
     ):
-        """Apply the spec V2 forward-output relay to the SB.
-
-        The ``next_draft_input`` payload (topk_p / topk_index / bonus_tokens /
-        new_seq_lens / hidden_states) is already on the gpu_scalar channel by
-        the time this runs (via ``store_to_map_for_new_batch``). What remains
-        is the explicit handoff to the SB so the next-iter schedule can read
-        these as if they were ordinary SB attributes: the new draft input is
-        bound to ``batch.spec_info`` with its ``future_indices`` so consumer
-        ``resolve_future`` will pull the channel slot; the new lens is set
-        on ``batch.seq_lens`` which, when a Relayer seq_lens ctx is attached,
-        will also mirror into the gpu_scalar channel via ``__setattr__``.
-        """
+        """Hand off spec V2 forward outputs (already on gpu_scalar slot) to SB
+        for the next-iter schedule consumer."""
         batch.spec_info = batch_result.next_draft_input
         batch.spec_info.future_indices = future_indices
         batch.seq_lens = batch_result.next_draft_input.new_seq_lens
@@ -3140,18 +3072,10 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
-                    # Read SB size via channel-resolved view so the
-                    # batch-size measurement uses the same seq_lens slot
-                    # forward will consume from the Relayer; equivalent to
-                    # ``len(batch.seq_lens)`` when no ctx is bound.
                     bs = len(batch.relayer_resolve_seq_lens())
-                    # Prefer SB-attached iter slots (set by
-                    # ``ScheduleBatch.bind_relayer_for_iter`` during the
-                    # schedule pass) so prepare_for_decode's writes have
-                    # already mirrored to the same gpu_scalar slot. Fall
-                    # back to fresh alloc for batches that did not flow
-                    # through the relayer-aware schedule pass (e.g. some
-                    # disagg prefill paths).
+                    # Reuse SB-bound iter slots (from bind_relayer_for_iter
+                    # in the schedule pass); fall back to fresh alloc for
+                    # batches that bypassed it (e.g. disagg prefill).
                     future_indices = getattr(
                         batch, "_relayer_iter_gpu_fi", None
                     ) or self.relayer.alloc_future_indices(bs)
@@ -3162,30 +3086,16 @@ class Scheduler(
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.relayer.resolve_future(batch)
-                        # Build the ForwardData snapshot at the ownership
-                        # boundary: from this point on the forward stream
-                        # consumes FD, not the live SB. SB-side mutations
-                        # after this line will not be visible to forward
-                        # (FD captured a snapshot of the relevant fields).
+                        # FD snapshot is the ownership boundary: from here
+                        # forward consumes FD, not the live SB.
                         forward_data = batch.to_forward_data()
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             forward_data
                         )
-                        # Park any refs the worker wants kept alive 2 iters
-                        # (cross-stream tensor lifetime; pinned in the same
-                        # ring slot as the SB attr snapshot).
                         if batch_result.extra_keep_alive_refs:
-                            # Route worker-registered keep-alive refs through
-                            # the Relayer iter pin so the lifetime owner is
-                            # the Relayer (not the Scheduler-local
-                            # batch_record_buf). The legacy list is still
-                            # updated as a shim for any direct indexer.
                             self.relayer.add_iter_pin(
                                 *batch_result.extra_keep_alive_refs
-                            )
-                            self.batch_record_buf[self.batch_record_ct].extend(
-                                batch_result.extra_keep_alive_refs
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
@@ -3198,25 +3108,12 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
                         batch_result.cpu_future_indices = cpu_future_indices
-                        # Attach the relayer ctx to the live SB so the next
-                        # iter's filter_batch (called on self.last_batch =
-                        # this same SB) can resolve forward-driven per-req
-                        # decisions from the cpu_value channel rather than
-                        # from the legacy in-place CPU mutation.
                         batch.set_relayer_ctx(self.relayer, cpu_future_indices)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # Spec V2 relay step: forward N's verify kernel emits
-                    # ``next_draft_input`` (carrying topk_p / topk_index /
-                    # bonus_tokens / new_seq_lens / hidden_states) on the
-                    # gpu_scalar channel via ``store_to_map_for_new_batch``
-                    # above; the explicit handles below thread this iter's
-                    # future indices into the draft input and bind the
-                    # new_seq_lens onto SB so the next-iter schedule sees a
-                    # settled view.
                     self._apply_spec_v2_relay_outputs(
                         batch, batch_result, future_indices
                     )
@@ -3229,10 +3126,6 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                # Non-overlap path: forward sees a ForwardData snapshot the
-                # same way the overlap path does. This is the unified
-                # ownership-boundary entry: after to_forward_data() returns,
-                # SB-side mutations are not visible to forward.
                 forward_data = batch.to_forward_data()
                 batch_result = self.model_worker.forward_batch_generation(
                     forward_data, **kwargs
@@ -3312,12 +3205,10 @@ class Scheduler(
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
 
-        # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
-        # iteration, causing a steady VRAM leak with structured output.
+        # Release the delay_sample_func closure (captures forward_batch +
+        # logits_output): without this the closure stays alive via
+        # batch_result in result_queue and the iter-pin ring, causing a
+        # steady VRAM leak with structured output.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None

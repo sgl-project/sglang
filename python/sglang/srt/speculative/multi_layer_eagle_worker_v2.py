@@ -804,7 +804,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
-        # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
+        # via extra_keep_alive_refs through Relayer.add_iter_pin.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,

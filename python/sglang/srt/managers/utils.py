@@ -39,10 +39,8 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
-    # Parallel slot allocation on the cpu_value channel for Python-state
-    # relays (kv_committed_delta, finished status). Allocated in lockstep
-    # with ``future_indices`` so producer (process_batch_result) and consumer
-    # (next iter cache_finished_req / prepare_for_decode) share a key.
+    # cpu_value channel slot for kv_committed_delta / finished status,
+    # allocated in lockstep with future_indices.
     cpu_future_indices: Optional[FutureIndices] = None
     speculative_num_draft_tokens: Optional[int] = None
 
@@ -53,11 +51,7 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
-    # Refs the worker wants scheduler to keep alive for the same 2-iter window
-    # as the legacy ``batch_record_buf`` shim. Routed through
-    # ``Relayer.add_iter_pin`` in run_batch so the Relayer owns the lifetime
-    # window rather than the Scheduler-local list; kept on this dataclass
-    # only as a transport between the worker and the run_batch wiring.
+    # Worker-registered refs to pin for 2 iters via Relayer.add_iter_pin.
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling

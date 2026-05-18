@@ -279,6 +279,10 @@ class Relayer:
         self.cpu_value = CpuValueChannel(future_buffer_len)
         self.state_obj = StateObjChannel()
 
+        # Iter-pin ring: 2 slots of Python ref lists, rotated each iter.
+        self._iter_pin_ring: list = [None, None]
+        self._iter_pin_ct: int = 0
+
         if self.spec_algo.is_none():
             self.gpu_scalar.ensure_buffer("token_ids", torch.Size(()), torch.int64)
 
@@ -407,18 +411,11 @@ class Relayer:
     # ------------------------------------------------------------------
 
     def begin_iter_pin(self) -> int:
-        if not hasattr(self, "_iter_pin_ring"):
-            self._iter_pin_ring = [None, None]
-            self._iter_pin_ct = 0
         self._iter_pin_ct = (self._iter_pin_ct + 1) % 2
         self._iter_pin_ring[self._iter_pin_ct] = []
         return self._iter_pin_ct
 
     def add_iter_pin(self, *refs):
         """Pin ``refs`` for two iters (slot survives one rotation)."""
-        slot = getattr(self, "_iter_pin_ring", None)
-        if slot is None:
-            self.begin_iter_pin()
-            slot = self._iter_pin_ring
         for ref in refs:
-            slot[self._iter_pin_ct].append(ref)
+            self._iter_pin_ring[self._iter_pin_ct].append(ref)
