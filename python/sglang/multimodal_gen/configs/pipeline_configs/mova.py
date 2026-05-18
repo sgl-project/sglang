@@ -40,7 +40,11 @@ class MOVAPipelineConfig(PipelineConfig):
     vae_config: WanVAEConfig = field(default_factory=WanVAEConfig)
     vae_precision: str = "bf16"
     audio_vae_config: DacVAEConfig = field(default_factory=DacVAEConfig)
-    audio_vae_precision: str = "bf16"
+    # TEMP REVERT for CI causation experiment: PR #25411 changed this from
+    # "fp32" -> "bf16" on 2026-05-16; cluster R53 (HIPRTC uint32_t on DAC
+    # snake) started failing immediately after. This branch flips just this
+    # one line back to "fp32" to confirm causation. DO NOT MERGE.
+    audio_vae_precision: str = "fp32"
 
     # Text encoder (UMT5 compatible)
     text_encoder_configs: tuple = field(default_factory=lambda: (T5Config(),))
