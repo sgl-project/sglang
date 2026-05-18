@@ -395,6 +395,7 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        kv = kv.contiguous()
         fused_norm_rope_inplace(
             kv,
             self.kv_norm.weight.data,
