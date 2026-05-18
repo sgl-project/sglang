@@ -1714,6 +1714,21 @@ class Scheduler(
             else:
                 recv_reqs = None
 
+        # PP downstream: unwrap write-ack count piggybacked on recv_reqs
+        if (
+            self.pp_rank > 0
+            and isinstance(recv_reqs, dict)
+            and "pp_write_ack_count" in recv_reqs
+        ):
+            pp_write_ack_count = recv_reqs.get("pp_write_ack_count", 0)
+            recv_reqs = recv_reqs.get("recv_reqs", [])
+            if (
+                pp_write_ack_count > 0
+                and self.enable_hicache_storage
+                and hasattr(self.tree_cache, "set_pp_upstream_write_ack_count")
+            ):
+                self.tree_cache.set_pp_upstream_write_ack_count(pp_write_ack_count)
+
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 

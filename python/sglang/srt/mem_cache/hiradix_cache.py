@@ -179,6 +179,14 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        # PP write-backup ack count sync: upstream rank records how many acks
+        # it consumed, downstream rank caps its consumption accordingly.
+        # NOTE: must be None (not 0) — None means "no budget signal received yet,
+        # skip capping entirely". Using 0 would cap all acks to zero on startup
+        # before any upstream signal arrives, causing write-through deadlock.
+        self._pp_write_ack_budget_from_upstream: Optional[int] = None
+        self._pp_last_write_ack_consumed: int = 0
+
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -744,6 +752,16 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
+    def set_pp_upstream_write_ack_count(self, count: int):
+        if self._pp_write_ack_budget_from_upstream is None:
+            self._pp_write_ack_budget_from_upstream = 0
+        self._pp_write_ack_budget_from_upstream += count
+
+    def get_pp_last_write_ack_consumed(self) -> int:
+        count = self._pp_last_write_ack_consumed
+        self._pp_last_write_ack_consumed = 0
+        return count
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
@@ -776,6 +794,19 @@ class HiRadixCache(RadixCache):
         self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())
+
+        # PP downstream: cap consumption by upstream budget
+        if (
+            self.pp_size > 1
+            and self.pp_rank > 0
+            and self._pp_write_ack_budget_from_upstream is not None
+        ):
+            finish_count = min(finish_count, self._pp_write_ack_budget_from_upstream)
+            self._pp_write_ack_budget_from_upstream -= finish_count
+            if self._pp_write_ack_budget_from_upstream <= 0:
+                self._pp_write_ack_budget_from_upstream = None
+
+        consumed_count = finish_count
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
@@ -787,6 +818,10 @@ class HiRadixCache(RadixCache):
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
+
+        # PP upstream: record consumed count for sync to downstream
+        if self.pp_size > 1 and self.pp_rank < self.pp_size - 1:
+            self._pp_last_write_ack_consumed += consumed_count
 
     def loading_check(self):
         finish_count = 0

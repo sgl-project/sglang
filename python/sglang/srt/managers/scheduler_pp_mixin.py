@@ -298,8 +298,18 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
+                    pp_send_payload = recv_reqs
+                    if self.enable_hicache_storage and hasattr(
+                        self.tree_cache, "get_pp_last_write_ack_consumed"
+                    ):
+                        ack_count = self.tree_cache.get_pp_last_write_ack_consumed()
+                        if ack_count > 0:
+                            pp_send_payload = {
+                                "recv_reqs": recv_reqs,
+                                "pp_write_ack_count": ack_count,
+                            }
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        pp_send_payload, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
