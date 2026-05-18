@@ -74,11 +74,15 @@ def plan_batch_from_forward_batch(
 
     K_req (already-written token count per req) is recovered as
     ``extend_prefix_lens`` (chunked prefill) or ``seq_lens - 1`` (decode /
-    target_verify). The verify range is ``[0, K_req)``, capped by
-    ``config.max_verify_per_req_per_forward``. Slot indices for the verify
-    range are pulled from ``forward_batch.req_to_token_pool.req_to_token``
-    (the canary trusts this map; cross-checks come from the kernel side
-    via req_id and position fields stored in the slot itself).
+    target_verify). The verify range is the full ``[0, K_req)`` window —
+    every historical token gets verified every forward (user requirement:
+    a 10k-token decode step verifies all 10k positions). For SWA pools the
+    range is reduced to ``[K_req - window_size, K_req)`` since older slots
+    are no longer addressable through the SWA index mapping. Slot indices
+    for the verify range are pulled from
+    ``forward_batch.req_to_token_pool.req_to_token`` (the canary trusts
+    this map; cross-checks come from the kernel side via req_id and
+    position fields stored in the slot itself).
 
     Returns ``None`` when the plan would be empty (no out_cache_loc, unknown
     forward mode, etc.).
@@ -124,7 +128,6 @@ def plan_batch_from_forward_batch(
     req_to_token_pool = forward_batch.req_to_token_pool
     if req_to_token_pool is None:
         return None
-    cap = int(config.max_verify_per_req_per_forward)
 
     return _build_plan(
         req_pool_indices=req_pool_indices,
@@ -134,7 +137,6 @@ def plan_batch_from_forward_batch(
         out_cache_loc_list=out_cache_loc_list,
         positions_list=positions_list,
         req_to_token_table=req_to_token_pool.req_to_token,
-        verify_cap=cap,
     )
 
 
@@ -147,7 +149,6 @@ def _build_plan(
     out_cache_loc_list: List[int],
     positions_list: Optional[List[int]],
     req_to_token_table: torch.Tensor,
-    verify_cap: int,
 ) -> Optional[BatchPlan]:
     verify_req_ids: List[int] = []
     verify_positions: List[int] = []
@@ -180,7 +181,6 @@ def _build_plan(
                 req_to_token_table=req_to_token_table,
                 req_pool_idx=req_pool_idx_int,
                 k_req=k_req_int,
-                cap=verify_cap,
             )
             window_start = k_req_int - len(slot_indices_for_verify)
             for j, slot_idx in enumerate(slot_indices_for_verify):
@@ -193,8 +193,11 @@ def _build_plan(
                 elif j > 0:
                     verify_prev_slot_indices.append(int(slot_indices_for_verify[j - 1]))
                 else:
-                    # Truncated window head: prev slot lives at column
-                    # (pos - 1) of the same req in req_to_token.
+                    # Window starts at pos > 0 (SWA truncation): prev slot
+                    # lives at column (pos - 1) of the same req in
+                    # req_to_token. For the full-prefix case (window_start
+                    # == 0) j > 0 always holds when pos > 0, so this branch
+                    # is reached only on the SWA path.
                     prev_slot = int(req_to_token_table[req_pool_idx_int, pos - 1])
                     verify_prev_slot_indices.append(prev_slot)
 
@@ -253,21 +256,16 @@ def _pull_verify_slot_indices(
     req_to_token_table: torch.Tensor,
     req_pool_idx: int,
     k_req: int,
-    cap: int,
 ) -> List[int]:
-    """Return slot indices for the verify range of one req.
+    """Return slot indices for the full verify range ``[0, K_req)`` of one req.
 
-    Bounds the per-forward verify cost: the full ``[0, K_req)`` range grows
-    linearly with the req's lifetime. When capped, the TAIL ``cap``
-    positions are verified (most likely to surface a fresh-write bug); the
-    older positions become unverifiable this forward but the next forward
-    re-walks the same window.
+    Every historical position is verified every forward (user requirement:
+    a 10k-prefix decode step verifies all 10k positions). SWA-pool path
+    overrides this in ``plan_batch_from_forward_batch`` to slice the range
+    down to ``[K_req - window_size, K_req)`` since older slots in the SWA
+    index space are no longer addressable.
     """
-    if cap > 0 and k_req > cap:
-        window_start = k_req - cap
-    else:
-        window_start = 0
-    row = req_to_token_table[req_pool_idx, window_start:k_req]
+    row = req_to_token_table[req_pool_idx, :k_req]
     return [int(x) for x in row.detach().cpu().tolist()]
 
 
@@ -493,10 +491,21 @@ class CanaryLaunchBuffers:
         ``plan.num_write`` so a write-req driver that reads
         ``write_*[entry_start + j]`` cannot pick up stale data.
 
-        When the verify plan exceeds capacity, the TAIL is kept and the
-        head is truncated: writes are prioritised (they advance the chain);
-        the next forward's verify entries re-cover the older history.
+        The verify range now covers the full ``[0, K_req)`` of every req
+        (SWA pools clip to ``[K_req - window_size, K_req)`` at plan time),
+        and ``verify_capacity`` is sized off ``max_total_num_tokens`` so
+        the buffer can hold every slot in the pool simultaneously. An
+        overflow here means the plan computed more verify entries than the
+        canary's slot pool — a logic bug, not a budget choice — so we
+        raise instead of silently truncating.
         """
+        if plan.num_verify > self.verify_capacity:
+            raise RuntimeError(
+                f"kv-canary: verify entry count {plan.num_verify} exceeds "
+                f"verify_capacity {self.verify_capacity}. This should be "
+                "unreachable when verify_capacity == max_total_num_tokens; "
+                "indicates a planner bug or undersized capacity."
+            )
         if plan.num_write > self.write_capacity:
             raise RuntimeError(
                 f"kv-canary: write entry count {plan.num_write} exceeds "
@@ -509,9 +518,8 @@ class CanaryLaunchBuffers:
                 f"write_req_capacity {self.write_req_capacity}."
             )
 
-        num_active_verify = min(plan.num_verify, self.verify_capacity)
-        drop = plan.num_verify - num_active_verify
-        v = slice(drop, plan.num_verify)
+        num_active_verify = plan.num_verify
+        v = slice(0, num_active_verify)
 
         device = self.verify_slot_indices.device
 

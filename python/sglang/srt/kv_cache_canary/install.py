@@ -92,14 +92,18 @@ def _compute_launch_capacities(
     - ``write_capacity`` = max_bs * num_tokens_per_bs (extend tokens or
       spec_num_draft_tokens).
     - ``write_req_capacity`` = max_bs.
-    - ``verify_capacity`` = max_bs * max_verify_per_req_per_forward.
+    - ``verify_capacity`` = ``max_total_num_tokens`` — every forward
+      verifies the full per-req prefix, and the sum of all reqs' K_req
+      across one forward is bounded by the global slot pool size. This is
+      the only upper bound that is independent of the (now removed)
+      per-req verify cap.
 
     Padding rows past ``num_active_*`` carry ``*_active_mask == 0`` and the
     kernel short-circuits them with zero I/O, so oversizing is cheap.
     """
     server_args = model_runner.server_args
-    cuda_graph_max_bs = getattr(server_args, "cuda_graph_max_bs", None) or 0
-    spec_num_draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
+    cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+    spec_num_draft_tokens = server_args.speculative_num_draft_tokens
     num_tokens_per_bs = 1
     if spec_num_draft_tokens:
         num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
@@ -107,7 +111,7 @@ def _compute_launch_capacities(
     max_bs = max(int(cuda_graph_max_bs), max_running_requests)
     write_capacity = max_bs * num_tokens_per_bs
     write_req_capacity = max_bs
-    verify_capacity = max_bs * max(1, int(config.max_verify_per_req_per_forward))
+    verify_capacity = max(1, int(model_runner.max_total_num_tokens))
     return verify_capacity, write_capacity, write_req_capacity
 
 

@@ -32,13 +32,6 @@ class CanaryConfig:
     counter_zero_warmup_forwards: int = 64
     perturb_req_to_token_prob: float = 0.0
     perturb_req_to_token_seed: int = 0
-    # Upper bound on per-request verify entries per forward. Verifying the
-    # full [0, K_req) prefix every forward is O(K_req) host work + O(K_req)
-    # GPU slots and grows quadratically over the lifetime of a long req.
-    # When ``history`` exceeds this, plan_batch verifies only the last
-    # ``max_verify_per_req_per_forward`` entries (deterministic head of the
-    # window: most recent positions). 0 = unbounded.
-    max_verify_per_req_per_forward: int = 64
 
     @classmethod
     def from_server_args(cls, mode: str | CanaryMode | None) -> "CanaryConfig":
