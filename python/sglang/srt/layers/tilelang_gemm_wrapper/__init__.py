@@ -9,7 +9,11 @@ from sglang.srt.layers.tilelang_gemm_wrapper.configurer import (
 from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
     clear_cache,
     export_selected_configs,
+    get_candidate_configs,
+    get_kernel_info,
     gemm_nt_f8f8bf16,
+    list_available_configs,
+    load_selected_configs,
     update_tilelang_config,
     warmup_or_autotune_shapes,
 )
@@ -19,9 +23,13 @@ __all__ = [
     "assert_available",
     "clear_cache",
     "export_selected_configs",
+    "get_candidate_configs",
+    "get_kernel_info",
     "gemm_nt_f8f8bf16",
     "get_availability_error",
     "is_available",
+    "list_available_configs",
+    "load_selected_configs",
     "update_tilelang_config",
     "warmup_or_autotune_shapes",
 ]

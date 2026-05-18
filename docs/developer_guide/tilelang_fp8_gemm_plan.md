@@ -20,6 +20,10 @@ Current main has moved on in several relevant areas:
 - Newer TileLang versions provide built-in autotuning and disk cache support,
   so the old Ray tuner and static JSON config-first design should not be
   carried forward as the primary implementation.
+- One important reason the old branch carried its own tuner was that the
+  TileLang `0.1.7` profiler did not support a CUDA graph backend at the time.
+  That made profiler timings inaccurate for small-`M` decode-style GEMMs, so
+  the branch used its own CUDA graph benchmark path instead.
 
 ## Decisions
 
@@ -45,6 +49,8 @@ Current main has moved on in several relevant areas:
 - The implementation depended on checked-in per-device JSON tuning files.
 - Auto backend selection did not include TileLang, even though the branch
   history suggested an intention to enable it broadly.
+- The custom tuner also worked around old TileLang profiler limitations for
+  small-`M` shapes by benchmarking with CUDA graphs.
 - The implementation predated current FP8 dispatch changes and therefore must
   be ported manually instead of rebased as-is.
 
@@ -85,6 +91,9 @@ The wrapper should expose a small API:
 - `update_tilelang_config(gpu_id, server_args) -> None`
 - `gemm_nt_f8f8bf16(lhs, rhs, out) -> None`
 - `warmup_or_autotune_shapes(shapes) -> None`
+- `load_selected_configs(path) -> None`
+- `export_selected_configs(path) -> None`
+- `get_kernel_info(M, N, K) -> dict`
 - `clear_cache() -> None`
 
 `fp8_utils.py` should only import this wrapper in a way that keeps normal
@@ -114,6 +123,11 @@ to install TileLang manually with `pip install 'tilelang>=0.1.9'` or through the
 `sglang[tilelang]` optional extra, but normal SGLang imports and non-TileLang
 backends must work when TileLang is absent.
 
+Selected configs for reproducible benchmark or CI runs can be loaded with
+`SGLANG_TILELANG_GEMM_CONFIG_PATH=/path/to/config.json` or by calling
+`tilelang_gemm_wrapper.load_selected_configs(path)`. The path may point to the
+new exported JSON format or to a directory of legacy per-shape JSON files.
+
 ### Autotuning And Cache
 
 Use TileLang's built-in autotuning as the primary tuning path. The wrapper
@@ -124,6 +138,9 @@ should:
   dynamic shapes require concrete tensors.
 - Cache tuned kernels by `(device, dtype, block_shape, M bucket, N, K,
   kernel_type or layout)`.
+- Ensure small-`M` tuning uses a CUDA graph compatible profiling path, either
+  through current TileLang autotuning support or an explicit benchmark fallback
+  when validating selected configs.
 - Respect TileLang cache environment variables and avoid inventing a parallel
   cache format unless there is a demonstrated gap.
 - Export selected best configs for reproducible CI benchmarks.
@@ -164,16 +181,16 @@ allowed for `--fp8-gemm-backend tilelang`.
 - Add backend enum and CLI choice.
 - Add TileLang wrapper skeleton with optional import behavior.
 - Add explicit dispatch path for `--fp8-gemm-backend tilelang`.
-- Add one correct non-autotuned baseline kernel path for `[128, 128]` blockwise
-  FP8 GEMM.
+- Add non-autotuned baseline, swapAB, split-K, and split-K swapAB kernel paths
+  for `[128, 128]` blockwise FP8 GEMM.
 - Fail fast for unsupported TileLang inputs.
 - Keep TileLang out of `auto`.
 
 ### Phase 2: Autotuning Integration
 
 - Replace fixed tuning configs with TileLang autotuning.
-- Add config-space generation for base, swapAB, split-K, and split-K swapAB
-  variants if all remain useful on current TileLang.
+- Add config-space generation and selected-config loading for base, swapAB,
+  split-K, and split-K swapAB variants.
 - Add precompile/autotune hooks and cache-key strategy.
 - Add developer documentation for tuning and cache behavior.
 - Add best-config export support for reproducible CI benchmarks.

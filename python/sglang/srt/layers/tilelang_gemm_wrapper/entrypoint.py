@@ -5,11 +5,21 @@ from __future__ import annotations
 import json
 import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.tilelang_gemm_wrapper.configurer import assert_available
+from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    KERNEL_TYPES,
+    SCHEMA_VERSION,
+    SPLIT_K_KERNEL_TYPES,
+    SWAP_AB_KERNEL_TYPES,
+    SelectedConfigStore,
+    default_config,
+    generate_candidate_configs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -20,25 +30,8 @@ _M_MAX = 1024 * 16
 _DO_COMPILE = True
 _SELECTED_CONFIGS: Dict[Tuple[int, int, int, str], dict] = {}
 _PARTIAL_BUFFER_CACHE: Dict[Tuple[str, int, int, int, str, str], torch.Tensor] = {}
-
-_DEFAULT_CONFIG = {
-    "kernel_type": "base",
-    "block_M": 128,
-    "block_N": 128,
-    "block_K": 128,
-    "num_stages": 2,
-    "threads": 128,
-    "split_k": 1,
-    "out_dtype": "bfloat16",
-    "accum_dtype": "float32",
-    "c_scale_local": False,
-    "a_scale_shm": False,
-    "b_scale_shm": False,
-}
-
-_SPLIT_K_KERNEL_TYPES = {"splitK", "splitK_swapAB"}
-_SWAP_AB_KERNEL_TYPES = {"swapAB", "splitK_swapAB"}
-_SUPPORTED_KERNEL_TYPES = {"base", "swapAB", "splitK", "splitK_swapAB"}
+_CONFIG_STORE = SelectedConfigStore()
+_CONFIG_PATH_LOADED: Optional[str] = None
 
 
 def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
@@ -67,28 +60,51 @@ def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
     )
 
 
+def load_selected_configs(path: str) -> None:
+    """Load exported TileLang selected configs for reproducible runs."""
+
+    global _CONFIG_STORE, _CONFIG_PATH_LOADED
+
+    _CONFIG_STORE = SelectedConfigStore.from_path(path)
+    _CONFIG_PATH_LOADED = path
+    logger.info(
+        "Loaded %s TileLang FP8 GEMM selected configs from %s",
+        len(_CONFIG_STORE.as_list()),
+        path,
+    )
+
+
+def _ensure_selected_configs_loaded() -> None:
+    config_path = envs.SGLANG_TILELANG_GEMM_CONFIG_PATH.get()
+    if not config_path or _CONFIG_PATH_LOADED == config_path:
+        return
+    load_selected_configs(config_path)
+
+
 def _select_config(M: int, N: int, K: int) -> dict:
     """Return the selected kernel config for a concrete shape.
 
-    The current default is intentionally conservative until SM89/SM90 validation
-    selects tuned configs. The full kernel family is available for autotuning.
+    Exported configs can select any supported kernel family. Without an exported
+    config, the fallback is intentionally conservative until SM89/SM90 validation
+    selects tuned defaults.
     """
 
-    config = dict(_DEFAULT_CONFIG)
-    config.update({"M": M, "N": N, "K": K})
-    return config
+    _ensure_selected_configs_loaded()
+    if _CONFIG_STORE.configs_by_nk:
+        return _CONFIG_STORE.select(M, N, K)
+    return default_config(M, N, K)
 
 
 def _validate_config(config: dict) -> None:
     kernel_type = config["kernel_type"]
-    if kernel_type not in _SUPPORTED_KERNEL_TYPES:
+    if kernel_type not in KERNEL_TYPES:
         raise RuntimeError(
             "TileLang FP8 GEMM got unsupported kernel_type="
-            f"{kernel_type}; expected one of {sorted(_SUPPORTED_KERNEL_TYPES)}."
+            f"{kernel_type}; expected one of {KERNEL_TYPES}."
         )
 
     split_k = config["split_k"]
-    if kernel_type in _SPLIT_K_KERNEL_TYPES:
+    if kernel_type in SPLIT_K_KERNEL_TYPES:
         K = config["K"]
         if split_k <= 1:
             raise RuntimeError(
@@ -223,7 +239,7 @@ def gemm_nt_f8f8bf16(
     _record_selected_config(config)
 
     kernel_type = config["kernel_type"]
-    if kernel_type in _SPLIT_K_KERNEL_TYPES:
+    if kernel_type in SPLIT_K_KERNEL_TYPES:
         partial = _get_partial_buffer(
             kernel_type,
             config["split_k"],
@@ -232,11 +248,11 @@ def gemm_nt_f8f8bf16(
             out.device,
             config["accum_dtype"],
         )
-        if kernel_type in _SWAP_AB_KERNEL_TYPES:
+        if kernel_type in SWAP_AB_KERNEL_TYPES:
             kernel(B_fp8, B_scale, A_fp8, A_scale, partial, out)
         else:
             kernel(A_fp8, A_scale, B_fp8, B_scale, partial, out)
-    elif kernel_type in _SWAP_AB_KERNEL_TYPES:
+    elif kernel_type in SWAP_AB_KERNEL_TYPES:
         kernel(B_fp8, B_scale, A_fp8, A_scale, out)
     else:
         kernel(A_fp8, A_scale, B_fp8, B_scale, out)
@@ -260,10 +276,34 @@ def warmup_or_autotune_shapes(shapes: Iterable[Tuple[int, int, int]]) -> None:
         _record_selected_config(config)
 
 
+def get_candidate_configs(
+    M: int, N: int, K: int, kernel_types: Optional[Iterable[str]] = None
+) -> list[dict]:
+    """Return legal configs for benchmark/autotune tooling."""
+
+    return generate_candidate_configs(M, N, K, kernel_types)
+
+
+def get_kernel_info(M: int, N: int, K: int) -> dict:
+    """Return the config that would be selected for a shape."""
+
+    config = _select_config(M, N, K)
+    _validate_config(config)
+    return dict(config)
+
+
+def list_available_configs() -> list[Tuple[int, int]]:
+    """List (N, K) pairs available from loaded selected configs."""
+
+    _ensure_selected_configs_loaded()
+    return sorted(_CONFIG_STORE.configs_by_nk)
+
+
 def export_selected_configs(path: str) -> None:
     """Export selected configs for reproducible benchmark runs."""
 
     payload = {
+        "schema_version": SCHEMA_VERSION,
         "backend": "tilelang_fp8_gemm",
         "configs": [v for _, v in sorted(_SELECTED_CONFIGS.items())],
     }

@@ -359,6 +359,9 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
+    # TileLang GEMM
+    SGLANG_TILELANG_GEMM_CONFIG_PATH = EnvStr("")
+
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
