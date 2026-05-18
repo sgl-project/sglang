@@ -131,15 +131,11 @@ class CanaryRunner:
     def pool_kind(self) -> PoolKind:
         return self._pool_kind
 
-    def run_head(self, *, plan: BatchPlan, skip_fill: bool = False) -> None:
-        self._run_kernel_pair(
-            plan=plan, kernel_kind=KERNEL_KIND_HEAD, skip_fill=skip_fill
-        )
+    def run_head(self, *, plan: BatchPlan) -> None:
+        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
 
-    def run_tail(self, *, plan: BatchPlan, skip_fill: bool = False) -> None:
-        self._run_kernel_pair(
-            plan=plan, kernel_kind=KERNEL_KIND_TAIL, skip_fill=skip_fill
-        )
+    def run_tail(self, *, plan: BatchPlan) -> None:
+        self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_TAIL)
 
     def end_of_forward(self) -> None:
         """Called once per forward (after run_tail) on the compute stream.
@@ -320,22 +316,18 @@ class CanaryRunner:
         *,
         plan: BatchPlan,
         kernel_kind: int,
-        skip_fill: bool = False,
     ) -> None:
-        """Launch the head/tail kernel pair using the fixed launch buffers.
+        """Eager-path launch: fill the fixed buffers from the plan, then launch.
 
-        ``skip_fill=True`` is the replay path: ``prepare_for_replay`` has
-        already populated the buffers on the host side outside the captured
-        region. The eager path leaves ``skip_fill=False`` and we fill here.
+        The replay path bypasses this and goes through ``prepare_for_replay``
+        + recorded-graph launches instead.
         """
         if not self._config.enabled:
             return
-        if not skip_fill:
-            total = plan.num_verify + plan.num_write
-            if total == 0:
-                return
-            self._launch.fill_from_plan(plan)
-
+        total = plan.num_verify + plan.num_write
+        if total == 0:
+            return
+        self._launch.fill_from_plan(plan)
         self._launch_kernel_only(kernel_kind=kernel_kind)
 
     def _cross_rank_max(self, local_flag: int) -> int:

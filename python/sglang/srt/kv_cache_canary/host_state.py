@@ -460,43 +460,90 @@ class CanaryLaunchBuffers:
     def fill_from_plan(self, plan: "BatchPlan") -> int:
         """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
 
-        Returns the number of active slots (verify + write). The prefix
-        ``[0, total)`` carries real data; ``[total, capacity)`` is reset to
-        the skip-sentinel so prior content from a larger batch cannot leak.
+        Returns the number of active slots (verify + write) actually copied.
+        The prefix ``[0, total)`` carries real data; ``[total, capacity)`` is
+        reset to the skip-sentinel so prior content from a larger batch
+        cannot leak.
 
         Padding semantics: ``verify_mask = -1`` makes the kernel exit before
         any I/O; ``verify_seq_positions = -1`` is the existing "no position
         check" sentinel and is kept consistent. Other expected_* fields'
         residual values don't matter once ``verify_mask`` is -1.
+
+        When ``num_verify + num_write`` exceeds capacity (e.g. an eager
+        prefill batch larger than what the install-time sizing anticipated),
+        the verify entries are TRUNCATED to whatever fits: writes are
+        prioritized because they advance the chain hash; dropping writes
+        would force every subsequent forward to see a broken chain.
+        Truncating verifies merely reduces this forward's verify coverage —
+        the next forward's verify entries re-cover the same history positions
+        from the host-side ``history`` tuple.
         """
         total = plan.num_verify + plan.num_write
-        if total > self.capacity:
+        if plan.num_write > self.capacity:
             raise RuntimeError(
-                f"kv-canary: BatchPlan total slots {total} exceeds launch capacity "
-                f"{self.capacity}; raise max_verify_per_req_per_forward or "
-                "increase cuda_graph capture sizing."
+                f"kv-canary: write slot count {plan.num_write} exceeds launch "
+                f"capacity {self.capacity}. The fixed buffer is sized for "
+                "cuda_graph_max_bs * num_tokens_per_bs writes; this eager "
+                "forward exceeds that. Raise the canary launch capacity or "
+                "disable the canary for this deployment."
             )
+        if total > self.capacity:
+            # Prefer writes over verifies (see docstring). Truncate the
+            # verify section from the FRONT so the most recent history
+            # entries (the right end of the verify list, since plan_batch
+            # appends in order) survive.
+            max_verify = max(0, self.capacity - plan.num_write)
+            drop_verify = plan.num_verify - max_verify
+            verify_slot_indices = plan.verify_slot_indices[drop_verify:]
+            expected_req_ids = (
+                plan.expected_req_ids[drop_verify : plan.num_verify]
+                + plan.expected_req_ids[plan.num_verify :]
+            )
+            expected_token_ids = (
+                plan.expected_token_ids[drop_verify : plan.num_verify]
+                + plan.expected_token_ids[plan.num_verify :]
+            )
+            expected_positions = (
+                plan.expected_positions[drop_verify : plan.num_verify]
+                + plan.expected_positions[plan.num_verify :]
+            )
+            expected_prev_hashes = (
+                plan.expected_prev_hashes[drop_verify : plan.num_verify]
+                + plan.expected_prev_hashes[plan.num_verify :]
+            )
+            verify_mask = (
+                plan.verify_mask[drop_verify : plan.num_verify]
+                + plan.verify_mask[plan.num_verify :]
+            )
+            verify_seq_positions = (
+                plan.verify_seq_positions[drop_verify : plan.num_verify]
+                + plan.verify_seq_positions[plan.num_verify :]
+            )
+            write_slot_indices = plan.write_slot_indices
+            total = max_verify + plan.num_write
+        else:
+            verify_slot_indices = plan.verify_slot_indices
+            expected_req_ids = plan.expected_req_ids
+            expected_token_ids = plan.expected_token_ids
+            expected_positions = plan.expected_positions
+            expected_prev_hashes = plan.expected_prev_hashes
+            verify_mask = plan.verify_mask
+            verify_seq_positions = plan.verify_seq_positions
+            write_slot_indices = plan.write_slot_indices
 
         device = self.slot_indices.device
         slot_src = torch.tensor(
-            plan.verify_slot_indices + plan.write_slot_indices,
+            verify_slot_indices + write_slot_indices,
             dtype=torch.int64,
             device=device,
         )
-        req_src = torch.tensor(plan.expected_req_ids, dtype=torch.int64, device=device)
-        token_src = torch.tensor(
-            plan.expected_token_ids, dtype=torch.int64, device=device
-        )
-        pos_src = torch.tensor(
-            plan.expected_positions, dtype=torch.int64, device=device
-        )
-        hash_src = torch.tensor(
-            plan.expected_prev_hashes, dtype=torch.int64, device=device
-        )
-        mask_src = torch.tensor(plan.verify_mask, dtype=torch.int32, device=device)
-        seq_src = torch.tensor(
-            plan.verify_seq_positions, dtype=torch.int64, device=device
-        )
+        req_src = torch.tensor(expected_req_ids, dtype=torch.int64, device=device)
+        token_src = torch.tensor(expected_token_ids, dtype=torch.int64, device=device)
+        pos_src = torch.tensor(expected_positions, dtype=torch.int64, device=device)
+        hash_src = torch.tensor(expected_prev_hashes, dtype=torch.int64, device=device)
+        mask_src = torch.tensor(verify_mask, dtype=torch.int32, device=device)
+        seq_src = torch.tensor(verify_seq_positions, dtype=torch.int64, device=device)
 
         self.slot_indices[:total].copy_(slot_src)
         self.expected_req_ids[:total].copy_(req_src)
