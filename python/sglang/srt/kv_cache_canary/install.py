@@ -216,29 +216,68 @@ _REPLAY_CLASS_PATCHED_ATTR = "_kv_cache_canary_replay_class_patched"
 
 
 def _patch_cuda_graph_runner_replay_class_method() -> None:
-    """Wrap ``CudaGraphRunner.replay`` at the CLASS level so replay calls canary.
+    """Wrap ``replay`` at the CLASS level for every graph-runner family.
 
-    SGLang's ``graph_runner.replay(forward_batch, ...)`` invokes
-    ``self.graphs[bs].replay()`` directly, bypassing ``model.forward`` —
-    the wrapper installed by :func:`_patch_model_forward` never sees a
-    replay. We have to hook the replay method itself.
+    SGLang has several independent graph-runner classes that each manage
+    their own captured CUDA graphs and bypass ``model.forward`` by calling
+    ``self.graphs[bs].replay()`` directly (or by replaying a piecewise
+    sub-graph). Patching only the base ``CudaGraphRunner`` leaves the spec
+    decoding draft worker and piecewise hot paths uninstrumented — the
+    canary kernel would never run during replay there. So we enumerate the
+    full family.
 
     Why CLASS-level: the canary install runs BEFORE ``init_device_graphs``,
-    so ``model_runner.graph_runner`` doesn't exist yet at install time.
-    Patching the class method covers every ``CudaGraphRunner`` instance
-    that will be created afterwards. The patched body looks the canary
-    runner up off ``self.model_runner.token_to_kv_pool`` per-call, so
-    instances without a canary attached just delegate to the original
-    method (zero cost).
+    so the per-instance graph runners don't exist yet at install time.
+    Patching the class method covers every instance created afterwards.
+    The patched body looks the canary runner up off
+    ``self.model_runner.token_to_kv_pool`` per-call, so instances without a
+    canary attached just delegate to the original method (zero cost).
+
+    Each subclass below defines its own ``replay`` method (verified at
+    import time), so patching the base class alone would NOT cover them —
+    each class must be patched individually.
 
     Idempotent at the class level: a second install call is a no-op.
     """
     from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
-    if getattr(CudaGraphRunner, _REPLAY_CLASS_PATCHED_ATTR, False):
+    classes_to_patch: list[type] = [CudaGraphRunner]
+    try:
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+
+        classes_to_patch.append(EAGLEDraftCudaGraphRunner)
+    except ImportError:
+        logger.debug("kv-canary: EAGLEDraftCudaGraphRunner not available; skipping")
+    try:
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+
+        classes_to_patch.append(EAGLEDraftExtendCudaGraphRunner)
+    except ImportError:
+        logger.debug(
+            "kv-canary: EAGLEDraftExtendCudaGraphRunner not available; skipping"
+        )
+    try:
+        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+            PiecewiseCudaGraphRunner,
+        )
+
+        classes_to_patch.append(PiecewiseCudaGraphRunner)
+    except ImportError:
+        logger.debug("kv-canary: PiecewiseCudaGraphRunner not available; skipping")
+
+    for cls in classes_to_patch:
+        _patch_graph_runner_class_replay(cls)
+
+
+def _patch_graph_runner_class_replay(cls: type) -> None:
+    if getattr(cls, _REPLAY_CLASS_PATCHED_ATTR, False):
         return
 
-    original_replay = CudaGraphRunner.replay
+    original_replay = cls.replay
 
     @functools.wraps(original_replay)
     def patched_replay(self, forward_batch, *args, **kwargs):
@@ -256,8 +295,8 @@ def _patch_cuda_graph_runner_replay_class_method() -> None:
         finalize_replay(runner=runner, plan=plan)
         return output
 
-    CudaGraphRunner.replay = patched_replay
-    setattr(CudaGraphRunner, _REPLAY_CLASS_PATCHED_ATTR, True)
+    cls.replay = patched_replay
+    setattr(cls, _REPLAY_CLASS_PATCHED_ATTR, True)
 
 
 def _extract_forward_batch(args, kwargs):
