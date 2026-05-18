@@ -11,7 +11,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.activation import gelu_tanh_and_mul, silu_and_mul
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
@@ -72,6 +72,7 @@ def fused_marlin_moe(
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -213,13 +214,19 @@ def fused_marlin_moe(
     )
 
     if clamp_limit is not None:
+        if activation != "silu":
+            raise ValueError("clamp_limit is only supported for SiLU/SwiGLU")
         swiglu_limit_func(
             intermediate_cache2,
             intermediate_cache1.view(-1, 2 * N),
             clamp_limit,
         )
-    else:
+    elif activation == "silu":
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    elif activation == "gelu_pytorch_tanh":
+        gelu_tanh_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    else:
+        raise ValueError(f"Unsupported activation: {activation!r}")
 
     if expert_map is not None:
         intermediate_cache3.zero_()

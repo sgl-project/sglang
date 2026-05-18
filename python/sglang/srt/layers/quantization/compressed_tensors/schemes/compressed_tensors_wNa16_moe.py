@@ -382,9 +382,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "gelu_pytorch_tanh",
+        ), f"Unsupported activation: {self.moe_runner_config.activation!r}"
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -419,6 +420,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            activation=self.moe_runner_config.activation,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -484,7 +486,7 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     ) -> "CombineInput":
         assert (
             self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        ), "Only SiLU activation is supported by the Triton WNA16 MoE path."
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

@@ -57,6 +57,11 @@ from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
+_PER_EXPERT_COMPRESSED_MOE_RE = re.compile(
+    r"^(.+?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
+    r"\.(weight_packed|weight_scale|weight_shape)$"
+)
+
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
@@ -1021,6 +1026,24 @@ class Gemma4ForCausalLM(PreTrainedModel):
             name = name.replace(".router.per_expert_scale", ".moe.per_expert_scale")
             if ".experts." in name and ".moe.experts." not in name:
                 name = name.replace(".experts.", ".moe.experts.")
+
+            per_expert_match = _PER_EXPERT_COMPRESSED_MOE_RE.match(name)
+            if per_expert_match:
+                prefix, expert_id_str, proj, suffix = per_expert_match.groups()
+                expert_id = int(expert_id_str)
+                if proj in ("gate_proj", "up_proj"):
+                    target_name = f"{prefix}w13_{suffix}"
+                    shard_id = "w1" if proj == "gate_proj" else "w3"
+                else:
+                    target_name = f"{prefix}w2_{suffix}"
+                    shard_id = "w2"
+                if target_name in params_dict:
+                    param = params_dict[target_name]
+                    param.weight_loader(
+                        param, loaded_weight, target_name, shard_id, expert_id
+                    )
+                    loaded_params.add(target_name)
+                    continue
 
             # attention_k_eq_v: full-attention layers have no v_proj in the
             # checkpoint (K and V share weights).  When we see a k_proj weight
