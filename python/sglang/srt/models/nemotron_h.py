@@ -42,6 +42,16 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -300,6 +310,28 @@ class NemotronHMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
+def _build_layer_scatter_modes() -> LayerScatterModes:
+    """All NemotronH layers operate on TP_ATTN_FULL at layer boundaries.
+
+    - mamba / attention layers: read TP_ATTN_FULL, mixer reduces inside
+      _ATTN_TP, write TP_ATTN_FULL — no MLP stage, so mlp/middle_residual
+      are unused by these layers but still need a value.
+    - MLP / MoE layers: prepare_mlp gathers TP_ATTN_FULL -> FULL, the mixer
+      runs in FULL (its row-parallel all-reduce fires on _TP), and
+      postprocess_layer scatters FULL -> TP_ATTN_FULL.
+
+    Settings the same modes for every layer keeps the inter-layer contract
+    uniform: every layer hands off TP_ATTN_FULL.
+    """
+    return LayerScatterModes(
+        layer_input_mode=ScatterMode.TP_ATTN_FULL,
+        attn_mode=ScatterMode.TP_ATTN_FULL,
+        mlp_mode=ScatterMode.FULL,
+        middle_residual_mode=ScatterMode.TP_ATTN_FULL,
+        layer_output_mode=ScatterMode.TP_ATTN_FULL,
+    )
+
+
 class NemotronHMLPDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -330,6 +362,14 @@ class NemotronHMLPDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # MLP layer uses prepare_mlp + mixer + postprocess_layer; the layer's
+        # entry RMSNorm acts as post_attention_layernorm here. input_layernorm
+        # is unused (we never call prepare_attn).
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=_build_layer_scatter_modes(),
+            input_layernorm=nn.Identity(),
+            post_attention_layernorm=self.norm,
+        )
 
     def forward(
         self,
@@ -338,13 +378,28 @@ class NemotronHMLPDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. LayerCommunicator's
+            # prepare_mlp / postprocess_layer assume a DP-attn scatter mode
+            # contract that's not satisfied here, and using them in TP-only
+            # produces collapsed reasoning output. Verified empirically.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(hidden_states)
+            return hidden_states, residual
 
+        # DP-attention path. MLP/MoE layers must run on every rank to keep
+        # _TP collectives in sync across DP groups. No idle skip.
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
         hidden_states = self.mixer.forward(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
         return hidden_states, residual
 
 
@@ -366,6 +421,11 @@ class NemotronHMoEDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=_build_layer_scatter_modes(),
+            input_layernorm=nn.Identity(),
+            post_attention_layernorm=self.norm,
+        )
 
     def forward(
         self,
@@ -374,13 +434,25 @@ class NemotronHMoEDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(hidden_states)
+            return hidden_states, residual
 
+        # DP-attention path. MLP/MoE layers must run on every rank to keep
+        # _TP collectives in sync across DP groups. No idle skip.
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
         hidden_states = self.mixer.forward(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
         return hidden_states, residual
 
 
@@ -408,6 +480,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # Mamba layer uses prepare_attn + mixer; mixer reduces internally to
+        # TP_ATTN_FULL via use_dp_attention_reduce, so no prepare_mlp /
+        # postprocess_layer is needed. post_attention_layernorm is unused.
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=_build_layer_scatter_modes(),
+            input_layernorm=self.norm,
+            post_attention_layernorm=nn.Identity(),
+        )
 
     def _forward_mamba(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -433,11 +513,34 @@ class NemotronHMambaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+
+            if is_in_breakable_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+                return output, residual
+
+            if is_in_piecewise_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+                return output, residual
+            else:
+                output = self._forward_mamba(hidden_states, forward_batch)
+                return output, residual
+
+        # DP-attention path.
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        if forward_batch.forward_mode.is_idle():
+            return hidden_states, residual
 
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
@@ -463,20 +566,23 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        # Under DP-attention, attention runs inside _ATTN_TP (a subset of _TP);
+        # match mamba mixer's class 1 sharding so attn_tp == tp in non-DP mode.
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % self.attn_tp_size == 0
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= self.attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % self.attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         if hasattr(config, "head_dim") and config.head_dim is not None:
             self.head_dim = config.head_dim
         else:
@@ -492,15 +598,29 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
+        # Reduce inside o_proj. Same reasoning as MambaMixer2.out_proj:
+        # Nemotron-H places attention layers next to mamba layers (also using
+        # prepare_attn / no-reduce path), so deferring the all-reduce to "next
+        # prepare_mlp" leaves the partial output un-reduced before the next
+        # layernorm. Reduce here; in DP-attn it fires inside _ATTN_TP, in
+        # TP-only it falls back to the full _TP group.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
+        # Static flag at construction time so dynamo can specialize the
+        # forward path; baseline (no DP-attn) skips the trim block entirely.
+        self._is_dp_attn = is_dp_attention_enabled()
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -515,10 +635,48 @@ class NemotronHAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn.forward(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if not self._is_dp_attn:
+            # Baseline path — no DP-attn padding, no trim needed. Keeping this
+            # path free of data-dependent branches lets piecewise cuda-graph's
+            # dynamo trace specialize cleanly.
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn.forward(q, k, v, forward_batch)
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        # DP-attention pads hidden_states up to attn_tp_size's multiple so
+        # collective ops align across ranks. flashinfer's ragged prefill
+        # requires q.shape[0] == qo_indptr[-1] (the real token count), and
+        # KV-cache write requires q.shape[0] == out_cache_loc.shape[0]. Trim
+        # both for the kernel; pad the output rows back so the dp_gather
+        # buffer shape (= num_tokens per rank) stays consistent across the
+        # layer.
+        padded_shape = hidden_states.shape[0]
+        real_tokens = padded_shape
+        original_out_cache_loc = forward_batch.out_cache_loc
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            real_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+            if real_tokens < padded_shape:
+                hidden_states = hidden_states[:real_tokens]
+                if original_out_cache_loc is not None:
+                    forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
+
+        try:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn.forward(q, k, v, forward_batch)
+            output, _ = self.o_proj(attn_output)
+        finally:
+            # Restore so subsequent layers see the original (padded) buffer.
+            forward_batch.out_cache_loc = original_out_cache_loc
+
+        if real_tokens < padded_shape:
+            zeros = output.new_zeros(padded_shape - real_tokens, output.shape[1])
+            output = torch.cat([output, zeros], dim=0)
         return output
 
 
@@ -540,6 +698,14 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # Attention layer uses prepare_attn + mixer; o_proj reduces inside
+        # _ATTN_TP via use_dp_attention_reduce, so the layer hands off
+        # TP_ATTN_FULL without prepare_mlp / postprocess_layer.
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=_build_layer_scatter_modes(),
+            input_layernorm=self.norm,
+            post_attention_layernorm=nn.Identity(),
+        )
 
     def forward(
         self,
@@ -548,15 +714,26 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states, forward_batch=forward_batch
+            )
+            return hidden_states, residual
 
-        hidden_states = self.mixer.forward(
-            hidden_states=hidden_states, forward_batch=forward_batch
+        # DP-attention path.
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
         )
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states, forward_batch=forward_batch
+            )
         return hidden_states, residual
 
 
@@ -600,6 +777,7 @@ class NemotronHModel(nn.Module):
                 self.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()

@@ -56,6 +56,23 @@ class Mamba2Metadata(ForwardMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
+    # Real (non-DP-padded) decode count for THIS DP rank. When DP attention pads
+    # `seq_lens` for collective alignment, `num_decodes` includes dummy entries
+    # whose `mamba_cache_indices` point to other reqs' SSM slots (req_pool_indices
+    # is padded with 0). Mamba kernels would then write garbage state to those
+    # real slots, corrupting decode output. Use `num_actual_decodes` to trim
+    # decode-side tensors before kernel dispatch. Falls back to `num_decodes`
+    # when None (e.g. CUDA-graph capture path where padding info is unavailable).
+    num_actual_decodes: Optional[int] = None
+    # Real (non-DP-padded) prefill REQ count for THIS DP rank. Same alias-padding
+    # hazard as decode: padded `extend_seq_lens` entries inflate `num_prefills`,
+    # and `mamba_chunk_scan_combined` always returns `varlen_state` of shape
+    # `(num_prefills, ...)` even for 0-length padded sequences. Writing
+    # `ssm_state[state_indices_tensor_p] = varlen_state` with dummy slots that
+    # alias real reqs' SSM slots overwrites a real req's accumulated state with
+    # garbage from the dummy. `num_actual_prefills` lets the mixer trim state
+    # writes to real prefills only. Falls back to `num_prefills` when None.
+    num_actual_prefills: Optional[int] = None
 
     @dataclass(kw_only=True, frozen=True)
     class MixedMetadata:
@@ -163,6 +180,7 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
+        num_actual_decodes: Optional[int] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
@@ -174,6 +192,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_decodes=len(seq_lens),
             num_prefills=0,
             num_prefill_tokens=0,
+            num_actual_decodes=num_actual_decodes,
             is_target_verify=is_target_verify,
             draft_token_num=draft_token_num,
         )
@@ -192,11 +211,22 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
+            # Pure decode: real decode count for this DP rank comes from
+            # `num_token_non_padded_cpu` (set before DP padding); padded
+            # `seq_lens` would otherwise yield padded `num_decodes`.
+            num_actual_decodes_pure: Optional[int] = None
+            if forward_batch.num_token_non_padded_cpu is not None:
+                real_total = int(forward_batch.num_token_non_padded_cpu)
+                if forward_batch.forward_mode.is_target_verify():
+                    num_actual_decodes_pure = real_total // max(draft_token_num, 1)
+                else:
+                    num_actual_decodes_pure = real_total
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
+                num_actual_decodes=num_actual_decodes_pure,
             )
         num_prefills = len(forward_batch.extend_seq_lens)
         num_prefill_tokens = forward_batch.extend_num_tokens
@@ -208,6 +238,14 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        # `forward_batch.extend_num_tokens` may be padded for DP-attention
+        # collective alignment, while `query_start_loc` is built from real
+        # per-seq lengths. Mamba kernels require `cu_seqlens.last() == seq_len`
+        # (the input shape they operate on). Use the real count here so the
+        # kernel's `output_size` matches `query_start_loc.diff().sum()`.
+        num_prefill_tokens = int(
+            (query_start_loc[-1] - query_start_loc[0]).item()
+        )
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
@@ -233,6 +271,27 @@ class Mamba2Metadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
+        # Real per-DP-rank decode count: `num_token_non_padded_cpu` is the
+        # un-padded total tokens for this rank; `num_prefill_tokens` is already
+        # adjusted to real (via query_start_loc above); the difference is the
+        # real decode token count. Convert back to req count via draft_token_num.
+        num_actual_decodes: Optional[int] = None
+        if forward_batch.num_token_non_padded_cpu is not None:
+            real_total = int(forward_batch.num_token_non_padded_cpu)
+            real_decode_tokens = max(0, real_total - num_prefill_tokens)
+            if forward_batch.forward_mode.is_target_verify():
+                num_actual_decodes = real_decode_tokens // max(draft_token_num, 1)
+            else:
+                num_actual_decodes = real_decode_tokens
+        # Real per-DP-rank prefill REQ count: `extend_seq_lens_cpu` is the
+        # ScheduleBatch's pre-padding list, while `forward_batch.extend_seq_lens`
+        # (GPU tensor used to derive `num_prefills`) is padded to `bs`. Padded
+        # entries are 0-length but still occupy a slot in the chunk-scan
+        # output and in `state_indices_tensor_p`, so without trimming they
+        # would write garbage into real reqs' SSM slots.
+        num_actual_prefills: Optional[int] = None
+        if forward_batch.extend_seq_lens_cpu is not None:
+            num_actual_prefills = len(forward_batch.extend_seq_lens_cpu)
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -242,6 +301,8 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
+            num_actual_decodes=num_actual_decodes,
+            num_actual_prefills=num_actual_prefills,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
             mixed_metadata=cls.MixedMetadata(

@@ -8,10 +8,11 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
 )
-from sglang.srt.distributed import (
-    divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+from sglang.srt.distributed import divide
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
@@ -208,8 +209,8 @@ class MambaMixer2(torch.nn.Module):
         #   may be replicated to follow the head shard.
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_attention_tp_size()
+        self.tp_rank = get_attention_tp_rank()
 
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
@@ -257,6 +258,8 @@ class MambaMixer2(torch.nn.Module):
                 ],
                 bias=use_conv_bias,
                 quant_config=None,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 prefix=f"{prefix}.conv1d",
             )
 
@@ -271,6 +274,8 @@ class MambaMixer2(torch.nn.Module):
                 ],
                 bias=use_bias,
                 quant_config=quant_config,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 prefix=f"{prefix}.in_proj",
             )
         else:
@@ -282,6 +287,8 @@ class MambaMixer2(torch.nn.Module):
                 output_size=self.conv_dim,
                 bias=use_conv_bias,
                 quant_config=None,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 prefix=f"{prefix}.conv1d",
             )
 
@@ -290,6 +297,8 @@ class MambaMixer2(torch.nn.Module):
                 output_size=intermediate_size + self.conv_dim + self.num_heads,
                 bias=use_bias,
                 quant_config=quant_config,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 prefix=f"{prefix}.in_proj",
             )
 
@@ -388,17 +397,32 @@ class MambaMixer2(torch.nn.Module):
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        # Reduce inside out_proj. In DP-attention mode the all-reduce fires
+        # across _ATTN_TP only (use_dp_attention_reduce=True); in TP-only
+        # mode it falls back to the full _TP group, matching origin/main
+        # behavior. Deferring the reduce to "next layer's prepare_mlp"
+        # would only work if the next layer were always MLP, but Nemotron-H
+        # places mamba next to attention layers whose prepare_attn does
+        # not all-reduce on the unfused path.
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
         self.norm = Mixer2RMSNormGated(
-            intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
+            intermediate_size,
+            n_groups,
+            self.use_rms_norm,
+            eps=rms_norm_eps,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
 
         self.prefix = prefix
@@ -422,6 +446,33 @@ class MambaMixer2(torch.nn.Module):
         ssm_state = layer_cache.temporal
 
         query_start_loc = metadata.query_start_loc
+
+        # DP attention may pad `extend_num_tokens` (prefill) AND `seq_lens`
+        # (decode) for collective-op alignment, so `hidden_states` can have
+        # padded rows beyond what the mamba kernel should process. The padded
+        # decode entries' `req_pool_indices` default to 0, which makes their
+        # `mamba_cache_indices` alias a real request's SSM slot — letting the
+        # kernel run over them would write garbage state into that slot and
+        # corrupt the real request's decode output. Trim to real token count
+        # so in_proj / split / kernel all operate on `num_actual_tokens`.
+        # Padded rows of the caller's `output` tensor are zeroed at the end
+        # of this forward to prevent uninitialized data from propagating to
+        # downstream layers.
+        num_actual_decodes_pre = (
+            metadata.num_actual_decodes
+            if metadata.num_actual_decodes is not None
+            else metadata.num_decodes
+        )
+        num_decode_tokens_pre = (
+            num_actual_decodes_pre * metadata.draft_token_num
+            if metadata.is_target_verify
+            else num_actual_decodes_pre
+        )
+        num_actual_tokens_pre = (
+            metadata.num_prefill_tokens + num_decode_tokens_pre
+        )
+        if hidden_states.shape[0] > num_actual_tokens_pre:
+            hidden_states = hidden_states[:num_actual_tokens_pre]
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
@@ -453,8 +504,23 @@ class MambaMixer2(torch.nn.Module):
             dim=-1,
         )
 
-        num_prefills = metadata.num_prefills  # request count
-        num_decodes = metadata.num_decodes  # token count (=request)
+        # Use real (un-padded) prefill REQ count and decode count for splits
+        # and kernel calls below. Both `metadata.num_prefills` and
+        # `metadata.num_decodes` may include DP-padded dummy entries; padded
+        # entries' `mamba_cache_indices` alias real reqs' SSM slots, and the
+        # mamba kernels would write garbage state into those slots if asked
+        # to process the padded entries. `state_indices_tensor` is sized to
+        # the padded total — slice (not split) below to drop the padded tail.
+        num_prefills = (
+            metadata.num_actual_prefills
+            if metadata.num_actual_prefills is not None
+            else metadata.num_prefills
+        )
+        num_decodes = (
+            metadata.num_actual_decodes
+            if metadata.num_actual_decodes is not None
+            else metadata.num_decodes
+        )
         num_decode_tokens = (
             num_decodes * metadata.draft_token_num
             if metadata.is_target_verify
@@ -479,12 +545,14 @@ class MambaMixer2(torch.nn.Module):
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
-        # Split along batch dimension
-        state_indices_tensor_p, state_indices_tensor_d = torch.split(
-            state_indices_tensor,
-            [num_prefills, num_decodes],
-            dim=0,
-        )
+        # Split along batch dimension. `state_indices_tensor` (a.k.a.
+        # mamba_cache_indices) is sized to the padded `num_prefills + padded
+        # num_decodes`; we deliberately drop the padded tail by slicing here
+        # rather than splitting (sums wouldn't match the padded length).
+        state_indices_tensor_p = state_indices_tensor[:num_prefills]
+        state_indices_tensor_d = state_indices_tensor[
+            num_prefills : num_prefills + num_decodes
+        ]
         query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
@@ -511,7 +579,9 @@ class MambaMixer2(torch.nn.Module):
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            has_initial_states_p = mixed_metadata.has_initial_states
+            # `has_initial_states` is sized to the padded prefill count;
+            # trim to real to match `state_indices_tensor_p` for broadcast.
+            has_initial_states_p = mixed_metadata.has_initial_states[:num_prefills]
             prep_initial_states = mixed_metadata.prep_initial_states
             cache_indices = state_indices_tensor_p
             x = hidden_states_B_C_p.transpose(
@@ -707,6 +777,10 @@ class MambaMixer2(torch.nn.Module):
 
         # 5. Final linear projection
         output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        if output.shape[0] > num_actual_tokens:
+            # Zero DP-attention padded rows so they do not carry uninitialized
+            # data (potentially NaN) into subsequent layers' residual additions.
+            output[num_actual_tokens:].zero_()
 
     @property
     def mamba_type(self) -> str:
