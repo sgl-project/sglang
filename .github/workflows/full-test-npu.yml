@@ -1,12 +1,12 @@
 name: Full Test (NPU)
 
 on:
-  #pull_request:
-  #  branches:
-  #    - main
-  #    - testcases
-  #  paths:
-  #    - ".github/workflows/full-test-npu.yml"
+#    pull_request:
+#    branches:
+#      - main
+#      - testcases
+#    paths:
+#      - ".github/workflows/full-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -18,7 +18,7 @@ on:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
         type: string
-        default: 'all'
+        default: 'all' 
       image_a3:
         description: 'The a3 running docker image of the test task.'
         required: false
