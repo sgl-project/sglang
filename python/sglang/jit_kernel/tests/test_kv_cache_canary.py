@@ -569,31 +569,33 @@ def _clone_state_for_reference(state: dict, *, device: str) -> dict:
     return {k: v.detach().clone().to(device) for k, v in state.items()}
 
 
-def _i64(values: list[int], device: str) -> torch.Tensor:
+def _i64_on(values: list[int], device: str) -> torch.Tensor:
     return torch.tensor(values or [0], dtype=torch.int64, device=device)
 
 
-def _i32(values: list[int], device: str) -> torch.Tensor:
+def _i32_on(values: list[int], device: str) -> torch.Tensor:
     return torch.tensor(values or [0], dtype=torch.int32, device=device)
 
 
 def _build_inputs_on(device: str, **plan_lists) -> dict:
     return dict(
-        verify_slot_indices=_i64(plan_lists["verify_slot_indices"], device),
-        verify_positions=_i64(plan_lists["verify_positions"], device),
-        verify_req_ids=_i64(plan_lists["verify_req_ids"], device),
-        verify_prev_slot_indices=_i64(plan_lists["verify_prev_slot_indices"], device),
-        verify_active_mask=_i32(plan_lists["verify_active_mask"], device),
-        write_slot_indices=_i64(plan_lists["write_slot_indices"], device),
-        write_token_ids=_i64(plan_lists["write_token_ids"], device),
-        write_positions=_i64(plan_lists["write_positions"], device),
-        write_req_ids=_i64(plan_lists["write_req_ids"], device),
-        write_req_seed_slot_indices=_i64(
+        verify_slot_indices=_i64_on(plan_lists["verify_slot_indices"], device),
+        verify_positions=_i64_on(plan_lists["verify_positions"], device),
+        verify_req_ids=_i64_on(plan_lists["verify_req_ids"], device),
+        verify_prev_slot_indices=_i64_on(
+            plan_lists["verify_prev_slot_indices"], device
+        ),
+        verify_active_mask=_i32_on(plan_lists["verify_active_mask"], device),
+        write_slot_indices=_i64_on(plan_lists["write_slot_indices"], device),
+        write_token_ids=_i64_on(plan_lists["write_token_ids"], device),
+        write_positions=_i64_on(plan_lists["write_positions"], device),
+        write_req_ids=_i64_on(plan_lists["write_req_ids"], device),
+        write_req_seed_slot_indices=_i64_on(
             plan_lists["write_req_seed_slot_indices"] or [-1], device
         ),
-        write_req_entry_starts=_i64(plan_lists["write_req_entry_starts"], device),
-        write_req_entry_counts=_i64(plan_lists["write_req_entry_counts"], device),
-        write_req_active_mask=_i32(plan_lists["write_req_active_mask"], device),
+        write_req_entry_starts=_i64_on(plan_lists["write_req_entry_starts"], device),
+        write_req_entry_counts=_i64_on(plan_lists["write_req_entry_counts"], device),
+        write_req_active_mask=_i32_on(plan_lists["write_req_active_mask"], device),
     )
 
 
