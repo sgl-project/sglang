@@ -1441,9 +1441,12 @@ _SB_CROSS_ITER_VOLATILE_ATTRS = frozenset(
 )
 _SB_STRICT_WORKER_FRAMES = frozenset(
     {
+        # Only the generation worker entry consumes ForwardData under
+        # overlap mode (FD boundary established by Scheduler.run_batch).
+        # Embedding / split-prefill workers still legitimately receive SB
+        # directly because they have not been migrated to FD, so excluding
+        # them prevents the strict shim from raising on legitimate reads.
         "forward_batch_generation",
-        "forward_batch_split_prefill",
-        "forward_batch_embedding",
     }
 )
 
