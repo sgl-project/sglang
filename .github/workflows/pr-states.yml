@@ -8,8 +8,8 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
     # Listen to pr-test* lifecycle so reruns initiated by slash commands
-    # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) — which don't
-    # refire pull_request_target — still refresh the CI-states block.
+    # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) -- which don't
+    # refire pull_request_target -- still refresh the CI-states block.
     workflows: ["PR Test", "PR Test Extra"]
     types: [requested, completed]
 
@@ -32,6 +32,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const RETRY_ATTEMPTS = 3;
+            const RETRY_DELAY_MS = 6000;
+            const LABEL_ON_PRESLEEP_MS = 3000;
+            const LABEL_OFF_PRESLEEP_MS = 6000;
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
             // Event-agnostic PR lookup.
             // - pull_request_target: PR is in the payload.
             // - workflow_run: pull_requests[] is populated for same-repo PRs;
@@ -76,6 +82,13 @@ jobs:
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
+            // Only `unlabeled` events have a real race against label removal
+            // vs an in-flight run. Other no-label fires (opened / synchronize /
+            // reopened / unrelated labeled / workflow_run) don't need to wait:
+            // any existing run is long-indexed or genuinely absent.
+            const justRemovedLabel = context.eventName === 'pull_request_target'
+                                     && context.payload.action === 'unlabeled';
+
             async function findRunBySha(workflowFile) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
@@ -86,11 +99,12 @@ jobs:
               });
               return data.workflow_runs[0] || null;
             }
-            async function findRunWithRetry(workflowFile, maxAttempts = 3, delayMs = 6000) {
-              for (let i = 0; i < maxAttempts; i++) {
+            async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
+              if (preSleepMs > 0) await sleep(preSleepMs);
+              for (let i = 0; i < attempts; i++) {
                 const run = await findRunBySha(workflowFile);
                 if (run) return run;
-                if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs));
+                if (i < attempts - 1) await sleep(delayMs);
               }
               return null;
             }
@@ -100,30 +114,24 @@ jobs:
             // still be live. Label state only picks the fallback text.
             //
             // Retry budget:
-            // - With label: 3s pre-sleep + 3 attempts 6s apart (max 15s)
-            //   to absorb indexing lag against a fresh push.
-            // - Without label: 6s pre-sleep + 1 lookup catches the
-            //   removal-immediately-after-push edge case.
-            async function findRun(workflowFile, hasLabel) {
-              if (hasLabel) {
-                await new Promise(r => setTimeout(r, 3000));
-                return findRunWithRetry(workflowFile, 3, 6000);
-              }
-              await new Promise(r => setTimeout(r, 6000));
-              return findRunBySha(workflowFile);
-            }
-            const ptRun = await findRun('pr-test.yml', hasCI);
+            // - With label: pre-sleep + retry absorb fresh-push indexing lag.
+            // - Without label + just-removed-label event: pre-sleep + 1 lookup
+            //   catches removal-immediately-after-push.
+            // - Without label + other events: 1 lookup, no wait.
+            const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
+            const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
+            const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
             // pr-test-extra gates on BOTH labels (see check-changes there).
-            const peRun = await findRun('pr-test-extra.yml', hasCI && hasExtra);
+            const peRun = await findRun('pr-test-extra.yml', (hasCI && hasExtra) ? labelOnOpts : labelOffOpts);
 
             // Skipped run = "no real run" -- happens when a label is added
             // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
-            const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
-            const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
-            const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
-            const stalePushText = ':warning: **Not run on latest push** — push again to dispatch.';
+            const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
+            const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
+            const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
+            const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
 
             // Status icon distinguishes live / success / gate-failed / cancelled
             // so the body reflects the actual run state instead of looking
@@ -136,6 +144,7 @@ jobs:
                 case 'cancelled': return ':no_entry_sign:';
                 case 'timed_out': return ':alarm_clock:';
                 case 'action_required': return ':warning:';
+                case 'neutral': return ':grey_question:';
                 default: return ':grey_question:';
               }
             }
