@@ -465,16 +465,12 @@ def alloc_for_extend(
             for t in prefix_tensors
         ]
         # Channel-resolved reads: when SB has a Relayer ctx, fetch
-        # ``seq_lens`` / ``seq_lens_cpu`` from the gpu_scalar channel slot so
-        # the value reflects the post-decode store (with cross-stream sync
-        # built in via the channel's cuda event wait) rather than the live
-        # SB attribute.
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.relayer_resolve_seq_lens(),
-            seq_lens_cpu=batch.relayer_resolve_seq_lens_cpu(),
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
@@ -536,12 +532,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    # Channel-resolved reads: when SB has a Relayer ctx, the gpu_scalar
-    # channel holds the post-decode seq_lens (with cuda-event cross-stream
-    # sync). Pulling here ensures the page-aware decode allocator and the
-    # last_loc lookup see the same settled value forward will read.
-    seq_lens = batch.relayer_resolve_seq_lens()
-    seq_lens_cpu = batch.relayer_resolve_seq_lens_cpu()
+    # Same-iter same-stream schedule consumer: read SB attribute directly.
+    # Channel resolve is reserved for cross-stream / cross-iter readers.
+    seq_lens = batch.seq_lens
+    seq_lens_cpu = batch.seq_lens_cpu
     bs = seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:

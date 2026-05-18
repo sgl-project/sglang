@@ -3060,7 +3060,10 @@ class Scheduler(
                 # tensor refs survive the schedule-side return.
                 self.record_batch_in_overlap(batch)
 
-                bs = len(batch.relayer_resolve_seq_lens())
+                # Schedule-side same-iter read; SB attribute is the right
+                # source. Channel resolve is reserved for cross-stream /
+                # cross-iter consumers (cuda_graph_runner / ForwardBatch.init_new).
+                bs = len(batch.seq_lens)
                 # Reuse SB-bound iter slots (from bind_relayer_for_iter
                 # in the schedule pass); fall back to fresh alloc for
                 # batches that bypassed it (e.g. disagg prefill).
