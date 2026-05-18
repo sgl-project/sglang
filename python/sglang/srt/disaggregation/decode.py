@@ -1670,7 +1670,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        ret = self.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.maybe_prepare_mlp_sync_batch(self.dp_attn_adapter, ret)
         if ret:
             set_schedule_time_batch(ret)
         return ret
