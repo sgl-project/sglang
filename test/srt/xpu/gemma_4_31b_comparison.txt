@@ -1,0 +1,30 @@
+Gemma-4-31B-it — device comparison log
+Model: google/gemma-4-31B-it
+Run started (UTC): 2026-05-15T21:20:04.931961+00:00
+================================================================================
+
+
+################################################################################
+OUTPUT FROM --device XPU (Gemma-4-31B-it)
+Server device flag: --device xpu
+SGLANG_USE_SGL_XPU=1; tp=4; intel_xpu attention backend; mem-fraction-static=0.92; context-length=8192.
+################################################################################
+--- user prompt ---
+Write a minimal Python function `def add(a, b):` that returns a+b. Reply with only the function, give a brief explanation. Finish with asking me How can I help you today?
+--- assistant message.content ---
+<|channel>thought
+<channel|>```python
+def add(a, b):
+    return a + b
+```
+
+This function takes two arguments and returns their sum.
+
+How can I help you today?
+--- assistant message.reasoning_content (if any) ---
+
+--- usage ---
+  prompt_tokens: 67
+  completion_tokens: 42
+  total_tokens: 109
+================================================================================
