@@ -17,9 +17,7 @@ class NamedNoOpStage(PipelineStage):
 class TestPipelineStageProfiling(unittest.TestCase):
     def test_profiler_uses_registered_stage_name(self):
         stage = NamedNoOpStage()
-        stage.set_component_residency_manager(
-            SimpleNamespace(state=SimpleNamespace(stage_name="registered_stage"))
-        )
+        stage.set_registered_stage_name("registered_stage")
         batch = Req(perf_dump_path="/tmp/unused_perf.json")
 
         stage(batch, SimpleNamespace())
