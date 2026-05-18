@@ -732,10 +732,14 @@ def fused_k_norm_rope_flashmla(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
-    module = _jit_main_k_norm_rope_flashmla_module(
-        kv.dtype, head_dim, rope_dim, page_size
-    )
-    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+    if _is_cuda:
+        module = _jit_main_k_norm_rope_flashmla_module(
+            kv.dtype, head_dim, rope_dim, page_size
+        )
+        module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+    else:
+        from .fused_k_norm_rope_flashmla_torch import fused_k_norm_rope_flashmla_torch
+        fused_k_norm_rope_flashmla_torch(kv, kv_weight, freqs_real, positions, out_loc, kvcache, page_size, eps)
 
 
 @triton.jit
