@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=300, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestXPUBasic(CustomTestCase):
