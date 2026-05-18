@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -40,6 +41,53 @@ logger = logging.getLogger(__name__)
 
 
 _LOG_RATE_LIMIT_SECONDS: float = 5.0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _RealKvKernelArgs:
+    """Resolved real-KV kernel arguments shared by head + tail endpoints."""
+
+    buf: torch.Tensor
+    slot_stride_bytes: int
+    read_bytes: int
+    hash_mode_int: int
+
+
+def _resolve_real_kv_kernel_args(
+    *,
+    shadow_group: CanaryShadowGroup,
+    config: CanaryConfig,
+    device: torch.device,
+) -> _RealKvKernelArgs:
+    """Resolve the real-KV kernel arguments for this shadow group + config.
+
+    When the real-KV-hash feature is disabled (or the shadow group has no
+    real KV source) the kernel receives a 1-byte placeholder tensor and
+    zero stride/read_bytes so it short-circuits on the OFF early-out.
+    """
+    hash_mode_int = real_kv_hash_mode_to_int(config.real_kv_hash_mode)
+    if (
+        shadow_group.real_kv_source is not None
+        and hash_mode_int != 0
+        and shadow_group.real_kv_slot_stride_bytes > 0
+    ):
+        buf = shadow_group.real_kv_source.view(torch.uint8).contiguous().flatten()
+        slot_stride_bytes = shadow_group.real_kv_slot_stride_bytes
+        read_bytes = real_kv_hash_read_bytes(
+            config.real_kv_hash_mode, slot_stride_bytes
+        )
+        return _RealKvKernelArgs(
+            buf=buf,
+            slot_stride_bytes=slot_stride_bytes,
+            read_bytes=read_bytes,
+            hash_mode_int=hash_mode_int,
+        )
+    return _RealKvKernelArgs(
+        buf=_empty_real_kv_buf(device),
+        slot_stride_bytes=0,
+        read_bytes=0,
+        hash_mode_int=hash_mode_int,
+    )
 
 
 class CanaryRunner:
@@ -87,62 +135,28 @@ class CanaryRunner:
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
         )
-
-        real_kv_hash_mode_int = real_kv_hash_mode_to_int(config.real_kv_hash_mode)
-        if (
-            shadow_group.real_kv_source is not None
-            and real_kv_hash_mode_int != 0
-            and shadow_group.real_kv_slot_stride_bytes > 0
-        ):
-            real_kv_buf = (
-                shadow_group.real_kv_source.view(torch.uint8).contiguous().flatten()
-            )
-            real_kv_slot_stride_bytes = shadow_group.real_kv_slot_stride_bytes
-            real_kv_read_bytes = real_kv_hash_read_bytes(
-                config.real_kv_hash_mode, real_kv_slot_stride_bytes
-            )
-        else:
-            real_kv_buf = _empty_real_kv_buf(device)
-            real_kv_slot_stride_bytes = 0
-            real_kv_read_bytes = 0
-
-        self._head_endpoint = CanaryEndpoint(
+        real_kv = _resolve_real_kv_kernel_args(
+            shadow_group=shadow_group, config=config, device=device
+        )
+        self._head_endpoint = self._make_endpoint(
             kernel_kind=KERNEL_KIND_HEAD,
-            k_shadow=shadow_group.k_head,
-            v_shadow=shadow_group.v_head,
-            k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_K),
-            v_violation=(
-                self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_V)
-                if self._has_v_half
-                else None
-            ),
+            shadow_group=shadow_group,
+            violation_kind_k=VIOLATION_KIND_HEAD_K,
+            violation_kind_v=VIOLATION_KIND_HEAD_V,
             slot_run_counter=self._device_state.slot_run_counter_head,
             kernel_run_counter=self._device_state.kernel_run_counter_head,
-            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
-            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
-            real_kv_buf=real_kv_buf,
-            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
-            real_kv_read_bytes=real_kv_read_bytes,
-            real_kv_hash_mode=real_kv_hash_mode_int,
+            use_head=True,
+            real_kv=real_kv,
         )
-        self._tail_endpoint = CanaryEndpoint(
+        self._tail_endpoint = self._make_endpoint(
             kernel_kind=KERNEL_KIND_TAIL,
-            k_shadow=shadow_group.k_tail,
-            v_shadow=shadow_group.v_tail,
-            k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_K),
-            v_violation=(
-                self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_V)
-                if self._has_v_half
-                else None
-            ),
+            shadow_group=shadow_group,
+            violation_kind_k=VIOLATION_KIND_TAIL_K,
+            violation_kind_v=VIOLATION_KIND_TAIL_V,
             slot_run_counter=self._device_state.slot_run_counter_tail,
             kernel_run_counter=self._device_state.kernel_run_counter_tail,
-            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
-            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
-            real_kv_buf=real_kv_buf,
-            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
-            real_kv_read_bytes=real_kv_read_bytes,
-            real_kv_hash_mode=real_kv_hash_mode_int,
+            use_head=False,
+            real_kv=real_kv,
         )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
         # records these specific addresses; replay-side host code refills
@@ -183,6 +197,38 @@ class CanaryRunner:
         self._forward_step: int = 0
         self._poll_armed: bool = False
         self._warmup_check_done: bool = False
+
+    def _make_endpoint(
+        self,
+        *,
+        kernel_kind: int,
+        shadow_group: CanaryShadowGroup,
+        violation_kind_k: str,
+        violation_kind_v: str,
+        slot_run_counter: torch.Tensor,
+        kernel_run_counter: torch.Tensor,
+        use_head: bool,
+        real_kv: "_RealKvKernelArgs",
+    ) -> CanaryEndpoint:
+        return CanaryEndpoint(
+            kernel_kind=kernel_kind,
+            k_shadow=shadow_group.k_head if use_head else shadow_group.k_tail,
+            v_shadow=shadow_group.v_head if use_head else shadow_group.v_tail,
+            k_violation=self._device_state.get_violation_slot(violation_kind_k),
+            v_violation=(
+                self._device_state.get_violation_slot(violation_kind_v)
+                if self._has_v_half
+                else None
+            ),
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
+            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
+            real_kv_buf=real_kv.buf,
+            real_kv_slot_stride_bytes=real_kv.slot_stride_bytes,
+            real_kv_read_bytes=real_kv.read_bytes,
+            real_kv_hash_mode=real_kv.hash_mode_int,
+        )
 
     @property
     def config(self) -> CanaryConfig:
