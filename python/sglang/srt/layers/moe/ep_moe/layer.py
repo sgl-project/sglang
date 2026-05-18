@@ -103,13 +103,13 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif (
             quant_config is None
+            and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
             and get_moe_a2a_backend().is_deepep()
             and get_deepep_mode().enable_low_latency()
             and not _is_npu
             and not _is_hip
         ):
-            self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
