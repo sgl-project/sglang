@@ -10,12 +10,14 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.managers.component_manager import (
+    from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
         ComponentUse,
         ResidencyState,
     )
@@ -55,6 +57,10 @@ def _module_ready_on_local_device(
     return dtype is None or tensor.dtype == dtype
 
 
+def is_fsdp_managed_module(module: nn.Module) -> bool:
+    return module.__class__.__name__.startswith("FSDP")
+
+
 class ComponentResidencyStrategy:
     """Baseclass for describing how a component should be treated (regarding where its weights locates)
 
@@ -73,7 +79,6 @@ class ComponentResidencyStrategy:
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        """hook called"""
         self.enter(module)
 
     def wait_for_use(
@@ -142,8 +147,9 @@ class ResidentStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        if use.target_dtype is not None:
-            _module_to_local_device(module, dtype=use.target_dtype)
+        if is_fsdp_managed_module(module):
+            return
+        _module_to_local_device(module, dtype=use.target_dtype)
 
 
 class SnapshotModuleResidency:
@@ -484,11 +490,11 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     name = "layerwise"
 
     def enter(self, module: nn.Module) -> None:
-        if isinstance(module, OffloadableDiTMixin):
+        if isinstance(module, LayerwiseOffloadableModuleMixin):
             module.prepare_for_next_req()
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        if not isinstance(module, OffloadableDiTMixin):
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
         for manager in module.layerwise_offload_managers:
             manager.release_all()
