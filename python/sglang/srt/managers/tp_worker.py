@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -54,6 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.model_executor.forward_batch_info import ForwardData
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -446,7 +447,7 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        batch: Optional[ScheduleBatch],
+        batch: Optional[Union[ScheduleBatch, "ForwardData"]],
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
@@ -455,10 +456,15 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
-        # Get forward batch from schedule batch
+        # Get forward batch from schedule batch. ``batch`` is now
+        # Union[ScheduleBatch, ForwardData]: the FD path enters when the
+        # scheduler has built a ForwardData snapshot at the ownership
+        # boundary; ForwardBatch.init_new dispatches by type.
         if batch is not None:
             # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(batch.hicache_consumer_index)
+            hicache_consumer = getattr(batch, "hicache_consumer_index", None)
+            if hicache_consumer is not None:
+                self.set_hicache_consumer(hicache_consumer)
 
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         else:

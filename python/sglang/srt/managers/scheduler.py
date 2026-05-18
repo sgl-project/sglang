@@ -3175,8 +3175,16 @@ class Scheduler(
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.relayer.resolve_future(batch)
+                        # Build the ForwardData snapshot at the ownership
+                        # boundary: from this point on the forward stream
+                        # consumes FD, not the live SB. SB-side mutations
+                        # after this line will not be visible to forward
+                        # (FD captured a snapshot of the relevant fields).
+                        forward_data = batch.to_forward_data()
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            forward_data
+                        )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
