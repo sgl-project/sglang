@@ -35,7 +35,6 @@ def attach_shadow_buffers(pool: "MHATokenToKVPool") -> None:
     pool.canary_v_tail = torch.zeros(v_shape, dtype=dtype, device=device)
 
     pool.canary_slot_stride_bytes = int(k_template[0].nbytes)
-    pool.canary_num_slots = int(k_template.shape[0])
 
     _patch_get_contiguous_buf_infos(pool)
 

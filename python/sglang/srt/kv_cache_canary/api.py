@@ -107,7 +107,7 @@ def run_tail(
     if runner is None or plan is None:
         return
     runner.run_tail(plan=plan, slot_indices=forward_batch.out_cache_loc)
-    runner.commit_batch(plan)
+    runner.host_state.commit_plan(plan)
     runner.poll_violations()
 
 
@@ -152,7 +152,7 @@ def _plan_from_forward_batch(
         tokens_per_req.append(input_ids_list[cursor : cursor + n])
         cursor += n
 
-    return runner.plan_forward(
+    return runner.host_state.plan_batch(
         req_pool_indices=[int(x) for x in req_pool_indices],
         req_token_counts=[int(x) for x in seq_lens],
         req_start_positions=[int(x) for x in prefix_lens],

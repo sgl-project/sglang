@@ -146,7 +146,6 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   const uint64_t expected_prev_hash = static_cast<uint64_t>(p.expected_prev_hashes[tid]);
   const int32_t do_verify = p.verify_mask[tid];
 
-  // (1) Verify the OLD canary that should already be present in src_buf at this slot.
   if (do_verify != 0) {
     const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
     const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
@@ -154,43 +153,20 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
     const uint64_t actual_prev_hash =
         static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
 
-    // (a) hash check: did the bytes get tampered with?
+    int32_t fail_reason = 0;
     if (actual_req_id != expected_req_id) {
-      record_violation(
-          p,
-          kFailReasonReqId,
-          slot_idx,
-          actual_req_id,
-          actual_token_id,
-          actual_position,
-          expected_prev_hash,
-          actual_prev_hash);
+      fail_reason = kFailReasonReqId;
     } else if (actual_token_id != expected_token_id) {
-      record_violation(
-          p,
-          kFailReasonTokenId,
-          slot_idx,
-          actual_req_id,
-          actual_token_id,
-          actual_position,
-          expected_prev_hash,
-          actual_prev_hash);
+      fail_reason = kFailReasonTokenId;
     } else if (actual_position != expected_position) {
-      // (b) per-token position check: if the slot we read does not even hold our
-      // own position, the slot map likely points elsewhere.
-      record_violation(
-          p,
-          kFailReasonPosition,
-          slot_idx,
-          actual_req_id,
-          actual_token_id,
-          actual_position,
-          expected_prev_hash,
-          actual_prev_hash);
+      fail_reason = kFailReasonPosition;
     } else if (actual_prev_hash != expected_prev_hash) {
+      fail_reason = kFailReasonHash;
+    }
+    if (fail_reason != 0) {
       record_violation(
           p,
-          kFailReasonHash,
+          fail_reason,
           slot_idx,
           actual_req_id,
           actual_token_id,
@@ -200,21 +176,13 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
     }
   }
 
-  // (2) Compute the prev_hash for the NEW slot we are about to write. The new
-  // slot's prev_hash equals the chain hash up to and including (expected_token_id,
-  // expected_position). Host already gave us prev_hash at this position; the new
-  // hash to store includes the current token mixed in.
   const uint64_t new_prev_hash = canary_mix(expected_prev_hash, expected_token_id, expected_position);
 
-  // (3) Write the new canary slot.
   store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, expected_req_id);
   store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, expected_token_id);
   store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, expected_position);
   store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(new_prev_hash));
 
-  // (4) Counters: every thread that survived the early-return bump the slot
-  // counter; one thread per CTA bumps the kernel-invocation counter so the host
-  // can compare against forward count.
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);

@@ -38,11 +38,11 @@ def install_on_model_runner(
 
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-    pool = getattr(model_runner, "token_to_kv_pool", None)
+    pool = model_runner.token_to_kv_pool
     if not isinstance(pool, MHATokenToKVPool):
         logger.warning(
             "kv-canary v1 only supports MHATokenToKVPool; got %s. Skipping.",
-            type(pool).__name__ if pool is not None else None,
+            type(pool).__name__,
         )
         return
 

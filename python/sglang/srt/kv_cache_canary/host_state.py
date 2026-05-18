@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import threading
 from dataclasses import dataclass
 from typing import Dict, List
@@ -11,10 +10,8 @@ from sglang.jit_kernel.kv_cache_canary import VIOLATION_FIELDS
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.fingerprint import mix_step
 
-logger = logging.getLogger(__name__)
 
-
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _RequestState:
     prev_hash_tail: int
     k_req: int
@@ -30,20 +27,15 @@ class CanaryHostState:
 
     def __init__(self, *, config: CanaryConfig, num_req_slots: int) -> None:
         self._config = config
-        self._num_req_slots = num_req_slots
         self._states: Dict[int, _RequestState] = {}
         self._lock = threading.Lock()
+
+    def _initial_state(self) -> _RequestState:
+        return _RequestState(prev_hash_tail=self._config.seed, k_req=0)
 
     def reset_request(self, req_pool_idx: int) -> None:
         with self._lock:
             self._states.pop(req_pool_idx, None)
-
-    def _get_or_init(self, req_pool_idx: int) -> _RequestState:
-        state = self._states.get(req_pool_idx)
-        if state is None:
-            state = _RequestState(prev_hash_tail=self._config.seed, k_req=0)
-            self._states[req_pool_idx] = state
-        return state
 
     def plan_batch(
         self,
@@ -77,7 +69,6 @@ class CanaryHostState:
         expected_positions = [0] * total_slots
         expected_prev_hashes = [0] * total_slots
         verify_mask = [0] * total_slots
-        # For host bookkeeping: post-plan, what each request's state should advance to.
         next_state: Dict[int, _RequestState] = {}
 
         cursor = 0
@@ -88,7 +79,7 @@ class CanaryHostState:
                 req_start_positions,
                 input_tokens_per_req,
             ):
-                state = self._get_or_init(req_pool_idx)
+                state = self._states.get(req_pool_idx) or self._initial_state()
                 prev_hash = state.prev_hash_tail
                 k_req = state.k_req
                 for offset in range(count):
@@ -103,7 +94,8 @@ class CanaryHostState:
                     cursor += 1
                 new_k_req = max(k_req, start_pos + count)
                 next_state[req_pool_idx] = _RequestState(
-                    prev_hash_tail=prev_hash, k_req=new_k_req
+                    prev_hash_tail=prev_hash,
+                    k_req=new_k_req,
                 )
 
         return BatchPlan(
