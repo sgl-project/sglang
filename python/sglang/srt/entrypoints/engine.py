@@ -1167,15 +1167,19 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
-        return self.loop.run_until_complete(
+        success, message = self.loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
+        if not success:
+            raise RuntimeError(f"release_memory_occupation failed: {message}")
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
-        return self.loop.run_until_complete(
+        success, message = self.loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
+        if not success:
+            raise RuntimeError(f"resume_memory_occupation failed: {message}")
 
     def freeze_gc(self):
         """

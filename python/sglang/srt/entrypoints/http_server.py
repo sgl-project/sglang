@@ -1274,9 +1274,18 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        success, message = (
+            await _global_state.tokenizer_manager.release_memory_occupation(
+                obj, request
+            )
+        )
     except Exception as e:
         return _create_error_response(e)
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
@@ -1286,9 +1295,16 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        success, message = (
+            await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        )
     except Exception as e:
         return _create_error_response(e)
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/weights_checker")

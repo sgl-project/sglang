@@ -748,17 +748,19 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: ReleaseMemoryOccupationReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
+    ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        results = await self.release_memory_occupation_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
         obj: ResumeMemoryOccupationReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
+    ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        results = await self.resume_memory_occupation_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
 
     async def check_weights(
         self: TokenizerManager,

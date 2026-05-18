@@ -1623,7 +1623,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq):
 
 @dataclass
 class ReleaseMemoryOccupationReqOutput(BaseReq):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 @dataclass
@@ -1635,7 +1636,8 @@ class ResumeMemoryOccupationReqInput(BaseReq):
 
 @dataclass
 class ResumeMemoryOccupationReqOutput(BaseReq):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 @dataclass
