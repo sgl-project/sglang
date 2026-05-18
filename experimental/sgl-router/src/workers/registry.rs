@@ -100,6 +100,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode,
             model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
+            bootstrap_port: None,
         }
     }
 

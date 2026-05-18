@@ -257,6 +257,7 @@ mod tests {
             url: url.into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(model_id.into())],
+            bootstrap_port: None,
         }))
     }
 

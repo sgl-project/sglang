@@ -110,6 +110,7 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
         url: url.into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(model.into())],
+        bootstrap_port: None,
     }))
 }
 

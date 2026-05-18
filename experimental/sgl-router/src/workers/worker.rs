@@ -6,6 +6,31 @@ use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
+/// fallback chain: parse as-is, retry with `http://` prefix if missing,
+/// fall back to `"localhost"` if both fail. The fallback is defensive —
+/// discovery code should never emit an unparsable URL — but a panic
+/// here would crash the whole router on a single bad config entry.
+fn parse_bootstrap_host(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(h) = parsed.host_str() {
+            return h.to_string();
+        }
+    }
+    if !url.contains("://") {
+        if let Ok(parsed) = url::Url::parse(&format!("http://{url}")) {
+            if let Some(h) = parsed.host_str() {
+                return h.to_string();
+            }
+        }
+    }
+    tracing::warn!(
+        worker_url = %url,
+        "Failed to parse worker URL for bootstrap_host; defaulting to 'localhost'"
+    );
+    "localhost".to_string()
+}
+
 /// RAII guard that increments `active_requests` on construction and
 /// decrements on drop.  Obtain via [`Worker::load_guard`].
 ///
@@ -63,6 +88,17 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
+    /// Hostname parsed from `url` at construction time and cached.
+    /// Used as the `bootstrap_host` field on PD-disagg requests so the
+    /// prefill engine can match incoming KV-transfer requests from
+    /// decode peers. Falls back to `"localhost"` if the URL fails to
+    /// parse — a misconfigured worker will fail the prefill request
+    /// downstream rather than panic here.
+    bootstrap_host: String,
+    /// SGLang bootstrap server port for prefill workers (`None` for
+    /// decode and plain). Set via `--disaggregation-bootstrap-port` at
+    /// worker startup; carried from `WorkerSpec`.
+    bootstrap_port: Option<u16>,
 }
 
 impl Worker {
@@ -80,6 +116,7 @@ impl Worker {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
             None => Arc::new(CircuitBreaker::new()),
         };
+        let bootstrap_host = parse_bootstrap_host(&spec.url);
         Self {
             id: spec.id,
             url: spec.url,
@@ -87,7 +124,19 @@ impl Worker {
             model_ids: spec.model_ids,
             breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
+            bootstrap_host,
+            bootstrap_port: spec.bootstrap_port,
         }
+    }
+
+    /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
+    pub fn bootstrap_host(&self) -> &str {
+        &self.bootstrap_host
+    }
+
+    /// SGLang bootstrap server port. `None` for decode / plain workers.
+    pub fn bootstrap_port(&self) -> Option<u16> {
+        self.bootstrap_port
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -140,6 +189,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
         });
         assert_eq!(w.active_load(), 0);
         let g = w.load_guard();
@@ -160,6 +210,7 @@ mod tests {
                 url: "http://x".into(),
                 mode: m,
                 model_ids: vec![],
+                bootstrap_port: None,
             });
             assert_eq!(w.mode(), m);
         }
@@ -172,11 +223,76 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Prefill,
             model_ids: vec![],
+            bootstrap_port: None,
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
         assert_eq!(w.mode(), WorkerMode::Decode);
         w.set_mode(WorkerMode::Plain);
         assert_eq!(w.mode(), WorkerMode::Plain);
+    }
+
+    #[test]
+    fn bootstrap_port_returns_spec_value_for_prefill() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: Some(8997),
+        });
+        assert_eq!(w.bootstrap_port(), Some(8997));
+    }
+
+    #[test]
+    fn bootstrap_port_defaults_to_none() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+        });
+        assert_eq!(w.bootstrap_port(), None);
+    }
+
+    #[test]
+    fn bootstrap_host_parses_ipv4_from_url() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![],
+            bootstrap_port: Some(8997),
+        });
+        assert_eq!(w.bootstrap_host(), "10.0.0.1");
+    }
+
+    #[test]
+    fn bootstrap_host_parses_dns_name_from_url() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: "http://prefill-0.svc.cluster.local:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![],
+            bootstrap_port: Some(8997),
+        });
+        assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
+    }
+
+    #[test]
+    fn bootstrap_host_falls_back_to_localhost_for_unparsable_url() {
+        // An empty / invalid URL is not expected from discovery, but the
+        // accessor must return a usable string rather than panic — the
+        // prefill worker will reject the request body-side if the host
+        // really is unreachable.
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: "not a url".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![],
+            bootstrap_port: Some(8997),
+        });
+        assert_eq!(w.bootstrap_host(), "localhost");
     }
 }

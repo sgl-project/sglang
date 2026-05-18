@@ -136,7 +136,7 @@ fn match_prefix_is_consistent_with_concurrent_clear() {
         thread::spawn(move || {
             let mut round = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if round % 2 == 0 {
+                if round.is_multiple_of(2) {
                     tree.clear_worker(&w);
                 } else {
                     tree.insert(&w, None, &chain);
