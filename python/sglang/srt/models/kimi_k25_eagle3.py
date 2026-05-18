@@ -223,7 +223,21 @@ class Eagle3MLAModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
+            # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels (far above
+            # vocab_size). Use target-produced mm_input_embeds for these positions and
+            # only call embed_tokens on the appended next-token to avoid embed OOB.
+            embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                assert embeds is not None
+                embeds = torch.cat(
+                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+                )
+            if embeds is None:
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 

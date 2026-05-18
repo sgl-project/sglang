@@ -20,7 +20,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
