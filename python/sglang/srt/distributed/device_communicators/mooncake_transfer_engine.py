@@ -178,34 +178,20 @@ class MooncakeTransferEngine:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
-            if npu_phy_id == -1:
-                hostname += f":{get_free_port()}:npu_{self.gpu_id}"
-            else:
-                hostname += f":{get_free_port()}:npu_{npu_phy_id}"
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                "ascend",
-                device_name if device_name is not None else "",
-            )
+            suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
+            hostname += f":{get_free_port()}:npu_{suffix}"
+            protocol = "ascend"
         else:
-            # Honour MOONCAKE_PROTOCOL only when the user has set it
-            # explicitly (e.g. MOONCAKE_PROTOCOL=efa on AWS EFA).
-            # Otherwise default to "rdma" to preserve the historical
-            # behaviour for InfiniBand / RoCE deployments that have
-            # never set this variable — the env's own default ("tcp")
-            # is specific to Mooncake Store and is not appropriate here.
-            protocol = (
-                envs.MOONCAKE_PROTOCOL.get()
-                if envs.MOONCAKE_PROTOCOL.is_set()
-                else "rdma"
-            )
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                protocol,
-                device_name if device_name is not None else "",
-            )
+            # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
+            # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
+            protocol = envs.MOONCAKE_PROTOCOL.get()
+
+        ret_value = self.engine.initialize(
+            hostname,
+            "P2PHANDSHAKE",
+            protocol,
+            device_name if device_name is not None else "",
+        )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

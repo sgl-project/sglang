@@ -904,19 +904,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
-        # Honour MOONCAKE_PROTOCOL only when set explicitly; fall back
-        # to the historical default ("rdma") otherwise so IB / RoCE
-        # users don't regress to tcp (which is this env's Store-side
-        # default).
-        mooncake_protocol = (
-            envs.MOONCAKE_PROTOCOL.get()
-            if envs.MOONCAKE_PROTOCOL.is_set()
-            else "rdma"
-        )
         self.remote_instance_transfer_engine.initialize(
             local_ip,
             "P2PHANDSHAKE",
-            mooncake_protocol,
+            envs.MOONCAKE_PROTOCOL.get(),
             envs.MOONCAKE_DEVICE.get(),
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
