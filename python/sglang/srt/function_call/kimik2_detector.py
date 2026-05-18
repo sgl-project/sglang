@@ -1,9 +1,10 @@
+import copy
 import json
 import logging
 import re
-from typing import List
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -333,5 +334,89 @@ class KimiK2Detector(BaseFormatDetector):
 
         return get_info
 
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional["StructuralTag"]:
+        if not (
+            tools
+            and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
+        ):
+            return super().get_structural_tag(
+                tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+            )
+
+        try:
+            from xgrammar import StructuralTag
+            from xgrammar.structural_tag import (
+                ConstStringFormat,
+                JSONSchemaFormat,
+                SequenceFormat,
+                TagFormat,
+                TagsWithSeparatorFormat,
+            )
+        except ImportError:
+            return None
+
+        if isinstance(tool_choice, ToolChoice):
+            selected_tools = [
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
+            ]
+        else:
+            selected_tools = tools
+
+        tags = []
+        for tool in selected_tools:
+            function = tool.function
+            if function.name is None:
+                continue
+            schema = self._get_xgrammar_schema(function.parameters, function.strict)
+            tags.append(
+                TagFormat(
+                    begin=(
+                        "<|tool_call_begin|>"
+                        f"functions.{function.name}:0"
+                        "<|tool_call_argument_begin|>"
+                    ),
+                    content=JSONSchemaFormat(json_schema=schema, style="json"),
+                    end="<|tool_call_end|>",
+                )
+            )
+
+        if not tags:
+            return None
+
+        return StructuralTag(
+            format=SequenceFormat(
+                elements=[
+                    ConstStringFormat(value="<|tool_calls_section_begin|>"),
+                    TagsWithSeparatorFormat(
+                        tags=tags,
+                        separator="",
+                        at_least_one=True,
+                        stop_after_first=True,
+                    ),
+                    ConstStringFormat(value="<|tool_calls_section_end|>"),
+                ]
+            )
+        )
+
     def get_structural_tag_name(self) -> str:
         return "kimi"
+
+    @staticmethod
+    def _get_xgrammar_schema(parameters, strict: bool):
+        schema = copy.deepcopy(parameters or {"type": "object"})
+        if (
+            strict
+            and isinstance(schema, dict)
+            and schema.get("type") == "object"
+            and "properties" in schema
+            and "additionalProperties" not in schema
+        ):
+            schema["additionalProperties"] = False
+        return schema
