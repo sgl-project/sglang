@@ -603,6 +603,60 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
+    def test_auto_high_memory_ltx23_resident_keeps_aux_components_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
+
+    def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "original",
+            },
+        )
+
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_explicit_layerwise_components_preserved_in_ltx23_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "layerwise_offload_components": ["text_encoder"],
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
+
     def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
