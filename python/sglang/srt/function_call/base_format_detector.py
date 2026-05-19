@@ -89,7 +89,13 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=tool_indices.get(name, -1),
+                    # Use the sequential call position (0, 1, 2 …) so the
+                    # OpenAI tool_calls[].index field is ordered correctly.
+                    # Previously this used tool_indices.get(name) which gave
+                    # the tool's position in the *tools list*, producing wrong
+                    # indices when the model called tools in a different order
+                    # than they were defined.
+                    tool_index=len(results),
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),
