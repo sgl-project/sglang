@@ -10,9 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_sm120_supported
 
-_is_cuda = torch.cuda.is_available() and not is_hip()
-_is_sm120 = _is_cuda and is_sm120_supported()
-
 if TYPE_CHECKING:
     pass
 
@@ -107,7 +104,7 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120:
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or is_sm120_supported():
             # SM120: DeepGEMM get_paged_mqa_logits_metadata asserts
             # "Unsupported architecture" on SM120. Use None (torch fallback path).
             self.deep_gemm_metadata = None
@@ -132,7 +129,7 @@ class PagedIndexerMetadata:
 
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_sm120:
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not is_sm120_supported():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
