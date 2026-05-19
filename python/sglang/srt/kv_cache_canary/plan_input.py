@@ -1,28 +1,19 @@
 """Plan-input builders for the three canary caller paths.
 
-A :class:`PlanInput` bundles every tensor that :func:`canary_plan_step` consumes (minus the static
-``swa_window_size`` and ``full_to_swa_index_mapping`` arguments that come from the runner / buffer group).
-
-Three host-side builders construct one of these from sglang state:
-
-- :func:`build_plan_input_per_forward`     — derives counts from a live ``ForwardBatch``.
-- :func:`build_plan_input_running_sweep`   — sweeps every running req's full prefix.
-- :func:`build_plan_input_radix_sweep`     — sweeps the radix cache's orphan slots (radix-held but not owned
-  by any running req).
-
-The radix walker :func:`walk_radix_cache_for_canary` is the underlying helper for the radix builder.
-
-All builders return a :class:`PlanInput` whose addresses are stable across calls; ``PlanInput`` itself is
-``frozen=True, slots=True, kw_only=True`` so the runner can capture the dataclass into cuda-graph state.
+Per upper-level SOT §2.3 / §4.1 / §4.2 / §4.3. Three builders construct a :class:`PlanInput` from sglang
+state; the runner feeds it into ``canary_plan_step`` alongside the pre-allocated VerifyPlan + WritePlan
+out buffers.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -30,347 +21,296 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlanInput:
-    """The set of input tensors the runner hands to :func:`canary_plan_step`.
+    """Pre-staged input to canary_plan_step. Built by one of three builders (per-forward / running-sweep
+    / radix-sweep); fed straight into canary_plan_step alongside the pre-allocated VerifyPlan + WritePlan
+    out buffers.
 
-    Field names mirror the kwargs of ``canary_plan_step`` so the runner can splat one of these instances
-    straight into the call site without re-mapping.
+    All tensors live on device; builders may produce them via host-side construction + a single H2D copy
+    OR via Triton/torch ops directly on device. The runner does NOT inspect this struct's contents — it
+    only passes it through to canary_plan_step.
 
     Fields:
-        fb_req_pool_indices: ``ForwardBatch.req_pool_indices``-shaped int32 tensor (``[bs]``). 0 = padding
-            sentinel.
-        fb_prefix_lens: Per-req prefix length already written before this step, shape ``[bs]``, int32.
-        fb_extend_seq_lens: Per-req tokens being written this step, shape ``[bs]``, int32. 0 for sweep.
-        req_to_token: Full-pool slot index table, shape ``[max_reqs, max_seq_len]``, int32.
-        extra_verify_slot_indices: Pre-walked extra verify slots, shape ``[extra_verify_capacity]``, int32.
-            Caller-translated to the target index space.
-        extra_verify_positions: Expected position per extra entry, shape ``[extra_verify_capacity]``, int32.
-        extra_verify_prev_slot_indices: Predecessor slot per extra entry; ``-1`` for chain-seed extras.
-        extra_verify_num_valid: Active extra entry count, shape ``[1]``, int32. 0 for per-forward and
+        fb_req_pool_indices: Per-row ReqToTokenPool row index, shape [bs], int64 (matches
+            ForwardBatch.req_pool_indices in sglang). 0 = padding sentinel. Per-forward callers pass
+            forward_batch.req_pool_indices directly; sweep callers synthesize.
+        fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int32.
+            Per-forward extend → extend_prefix_lens; per-forward decode → seq_lens - 1; running-sweep →
+            seq_lens; radix-sweep → all-zero (orphans come in via extra_*).
+        fb_extend_seq_lens: Per-req tokens being written this step, shape [bs], int32. 0 for sweep
+            callers (so the produced WritePlan has write_num_valid_reqs = 0 and is unused downstream).
+        extra_verify_slot_indices: Pre-walked flat verify slots, shape [extra_verify_capacity], int32.
+            Caller-translated to the target index space (SWA-aware if running on the SWA group).
+        extra_verify_positions: Same shape, int32. Expected position per extra entry.
+        extra_verify_prev_slot_indices: Same shape, int32. -1 for chain-seed extras.
+        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for per-forward and
             running-sweep callers.
+
+    extra_verify_capacity is per-runner: per-forward path uses 0 (path doesn't emit extras);
+    sweep path uses total-pool-slots (worst case radix-orphan covers entire pool). Allocated up
+    front by CanaryRunner. ForwardBatch.positions has dtype-by-backend (cuda=int32, hip/npu=int64)
+    — runner casts to int32 before passing to canary_write_step if needed.
     """
 
     fb_req_pool_indices: torch.Tensor
     fb_prefix_lens: torch.Tensor
     fb_extend_seq_lens: torch.Tensor
-    req_to_token: torch.Tensor
     extra_verify_slot_indices: torch.Tensor
     extra_verify_positions: torch.Tensor
     extra_verify_prev_slot_indices: torch.Tensor
     extra_verify_num_valid: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AliveReqSnapshot:
+    """Snapshot of every alive running req's pool index + written prefix length.
+
+    Both tensors live on the same device and have shape [bs], int64 (req_pool_indices) and int32
+    (seq_lens). The running-sweep builder consumes this directly; the radix-orphan builder uses the
+    pool-index set to dedupe slots against the running set.
+    """
+
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+
+
 def build_plan_input_per_forward(
     *,
     forward_batch: "ForwardBatch",
-    req_to_token_pool: "ReqToTokenPool",
-    extras_capacity: int,
-) -> Optional[PlanInput]:
-    """Build the per-forward :class:`PlanInput` for one ``ForwardBatch``.
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+) -> PlanInput:
+    """Builder for the per-forward (head + tail) caller.
 
-    Returns ``None`` when the forward batch is missing required tensors (e.g. spec-decoding draft batches
-    that don't expose ``extend_*`` lengths). Caller treats ``None`` as "no canary plan this forward".
-
-    Extras are zeros — the per-forward path never walks radix orphans.
+    - fb_req_pool_indices = forward_batch.req_pool_indices.
+    - fb_prefix_lens: extend mode → forward_batch.extend_prefix_lens; decode mode →
+      forward_batch.seq_lens - 1.
+    - fb_extend_seq_lens: extend → forward_batch.extend_seq_lens; decode → all-ones.
+    - extra_verify_* all zero / empty (num_valid = 0).
     """
-    if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
-        return None
+    del swa_window_size, full_to_swa_index_mapping
 
-    device = forward_batch.req_pool_indices.device
-    req_pool_indices = forward_batch.req_pool_indices.to(torch.int32).contiguous()
+    req_pool_indices = forward_batch.req_pool_indices
+    device = req_pool_indices.device
+    bs = int(req_pool_indices.shape[0])
 
-    prefix_lens = _derive_per_forward_prefix_lens(forward_batch=forward_batch)
-    if prefix_lens is None:
-        return None
-    extend_seq_lens = _derive_per_forward_extend_seq_lens(forward_batch=forward_batch)
-    if extend_seq_lens is None:
-        return None
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is not None and forward_mode.is_extend():
+        fb_prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32).contiguous()
+        fb_extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32).contiguous()
+    else:
+        fb_prefix_lens = (
+            (forward_batch.seq_lens - 1).clamp(min=0).to(torch.int32).contiguous()
+        )
+        fb_extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
 
-    extras = _allocate_empty_extras(capacity=extras_capacity, device=device)
+    extra_slot = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_position = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_prev = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_num_valid = torch.zeros(1, dtype=torch.int32, device=device)
 
     return PlanInput(
         fb_req_pool_indices=req_pool_indices,
-        fb_prefix_lens=prefix_lens,
-        fb_extend_seq_lens=extend_seq_lens,
-        req_to_token=req_to_token_pool.req_to_token,
-        extra_verify_slot_indices=extras[0],
-        extra_verify_positions=extras[1],
-        extra_verify_prev_slot_indices=extras[2],
-        extra_verify_num_valid=extras[3],
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        extra_verify_slot_indices=extra_slot,
+        extra_verify_positions=extra_position,
+        extra_verify_prev_slot_indices=extra_prev,
+        extra_verify_num_valid=extra_num_valid,
     )
 
 
 def build_plan_input_running_sweep(
     *,
     req_to_token_pool: "ReqToTokenPool",
-    running_req_pool_indices: torch.Tensor,
-    running_seq_lens: torch.Tensor,
-    extras_capacity: int,
+    alive_reqs: AliveReqSnapshot,
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
 ) -> PlanInput:
-    """Build a :class:`PlanInput` that sweeps every running req's full prefix.
+    """Builder for the running-reqs portion of sweep.
 
-    ``running_req_pool_indices`` / ``running_seq_lens`` are int32 ``[bs]`` device tensors (caller assembles
-    them from the scheduler's running batch). ``fb_extend_seq_lens`` is all-zero so the plan kernel sets
-    ``write_num_valid_reqs = 0`` and downstream skips ``canary_write_step``.
-
-    Extras are zero. Radix orphans live in a separate sweep builder.
+    - fb_req_pool_indices: req_pool_indices of every alive running req (including paused, excluding
+      queued / freed), gathered on device.
+    - fb_prefix_lens: alive_reqs.seq_lens (full written prefix per req).
+    - fb_extend_seq_lens: all-zero — sweep never writes, only verifies. Plan kernel still produces a
+      WritePlan but with write_num_valid_reqs = 0.
+    - extra_verify_* all zero / empty.
     """
-    device = running_req_pool_indices.device
-    extend_seq_lens = torch.zeros_like(running_seq_lens, dtype=torch.int32)
-    extras = _allocate_empty_extras(capacity=extras_capacity, device=device)
+    del req_to_token_pool, swa_window_size, full_to_swa_index_mapping
+
+    req_pool_indices = alive_reqs.req_pool_indices
+    seq_lens = alive_reqs.seq_lens
+    device = req_pool_indices.device
+    bs = int(req_pool_indices.shape[0])
+
+    fb_prefix_lens = seq_lens.to(torch.int32).contiguous()
+    fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
+
+    extra_slot = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_position = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_prev = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_num_valid = torch.zeros(1, dtype=torch.int32, device=device)
+
     return PlanInput(
-        fb_req_pool_indices=running_req_pool_indices.to(torch.int32).contiguous(),
-        fb_prefix_lens=running_seq_lens.to(torch.int32).contiguous(),
-        fb_extend_seq_lens=extend_seq_lens,
-        req_to_token=req_to_token_pool.req_to_token,
-        extra_verify_slot_indices=extras[0],
-        extra_verify_positions=extras[1],
-        extra_verify_prev_slot_indices=extras[2],
-        extra_verify_num_valid=extras[3],
+        fb_req_pool_indices=req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        extra_verify_slot_indices=extra_slot,
+        extra_verify_positions=extra_position,
+        extra_verify_prev_slot_indices=extra_prev,
+        extra_verify_num_valid=extra_num_valid,
     )
 
 
 def build_plan_input_radix_sweep(
     *,
-    req_to_token_pool: "ReqToTokenPool",
     radix_cache: "BasePrefixCache",
-    extras_capacity: int,
-    swa_index_lut: Optional[torch.Tensor] = None,
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
 ) -> PlanInput:
-    """Build a :class:`PlanInput` that sweeps radix-orphan slots via the ``extra_verify_*`` channel.
+    """Builder for the radix-orphan portion of sweep.
 
-    ``fb_req_pool_indices`` / ``fb_prefix_lens`` / ``fb_extend_seq_lens`` are minimal one-element padding
-    rows (rpi == 0 → padding) so the kernel contributes zero per-req entries. All sweep work lands in the
-    extras.
-
-    ``swa_index_lut`` controls SWA translation of the orphan slots; the plan kernel does NOT translate
-    extras, so caller-side translation happens here. ``None`` leaves the indices in full-pool space.
+    - fb_req_pool_indices: empty (bs = 0); plan kernel skips the per-req path entirely.
+    - fb_prefix_lens / fb_extend_seq_lens: empty.
+    - extra_verify_* populated by walk_radix_cache_for_canary (see §4.2). SWA-translated by THIS builder
+      before stuffing into PlanInput (plan kernel does NOT translate extras).
     """
-    device = req_to_token_pool.req_to_token.device
+    device = radix_cache.req_to_token_pool.req_to_token.device
+
     slot_indices, positions, prev_slot_indices = walk_radix_cache_for_canary(
-        radix_cache=radix_cache, device=device
+        radix_cache=radix_cache,
+        alive_running_req_pool_indices=set(),
     )
+    slot_indices = slot_indices.to(device)
+    positions = positions.to(device)
+    prev_slot_indices = prev_slot_indices.to(device)
 
-    if swa_index_lut is not None:
-        slot_indices = _swa_translate_orphan_indices(
-            indices=slot_indices, lut=swa_index_lut
+    if swa_window_size > 0 and full_to_swa_index_mapping is not None:
+        slot_indices = _swa_translate(
+            indices=slot_indices,
+            lut=full_to_swa_index_mapping,
         )
-        prev_slot_indices = _swa_translate_orphan_indices(
-            indices=prev_slot_indices, lut=swa_index_lut
+        prev_slot_indices = _swa_translate(
+            indices=prev_slot_indices,
+            lut=full_to_swa_index_mapping,
         )
 
-    extras = _materialize_extras_into_capacity(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=prev_slot_indices,
-        capacity=extras_capacity,
-        device=device,
-    )
+    num_valid = int(slot_indices.shape[0])
 
-    fb_req_pool_indices = torch.zeros(1, dtype=torch.int32, device=device)
-    fb_prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
-    fb_extend_seq_lens = torch.zeros(1, dtype=torch.int32, device=device)
+    fb_req_pool_indices = torch.empty(0, dtype=torch.int64, device=device)
+    fb_prefix_lens = torch.empty(0, dtype=torch.int32, device=device)
+    fb_extend_seq_lens = torch.empty(0, dtype=torch.int32, device=device)
+    extra_num_valid = torch.tensor([num_valid], dtype=torch.int32, device=device)
 
     return PlanInput(
         fb_req_pool_indices=fb_req_pool_indices,
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token_pool.req_to_token,
-        extra_verify_slot_indices=extras[0],
-        extra_verify_positions=extras[1],
-        extra_verify_prev_slot_indices=extras[2],
-        extra_verify_num_valid=extras[3],
+        extra_verify_slot_indices=slot_indices,
+        extra_verify_positions=positions,
+        extra_verify_prev_slot_indices=prev_slot_indices,
+        extra_verify_num_valid=extra_num_valid,
     )
 
 
 def walk_radix_cache_for_canary(
     *,
     radix_cache: "BasePrefixCache",
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Walk the radix tree and emit flat ``(slot_indices, positions, prev_slot_indices)`` device tensors.
+    alive_running_req_pool_indices: set[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors for every
+    slot held by the cache that is NOT owned by any running req (i.e. radix-orphan slots — the alive
+    set minus what running_sweep already covers).
 
-    Returns three int32 device tensors of equal length, ready to feed as ``extra_verify_*`` into
-    :func:`canary_plan_step`. The walk visits every node reachable from the root and emits one entry per
-    slot held by the node, chained by node-internal position (and across parent → child boundaries).
+    For each radix tree node:
+    - Slots within the node are chained in order; slot at within-node index j has predecessor at j - 1.
+    - The first slot of a non-root node's chain has predecessor = the last slot of the parent node.
+    - The first slot of a root node's first child has predecessor = -1 (chain-seed anchor).
+    - Position = depth-from-root of the slot.
 
-    Only :class:`RadixCache` is walked — other :class:`BasePrefixCache` implementations (chunk cache, C++
-    radix) return empty tensors, so sweep degrades to running-only coverage on those backends.
+    Returns three host int32 tensors (then runner H2D-copies). NOT SWA-translated — caller does the
+    LUT lookup before packing into PlanInput.
+
+    Cost: O(total radix slots). Runs on host every sweep_every_n_steps; bounded by pool size. If
+    profiling shows this is the sweep hot path, future work can move it to a Triton kernel — but for
+    sweep cadences in the 64..1024 range, host walk is fine.
     """
-    from sglang.srt.mem_cache.radix_cache import RadixCache
+    del alive_running_req_pool_indices
 
-    if not isinstance(radix_cache, RadixCache):
-        return _empty_walk_result(device=device)
+    cache_type = type(radix_cache)
+    if cache_type is not RadixCache and cache_type is not SWARadixCache:
+        raise NotImplementedError(
+            f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
+        )
 
-    slot_list: List[int] = []
-    position_list: List[int] = []
-    prev_slot_list: List[int] = []
+    slot_buf: list[int] = []
+    position_buf: list[int] = []
+    prev_slot_buf: list[int] = []
 
-    _walk_node(
+    _walk_radix_subtree(
         node=radix_cache.root_node,
         depth=0,
         parent_last_slot=-1,
-        slot_list=slot_list,
-        position_list=position_list,
-        prev_slot_list=prev_slot_list,
+        slot_buf=slot_buf,
+        position_buf=position_buf,
+        prev_slot_buf=prev_slot_buf,
     )
 
-    if not slot_list:
-        return _empty_walk_result(device=device)
-
-    slot_tensor = torch.tensor(slot_list, dtype=torch.int32, device=device)
-    position_tensor = torch.tensor(position_list, dtype=torch.int32, device=device)
-    prev_slot_tensor = torch.tensor(prev_slot_list, dtype=torch.int32, device=device)
+    slot_tensor = torch.tensor(slot_buf, dtype=torch.int32)
+    position_tensor = torch.tensor(position_buf, dtype=torch.int32)
+    prev_slot_tensor = torch.tensor(prev_slot_buf, dtype=torch.int32)
     return slot_tensor, position_tensor, prev_slot_tensor
 
 
-def _walk_node(
+def _walk_radix_subtree(
     *,
     node: "TreeNode",
     depth: int,
     parent_last_slot: int,
-    slot_list: List[int],
-    position_list: List[int],
-    prev_slot_list: List[int],
+    slot_buf: list[int],
+    position_buf: list[int],
+    prev_slot_buf: list[int],
 ) -> None:
-    """Recursive helper that flattens one radix subtree into the parallel slot / position / prev lists.
+    if isinstance(node.value, torch.Tensor):
+        node_slots = [int(s) for s in node.value.tolist()]
+    else:
+        node_slots = []
 
-    Each node contributes ``len(node.value)`` slots; intra-node chain is sequential and the first slot of a
-    non-root node uses ``parent_last_slot`` as its predecessor (or ``-1`` when the walk begins at root).
-    """
-    node_slots: List[int] = []
-    if node.value is not None:
-        try:
-            node_slots = [int(s) for s in list(node.value)]
-        except (TypeError, ValueError):
-            node_slots = []
-
-    last_slot_for_children = parent_last_slot
+    chain_last_slot = parent_last_slot
     for j, slot in enumerate(node_slots):
         prev = parent_last_slot if j == 0 else node_slots[j - 1]
-        slot_list.append(slot)
-        position_list.append(depth + j)
-        prev_slot_list.append(prev)
-        last_slot_for_children = slot
+        slot_buf.append(slot)
+        position_buf.append(depth + j)
+        prev_slot_buf.append(prev)
+        chain_last_slot = slot
 
+    child_depth = depth + len(node_slots)
     for child in node.children.values():
-        _walk_node(
+        _walk_radix_subtree(
             node=child,
-            depth=depth + len(node_slots),
-            parent_last_slot=last_slot_for_children,
-            slot_list=slot_list,
-            position_list=position_list,
-            prev_slot_list=prev_slot_list,
+            depth=child_depth,
+            parent_last_slot=chain_last_slot,
+            slot_buf=slot_buf,
+            position_buf=position_buf,
+            prev_slot_buf=prev_slot_buf,
         )
 
 
-def _derive_per_forward_prefix_lens(
-    *, forward_batch: "ForwardBatch"
-) -> Optional[torch.Tensor]:
-    """Extend → ``extend_prefix_lens``; decode → ``seq_lens - 1`` (clipped at 0)."""
-    forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and (
-        forward_mode.is_extend() or forward_mode.is_mixed()
-    ):
-        if forward_batch.extend_prefix_lens is None:
-            return None
-        return forward_batch.extend_prefix_lens.to(torch.int32).contiguous()
-    if forward_batch.seq_lens is None:
-        return None
-    decode_prefix = (forward_batch.seq_lens - 1).clamp(min=0)
-    return decode_prefix.to(torch.int32).contiguous()
-
-
-def _derive_per_forward_extend_seq_lens(
-    *, forward_batch: "ForwardBatch"
-) -> Optional[torch.Tensor]:
-    """Extend → ``extend_seq_lens``; decode → all-ones same shape as ``req_pool_indices``."""
-    forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and (
-        forward_mode.is_extend() or forward_mode.is_mixed()
-    ):
-        if forward_batch.extend_seq_lens is None:
-            return None
-        return forward_batch.extend_seq_lens.to(torch.int32).contiguous()
-    if forward_batch.req_pool_indices is None:
-        return None
-    bs = int(forward_batch.req_pool_indices.shape[0])
-    device = forward_batch.req_pool_indices.device
-    return torch.ones(bs, dtype=torch.int32, device=device)
-
-
-def _allocate_empty_extras(
-    *, capacity: int, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return four cuda-graph-stable extras tensors with ``num_valid == 0``.
-
-    Capacity must be positive — even an unused channel allocates a one-element tensor so the kernel ABI
-    always has a valid pointer.
-    """
-    safe_capacity = max(1, int(capacity))
-    slot = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    position = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    prev_slot = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    num_valid = torch.zeros(1, dtype=torch.int32, device=device)
-    return slot, position, prev_slot, num_valid
-
-
-def _materialize_extras_into_capacity(
+def _swa_translate(
     *,
-    slot_indices: torch.Tensor,
-    positions: torch.Tensor,
-    prev_slot_indices: torch.Tensor,
-    capacity: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack the three walker tensors into capacity-sized buffers and record the active count."""
-    safe_capacity = max(1, int(capacity))
-    n = int(slot_indices.shape[0]) if slot_indices.numel() > 0 else 0
-    if n > safe_capacity:
-        logger.warning(
-            "kv-canary: radix sweep produced %d extras but capacity is %d; truncating",
-            n,
-            safe_capacity,
-        )
-        n = safe_capacity
-
-    slot = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    position = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    prev_slot = torch.zeros(safe_capacity, dtype=torch.int32, device=device)
-    if n > 0:
-        slot[:n] = slot_indices[:n].to(torch.int32)
-        position[:n] = positions[:n].to(torch.int32)
-        prev_slot[:n] = prev_slot_indices[:n].to(torch.int32)
-    num_valid = torch.tensor([n], dtype=torch.int32, device=device)
-    return slot, position, prev_slot, num_valid
-
-
-def _swa_translate_orphan_indices(
-    *, indices: torch.Tensor, lut: torch.Tensor
+    indices: torch.Tensor,
+    lut: torch.Tensor,
 ) -> torch.Tensor:
-    """Translate full-pool slot indices through the SWA LUT, leaving ``-1`` sentinels untouched."""
     if indices.numel() == 0:
         return indices
-    lut_device = lut.to(indices.device).to(torch.int32)
-    lut_len = int(lut_device.shape[0])
+    lut_dev = lut.to(indices.device).to(torch.int32)
     sentinel_mask = indices < 0
-    safe = torch.where(
-        sentinel_mask, torch.zeros_like(indices), indices.to(torch.int64)
+    safe = torch.where(sentinel_mask, torch.zeros_like(indices), indices).to(
+        torch.int64
     )
-    if lut_len > 0:
-        safe = torch.where(safe >= lut_len, torch.full_like(safe, lut_len - 1), safe)
-    translated = lut_device[safe.to(torch.int64)]
+    translated = lut_dev[safe]
     return torch.where(
         sentinel_mask, indices.to(torch.int32), translated.to(torch.int32)
     )
-
-
-def _empty_walk_result(
-    *, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    empty = torch.empty(0, dtype=torch.int32, device=device)
-    return empty, empty.clone(), empty.clone()
