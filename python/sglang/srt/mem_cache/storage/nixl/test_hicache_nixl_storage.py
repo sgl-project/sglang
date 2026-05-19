@@ -46,7 +46,6 @@ class TestNixlUnified(unittest.TestCase):
             enable_storage_metrics=False,
             is_page_first_layout=False,
             model_name="test_model",
-            enable_storage_metrics=False,
             extra_config={"plugin": {"posix": {"active": True}}},
         )
 
