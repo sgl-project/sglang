@@ -21,6 +21,7 @@ ATTENTION_BACKEND = ["ascend"]
 TORCH_DTYPES = [torch.bfloat16]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBgeReranker(CustomTestCase):
     """Testcase: This test case validates that the cross-encoder scores from the BAAI/bge-reranker-v2-m3 model in the
     SGLang framework are less than 1e-2 different from the Hugging Face implementation.

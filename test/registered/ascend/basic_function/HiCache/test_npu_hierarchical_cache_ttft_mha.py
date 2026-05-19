@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_32B_WEIGHTS_PATH,
     run_bench_serving,
@@ -14,6 +16,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNpuHierarchicalCacheTTFT(CustomTestCase):
     """The test used the Qwen3-32B model, with hierarchical cache enabled, and TTFT improved by 40%.
 
