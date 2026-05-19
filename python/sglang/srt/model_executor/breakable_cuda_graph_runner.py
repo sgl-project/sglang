@@ -480,6 +480,15 @@ class BreakableCudaGraphRunner:
             finally:
                 self.layer_model.forward = original_layer_forward
         if isinstance(output, LogitsProcessorOutput):
+            # Slice trailing-padding off hidden_states; next_token_logits is
+            # bs-shaped from logits_processor (bs <= raw_num_tokens), so the
+            # slice is a no-op for that field but matches PCG's pattern.
+            mm_input_embeds = None
+            if (
+                self.model_runner.spec_algorithm.is_speculative()
+                and output.mm_input_embeds is not None
+            ):
+                mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_tokens],
                 hidden_states=(
@@ -487,6 +496,7 @@ class BreakableCudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                mm_input_embeds=mm_input_embeds,
             )
         elif isinstance(output, EmbeddingPoolerOutput):
             return output
