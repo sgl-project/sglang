@@ -90,7 +90,6 @@ def _launch(
     *,
     src: torch.Tensor,
     dst: torch.Tensor,
-    slot_stride: int,
     verify_slot_indices: list[int],
     verify_positions: list[int],
     verify_prev_slot_indices: list[int],
@@ -106,9 +105,8 @@ def _launch(
     n_write = len(write_slot_indices)
     n_write_reqs = len(write_req_seed_slot_indices)
     canary_step(
-        src_buf=src.flatten(),
-        dst_buf=dst.flatten(),
-        slot_stride_bytes=slot_stride,
+        src_buf=src,
+        dst_buf=dst,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -136,8 +134,7 @@ def _launch(
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=KERNEL_KIND_HEAD,
-        real_kv_buf=torch.zeros(1, dtype=torch.uint8, device=DEFAULT_DEVICE),
-        real_kv_slot_stride_bytes=0,
+        real_kv_buf=torch.zeros(1, 1, dtype=torch.uint8, device=DEFAULT_DEVICE),
         real_kv_read_bytes=0,
         real_kv_hash_mode=0,
     )
@@ -150,8 +147,9 @@ def _context_len_step(context_len: int) -> None:
     plus the canary writes the new decode token at the tail.
     """
     num_slots = context_len + 2
-    slot_stride = CANARY_SLOT_BYTES
-    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    buf = torch.zeros(
+        num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=DEFAULT_DEVICE
+    )
     state = _build_state(num_slots=num_slots)
 
     verify_slot_indices = list(range(context_len))
@@ -160,7 +158,6 @@ def _context_len_step(context_len: int) -> None:
     _launch(
         src=buf,
         dst=buf,
-        slot_stride=slot_stride,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
         verify_prev_slot_indices=verify_prev_slot_indices,
@@ -177,14 +174,14 @@ def _context_len_step(context_len: int) -> None:
 def _extend_chunk_step(chunk_size: int) -> None:
     """Single req writes ``chunk_size`` new tokens (chunked prefill)."""
     num_slots = chunk_size + 2
-    slot_stride = CANARY_SLOT_BYTES
-    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    buf = torch.zeros(
+        num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=DEFAULT_DEVICE
+    )
     state = _build_state(num_slots=num_slots)
 
     _launch(
         src=buf,
         dst=buf,
-        slot_stride=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -201,10 +198,11 @@ def _extend_chunk_step(chunk_size: int) -> None:
 def _decode_bs_step(batch_size: int) -> None:
     """``batch_size`` concurrent decode reqs, each verifies a short history + writes 1 token."""
     history = _DECODE_HISTORY
-    slot_stride = CANARY_SLOT_BYTES
     total_slots_per_req = history + 1
     num_slots = batch_size * total_slots_per_req
-    buf = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device=DEFAULT_DEVICE)
+    buf = torch.zeros(
+        num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=DEFAULT_DEVICE
+    )
     state = _build_state(num_slots=num_slots)
 
     verify_slot_indices: list[int] = []
@@ -233,7 +231,6 @@ def _decode_bs_step(batch_size: int) -> None:
     _launch(
         src=buf,
         dst=buf,
-        slot_stride=slot_stride,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
         verify_prev_slot_indices=verify_prev_slot_indices,

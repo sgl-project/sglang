@@ -81,7 +81,6 @@ class _RealKvKernelArgs:
     """Resolved real-KV kernel arguments shared by head + tail endpoints."""
 
     buf: torch.Tensor
-    slot_stride_bytes: int
     read_bytes: int
     hash_mode_int: int
 
@@ -95,8 +94,8 @@ def _resolve_real_kv_kernel_args(
     """Resolve the real-KV kernel arguments for this canary buffer group + config.
 
     When the real-KV-hash feature is disabled (or the canary buffer group has no
-    real KV source) the kernel receives a 1-byte placeholder tensor and
-    zero stride/read_bytes so it short-circuits on the OFF early-out.
+    real KV source) the kernel receives a 2D placeholder tensor and
+    zero read_bytes so it short-circuits on the OFF early-out.
     """
     hash_mode_int = real_kv_hash_mode_to_int(config.real_kv_hash_mode)
     if (
@@ -104,20 +103,19 @@ def _resolve_real_kv_kernel_args(
         and hash_mode_int != 0
         and buffer_group.real_kv_slot_stride_bytes > 0
     ):
-        buf = buffer_group.real_kv_source.view(torch.uint8).contiguous().flatten()
-        slot_stride_bytes = buffer_group.real_kv_slot_stride_bytes
+        real_kv_source = buffer_group.real_kv_source.contiguous()
+        num_slots = int(real_kv_source.shape[0])
+        buf = real_kv_source.view(torch.uint8).view(num_slots, -1)
         read_bytes = real_kv_hash_read_bytes(
-            config.real_kv_hash_mode, slot_stride_bytes
+            config.real_kv_hash_mode, buffer_group.real_kv_slot_stride_bytes
         )
         return _RealKvKernelArgs(
             buf=buf,
-            slot_stride_bytes=slot_stride_bytes,
             read_bytes=read_bytes,
             hash_mode_int=hash_mode_int,
         )
     return _RealKvKernelArgs(
         buf=_empty_real_kv_buf(device),
-        slot_stride_bytes=0,
         read_bytes=0,
         hash_mode_int=hash_mode_int,
     )
@@ -294,10 +292,7 @@ class CanaryRunner:
             ),
             slot_run_counter=slot_run_counter,
             kernel_run_counter=kernel_run_counter,
-            k_slot_stride_bytes=buffer_group.k_slot_stride_bytes,
-            v_slot_stride_bytes=buffer_group.v_slot_stride_bytes,
             real_kv_buf=real_kv.buf,
-            real_kv_slot_stride_bytes=real_kv.slot_stride_bytes,
             real_kv_read_bytes=real_kv.read_bytes,
             real_kv_hash_mode=real_kv.hash_mode_int,
         )

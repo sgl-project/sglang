@@ -92,7 +92,6 @@ def canary_step_torch_reference(
     *,
     src_buf: torch.Tensor,
     dst_buf: torch.Tensor,
-    slot_stride_bytes: int,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
@@ -117,7 +116,6 @@ def canary_step_torch_reference(
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
     real_kv_buf: torch.Tensor,
-    real_kv_slot_stride_bytes: int,
     real_kv_read_bytes: int,
     real_kv_hash_mode: int,
 ) -> None:
@@ -160,11 +158,9 @@ def canary_step_torch_reference(
     int_views = _IntViewBundle(
         src_buf=src_buf,
         dst_buf=dst_buf,
-        slot_stride_bytes=slot_stride_bytes,
     )
     real_kv_view = _RealKvView(
         real_kv_buf=real_kv_buf,
-        slot_stride_bytes=int(real_kv_slot_stride_bytes),
         read_bytes=int(real_kv_read_bytes),
         mode=int(real_kv_hash_mode),
     )
@@ -222,7 +218,8 @@ class _IntViewBundle:
     The CUDA kernel reads/writes 64-bit fields directly out of byte
     buffers. We mirror that by pulling both buffers to host once,
     reshaping them as ``(num_slots, slot_stride_bytes // 8)`` int64
-    arrays, and writing changes back on commit.
+    arrays, and writing changes back on commit. The per-slot byte
+    stride is taken from ``src_buf.shape[1]``.
     """
 
     def __init__(
@@ -230,17 +227,18 @@ class _IntViewBundle:
         *,
         src_buf: torch.Tensor,
         dst_buf: torch.Tensor,
-        slot_stride_bytes: int,
     ) -> None:
         self._src_buf = src_buf
         self._dst_buf = dst_buf
-        self._slot_stride_bytes = int(slot_stride_bytes)
+        self._slot_stride_bytes = int(src_buf.shape[1])
         self._slot_stride_i64 = self._slot_stride_bytes // 8
-        self._src_i64 = src_buf.detach().to("cpu").view(torch.int64).clone()
+        self._src_i64 = src_buf.detach().to("cpu").view(torch.int64).flatten().clone()
         if dst_buf.data_ptr() == src_buf.data_ptr():
             self._dst_i64 = self._src_i64
         else:
-            self._dst_i64 = dst_buf.detach().to("cpu").view(torch.int64).clone()
+            self._dst_i64 = (
+                dst_buf.detach().to("cpu").view(torch.int64).flatten().clone()
+            )
 
     def load_field(self, slot_idx: int, field: int) -> int:
         row_start = slot_idx * self._slot_stride_i64
@@ -263,7 +261,9 @@ class _IntViewBundle:
         storage and the single copy below updates both.
         """
         dst_dev_i64 = self._dst_i64.to(self._dst_buf.device)
-        self._dst_buf.view(torch.int64).copy_(dst_dev_i64)
+        self._dst_buf.view(torch.int64).copy_(
+            dst_dev_i64.view(self._dst_buf.shape[0], self._slot_stride_i64)
+        )
 
 
 class _RealKvView:
@@ -281,17 +281,18 @@ class _RealKvView:
         self,
         *,
         real_kv_buf: torch.Tensor,
-        slot_stride_bytes: int,
         read_bytes: int,
         mode: int,
     ) -> None:
         self._mode = int(mode)
-        self._slot_stride_bytes = int(slot_stride_bytes)
+        self._slot_stride_bytes = int(real_kv_buf.shape[1])
         self._read_bytes = int(read_bytes)
         if self._mode == REAL_KV_HASH_MODE_OFF or self._read_bytes <= 0:
             self._host_bytes: Optional[bytes] = None
         else:
-            flat_bytes = real_kv_buf.detach().to("cpu").contiguous().view(torch.uint8)
+            flat_bytes = (
+                real_kv_buf.detach().to("cpu").contiguous().view(torch.uint8).flatten()
+            )
             self._host_bytes = bytes(flat_bytes.numpy().tobytes())
 
     def hash_slot(self, slot_idx: int) -> int:

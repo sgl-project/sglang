@@ -447,7 +447,6 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
 void canary_step(
     tvm::ffi::TensorView src_buf,
     tvm::ffi::TensorView dst_buf,
-    int64_t slot_stride_bytes,
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
@@ -472,16 +471,30 @@ void canary_step(
     tvm::ffi::TensorView kernel_run_counter,
     int64_t kernel_kind,
     tvm::ffi::TensorView real_kv_buf,
-    int64_t real_kv_slot_stride_bytes,
     int64_t real_kv_read_bytes,
     int64_t real_kv_hash_mode) {
   using namespace host;
 
+  SymbolicSize N_canary_slots = {"num_canary_slots"};
+  SymbolicSize N_slot_stride = {"slot_stride_bytes"};
   SymbolicSize N_verify = {"num_verify"};
   SymbolicSize N_write = {"num_write"};
   SymbolicSize N_write_reqs = {"num_write_reqs"};
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
+
+  TensorMatcher({N_canary_slots, N_slot_stride})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(src_buf)
+      .verify(dst_buf);
+
+  SymbolicSize N_real_kv_slots = {"num_real_kv_slots"};
+  SymbolicSize N_real_kv_stride = {"real_kv_slot_stride_bytes"};
+  TensorMatcher({N_real_kv_slots, N_real_kv_stride})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(real_kv_buf);
 
   TensorMatcher({N_verify})
       .with_dtype<int64_t>()
@@ -508,6 +521,7 @@ void canary_step(
       .verify(write_req_entry_counts);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_req_num_valid);
 
+  const int64_t slot_stride_bytes = N_slot_stride.unwrap();
   const uint32_t num_verify = static_cast<uint32_t>(N_verify.unwrap());
   const uint32_t num_write_reqs = static_cast<uint32_t>(N_write_reqs.unwrap());
   const DLDevice device = device_.unwrap();
@@ -529,6 +543,11 @@ void canary_step(
   RuntimeCheck(
       violation_ring_valid.size(0) == static_cast<int64_t>(ring_capacity),
       "canary: violation_ring_valid first dim must equal ring_capacity");
+
+  // real_kv_buf is 2D [num_slots, real_kv_slot_stride_bytes] when the
+  // real-KV feature is ON. In OFF mode it is a 2D placeholder (any shape)
+  // that the kernel never dereferences.
+  const int64_t real_kv_slot_stride_bytes = real_kv_buf.size(1);
 
   const uint32_t total_threads = num_verify + num_write_reqs;
   // No early return on total_threads == 0: the kernel still has the

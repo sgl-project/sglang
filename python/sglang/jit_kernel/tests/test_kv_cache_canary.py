@@ -67,14 +67,13 @@ def _num_valid(values: list[int]) -> torch.Tensor:
 
 
 def _empty_real_kv() -> torch.Tensor:
-    return torch.zeros(1, dtype=torch.uint8, device="cuda")
+    return torch.zeros(1, 1, dtype=torch.uint8, device="cuda")
 
 
 def _run(
     *,
     src: torch.Tensor,
     dst: torch.Tensor,
-    slot_stride_bytes: int,
     verify_slot_indices: list[int],
     verify_positions: list[int],
     verify_prev_slot_indices: list[int],
@@ -90,7 +89,6 @@ def _run(
     kernel_kind: int,
     seed: int = _SEED,
     real_kv_buf: torch.Tensor | None = None,
-    real_kv_slot_stride_bytes: int = 0,
     real_kv_read_bytes: int = 0,
     real_kv_hash_mode: int = 0,
     expected_write_token_ids: list[int] | None = None,
@@ -104,9 +102,8 @@ def _run(
         [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
     )
     canary_step(
-        src_buf=src.flatten(),
-        dst_buf=dst.flatten(),
-        slot_stride_bytes=slot_stride_bytes,
+        src_buf=src,
+        dst_buf=dst,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -131,7 +128,6 @@ def _run(
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=kernel_kind,
         real_kv_buf=real_kv_buf if real_kv_buf is not None else _empty_real_kv(),
-        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
     )
@@ -159,7 +155,6 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
     _run(
         src=dst,
         dst=dst,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -203,7 +198,6 @@ def test_verify_clean_round_trip_no_violation():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -224,7 +218,6 @@ def test_verify_clean_round_trip_no_violation():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=slot_indices,
         verify_positions=positions,
         verify_prev_slot_indices=[-1, slot_indices[0], slot_indices[1]],
@@ -251,7 +244,6 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -272,7 +264,6 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[5],
         verify_prev_slot_indices=[-1],
@@ -302,7 +293,6 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -327,7 +317,6 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
@@ -362,7 +351,6 @@ def test_verify_skips_chain_check_on_sentinel():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -388,7 +376,6 @@ def test_verify_skips_chain_check_on_sentinel():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
@@ -421,7 +408,6 @@ def test_verify_skips_chain_check_on_sentinel():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
@@ -451,7 +437,6 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
         verify_prev_slot_indices=[-1, 0],
@@ -503,7 +488,6 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
@@ -532,7 +516,6 @@ def test_first_violation_preserved_across_cascading_mismatches():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -552,7 +535,6 @@ def test_first_violation_preserved_across_cascading_mismatches():
     _run(
         src=buf,
         dst=buf,
-        slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[7],
         verify_prev_slot_indices=[-1],
@@ -574,7 +556,6 @@ def test_first_violation_preserved_across_cascading_mismatches():
         _run(
             src=buf,
             dst=buf,
-            slot_stride_bytes=slot_stride,
             verify_slot_indices=[1, 2, 3],
             verify_positions=[99, 98, 97],
             verify_prev_slot_indices=[0, 1, 2],
@@ -712,12 +693,10 @@ def _run_differential(
     state_ref: dict,
     inputs_cuda: dict,
     inputs_ref: dict,
-    slot_stride: int,
     kernel_kind: int,
     seed: int = _SEED,
     real_kv_buf_cuda: torch.Tensor | None = None,
     real_kv_buf_ref: torch.Tensor | None = None,
-    real_kv_slot_stride_bytes: int = 0,
     real_kv_read_bytes: int = 0,
     real_kv_hash_mode: int = 0,
 ) -> None:
@@ -727,17 +706,16 @@ def _run_differential(
 
     if real_kv_buf_cuda is None:
         real_kv_buf_cuda = torch.zeros(
-            1, dtype=torch.uint8, device=state_cuda["dst_buf"].device
+            1, 1, dtype=torch.uint8, device=state_cuda["dst_buf"].device
         )
     if real_kv_buf_ref is None:
         real_kv_buf_ref = torch.zeros(
-            1, dtype=torch.uint8, device=state_ref["dst_buf"].device
+            1, 1, dtype=torch.uint8, device=state_ref["dst_buf"].device
         )
 
     canary_step(
-        src_buf=src_cuda.flatten(),
-        dst_buf=state_cuda["dst_buf"].flatten(),
-        slot_stride_bytes=slot_stride,
+        src_buf=src_cuda,
+        dst_buf=state_cuda["dst_buf"],
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_cuda["violation_ring"],
@@ -749,7 +727,6 @@ def _run_differential(
         slot_run_counter=state_cuda["slot_run_counter"],
         kernel_run_counter=state_cuda["kernel_run_counter"],
         real_kv_buf=real_kv_buf_cuda,
-        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
         **inputs_cuda,
@@ -757,9 +734,8 @@ def _run_differential(
     torch.cuda.synchronize()
 
     canary_step_torch_reference(
-        src_buf=src_ref.flatten(),
-        dst_buf=state_ref["dst_buf"].flatten(),
-        slot_stride_bytes=slot_stride,
+        src_buf=src_ref,
+        dst_buf=state_ref["dst_buf"],
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_ref["violation_ring"],
@@ -771,7 +747,6 @@ def _run_differential(
         slot_run_counter=state_ref["slot_run_counter"],
         kernel_run_counter=state_ref["kernel_run_counter"],
         real_kv_buf=real_kv_buf_ref,
-        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
         **inputs_ref,
@@ -1199,7 +1174,6 @@ def _prefill_buffer_with_chain(
     positions: list[int],
     slot_stride: int,
     real_kv_buf: torch.Tensor | None = None,
-    real_kv_slot_stride_bytes: int = 0,
     real_kv_read_bytes: int = 0,
     real_kv_hash_mode: int = 0,
 ) -> None:
@@ -1228,11 +1202,10 @@ def _prefill_buffer_with_chain(
     )
     # Use canary_step itself; result lives in state["dst_buf"], copy to buf.
     if real_kv_buf is None:
-        real_kv_buf = torch.zeros(1, dtype=torch.uint8, device=buf.device)
+        real_kv_buf = torch.zeros(1, 1, dtype=torch.uint8, device=buf.device)
     canary_step(
-        src_buf=state["dst_buf"].flatten(),
-        dst_buf=state["dst_buf"].flatten(),
-        slot_stride_bytes=slot_stride,
+        src_buf=state["dst_buf"],
+        dst_buf=state["dst_buf"],
         seed=_SEED,
         kernel_kind=KERNEL_KIND_HEAD,
         violation_ring=state["violation_ring"],
@@ -1244,7 +1217,6 @@ def _prefill_buffer_with_chain(
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         real_kv_buf=real_kv_buf,
-        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
         **inputs,
@@ -1279,18 +1251,16 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
     corrupt = scenario.get("corrupt_prev_hash")
     real_kv_cfg = scenario.get("real_kv")
 
-    real_kv_slot_stride_bytes = 0
     real_kv_read_bytes = 0
     real_kv_hash_mode = 0
     real_kv_buf_cuda: torch.Tensor | None = None
     real_kv_buf_ref: torch.Tensor | None = None
     if real_kv_cfg is not None:
-        real_kv_slot_stride_bytes = int(real_kv_cfg["slot_stride_bytes"])
         real_kv_read_bytes = int(real_kv_cfg["read_bytes"])
         real_kv_hash_mode = int(real_kv_cfg["mode_int"])
         real_kv_buf_cuda = _build_real_kv_buf(
             num_slots=num_slots,
-            slot_stride_bytes=real_kv_slot_stride_bytes,
+            slot_stride_bytes=int(real_kv_cfg["slot_stride_bytes"]),
             pattern=real_kv_cfg["byte_pattern"],
         )
 
@@ -1303,7 +1273,6 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
             positions=prefill["positions"],
             slot_stride=slot_stride,
             real_kv_buf=real_kv_buf_cuda,
-            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
             real_kv_read_bytes=real_kv_read_bytes,
             real_kv_hash_mode=real_kv_hash_mode,
         )
@@ -1352,11 +1321,9 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
         state_ref=state_ref,
         inputs_cuda=inputs_cuda,
         inputs_ref=inputs_ref,
-        slot_stride=slot_stride,
         kernel_kind=kernel_kind,
         real_kv_buf_cuda=real_kv_buf_cuda,
         real_kv_buf_ref=real_kv_buf_ref,
-        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
     )

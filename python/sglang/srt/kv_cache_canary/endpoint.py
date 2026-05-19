@@ -13,14 +13,14 @@ from sglang.srt.kv_cache_canary.host_state import (
 
 
 def _empty_real_kv_buf(device: torch.device) -> torch.Tensor:
-    """One-byte placeholder ``real_kv_buf`` for OFF-mode kernel launches.
+    """2D 1x1 placeholder ``real_kv_buf`` for OFF-mode kernel launches.
 
     The kernel takes a non-null tensor handle but never dereferences it
-    in OFF mode (``real_kv_hash_mode == 0`` -> early-out). A 1-byte
-    uint8 tensor satisfies the type / non-null constraint without
-    allocating real KV memory.
+    in OFF mode (``real_kv_hash_mode == 0`` -> early-out). A 2D uint8
+    placeholder satisfies the type / shape constraint without allocating
+    real KV memory.
     """
-    return torch.zeros(1, dtype=torch.uint8, device=device)
+    return torch.zeros(1, 1, dtype=torch.uint8, device=device)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -45,10 +45,7 @@ class CanaryEndpoint:
     v_violation: Optional[CanaryViolationSlot]
     slot_run_counter: torch.Tensor
     kernel_run_counter: torch.Tensor
-    k_slot_stride_bytes: int
-    v_slot_stride_bytes: int
     real_kv_buf: torch.Tensor
-    real_kv_slot_stride_bytes: int
     real_kv_read_bytes: int
     real_kv_hash_mode: int
 
@@ -70,11 +67,10 @@ class CanaryEndpoint:
         ``CanaryViolationSlot`` so K-half and V-half mismatches never
         cross-latch into one another's first-violation row.
         """
-        buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int, CanaryViolationSlot]] = [
+        buf_specs: List[Tuple[torch.Tensor, torch.Tensor, CanaryViolationSlot]] = [
             (
                 src.k_canary_buf,
                 self.k_canary_buf,
-                self.k_slot_stride_bytes,
                 self.k_violation,
             )
         ]
@@ -89,17 +85,15 @@ class CanaryEndpoint:
                 (
                     src.v_canary_buf,
                     self.v_canary_buf,
-                    self.v_slot_stride_bytes,
                     self.v_violation,
                 )
             )
 
-        for src_buf, dst_buf, stride, violation_slot in buf_specs:
+        for src_buf, dst_buf, violation_slot in buf_specs:
             # API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
             canary_step(
-                src_buf=src_buf.view(torch.uint8).flatten(),
-                dst_buf=dst_buf.view(torch.uint8).flatten(),
-                slot_stride_bytes=stride,
+                src_buf=src_buf,
+                dst_buf=dst_buf,
                 verify_slot_indices=launch_buffers.verify_slot_indices,
                 verify_positions=launch_buffers.verify_positions,
                 verify_prev_slot_indices=launch_buffers.verify_prev_slot_indices,
@@ -124,7 +118,6 @@ class CanaryEndpoint:
                 kernel_run_counter=self.kernel_run_counter,
                 kernel_kind=self.kernel_kind,
                 real_kv_buf=self.real_kv_buf,
-                real_kv_slot_stride_bytes=self.real_kv_slot_stride_bytes,
                 real_kv_read_bytes=self.real_kv_read_bytes,
                 real_kv_hash_mode=self.real_kv_hash_mode,
             )

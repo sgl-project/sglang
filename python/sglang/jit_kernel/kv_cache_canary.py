@@ -161,7 +161,6 @@ def canary_step(
     *,
     src_buf: torch.Tensor,
     dst_buf: torch.Tensor,
-    slot_stride_bytes: int,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
@@ -186,14 +185,14 @@ def canary_step(
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
     real_kv_buf: torch.Tensor,
-    real_kv_slot_stride_bytes: int,
     real_kv_read_bytes: int,
     real_kv_hash_mode: int,
 ) -> None:
     """One step of the KV-cache canary protocol against the canary buffer.
 
-    Shadow slot layout — each logical token tracked by the canary occupies one slot of ``slot_stride_bytes`` bytes
-    in ``src_buf`` / ``dst_buf``, holding 4 ``int64`` fields (see ``_CANARY_FIELD_*`` for offsets):
+    Shadow slot layout — each logical token tracked by the canary occupies one slot of ``slot_bytes`` bytes
+    in ``src_buf`` / ``dst_buf`` (the second dim of the 2D buffer), holding 4 ``int64`` fields
+    (see ``_CANARY_FIELD_*`` for offsets):
 
     - ``token_id``     — vocab id of the token this slot represents.
     - ``position``     — sequence position of the token within its request.
@@ -220,10 +219,10 @@ def canary_step(
     in-place mutation of the output tensors listed below.
 
     Args:
-        src_buf:                     Flat ``uint8`` view of the canary canary tensor that verify reads from.
-        dst_buf:                     Flat ``uint8`` view of the canary canary tensor that writes land in. Aliasing
-                                     ``src_buf`` is allowed.
-        slot_stride_bytes:           Bytes per logical slot in the canary buffer.
+        src_buf:                     ``uint8 [num_slots, slot_bytes]`` — canary tensor that verify reads from. Bytes
+                                     per slot are taken from ``src_buf.shape[1]``.
+        dst_buf:                     ``uint8 [num_slots, slot_bytes]`` — canary tensor that writes land in. Same
+                                     shape as ``src_buf``. Aliasing ``src_buf`` is allowed.
         verify_slot_indices:         ``int64 [N_verify]`` — slot of each verify entry.
         verify_positions:            ``int64 [N_verify]`` — position the caller expects that slot to carry.
         verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor
@@ -262,9 +261,10 @@ def canary_step(
                                      health monitor uses this to prove the canary hook actually ran.
         kernel_kind:                 :data:`KERNEL_KIND_HEAD` or :data:`KERNEL_KIND_TAIL` — stamped into every
                                      violation row so downstream reporting can tell which hook fired.
-        real_kv_buf:                 Flat ``uint8`` view of the *real* KV pool layer this canary is mirroring. Read
-                                     by the real-KV fingerprint mixin.
-        real_kv_slot_stride_bytes:   Bytes per slot in ``real_kv_buf``.
+        real_kv_buf:                 ``uint8 [num_slots, real_kv_slot_stride_bytes]`` — view of the *real* KV pool
+                                     layer this canary is mirroring. Read by the real-KV fingerprint mixin. In OFF
+                                     mode the kernel never dereferences this buffer; a 2D placeholder of any shape
+                                     is accepted.
         real_kv_read_bytes:          Number of leading bytes per real-KV slot folded into the fingerprint. ``0``
                                      disables the mixin.
         real_kv_hash_mode:           One of :data:`REAL_KV_HASH_MODE_OFF` / :data:`REAL_KV_HASH_MODE_BIT` /
@@ -292,7 +292,6 @@ def canary_step(
     module.canary_step(
         src_buf,
         dst_buf,
-        slot_stride_bytes,
         verify_slot_indices,
         verify_positions,
         verify_prev_slot_indices,
@@ -317,7 +316,6 @@ def canary_step(
         kernel_run_counter,
         kernel_kind,
         real_kv_buf,
-        real_kv_slot_stride_bytes,
         real_kv_read_bytes,
         real_kv_hash_mode,
     )
