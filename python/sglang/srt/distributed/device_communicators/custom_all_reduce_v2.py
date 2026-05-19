@@ -38,6 +38,7 @@ class CustomAllReduceV2:
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
+        _init_config()
         self.disabled = True
         if not can_use_custom_all_reduce_v2(group=group, device=device):
             return
@@ -198,11 +199,10 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
-    _init_config()
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
-        supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
+        supported_world_size=list(range(2, 9)),
         cls_name="CustomAllReduceV2",
     )
     return full_nvlink is True
