@@ -58,7 +58,7 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     )
 
 
-class NativeSparseAttnBackendMTPPrecomputeMixin:
+class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     """Mixin class providing metadata precomputation for multi-step speculative decoding.
 
     This mixin provides the _precompute_replay_metadata method and its helpers,
@@ -323,3 +323,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
         )
+
+# Backward-compat alias
+NativeSparseAttnBackendMTPPrecomputeMixin = DeepseekSparseAttnBackendMTPPrecomputeMixin

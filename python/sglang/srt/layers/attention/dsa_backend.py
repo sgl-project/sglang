@@ -11,7 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
-    NativeSparseAttnBackendMTPPrecomputeMixin,
+    DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
@@ -87,25 +87,25 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 
 
 @dataclass(frozen=True)
-class NSAFlashMLAMetadata:
+class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
 
     flashmla_metadata: torch.Tensor
     num_splits: torch.Tensor
 
     def slice(self, sli):
-        return NSAFlashMLAMetadata(
+        return DSAFlashMLAMetadata(
             flashmla_metadata=self.flashmla_metadata,
             num_splits=self.num_splits[sli],
         )
 
-    def copy_(self, other: "NSAFlashMLAMetadata"):
+    def copy_(self, other: "DSAFlashMLAMetadata"):
         self.flashmla_metadata.copy_(other.flashmla_metadata)
         self.num_splits.copy_(other.num_splits)
 
 
 @dataclass(frozen=True)
-class NSAMetadata:
+class DSAMetadata:
     page_size: int
 
     # Sequence lengths for the forward batch
@@ -135,7 +135,7 @@ class NSAMetadata:
     nsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
-    flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
+    flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -187,8 +187,8 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
-class NSAIndexerMetadata(BaseIndexerMetadata):
-    attn_metadata: NSAMetadata
+class DSAIndexerMetadata(BaseIndexerMetadata):
+    attn_metadata: DSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
@@ -261,7 +261,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
+        if not envs.SGLANG_DSA_FUSE_TOPK.get() or self.force_unfused_topk:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
@@ -295,8 +295,8 @@ _NSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
-class NativeSparseAttnBackend(
-    NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
+class DeepseekSparseAttnBackend(
+    DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
     def __init__(
         self,
@@ -307,7 +307,7 @@ class NativeSparseAttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
-        self.forward_metadata: NSAMetadata
+        self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
@@ -667,7 +667,7 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
-        metadata = NSAMetadata(
+        metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -953,7 +953,7 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
-        metadata = NSAMetadata(
+        metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -996,7 +996,7 @@ class NativeSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -1426,7 +1426,7 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1616,7 +1616,7 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_NSA_FUSE_TOPK.get():
+        elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1786,7 +1786,7 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         sm_scale: float,
         layer,
-        metadata: NSAMetadata,
+        metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -1847,7 +1847,7 @@ class NativeSparseAttnBackend(
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        metadata: NSAMetadata,
+        metadata: DSAMetadata,
     ) -> torch.Tensor:
         """Standard MHA using FlashAttention varlen for MHA_ONE_SHOT mode."""
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1929,7 +1929,7 @@ class NativeSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
-        metadata: NSAMetadata,
+        metadata: DSAMetadata,
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2125,7 +2125,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2220,7 +2220,7 @@ class NativeSparseAttnBackend(
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
                 and max_kv_len
-                <= envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
+                <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
@@ -2254,7 +2254,7 @@ class NativeSparseAttnBackend(
         self, forward_mode: Optional[ForwardMode] = None
     ) -> TopkTransformMethod:
         """
-        SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
+        SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
@@ -2270,12 +2270,12 @@ class NativeSparseAttnBackend(
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
-    ) -> NSAIndexerMetadata:
+    ) -> DSAIndexerMetadata:
         force_unfused = (
             forward_batch.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
-        return NSAIndexerMetadata(
+        return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
@@ -2300,13 +2300,13 @@ class NativeSparseAttnBackend(
             topk=self.nsa_index_topk,
         )
 
-        return NSAFlashMLAMetadata(
+        return DSAFlashMLAMetadata(
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
 
 
-class NativeSparseAttnMultiStepBackend:
+class DeepseekSparseAttnMultiStepBackend:
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
@@ -2317,7 +2317,7 @@ class NativeSparseAttnMultiStepBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                NativeSparseAttnBackend(
+                DeepseekSparseAttnBackend(
                     model_runner,
                     speculative_step_id=i,
                     topk=self.topk,
@@ -2348,7 +2348,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if envs.SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
+        if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
@@ -2518,3 +2518,11 @@ class NativeSparseAttnMultiStepBackend:
                     seq_lens_cpu=forward_batch.seq_lens_cpu,
                     out_cache_loc=None,
                 )
+
+
+# Backward-compat aliases (deprecated: use DSA class names)
+NativeSparseAttnBackend = DeepseekSparseAttnBackend
+NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+NSAMetadata = DSAMetadata
+NSAFlashMLAMetadata = DSAFlashMLAMetadata
+NSAIndexerMetadata = DSAIndexerMetadata
