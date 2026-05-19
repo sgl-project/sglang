@@ -43,9 +43,22 @@
 //   initState(featureConfig)               → initial delta value
 //   revertHidden(value, fc, base, helpers) → next value (same ref if unchanged)
 //   apply({flags, env, value, fc, sel, helpers}) → next {flags, env}
-//   render({axisId, value, setValue, fc, base, s, helpers, renderChip}) → JSX | null
+//   render({axisId, value, setValue, fc, base, s, h, renderChip, renderSelect}) → JSX | null
 // Plus one optional method:
 //   getRenderHints(value, fc)              → {pdMode?, ...} hints for renderer
+//
+// LAYOUT CONVENTION
+// -----------------
+// Each axis card renders as a single compact horizontal row:
+//
+//     [Axis Title]  [field-label] [field-input]  [field-label] [field-input] ...
+//
+// Use `s.compactRow` for the outer flex, `s.axisTitle` for the leading label,
+// `s.field` to wrap each `[label, input]` pair, `s.fieldLabel` for the inline
+// sub-label. Multi-option fields render via `renderSelect(current, entries,
+// onPick, base, labelFor?)` — emits a <select> with hidden-filtered options
+// and disabled options greyed out. Pure enable/disable toggles still use
+// `renderChip(label, current, true, () => onPick(!current))`.
 //
 // MINTLIFY GOTCHAS LEARNED THE HARD WAY
 // -------------------------------------
@@ -335,12 +348,13 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         const knobs = fc.knobs || [];
         if (!knobs.length) return null;
         const setKnob = (k, v) => setValue({ ...value, [k]: v });
-        // DP-Attention chip labels are boolean-aware; others use plain numeric.
-        const labelFor = (knob, c) => {
+        // DP-Attention labels are boolean-aware; numeric knobs default to
+        // "auto" for the null/inherit sentinel and the bare number otherwise.
+        const labelFor = (knob) => (c) => {
           if (c.label !== undefined) return c.label;
           if (knob.id === "dpAttn") {
             const labelMap = knob.labels || { "auto": "auto", "true": "on", "false": "off" };
@@ -350,22 +364,17 @@ export const Playground = ({ config }) => {
           return c.value === null ? "auto" : String(c.value);
         };
         return (
-          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-            <div style={s.title}>Attention Parallelism</div>
-            {knobs.map((knob) => (
-              <div key={knob.id} style={s.subRow}>
-                <span style={s.subLabel}>{knob.label || knob.id.toUpperCase()}</span>
-                <div style={s.chipRow}>
-                  {(knob.values || [null]).map((entry) => {
-                    const c = h.evaluateChip(entry, base);
-                    if (c.hidden) return null;
-                    return renderChip(labelFor(knob, c), value[knob.id], c.value,
-                      (nv) => setKnob(knob.id, nv),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            ))}
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>Attention</span>
+              {knobs.map((knob) => (
+                <span key={knob.id} style={s.field}>
+                  <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
+                  {renderSelect(value[knob.id], knob.values || [null],
+                    (nv) => setKnob(knob.id, nv), base, labelFor(knob))}
+                </span>
+              ))}
+            </div>
           </div>
         );
       },
@@ -410,41 +419,28 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         if (!fc.backend && !fc.ep) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         return (
-          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-            <div style={s.title}>MoE Parallelism</div>
-            {fc.backend && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>Backend</span>
-                <div style={s.chipRow}>
-                  {(fc.backend.options || []).map((o) => {
-                    const c = h.evaluateChip(o, base);
-                    if (c.hidden) return null;
-                    return renderChip(c.label, value.backend, c.value,
-                      (v) => setSlot("backend", v),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
-            {fc.ep && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>{fc.ep.label || "EP"}</span>
-                <div style={s.chipRow}>
-                  {(fc.ep.values || [null]).map((entry) => {
-                    const c = h.evaluateChip(entry, base);
-                    if (c.hidden) return null;
-                    const lbl = c.label ?? (c.value === null ? "auto" : String(c.value));
-                    return renderChip(lbl, value.ep, c.value,
-                      (nv) => setSlot("ep", nv),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>MoE</span>
+              {fc.backend && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Backend</span>
+                  {renderSelect(value.backend, fc.backend.options || [],
+                    (v) => setSlot("backend", v), base)}
+                </span>
+              )}
+              {fc.ep && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
+                  {renderSelect(value.ep, fc.ep.values || [null],
+                    (v) => setSlot("ep", v), base)}
+                </span>
+              )}
+            </div>
           </div>
         );
       },
@@ -489,18 +485,17 @@ export const Playground = ({ config }) => {
           .filter(({ c }) => !c.hidden);
         if (visible.length === 0) return null;
         return (
-          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-            <div style={s.title}>Parsers</div>
-            {visible.map(({ item, c }) => (
-              <div key={item.id} style={s.subRow}>
-                <span style={s.subLabel}>{item.label}</span>
-                <div style={s.chipRow}>
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>Parsers</span>
+              {visible.map(({ item, c }) => (
+                <span key={item.id} style={s.field}>
                   {renderChip(item.label, value[item.id], true,
                     () => setValue({ ...value, [item.id]: !value[item.id] }),
                     { disabled: c.disabled, disabledReason: c.disableReason })}
-                </div>
-              </div>
-            ))}
+                </span>
+              ))}
+            </div>
           </div>
         );
       },
@@ -532,19 +527,16 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         const opts = fc.options || [];
         if (!opts.length) return null;
         return (
           <div key={axisId} style={s.card}>
-            <div style={s.title}>Speculative Decoding</div>
-            <div style={s.rowFlex}>
-              {opts.map((p) => {
-                const c = h.evaluateChip(p, base);
-                if (c.hidden) return null;
-                return renderChip(c.label, value, c.value, setValue,
-                  { disabled: c.disabled, disabledReason: c.disableReason });
-              })}
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>Speculative</span>
+              <span style={s.field}>
+                {renderSelect(value, opts, setValue, base)}
+              </span>
             </div>
           </div>
         );
@@ -606,43 +598,30 @@ export const Playground = ({ config }) => {
         return null;
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         const showModes = (fc.modes     || []).length > 0;
         const showIb    = (fc.ibDevices || []).length > 0;
         if (!showModes && !showIb) return null;
         return (
-          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-            <div style={s.title}>PD Disaggregation</div>
-            {showModes && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>Mode</span>
-                <div style={s.chipRow}>
-                  {fc.modes.map((m) => {
-                    const c = h.evaluateChip(m, base);
-                    if (c.hidden) return null;
-                    return renderChip(c.label, value.mode, c.value,
-                      (v) => setSlot("mode", v),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
-            {showIb && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>IB Device</span>
-                <div style={s.chipRow}>
-                  {fc.ibDevices.map((entry) => {
-                    const c = h.evaluateChip(entry, base);
-                    if (c.hidden) return null;
-                    const lbl = c.label ?? String(c.value);
-                    return renderChip(lbl, value.ibDevice, c.value,
-                      (nv) => setSlot("ibDevice", nv),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>PD Disagg</span>
+              {showModes && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Mode</span>
+                  {renderSelect(value.mode, fc.modes,
+                    (v) => setSlot("mode", v), base)}
+                </span>
+              )}
+              {showIb && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>IB Device</span>
+                  {renderSelect(value.ibDevice, fc.ibDevices,
+                    (v) => setSlot("ibDevice", v), base)}
+                </span>
+              )}
+            </div>
           </div>
         );
       },
@@ -698,47 +677,33 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const hasBackends = (fc.backends || []).length > 0;
+        const hasPolicies = (fc.writePolicies || []).length > 0;
         return (
-          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-            <div style={s.title}>Hierarchical KV Cache (HiCache)</div>
-            <div style={s.subRow}>
-              <span style={s.subLabel}>Enable</span>
-              <div style={s.chipRow}>
-                {renderChip("HiCache", value.enable, true,
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>HiCache</span>
+              <span style={s.field}>
+                {renderChip("Enable", value.enable, true,
                   () => setSlot("enable", !value.enable))}
-              </div>
+              </span>
+              {hasBackends && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Storage</span>
+                  {renderSelect(value.backend, fc.backends,
+                    (v) => setSlot("backend", v), base)}
+                </span>
+              )}
+              {hasPolicies && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Write</span>
+                  {renderSelect(value.writePolicy, fc.writePolicies,
+                    (v) => setSlot("writePolicy", v), base)}
+                </span>
+              )}
             </div>
-            {(fc.backends || []).length > 0 && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>Storage</span>
-                <div style={s.chipRow}>
-                  {fc.backends.map((o) => {
-                    const c = h.evaluateChip(o, base);
-                    if (c.hidden) return null;
-                    return renderChip(c.label, value.backend, c.value,
-                      (v) => setSlot("backend", v),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
-            {(fc.writePolicies || []).length > 0 && (
-              <div style={s.subRow}>
-                <span style={s.subLabel}>Write Policy</span>
-                <div style={s.chipRow}>
-                  {fc.writePolicies.map((entry) => {
-                    const c = h.evaluateChip(entry, base);
-                    if (c.hidden) return null;
-                    const lbl = c.label ?? String(c.value);
-                    return renderChip(lbl, value.writePolicy, c.value,
-                      (v) => setSlot("writePolicy", v),
-                      { disabled: c.disabled, disabledReason: c.disableReason });
-                  })}
-                </div>
-              </div>
-            )}
           </div>
         );
       },
@@ -786,7 +751,7 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         // Inline axis-level gate check (matches the one in revertHidden above).
         // Kept in sync rather than extracted to a shared method to avoid the
         // cross-reference complexity that hurt readability earlier.
@@ -795,14 +760,11 @@ export const Playground = ({ config }) => {
         if (!hwGate || !stratGate) return null;
         return (
           <div key={axisId} style={s.card}>
-            <div style={s.title}>MegaMoE</div>
-            <div style={s.rowFlex}>
-              {(fc.options || []).map((o) => {
-                const c = h.evaluateChip(o, base);
-                if (c.hidden) return null;
-                return renderChip(c.label, value, c.value, setValue,
-                  { disabled: c.disabled, disabledReason: c.disableReason });
-              })}
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>MegaMoE</span>
+              <span style={s.field}>
+                {renderSelect(value, fc.options || [], setValue, base)}
+              </span>
             </div>
           </div>
         );
@@ -942,11 +904,11 @@ export const Playground = ({ config }) => {
   // 8. Style helper (dark-mode-aware)
   // ==========================================================================
   const makeStyles = (isDark) => ({
-    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "8px" },
+    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "6px" },
     card: {
-      padding: "8px 12px",
+      padding: "6px 10px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
-      borderLeft: `3px solid ${isDark ? "#A78BFA" : "#8B5CF6"}`,
+      borderLeft: `3px solid ${isDark ? "#FDBA74" : "#FB923C"}`,
       borderRadius: "4px",
       background: isDark ? "#1f2937" : "#fff",
     },
@@ -960,6 +922,32 @@ export const Playground = ({ config }) => {
       display: "flex", alignItems: "center", gap: "10px",
     },
     title: { fontSize: "13px", fontWeight: "600", color: isDark ? "#e5e7eb" : "inherit", marginBottom: "8px" },
+    // Compact one-line axis row: title + fields all on the same line.
+    compactRow: {
+      display: "flex", flexWrap: "wrap", alignItems: "center",
+      gap: "10px", rowGap: "4px",
+    },
+    axisTitle: {
+      fontSize: "12px", fontWeight: 700,
+      color: isDark ? "#FDBA74" : "#C2410C",
+      letterSpacing: "0.02em",
+      minWidth: "100px", flexShrink: 0,
+    },
+    field: { display: "inline-flex", alignItems: "center", gap: "4px" },
+    fieldLabel: {
+      fontSize: "11px", fontWeight: 500,
+      color: isDark ? "#9ca3af" : "#6b7280",
+    },
+    select: {
+      padding: "2px 6px",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "3px",
+      fontSize: "12px",
+      background: isDark ? "#111827" : "#fff",
+      color: isDark ? "#e5e7eb" : "#111827",
+      cursor: "pointer",
+      lineHeight: "1.4",
+    },
     rowFlex: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", flex: 1 },
     subRow: { display: "flex", alignItems: "center", gap: "10px" },
     subLabel: {
@@ -970,7 +958,7 @@ export const Playground = ({ config }) => {
     },
     chipRow: { display: "flex", flexWrap: "wrap", gap: "6px", flex: 1 },
     chip: {
-      padding: "4px 10px",
+      padding: "3px 9px",
       border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
       borderRadius: "3px",
       cursor: "pointer",
@@ -978,10 +966,13 @@ export const Playground = ({ config }) => {
       userSelect: "none",
       background: isDark ? "#374151" : "#fff",
       color: isDark ? "#e5e7eb" : "inherit",
-      minWidth: "44px",
       textAlign: "center",
     },
-    chipChecked: { background: "#8B5CF6", color: "white", borderColor: "#8B5CF6" },
+    chipChecked: {
+      background: isDark ? "#FDBA74" : "#FB923C",
+      color: isDark ? "#7C2D12" : "white",
+      borderColor: isDark ? "#FDBA74" : "#FB923C",
+    },
     chipDisabled: { cursor: "not-allowed", opacity: 0.4 },
     commandWrap: {
       position: "relative",
@@ -1095,7 +1086,9 @@ export const Playground = ({ config }) => {
       margin: "12px 0 6px 0",
     },
     primaryBtn: {
-      padding: "6px 14px", background: "#8B5CF6", color: "white",
+      padding: "6px 14px",
+      background: isDark ? "#FDBA74" : "#FB923C",
+      color: isDark ? "#7C2D12" : "white",
       border: "none", borderRadius: "4px", cursor: "pointer",
       fontSize: "13px", fontWeight: 500,
     },
@@ -1105,6 +1098,14 @@ export const Playground = ({ config }) => {
       borderRadius: "3px",
       background: "transparent",
       color: isDark ? "#9ca3af" : "#6b7280",
+      cursor: "pointer",
+    },
+    switchBaseBtn: {
+      padding: "2px 8px", fontSize: "11px", fontWeight: 600,
+      border: `1px solid ${isDark ? "#FDBA74" : "#FB923C"}`,
+      borderRadius: "3px",
+      background: "transparent",
+      color: isDark ? "#FDBA74" : "#C2410C",
       cursor: "pointer",
     },
   });
@@ -1307,6 +1308,55 @@ export const Playground = ({ config }) => {
     );
   };
 
+  // Dropdown selector. Returns a <select> whose options come from a chip-schema
+  // `entries` array (same shape as renderChip consumes — bare value, wrapper
+  // object, or rich option object). Hidden entries are excluded; disabled
+  // entries appear with a "(n/a)" suffix and cannot be selected.
+  //
+  // To sidestep all the string/number/null/boolean serialization headaches
+  // that come with HTML form values, we use the option's array index as the
+  // <select> value and resolve back to the original chip value on change.
+  // `current` is the picked value (whatever the axis stores in state) and
+  // `onPick(v)` receives the original value (not the index).
+  //
+  // `labelFor(c)` is an optional custom label resolver — receives the
+  // evaluated chip and returns a string. Falls back to c.label, then to
+  // "auto" for null, then to String(c.value).
+  const renderSelect = (current, entries, onPick, base, labelFor) => {
+    const opts = [];
+    for (const entry of (entries || [])) {
+      const c = helpers.evaluateChip(entry, base);
+      if (c.hidden) continue;
+      const lbl = labelFor
+        ? labelFor(c)
+        : (c.label !== undefined ? c.label
+          : c.value === null ? "auto" : String(c.value));
+      opts.push({ ...c, label: lbl });
+    }
+    let idx = opts.findIndex((c) => c.value === current);
+    if (idx === -1) idx = 0;
+    return (
+      <select
+        style={s.select}
+        value={idx}
+        onChange={(e) => {
+          const next = opts[parseInt(e.target.value, 10)];
+          if (next && !next.disabled) onPick(next.value);
+        }}
+      >
+        {opts.map((c, i) => (
+          <option
+            key={i}
+            value={i}
+            disabled={c.disabled}
+          >
+            {c.label}{c.disabled ? " (n/a)" : ""}
+          </option>
+        ))}
+      </select>
+    );
+  };
+
   // ==========================================================================
   // 12. JSX render
   // ==========================================================================
@@ -1316,6 +1366,20 @@ export const Playground = ({ config }) => {
       <div style={s.baseStrip}>
         <span style={{ fontWeight: 600 }}>Inherited base from §3:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
+        {/* Scroll back to §3.1 (the Interactive Command Generator). Use
+            scrollIntoView so the URL hash — which carries the base cell
+            selection — isn't overwritten. The target id is the auto-
+            generated Mintlify slug for "### 3.1 Basic Configuration". */}
+        <button
+          type="button"
+          style={s.switchBaseBtn}
+          onClick={() => {
+            const el = document.getElementById("3-1-basic-configuration");
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
+        >
+          ↑ Switch base
+        </button>
         <button style={s.resetBtn} onClick={resetAll}>Reset all overrides</button>
       </div>
 
@@ -1330,7 +1394,7 @@ export const Playground = ({ config }) => {
         const setValue = (next) => setDeltas((d) => ({ ...d, [axisId]: next }));
         return handler.render({
           axisId, value: deltas[axisId], setValue,
-          fc, base, s, h: helpers, renderChip,
+          fc, base, s, h: helpers, renderChip, renderSelect,
         });
       })}
 
