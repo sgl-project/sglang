@@ -293,9 +293,10 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## LMCache
 
-| Argument           | Defaults | Options                        | Server supported |
-|--------------------|----------|--------------------------------|:----------------:|
-| `--enable-lmcache` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| Argument                | Defaults | Options                        | Server supported |
+|-------------------------|----------|--------------------------------|:----------------:|
+| `--enable-lmcache`      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--lmcache-config-file` | `None`   | Type: str                      | Special for GPU  |
 
 ## Offloading (must be used with `--disable-cuda-graph`)
 

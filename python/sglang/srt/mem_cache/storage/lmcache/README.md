@@ -49,11 +49,10 @@ Use the bundled `example_config_mp.yaml` (or any YAML setting `mp_host` / `mp_po
 Terminal 2 — start SGLang:
 
 ```bash
-export LMCACHE_CONFIG_FILE=example_config_mp.yaml
-
 python -m sglang.launch_server \
   --model-path MODEL \
-  --enable-lmcache
+  --enable-lmcache \
+  --lmcache-config-file example_config_mp.yaml
 ```
 
 For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.
@@ -62,12 +61,11 @@ For full LMCache config options see https://docs.lmcache.ai/api_reference/config
 
 Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, edit `LMCRadixCache.__init__` and set `self._mode = LMCacheMode.IP`.
 
-The LMCache config (`LMCACHE_CONFIG_FILE`) still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
+The LMCache config still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
 
 ```bash
-export LMCACHE_CONFIG_FILE=example_config_ip.yaml
-
 python -m sglang.launch_server \
   --model-path MODEL \
-  --enable-lmcache
+  --enable-lmcache \
+  --lmcache-config-file example_config_ip.yaml
 ```

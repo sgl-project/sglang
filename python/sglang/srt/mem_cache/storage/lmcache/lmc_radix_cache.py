@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -107,6 +108,10 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
+        cli_lmc_cfg = get_global_server_args().lmcache_config_file
+        if cli_lmc_cfg:
+            os.environ["LMCACHE_CONFIG_FILE"] = cli_lmc_cfg
+
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
             sgl_config=model_config,
@@ -158,7 +163,7 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
-    def reset(self):  # type: ignore[override]
+    def reset(self):
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
@@ -166,7 +171,7 @@ class LMCRadixCache(RadixCache):
         if hasattr(self, "_mp_load_back_markers"):
             self._mp_load_back_markers.clear()
 
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Dispatch to the mode-specific match_prefix.
 
         MP mode → ``_mp_match_prefix`` (fires LOOKUP only).
@@ -267,7 +272,7 @@ class LMCRadixCache(RadixCache):
             best_match_node=new_node,
         )
 
-    def init_load_back(  # type: ignore[override]
+    def init_load_back(
         self, params: InitLoadBackParams
     ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
         """MP RETRIEVE.
@@ -329,12 +334,13 @@ class LMCRadixCache(RadixCache):
         if token_slots is None:
             return None
 
-        slot_mapping = torch.cat(
-            [
-                torch.full((value_numel,), -1, dtype=torch.int64, device=self.device),
-                token_slots.detach().clone().to(torch.int64).to(self.device),
-            ]
+        slot_mapping = torch.empty(
+            value_numel + token_slots.numel(),
+            dtype=torch.int64,
+            device=self.device,
         )
+        slot_mapping[:value_numel].fill_(-1)
+        slot_mapping[value_numel:].copy_(token_slots)
 
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
@@ -413,7 +419,7 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
         super().cache_finished_req(req, is_insert=is_insert)
@@ -478,7 +484,7 @@ class LMCRadixCache(RadixCache):
 
         return super().evict(params)
 
-    def pretty_print(self):  # type: ignore[override]
+    def pretty_print(self):
         super().pretty_print()
         try:
             logger.debug(

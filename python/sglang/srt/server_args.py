@@ -674,6 +674,7 @@ class ServerArgs:
 
     # LMCache
     enable_lmcache: bool = False
+    lmcache_config_file: Optional[str] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -6311,6 +6312,12 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+        parser.add_argument(
+            "--lmcache-config-file",
+            type=str,
+            default=ServerArgs.lmcache_config_file,
+            help="Path to the LMCache YAML configuration file",
         )
 
         # Ktransformer server args
