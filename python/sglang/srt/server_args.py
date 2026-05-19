@@ -679,6 +679,9 @@ class ServerArgs:
     kv_cache_canary: str = "off"
     kv_cache_canary_real_data: str = "off"
     kv_cache_canary_real_data_sweep_every_n_steps: int = 0
+    kv_cache_canary_input_check_mode: Optional[str] = None
+    mock_model_enabled: bool = False
+    num_hidden_layers_override: Optional[int] = None
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
