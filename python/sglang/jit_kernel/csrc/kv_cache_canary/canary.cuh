@@ -256,7 +256,7 @@ __device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
         splitmix64_mix(prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position));
   }
 
-  // Independent verify-path fail_reason categories (README §3):
+  // Independent verify-path fail_reason categories:
   // (b1) req_id cross-check, (b3) position monotonic, (a) chain hash,
   // (c) real-KV fingerprint (when ``--kv-cache-canary-real-data`` is on).
   // Token-id check applies only to the write path (where the host has the
@@ -341,10 +341,11 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   // Unconditional liveness counter: block 0 thread 0 ALWAYS increments the
   // kernel-run counter before the early-return guard, even when the plan
   // is fully inactive (skip-sentinel masks) or the launch has zero verify
-  // and zero write-req entries. The §5 health monitor uses this counter
-  // to detect "canary is actually executing" — tying the increment to
-  // active work would silently zero it during server warmup forwards (and
-  // any other no-work step) and trip a spurious "kernel never ran" panic.
+  // and zero write-req entries. The host-side health monitor reads this
+  // counter to detect "canary is actually executing" — tying the
+  // increment to active work would silently zero it during server warmup
+  // forwards (and any other no-work step) and trip a spurious "kernel
+  // never ran" panic.
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
   }
@@ -450,8 +451,8 @@ void canary_step(
   const uint32_t total_threads = num_verify + num_write_reqs;
   // No early return on total_threads == 0: the kernel still has the
   // unconditional kernel_run_counter atomicAdd at its entry, which the
-  // §5 health monitor relies on to detect "canary actually ran" across
-  // warmup / no-work forwards.
+  // host-side health monitor relies on to detect "canary actually ran"
+  // across warmup / no-work forwards.
 
   CanaryParams p{};
   p.src_buf = static_cast<const uint8_t*>(src_buf.data_ptr());

@@ -254,8 +254,9 @@ def _attach_swa(
 ) -> None:
     """Attach BOTH a FULL and a SWA canary to an SWA system.
 
-    Rule from the spec / user instruction: "正常 SWA 系统其实就是 2 条都走".
-    Two independent shadow groups live on the pool:
+    A normal SWA system always runs both — a FULL canary that covers the
+    entire prefix and a SWA canary that only covers the window. Two
+    independent shadow groups live on the pool:
 
     - ``FULL``: sized off the full sub-pool (``pool.full_kv_pool``) when
       it exists (sglang ``SWAKVPool``), otherwise off the SWA sub-pool

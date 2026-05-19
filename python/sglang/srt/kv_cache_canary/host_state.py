@@ -460,8 +460,8 @@ class CanaryDeviceState:
         after capacity rows).
 
         Counters (slot/kernel run counters) are intentionally NOT reset:
-        the §5 health monitor uses their monotonic growth to detect "canary
-        stopped running".
+        the host-side health monitor uses their monotonic growth to detect
+        "canary stopped running".
         """
         for slot in self.violation_slots.values():
             slot.reset()

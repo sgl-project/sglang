@@ -24,7 +24,7 @@ class CanaryMode(str, enum.Enum):
 
 
 class RealKvHashMode(str, enum.Enum):
-    """``--kv-cache-canary-real-data`` modes (UserInstr Fix 5 / part c).
+    """``--kv-cache-canary-real-data`` modes.
 
     Controls whether the canary kernel reads a portion of the real KV pool
     on each write and stores a splitmix64 fingerprint of it into the

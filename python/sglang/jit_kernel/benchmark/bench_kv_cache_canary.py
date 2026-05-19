@@ -1,9 +1,9 @@
 """KV cache canary kernel benchmarks.
 
-Three axes are covered (user-instruction L73-75):
+Three axes are covered:
 
 1. ``context_len`` — single-req decode that verifies the FULL prefix
-   every forward (Fix 1: 1w-token prefix verifies all 1w positions);
+   every forward (a 10k-token prefix verifies all 10k positions);
 2. ``extend_chunk`` — single-req extend writes a chunk of new tokens
    per forward;
 3. ``decode_bs`` — many concurrent decode reqs, each contributing a
@@ -143,7 +143,7 @@ def _launch(
 def _context_len_step(context_len: int) -> None:
     """Single decode step on a req with ``context_len`` already written.
 
-    Mimics user-instruction L53: the verify path covers ALL positions,
+    The verify path covers ALL prefix positions in the same forward,
     plus the canary writes the new decode token at the tail.
     """
     num_slots = context_len + 2

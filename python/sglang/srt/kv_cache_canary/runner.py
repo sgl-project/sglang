@@ -107,9 +107,11 @@ class CanaryRunner:
         be simplified away by an automated pass:
 
         - the side-stream + event-based async D2H pump
-          (``_record_poll_events`` / ``_pull_latest_from_events``) — the hot
-          path stays non-blocking, the README §4 design,
-        - the §5 health monitoring: ``_maybe_health_check``,
+          (``_record_poll_events`` / ``_pull_latest_from_events``) — keeps
+          the hot path non-blocking,
+        - the health monitoring in ``_maybe_health_check`` — detects a
+          dead canary kernel by checking that ``kernel_run_counter`` is
+          advancing after warmup,
         - the unconditional cross-rank allreduce in ``_cross_rank_max``,
           called from every ``end_of_forward``.
 
@@ -251,8 +253,7 @@ class CanaryRunner:
         non-blockingly, refreshes the host-side cached error flag + health
         counters, increments the step counter, and unconditionally
         allreduces the local error flag so every rank decides to raise in
-        lock-step (no single-rank raise → no NCCL deadlock; README §3
-        decision #3).
+        lock-step (no single-rank raise → no NCCL deadlock).
 
         Skipped during cuda graph capture: side-stream / event / sync ops
         are unsafe inside captured regions.
@@ -310,7 +311,7 @@ class CanaryRunner:
             self._poll_armed = True
             # Counter D2H is intentionally decoupled from the periodic print
             # interval (``health_print_every_n_forwards``). Refreshing the
-            # cached counters every forward lets the §5 warmup health check
+            # cached counters every forward lets the warmup health check
             # see fresh values by ``counter_zero_warmup_forwards`` (~64);
             # tying the D2H to the 1024-forward print period would leave the
             # host-side ``_latest_counters`` stuck at the step-0 snapshot and
@@ -345,10 +346,27 @@ class CanaryRunner:
         self._launch.reset_to_skip_sentinel()
 
     def launch_for_capture(self, *, kernel_kind: int) -> None:
-        """Capture-only: record one kernel launch as a no-op (skip-sentinel)."""
+        """Capture-only: record one kernel launch as a no-op (skip-sentinel).
+
+        Crucially, this does NOT call ``reset_launch_buffers_to_skip_sentinel``:
+        that helper issues ``zero_()`` ops on the compute stream, and any op
+        on the compute stream during cuda graph capture gets recorded INTO
+        the graph. A captured zero would then wipe the active-mask buffer
+        the replay-side ``prepare_for_replay`` had just filled with the
+        real plan, leaving every replay launching with all-zero masks (the
+        kernel skips every entry, ``slot_run_counter`` stays at 0, the
+        canary never actually verifies anything).
+
+        The buffers are guaranteed to already be all zero at capture time:
+        :class:`CanaryLaunchBuffers` is allocated with ``torch.zeros`` and
+        nothing writes a non-skip-sentinel value to it before
+        ``init_device_graphs`` runs (the canary attaches BEFORE graph
+        init, and no eager forward with a real plan can fire before then).
+        The captured kernel therefore records a no-op grid by virtue of
+        the initial state, with no captured zeroing op needed.
+        """
         if not self._config.enabled:
             return
-        self.reset_launch_buffers_to_skip_sentinel()
         self._launch_kernel_only(kernel_kind=kernel_kind)
 
     def _launch_kernel_only(self, *, kernel_kind: int) -> None:
@@ -377,7 +395,7 @@ class CanaryRunner:
         """Eager-path launch: fill the fixed buffers from the plan, then launch.
 
         Always launches the kernel — even when the plan has zero verify
-        entries and zero write entries — so the §5 liveness counter
+        entries and zero write entries — so the liveness counter
         (``kernel_run_counter``) advances on every forward. The kernel's
         unconditional entry-side atomicAdd is what the health monitor uses
         to detect "canary is actually executing"; gating the host launch
@@ -394,8 +412,7 @@ class CanaryRunner:
 
         Critical: every forward must enter this allreduce so all peers agree
         on whether ANY rank saw a violation. If only the offending rank
-        all-reduced, the others would block in the next NCCL collective
-        (README §3 decision #3).
+        all-reduced, the others would block in the next NCCL collective.
 
         Returns the post-reduce global flag.
         """
@@ -426,7 +443,7 @@ class CanaryRunner:
         return int(flag.item())
 
     def _maybe_health_check(self) -> None:
-        """README §5 — counter-zero detection + periodic print."""
+        """Counter-zero detection (after warmup) + periodic liveness print."""
         step = self._forward_step
         period = max(1, self._config.health_print_every_n_forwards)
         kernel_head, kernel_tail, slot_head, slot_tail = self._latest_counters

@@ -6041,8 +6041,7 @@ class ServerArgs:
                 "records mismatches to a violation buffer and logs them while the "
                 "server keeps running (production-safe). 'raise' performs a "
                 "cross-rank allreduce of the error flag and raises on every rank "
-                "to avoid TP deadlocks (CI lane). See "
-                "python/sglang/srt/kv_cache_canary/README for details."
+                "to avoid TP deadlocks (CI lane)."
             ),
         )
         parser.add_argument(
@@ -6051,17 +6050,16 @@ class ServerArgs:
             default=ServerArgs.kv_cache_canary_real_data,
             choices=["off", "bit", "all"],
             help=(
-                "Enable the canary-with-real-data fingerprint (UserInstr Fix 5 "
-                "/ part c). 'off' (default) leaves the new real_kv_hash slot "
-                "field at zero. 'bit' reads the first 16 bytes of the real KV "
-                "pool's slot at write time, folds through splitmix64, and "
-                "verifies on read; useful when corruption is suspected but "
-                "overhead must stay tiny. 'all' reads the full real-KV slot "
-                "stride for maximum coverage at higher cost. Catches "
-                "corruption that is invisible to the pure-canary path because "
-                "the canary slot itself is intact but the real KV got "
-                "written wrong (attn-kernel idle-logic misconfig; PD "
-                "transfer bit-rot)."
+                "Mix a fingerprint of the real KV-cache slot into the canary's "
+                "chain hash. 'off' (default) leaves the real_kv_hash slot field "
+                "at zero. 'bit' reads the first 16 bytes of the real KV pool's "
+                "slot at write time, folds through splitmix64, and verifies on "
+                "read; useful when corruption is suspected but overhead must "
+                "stay tiny. 'all' reads the full real-KV slot stride for "
+                "maximum coverage at higher cost. Catches corruption that the "
+                "pure-canary path misses because the canary slot itself is "
+                "intact but the real KV got written wrong (attn-kernel "
+                "idle-logic misconfig; PD transfer bit-rot)."
             ),
         )
         parser.add_argument(

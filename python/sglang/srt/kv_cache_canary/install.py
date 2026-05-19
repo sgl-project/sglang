@@ -46,8 +46,10 @@ def install_on_model_runner(
     the eager and the captured-into-cuda-graph paths.
 
     ``real_kv_hash_mode`` (one of ``off`` / ``bit`` / ``all``, default
-    ``off``) controls the canary-with-real-data fingerprint (UserInstr
-    Fix 5 / part c).
+    ``off``) controls whether a fingerprint of the real KV-cache slot is
+    folded into the canary's chain hash. ``off`` leaves the field zero;
+    ``bit`` hashes the first 16 bytes of the real slot; ``all`` hashes
+    the full slot stride.
     """
     config = CanaryConfig.from_server_args(mode, real_kv_hash_mode=real_kv_hash_mode)
     if not config.enabled:

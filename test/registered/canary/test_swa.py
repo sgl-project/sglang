@@ -192,8 +192,8 @@ class TestSWAVerifyWindowClipping(unittest.TestCase):
     def test_non_swa_swa_window_size_none_walks_full_prefix(self) -> None:
         plan = self._build_plan_for_one_req(k_req=10000, swa_window_size=None)
         assert plan is not None
-        # No cap: every position verified (user-instruction: 10k tokens
-        # decode step verifies all 10k positions).
+        # No cap: every prefix position is verified on every forward (a
+        # 10k-token decode step verifies all 10k positions).
         self.assertEqual(plan.num_verify, 10000)
         self.assertEqual(plan.verify_positions[0], 0)
         self.assertEqual(plan.verify_positions[-1], 9999)

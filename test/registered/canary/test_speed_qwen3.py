@@ -12,11 +12,10 @@ profile) -- then compare the throughput / latency numbers reported by
 ``bench_one_batch_server``.
 
 Goal: surface canary overhead in a CI-runnable form so the v1
-acceptance "Overhead 达标 < 1%" criterion (README §"工程验证") has a
-concrete measurement to check against. We intentionally do not assert
-a hard percentage in CI (noisy infra makes that flaky); instead we
-print both sets of numbers so reviewers can eyeball the delta and a
-follow-up perf agent can analyze.
+overhead target has a concrete measurement to check against. We
+intentionally do not assert a hard percentage in CI (noisy infra makes
+that flaky); instead we print both sets of numbers so reviewers can
+eyeball the delta and a follow-up perf agent can analyze.
 
 Test group: extra-a / 1-gpu-large (H100 80GB equivalent). Performance
 tests are noise-sensitive so we keep them out of the base lane.

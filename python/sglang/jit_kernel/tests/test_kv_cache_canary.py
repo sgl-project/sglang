@@ -433,8 +433,8 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
     # Every active mask is 0: kernel must be a no-op on slot I/O and counters.
     assert int(state["is_errored"].item()) == 0
     assert int(state["slot_run_counter"].item()) == 0
-    # But the kernel_run_counter still increments — that's what the §5
-    # health monitor uses to detect "kernel actually launched".
+    # But the kernel_run_counter still increments — that's what the
+    # host-side health monitor uses to detect "kernel actually launched".
     assert int(state["kernel_run_counter"].item()) >= 1
 
 
@@ -442,7 +442,8 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
     """Regression for the e2e wiring bug: when the host has no verify
     entries and no write-req chains (length-1 placeholder arrays with the
     active mask zeroed), the kernel must still launch and atomicAdd the
-    ``kernel_run_counter`` so the §5 warmup health monitor sees liveness.
+    ``kernel_run_counter`` so the host-side warmup health monitor sees
+    liveness.
 
     Pre-fix history: ``canary_step`` host stub returned early when
     ``num_verify + num_write_reqs == 0`` and the runner additionally

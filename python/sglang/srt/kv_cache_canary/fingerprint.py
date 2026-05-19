@@ -7,7 +7,7 @@ bit-wise reference for a Python <-> CUDA consistency unit test
 (``test/registered/canary/test_splitmix64_consistency.py``). It is NOT
 used on the hot path.
 
-Algorithm (per spec):
+Algorithm:
 
 - ``splitmix64`` finalizer: the standard variant
   (`x ^= x >> 30; x *= 0xBF58476D1CE4E5B9; x ^= x >> 27; x *= 0x94D049BB133111EB; x ^= x >> 31`).
