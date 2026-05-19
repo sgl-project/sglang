@@ -22,7 +22,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 | File | Role |
 |------|------|
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
-| `.github/workflows/pr-test-extra.yml` | Extra (nightly-class) workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
+| `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fast-fail: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
