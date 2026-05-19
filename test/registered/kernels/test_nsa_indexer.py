@@ -11,12 +11,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.nsa.nsa_indexer import (
+from sglang.srt.layers.attention.dsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -289,7 +289,7 @@ class TestNSAIndexer(CustomTestCase):
         if config_override:
             config.update(config_override)
         self.model_runner = MockModelRunner(config)
-        self.backend = NativeSparseAttnBackend(self.model_runner)
+        self.backend = DeepseekSparseAttnBackend(self.model_runner)
 
     def _create_indexer(self, **kwargs):
         """Create an Indexer instance with default parameters."""
@@ -417,7 +417,7 @@ class TestNSAIndexer(CustomTestCase):
             "Output should have padding or exact topk size",
         )
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):
         """Test basic indexer creation and initialization."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -431,8 +431,8 @@ class TestNSAIndexer(CustomTestCase):
         self.assertEqual(indexer.index_topk, self.config["index_topk"])
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.nsa.triton_kernel.act_quant")
+    @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -513,8 +513,8 @@ class TestNSAIndexer(CustomTestCase):
             topk_indices, self.batch_size, self.seq_len, self.config["index_topk"]
         )
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.nsa.triton_kernel.act_quant")
+    @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
@@ -627,7 +627,7 @@ class TestNSAIndexer(CustomTestCase):
         self.assertEqual(topk_indices.shape, (batch_size, topk))
 
     # TODO: enable this test after indexer accuracy aligned
-    # @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    # @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
     # def test_indexer_with_different_topk(self, mock_deep_gemm):
     #     """Test indexer with different topk values."""
     #     mock_deep_gemm.get_num_sms.return_value = 132
@@ -637,7 +637,7 @@ class TestNSAIndexer(CustomTestCase):
     #             indexer = self._create_indexer(index_topk=topk)
     #             self.assertEqual(indexer.index_topk, topk)
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
     def test_indexer_with_fused_wk(self, mock_deep_gemm):
         """Test indexer creation with fused wk and weights projection."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -647,7 +647,7 @@ class TestNSAIndexer(CustomTestCase):
         indexer = self._create_indexer()
         self.assertIsNotNone(indexer)
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.nsa_indexer.deep_gemm")
     def test_indexer_with_alt_stream(self, mock_deep_gemm):
         """Test indexer creation with alternative CUDA stream."""
         mock_deep_gemm.get_num_sms.return_value = 132
