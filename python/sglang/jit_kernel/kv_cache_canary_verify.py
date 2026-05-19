@@ -40,7 +40,7 @@ CANARY_SLOT_BYTES: Final[int] = 32
 # Width of one violation_ring row in int64 fields.
 VIOLATION_FIELDS: Final[int] = 8
 
-# Violation-row field offsets. C++ counterpart (kViolationField*) lives in canary.cuh. These constants are
+# Violation-row field offsets. C++ counterpart (kViolationField*) lives in canary_common.cuh. These constants are
 # private to this module + the torch reference; downstream readers should consume the schema through
 # violation_state helpers, not by indexing positionally.
 #
@@ -83,7 +83,7 @@ class CanaryLaunchTag(IntEnum):
 class RealKvHashMode(IntEnum):
     """Selector for the real-KV hash mixin.
 
-    Mirrored in C++ (canary.cuh / canary_common.cuh) as kRealKvHashMode*; value parity enforced by
+    Mirrored in C++ (canary_common.cuh) as kRealKvHashMode*; value parity enforced by
     test_unit_const_sync.py.
     """
 
@@ -325,7 +325,7 @@ def canary_verify_step(
 
 @cache_once
 def _jit_canary_verify_module() -> "Module":
-    """Lazy-load the CUDA verify module via tvm-ffi. Same JIT plumbing as the legacy canary.cuh loader."""
+    """Lazy-load the CUDA verify module via tvm-ffi."""
     return load_jit(
         "kv_cache_canary_verify",
         cuda_files=["kv_cache_canary/canary_verify.cuh"],
