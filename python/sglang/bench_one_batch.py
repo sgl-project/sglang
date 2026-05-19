@@ -515,7 +515,11 @@ class _TorchBenchRunner:
         synchronize(self.torch_runner.device)
 
     def max_batch_size(self, input_len, output_len):
-        return self.torch_runner.max_total_num_tokens // (input_len + output_len)
+        allocator = self.torch_runner.token_to_kv_pool_allocator
+        kv_pool_capacity = allocator.available_size()
+        return min(self.torch_runner.max_total_num_tokens, kv_pool_capacity) // (
+            input_len + output_len
+        )
 
 
 class _MlxBenchRunner:
@@ -687,14 +691,14 @@ def latency_test_run_once(
     profile_start_step=None,
     profile_steps=None,
 ):
+    model_runner.clear()
+
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
         rank_print(
             f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
         )
         return
-
-    model_runner.clear()
 
     measurement_results = {
         "run_name": run_name,
