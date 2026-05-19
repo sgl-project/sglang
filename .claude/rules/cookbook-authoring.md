@@ -331,14 +331,24 @@ Template:
 
   // Returns the axis card JSX. The outer div MUST have key={axisId} so
   // React can track it in the engine's map loop. Return null for
-  // axis-level gating (e.g. MegaMoE on Hopper).
-  render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+  // axis-level gating (e.g. MegaMoE on Hopper). Lay out as a single
+  // compact horizontal row: title on the left, fields after.
+  render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
     if (/* axis-level gating fails */) return null;
     return (
-      <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
-        <div style={s.title}>Axis Title</div>
-        {/* chip rows / sub-rows. Read state from `value`; write via
-            `setValue(next)` (replaces the whole axis slot). */}
+      <div key={axisId} style={s.card}>
+        <div style={s.compactRow}>
+          <span style={s.axisTitle}>Axis Title</span>
+          {/* For multi-option fields, use renderSelect(...). For pure
+              enable/disable fields, use renderChip(label, value, true,
+              () => setValue(!value)). Read state from `value`; write
+              via `setValue(next)` (replaces the whole axis slot). */}
+          <span style={s.field}>
+            <span style={s.fieldLabel}>Field</span>
+            {renderSelect(value.slot, fc.entries, (v) =>
+              setValue({ ...value, slot: v }), base)}
+          </span>
+        </div>
       </div>
     );
   },
@@ -357,9 +367,13 @@ Template:
 - Inside `render`, read state via `value` (the slice for this axis).
   Write state via `setValue(next)` (replaces the whole slice). For
   compound axes, do `setValue({ ...value, [k]: nextK })`.
-- Per-chip constraint handling: always call `h.evaluateChip(entry, base)`
-  inside `.map` and skip when `c.hidden`. Pass `c.disabled` /
-  `c.disableReason` to `renderChip` for the soft-warning case.
+- Layout: one `s.compactRow` per axis card, `s.axisTitle` for the
+  leading label, one `s.field` per (label + input) pair. Use
+  `renderSelect(current, entries, onPick, base, labelFor?)` for any
+  field with more than two options; reserve `renderChip` for pure
+  on/off toggles. `renderSelect` filters hidden chips and disables
+  greyed-out ones internally — no per-chip `evaluateChip` loop needed
+  in the render body.
 - **Avoid the `in` operator wrapped in unary** (`!(x in y)`). Mintlify's
   AST walker crashes on it (`TypeError: this[e] is not a function`). Use
   `obj.key === undefined` or `obj.id !== undefined` instead. Bare

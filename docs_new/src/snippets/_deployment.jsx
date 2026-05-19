@@ -720,7 +720,7 @@ export const Deployment = ({ config }) => {
             background: "transparent",
             border: "none",
             padding: 0,
-            color: isDark ? "#A78BFA" : "#8B5CF6",
+            color: isDark ? "#FDBA74" : "#C2410C",
             cursor: "pointer",
             fontSize: "12px",
             fontWeight: 600,
