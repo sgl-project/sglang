@@ -711,8 +711,8 @@ class GenerateReqInput(BaseReq):
 class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
-    # The input token ids.
     # TODO(Jialin): Migrate to python array.
+    # The input token ids.
     input_ids: List[int]
     # The multimodal inputs
     mm_inputs: object
@@ -1027,8 +1027,8 @@ class EmbeddingReqInput(BaseReq):
 class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
-    # The input token ids.
     # TODO(Jialin): Migrate to python array.
+    # The input token ids.
     input_ids: List[int]
     # The image inputs
     image_inputs: dict
