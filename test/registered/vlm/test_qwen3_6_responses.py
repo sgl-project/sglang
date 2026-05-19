@@ -48,12 +48,10 @@ class TestQwen3_6Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
             other_args=[
                 "--trust-remote-code",
                 "--enable-multimodal",
@@ -69,10 +67,7 @@ class TestQwen3_6Responses(CustomTestCase):
         """Exact curl from issue #25593 — before the fix this returned 400."""
         r = requests.post(
             f"{self.base_url}/v1/responses",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Content-Type": "application/json"},
             json={"model": self.model, "input": "hello"},
             timeout=120,
         )
