@@ -705,7 +705,11 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
+            # Record (node, backup_len): _split_node may later slice this
+            # node's key/hash_value/host_value into clones across a parent
+            # chain, but the slices still point at the same host slots, so
+            # ack-time walk-and-concat exactly recovers the enqueue snapshot.
+            self.ongoing_write_through[node.id] = (node, len(node.key))
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
@@ -716,22 +720,69 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
-    def write_backup_storage(self, node: TreeNode):
+    def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
+        # When `backup_len` is given and the node has been split since
+        # enqueue, walk node.parent and concat key/hash_value/host_value to
+        # recover the enqueue-time snapshot.  prefix_keys is anchored at the
+        # chain top (NOT node) so a freshly inserted split parent's hashes
+        # don't double-count the recovered prefix.
+        if backup_len is None or len(node.key) == backup_len:
+            top, key, hash_value, host_value = (
+                node,
+                node.key,
+                node.hash_value,
+                node.host_value,
+            )
+        else:
+            top, key, hash_value, host_value = self._concat_split_chain(
+                node, backup_len
+            )
+
         prefix_keys = (
-            node.get_prefix_hash_values(node.parent)
+            top.get_prefix_hash_values(top.parent)
             if self.hicache_storage_pass_prefix_keys
             else None
         )
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value,
-            node.key,
-            node.hash_value,
-            prefix_keys,
-            **self._get_extra_pools(),
+            host_value, key, hash_value, prefix_keys, **self._get_extra_pools()
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+
+    def _concat_split_chain(self, node: TreeNode, backup_len: int):
+        """Walk node.parent until accumulated key length covers backup_len,
+        then concat parent-first.  _split_node slices into clones at the same
+        host slots, so concat reproduces the enqueue snapshot exactly."""
+        chain, accumulated = [], 0
+        current = node
+        while current is not self.root_node and accumulated < backup_len:
+            chain.append(current)
+            accumulated += len(current.key)
+            current = current.parent
+        assert accumulated == backup_len, (
+            f"backup chain length mismatch for node {node.id}: "
+            f"expected {backup_len}, got {accumulated}"
+        )
+        chain.reverse()  # parent-first
+        top = chain[0]
+        if top.key.is_bigram:
+            # Each segment shares its first raw token with the previous
+            # segment's last; drop the overlap on every segment except the first.
+            token_ids = list(chain[0].key.token_ids)
+            for n in chain[1:]:
+                token_ids.extend(n.key.token_ids[1:])
+        else:
+            token_ids = [t for n in chain for t in n.key.token_ids]
+        key = RadixKey(token_ids, top.key.extra_key, top.key.is_bigram)
+
+        hash_value = (
+            [h for n in chain for h in n.hash_value]
+            if all(n.hash_value is not None for n in chain)
+            else None
+        )
+        host_value = torch.cat([n.host_value for n in chain])
+        return top, key, hash_value, host_value
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -751,13 +802,11 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        node, backup_len = self.ongoing_write_through.pop(ack_id)
                         # DMA confirmed -- block is now on host.
-                        self._record_store_event(
-                            backuped_node, medium=StorageMedium.CPU
-                        )
+                        self._record_store_event(node, medium=StorageMedium.CPU)
                         if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                            self.write_backup_storage(node, backup_len)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -780,12 +829,12 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
+                node, backup_len = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
+                self._record_store_event(node, medium=StorageMedium.CPU)
+                self.dec_lock_ref(node)
                 if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                    self.write_backup_storage(node, backup_len)
             finish_count -= 1
 
     def loading_check(self):
