@@ -606,10 +606,7 @@ fn try_send_chunk(
     }
 }
 
-// ======================================================================
-// Typed chunk callback (for SGLang-native RPCs: dict-based chunks)
-// ======================================================================
-
+// Typed chunk callback for SGLang-native RPCs (dict-based chunks).
 #[pyclass]
 struct ChunkCallback {
     rid: String,
@@ -697,10 +694,7 @@ impl ChunkCallback {
     }
 }
 
-// ======================================================================
-// JSON chunk callback (for OpenAI pass-through RPCs: raw bytes)
-// ======================================================================
-
+// JSON chunk callback for OpenAI pass-through RPCs (raw bytes).
 #[pyclass]
 struct JsonChunkCallback {
     rid: String,

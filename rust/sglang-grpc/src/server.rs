@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use pyo3::PyErr;
+use pyo3::Python;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use tokio::sync::{Notify, mpsc::Receiver};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
@@ -22,6 +25,28 @@ pub struct SglangServiceImpl {
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 300;
+
+/// 64 MiB — leaves headroom for multimodal inputs and OpenAI JSON pass-through bodies,
+/// well above tonic's 4 MiB decode default.
+pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Classify a bridge `PyErr` into the right gRPC `Status`.
+///
+/// `PyValueError` / `PyTypeError` mean the client sent bad input — surface as
+/// `INVALID_ARGUMENT` so callers can distinguish them from server failures.
+/// Everything else (typically `PyRuntimeError`, but also Python tracebacks
+/// from inside the tokenizer manager) maps to `INTERNAL`.
+fn pyerr_to_status(err: PyErr, context: &str) -> Status {
+    let is_client_error = Python::with_gil(|py| {
+        err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py)
+    });
+    let msg = format!("{}: {}", context, err);
+    if is_client_error {
+        Status::invalid_argument(msg)
+    } else {
+        Status::internal(msg)
+    }
+}
 
 async fn recv_chunk_with_timeout(
     receiver: &mut Receiver<ResponseChunk>,
@@ -163,9 +188,7 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
 
 #[tonic::async_trait]
 impl proto::sglang_service_server::SglangService for SglangServiceImpl {
-    // ==================================================================
-    // SGLang-native RPCs: TextGenerate / Generate
-    // ==================================================================
+    // --- SGLang-native RPCs: TextGenerate / Generate ---
 
     type TextGenerateStream = StreamResult<proto::TextGenerateResponse>;
 
@@ -183,7 +206,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_request(&rid, "generate", req_dict)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
@@ -252,7 +275,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_request(&rid, "generate", req_dict)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
@@ -305,9 +328,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    // ==================================================================
-    // SGLang-native RPCs: Embed (text / tokenized)
-    // ==================================================================
+    // --- SGLang-native RPCs: Embed (text / tokenized) ---
 
     async fn text_embed(
         &self,
@@ -323,7 +344,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_request(&rid, "embed", req_dict)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
@@ -358,7 +379,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_request(&rid, "embed", req_dict)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
@@ -379,9 +400,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
     }
 
-    // ==================================================================
-    // SGLang-native RPCs: Classify
-    // ==================================================================
+    // --- SGLang-native RPCs: Classify ---
 
     async fn classify(
         &self,
@@ -402,7 +421,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_request(&rid, "embed", req_dict)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
@@ -423,9 +442,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
     }
 
-    // ==================================================================
-    // SGLang-native RPCs: Tokenize / Detokenize (Rust-native with fallback)
-    // ==================================================================
+    // --- SGLang-native RPCs: Tokenize / Detokenize (Rust-native with fallback) ---
 
     async fn tokenize(
         &self,
@@ -456,7 +473,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Tokenize failed: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Tokenize failed"))?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -501,7 +518,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Detokenize failed: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Detokenize failed"))?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -510,9 +527,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }))
     }
 
-    // ==================================================================
-    // SGLang-native RPCs: Info / control
-    // ==================================================================
+    // --- SGLang-native RPCs: Info / control ---
 
     async fn health_check(
         &self,
@@ -524,7 +539,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Health check failed: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Health check failed"))?;
 
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
     }
@@ -539,7 +554,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to get model info: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Failed to get model info"))?;
 
         Ok(Response::new(proto::GetModelInfoResponse {
             model_path: extract_model_path(&json_info),
@@ -557,7 +572,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to get server info: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Failed to get server info"))?;
 
         Ok(Response::new(proto::GetServerInfoResponse { json_info }))
     }
@@ -572,7 +587,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to list models: {}", e)))?;
+        .map_err(|e| pyerr_to_status(e, "Failed to list models"))?;
 
         let models_arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse models JSON: {}", e)))?;
@@ -602,7 +617,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_get_load(&rid, req.dp_rank)
-            .map_err(|e| Status::internal(format!("Failed to get load: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to get load"))?;
 
         let json_info =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -626,7 +641,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
         self.bridge
             .abort(&req.rid, req.abort_all)
-            .map_err(|e| Status::internal(format!("Failed to abort: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to abort"))?;
 
         Ok(Response::new(proto::AbortResponse { success: true }))
     }
@@ -639,7 +654,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_flush_cache(&rid)
-            .map_err(|e| Status::internal(format!("Failed to flush cache: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to flush cache"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -660,7 +675,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_pause_generation(&rid, &req.mode)
-            .map_err(|e| Status::internal(format!("Failed to pause generation: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to pause generation"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -679,7 +694,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_continue_generation(&rid)
-            .map_err(|e| Status::internal(format!("Failed to continue generation: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to continue generation"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -690,9 +705,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }))
     }
 
-    // ==================================================================
-    // OpenAI-compatible RPCs (JSON pass-through)
-    // ==================================================================
+    // --- OpenAI-compatible RPCs (JSON pass-through) ---
 
     type ChatCompleteStream = StreamResult<proto::OpenAiStreamChunk>;
 
@@ -743,9 +756,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         self.openai_unary_rpc(request, "submit_openai_rerank").await
     }
 
-    // ==================================================================
-    // Admin RPCs
-    // ==================================================================
+    // --- Admin RPCs ---
 
     async fn start_profile(
         &self,
@@ -756,7 +767,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_start_profile(&rid, req.output_dir.as_deref())
-            .map_err(|e| Status::internal(format!("Failed to start profile: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to start profile"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -775,7 +786,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_stop_profile(&rid)
-            .map_err(|e| Status::internal(format!("Failed to stop profile: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to stop profile"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -795,7 +806,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let receiver = self
             .bridge
             .submit_update_weights(&rid, &req.model_path, req.load_format.as_deref())
-            .map_err(|e| Status::internal(format!("Failed to update weights: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to update weights"))?;
 
         let json_str =
             recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
@@ -808,10 +819,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     }
 }
 
-// ======================================================================
-// Helper methods for OpenAI pass-through RPCs
-// ======================================================================
-
+// Helper methods for OpenAI pass-through RPCs.
 impl SglangServiceImpl {
     async fn openai_streaming_rpc(
         &self,
@@ -824,7 +832,7 @@ impl SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_openai(&rid, method_name, &req.json_body, &req.trace_headers)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
@@ -887,7 +895,7 @@ impl SglangServiceImpl {
         let mut receiver = self
             .bridge
             .submit_openai(&rid, method_name, &req.json_body, &req.trace_headers)
-            .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
+            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
@@ -936,6 +944,10 @@ async fn recv_json_response(
 }
 
 /// Start the Tonic gRPC server on the given address.
+//
+// TODO(grpc-auth): this listener is currently unauthenticated. Before exposing
+// it in any default deploy path, gate it with the same API-key / admin-key
+// checks the HTTP server applies (see issue tracking gRPC auth parity).
 pub async fn run_grpc_server(
     listener: std::net::TcpListener,
     bridge: Arc<PyBridge>,
@@ -949,7 +961,9 @@ pub async fn run_grpc_server(
         response_timeout,
     };
 
-    let svc = proto::sglang_service_server::SglangServiceServer::new(service);
+    let svc = proto::sglang_service_server::SglangServiceServer::new(service)
+        .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_SIZE);
 
     tracing::info!("gRPC server listening on {}", addr);
 
