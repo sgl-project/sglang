@@ -90,20 +90,24 @@ void decode_attention_cpu(
     at::Tensor& k_cache,
     at::Tensor& v_cache,
     at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
+    const std::optional<at::Tensor>& key,
+    const std::optional<at::Tensor>& value,
     at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t slidling_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend,
+    const std::optional<at::Tensor>& v_extend,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -114,7 +118,11 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -125,7 +133,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal);
+    bool causal,
+    std::optional<double> scale);
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -211,6 +220,7 @@ at::Tensor fused_linear_sigmoid_mul(
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -225,9 +235,12 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
-    bool is_vnni);
-
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
+    bool is_vnni,
+    const std::optional<std::string>& activation);
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -309,6 +322,25 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+// multidimensional rope
+std::tuple<at::Tensor, at::Tensor>
+apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+#else
+// fused moe
+at::Tensor fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
+    const std::optional<std::vector<int64_t>> block_size,
+    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -337,7 +369,7 @@ std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // mrope
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -462,22 +494,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
+      "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
-      "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
+      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
+      "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal, float? scale=None) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
 
   // linear attn
@@ -546,14 +581,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
+      "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
-
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
@@ -592,6 +627,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  // multidimensional rope
+  m.def(
+      "apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> (Tensor(a!), "
+      "Tensor(b!))");
+  m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
+#else
+  // moe
+  m.def(
+      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
+      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+  m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 #endif
 
   // conv3d fast path for patch embedding
@@ -618,7 +666,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // multimodal rope
   m.def(
       "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> ()");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding

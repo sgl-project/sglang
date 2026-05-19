@@ -161,9 +161,10 @@ void flash_attn_kernel_impl(
           }
         }
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
-
+        for (int row = 0; row < m_size; ++row) {
+          flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+        }
         // get value and pack
         pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
@@ -344,8 +345,10 @@ void flash_attn_varlen_kernel_impl(
           }
         }
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+        for (int row = 0; row < m_size; ++row) {
+          flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+        }
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -440,7 +443,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal) {
+    bool causal,
+    std::optional<double> scale) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
@@ -477,7 +481,7 @@ at::Tensor flash_attn_varlen_func(
   TORCH_CHECK(head_size_v % 2 == 0, "invalid head_size_v ", head_size_v);
 
   // softmax scale
-  double sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
+  double sm_scale = scale.has_value() ? scale.value() : 1.0 / std::sqrt(static_cast<double>(head_size));
 
   // check whether the batch has variant lengths
   const bool is_varlen =

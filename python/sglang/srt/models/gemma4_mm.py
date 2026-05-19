@@ -33,6 +33,7 @@ from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -51,10 +52,13 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import Gemma4TextModel
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -218,7 +222,19 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-
+        if (
+            self.config.tie_word_embeddings
+            and not _is_cpu
+            and not _is_cpu_amx_available
+        ):
+            self.lm_head = self.language_model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_aux_hidden_states = False
@@ -604,7 +620,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return self.logits_processor(
             input_ids,
             hidden_states,
-            self.language_model.embed_tokens,
+            self.lm_head,
             forward_batch,
             aux_hidden_states,
         )
@@ -882,6 +898,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    if (
+                        self.config.tie_word_embeddings
+                        and name == "language_model.embed_tokens.weight"
+                        and _is_cpu
+                        and _is_cpu_amx_available
+                    ):
+                        param_lm_head = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            param_lm_head, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:

@@ -56,11 +56,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_cpu, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 @dataclasses.dataclass
@@ -875,7 +876,7 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
-            if not _is_npu:
+            if not _is_npu and not _is_cpu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(
