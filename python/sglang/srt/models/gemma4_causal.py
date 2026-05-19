@@ -349,14 +349,15 @@ class Gemma4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-        # Preconditions for the fused path: tensors on CUDA, q_norm/k_norm use
-        # the standard norm*weight (scale_shift==0) and v_norm has weight=ones
+        # Preconditions for the fused path: tensors on CUDA or XPU (the kernel
+        # is pure Triton and lowers to both backends), q_norm/k_norm use the
+        # standard norm*weight (scale_shift==0) and v_norm has weight=ones
         # (with_scale=False) — the canonical Gemma4 attention configuration.
         is_kv_shared = (
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            q.is_cuda
+            (q.is_cuda or q.is_xpu)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale

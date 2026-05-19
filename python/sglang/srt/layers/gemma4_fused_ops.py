@@ -215,7 +215,7 @@ def gemma_qkv_rmsnorm(
 
     If k and v are both None (KV-shared layer), only Q is normalized.
     """
-    assert q.is_cuda
+    assert q.is_cuda or q.is_xpu
     assert q.stride(-1) == 1, "Q's last dim must be contiguous"
     assert q_weight.shape[-1] == head_dim
     M = q.shape[0] if q.dim() >= 2 else 1
@@ -223,7 +223,7 @@ def gemma_qkv_rmsnorm(
 
     has_kv = k is not None and v is not None
     if has_kv:
-        assert k.is_cuda and v.is_cuda
+        assert (k.is_cuda and v.is_cuda) or (k.is_xpu and v.is_xpu)
         assert k.stride(-1) == 1 and v.stride(-1) == 1
         assert k_weight is not None and k_weight.shape[-1] == head_dim
 
