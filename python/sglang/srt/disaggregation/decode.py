@@ -380,16 +380,14 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        if self.scheduler.enable_hisparse:
-            # Direct-to-host: register host pool pointers so P writes to D's host memory
-            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                host_pool.get_contiguous_buf_infos()
-            )
-        else:
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                self.token_to_kv_pool.get_contiguous_buf_infos()
-            )
+        transfer_kv_pool = (
+            self.scheduler.hisparse_coordinator.mem_pool_host
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool
+        )
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -403,10 +401,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
-        kv_args.page_size = (
-            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
-        )
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -913,6 +908,7 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
+            page_size = self.token_to_kv_pool_allocator.page_size
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
@@ -921,7 +917,6 @@ class DecodePreallocQueue:
                     .numpy()
                     .astype(np.int32)
                 )
-                page_size = 1  # host pool page_size
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -931,7 +926,6 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 )
-                page_size = self.token_to_kv_pool_allocator.page_size
 
             seq_len = len(decode_req.req.origin_input_ids)
 
@@ -1270,14 +1264,13 @@ class DecodePreallocQueue:
                 extend_num_tokens=fill_len,
             )
             # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
-                )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                coordinator.req_to_host_pool,
+                coordinator.req_to_host_pool_allocated_len,
+                req.req_pool_idx,
+                0,
+                fill_len,
+            )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
@@ -1793,6 +1786,4 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(transferred_reqs)
-            else:
-                self.waiting_queue.extend(transferred_reqs)
+            self.waiting_queue.extend(transferred_reqs)
