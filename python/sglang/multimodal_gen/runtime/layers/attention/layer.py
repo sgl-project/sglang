@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
-    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -610,11 +609,12 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
 
-        Note: this path is only used when ring == 1 (ulysses-only).
-        When ring > 1, forward() dispatches to _shard_replicated_and_forward().
+        Note: this path is used when ulysses > 1 and ring == 1.
+        When both ulysses > 1 and ring > 1, forward() dispatches to
+        _shard_replicated_and_forward() instead.
         """
         sp_size = get_ulysses_parallel_world_size()
-        sp_rank = get_ulysses_parallel_rank()
+        sp_rank = get_sp_parallel_rank()
 
         q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
