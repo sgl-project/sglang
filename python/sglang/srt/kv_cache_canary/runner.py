@@ -549,8 +549,8 @@ def _format_violation(
         tag_label = CanaryLaunchTag(int(kernel_kind)).name
     except ValueError:
         tag_label = f"unknown({int(kernel_kind)})"
-    reasons: list[str] = []
     bits = int(fail_reason_bits)
+    reasons: list[str] = []
     if bits & 0x1:
         reasons.append("chain_hash")
     if bits & 0x2:
@@ -558,6 +558,9 @@ def _format_violation(
     if bits & 0x4:
         reasons.append("real_kv_hash")
     u64_mask = (1 << 64) - 1
+    stored_prev_hash = int(stored_chain_hash) & u64_mask
+    expected_prev_hash = int(expected_aux) & u64_mask
+
     return "\n".join(
         [
             (
@@ -567,13 +570,11 @@ def _format_violation(
             f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}",
             (
                 f"  stored:   token_id={int(stored_token)}   position={int(position)} "
-                f"prev_hash={int(stored_chain_hash) & u64_mask:#018x} "
-                f"real_kv_hash={int(expected_aux) & u64_mask:#018x}"
+                f"prev_hash={stored_prev_hash:#018x} real_kv_hash={0:#018x}"
             ),
             (
                 f"  expected: token_id={int(expected_token)}   position={int(position)} "
-                f"prev_hash={int(stored_chain_hash) & u64_mask:#018x} "
-                f"real_kv_hash={int(expected_aux) & u64_mask:#018x}"
+                f"prev_hash={expected_prev_hash:#018x} real_kv_hash={0:#018x}"
             ),
             (
                 f"  total_violations={total} ring_overflow={ring_overflow} "
