@@ -595,17 +595,32 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        if is_indexer:
-            kv_fp8, kv_scale = act_quant(kv_to_store)
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=out_loc_to_store,
-                index_k=kv_fp8,
-                index_k_scale=kv_scale,
-            )
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+            # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
+            if is_indexer:
+                token_to_kv_pool.set_index_k_fused(
+                    layer_id=layer_id,
+                    loc=out_loc_to_store,
+                    cache_k=kv_to_store,
+                )
+            else:
+                token_to_kv_pool.set_extra_key_buffer_fused(
+                    layer_id=layer_id,
+                    loc=out_loc_to_store,
+                    cache_k=kv_to_store,
+                )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_to_store.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc_to_store, pack)
+            if is_indexer:
+                kv_fp8, kv_scale = act_quant(kv_to_store)
+                token_to_kv_pool.set_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    loc=out_loc_to_store,
+                    index_k=kv_fp8,
+                    index_k_scale=kv_scale,
+                )
+            else:
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_to_store.bfloat16())
+                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc_to_store, pack)
 
     # NOTE: alias for backward compatibility
     forward_indexer_compressor = forward_unified
