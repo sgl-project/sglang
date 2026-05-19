@@ -45,8 +45,8 @@ def test_canary_env_var_types_are_primitive():
 @pytest.mark.xfail(
     strict=False,
     reason="server_args choices for --kv-cache-canary-real-data are "
-    "{off, portion, all}; SOT requires {off, bit, all} matching RealKvHashMode "
-    "(phase-2 phase 08 ci-and-environ wiring)",
+    "{off, portion, all}; expected {off, bit, all} matching RealKvHashMode "
+    "members",
 )
 def test_real_data_cli_flag_registered_and_matches_enum():
     parser = argparse.ArgumentParser()
