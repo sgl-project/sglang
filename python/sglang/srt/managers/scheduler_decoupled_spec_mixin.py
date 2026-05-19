@@ -485,6 +485,10 @@ class SchedulerDecoupledSpecMixin:
         else:
             checkpoint_candidate_indices = req_indices
 
+        src_indices: list[torch.Tensor] = []
+        dst_indices: list[torch.Tensor] = []
+        checkpointed_positions: list[tuple[DraftReqState, int]] = []
+
         for req_batch_idx in checkpoint_candidate_indices:
             if not (0 <= req_batch_idx < len(batch.reqs)):
                 continue
@@ -501,9 +505,18 @@ class SchedulerDecoupledSpecMixin:
             checkpoint_slot = self._draft_mamba_checkpoint_slot_for_pos(
                 state, token_pos
             )
-            self.req_to_token_pool.mamba_pool.copy_from(
-                req.mamba_pool_idx.unsqueeze(0), checkpoint_slot
-            )
+            src_indices.append(req.mamba_pool_idx.unsqueeze(0))
+            dst_indices.append(checkpoint_slot)
+            checkpointed_positions.append((state, token_pos))
+
+        if not src_indices:
+            return
+
+        self.req_to_token_pool.mamba_pool.copy_from(
+            torch.cat(src_indices), torch.cat(dst_indices)
+        )
+
+        for state, token_pos in checkpointed_positions:
             state.mamba_checkpoint_positions.add(token_pos)
 
     def _restore_draft_mamba_checkpoint(
