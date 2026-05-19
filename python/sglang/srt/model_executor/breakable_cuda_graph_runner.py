@@ -401,16 +401,10 @@ class BreakableCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        # Re-run prepare_lora_batch with force_cuda_graph=True so the LoRA
-        # backend writes batch metadata into the pinned cuda_graph_batch_info
-        # whose address was baked into the captured graph (mirrors PCG.replay).
-        if (
-            self.model_runner.server_args.enable_lora
-            and forward_batch.lora_ids is not None
-        ):
-            self.model_runner.lora_manager.prepare_lora_batch(
-                forward_batch, force_cuda_graph=True
-            )
+        # Note: prepare_lora_batch is NOT called here anymore. When PCG (or
+        # BCG) is enabled, lora_manager._cuda_graph_supports_extend is True
+        # so the upstream init_new call already routes EXTEND through the
+        # pinned cuda_graph_batch_info. Calling again duplicated CPU work.
 
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)

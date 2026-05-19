@@ -124,6 +124,13 @@ class LoRAManager:
                 can share the pinned cuda_graph_batch_info. None = PCG disabled.
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        # When max_num_tokens_pcg is supplied, the pinned cuda_graph_batch_info
+        # is sized large enough to cover prefill (EXTEND) too. Use this to
+        # route the upstream prepare_lora_batch() call from init_new directly
+        # into the pinned buffer for EXTEND, avoiding the wasted fresh-alloc
+        # done by the non-cuda-graph path. PCG.replay can then skip a second
+        # prepare_lora_batch call.
+        self._cuda_graph_supports_extend = max_num_tokens_pcg is not None
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
@@ -332,10 +339,22 @@ class LoRAManager:
 
         # force_cuda_graph=True lets PCG (extend) drive in-place batch info updates
         # even though ForwardMode.EXTEND is not in ForwardMode.is_cuda_graph().
+        # Additionally, when the pinned cuda_graph_batch_info was sized for PCG
+        # (max_num_tokens_pcg supplied), route EXTEND through it directly so the
+        # upstream init_new call writes into the pinned buffer once, instead of
+        # doing the throwaway fresh-alloc path followed by a second pass in
+        # PCG.replay (which was the source of long-prompt regression).
         use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
-            and (forward_batch.forward_mode.is_cuda_graph() or force_cuda_graph)
+            and (
+                forward_batch.forward_mode.is_cuda_graph()
+                or force_cuda_graph
+                or (
+                    getattr(self, "_cuda_graph_supports_extend", False)
+                    and forward_batch.forward_mode.is_extend()
+                )
+            )
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)

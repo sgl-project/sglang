@@ -839,18 +839,13 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        # Re-run prepare_lora_batch with force_cuda_graph=True so the backend
-        # writes batch metadata into the pinned cuda_graph_batch_info buffer
-        # whose address was baked into the captured graph. The upstream call in
-        # forward_batch_info.init_new ran with use_cuda_graph=False (EXTEND is
-        # not in is_cuda_graph()), so we overwrite its fresh allocations here.
-        if (
-            self.model_runner.server_args.enable_lora
-            and forward_batch.lora_ids is not None
-        ):
-            self.model_runner.lora_manager.prepare_lora_batch(
-                forward_batch, force_cuda_graph=True
-            )
+        # Note: prepare_lora_batch is NOT called here anymore. The upstream
+        # call in forward_batch_info.init_new already routed EXTEND through
+        # the pinned cuda_graph_batch_info path because
+        # lora_manager._cuda_graph_supports_extend is True when PCG was
+        # initialized (max_num_tokens_pcg was supplied). Calling again here
+        # would duplicate the CPU permutation/segments build + async copies
+        # and was the source of the long-prompt PCG regression.
 
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
