@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -100,6 +101,7 @@ def plan_batch_from_forward_batch(
     *,
     forward_batch: "ForwardBatch",
     config: CanaryConfig,
+    swa_index_lut: Optional[torch.Tensor] = None,
 ) -> Optional[BatchPlan]:
     """Translate a ``ForwardBatch`` into a :class:`BatchPlan`.
 
@@ -107,6 +109,11 @@ def plan_batch_from_forward_batch(
     position re-verified each forward); SWA pools clip to the most recent
     ``swa_window_size`` slots because older positions in ``req_to_token``
     point at slots that have been evicted to other reqs.
+
+    When ``swa_index_lut`` is supplied (SWA canary group on a pool with a
+    distinct swa sub-pool slot index space) the plan's slot-index fields
+    are remapped through ``lut[idx]`` before return; chain-head sentinel
+    (-1) and skip-chain sentinel (-2) values pass through unchanged.
 
     Returns ``None`` for empty / unsupported batches (no out_cache_loc,
     unknown forward mode, missing extend lens).
@@ -153,7 +160,7 @@ def plan_batch_from_forward_batch(
     if req_to_token_pool is None:
         return None
 
-    return _build_plan(
+    plan = _build_plan(
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         prefix_lens=prefix_lens,
@@ -162,6 +169,89 @@ def plan_batch_from_forward_batch(
         positions_list=positions_list,
         req_to_token_table=req_to_token_pool.req_to_token,
         swa_window_size=config.swa_window_size,
+    )
+    if plan is None or swa_index_lut is None:
+        return plan
+    return _translate_plan_slot_indices(plan=plan, lut=swa_index_lut)
+
+
+def translate_alive_slots_for_swa(
+    *,
+    alive_slots: torch.Tensor,
+    lut: torch.Tensor,
+) -> torch.Tensor:
+    """Filter + remap a full-pool alive-slot tensor into SWA index space.
+
+    Input alive-slot indices live in the full-pool slot space (sourced
+    from ``req_to_token``). The LUT translates each into its SWA
+    sub-pool slot; entries mapped to the LUT's ``-1`` sentinel
+    (not in window / unmapped) are dropped because the sweep kernel
+    would otherwise index the swa-sized canary buffer with garbage.
+    """
+    if alive_slots.numel() == 0:
+        return alive_slots
+    cpu_lut = lut.detach().cpu().to(torch.int64)
+    lut_len = int(cpu_lut.shape[0])
+    cpu_alive = alive_slots.detach().cpu().to(torch.int64)
+    if lut_len > 0:
+        oob_mask = cpu_alive >= lut_len
+        cpu_alive = torch.where(
+            oob_mask, torch.full_like(cpu_alive, lut_len - 1), cpu_alive
+        )
+    translated = cpu_lut[cpu_alive]
+    valid = translated >= 0
+    filtered = translated[valid]
+    if alive_slots.device != filtered.device:
+        filtered = filtered.to(alive_slots.device)
+    return filtered
+
+
+def _translate_plan_slot_indices(
+    *,
+    plan: BatchPlan,
+    lut: torch.Tensor,
+) -> BatchPlan:
+    """Remap the four slot-index fields of ``plan`` through ``lut``.
+
+    ``lut`` is the pool's ``full_to_swa_index_mapping``: a ``[size_full + 1]``
+    int tensor whose final entry is ``-1`` (sentinel for "not in window /
+    unmapped"). Sentinel values already present in the plan — ``-1``
+    (chain-head, used by ``verify_prev_slot_indices`` and
+    ``write_req_seed_slot_indices``) and ``SKIP_CHAIN_SENTINEL`` (-2,
+    used by sweep) — pass through unchanged; only non-negative full-pool
+    indices are translated.
+    """
+    cpu_lut = lut.detach().cpu().to(torch.int64)
+    lut_len = int(cpu_lut.shape[0])
+
+    def translate(values: List[int]) -> List[int]:
+        if not values:
+            return list(values)
+        idx_tensor = torch.tensor(values, dtype=torch.int64)
+        sentinel_mask = idx_tensor < 0
+        # Clamp negatives to a safe in-range index (0) before gather; the
+        # sentinel positions are restored below, so the value gathered for
+        # them is discarded.
+        safe_idx = torch.where(sentinel_mask, torch.zeros_like(idx_tensor), idx_tensor)
+        if lut_len > 0:
+            # Out-of-range positive indices fall back to the LUT's final
+            # entry (the -1 sentinel), matching the sglang convention.
+            oob_mask = safe_idx >= lut_len
+            safe_idx = torch.where(
+                oob_mask,
+                torch.full_like(safe_idx, lut_len - 1),
+                safe_idx,
+            )
+        translated = cpu_lut[safe_idx]
+        result = torch.where(sentinel_mask, idx_tensor, translated)
+        return [int(x) for x in result.tolist()]
+
+    return dataclasses.replace(
+        plan,
+        verify_slot_indices=translate(plan.verify_slot_indices),
+        verify_prev_slot_indices=translate(plan.verify_prev_slot_indices),
+        write_slot_indices=translate(plan.write_slot_indices),
+        write_req_seed_slot_indices=translate(plan.write_req_seed_slot_indices),
     )
 
 

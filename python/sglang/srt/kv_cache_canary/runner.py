@@ -38,6 +38,7 @@ from sglang.srt.kv_cache_canary.host_state import (
     BatchPlan,
     CanaryDeviceState,
     CanaryLaunchBuffers,
+    translate_alive_slots_for_swa,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
     CanaryBufferGroup,
@@ -401,6 +402,13 @@ class CanaryRunner:
         )
         if alive_slots.numel() == 0:
             return
+        lut = self._buffer_group.swa_index_lut
+        if lut is not None:
+            alive_slots = translate_alive_slots_for_swa(
+                alive_slots=alive_slots, lut=lut
+            )
+            if alive_slots.numel() == 0:
+                return
         plan = build_sweep_plan(
             canary_buf=self._buffer_group.k_tail,
             alive_slot_indices=alive_slots,

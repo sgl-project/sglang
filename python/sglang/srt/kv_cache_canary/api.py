@@ -121,7 +121,9 @@ def run_head(
     for runner in runners:
         runner.set_last_forward_batch(forward_batch)
         plan = plan_batch_from_forward_batch(
-            forward_batch=forward_batch, config=runner.config
+            forward_batch=forward_batch,
+            config=runner.config,
+            swa_index_lut=runner.buffer_group.swa_index_lut,
         )
         if plan is None:
             continue
@@ -171,7 +173,9 @@ def prepare_replay(
         if not runner.config.enabled:
             continue
         plan = plan_batch_from_forward_batch(
-            forward_batch=forward_batch, config=runner.config
+            forward_batch=forward_batch,
+            config=runner.config,
+            swa_index_lut=runner.buffer_group.swa_index_lut,
         )
         if plan is None:
             runner.reset_launch_buffers_to_skip_sentinel()
