@@ -40,6 +40,7 @@ class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
     num_questions = 1319
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
     model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
     other_args = [
