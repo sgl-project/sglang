@@ -726,6 +726,10 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
+        self.mamba_cow_src_index: Optional[torch.Tensor] = None
+        # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
+        self.mamba_needs_clear: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -1282,6 +1286,8 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
@@ -1398,6 +1404,26 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_seqlen: int
 
 
+def set_mamba_track_indices_from_reqs(batch):
+    """Build mamba_track_indices from req objects (authoritative source)."""
+    req_to_token_pool = batch.req_to_token_pool
+    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+        batch.req_pool_indices
+    ]  # (bs, ping_pong_size), int64, on device
+    idx = (
+        torch.tensor(
+            [req.mamba_next_track_idx for req in batch.reqs],
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        .unsqueeze(1)
+        .to(device=all_buffers.device, non_blocking=True)
+    )
+    batch.mamba_track_indices = (
+        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    )
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1443,6 +1469,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
+    mamba_cow_src_indices: torch.Tensor = None
+    mamba_cow_dst_indices: torch.Tensor = None
+    mamba_clear_indices: torch.Tensor = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -2003,6 +2033,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+        # Collect mamba init info for deferred ops on forward stream
+        if any(req.mamba_pool_idx is not None for req in reqs):
+            self._collect_deferred_mamba_cow_and_clear(reqs)
+
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
@@ -2084,11 +2118,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
         )
+
+    def _collect_deferred_mamba_cow_and_clear(self, reqs):
+        """Collect deferred COW/clear info from requests."""
+        cow_src_tensors = []
+        cow_dst_tensors = []
+        clear_tensors = []
+        for req in reqs:
+            if req.mamba_cow_src_index is not None:
+                cow_src_tensors.append(req.mamba_cow_src_index)
+                cow_dst_tensors.append(req.mamba_pool_idx.unsqueeze(0))
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+            elif req.mamba_needs_clear:
+                clear_tensors.append(req.mamba_pool_idx.unsqueeze(0))
+                req.mamba_needs_clear = False
+        self.mamba_cow_src_indices = (
+            torch.cat(cow_src_tensors) if cow_src_tensors else None
+        )
+        self.mamba_cow_dst_indices = (
+            torch.cat(cow_dst_tensors) if cow_dst_tensors else None
+        )
+        self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+
+    def prepare_for_split_prefill(self):
+        self.prepare_for_extend()
+        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
+        self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -2379,22 +2441,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                # already on device
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
-                )
-                idx = (
-                    torch.tensor(
-                        [req.mamba_next_track_idx for req in self.reqs],
-                        dtype=torch.int64,
-                        pin_memory=True,
-                    )
-                    .unsqueeze(1)
-                    .to(device=all_buffers.device, non_blocking=True)
-                )
-                self.mamba_track_indices = (
-                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
-                )
+                set_mamba_track_indices_from_reqs(self)
 
             # async H2D
             self.mamba_track_mask = (
@@ -2467,6 +2514,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
