@@ -17,15 +17,21 @@ runtime. Three hook surfaces:
   - chunk commit + step commit + finish: wrap
     ``Scheduler.process_batch_result`` (covers prefill / decode / chunked
     prefill / overlap delay-sample via the same post-step entry).
+
+A fourth surface — the harness IPC handlers ``_pseudo_*`` — is wired
+on demand by :func:`install_harness_ipc_handlers` when the
+``PseudoEngine`` test harness needs single-step / inspection RPCs.
 """
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import functools
 import logging
+import pickle
 import types
-from typing import TYPE_CHECKING, Dict, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from sglang.srt.kv_cache_canary import host_state as _canary_host_state
 from sglang.srt.kv_cache_canary.api import get_runners
@@ -334,5 +340,200 @@ def _post_step_oracle_sync(
         last_output_lens.pop(rid, None)
 
 
+_HARNESS_IPC_PATCHED_ATTR = "_pseudo_mode_harness_ipc_patched"
+_HARNESS_IPC_METHOD_PREFIX = "_pseudo_"
+
+
+def install_harness_ipc_handlers(*, scheduler: "Scheduler") -> None:
+    """Wire the harness-side single-step / inspection RPC methods.
+
+    The test harness invokes these by sending :class:`RpcReqInput`
+    objects with ``method`` starting with ``_pseudo_``. They are not
+    part of the production scheduler surface and only exist when the
+    PseudoEngine test harness is in use.
+
+    Patches ``Scheduler.handle_rpc_request`` to:
+
+    * Dispatch ``_pseudo_*`` method names to handlers registered on
+      this module (rather than ``getattr(scheduler, method)``).
+    * Smuggle the handler's return value back to the harness as a
+      base64-pickled blob stuffed into ``RpcReqOutput.message`` — the
+      production ``collective_rpc`` path only uses ``message`` for
+      error strings, so this is non-disruptive.
+
+    Idempotent — second call on the same scheduler is a no-op.
+    """
+    if getattr(scheduler, _HARNESS_IPC_PATCHED_ATTR, False):
+        return
+
+    from sglang.srt.managers.io_struct import RpcReqOutput
+
+    original_handle = scheduler.handle_rpc_request
+
+    def patched_handle_rpc_request(self_scheduler, recv_req):
+        method = recv_req.method
+        if not method.startswith(_HARNESS_IPC_METHOD_PREFIX):
+            return original_handle(recv_req)
+        handler = _HARNESS_IPC_HANDLERS.get(method)
+        if handler is None:
+            return RpcReqOutput(False, f"unknown pseudo-mode RPC: {method}")
+        params = recv_req.parameters or {}
+        try:
+            result = handler(self_scheduler, **params)
+        except Exception as exc:  # noqa: BLE001 — bubble up to harness
+            logger.warning(
+                "pseudo-mode RPC %s raised: %s", method, exc, exc_info=True
+            )
+            return RpcReqOutput(False, f"{type(exc).__name__}: {exc}")
+
+        payload = base64.b64encode(pickle.dumps(result)).decode("ascii")
+        return RpcReqOutput(True, payload)
+
+    scheduler.handle_rpc_request = types.MethodType(
+        patched_handle_rpc_request, scheduler
+    )
+    setattr(scheduler, _HARNESS_IPC_PATCHED_ATTR, True)
+
+
+def decode_harness_ipc_payload(message: str) -> Any:
+    """Inverse of the payload encoding in :func:`install_harness_ipc_handlers`.
+
+    Harness-side helper; lives here so the encoding is one-sided in
+    code (single source of truth).
+    """
+    return pickle.loads(base64.b64decode(message))
+
+
+def _handle_pseudo_step(scheduler: "Scheduler") -> Dict[str, Any]:
+    """Drive scheduler one outer-loop iteration; return step metadata.
+
+    Mirrors ``event_loop_normal``'s inner body but only runs once. The
+    scheduler stays paused around this call so no other forward fires
+    between RPCs.
+    """
+    recv_reqs = scheduler.recv_requests()
+    scheduler.process_input_requests(recv_reqs)
+    batch = scheduler.get_next_batch_to_run()
+    scheduler.cur_batch = batch
+    forward_mode = "idle"
+    active_rids: List[str] = []
+    if batch is not None:
+        forward_mode = (
+            batch.forward_mode.name if batch.forward_mode is not None else "unknown"
+        )
+        active_rids = [req.rid for req in batch.reqs]
+        result = scheduler.run_batch(batch)
+        scheduler.process_batch_result(batch, result)
+    scheduler.last_batch = batch
+    return {
+        "forward_mode": forward_mode,
+        "active_rids": active_rids,
+    }
+
+
+def _handle_pseudo_force_preempt(
+    scheduler: "Scheduler", *, rid: str
+) -> Dict[str, Any]:
+    """Flag a rid for retraction on the next ``run_batch``.
+
+    Best-effort: production ``retract_decode`` only fires on OOM and
+    only retracts the lowest-priority tail; we drop the rid from the
+    next running-batch instead. Returns whether the rid was found.
+    """
+    found = False
+    running = getattr(scheduler, "running_batch", None)
+    if running is not None and running.reqs:
+        for i, req in enumerate(list(running.reqs)):
+            if req.rid == rid:
+                running.release_req(i, len(running.reqs) - 1, scheduler.server_args)
+                running.filter_batch(
+                    keep_indices=[
+                        j for j in range(len(running.reqs)) if j != i
+                    ]
+                )
+                found = True
+                break
+    return {"found": found}
+
+
+def _handle_pseudo_pull_violations(scheduler: "Scheduler") -> List[Dict[str, Any]]:
+    """Pull every canary runner's first-violation row + write_index.
+
+    Returns one entry per (runner, kind) with non-NONE fail_reason.
+    The harness decodes these into ``CanaryViolationView`` records.
+    """
+    from sglang.srt.kv_cache_canary.api import get_runners
+    from sglang.srt.kv_cache_canary.host_state import VIOLATION_KINDS
+
+    pool = scheduler.tp_worker.model_runner.token_to_kv_pool
+    out: List[Dict[str, Any]] = []
+    for runner in get_runners(pool):
+        for kind in VIOLATION_KINDS:
+            row, write_index = runner._pull_first_violation(kind)
+            if int(row[1]) == 0 and int(write_index) == 0:
+                continue
+            out.append({"row": row, "kind": kind, "write_index": write_index})
+    return out
+
+
+def _handle_pseudo_allocator_stats(scheduler: "Scheduler") -> Dict[str, int]:
+    """Return free / used / total KV slot counts."""
+    allocator = scheduler.token_to_kv_pool_allocator
+    free = int(allocator.available_size())
+    total = int(scheduler.max_total_num_tokens)
+    return {"free": free, "used": total - free, "total": total}
+
+
+def _handle_pseudo_active_reqs(scheduler: "Scheduler") -> List[Dict[str, Any]]:
+    """Return summary info for every req currently in waiting + running."""
+    out: List[Dict[str, Any]] = []
+    for req in list(scheduler.waiting_queue):
+        out.append(
+            {
+                "rid": req.rid,
+                "state": "waiting",
+                "output_len": len(req.output_ids),
+            }
+        )
+    running = getattr(scheduler, "running_batch", None)
+    if running is not None:
+        for req in list(running.reqs):
+            out.append(
+                {
+                    "rid": req.rid,
+                    "state": "running",
+                    "output_len": len(req.output_ids),
+                }
+            )
+    return out
+
+
+def _handle_pseudo_pause(scheduler: "Scheduler") -> Dict[str, bool]:
+    """Set ``_engine_paused`` so the event loop spins on recv only."""
+    scheduler._engine_paused = True
+    return {"paused": True}
+
+
+def _handle_pseudo_resume(scheduler: "Scheduler") -> Dict[str, bool]:
+    """Clear ``_engine_paused``; harness uses this after step batches."""
+    scheduler._engine_paused = False
+    return {"paused": False}
+
+
+_HARNESS_IPC_HANDLERS: Dict[str, Any] = {
+    "_pseudo_step": _handle_pseudo_step,
+    "_pseudo_force_preempt": _handle_pseudo_force_preempt,
+    "_pseudo_pull_violations": _handle_pseudo_pull_violations,
+    "_pseudo_allocator_stats": _handle_pseudo_allocator_stats,
+    "_pseudo_active_reqs": _handle_pseudo_active_reqs,
+    "_pseudo_pause": _handle_pseudo_pause,
+    "_pseudo_resume": _handle_pseudo_resume,
+}
+
+
 # Re-export for tests; the public surface is the one-call install above.
-__all__ = ["install_on_model_runner"]
+__all__ = [
+    "install_on_model_runner",
+    "install_harness_ipc_handlers",
+    "decode_harness_ipc_payload",
+]

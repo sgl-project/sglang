@@ -697,7 +697,10 @@ class Scheduler(
         scheduler-bound hooks atop the existing model_runner-bound
         ones.
         """
-        from sglang.srt.pseudo_mode.install import install_on_model_runner
+        from sglang.srt.pseudo_mode.install import (
+            install_harness_ipc_handlers,
+            install_on_model_runner,
+        )
 
         model_runner = self.tp_worker.model_runner
         oracle = getattr(model_runner, "pseudo_oracle", None)
@@ -710,6 +713,10 @@ class Scheduler(
         install_on_model_runner(
             model_runner=model_runner, oracle=oracle, scheduler=self
         )
+        # Harness IPC handlers (``_pseudo_*`` methods) are no-ops in
+        # production — they only fire when a test harness sends matching
+        # RpcReqInput messages.
+        install_harness_ipc_handlers(scheduler=self)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
