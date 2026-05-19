@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import is_sm120_supported
 
-_is_sm120 = is_cuda() and is_sm120_supported()
+_is_sm120 = is_sm120_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

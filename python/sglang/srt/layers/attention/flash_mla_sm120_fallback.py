@@ -21,13 +21,11 @@ import os
 
 import torch
 
-from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = torch.cuda.is_available() and not is_hip()
-_is_sm120 = _is_cuda and is_sm120_supported()
+_is_sm120 = is_sm120_supported()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_sm120 = _is_cuda and is_sm120_supported()
+_is_sm120 = is_sm120_supported()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
