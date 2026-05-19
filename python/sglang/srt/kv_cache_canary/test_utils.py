@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
-from sglang.srt.mem_cache.req_to_token_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
