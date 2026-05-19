@@ -53,7 +53,10 @@ class PseudoEngineConfig:
 
     model: str = "Qwen/Qwen3-0.6B"
     num_hidden_layers: int = 1
-    enable_overlap: bool = True
+    # The harness's _pseudo_step only mirrors event_loop_normal, not the
+    # overlap variant's deferred result_queue + pop_and_process. Until
+    # overlap-aware stepping lands, default off.
+    enable_overlap: bool = False
     speculative_algorithm: Optional[str] = None
     radix_cache: bool = False
     cuda_graph: bool = True
@@ -74,11 +77,17 @@ class PseudoReqHandle:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PseudoStepResult:
-    """One step's metadata, returned from :meth:`PseudoEngine.step`."""
+    """One step's metadata, returned from :meth:`PseudoEngine.step`.
+
+    ``canary_violations`` is the cumulative first-violation set across
+    every kind/runner since the engine launched, not a per-step delta.
+    Tests typically assert it is empty; if they need a per-step diff
+    they have to track the previous snapshot themselves.
+    """
 
     forward_mode: str
     active_rids: List[str]
-    canary_violations_this_step: List[CanaryViolationView]
+    canary_violations: List[CanaryViolationView]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -169,11 +178,21 @@ class PseudoEngine:
         """
         if self._engine is None:
             raise RuntimeError("PseudoEngine: not started")
+        if not prompt:
+            raise ValueError("PseudoEngine.admit: prompt must be non-empty")
+        if max_new_tokens < 1:
+            raise ValueError(
+                f"PseudoEngine.admit: max_new_tokens must be >= 1, got {max_new_tokens}"
+            )
+        if any(t < 0 for t in prompt):
+            raise ValueError(
+                "PseudoEngine.admit: prompt contains negative token ids"
+            )
         if eos_at is not None:
-            # v1: the oracle decides EOS placement from max_new_tokens.
-            # Passing an explicit ``eos_at`` is a future extension.
+            # The oracle decides EOS placement from max_new_tokens; an
+            # explicit ``eos_at`` is not yet wired through the IPC.
             logger.warning(
-                "PseudoEngine.admit: eos_at=%r ignored in v1 (oracle picks)",
+                "PseudoEngine.admit: eos_at=%r is not yet honoured (oracle picks)",
                 eos_at,
             )
         rid = req_id if req_id is not None else f"pseudo-{uuid.uuid4().hex[:12]}"
@@ -215,7 +234,7 @@ class PseudoEngine:
         return PseudoStepResult(
             forward_mode=str(payload.get("forward_mode", "idle")),
             active_rids=list(payload.get("active_rids", [])),
-            canary_violations_this_step=violations,
+            canary_violations=violations,
         )
 
     def step_until(
