@@ -2563,7 +2563,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.input_ids is not None and other.input_ids is not None:
+        if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
