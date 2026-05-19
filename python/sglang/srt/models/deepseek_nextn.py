@@ -161,9 +161,6 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -224,9 +221,6 @@ class DeepseekModelNextN(nn.Module):
                     torch.cuda.current_stream(),
                 )
 
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
         return hidden_states
 
 

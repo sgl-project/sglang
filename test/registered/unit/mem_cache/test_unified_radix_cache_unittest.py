@@ -1291,7 +1291,7 @@ class UnifiedRadixCacheSuite:
                 self._simulate_backup(tree, node)
             stack.extend(node.children.values())
 
-    def _init_hicache(self, tree):
+    def _init_hicache(self, tree, *, write_policy: str = "write_through"):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         orig_kv_host_pool = assembler.MHATokenToKVPoolHost
@@ -1325,7 +1325,7 @@ class UnifiedRadixCacheSuite:
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
-            hicache_write_policy="write_through",
+            hicache_write_policy=write_policy,
         )
         set_global_server_args_for_scheduler(server_args)
         tree.init_hicache(server_args, tree.cache_init_params)
@@ -2430,6 +2430,46 @@ class UnifiedRadixCacheSuite:
         # Verify D-leaf / H-leaf mutual exclusion
         overlap = tree.evictable_device_leaves & tree.evictable_host_leaves
         self.assertEqual(len(overlap), 0)
+
+    def test_hicache_write_back_leaf_backup(self):
+        """write_back: evicting a device leaf backs it up to host"""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+
+        base = self._make_seq(1, 2)
+        leaf_seq = base + self._make_seq(500, 2)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf_seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(leaf_seq)))
+        leaf = m.last_device_node
+        parent = leaf.parent
+        self.assertIsNot(parent, tree.root_node)
+
+        self.assertFalse(leaf.backuped)
+        self.assertFalse(parent.backuped)
+
+        lr = tree.inc_lock_ref(parent)
+        try:
+            evict_tokens = len(leaf_seq) - len(base)
+            tree.evict(EvictParams(num_tokens=evict_tokens))
+        finally:
+            tree.dec_lock_ref(
+                parent,
+                DecLockRefParams(
+                    swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)
+                ),
+            )
+
+        self.assertTrue(leaf.evicted, "leaf should be demoted to host")
+        self.assertTrue(leaf.backuped, "write_back must back up the leaf on eviction")
+        self.assertFalse(
+            parent.backuped, "parent must NOT be backed up under write_back"
+        )
+
+        tree.sanity_check()
 
 
 _CONFIGS: list[CacheConfig] = [
