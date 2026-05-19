@@ -1,8 +1,81 @@
 # Operator Performance Optimizing Guidance
 
-::::{toctree}
-:caption: Operator Performance Optimizing Guidance
-:maxdepth: 1
-performance_benchmark
-optimization
-::::
+# performance_benchmark
+
+## Obtaining Performance Data
+
+Before optimizing the performance, you need to obtain accurate performance data, understand the current performance status, and analyze the next optimization direction based on the performance status. MindStudio provides multiple methods for testing the performance of Triton operators, including profiling on the board and single-operator performance simulation pipeline.
+
+### Network
+'''
+import torch
+import torch_npu
+
+experimental_config = torch_npu.profiler._ExperimentalConfig(
+    export_type=[
+        torch_npu.profiler.ExportType.Text
+        ],
+    profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+    mstx=False,
+    mstx_domain_include=[],
+    mstx_domain_exclude=[],
+    aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+    l2_cache=False,
+    op_attr=False,
+    data_simplification=False,
+    record_op_args=False,
+    gc_detect_threshold=None,
+    host_sys=[
+        torch_npu.profiler.HostSystem.CPU,
+        torch_npu.profiler.HostSystem.MEM],
+    sys_io=False,
+    sys_interconnection=False
+)
+
+with torch_npu.profiler.profile(
+    activities=[
+        torch_npu.profiler.ProfilerActivity.CPU,
+        torch_npu.profiler.ProfilerActivity.NPU
+        ],
+    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=1),
+    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=False,
+    with_modules=False,
+    with_flops=False,
+    experimental_config=experimental_config) as prof:
+
+    for step in range(steps):
+        train_one_step(step, steps, train_loader, model, optimizer, criterion)
+        prof.step()
+'''
+Refer to the function event_loop_overlap of this document https://github.com/sgl-project/sglang/blob/ifmn/eagle-dp-attn/python/sglang/srt/managers/scheduler.py to revise the same function in scheduler.py
+
+
+### Device-end
+The msProf tool is used to collect and analyze key performance indicators of operators running on the Ascend AI Processor. You can use the output performance data to quickly locate the software and hardware performance bottlenecks of operators and improve the efficiency of operator performance analysis.
+
+msprof op --kernel-name=xxxxx python3 test_xxxxx.py
+
+Name	Type	OP State	Accelerator Core	Start Time(us)	Duration(us)	Wait Time(us)	Block Dim	Mix Block Dim	HF32 Eligible	Input Shapes	Input Data Types	Input Formats	Output Shapes	Output Data Types	Output Formats	Context ID	aicore_time(us)	aic_total_cycles	aic_mac_time(us)	aic_mac_ratio	aic_scalar_time(us)	aic_scalar_ratio	aic_mte1_time(us)	aic_mte1_ratio	aic_mte2_time(us)	aic_mte2_ratio	aic_fixpipe_time(us)	aic_fixpipe_ratio	aic_icache_miss_rate	aiv_time(us)	aiv_total_cycles	aiv_vec_time(us)	aiv_vec_ratio	aiv_scalar_time(us)	aiv_scalar_ratio	aiv_mte2_time(us)	aiv_mte2_ratio	aiv_mte3_time(us)	aiv_mte3_ratio	aiv_icache_miss_rate	cube_utilization(%)
+DequantSwigluQuant_int32_high_performance_100000000	DequantSwigluQuant	static	AI_VECTOR_CORE	"1774489226717521.715	"	102.824	0	36	0	NO	"163840,1024;128,1024;163840;;;;128"	INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64	ND;ND;ND;NULL;NULL;NULL;ND	"163840,512;163840"	INT8;FLOAT	ND;ND	N/A	0	0	0	0	0	0	0	0	0	0	0	0	0	59.128	3512188	36.708	0.621	41.403	0.7	11.975	0.203	9.738	0.165	0.005	0
+
+
+
+The Task Duration field indicates the time consumed by each operator. You can sort the operators by Task Duration to find the operators that consume the most time, or sort the operators by Task Type to view the operators that consume the most time on the AI Core or AI CPU.
+
+For some operators, the execution time is too long. As a result, the metric data is inaccurate and no longer has reference value. Such data is set to N/A and is not displayed.
+
+Input Shapes set to an empty value indicates that when the format is "; ; ; ;", the current input is a scalar. Here, ";" serves as the separator for each dimension. The output dimension of the operator follows the same principle.
+
+Task Duration (us)
+Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
+Task Wait Time (us)
+Interval between the end time of the previous task and the start time of the current task. The unit is μs.
+Block Dim
+Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is l0, this field is not collected and is displayed as 0.
+
+
+# optimization
+
