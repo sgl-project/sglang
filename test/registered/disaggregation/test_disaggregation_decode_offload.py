@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 # Increasing estimated time since we run evaluation twice
 register_cuda_ci(
     est_time=600,
-    stage="stage-b",
+    stage="base-b",
     runner_config="2-gpu-large",
     disabled="Temporarily disable the flaky test.",
 )

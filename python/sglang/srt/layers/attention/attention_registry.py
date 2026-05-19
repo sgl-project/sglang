@@ -114,11 +114,24 @@ def create_nsa_backend(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
+    from sglang.srt.utils import is_hip
 
-    return DeepseekV4AttnBackend(runner)
+    if is_hip():
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        logger.info(
+            "Using DeepseekV4HipRadixBackend for compressed attention backend (HIP)."
+        )
+        return DeepseekV4HipRadixBackend(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
+        return DeepseekV4AttnBackend(runner)
 
 
 @register_attention_backend("triton")
