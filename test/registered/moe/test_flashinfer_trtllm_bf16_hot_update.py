@@ -51,16 +51,20 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         tp_size=1,
         tp_rank=0,
         use_weight_loader_fused=False,
+        intermediate_size=None,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
         from sglang.srt.layers.moe.token_dispatcher import standard
 
+        intermediate_size = intermediate_size or self.intermediate_size
         fm = fused_moe_layer
         std = standard
         with (
             patch.object(fm, "get_moe_expert_parallel_world_size", return_value=1),
             patch.object(fm, "get_moe_expert_parallel_rank", return_value=0),
-            patch.object(fm, "get_moe_tensor_parallel_world_size", return_value=tp_size),
+            patch.object(
+                fm, "get_moe_tensor_parallel_world_size", return_value=tp_size
+            ),
             patch.object(fm, "get_moe_tensor_parallel_rank", return_value=tp_rank),
             patch.object(std, "get_moe_expert_parallel_world_size", return_value=1),
             patch.object(std, "get_moe_expert_parallel_rank", return_value=0),
@@ -68,7 +72,7 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
             layer = FusedMoE(
                 num_experts=self.num_experts,
                 hidden_size=self.hidden_size,
-                intermediate_size=self.intermediate_size,
+                intermediate_size=intermediate_size,
                 layer_id=0,
                 top_k=1,
                 params_dtype=torch.bfloat16,
@@ -197,7 +201,7 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
                 torch.testing.assert_close(
                     layer.w13_weight[:, :per_rank_size, :],
                     full_w13[
-                        :, first_half_start : first_half_start + per_rank_size, :
+                        :, second_half_start : second_half_start + per_rank_size, :
                     ],
                 )
                 torch.testing.assert_close(
@@ -207,9 +211,76 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
                         :,
                     ],
                     full_w13[
-                        :, second_half_start : second_half_start + per_rank_size, :
+                        :, first_half_start : first_half_start + per_rank_size, :
                     ],
                 )
+
+    def test_tp_padded_load_uses_unpadded_source_shard(self):
+        tp_size = 8
+        tp_rank = 3
+        intermediate_size = 768
+        shard_size = intermediate_size // tp_size
+        padded_shard_size = 128
+        source_shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        layer = self._make_layer(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            intermediate_size=intermediate_size,
+        )
+
+        loaded = []
+        for expert_id in range(self.num_experts):
+            expert_offset = expert_id * 10
+            w1 = self._make_weight(
+                (intermediate_size, self.hidden_size), expert_offset + 1
+            )
+            w3 = self._make_weight(
+                (intermediate_size, self.hidden_size), expert_offset + 3
+            )
+            w2 = self._make_weight(
+                (self.hidden_size, intermediate_size), expert_offset + 2
+            )
+            self._load_expert(layer, expert_id, w1, w3, w2)
+            loaded.append((w1, w3, w2))
+
+        self.assertEqual(
+            tuple(layer.w13_weight.shape),
+            (self.num_experts, 2 * padded_shard_size, self.hidden_size),
+        )
+        self.assertEqual(
+            tuple(layer.w2_weight.shape),
+            (self.num_experts, self.hidden_size, padded_shard_size),
+        )
+
+        for expert_id, (w1, w3, w2) in enumerate(loaded):
+            self._assert_equal(
+                layer.w13_weight[expert_id, :shard_size, :], w3[source_shard, :]
+            )
+            self._assert_equal(
+                layer.w13_weight[
+                    expert_id,
+                    padded_shard_size : padded_shard_size + shard_size,
+                    :,
+                ],
+                w1[source_shard, :],
+            )
+            self._assert_equal(
+                layer.w2_weight[expert_id, :, :shard_size], w2[:, source_shard]
+            )
+            self._assert_equal(
+                layer.w13_weight[expert_id, shard_size:padded_shard_size, :], 0
+            )
+            self._assert_equal(
+                layer.w13_weight[
+                    expert_id,
+                    padded_shard_size + shard_size : 2 * padded_shard_size,
+                    :,
+                ],
+                0,
+            )
+            self._assert_equal(
+                layer.w2_weight[expert_id, :, shard_size:padded_shard_size], 0
+            )
 
 
 if __name__ == "__main__":
