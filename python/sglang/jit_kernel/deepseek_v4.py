@@ -1085,7 +1085,9 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def _dispatch_bf16_fp32_backend(
     x: torch.Tensor, y: torch.Tensor, *, algo: str
 ) -> torch.Tensor:
-    if algo == "cublas":
+    if _use_aiter:
+        return tgemm.mm(x, y, otype=torch.float32)
+    elif algo == "cublas":
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
     elif algo == "deep_gemm":
@@ -1094,8 +1096,7 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
-    elif _use_aiter:
-        return tgemm.mm(x, y, otype=torch.float32)
+
     else:
         return torch.nn.functional.linear(x.float(), y.float())
 

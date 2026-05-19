@@ -92,6 +92,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    is_gfx95_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -100,6 +102,29 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95_supported = is_gfx95_supported()
+
+if _use_aiter:
+    if _is_gfx95_supported:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+
+def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
+    x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
+        hidden_states,
+        weight,
+        eps,
+        inp2=None,
+        inp2_weight=None,
+        inp2_epsilon=None,
+        group_size=128,
+        dtype_quant=torch.float8_e4m3fn,
+        res1=None,
+        output_unquantized_inp1=True,
+    )
+    return x_quant, x_bf16
 
 
 if TYPE_CHECKING:
@@ -515,13 +540,23 @@ class MQALayer(nn.Module):
         else:
             q_lora, _ = self.wq_a(x)
             qkv_a = None
-        q_lora = self.q_norm(q_lora)
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
 
         if self.use_fused_qk_norm_rope:
-            q, _ = self.wq_b(q_lora)
+
+            if _is_gfx95_supported:
+                q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
+                    q_lora,
+                    self.q_norm.weight,
+                    self.q_norm.variance_epsilon,
+                )
+                q, _ = self.wq_b(q_for_wqb)
+            else:
+                q_lora = self.q_norm(q_lora)
+                q, _ = self.wq_b(q_lora)
+
             kv = qkv_a[..., self.q_lora_rank :] if qkv_a is not None else self.wkv(x)[0]
 
             from sglang.srt.layers.fused_qk_norm_rope_store import (
@@ -560,6 +595,7 @@ class MQALayer(nn.Module):
                     torch.cuda.current_stream(),
                 )
         else:
+            q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
             if use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
