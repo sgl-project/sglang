@@ -527,6 +527,7 @@ class SchedulerDecoupledSpecMixin:
         self: Scheduler,
         req: Req,
         token_pos: int,
+        mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
         """
         Restore the draft req's mamba state from the checkpoint 
@@ -557,8 +558,27 @@ class SchedulerDecoupledSpecMixin:
         slot_count = int(slots.numel())
         slot_offset = token_pos % slot_count
         checkpoint_slot = slots[slot_offset : slot_offset + 1]
-        mamba_pool = self.req_to_token_pool.mamba_pool
-        mamba_pool.copy_from(checkpoint_slot, req.mamba_pool_idx.unsqueeze(0))
+        restore_pair = (checkpoint_slot, req.mamba_pool_idx.unsqueeze(0))
+        mamba_restore_pairs.append(restore_pair)
+
+    def _flush_draft_mamba_checkpoint_restores(
+        self: Scheduler,
+        mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        if not mamba_restore_pairs:
+            return
+
+        latest_by_dst: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for src_idx, dst_idx in mamba_restore_pairs:
+            dst_slot = int(dst_idx.reshape(-1)[0].item())
+            latest_by_dst[dst_slot] = (src_idx, dst_idx)
+
+        src_indices = [pair[0] for pair in latest_by_dst.values()]
+        dst_indices = [pair[1] for pair in latest_by_dst.values()]
+        self.req_to_token_pool.mamba_pool.copy_from(
+            torch.cat(src_indices), torch.cat(dst_indices)
+        )
+        mamba_restore_pairs.clear()
 
     def apply_verify_commit(
         self: Scheduler,
@@ -567,6 +587,7 @@ class SchedulerDecoupledSpecMixin:
         *,
         batch: Optional[ScheduleBatch] = None,
         req_batch_idx: Optional[int] = None,
+        mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
         """
         apply the verify result (pre_verify_committed_len, bonus_token_pos,
@@ -699,7 +720,9 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
 
-        self._restore_draft_mamba_checkpoint(req, bonus_token_pos)
+        self._restore_draft_mamba_checkpoint(
+            req, bonus_token_pos, mamba_restore_pairs
+        )
 
         if removed > 0:
             if req.grammar is not None:
@@ -944,34 +967,38 @@ class SchedulerDecoupledSpecMixin:
                     return batch, req_batch_idx
         return None, None
 
-    def _apply_pending_verify_commits_for_state(
-        self: Scheduler,
-        state: DraftReqState,
-    ) -> list[VerifyCommit]:
-        req = state.req
-        if (
-            req is None
-            or state.pending_close is not None
-            or req.req_pool_idx is None
-            or req.kv_committed_freed
-        ):
-            return []
 
+    def _apply_pending_verify_commits(self: Scheduler) -> list[VerifyCommit]:
+        mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         applied_commits: list[VerifyCommit] = []
-        while state.pending_verify_commits:
-            verify_commit = state.pending_verify_commits[0]
-            if int(verify_commit.bonus_token_pos) >= len(req.output_ids):
-                # the draft request has not materialized the bonus token position for this VerifyCommit
-                break
-            state.pending_verify_commits.popleft()
-            batch, req_batch_idx = self._find_draft_req_batch(req)
-            self.apply_verify_commit(
-                req,
-                verify_commit,
-                batch=batch,
-                req_batch_idx=req_batch_idx,
-            )
-            applied_commits.append(verify_commit)
+
+        for state in list(self.draft_req_table.values()):
+            req = state.req
+            if (
+                req is None
+                or state.pending_close is not None
+                or req.req_pool_idx is None
+                or req.kv_committed_freed
+            ):
+                continue
+
+            while state.pending_verify_commits:
+                verify_commit = state.pending_verify_commits[0]
+                if int(verify_commit.bonus_token_pos) >= len(req.output_ids):
+                    # The draft request has not materialized the bonus token position.
+                    break
+                state.pending_verify_commits.popleft()
+                batch, req_batch_idx = self._find_draft_req_batch(req)
+                self.apply_verify_commit(
+                    req,
+                    verify_commit,
+                    batch=batch,
+                    req_batch_idx=req_batch_idx,
+                    mamba_restore_pairs=mamba_restore_pairs,
+                )
+                applied_commits.append(verify_commit)
+
+        self._flush_draft_mamba_checkpoint_restores(mamba_restore_pairs)
         return applied_commits
 
     def _handle_draft_sync_message(
@@ -996,12 +1023,11 @@ class SchedulerDecoupledSpecMixin:
     def _handle_draft_verify_commit_message(
         self: Scheduler,
         message: VerifyCommit,
-    ) -> list[VerifyCommit]:
+    ) -> None:
         entry = self._get_or_create_draft_state(message.draft_key)
         if entry.pending_close is not None:
-            return []
+            return
         entry.pending_verify_commits.append(message)
-        return self._apply_pending_verify_commits_for_state(entry)
 
     def _handle_draft_close_message(self: Scheduler, message: DraftClose) -> None:
         entry = self.draft_req_table.get(message.draft_key)
@@ -1044,13 +1070,6 @@ class SchedulerDecoupledSpecMixin:
         num_created_reqs = 0
         num_applied_commit = 0
 
-        # First apply verifier commits that were deferred in earlier loops. A
-        # previous prefill/decode result may have materialized their bonus token.
-        for state in list(self.draft_req_table.values()):
-            num_applied_commit += len(
-                self._apply_pending_verify_commits_for_state(state)
-            )
-
         closed_keys: set[DraftReqKey] = set()
         for message in messages:
             draft_key = message.draft_key
@@ -1070,16 +1089,12 @@ class SchedulerDecoupledSpecMixin:
                     num_created_reqs += 1
             elif isinstance(message, VerifyCommit):
                 num_commit += 1
-                num_applied_commit += len(
-                    self._handle_draft_verify_commit_message(message)
-                )
+                self._handle_draft_verify_commit_message(message)
 
-        # A new DraftSync can attach a request to commits that arrived before
-        # the sync, so scan once more after all new controls are handled.
-        for state in list(self.draft_req_table.values()):
-            num_applied_commit += len(
-                self._apply_pending_verify_commits_for_state(state)
-            )
+        # Apply ready commits after all control messages are tabled. This covers
+        # both newly queued commits and commits materialized by the previous
+        # prefill/decode result.
+        num_applied_commit += len(self._apply_pending_verify_commits())
 
         if not messages and num_applied_commit == 0:
             return None
