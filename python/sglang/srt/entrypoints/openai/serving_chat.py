@@ -368,7 +368,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # OpenAI's own API rejects response_format + active tool calling.
         _active_tool_calling = request.tools and request.tool_choice != "none"
         if _active_tool_calling:
-            rf_type = getattr(request.response_format, "type", None)
+            rf_type = (
+                getattr(request.response_format, "type", None)
+                if request.response_format
+                else None
+            )
             if rf_type in ("json_schema", "json_object"):
                 return (
                     "response_format with type 'json_schema' or 'json_object' is "
