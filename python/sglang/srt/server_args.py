@@ -1658,7 +1658,7 @@ class ServerArgs:
         # suggest them to be explicit about kv_cache_dtype to avoid surprises
         if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
             logger.warning(
-                "When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                "When specifying --dsa-prefill-backend or --dsa-decode-backend, "
                 "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
@@ -1721,7 +1721,7 @@ class ServerArgs:
                     self.dsa_decode_backend = "fa3"
 
         logger.warning(
-            f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
+            f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )
 
     def _handle_model_specific_adjustments(self):
@@ -1822,7 +1822,7 @@ class ServerArgs:
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                         )
                     else:
-                        # Pure TP and partial DP Attention mode is active for NSA, logging a warning
+                        # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if self.dp_size < self.tp_size:
                             logger.warning(
                                 f"DSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
@@ -1830,7 +1830,7 @@ class ServerArgs:
                             )
 
                     # Deferred import to avoid a circular import at module-load
-                    # time (nsa.utils imports get_global_server_args).
+                    # time (dsa.utils imports get_global_server_args).
                     from sglang.srt.layers.attention.dsa.utils import (
                         aiter_can_use_preshuffle_paged_mqa,
                     )
@@ -1858,7 +1858,7 @@ class ServerArgs:
                 if self.enable_dsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1

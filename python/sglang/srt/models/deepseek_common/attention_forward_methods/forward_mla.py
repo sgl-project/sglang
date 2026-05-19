@@ -124,7 +124,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMLAForwardMixin:
-
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
@@ -281,9 +280,13 @@ class DeepseekMLAForwardMixin:
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
+            (
+                q_nope_val,
+                q_nope_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
             )
@@ -545,10 +548,14 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
-            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1)
-                )
+            (
+                attn_output_val,
+                attn_output_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                attn_output.transpose(0, 1)
             )
             attn_bmm_output = attn_output.new_empty(
                 (self.num_local_heads, aligned_m, self.v_head_dim)
@@ -683,7 +690,7 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
-        if self.current_attention_backend == "nsa":
+        if self.current_attention_backend in ("dsa", "nsa"):
             return (
                 get_global_server_args().dsa_decode_backend == "trtllm"
                 or get_global_server_args().dsa_prefill_backend == "trtllm"
@@ -705,7 +712,7 @@ class DeepseekMLAForwardMixin:
         server_args = get_global_server_args()
         return (
             _use_aiter_gfx95
-            and self.current_attention_backend == "nsa"
+            and self.current_attention_backend in ("dsa", "nsa")
             and (
                 server_args.dsa_decode_backend == "tilelang"
                 or server_args.dsa_prefill_backend == "tilelang"

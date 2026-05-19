@@ -90,6 +90,6 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         if backend is not None and backend not in allowed_backends:
             raise ValueError(
                 f"HiSparse with --kv-cache-dtype={server_args.kv_cache_dtype} requires "
-                f"--nsa-{label}-backend in {sorted(allowed_backends)}, "
+                f"--dsa-{label}-backend in {sorted(allowed_backends)}, "
                 f"but got {backend}."
             )

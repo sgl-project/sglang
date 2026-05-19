@@ -147,7 +147,7 @@ def handle_attention_aiter(attn, forward_batch):
         return AttnForwardMethod.MLA
 
 
-def handle_attention_nsa(attn, forward_batch):
+def handle_attention_dsa(attn, forward_batch):
     """
     Dispatch logic is centralized in DeepseekSparseAttnBackend.set_nsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
@@ -191,6 +191,9 @@ AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
-AttentionBackendRegistry.register("nsa", handle_attention_nsa)
+AttentionBackendRegistry.register("dsa", handle_attention_dsa)
+AttentionBackendRegistry.register(
+    "nsa", handle_attention_dsa
+)  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)

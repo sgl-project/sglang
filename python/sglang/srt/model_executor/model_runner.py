@@ -246,7 +246,8 @@ MLA_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "tokenspeed_mla",
     "ascend",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "intel_xpu",
 ]
 
