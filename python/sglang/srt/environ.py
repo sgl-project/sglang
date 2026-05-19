@@ -346,16 +346,6 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
-    # Route ratio-4/128 attention through the has_cmp_kv kernel path.
-    SGLANG_DSV4_NPU_SPARSE_ATTN = EnvBool(False)
-    # Log cmp_kv / cmp_block_table / cmp_sparse_indices per call (spammy).
-    SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG = EnvBool(False)
-    # Bisect-only: route just ratio=128 through _forward_compressed.
-    SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY = EnvBool(False)
-    # Diagnostic: c4 _forward_compressed with cmp_sparse_indices=None.
-    SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK = EnvBool(False)
-    # Drive the real npu_quant_lightning_indexer for c4 sparse selection.
-    SGLANG_DSV4_NPU_REAL_INDEXER = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
@@ -617,7 +607,6 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph

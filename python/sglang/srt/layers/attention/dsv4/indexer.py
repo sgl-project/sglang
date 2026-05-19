@@ -664,19 +664,6 @@ class C4Indexer(nn.Module):
         # compressor path — writes c4 indexer compress kv + state on NPU.
         self.compressor(x, forward_batch)
 
-        # Sentinel gate: when SGLANG_DSV4_NPU_REAL_INDEXER is OFF, NPU returns
-        # the -1 sentinel so callers stay on the dense-equivalent path. When
-        # ON, fall through to `_forward_npu_fused` (real npu_quant_lightning_
-        # indexer).
-        if _is_npu and not envs.SGLANG_DSV4_NPU_REAL_INDEXER.get():
-            T = bs
-            return torch.full(
-                (T, self.index_topk),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-
         # Prefer the fused int8 lightning indexer when the indexer KV is
         # quantized.
         li_kv_dtype = getattr(self.compressor, "li_kv_dtype", "bf16")
@@ -807,36 +794,6 @@ class C4Indexer(nn.Module):
             sparse_count=self.index_topk,
             metadata=li_quant_metadata,
         )
-        if envs.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
-            import logging as _logging
-            _lg = _logging.getLogger("v4-indexer-dbg")
-            asq = kwargs["actual_seq_lengths_query"]
-            ask = kwargs["actual_seq_lengths_key"]
-            bt = kwargs["block_table"]
-            _lg.warning(
-                "[V4-NPU-indexer-dbg] layer=%d "
-                "q.shape=%s q.dtype=%s "
-                "k.shape=%s k.dtype=%s "
-                "k_scale.shape=%s k_scale.dtype=%s "
-                "weights.shape=%s "
-                "q_scale.shape=%s "
-                "actual_seq_q=%s asq.dtype=%s "
-                "actual_seq_kv=%s ask.dtype=%s "
-                "block_table.shape=%s bt.dtype=%s bt.range=[%s,%s] "
-                "index_topk=%d",
-                self.layer_id,
-                tuple(kwargs["query"].shape), kwargs["query"].dtype,
-                tuple(kwargs["key"].shape), kwargs["key"].dtype,
-                tuple(kwargs["key_dequant_scale"].shape), kwargs["key_dequant_scale"].dtype,
-                tuple(kwargs["weights"].shape),
-                tuple(kwargs["query_dequant_scale"].shape),
-                asq.tolist() if asq.numel() < 32 else "(too long)", asq.dtype,
-                ask.tolist() if ask.numel() < 32 else "(too long)", ask.dtype,
-                tuple(bt.shape), bt.dtype,
-                int(bt.min().item()) if bt.numel() else "(empty)",
-                int(bt.max().item()) if bt.numel() else "(empty)",
-                self.index_topk,
-            )
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
         return topk_idxs.view(-1, self.index_topk)
 

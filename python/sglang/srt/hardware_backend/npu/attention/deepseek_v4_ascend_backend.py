@@ -457,30 +457,22 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        # Honor the save_kv_cache=True contract. With SGLANG_OPT_USE_OVERLAP_STORE_CACHE
-        # (default TRUE), MQALayer._forward_prepare already writes K via store_cache
-        # and passes save_kv_cache=False here, so we skip the dup-write. With
-        # overlap=False, save_kv_cache=True is the only writer for swa_kv_pool
-        # and must run, otherwise decode reads an unwritten buffer.
+        # Honor the save_kv_cache flag. MQALayer._forward_prepare already
+        # writes K via store_cache on the compressor stream and passes
+        # save_kv_cache=False here, so the dup-write is skipped by default;
+        # any caller still passing True (e.g. a non-overlap path) gets the
+        # write so decode never reads an unwritten swa_kv_pool.
         if save_kv_cache:
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        # ratio 4 / 128 routing gated by SGLANG_DSV4_NPU_SPARSE_ATTN. When OFF
-        # we fall back to dense SWA (matches the bit-for-bit baseline); when
-        # ON we route through _forward_compressed (has_cmp_kv kernel path).
-        sparse_on = envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get()
-        c128_only = envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
-        # Bisect mode: only c128 layers route to _forward_compressed.
-        if c128_only and compress_ratio != 128:
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
-        if sparse_on or c128_only:
-            return self._forward_compressed(
-                q, layer, forward_batch, attn_sink, compress_ratio
-            )
-        return self._forward_dense(q, layer, forward_batch, attn_sink)
+        # ratio 4 / 128: sparse compressed-KV path via npu_sparse_attn_sharedkv
+        # with has_cmp_kv=True.
+        return self._forward_compressed(
+            q, layer, forward_batch, attn_sink, compress_ratio
+        )
 
     def _forward_dense(
         self,
@@ -525,8 +517,7 @@ class DeepseekV4AscendAttnBackend(
         attention via npu_sparse_attn_sharedkv with has_cmp_kv=True. cmp_kv
         comes from the c4 / c128 pool (populated by the compressor) and
         cmp_sparse_indices for c4 comes from forward_metadata.c4_topk_indices
-        (populated by the lightning indexer when SGLANG_DSV4_NPU_REAL_INDEXER=1;
-        -1 sentinel otherwise).
+        (populated by the lightning indexer).
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
@@ -596,18 +587,10 @@ class DeepseekV4AscendAttnBackend(
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
         )
-        # Step-5c diagnosis: route c4 with cmp_sparse_indices=None (= same
-        # treatment as c128) when SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK is set.
-        # This bypasses the -1 sentinel topk path that was used to "mask"
-        # all c4 history, and instead lets the kernel use the entire
-        # populated c4 history (up to seqused_kv // ratio compressed
-        # tokens). If output stabilizes after this, the divergence we see
-        # in step-5c is due to the kernel mis-handling -1 in the c4 sparse
-        # indices tensor, not due to slab/cmp_kv layout. If output still
-        # diverges from dense baseline, the issue is in compressor write
-        # values (ape/wkv split) or in lingering pool state.
-
-        if compress_ratio == 4 and not envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
+        # c4 attention reads the top-k compressed indices produced by the
+        # lightning indexer; c128 uses cmp_sparse_indices=None and lets the
+        # kernel read the full populated c128 history.
+        if compress_ratio == 4:
             topk = fm.c4_topk_indices
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
@@ -675,10 +658,10 @@ class DeepseekV4AscendAttnBackend(
     ) -> None:
         """Populate ``forward_metadata.c4_topk_indices`` for c4 sparse attention.
 
-        When SGLANG_DSV4_NPU_REAL_INDEXER=1, ``C4Indexer.forward_npu`` runs the
-        npu_quant_lightning_indexer and writes the real top-k indices itself;
-        we just seed the -1 sentinel so ``_forward_compressed`` reads a well-
-        shaped tensor on the OFF path or on idle ranks.
+        ``C4Indexer.forward_npu`` runs the npu_quant_lightning_indexer and
+        writes the real top-k indices itself; we seed the -1 sentinel here
+        so ``_forward_compressed`` reads a well-shaped tensor on idle ranks
+        (where forward_npu is short-circuited).
         """
         if forward_batch.forward_mode.is_idle():
             return

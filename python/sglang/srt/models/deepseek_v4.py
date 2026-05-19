@@ -435,7 +435,6 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
@@ -544,12 +543,11 @@ class MQALayer(nn.Module):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             kv = self._compute_kv(x, positions, qkv_a=qkv_a)
-            if self.overlap_store_cache:
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
 
         del qkv_a
 
@@ -629,12 +627,11 @@ class MQALayer(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        if self.overlap_store_cache:
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
-            )
+        attn_backend.store_cache(
+            layer_id=self.layer_id,
+            swa_k=kv,
+            forward_batch=forward_batch,
+        )
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -698,7 +695,7 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not self.overlap_store_cache,
+            save_kv_cache=False,
         )
         o = o[:, tp_slice, :]
         if _is_npu:
