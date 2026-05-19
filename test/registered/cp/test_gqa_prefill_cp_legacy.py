@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -18,6 +20,7 @@ GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 GSM8K_BASELINE_ACCURACY = 0.93
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGQACP2TP2EP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -75,6 +78,7 @@ class TestGQACP2TP2EP2(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGQACPTP2CP2EP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
