@@ -115,12 +115,12 @@ struct CanaryParams {
   int32_t real_kv_hash_mode;
 };
 
-__device__ inline int64_t load_field(const uint8_t* buf, int64_t slot_idx, int64_t stride, int field) {
+SGL_DEVICE int64_t load_field(const uint8_t* buf, int64_t slot_idx, int64_t stride, int field) {
   const int64_t* p = reinterpret_cast<const int64_t*>(buf + slot_idx * stride);
   return p[field];
 }
 
-__device__ inline void store_field(uint8_t* buf, int64_t slot_idx, int64_t stride, int field, int64_t value) {
+SGL_DEVICE void store_field(uint8_t* buf, int64_t slot_idx, int64_t stride, int field, int64_t value) {
   int64_t* p = reinterpret_cast<int64_t*>(buf + slot_idx * stride);
   p[field] = value;
 }
@@ -129,13 +129,13 @@ __device__ inline void store_field(uint8_t* buf, int64_t slot_idx, int64_t strid
 // mirror in ``jit_kernel/kv_cache_canary_ref.py``;
 // ``test_splitmix64_consistency.py`` cross-validates the two
 // implementations.
-__device__ inline uint64_t splitmix64_finalize(uint64_t x) {
+SGL_DEVICE uint64_t splitmix64_finalize(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
   return x ^ (x >> 31);
 }
 
-__device__ inline uint64_t splitmix64_mix(uint64_t prev_hash, uint64_t token_id, uint64_t position) {
+SGL_DEVICE uint64_t splitmix64_mix(uint64_t prev_hash, uint64_t token_id, uint64_t position) {
   return splitmix64_finalize(prev_hash ^ token_id ^ position);
 }
 
@@ -144,7 +144,7 @@ __device__ inline uint64_t splitmix64_mix(uint64_t prev_hash, uint64_t token_id,
 // when the feature is disabled (mode == OFF) or when no buffer/byte budget is
 // configured. Bit-exact reference lives in ``_RealKvView.hash_slot`` in
 // ``jit_kernel/kv_cache_canary.py``.
-__device__ inline uint64_t compute_real_kv_hash(const CanaryParams& p, int64_t slot_idx) {
+SGL_DEVICE uint64_t compute_real_kv_hash(const CanaryParams& p, int64_t slot_idx) {
   if (p.real_kv_hash_mode == kRealKvHashModeOff || p.real_kv_buf == nullptr || p.real_kv_read_bytes <= 0 ||
       p.real_kv_slot_stride_bytes <= 0) {
     return 0ULL;
@@ -168,7 +168,7 @@ __device__ inline uint64_t compute_real_kv_hash(const CanaryParams& p, int64_t s
   return acc;
 }
 
-__device__ inline void record_violation(
+SGL_DEVICE void record_violation(
     const CanaryParams& p,
     int32_t fail_reason,
     int64_t slot_idx,
@@ -230,7 +230,7 @@ __device__ inline void record_violation(
   atomicOr(reinterpret_cast<unsigned int*>(p.is_errored), 1u);
 }
 
-__device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
+SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   if (p.verify_active_mask[tid] == 0) {
     return;
   }
@@ -289,7 +289,7 @@ __device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
 }
 
-__device__ inline void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
+SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
   if (p.write_req_active_mask[req_tid] == 0) {
     return;
   }
