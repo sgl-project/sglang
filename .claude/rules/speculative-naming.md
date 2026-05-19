@@ -12,14 +12,14 @@ Use the verb form `accept` everywhere. Don't use the past-participle form `accep
 | `accepted_indices` | `accept_indices` |
 | `accepted_token_ids` | `accept_tokens` (also see Rule 3) |
 
-## Rule 2 — The extra/bonus token is `bonus_token`
+## Rule 2 — The extra/bonus token is `bonus_token` / `bonus_tokens`
 
-The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Always call it `bonus_token`.
+The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Use `bonus_token` / `bonus_tokens` per Rule 7.
 
 | Don't | Do |
 |---|---|
-| `verified_id` | `bonus_token` |
-| `output_id` (when referring to the bonus) | `bonus_token` |
+| `verified_id` / `verified_ids` | `bonus_token` / `bonus_tokens` |
+| `output_id` / `output_ids` (when referring to the bonus) | `bonus_token` / `bonus_tokens` |
 
 `req.output_ids` (the full output history of a request) is unrelated and stays as is.
 
@@ -63,17 +63,7 @@ Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`
 | **Rate / ratio** | `X_rate` | Fractional value in `[0, 1]` | `accept_rate` |
 | **Tokens / content array** | no prefix | The actual token data, not a count | `accept_tokens`, `correct_drafts`, `bonus_token` |
 
-## Rule 5 — Avoid `length` / `lens` internally
-
-Internal code uses `num_X` for counts (Rule 4), not `length` / `lens`.
-
-The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Outside kernel signatures, never write `accept_lens` / `accepted_length` / `commit_lens`.
-
-### Exception: Triton kernel signatures
-
-Triton kernel parameters (and their inner scalar loads) may use `_lens` / `_len` to align with the broader PyTorch ecosystem (`seq_lens`, `cu_seqlens_q`). Example: `accept_lens` (kernel param, `[bs]`) and `accept_len = tl.load(accept_lens + pid)` (scalar inside kernel) are OK. The wrapping Python code that calls the kernel still uses `num_accept_tokens`.
-
-## Rule 6 — Drop redundant `_token_id` / `_token_ids` suffix in spec scope
+## Rule 5 — Drop redundant `_token_id` / `_token_ids` suffix in spec scope
 
 `_id` / `_ids` and `_token` / `_tokens` are both fine. But don't combine — `_token_id` / `_token_ids` is redundant **inside spec decoding**, because spec code only ever deals with vocab integers.
 
@@ -93,15 +83,17 @@ The semantic differs by scope:
 | `out_token_ids` | `out_tokens` |
 | `_resolve_spec_overlap_token_ids` | `_resolve_spec_overlap_tokens` |
 
-## Rule 7 — Singular vs plural
+## Rule 6 — Singular vs plural
 
-Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.). The fixed name `bonus_token` (Rule 2) is the one singular exception even though its shape is `[bs]`.
+Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.).
 
 ```python
 accept_tokens: torch.Tensor     # [total_accepted] flat - plural
 accept_indices: torch.Tensor    # [bs, num_draft_tokens] - plural
 draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - plural
+bonus_tokens: torch.Tensor      # [bs] - plural
 accept_token = tl.load(...)     # int32 scalar in a kernel iteration - singular
+bonus_token = tl.load(...)      # int32 scalar inside a kernel - singular
 ```
 
 ## Out of scope (these names stay as is)
@@ -113,3 +105,4 @@ These rules apply to **spec-decoding-specific** identifiers. Pre-existing or fra
 - **Request-level state**: `req.input_ids`, `req.output_ids`, `req.origin_input_ids`, `next_token_ids` (`model_runner.sample` output)
 - **Frozen C++ kwargs**: `accept_token_num` (sgl-kernel)
 - **Non-token IDs**: `req_id`, `gpu_id`, `layer_id`, `program_id`
+- **`_len` / `_lens` names**: `num_X` is preferred for counts (Rule 4), but `_len` / `_lens` names are acceptable. Triton kernel params in particular often use `_lens` / `_len` to align with the PyTorch ecosystem (`seq_lens`, `cu_seqlens_q`). Rule 1 still requires the `-ed`-less form (`accept_length` OK, `accepted_length` not).
