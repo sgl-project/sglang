@@ -1,4 +1,5 @@
 import logging
+import warnings
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.linear_attn_model_registry import (
@@ -96,11 +97,22 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
-@register_attention_backend("nsa")
-def create_nsa_backend(runner):
+@register_attention_backend("dsa")
+def create_dsa_backend(runner):
     from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
     return NativeSparseAttnBackend(runner)
+
+
+@register_attention_backend("nsa")
+def create_nsa_backend(runner):
+    warnings.warn(
+        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
+        "The alias will be removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return create_dsa_backend(runner)
 
 
 @register_attention_backend("dsv4")
