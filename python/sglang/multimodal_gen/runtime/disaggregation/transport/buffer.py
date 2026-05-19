@@ -170,7 +170,7 @@ class TransferTensorBuffer:
         self,
         handle: SlotHandle,
         tensors: dict[str, torch.Tensor | list[torch.Tensor] | None],
-        stream: torch.npu.Stream | None = None,
+        stream: torch.get_device_module().Stream | None = None,
     ) -> dict[str, list[dict]]:
         """Batch-write GPU tensors into a slot. Returns a manifest for later reads."""
         manifest: dict[str, list[dict]] = {}
