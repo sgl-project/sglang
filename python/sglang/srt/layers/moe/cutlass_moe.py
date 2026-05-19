@@ -272,7 +272,7 @@ def cutlass_fused_experts_fp8(
     silu_and_mul(c1, intermediate)
 
     if use_mxfp8 and es_down:
-        intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
+        intermediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
         a2_scale = torch.empty(
             (max_blockscale, n // 32), dtype=torch.uint8, device=device
         )
@@ -281,16 +281,16 @@ def cutlass_fused_experts_fp8(
             problem_sizes2,
             expert_offsets[:-1],
             blockscale_offsets[:-1],
-            intemediate_q,
+            intermediate_q,
             a2_scale,
         )
     else:
-        intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+        intermediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
     if is_sm90_supported() and es_down:
         es_fp8_blockwise_scaled_grouped_mm(
             c2,
-            intemediate_q,
+            intermediate_q,
             w2_q,
             a2_scale,
             w2_scale,
@@ -304,7 +304,7 @@ def cutlass_fused_experts_fp8(
     elif use_mxfp8 and es_down:
         es_sm100_mxfp8_blockscaled_grouped_mm(
             c2,
-            intemediate_q,
+            intermediate_q,
             w2_q,
             a2_scale,
             w2_scale,
@@ -320,7 +320,7 @@ def cutlass_fused_experts_fp8(
             out_ptrs,
             a_scales_ptrs,
             b_scales_ptrs,
-            intemediate_q,
+            intermediate_q,
             w2_q,
             a2_scale,
             w2_scale,

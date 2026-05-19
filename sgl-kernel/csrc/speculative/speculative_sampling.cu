@@ -23,9 +23,9 @@ using namespace flashinfer;
 // accept_index: [bs, num_spec_step]
 // accept_token_num: [bs]
 // candidates: [bs, num_draft_tokens]
-// retrive_index: [bs, num_draft_tokens]
-// retrive_next_token: [bs, num_draft_tokens]
-// retrive_next_sibling: [bs, num_draft_tokens]
+// retrieve_index: [bs, num_draft_tokens]
+// retrieve_next_token: [bs, num_draft_tokens]
+// retrieve_next_sibling: [bs, num_draft_tokens]
 // uniform_samples: [bs, num_draft_tokens]
 // target_probs: [bs, num_draft_tokens, vocab_size]
 void tree_speculative_sampling_target_only(
@@ -33,9 +33,9 @@ void tree_speculative_sampling_target_only(
     at::Tensor accept_index,
     at::Tensor accept_token_num,  // mutable
     at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    at::Tensor retrieve_index,
+    at::Tensor retrieve_next_token,
+    at::Tensor retrieve_next_sibling,
     at::Tensor uniform_samples,
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
@@ -44,17 +44,17 @@ void tree_speculative_sampling_target_only(
     double threshold_acc,
     bool deterministic = true) {
   CHECK_INPUT(candidates);
-  CHECK_INPUT(retrive_index);
-  CHECK_INPUT(retrive_next_token);
-  CHECK_INPUT(retrive_next_sibling);
+  CHECK_INPUT(retrieve_index);
+  CHECK_INPUT(retrieve_next_token);
+  CHECK_INPUT(retrieve_next_sibling);
   CHECK_INPUT(uniform_samples);
   CHECK_INPUT(uniform_samples_for_final_sampling);
   CHECK_INPUT(target_probs);
   auto device = target_probs.device();
   CHECK_EQ(candidates.device(), device);
-  CHECK_EQ(retrive_index.device(), device);
-  CHECK_EQ(retrive_next_token.device(), device);
-  CHECK_EQ(retrive_next_sibling.device(), device);
+  CHECK_EQ(retrieve_index.device(), device);
+  CHECK_EQ(retrieve_next_token.device(), device);
+  CHECK_EQ(retrieve_next_sibling.device(), device);
   CHECK_EQ(uniform_samples.device(), device);
   CHECK_EQ(uniform_samples_for_final_sampling.device(), device);
   CHECK_EQ(target_probs.device(), device);
@@ -62,9 +62,9 @@ void tree_speculative_sampling_target_only(
   CHECK_DIM(2, accept_index);
   CHECK_DIM(1, accept_token_num);
   CHECK_DIM(2, candidates);
-  CHECK_DIM(2, retrive_index);
-  CHECK_DIM(2, retrive_next_token);
-  CHECK_DIM(2, retrive_next_sibling);
+  CHECK_DIM(2, retrieve_index);
+  CHECK_DIM(2, retrieve_next_token);
+  CHECK_DIM(2, retrieve_next_sibling);
   CHECK_DIM(2, uniform_samples);
   CHECK_DIM(3, target_probs);
   CHECK_DIM(3, draft_probs);
@@ -73,13 +73,13 @@ void tree_speculative_sampling_target_only(
   unsigned int num_draft_tokens = candidates.size(1);
   unsigned int vocab_size = target_probs.size(2);
   CHECK_EQ(batch_size, candidates.size(0));
-  CHECK_EQ(batch_size, retrive_index.size(0));
-  CHECK_EQ(batch_size, retrive_next_token.size(0));
-  CHECK_EQ(batch_size, retrive_next_sibling.size(0));
+  CHECK_EQ(batch_size, retrieve_index.size(0));
+  CHECK_EQ(batch_size, retrieve_next_token.size(0));
+  CHECK_EQ(batch_size, retrieve_next_sibling.size(0));
   CHECK_EQ(batch_size, target_probs.size(0));
-  CHECK_EQ(num_draft_tokens, retrive_index.size(1));
-  CHECK_EQ(num_draft_tokens, retrive_next_token.size(1));
-  CHECK_EQ(num_draft_tokens, retrive_next_sibling.size(1));
+  CHECK_EQ(num_draft_tokens, retrieve_index.size(1));
+  CHECK_EQ(num_draft_tokens, retrieve_next_token.size(1));
+  CHECK_EQ(num_draft_tokens, retrieve_next_sibling.size(1));
   CHECK_EQ(num_draft_tokens, uniform_samples.size(1));
   CHECK_EQ(num_draft_tokens, target_probs.size(1));
   CHECK_EQ(vocab_size, target_probs.size(2));
@@ -97,14 +97,14 @@ void tree_speculative_sampling_target_only(
   if (candidates.scalar_type() != at::kLong) {
     throw std::runtime_error("Expected 'candidates' to be of type long (torch.int64).");
   }
-  if (retrive_index.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_index' to be of type long (torch.int64).");
+  if (retrieve_index.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrieve_index' to be of type long (torch.int64).");
   }
-  if (retrive_next_token.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_next_token' to be of type long (torch.int64).");
+  if (retrieve_next_token.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrieve_next_token' to be of type long (torch.int64).");
   }
-  if (retrive_next_sibling.scalar_type() != at::kLong) {
-    throw std::runtime_error("Expected 'retrive_next_sibling' to be of type long (torch.int64).");
+  if (retrieve_next_sibling.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrieve_next_sibling' to be of type long (torch.int64).");
   }
   if (uniform_samples.scalar_type() != at::kFloat) {
     throw std::runtime_error("Expected 'uniform_samples' to be of type float (torch.float32).");
@@ -129,9 +129,9 @@ void tree_speculative_sampling_target_only(
       static_cast<int32_t*>(accept_index.data_ptr()),
       static_cast<int32_t*>(accept_token_num.data_ptr()),
       static_cast<int64_t*>(candidates.data_ptr()),
-      static_cast<int64_t*>(retrive_index.data_ptr()),
-      static_cast<int64_t*>(retrive_next_token.data_ptr()),
-      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<int64_t*>(retrieve_index.data_ptr()),
+      static_cast<int64_t*>(retrieve_next_token.data_ptr()),
+      static_cast<int64_t*>(retrieve_next_sibling.data_ptr()),
       static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()),

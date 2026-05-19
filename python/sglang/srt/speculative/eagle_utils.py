@@ -178,10 +178,9 @@ def verify_tree_greedy_func(
             accept_index=accept_index,  # mutable
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
 
@@ -193,10 +192,9 @@ def verify_tree_greedy_func(
             accept_index=accept_index,
             accept_token_num=accept_token_num,
             candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num

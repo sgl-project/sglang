@@ -107,8 +107,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
-            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
-            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
+            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrieve_next_token)
+            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -179,12 +179,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
-            bs_without_pad = spec_info.retrive_next_token.shape[0]
+            bs_without_pad = spec_info.retrieve_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_token
+                spec_info.retrieve_next_token
             )
             self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_sibling
+                spec_info.retrieve_next_sibling
             )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],

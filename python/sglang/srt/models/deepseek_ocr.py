@@ -1448,7 +1448,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
         if self.tile_tag == "2D":
             # <|view_separator|>, <|\n|>
-            self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
+            self.view_separator = nn.Parameter(torch.randn(n_embed) * embed_std)
             if not self.is_ocr2:
                 self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
         else:
@@ -1611,7 +1611,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         # Pixel_values (global view): [n_image, batch_size, 3, height, width]
         # images_spatial_crop: [n_image, batch_size, [num_tiles_w, num_tiles_h]]
-        # images_crop (local view): [n_image, batch_size, num_pathes, 3, h, w]
+        # images_crop (local view): [n_image, batch_size, num_paths, 3, h, w]
         # split the pixel and image_crop, all batch_size = 1
 
         images_in_this_batch = []
@@ -1640,13 +1640,13 @@ class DeepseekOCRForCausalLM(nn.Module):
                             [
                                 local_features,
                                 global_features,
-                                self.view_seperator[None, :],
+                                self.view_separator[None, :],
                             ],
                             dim=0,
                         )
                     else:
                         global_local_features = torch.cat(
-                            [global_features, self.view_seperator[None, :]], dim=0
+                            [global_features, self.view_separator[None, :]], dim=0
                         )
 
                     images_in_this_batch.append(global_local_features)
@@ -1667,12 +1667,12 @@ class DeepseekOCRForCausalLM(nn.Module):
                 if use_local_crops:
                     local_features = self._encode_ocr2_features(patches)
                     global_local_features = torch.cat(
-                        [local_features, global_features, self.view_seperator[None, :]],
+                        [local_features, global_features, self.view_separator[None, :]],
                         dim=0,
                     )
                 else:
                     global_local_features = torch.cat(
-                        [global_features, self.view_seperator[None, :]], dim=0
+                        [global_features, self.view_separator[None, :]], dim=0
                     )
 
                 images_in_this_batch.append(global_local_features)
@@ -1791,7 +1791,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                     or "vision_model" in name
                     or "qwen2_model" in name
                     or "sam_model" in name
-                    or "view_seperator" in name
+                    or "view_separator" in name
                 ):
                     name = name[len("model.") :]
                 elif not (

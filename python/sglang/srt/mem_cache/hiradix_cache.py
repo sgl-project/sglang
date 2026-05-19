@@ -985,10 +985,10 @@ class HiRadixCache(RadixCache):
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
-            ancester_node = node
+            ancestor_node = node
 
         # protect the ancestor nodes from eviction
-        result = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancestor_node)
         delta = result.delta
 
         # load it all or not at all
@@ -997,7 +997,7 @@ class HiRadixCache(RadixCache):
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
+            self.dec_lock_ref(ancestor_node)
             return None
 
         device_indices = self.cache_controller.load(
@@ -1012,7 +1012,7 @@ class HiRadixCache(RadixCache):
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
-        self.dec_lock_ref(ancester_node)
+        self.dec_lock_ref(ancestor_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
             logger.warning(
@@ -1286,8 +1286,8 @@ class HiRadixCache(RadixCache):
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            avaliable_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = avaliable_size - (avaliable_size % self.page_size)
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
                 new_input_tokens = new_input_tokens[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(

@@ -28,7 +28,7 @@ class NgramEmbedding(torch.nn.Module):
         self.over_embedding_k = over_embedding_k
         self.over_embedding_n = over_embedding_n
 
-        self.word_embeder = VocabParallelEmbedding(
+        self.word_embedder = VocabParallelEmbedding(
             num_embeddings,
             embedding_dim,
             enable_tp=is_dp_attention_enabled(),
@@ -45,7 +45,7 @@ class NgramEmbedding(torch.nn.Module):
                 self.exclusive_oe_embedder_size_sums[i]
                 + int(over_embedding_m + i * 2 + 1)
             )
-        self.oe_embeder = VocabParallelEmbedding(
+        self.oe_embedder = VocabParallelEmbedding(
             num_embeddings=self.exclusive_oe_embedder_size_sums[-1],
             embedding_dim=oe_hidden_dim,
             enable_tp=is_dp_attention_enabled(),
@@ -105,8 +105,8 @@ class NgramEmbedding(torch.nn.Module):
             assert (
                 oe_weight_end - oe_weight_start == loaded_weight.shape[0]
             ), f"{oe_weight_end - oe_weight_start=} {loaded_weight.shape[0]=}"
-            tp_start = self.oe_embeder.shard_indices.org_vocab_start_index
-            tp_end = self.oe_embeder.shard_indices.org_vocab_end_index
+            tp_start = self.oe_embedder.shard_indices.org_vocab_start_index
+            tp_end = self.oe_embedder.shard_indices.org_vocab_end_index
             to_load_start = max(oe_weight_start, tp_start)
             to_load_end = min(oe_weight_end, tp_end)
             if to_load_start < to_load_end:
@@ -114,7 +114,7 @@ class NgramEmbedding(torch.nn.Module):
                 src_end = to_load_end - oe_weight_start
                 dest_start = to_load_start - tp_start
                 dest_end = to_load_end - tp_start
-                self.oe_embeder.weight.data[dest_start:dest_end] = loaded_weight[
+                self.oe_embedder.weight.data[dest_start:dest_end] = loaded_weight[
                     src_start:src_end
                 ]
             else:
@@ -163,9 +163,9 @@ class NgramEmbedding(torch.nn.Module):
             dtype=self.oe_projection.dtype,
             device=input_ids.device,
         )
-        all_hidden_states[0] = self.word_embeder(input_ids)
+        all_hidden_states[0] = self.word_embedder(input_ids)
         # oe_hidden_states: [12, seq_len, hidden_dim / 12]
-        oe_hidden_states = self.oe_embeder(
+        oe_hidden_states = self.oe_embedder(
             self.oe_n_gram_ids[: len(input_ids)].permute(1, 0).contiguous()
         )
         torch.bmm(oe_hidden_states, self.oe_projection, out=all_hidden_states[1:])

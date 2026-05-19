@@ -39,7 +39,7 @@ class GSM8KAscendMixin(ABC):
         "USE_VLLM_CUSTOM_ALLREDUCE": "1",
         "HCCL_EXEC_TIMEOUT": "200",
         "STREAMS_PER_DEVICE": "32",
-        "SGLANG_ENBLE_TORCH_COMILE": "1",
+        "SGLANG_ENABLE_TORCH_COMPILE": "1",
         "AUTO_USE_UC_MEMORY": "0",
         "P2P_HCCL_BUFFSIZE": "20",
     }

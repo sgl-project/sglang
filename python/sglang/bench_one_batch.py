@@ -38,7 +38,7 @@ The capital of the United States is Washington, D.C.
 
 
 ========== Prompt 1 ==========
-<s> The capital of the United Kindom is London.
+<s> The capital of the United Kingdom is London.
 The capital of the United Kingdom is London.
 The capital of the
 
@@ -349,7 +349,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         if custom_prompts
         else [
             "The capital of France is",
-            "The capital of the United Kindom is",
+            "The capital of the United Kingdom is",
             "Today is a sunny day and I like",
         ]
     )

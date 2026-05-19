@@ -248,7 +248,7 @@ class MlxTpModelWorker(TpModelWorker):
           an extend batch).
         * ``mode`` — one of ``"idle"``, ``"decode"``, ``"extend"``.
 
-        The caller must make sure the returned pendings are fed into a
+        The caller must make sure the returned pending results are fed into a
         subsequent ``mx.async_eval`` or ``.item()`` / ``.tolist()`` call
         — :meth:`finalize_mlx_result` does that.
         """

@@ -138,7 +138,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.scheduler = scheduler
 
         self.vae_scale_factor = (
-            2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+            2 ** len(self.vae.temporal_downsample) if getattr(self, "vae", None) else 8
         )
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2

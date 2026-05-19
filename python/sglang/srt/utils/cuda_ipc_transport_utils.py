@@ -285,7 +285,7 @@ class CudaIpcTensorTransportProxy:
     A torch.tensor's proxy used to do inter-process data-sharing
     including:
 
-    torch.tensor(on gpu)'s cuda-ipc-hande infos
+    torch.tensor(on gpu)'s cuda-ipc-handle infos
     a shm sync buffer's meta data which is used to sync between different process
     """
 

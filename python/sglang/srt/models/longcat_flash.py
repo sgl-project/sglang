@@ -888,7 +888,7 @@ class LongcatFlashForCausalLM(nn.Module):
                     continue
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
-                        name = "model.embed_tokens.word_embeder.weight"
+                        name = "model.embed_tokens.word_embedder.weight"
                     if ".ngram_embeddings" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         continue

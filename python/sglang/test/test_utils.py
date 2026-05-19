@@ -1507,7 +1507,7 @@ def run_bench_one_batch(model, other_args):
     # Auto-detect device if needed
 
     device = auto_config_device()
-    print(f"Auto-configed device: {device}", flush=True)
+    print(f"Auto-configured device: {device}", flush=True)
     other_args += ["--device", str(device)]
 
     command = [
@@ -1820,7 +1820,7 @@ def run_mmlu_test(
     )
 
 
-def run_mulit_request_test(
+def run_multi_request_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
     enable_overlap=False,

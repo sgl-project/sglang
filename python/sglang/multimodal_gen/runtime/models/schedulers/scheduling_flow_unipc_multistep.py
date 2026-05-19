@@ -108,7 +108,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 )
 
         self.predict_x0 = predict_x0
-        # setable values
+        # settable values
         self.num_inference_steps: int | None = None
         alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps)[
             ::-1

@@ -28,9 +28,9 @@ struct std_vector_hash {
 
 struct TreeNode {
  public:
-  using childern_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
-  using iterator_t = typename childern_map_t::iterator;
-  using const_iterator_t = typename childern_map_t::const_iterator;
+  using children_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
+  using iterator_t = typename children_map_t::iterator;
+  using const_iterator_t = typename children_map_t::const_iterator;
   using timestamp_t = std::chrono::steady_clock::time_point;
 
   TreeNode(std::size_t node_id_)
@@ -238,7 +238,7 @@ struct TreeNode {
   at::Tensor m_device_indices;  // indices of device value
   at::Tensor m_host_indices;    // indices of host value
   TreeNode* m_parent;
-  childern_map_t m_children;
+  children_map_t m_children;
   timestamp_t m_last_access_time;
 
  public:

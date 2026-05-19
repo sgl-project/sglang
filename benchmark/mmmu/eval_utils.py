@@ -658,7 +658,7 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
             # print("Skipping {} for not found".format(category))
             continue
 
-        exampels_to_eval = []
+        examples_to_eval = []
         for data_id, parsed_pred in cat_outputs.items():
             question_type = cat_answers[data_id]["question_type"]
             if question_type != "multiple-choice":
@@ -668,7 +668,7 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
             else:
                 parsed_pred = parsed_pred
 
-            exampels_to_eval.append(
+            examples_to_eval.append(
                 {
                     "id": data_id,
                     "question_type": question_type,
@@ -677,8 +677,8 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
                 }
             )
 
-        judge_dict, metric_dict = evaluate(exampels_to_eval)
-        metric_dict.update({"num_example": len(exampels_to_eval)})
+        judge_dict, metric_dict = evaluate(examples_to_eval)
+        metric_dict.update({"num_example": len(examples_to_eval)})
         for key, value in judge_dict.items():
             output_dict[key]["judge"] = value
 

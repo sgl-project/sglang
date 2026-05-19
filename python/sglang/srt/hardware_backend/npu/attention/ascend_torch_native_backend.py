@@ -121,13 +121,13 @@ class AscendTorchNativeAttnBackend:
                     atten_end_kv = encoder_lens[seq_idx] + extend_seq_len_q
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
+            per_req_query_redundant = torch.empty(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
                 dtype=per_req_query.dtype,
                 device=per_req_query.device,
             )
 
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            per_req_query_redundant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -142,9 +142,9 @@ class AscendTorchNativeAttnBackend:
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
             if logit_cap > 0:
-                per_req_out_redudant = (
+                per_req_out_redundant = (
                     self.scaled_dot_product_attention_with_softcapping(
-                        per_req_query_redudant.unsqueeze(0),
+                        per_req_query_redundant.unsqueeze(0),
                         per_req_key.unsqueeze(0),
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
@@ -157,9 +157,9 @@ class AscendTorchNativeAttnBackend:
                     .movedim(query.dim() - 2, 0)
                 )
             else:
-                per_req_out_redudant = (
+                per_req_out_redundant = (
                     scaled_dot_product_attention(
-                        per_req_query_redudant.unsqueeze(0),
+                        per_req_query_redundant.unsqueeze(0),
                         per_req_key.unsqueeze(0),
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
@@ -169,7 +169,9 @@ class AscendTorchNativeAttnBackend:
                     .squeeze(0)
                     .movedim(query.dim() - 2, 0)
                 )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out_redundant[
+                prefill_seq_len_q:, :, :
+            ]
             start_q, start_kv = end_q, end_kv
         return output
 

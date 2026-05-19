@@ -671,7 +671,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        # for corss-endoder model
+        # for cross-encoder model
         self.token_type_ids = token_type_ids
 
         # The length of KV that have been removed in swa cache.
@@ -790,7 +790,7 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
-        # Incremental streamining
+        # Incremental streaming
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
@@ -2245,7 +2245,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(self, idx: int, remaining_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
@@ -2258,7 +2258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
-        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        num_tokens = remaining_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()

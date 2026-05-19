@@ -509,8 +509,8 @@ class Envs:
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
-    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    SGLANG_ENABLE_LOGITS_PROCESSOR_CHUNK = EnvBool(False)
+    SGLANG_LOGITS_PROCESSOR_CHUNK_SIZE = EnvInt(2048)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)

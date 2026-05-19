@@ -188,7 +188,7 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.coefficients = []
         self.accumulated_rel_l1_distance = 0
         self.previous_modulated_input = None
-        self.previous_resiual = None
+        self.previous_residual = None
         self.previous_e0_even = None
         self.previous_e0_odd = None
         self.previous_residual_even = None

@@ -1,0 +1,92 @@
+[files]
+ignore-hidden = false
+extend-exclude = [
+    ".git/**",
+    ".github/CODEOWNERS",
+    ".github/MAINTAINER.md",
+    "*.json",
+    "*.jsonl",
+    "*.txt",
+    "3rdparty/**",
+    "python/sglang/multimodal_gen/third_party/**",
+    "python/sglang/test/simple_eval_mgsm.py",
+    "test/registered/unit/function_call/test_function_call_parser.py",
+]
+
+[default]
+extend-ignore-identifiers-re = [
+    ".*[Uu][Ee][0-9][Mm][0-9].*",   # FP format: ue8m0, UE8M0 (micro-exponent)
+]
+
+[default.extend-identifiers]
+# Identifiers that contain intentional "typos" (matched exactly)
+cudaDevAttrMaxSharedMemoryPerBlockOptin = "cudaDevAttrMaxSharedMemoryPerBlockOptin"  # CUDA constant
+nin_shortcut = "nin_shortcut"           # model architecture term
+stride_bse = "stride_bse"              # variable name
+local_pref_numer = "local_pref_numer"    # variable name (numerator)
+_LOCAL_PREF_NUMER = "_LOCAL_PREF_NUMER"  # constant (numerator)
+meshVerticeInpaint = "meshVerticeInpaint"         # public API function
+meshVerticeInpaint_smooth = "meshVerticeInpaint_smooth"  # public API function
+CachableDiT = "CachableDiT"            # class name
+Convnet = "Convnet"                    # class name
+layrnorm = "layrnorm"                 # transformers weight name
+pre_layrnorm = "pre_layrnorm"         # transformers weight name
+SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"  # env var
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"    # env var
+SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK = "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"        # env var
+rounter_params_dtype = "rounter_params_dtype"  # config param (matches upstream Longcat)
+
+[default.extend-words]
+# --- Code variable names ---
+ans = "ans"             # variable name (answer) in benchmark code
+vas = "vas"             # AVX-512 variable name in CPU moe kernel
+medias = "medias"       # variable name in multimodal code
+visibles = "visibles"   # variable name in whisper adapter test
+nd = "nd"               # PyTorch einsum notation "...nd"
+fo = "fo"               # FoCa method name (Forecast then Calibrate)
+thw = "thw"             # HuggingFace Qwen2-VL (temporal, height, width)
+ba = "ba"               # Qwen3 variable
+BA = "BA"               # Qwen3 variable
+thr = "thr"             # CUDA variable (elements_per_thr)
+Thr = "Thr"             # CUDA variable
+arange = "arange"       # torch.arange / np.arange
+indx = "indx"           # variable abbreviation (index)
+Indx = "Indx"           # variable abbreviation
+iy = "iy"               # variable name
+PN = "PN"               # abbreviation
+dout = "dout"           # variable name (gradient output)
+activ = "activ"         # variable name (activation pointer)
+tpos = "tpos"           # variable name (temporal position)
+padd = "padd"           # variable name (padded)
+splitted = "splitted"   # valid English (though informal)
+
+# --- Test strings / special tokens ---
+hel = "hel"             # test string in router tree tests
+ment = "ment"           # substring in test data (tokenization test)
+thi = "thi"             # test string in reasoning parser tests
+nothink = "nothink"     # template tag /nothink
+Chello = "Chello"       # test string
+
+# --- CUDA / CUTLASS / hardware terms ---
+setp = "setp"           # PTX assembly instruction setp.ne.b32
+subtile = "subtile"     # CUTLASS term (epilogue_subtile)
+CPY = "CPY"             # CUTLASS template parameter
+Ot = "Ot"               # CUTLASS tensor variable (tOtO)
+Eles = "Eles"           # CUDA macro (kRmemEles)
+eles = "eles"           # CUDA variable (eles_per_thr)
+muh = "muh"             # file extension (.muh = Musa Header)
+countr = "countr"       # C++ std::countr_zero (C++20)
+hsa = "hsa"             # HSA (Heterogeneous System Architecture) for AMD ROCm
+cann = "cann"           # CANN (Compute Architecture for Neural Networks) for Ascend NPU
+tbe = "tbe"             # TBE (Tensor Boost Engine) for Ascend NPU
+
+# --- Module / class / metric names ---
+cmo = "cmo"             # Cache Management Operation module
+CMO = "CMO"             # Cache Management Operation module
+DBE = "DBE"             # third-party pynvml
+NOO = "NOO"             # from NOOPs
+OME = "OME"             # project name (Kubernetes operator)
+wrk = "wrk"             # benchmarking tool name
+MIS = "MIS"             # MIS scoring mode in sequence classification
+PRIS = "PRIS"           # AIBRIX KV cache backend name
+rouge = "rouge"         # ROUGE metric name (rouge-score package)

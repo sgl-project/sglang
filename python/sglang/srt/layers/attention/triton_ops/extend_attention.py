@@ -456,11 +456,11 @@ def _fwd_kernel(
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
-            mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
+            mask_causal = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
-            mask_causual &= mask_m[:, None] & mask_n[None, :]
-            final_mask &= mask_causual
+            mask_causal &= mask_m[:, None] & mask_n[None, :]
+            final_mask &= mask_causal
         else:
             mask_non_causal = mask_m[:, None] & mask_n[None, :]
             final_mask &= mask_non_causal

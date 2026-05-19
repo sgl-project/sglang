@@ -17,16 +17,16 @@ __global__ void ComputeNGramIdsKernel(
     int batch_size,
     int ne_n,
     int ne_k,
-    int* ne_weights,                      // [ne_n-1,ne_k,ne_n]
-    int* ne_mods,                         // [ne_n-1,ne_k]
-    int* exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
-    int* tokens,                          // [token_num]
-    int* exclusive_req_len_sums,          // [batch_size+1]
-    int* ne_token_table,                  // [max_running_reqs, max_context_len]
-    int max_context_len,                  // max_context_len
-    long* row_indices,                    // [batch_size]
-    int* column_starts,                   // [batch_size]
-    int* n_gram_ids                       // [ne_n-1,ne_k,token_num]
+    int* ne_weights,                       // [ne_n-1,ne_k,ne_n]
+    int* ne_mods,                          // [ne_n-1,ne_k]
+    int* exclusive_ne_embedder_size_sums,  // [(ne_n-1)*ne_k]
+    int* tokens,                           // [token_num]
+    int* exclusive_req_len_sums,           // [batch_size+1]
+    int* ne_token_table,                   // [max_running_reqs, max_context_len]
+    int max_context_len,                   // max_context_len
+    long* row_indices,                     // [batch_size]
+    int* column_starts,                    // [batch_size]
+    int* n_gram_ids                        // [ne_n-1,ne_k,token_num]
 ) {
   // Determine which n, k, and request this block handles.
   /**
@@ -78,7 +78,7 @@ __global__ void ComputeNGramIdsKernel(
       n_gram_id += term % ne_mod;
     }
     n_gram_id %= ne_mod;
-    n_gram_id += exclusive_ne_embeder_size_sums[n * ne_k + k];
+    n_gram_id += exclusive_ne_embedder_size_sums[n * ne_k + k];
     // [token_num, ne_n-1, ne_k]
     n_gram_ids[i * (ne_n - 1) * ne_k + n * ne_k + k] = (int)(n_gram_id);
   }
@@ -131,7 +131,7 @@ struct NgramEmbeddingKernel {
       const int64_t ne_k,
       const tvm::ffi::TensorView ne_weights,
       const tvm::ffi::TensorView ne_mods,
-      const tvm::ffi::TensorView exclusive_ne_embeder_size_sums,
+      const tvm::ffi::TensorView exclusive_ne_embedder_size_sums,
       const tvm::ffi::TensorView tokens,
       const tvm::ffi::TensorView exclusive_req_len_sums,
       const tvm::ffi::TensorView ne_token_table,
@@ -156,7 +156,7 @@ struct NgramEmbeddingKernel {
     TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
         .with_dtype<int32_t>()
         .with_device<kDLCUDA>()
-        .verify(exclusive_ne_embeder_size_sums);
+        .verify(exclusive_ne_embedder_size_sums);
 
     TensorMatcher({-1})  // [token_num]
         .with_dtype<int32_t>()
@@ -203,7 +203,7 @@ struct NgramEmbeddingKernel {
         static_cast<int>(ne_k),
         static_cast<int*>(ne_weights.data_ptr()),
         static_cast<int*>(ne_mods.data_ptr()),
-        static_cast<int*>(exclusive_ne_embeder_size_sums.data_ptr()),
+        static_cast<int*>(exclusive_ne_embedder_size_sums.data_ptr()),
         static_cast<int*>(tokens.data_ptr()),
         static_cast<int*>(exclusive_req_len_sums.data_ptr()),
         static_cast<int*>(ne_token_table.data_ptr()),

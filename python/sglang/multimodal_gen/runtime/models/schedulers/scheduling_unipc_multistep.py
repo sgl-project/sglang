@@ -298,7 +298,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 )
 
         self.predict_x0 = predict_x0
-        # setable values
+        # settable values
         self.num_inference_steps = None
         timesteps = np.linspace(
             0, num_train_timesteps - 1, num_train_timesteps, dtype=np.float32

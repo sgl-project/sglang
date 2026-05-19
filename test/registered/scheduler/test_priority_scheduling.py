@@ -80,7 +80,7 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
         assert e2e_latencies[0] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[2]
@@ -117,7 +117,7 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
         assert e2e_latencies[0] < e2e_latencies[6] < e2e_latencies[5] < e2e_latencies[4]
@@ -154,7 +154,7 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
         assert e2e_latencies[0] < e2e_latencies[1] < e2e_latencies[2] < e2e_latencies[3]
@@ -189,7 +189,7 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
 
@@ -220,7 +220,7 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
 
@@ -290,7 +290,7 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
             (200, None),
         ]
 
-        _verify_genereate_responses(responses, expected_status_and_error_messages, [])
+        _verify_generate_responses(responses, expected_status_and_error_messages, [])
 
     def test_priority_scheduling_preemption_token_offset_calculation(self):
         """
@@ -361,7 +361,7 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(
+        _verify_generate_responses(
             responses, expected_status_and_error_messages, e2e_latencies
         )
 
@@ -375,7 +375,7 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
         # assert e2e_latencies[2] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[0]
 
 
-def _verify_genereate_responses(
+def _verify_generate_responses(
     responses: Tuple[int, Any, float],
     expected_code_and_error_message: Tuple[int, Any],
     e2e_latencies: List[Optional[float]],

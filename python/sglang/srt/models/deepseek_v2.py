@@ -513,7 +513,7 @@ class DeepseekV2MoE(nn.Module):
             and self.num_fused_shared_experts > 0
             and not _is_deepep_fusion
         ):
-            # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
+            # if enable_ep_moe tp_size == ep_size, every gpu get shared experts gemm output
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)

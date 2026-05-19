@@ -238,7 +238,7 @@ void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, siz
     }
   }
 
-  // each rank reduce the buffer independently so therre is no need for
+  // each rank reduce the buffer independently so there is no need for
   // synchronization afterward
   reduce_all_buffers(0, chunk_el, scalar_type, world_rank, data_ptr, symmetric_buffer[current_buffer]);
 

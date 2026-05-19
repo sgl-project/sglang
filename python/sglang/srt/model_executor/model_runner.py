@@ -282,7 +282,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
-# Detect stragger ranks in model loading
+# Detect stagger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
@@ -1899,10 +1899,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
+        inferred_device = device_module.current_device()
 
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=inferred_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
