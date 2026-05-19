@@ -93,8 +93,13 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
+    hicache_io_backend = "direct"
+    hicache_mem_layout = "page_first_direct"
+    max_running_requests = 4
     kl_threshold = 0.005
     sampling_temperature = 0
+    decode_hit_request_batch_size = 3
+    decode_hit_inter_batch_delay_s = 0.5
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
     num_gsm8k_questions = 100
@@ -130,15 +135,15 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "direct",
+                cls.hicache_io_backend,
                 "--hicache-mem-layout",
-                "page_first_direct",
+                cls.hicache_mem_layout,
                 "--swa-full-tokens-ratio",
                 "0.25",
                 "--max-total-tokens",
                 "20000",
                 "--max-running-requests",
-                "2",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -150,6 +155,15 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "layer_first"
 
 
 if __name__ == "__main__":
