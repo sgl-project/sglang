@@ -5,7 +5,6 @@ import requests
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
@@ -21,9 +20,6 @@ from sglang.test.test_utils import (
     is_in_amd_ci,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=245, suite="stage-c-test-4-gpu-h100")
-register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
 @unittest.skipIf(
