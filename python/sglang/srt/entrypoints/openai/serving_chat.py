@@ -369,7 +369,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # silently always be null.  OpenAI's own API rejects this combination.
         if (
             request.response_format
-            and request.response_format.type in ("json_schema", "json_object")
+            and getattr(request.response_format, "type", None)
+            in ("json_schema", "json_object")
             and request.tools
             and request.tool_choice != "none"
         ):
