@@ -31,6 +31,7 @@ LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
 SIMILARITY_THRESHOLD = 0.9999
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEmbeddingLoRAParity(CustomTestCase):
     """Guard the end-to-end embedding request and LoRA execution path."""
 
