@@ -496,8 +496,6 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self._maybe_apply_fuseep_weights(layer):
-            return
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
         layer.w13_weight.data = self._pack_to_int32(
             layer.w13_weight.data.to(torch.int32)
@@ -801,8 +799,6 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, is_per_channel_weight, activation_use_clip
     ) -> None:
-        if self._maybe_apply_fuseep_weights(layer):
-            return
         if not activation_use_clip:
             self._process_weights_without_clip(layer, is_per_channel_weight)
         else:
@@ -1092,8 +1088,6 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         return unpacked
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self._maybe_apply_fuseep_weights(layer):
-            return
         w13_weight_scale = layer.w13_weight_scale.data.transpose(-1, -2).contiguous()
         w2_weight_scale = layer.w2_weight_scale.data.transpose(-1, -2).contiguous()
         layer.w13_weight_scale = torch.nn.Parameter(

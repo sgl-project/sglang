@@ -976,16 +976,6 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.utils import is_npu
-
-        if is_npu():
-            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-                maybe_apply_fuseep_weights,
-            )
-
-            if maybe_apply_fuseep_weights(layer):
-                return
-
         layer.scheme.process_weights_after_loading(layer)
 
     def create_weights(
@@ -1025,7 +1015,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output,
+        dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         """
         Use the output of create_weights and the CompressedTensorsScheme
@@ -1033,17 +1023,6 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         layer input.  See LinearMethodBase for param details
 
         """
-        from sglang.srt.utils import is_npu
-
-        if is_npu():
-            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-                maybe_apply_deepep_npu,
-            )
-
-            combine_input = maybe_apply_deepep_npu(self, layer, dispatch_output)
-            if combine_input is not None:
-                return combine_input
-
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
