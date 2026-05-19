@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY: int = 1_000_000
+
 _INSIDE_REPLAY: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "kv_cache_canary_inside_replay", default=False
 )
@@ -165,13 +167,18 @@ def _compute_launch_capacities(
     write_entry_capacity = max(
         1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
     )
+    max_seq_len_per_req = int(model_runner.req_to_token_pool.req_to_token.shape[1])
+    per_forward_verify_capacity = max(1, max_seq_len_per_req)
+    sweep_verify_capacity = max(
+        1, min(pool_slot_count, _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)
+    )
 
     _ = config
     return _LaunchCapacities(
-        per_forward_verify_capacity=max(1, pool_slot_count),
+        per_forward_verify_capacity=per_forward_verify_capacity,
         per_forward_write_req_capacity=max(1, max_bs),
         per_forward_write_entry_capacity=write_entry_capacity,
-        sweep_verify_capacity=max(1, pool_slot_count),
+        sweep_verify_capacity=sweep_verify_capacity,
     )
 
 
