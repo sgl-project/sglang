@@ -64,8 +64,8 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm, vector
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -300,6 +300,7 @@ class FP8MQALogitsKernel:
         self.mma_tiler = (*self.mma_tiler_mn, 1)
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             a_dtype,
+            a_dtype,
             a_major,
             b_major,
             self.acc_dtype,
@@ -412,7 +413,7 @@ class FP8MQALogitsKernel:
         # single-tile SMEM layout and (phys, head) as cta_tiler.
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         self.a_tma_view_layout = sm100_utils.make_smem_layout(
-            tcgen05.OperandMajorMode.K,
+            OperandMajorMode.K,
             (self.block_kv, self.head_dim),
             a_dtype,
             self.num_kv_stages,
@@ -931,7 +932,7 @@ class FP8MQALogitsKernel:
         if is_tma_warp_0:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             # Matches DeepGEMM's TMA warp with kv_group_idx == 0
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.setmaxregister_decrease(24)
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
@@ -1060,7 +1061,7 @@ class FP8MQALogitsKernel:
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
             # Matches DeepGEMM's TMA warp with kv_group_idx == 1
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.setmaxregister_decrease(24)
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
@@ -1134,7 +1135,7 @@ class FP8MQALogitsKernel:
             # barriers are NOT visibility-ordered even within the same
             # warp. KV0 barrier arriving does not guarantee Q SMEM
             # writes are visible.
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.setmaxregister_decrease(24)
 
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -1206,7 +1207,7 @@ class FP8MQALogitsKernel:
             # Explicitly waits on Q pipeline — critical because TMA warp 1
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.setmaxregister_decrease(24)
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -1272,7 +1273,7 @@ class FP8MQALogitsKernel:
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
-            cute.arch.warpgroup_reg_alloc(240)
+            cute.arch.setmaxregister_increase(240)
 
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
@@ -1311,7 +1312,7 @@ class FP8MQALogitsKernel:
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -1330,7 +1331,7 @@ class FP8MQALogitsKernel:
                         q_stage_local = q_cons_state.index
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
-                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                            for w_j in cutlass.range(NUM_W_IN_REG, unroll_full=True):
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
@@ -1469,13 +1470,13 @@ class FP8MQALogitsKernel:
                                         (a0, a1),
                                         (w0, w1),
                                         (s0x, s0y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
                                         (a2, a3),
                                         (w2, w3),
                                         (s1x, s1y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1525,13 +1526,13 @@ class FP8MQALogitsKernel:
                                         (a0, a1),
                                         (w0, w1),
                                         (s0x, s0y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
                                         (a2, a3),
                                         (w2, w3),
                                         (s1x, s1y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
@@ -1588,7 +1589,7 @@ class FP8MQALogitsKernel:
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -1607,7 +1608,7 @@ class FP8MQALogitsKernel:
                         q_stage_local = q_cons_state.index
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
-                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                            for w_j in cutlass.range(NUM_W_IN_REG, unroll_full=True):
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
@@ -1727,13 +1728,13 @@ class FP8MQALogitsKernel:
                                         (a0, a1),
                                         (w0, w1),
                                         (s0x, s0y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
                                         (a2, a3),
                                         (w2, w3),
                                         (s1x, s1y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1783,13 +1784,13 @@ class FP8MQALogitsKernel:
                                         (a0, a1),
                                         (w0, w1),
                                         (s0x, s0y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
                                         (a2, a3),
                                         (w2, w3),
                                         (s1x, s1y),
-                                        rnd=nvvm.RoundingModeKind.RN,
+                                        rnd="rn",
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
@@ -1829,4 +1830,4 @@ class FP8MQALogitsKernel:
             tmem.free(tmem_ptr)
 
         else:
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.setmaxregister_decrease(24)

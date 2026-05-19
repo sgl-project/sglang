@@ -24,8 +24,7 @@ Usage:
         --next_n 1 2 4 \\
         --context_len 4096 32768 131072
 
-Requires: cupti-python>=13 (``pip install -U cupti-python``). Falls back to
-CUDA-graph + CUDA-event timing if CUPTI is unavailable.
+Requires: cupti-python>=13 (``pip install -U cupti-python``).
 """
 
 from __future__ import annotations
@@ -38,12 +37,7 @@ import torch
 
 # Force registration of torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits.
 import sglang.srt.layers.attention.nsa.cute_dsl_paged_mqa_logits  # noqa: F401
-
-
-def _device_cap_major() -> int:
-    if not torch.cuda.is_available():
-        return -1
-    return torch.cuda.get_device_capability()[0]
+from sglang.srt.utils import is_sm100_supported
 
 
 def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -184,7 +178,6 @@ def benchmark(
     output_dtype: torch.dtype = torch.float32,
     varlen: bool = False,
     block_kv: int = 64,
-    enable_cupti: bool = True,
     use_cuda_graph: bool = True,
 ):
     """Benchmark CuTe DSL vs DeepGEMM FP8 paged MQA logits.
@@ -203,12 +196,10 @@ def benchmark(
 
     dtype_str = str(output_dtype).split(".")[-1]
     mode_str = "varlen" if varlen else "fix-len"
-    backend = (
-        "CUPTI" if enable_cupti else ("CUDA-Graph" if use_cuda_graph else "CUDA-Event")
-    )
+    backend = "CUPTI + CUDA-Graph" if use_cuda_graph else "CUPTI"
     print(
         f"output_dtype={dtype_str}  mode={mode_str}  block_kv={block_kv}  "
-        f"timing={backend}{' + CUDA-Graph' if (use_cuda_graph and enable_cupti) else ''}"
+        f"timing={backend}"
     )
     hdr = (
         f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
@@ -397,7 +388,7 @@ def benchmark(
                 bench_kwargs = dict(
                     dry_run_iters=5,
                     repeat_iters=30,
-                    enable_cupti=enable_cupti,
+                    enable_cupti=True,
                     use_cuda_graph=use_cuda_graph,
                     cold_l2_cache=True,
                 )
@@ -482,18 +473,13 @@ def main():
         help="Cache page size in tokens (default: 64 — matches SGLang NSA).",
     )
     parser.add_argument(
-        "--no-cupti",
-        action="store_true",
-        help="Disable CUPTI; use CUDA-graph + CUDA-event timing instead.",
-    )
-    parser.add_argument(
         "--no-cuda-graph",
         action="store_true",
         help="Disable CUDA-graph capture; measure launch overhead too.",
     )
     args = parser.parse_args()
 
-    if _device_cap_major() != 10:
+    if not is_sm100_supported():
         print(
             "Skipping: CuTe DSL FP8 Paged MQA Logits kernel only supports "
             "SM 100 family (Blackwell)."
@@ -508,7 +494,6 @@ def main():
         output_dtype=dtype_map[args.output_dtype],
         varlen=args.varlen,
         block_kv=args.block_kv,
-        enable_cupti=not args.no_cupti,
         use_cuda_graph=not args.no_cuda_graph,
     )
 
