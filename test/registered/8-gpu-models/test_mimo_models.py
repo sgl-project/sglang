@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -9,6 +11,7 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 register_cuda_ci(est_time=500, stage="base-c", runner_config="8-gpu-h200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_num_questions = 1319
@@ -77,6 +80,7 @@ MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiMoV2(GSM8KMixin, MMMUServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_accept_length_thres = 2.5

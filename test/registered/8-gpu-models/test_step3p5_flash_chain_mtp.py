@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -22,6 +23,7 @@ register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStep3p5FlashChainMTP(CustomTestCase):
     """Chain-style multi-layer EAGLE speculative decoding on Step-3.5-Flash.
 
