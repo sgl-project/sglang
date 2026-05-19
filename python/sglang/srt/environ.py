@@ -690,9 +690,39 @@ class Envs:
     SGLANG_PSEUDO_INPUT_POSITION_PERTURB_PROB = EnvFloat(0.0)
     SGLANG_PSEUDO_INPUT_POSITION_PERTURB_SEED = EnvInt(0)
 
+    # Testing SOT (testing.md §3.1) canary perturb / mock perturb env vars.
+    # Primitive float / int values (no compound types) so the registry
+    # reflection self-unit test can assert declared types are primitive.
+    # Per-write probability the canary self-unit perturb hook flips a
+    # ``req_to_token_pool`` slot to force INPUT_TOKEN_MISMATCH / chain hash
+    # violations. Counterpart of ``SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB``;
+    # this SOT-named alias is consumed by the new testing harness.
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN = EnvFloat(0.0)
+    # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
+    # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
+    # (default 1.5x). Override via env var when runner jitter or temporary
+    # debugging needs a wider window.
+    SGLANG_KV_CANARY_BENCH_OVERHEAD_THRESHOLD_RATIO = EnvFloat(1.5)
+    # Mock-engine sampler-override per-element probability for writing the
+    # wrong input token so the canary's ``INPUT_TOKEN_MISMATCH`` fires on
+    # the next forward. Used by the canary <-> mock-oracle wiring tests in
+    # ``test/registered/mock_model/test_self_unit_canary_mock_wiring.py``.
+    SGLANG_MOCK_INPUT_PERTURB_PROB = EnvFloat(0.0)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def get_registry() -> dict[str, EnvField]:
+    """Return all registered environment variable descriptors as a name -> EnvField map.
+
+    Test code uses this to assert declared types (e.g. canary perturb env vars must
+    be primitive ``EnvFloat`` / ``EnvInt`` / ``EnvBool``, not compound types).
+    """
+    return {
+        name: value for name, value in vars(Envs).items() if isinstance(value, EnvField)
+    }
 
 
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
