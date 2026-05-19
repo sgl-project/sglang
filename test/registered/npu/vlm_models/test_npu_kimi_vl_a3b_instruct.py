@@ -1,3 +1,4 @@
+import torch
 import unittest
 
 from sglang.test.ascend.test_ascend_utils import KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH
@@ -11,6 +12,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiVLA3BInstruct(TestVLMModels):
     """Testcase: Verify that the inference accuracy of the moonshotai/Kimi-VL-A3B-Instruct model on the MMMU dataset is no less than 0.2.
 

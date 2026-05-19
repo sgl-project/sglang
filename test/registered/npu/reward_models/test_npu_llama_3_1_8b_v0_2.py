@@ -29,6 +29,7 @@ CONVS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLlama(CustomTestCase):
     """Testcase: This test case validates that the reward scores from the Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 model
     in the SGLang framework are less than 4e-2 different from the Hugging Face implementation.

@@ -2,6 +2,7 @@ import os
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import MINICPM_O_2_6_WEIGHTS_PATH
@@ -19,6 +20,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendWarmups(CustomTestCase):
     """Testcase: Test that the warm-up task runs successfully when the --warmups voice_chat parameter is specified upon service startup.
 
