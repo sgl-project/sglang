@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
-if TYPE_CHECKING:
-    from sglang.srt.kv_cache_canary.runner import CanaryRunner
-    from sglang.srt.mem_cache.req_to_token_pool import ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.kv_cache_canary.runner import CanaryRunner
+from sglang.srt.mem_cache.req_to_token_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +18,9 @@ _PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
 
 def maybe_perturb_hook(
     *,
-    runner: Optional["CanaryRunner"],
-    model_runner: "ModelRunner",
-    forward_batch: "ForwardBatch",
+    runner: Optional[CanaryRunner],
+    model_runner: ModelRunner,
+    forward_batch: ForwardBatch,
 ) -> None:
     """Shared eager + replay self-test perturb hook."""
     active_indices, active_seq_lens = _extract_active_rows(forward_batch)
@@ -36,8 +35,8 @@ def maybe_perturb_hook(
 
 def maybe_perturb_req_to_token(
     *,
-    runner: Optional["CanaryRunner"],
-    req_to_token_pool: "ReqToTokenPool",
+    runner: Optional[CanaryRunner],
+    req_to_token_pool: ReqToTokenPool,
     rank: int,
     active_req_pool_indices: Optional[List[int]] = None,
     active_seq_lens: Optional[List[int]] = None,
@@ -105,7 +104,7 @@ def maybe_perturb_req_to_token(
 
 
 def _extract_active_rows(
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb."""
     if forward_batch is None:

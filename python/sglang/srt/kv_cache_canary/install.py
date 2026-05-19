@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -16,9 +16,7 @@ from sglang.srt.kv_cache_canary.api import (
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_hook
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +35,7 @@ def _is_inside_replay() -> bool:
 
 def install_on_model_runner(
     *,
-    model_runner: "ModelRunner",
+    model_runner: ModelRunner,
     mode: Optional[str],
     real_kv_hash_mode: Optional[str] = None,
 ) -> None:
@@ -111,7 +109,7 @@ def install_on_model_runner(
 
 
 def _compute_launch_capacities(
-    *, model_runner: "ModelRunner", config: CanaryConfig
+    *, model_runner: ModelRunner, config: CanaryConfig
 ) -> Tuple[int, int, int]:
     """Pick fixed launch-buffer capacities that cover every forward shape.
 
@@ -167,7 +165,7 @@ def _is_swa_pool(pool: object) -> bool:
     return isinstance(pool, BaseSWAKVPool)
 
 
-def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
+def _patch_model_forward(*, model_runner: ModelRunner) -> None:
     """Wrap ``model_runner.model.forward`` to run the canary kernel pair.
 
     Two execution paths, both routed through this single wrapper:

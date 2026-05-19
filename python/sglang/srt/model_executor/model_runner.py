@@ -105,7 +105,6 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.kv_cache_canary.install import install_on_model_runner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -744,6 +743,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
+        # Local import: kv_cache_canary.install imports ModelRunner globally, so
+        # importing it at module top here would form a cycle.
+        from sglang.srt.kv_cache_canary.install import install_on_model_runner
+
         install_on_model_runner(
             model_runner=self,
             mode=server_args.kv_cache_canary,

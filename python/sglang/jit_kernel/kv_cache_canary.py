@@ -125,49 +125,81 @@ def canary_step(
     real_kv_read_bytes: int,
     real_kv_hash_mode: int,
 ) -> None:
-    """Launch one KV-cache canary step.
+    """Launch one KV-cache canary step against the shadow buffers.
 
-    The kernel runs two distinct workloads sharing one grid:
-
-    1. **Verify entries** (per-thread): read a slot's stored fingerprint,
-       compute the expected ``prev_hash`` by reading the previous slot and
-       running ``splitmix64_mix`` on-device, then compare against three
-       expected fields (``req_id``, ``position``, ``prev_hash``) — one
-       independent fail_reason per field. ``token_id`` is NOT verified on
-       this path (historical tokens are not in the current
-       ``ForwardBatch.input_ids``); token tampering is caught indirectly
-       via the splitmix64 chain at the next position.
-    2. **Write-req chains** (per-thread, one driver thread per request): walk
-       the splitmix64 chain across all writes for that req, seeded from
-       either ``kSeed`` (``write_req_seed_slot_indices == -1``) or the
-       canary slot at ``K_req - 1``, and store ``(req_id, token_id, position,
-       prev_hash)`` into each slot in order.
-
-    The host emits **raw input data** (``token_id``, ``position``) from the
-    sglang ``ForwardBatch`` — no host-side hash computation. ``seed`` is
-    ``CanaryConfig.seed``.
+    Per-forward host hook into the compiled CUDA kernel. Each call
+    optionally verifies a set of slots and optionally writes a set of
+    new slots, in a single grid launch on the current stream. All output
+    state (the destination buffer, violation ring, is_errored flag,
+    counters) is mutated in-place; this function returns ``None``.
 
     Args:
-        src_buf:             uint8 flatten view of the source shadow tensor
-                             (verify reads + prev-slot reads here).
-        dst_buf:             uint8 flatten view of the destination shadow.
-        slot_stride_bytes:   bytes per logical slot in both buffers.
-        verify_*:            per-verify-entry arrays. ``verify_prev_slot_indices``
-                             at ``-1`` means "position 0, expected prev_hash =
-                             kSeed". ``verify_active_mask`` at 0 means
-                             "skip-sentinel padding for cuda graph".
-        write_*:             per-write-entry arrays (pure data; driver threads
-                             read these).
-        write_req_*:         per-write-req arrays, one row per req with new
-                             writes. The driver thread walks
-                             ``[entry_starts, entry_starts + entry_counts)``
-                             sequentially, advancing splitmix64.
-        seed:                ``CanaryConfig.seed`` (chain head).
-        violation_*:         GPU ring + first-violation latch + is_errored
-                             flag for error reporting.
-        slot_run_counter:    int64 [1]. ``+= num_active_slots`` per launch.
-        kernel_run_counter:  int64 [1]. ``+= 1`` per launch.
-        kernel_kind:         ``KERNEL_KIND_HEAD`` or ``KERNEL_KIND_TAIL``.
+        src_buf:                Flattened ``uint8`` view of the source
+                                shadow tensor (verify reads + prev-slot
+                                reads come from here).
+        dst_buf:                Flattened ``uint8`` view of the
+                                destination shadow tensor (writes land
+                                here). Aliasing ``src_buf`` is allowed.
+        slot_stride_bytes:      Bytes per logical slot in both buffers.
+        verify_slot_indices:    ``int64 [N_verify]`` — slots to verify.
+        verify_positions:       ``int64 [N_verify]`` — expected positions.
+        verify_req_ids:         ``int64 [N_verify]`` — expected req ids.
+        verify_prev_slot_indices: ``int64 [N_verify]`` — slot index of
+                                position ``p - 1`` for each verify entry,
+                                or ``-1`` for "position 0, seed from
+                                kSeed".
+        verify_active_mask:     ``int32 [N_verify]`` — 1 = process, 0 =
+                                skip (cuda-graph padding).
+        write_slot_indices:     ``int64 [N_write]`` — slots to write.
+        write_token_ids:        ``int64 [N_write]`` — token IDs to store.
+        write_positions:        ``int64 [N_write]`` — positions to store.
+        write_req_ids:          ``int64 [N_write]`` — req IDs to store.
+        write_req_seed_slot_indices: ``int64 [N_write_reqs]`` — for each
+                                write-req, the slot to seed the chain
+                                from (``-1`` = seed from kSeed).
+        write_req_entry_starts: ``int64 [N_write_reqs]`` — start offset
+                                into the per-write-entry arrays.
+        write_req_entry_counts: ``int64 [N_write_reqs]`` — count of
+                                entries in the per-write-entry arrays.
+        write_req_active_mask:  ``int32 [N_write_reqs]`` — 1 = process,
+                                0 = skip.
+        seed:                   Chain seed (``CanaryConfig.seed``).
+                                Cast through :func:`to_signed_int64`
+                                before being handed to the kernel.
+        violation_ring:         ``int64 [ring_capacity, VIOLATION_FIELDS]``.
+        violation_ring_valid:   ``int32 [ring_capacity]``.
+        violation_write_index:  ``int32 [1]`` — ring write cursor.
+        first_violation:        ``int64 [VIOLATION_FIELDS]`` — latched
+                                first violation row.
+        first_violation_set:    ``int32 [1]`` — CAS latch flag.
+        is_errored:             ``int32 [1]`` — set to 1 on any violation.
+        slot_run_counter:       ``int64 [1]`` — ``+= num_active_slots``.
+        kernel_run_counter:     ``int64 [1]`` — ``+= 1`` unconditionally
+                                (host-side health monitor relies on this).
+        kernel_kind:            :data:`KERNEL_KIND_HEAD` or
+                                :data:`KERNEL_KIND_TAIL`.
+        real_kv_buf:            Flattened ``uint8`` view of the real-KV
+                                pool's source layer (used by the optional
+                                real-data fingerprint).
+        real_kv_slot_stride_bytes: Byte stride of the real-KV pool.
+        real_kv_read_bytes:     Number of leading bytes per slot to fold
+                                into the fingerprint (0 disables).
+        real_kv_hash_mode:      One of :data:`REAL_KV_HASH_MODE_OFF`,
+                                :data:`REAL_KV_HASH_MODE_BIT`,
+                                :data:`REAL_KV_HASH_MODE_ALL`.
+
+    Calling contract:
+
+    - Safe to call inside cuda-graph capture; the recorded kernel uses
+      the buffer addresses passed here. Replay-side code must refill the
+      buffers in-place before ``graph.replay()``.
+    - Always launches at least one thread (the kernel performs an
+      unconditional ``kernel_run_counter`` atomicAdd in block 0 / thread
+      0 before any other work); skipping the launch breaks the host
+      health monitor.
+    - For the per-forward write/verify semantics see
+      :func:`sglang.jit_kernel.kv_cache_canary_ref.canary_step_torch_reference`,
+      which is a byte-equal reference implementation.
     """
     module = _jit_canary_module()
     module.canary_step(
