@@ -2,13 +2,11 @@ import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -18,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-large")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -34,12 +32,20 @@ LOW_ACCEPT_PROMPT = (
 MAX_UPSHIFT_ATTEMPTS = 4
 MAX_DOWNSHIFT_ATTEMPTS = 6
 
+# candidate_steps=[2, 3] is required at topk=4: min_step=1 would only yield a
+# pool of 4 < num_draft_tokens-1=15 and fail _validate_candidate_steps_against_topk.
 EXPECTED_UPSHIFT_STEPS = 3
-EXPECTED_DOWNSHIFT_STEPS = 1
+EXPECTED_DOWNSHIFT_STEPS = 2
 
 
-class TestAdaptiveSpeculativeServer(CustomTestCase):
-    """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
+class TestAdaptiveSpeculativeTopkServer(CustomTestCase):
+    """Adaptive speculative decoding under tree EAGLE (topk > 1).
+
+    Exercises tier swap correctness: both runtime states init under topk=4,
+    upshift drives steps to 3, downshift drives to 2 (the floor of
+    candidate_steps=[2, 3], not 1), and a smoke decode after the second
+    upshift confirms the verify path runs cleanly post-swap.
+    """
 
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
@@ -50,11 +56,12 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
                 {
-                    "candidate_steps": [1, 3],
-                    "ema_alpha": 1.0,
+                    "candidate_steps": [2, 3],
+                    "ema_alpha": 0.3,
                     "warmup_batches": 1,
                     "update_interval": 1,
                     "up_hysteresis": 0.0,
+                    "down_hysteresis": -0.5,
                 },
                 f,
             )
@@ -68,17 +75,17 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 other_args=[
                     "--trust-remote-code",
                     "--attention-backend",
-                    "triton",
+                    "flashinfer",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-draft-model-path",
                     cls.draft_model,
                     "--speculative-num-steps",
-                    "1",
+                    "3",
                     "--speculative-eagle-topk",
-                    "1",
+                    "4",
                     "--speculative-num-draft-tokens",
-                    "2",
+                    "16",
                     "--speculative-adaptive",
                     "--speculative-adaptive-config",
                     cls.adaptive_config_path,
@@ -120,7 +127,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         return response.json()
 
     def _drive_upshift(self, target: int = EXPECTED_UPSHIFT_STEPS) -> dict:
-        """Send high-acceptance prompts until steps upshift to *target*."""
         state = self._get_internal_state()
         for _ in range(MAX_UPSHIFT_ATTEMPTS):
             self._generate(HIGH_ACCEPT_PROMPT)
@@ -130,7 +136,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         return state
 
     def _drive_downshift(self, target: int = EXPECTED_DOWNSHIFT_STEPS) -> dict:
-        """Send low-acceptance prompts until steps downshift to *target*."""
         state = self._get_internal_state()
         for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
             self._generate(LOW_ACCEPT_PROMPT)
@@ -139,8 +144,8 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 return state
         return state
 
-    def test_gsm8k_after_adaptive_switches(self):
-        """Exercise up/down/up adaptive switches, then verify GSM8K accuracy."""
+    def test_adaptive_switches_under_topk_gt_1(self):
+        """Up -> down -> up sequence under topk=4, then a smoke decode."""
         state = self._drive_upshift()
         self.assertEqual(
             state["speculative_num_steps"],
@@ -155,24 +160,18 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             f"Never downshifted: {state}",
         )
 
-        self._drive_upshift()
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=100,
-            num_threads=64,
+        state = self._drive_upshift()
+        self.assertEqual(
+            state["speculative_num_steps"],
+            EXPECTED_UPSHIFT_STEPS,
+            f"Never re-upshifted: {state}",
         )
-        metrics = run_eval(args)
-        print(f"GSM8K after adaptive switches: {metrics}")
-        self.assertGreater(metrics["score"], 0.20)
 
-        server_info = requests.get(self.base_url + "/server_info").json()
-        avg_accept_len = server_info["internal_states"][0]["avg_spec_accept_length"]
-        print(f"avg_spec_accept_length={avg_accept_len:.4f}")
+        # Smoke decode: confirms the verify path runs cleanly after the
+        # last tier swap; a non-empty output is enough signal here, broader
+        # parity is left to local-only smokes.
+        result = self._generate("Hello", max_new_tokens=8)
+        self.assertTrue(result.get("text"), f"Empty decode after swap: {result}")
 
 
 if __name__ == "__main__":

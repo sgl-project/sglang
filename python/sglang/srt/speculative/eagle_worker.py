@@ -344,6 +344,36 @@ class EAGLEWorker(TpModelWorker):
             state.speculative_num_draft_tokens
         )
 
+    def get_draft_pool_size(self, num_steps: int) -> int:
+        """Number of draft candidates produced by the EAGLE draft loop.
+
+        ``select_top_k_tokens`` (in ``spec_utils.py``) appends ``topk``
+        scores at step 0 and ``topk * topk`` scores at every subsequent
+        step. ``organize_draft_results`` then selects
+        ``num_draft_tokens - 1`` entries from this pool.
+
+        Returns 0 for ``num_steps < 1`` so the controller's invariant
+        check fails with a clear "pool too small" message.
+        """
+        if num_steps < 1:
+            return 0
+        return self.topk + (num_steps - 1) * self.topk * self.topk
+
+    def get_num_draft_tokens(self, num_steps: int) -> int:
+        """Per-tier ``speculative_num_draft_tokens``.
+
+        Chain (``topk == 1``): server_args enforces
+        ``num_draft_tokens = num_steps + 1`` in post-init, so each tier
+        gets its own size.
+
+        Tree (``topk > 1``): hold the user-supplied budget constant across
+        tiers so the user retains direct control over the verifier graph
+        size; ``build_tree_kernel`` then selects top-N by score.
+        """
+        if self.topk == 1:
+            return num_steps + 1
+        return self.speculative_num_draft_tokens
+
     def build_adaptive_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
     ) -> SpecRuntimeState:
