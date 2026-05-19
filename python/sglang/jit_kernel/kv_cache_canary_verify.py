@@ -16,9 +16,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import torch
+
+from sglang.jit_kernel.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+# Maximum number of RealKvSource entries the C++ ABI supports per launch. Mirrors kMaxRealKvSources in
+# canary_common.cuh. The host wrapper pads any shorter tuple up to this length with dummy entries and
+# rejects longer tuples.
+_MAX_REAL_KV_SOURCES: Final[int] = 4
 
 # Chain hash anchor. Hardcoded at the jit_kernel layer; no runtime seed parameter exists. Mirrored in C++ as
 # kCanaryChainAnchor; const-sync test pins them together.
@@ -260,6 +270,84 @@ def canary_verify_step(
     :func:`sglang.jit_kernel.kv_cache_canary_verify_ref.canary_verify_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
-    raise NotImplementedError(
-        "Use canary_verify_step_torch_reference until CUDA kernel lands"
+    if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:
+        raise ValueError(
+            f"kv-canary: at most {_MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
+            f"got {len(real_kv_sources)}"
+        )
+
+    padded_bufs, source_params = _build_real_kv_source_abi(
+        real_kv_sources=real_kv_sources, device=canary_buf.device
     )
+
+    module = _jit_canary_verify_module()
+    module.canary_verify_step_cuda(
+        canary_buf,
+        plan.verify_slot_indices,
+        plan.verify_positions,
+        plan.verify_prev_slot_indices,
+        plan.verify_num_valid,
+        int(kernel_kind),
+        violation_ring,
+        violation_write_index,
+        slot_run_counter,
+        kernel_run_counter,
+        padded_bufs[0],
+        padded_bufs[1],
+        padded_bufs[2],
+        padded_bufs[3],
+        source_params,
+        len(real_kv_sources),
+        int(real_kv_hash_mode),
+    )
+
+
+@cache_once
+def _jit_canary_verify_module() -> "Module":
+    """Lazy-load the CUDA verify module via tvm-ffi. Same JIT plumbing as the legacy canary.cuh loader."""
+    return load_jit(
+        "kv_cache_canary_verify",
+        cuda_files=["kv_cache_canary/canary_verify.cuh"],
+        cuda_wrappers=[
+            ("canary_verify_step_cuda", "canary::canary_verify_step_cuda"),
+        ],
+    )
+
+
+def _build_real_kv_source_abi(
+    *,
+    real_kv_sources: tuple[RealKvSource, ...],
+    device: torch.device,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Pad a RealKvSource tuple up to _MAX_REAL_KV_SOURCES dummy entries and build the (bufs, params) ABI.
+
+    Returns:
+        padded_bufs: list of length _MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Unused trailing
+            slots are tiny 1-byte placeholders that the kernel never dereferences (their read_bytes is 0).
+        source_params: int32 tensor on CPU, shape [_MAX_REAL_KV_SOURCES, 3]. Per row: (page_size,
+            num_bytes_per_token, read_bytes). Padding rows are all zeros except page_size = 1 and
+            num_bytes_per_token = 1 to keep the device-side address arithmetic well-defined.
+    """
+    padded_bufs: list[torch.Tensor] = []
+    params = torch.zeros((_MAX_REAL_KV_SOURCES, 3), dtype=torch.int32, device="cpu")
+
+    for i, source in enumerate(real_kv_sources):
+        source_u8 = source.tensor.view(torch.uint8)
+        if source_u8.dim() != 2:
+            raise ValueError(
+                f"kv-canary: real_kv_sources[{i}].tensor (viewed as uint8) must be 2-D, "
+                f"got {source_u8.dim()}-D"
+            )
+        padded_bufs.append(source_u8)
+        params[i, 0] = source.page_size
+        params[i, 1] = source.num_bytes_per_token
+        params[i, 2] = source.read_bytes
+
+    dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
+    for i in range(len(real_kv_sources), _MAX_REAL_KV_SOURCES):
+        padded_bufs.append(dummy)
+        params[i, 0] = 1  # page_size
+        params[i, 1] = 1  # num_bytes_per_token
+        params[i, 2] = 0  # read_bytes -> kernel skips this slot
+
+    return padded_bufs, params
