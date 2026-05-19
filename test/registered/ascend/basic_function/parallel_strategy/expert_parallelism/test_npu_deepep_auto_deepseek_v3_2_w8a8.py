@@ -62,6 +62,7 @@ class TestDeepEpDeepseekV32(CustomTestCase):
                 "SGLANG_NPU_USE_MLAPO": "0",
                 "SGLANG_NPU_USE_MULTI_STREAM": "1",
                 "TASK_QUEUE_ENABLE": "0",
+                "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
         )

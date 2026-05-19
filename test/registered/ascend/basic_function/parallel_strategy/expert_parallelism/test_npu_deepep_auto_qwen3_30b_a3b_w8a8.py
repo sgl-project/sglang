@@ -50,6 +50,7 @@ class TestDeepepAutoQwen3(CustomTestCase):
                 "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "2048",
+                "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
         )
