@@ -773,7 +773,7 @@ class Req(ReqDllmMixin):
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
-        self.is_chunked = 0
+        self.inflight_middle_chunks = 0
 
         # For retraction
         self.is_retracted = False
@@ -1263,7 +1263,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        self.is_chunked = 0
+        self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
