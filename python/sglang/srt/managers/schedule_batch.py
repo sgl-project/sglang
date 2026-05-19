@@ -791,13 +791,13 @@ class Req(ReqDllmMixin):
         # req in flight concurrently. In non-PP, oscillates 0/1 within each
         # iter. Used by output_processor to know whether this forward's
         # sample is real (==0) or garbage (>0).
-        self.inflight_middle_chunks = 0
+        self.pending_middle_outputs = 0
 
         # Persistent (cross-iter) flag set by admission when this req's
         # current admission was truncated (more chunks remain). Cleared
         # when last chunk is admitted (truncated=False) or on retract.
         # Used by Stage A stash detection, filter_batch exclusion, and
-        # add_one_req's reuse-vs-fresh branch. Independent of inflight_middle_chunks
+        # add_one_req's reuse-vs-fresh branch. Independent of pending_middle_outputs
         # counter (transient) and kv_committed_len (derived).
         self.has_pending_chunk = False
 
@@ -1292,7 +1292,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        self.inflight_middle_chunks = 0
+        self.pending_middle_outputs = 0
         self.has_pending_chunk = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -2501,7 +2501,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     exclude_chunked_req
                     and (
                         self.reqs[i].has_pending_chunk
-                        or self.reqs[i].inflight_middle_chunks > 0
+                        or self.reqs[i].pending_middle_outputs > 0
                         or self.reqs[i].is_dllm()
                     )
                 )
@@ -2585,7 +2585,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the full exclude_chunked_req predicate so PP middle-chunk and DLLM
         # staging reqs are also caught here.
         assert not any(
-            r.has_pending_chunk or r.inflight_middle_chunks > 0 or r.is_dllm()
+            r.has_pending_chunk or r.pending_middle_outputs > 0 or r.is_dllm()
             for r in other.reqs
         )
 

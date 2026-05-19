@@ -1022,7 +1022,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         # Chunked-resume tracking is now per-req (Req.has_pending_chunk +
-        # inflight_middle_chunks counter); the scheduler no longer holds a global pointer.
+        # pending_middle_outputs counter); the scheduler no longer holds a global pointer.
         # Stage A stashes any waiting_queue req with has_pending_chunk; cache
         # impls bound row reads by kv_committed_len so a stash after
         # init_next_round_input is safe without the old gate.
@@ -2651,7 +2651,7 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        # Bump inflight_middle_chunks for every admitted req that's still
+        # Bump pending_middle_outputs for every admitted req that's still
         # mid-prefill — output processor uses this to know its forward's
         # sample is garbage. Counter semantics needed for PP, where multiple
         # microbatches may admit the same req.
@@ -2661,7 +2661,7 @@ class Scheduler(
         ), "single-flight invariant: at most one chunked-resume req per batch"
         chunk_deduct = 0
         for r in chunked_in_batch:
-            r.inflight_middle_chunks += 1
+            r.pending_middle_outputs += 1
             chunk_deduct = r.extend_input_len
 
         set_time_batch(can_run_list, "set_forward_entry_time")
@@ -3463,11 +3463,11 @@ class Scheduler(
         # 'in batch'. Each mb's forward was launched against the req's
         # req_pool_idx + KV slots; the output processor on a different mb
         # iteration consumes the result later. Without this, a chunked-resume
-        # req with inflight_middle_chunks > 0 sitting in waiting_queue would
+        # req with pending_middle_outputs > 0 sitting in waiting_queue would
         # fall into the waiting-only abort path, release_kv_cache would free
         # the row + KV underneath the still-launched forward, and the delayed
         # output processor would crash on a None req_pool_idx (or, with
-        # inflight_middle_chunks cleared to 0, mistake the middle-chunk
+        # pending_middle_outputs cleared to 0, mistake the middle-chunk
         # result for a full output and append garbage tokens).
         if self.pp_size > 1 and hasattr(self, "mbs"):
             for mb_list in (self.mbs, self.last_mbs, self.running_mbs):
@@ -3515,7 +3515,7 @@ class Scheduler(
                 # Defensive: clear pending-chunk flags on the orphaned req so a
                 # stale reference can't trigger Stage A re-stash of the freed row.
                 req.has_pending_chunk = False
-                req.inflight_middle_chunks = 0
+                req.pending_middle_outputs = 0
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

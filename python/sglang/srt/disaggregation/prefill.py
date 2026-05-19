@@ -514,7 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.inflight_middle_chunks <= 0:
+            if req.pending_middle_outputs <= 0:
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -564,7 +564,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
+                req.pending_middle_outputs -= 1
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]

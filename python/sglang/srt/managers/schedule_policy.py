@@ -959,7 +959,7 @@ class PrefillAdder:
                 truncated = True
 
         # has_pending_chunk: persistent flag carrying chunked-resume state
-        # across iters. DLLM uses its own staging_queue + inflight_middle_chunks counter.
+        # across iters. DLLM uses its own staging_queue + pending_middle_outputs counter.
         if not req.is_dllm():
             req.has_pending_chunk = truncated
 
