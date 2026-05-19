@@ -243,8 +243,13 @@ pub fn select_decode_with_affinity(
     let prefill_host = host_of(prefill_url);
 
     // Build the closed-breaker subset once; both the affinity branch
-    // and the fallback branch read from it.
-    let healthy: Vec<&Arc<Worker>> = candidates.iter().filter(|w| w.breaker.allow()).collect();
+    // and the fallback branch read from it. `would_allow` (non-mutating)
+    // is the right filter — `allow()` would claim a half-open probe for
+    // every candidate we look at, including ones we never dispatch to.
+    let healthy: Vec<&Arc<Worker>> = candidates
+        .iter()
+        .filter(|w| w.breaker.would_allow())
+        .collect();
 
     // Compute the median load over the closed-breaker subset.  Empty
     // subset → median is 0 (means: every peer's breaker is open; the

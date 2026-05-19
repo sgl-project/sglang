@@ -45,7 +45,9 @@
 //! type whose `duration_since(other)` returns the wall-clock delta.
 
 use crate::discovery::WorkerId;
+use crate::server::metrics::{ActiveLoadKind, MetricsRegistry};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,6 +106,13 @@ struct WorkerCounters {
 #[derive(Debug)]
 struct RequestEntry {
     worker: WorkerId,
+    /// Worker URL captured at register time. The metrics gauge
+    /// (`sgl_router_active_load`) is keyed by URL, not by `WorkerId`, so
+    /// drop / sweep paths need the URL to emit the decremented gauge
+    /// value. Stored on the entry (not looked up via the worker
+    /// registry) so a `forget_worker` between register and drop still
+    /// produces a coherent metric trace.
+    worker_url: String,
     counters: Arc<WorkerCounters>,
     prefill_load: usize,
     decode_load: usize,
@@ -175,6 +184,13 @@ pub struct ActiveLoadRegistry {
     requests: DashMap<RequestId, RequestEntry>,
     clock: Arc<dyn Clock>,
     stale_request_timeout: Duration,
+    /// Optional Prometheus metrics sink. When attached via
+    /// [`Self::attach_metrics`] (typically from `AppContext`), every
+    /// `register` / drop / `sweep_stale` emits the live per-worker
+    /// `sgl_router_active_load` gauge for both axes. Late binding via
+    /// `Mutex<Option<...>>` keeps construction order flexible: the
+    /// registry can be created before the metrics registry exists.
+    metrics: Mutex<Option<Arc<MetricsRegistry>>>,
 }
 
 impl ActiveLoadRegistry {
@@ -191,7 +207,38 @@ impl ActiveLoadRegistry {
             requests: DashMap::new(),
             clock,
             stale_request_timeout,
+            metrics: Mutex::new(None),
         })
+    }
+
+    /// Attach (or replace) the [`MetricsRegistry`] this registry pushes
+    /// gauge updates into. Idempotent; safe to call multiple times.
+    /// Production wires this from `AppContext` after the metrics registry
+    /// is constructed; tests skip it unless they assert on the gauge.
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        *self.metrics.lock() = Some(metrics);
+    }
+
+    /// Snapshot the current per-worker load and push it to the metrics
+    /// gauge (if any). Called from the register / drop / sweep paths
+    /// after the counter mutation completes. Reading `counters.load()`
+    /// here (rather than computing from the delta) keeps the gauge
+    /// eventually-consistent with the canonical counter even under
+    /// concurrent register + drop interleavings.
+    fn publish_gauge(&self, counters: &WorkerCounters, worker_url: &str) {
+        let Some(metrics) = self.metrics.lock().clone() else {
+            return;
+        };
+        metrics.set_active_load(
+            worker_url,
+            ActiveLoadKind::PrefillTokens,
+            counters.prefill_load.load(Ordering::Relaxed) as i64,
+        );
+        metrics.set_active_load(
+            worker_url,
+            ActiveLoadKind::DecodeBlocks,
+            counters.decode_load.load(Ordering::Relaxed) as i64,
+        );
     }
 
     /// Default-config registry: monotonic system clock + 5-minute stale
@@ -210,12 +257,19 @@ impl ActiveLoadRegistry {
     /// Register a new in-flight request and return a guard that holds the
     /// active-load counters up. The guard's drop / explicit complete path
     /// decrements the counters and removes the request entry.
+    ///
+    /// `worker_url` is captured on the entry so drop / sweep can emit a
+    /// coherent gauge update via the attached [`MetricsRegistry`] (if
+    /// any). Callers in the request path pass `&worker.url`; tests pass a
+    /// stable placeholder.
     pub fn register(
         self: &Arc<Self>,
         worker: WorkerId,
+        worker_url: impl Into<String>,
         prefill_load: usize,
         decode_load: usize,
     ) -> ActiveLoadGuard {
+        let worker_url = worker_url.into();
         let request_id = RequestId::new_v4();
         let counters = self
             .workers
@@ -229,11 +283,13 @@ impl ActiveLoadRegistry {
         counters
             .decode_load
             .fetch_add(decode_load, Ordering::Relaxed);
+        self.publish_gauge(&counters, &worker_url);
         let cancel = CancellationToken::new();
         self.requests.insert(
             request_id.clone(),
             RequestEntry {
                 worker: worker.clone(),
+                worker_url,
                 counters,
                 prefill_load,
                 decode_load,
@@ -326,6 +382,7 @@ impl ActiveLoadRegistry {
                     .counters
                     .decode_load
                     .fetch_sub(entry.decode_load, Ordering::Relaxed);
+                self.publish_gauge(&entry.counters, &entry.worker_url);
                 // Wake the chat handler awaiting this request so it can
                 // return `ApiError::StaleRequestExpired` to the client.
                 // Cancellation is idempotent; if the handler already
@@ -477,6 +534,7 @@ impl Drop for ActiveLoadGuard {
                 .counters
                 .decode_load
                 .fetch_sub(entry.decode_load, Ordering::Relaxed);
+            registry.publish_gauge(&entry.counters, &entry.worker_url);
         }
     }
 }
@@ -498,7 +556,7 @@ mod tests {
         let w = WorkerId("w0".into());
         assert_eq!(registry.prefill_load(&w), 0);
         assert_eq!(registry.decode_load(&w), 0);
-        let g = registry.register(w.clone(), 100, 5);
+        let g = registry.register(w.clone(), "test://100-5", 100, 5);
         assert_eq!(registry.prefill_load(&w), 100);
         assert_eq!(registry.decode_load(&w), 5);
         assert_eq!(registry.inflight_count(), 1);
@@ -512,8 +570,8 @@ mod tests {
     fn two_concurrent_guards_increment_to_2_then_drop_to_0() {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
-        let g1 = registry.register(w.clone(), 10, 1);
-        let g2 = registry.register(w.clone(), 20, 2);
+        let g1 = registry.register(w.clone(), "test://10-1", 10, 1);
+        let g2 = registry.register(w.clone(), "test://20-2", 20, 2);
         assert_eq!(registry.prefill_load(&w), 30);
         assert_eq!(registry.decode_load(&w), 3);
         assert_eq!(registry.inflight_count(), 2);
@@ -530,7 +588,7 @@ mod tests {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
         {
-            let _g = registry.register(w.clone(), 7, 1);
+            let _g = registry.register(w.clone(), "test://7-1", 7, 1);
             assert_eq!(registry.prefill_load(&w), 7);
         }
         assert_eq!(registry.prefill_load(&w), 0);
@@ -541,8 +599,8 @@ mod tests {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w0 = WorkerId("w0".into());
         let w1 = WorkerId("w1".into());
-        let _g0 = registry.register(w0.clone(), 5, 0);
-        let _g1 = registry.register(w1.clone(), 11, 0);
+        let _g0 = registry.register(w0.clone(), "test://5-0", 5, 0);
+        let _g1 = registry.register(w1.clone(), "test://11-0", 11, 0);
         assert_eq!(registry.prefill_load(&w0), 5);
         assert_eq!(registry.prefill_load(&w1), 11);
     }
@@ -560,7 +618,7 @@ mod tests {
     fn janitor_then_guard_drop_does_not_underflow() {
         let (registry, clock) = registry_with_mock_clock(Duration::from_secs(1));
         let w = WorkerId("w0".into());
-        let g = registry.register(w.clone(), 50, 5);
+        let g = registry.register(w.clone(), "test://50-5", 50, 5);
         clock.advance(Duration::from_secs(2));
         let n = registry.sweep_stale();
         assert_eq!(n, 1);
@@ -578,7 +636,7 @@ mod tests {
     fn janitor_expires_stale_requests() {
         let (registry, clock) = registry_with_mock_clock(Duration::from_secs(5));
         let w = WorkerId("w0".into());
-        let _g = registry.register(w.clone(), 100, 4);
+        let _g = registry.register(w.clone(), "test://100-4", 100, 4);
         assert_eq!(registry.prefill_load(&w), 100);
         // Just below the threshold — no expiry.
         clock.advance(Duration::from_secs(4));
@@ -595,7 +653,7 @@ mod tests {
     fn janitor_is_idempotent_on_double_run() {
         let (registry, clock) = registry_with_mock_clock(Duration::from_secs(1));
         let w = WorkerId("w0".into());
-        let _g = registry.register(w.clone(), 7, 0);
+        let _g = registry.register(w.clone(), "test://7-0", 7, 0);
         clock.advance(Duration::from_secs(2));
         assert_eq!(registry.sweep_stale(), 1);
         // Second run finds nothing to do.
@@ -607,7 +665,7 @@ mod tests {
     fn janitor_leaves_fresh_requests_alone() {
         let (registry, clock) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
-        let _g = registry.register(w.clone(), 50, 0);
+        let _g = registry.register(w.clone(), "test://50-0", 50, 0);
         clock.advance(Duration::from_secs(1));
         assert_eq!(registry.sweep_stale(), 0);
         assert_eq!(registry.prefill_load(&w), 50);
@@ -623,7 +681,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemTimeClock);
         let registry = ActiveLoadRegistry::new(clock, Duration::from_millis(30));
         let w = WorkerId("w0".into());
-        let _g = registry.register(w.clone(), 50, 2);
+        let _g = registry.register(w.clone(), "test://50-2", 50, 2);
         assert_eq!(registry.inflight_count(), 1);
 
         let handle = spawn_janitor(Arc::clone(&registry), Duration::from_millis(20));
@@ -655,7 +713,7 @@ mod tests {
     fn forget_worker_drops_counters_entry() {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
-        let g = registry.register(w.clone(), 7, 2);
+        let g = registry.register(w.clone(), "test://7-2", 7, 2);
         assert!(registry.is_known(&w), "worker is known after register");
         assert_eq!(registry.prefill_load(&w), 7);
 
@@ -702,12 +760,12 @@ mod tests {
     fn forget_then_reregister_does_not_underflow_new_counters() {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
-        let old_guard = registry.register(w.clone(), 7, 2);
+        let old_guard = registry.register(w.clone(), "test://7-2", 7, 2);
         registry.forget_worker(&w);
         // Re-register under the same id → brand-new WorkerCounters
         // slot. Fresh load of 0 (we mint a no-op guard to materialize
         // the slot without bumping any counters).
-        let _new_guard = registry.register(w.clone(), 0, 0);
+        let _new_guard = registry.register(w.clone(), "test://0-0", 0, 0);
         assert_eq!(registry.prefill_load(&w), 0);
         assert_eq!(registry.decode_load(&w), 0);
 
@@ -733,7 +791,7 @@ mod tests {
     async fn janitor_expiry_fires_guard_cancel_token() {
         let (registry, clock) = registry_with_mock_clock(Duration::from_secs(1));
         let w = WorkerId("w0".into());
-        let g = registry.register(w.clone(), 50, 5);
+        let g = registry.register(w.clone(), "test://50-5", 50, 5);
         let cancel = g.cancel_token().clone();
         assert!(
             !cancel.is_cancelled(),
@@ -762,12 +820,100 @@ mod tests {
     fn guard_drop_does_not_cancel_token() {
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let w = WorkerId("w0".into());
-        let g = registry.register(w, 1, 1);
+        let g = registry.register(w, "test://1-1", 1, 1);
         let cancel = g.cancel_token().clone();
         drop(g);
         assert!(
             !cancel.is_cancelled(),
             "normal guard drop must NOT cancel the token (sweep-only signal)",
+        );
+    }
+
+    /// When a [`MetricsRegistry`] is attached, the per-worker active-load
+    /// gauge mirrors the live counter on register / drop / sweep.
+    /// Regression: prior code exposed [`MetricsRegistry::set_active_load`]
+    /// but nothing in the request hot path ever called it, leaving
+    /// `sgl_router_active_load` permanently at 0 in production.
+    #[test]
+    fn metrics_gauge_tracks_active_load_on_register_and_drop() {
+        use crate::server::metrics::{ActiveLoadKind, MetricsRegistry};
+
+        let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
+        let metrics = MetricsRegistry::new();
+        registry.attach_metrics(Arc::clone(&metrics));
+        let w = WorkerId("w0".into());
+        let url = "http://w0:30000";
+
+        // Before any register, the gauge isn't surfaced (no entry yet).
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains("sgl_router_active_load{worker_url=\"http://w0:30000\""),
+            "no gauge entry expected before first register; got:\n{rendered}"
+        );
+
+        // Register a request with prefill_load=100, decode_load=5.
+        let g = registry.register(w.clone(), url, 100, 5);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w0:30000\",kind=\"prefill_tokens\"} 100"
+            ),
+            "expected prefill_tokens=100 gauge, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w0:30000\",kind=\"decode_blocks\"} 5"
+            ),
+            "expected decode_blocks=5 gauge, got:\n{rendered}"
+        );
+
+        // Drop the guard → gauge returns to 0.
+        drop(g);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w0:30000\",kind=\"prefill_tokens\"} 0"
+            ),
+            "expected prefill_tokens=0 after drop, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w0:30000\",kind=\"decode_blocks\"} 0"
+            ),
+            "expected decode_blocks=0 after drop, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn metrics_gauge_tracks_active_load_on_sweep_stale() {
+        use crate::server::metrics::MetricsRegistry;
+
+        let (registry, clock) = registry_with_mock_clock(Duration::from_millis(50));
+        let metrics = MetricsRegistry::new();
+        registry.attach_metrics(Arc::clone(&metrics));
+        let w = WorkerId("w1".into());
+        let url = "http://w1:30000";
+
+        // `register` returns a guard but we don't drop it — janitor sweeps it.
+        let _g = registry.register(w, url, 200, 10);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w1:30000\",kind=\"prefill_tokens\"} 200"
+            ),
+            "register emits gauge; got:\n{rendered}"
+        );
+
+        // Advance past timeout and sweep.
+        clock.advance(Duration::from_millis(60));
+        let swept = registry.sweep_stale();
+        assert_eq!(swept, 1, "exactly one entry should have expired");
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_active_load{worker_url=\"http://w1:30000\",kind=\"prefill_tokens\"} 0"
+            ),
+            "sweep emits decremented gauge; got:\n{rendered}"
         );
     }
 
@@ -783,7 +929,7 @@ mod tests {
             let wid = w.clone();
             set.spawn(async move {
                 for _ in 0..100 {
-                    let _g = r.register(wid.clone(), 1, 1);
+                    let _g = r.register(wid.clone(), "test://1-1", 1, 1);
                     // Yield occasionally so tasks interleave.
                     tokio::task::yield_now().await;
                 }

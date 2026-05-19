@@ -63,6 +63,12 @@ impl AppContext {
         policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
     ) -> Self {
+        let metrics = MetricsRegistry::new();
+        // Wire the per-worker active-load gauge so `sgl_router_active_load`
+        // mirrors the live counter on every register / drop / sweep.
+        // Without this, the metric is permanently 0 in production even
+        // though the chat handler is faithfully calling `register`.
+        active_load.attach_metrics(Arc::clone(&metrics));
         Self {
             config,
             tokenizers,
@@ -70,7 +76,7 @@ impl AppContext {
             registry,
             policies,
             active_load,
-            metrics: MetricsRegistry::new(),
+            metrics,
             ready: AtomicBool::new(false),
         }
     }

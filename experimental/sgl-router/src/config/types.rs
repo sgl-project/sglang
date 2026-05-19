@@ -138,11 +138,6 @@ pub struct CacheAwareConfig {
     /// difference triggers re-balancing.
     #[serde(default = "default_balance_rel")]
     pub balance_rel_threshold: f32,
-    /// Number of tokens per KV block in the SGLang worker. Must match
-    /// the worker config — mismatch silently misses every cache lookup.
-    /// Default 64; SGLang ships with 64 by default.
-    #[serde(default = "default_block_size")]
-    pub block_size: u32,
 }
 
 impl Default for CacheAwareConfig {
@@ -151,7 +146,6 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
-            block_size: default_block_size(),
         }
     }
 }
@@ -164,9 +158,6 @@ fn default_balance_abs() -> usize {
 }
 fn default_balance_rel() -> f32 {
     1.1
-}
-fn default_block_size() -> u32 {
-    64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,11 +358,57 @@ pub enum ConfigError {
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,
     #[error(
-        "discovery.k8s: PD `{which}_selector` must be a non-empty label selector — \
-         an empty selector matches every endpoint and would silently classify every \
-         worker as the same role"
+        "discovery.k8s: PD-disaggregation mode is not yet supported on K8s discovery. \
+         EndpointSlice does not carry the per-pod `sglang.ai/bootstrap-port` annotation, \
+         so workers are emitted with `bootstrap_port: None` and the engine rejects them \
+         at runtime. Use `discovery.static_file` for PD until pod-annotation plumbing \
+         lands."
     )]
-    EmptyPdSelector { which: &'static str },
+    PdNotImplemented,
+    #[error(
+        "discovery.k8s: {selector}_selector `{value}` uses unsupported syntax — \
+         only equality terms (`key=value` or `key==value`) joined by `,` are accepted. \
+         Set-based operators (`in`, `notin`), presence tests, and `!=` silently match \
+         zero endpoints at runtime and are rejected at config-load time."
+    )]
+    UnsupportedSelectorGrammar {
+        selector: &'static str,
+        value: String,
+    },
+}
+
+/// Returns `true` when `selector` parses as a comma-separated equality
+/// selector — every term has the shape `key=value` or `key==value`.
+/// See [`ConfigError::UnsupportedSelectorGrammar`] for rationale.
+fn is_equality_selector(selector: &str) -> bool {
+    for term in selector.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            // Treat lone trailing commas / whitespace as fine; the runtime
+            // splitter ignores empty terms.
+            continue;
+        }
+        if let Some((k, _)) = term.split_once("==") {
+            if k.trim().is_empty() {
+                return false;
+            }
+            continue;
+        }
+        if let Some((k, v)) = term.split_once('=') {
+            // Reject `!=` (rendered as `key!` + `=value` by split_once).
+            if k.trim().is_empty() || k.trim().ends_with('!') {
+                return false;
+            }
+            // Reject leading whitespace-only values? An empty value is
+            // technically legal in K8s — `label_selector = "tier="` matches
+            // pods that explicitly set `tier=""`. Allow it.
+            let _ = v;
+            continue;
+        }
+        // No `=` at all → set-based operator, presence test, or garbage.
+        return false;
+    }
+    true
 }
 
 impl K8sDiscoveryConfig {
@@ -382,24 +419,110 @@ impl K8sDiscoveryConfig {
         let decode = self.decode_selector.as_deref();
 
         match (plain, prefill, decode) {
-            (Some(label), None, None) => Ok(K8sDiscoveryMode::Plain {
-                label_selector: label.to_string(),
-            }),
-            (None, Some(p), Some(d)) => {
-                if p.is_empty() {
-                    return Err(ConfigError::EmptyPdSelector { which: "prefill" });
+            (Some(label), None, None) => {
+                if !is_equality_selector(label) {
+                    return Err(ConfigError::UnsupportedSelectorGrammar {
+                        selector: "label",
+                        value: label.to_string(),
+                    });
                 }
-                if d.is_empty() {
-                    return Err(ConfigError::EmptyPdSelector { which: "decode" });
-                }
-                Ok(K8sDiscoveryMode::PdDisaggregation {
-                    prefill_selector: p.to_string(),
-                    decode_selector: d.to_string(),
+                Ok(K8sDiscoveryMode::Plain {
+                    label_selector: label.to_string(),
                 })
+            }
+            (None, Some(_), Some(_)) => {
+                // PD disaggregation is not yet wired through K8s discovery —
+                // bootstrap_port can't be populated from EndpointSlice. Reject
+                // before we get to per-selector validation, so the operator
+                // sees the actionable error first.
+                Err(ConfigError::PdNotImplemented)
             }
             (None, None, None) => Err(ConfigError::NoSelector),
             (None, Some(_), None) | (None, None, Some(_)) => Err(ConfigError::PartialPdSelectors),
             (Some(_), _, _) => Err(ConfigError::MixedModes),
         }
+    }
+}
+
+#[cfg(test)]
+mod k8s_discovery_config_tests {
+    use super::*;
+
+    fn cfg(plain: Option<&str>, prefill: Option<&str>, decode: Option<&str>) -> K8sDiscoveryConfig {
+        K8sDiscoveryConfig {
+            namespace: "ns".to_string(),
+            label_selector: plain.map(str::to_string),
+            prefill_selector: prefill.map(str::to_string),
+            decode_selector: decode.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mode_rejects_pd_until_pod_annotation_plumbing_lands() {
+        // K8s PD requires per-pod `sglang.ai/bootstrap-port` annotations, which
+        // EndpointSlice doesn't carry. The discovery path silently sets
+        // `bootstrap_port: None` and the chat handler forwards JSON `null` to
+        // the engine. Config validation must fail-fast instead.
+        let err = cfg(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PdNotImplemented),
+            "expected PdNotImplemented, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mode_accepts_plain_with_equality_selector() {
+        let m = cfg(Some("app=sglang"), None, None).mode().unwrap();
+        assert_eq!(
+            m,
+            K8sDiscoveryMode::Plain {
+                label_selector: "app=sglang".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mode_rejects_set_based_selector_in_plain_mode() {
+        // labels_match_selector only handles `key=value` / `key==value`;
+        // anything else (presence tests, set-based ops, inequality) silently
+        // returns false at runtime, so zero pods match and discovery emits
+        // an empty worker set with no diagnostic. Validate up front.
+        let err = cfg(Some("app in (sglang, vllm)"), None, None).mode().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
+            "expected UnsupportedSelectorGrammar, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mode_rejects_presence_only_term() {
+        let err = cfg(Some("app"), None, None).mode().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
+            "expected UnsupportedSelectorGrammar, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mode_rejects_negation_term() {
+        let err = cfg(Some("app!=sglang"), None, None).mode().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
+            "expected UnsupportedSelectorGrammar, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mode_accepts_comma_separated_equality_terms() {
+        // The canonical Plain-mode selector form: `key1=v1,key2=v2`.
+        let m = cfg(Some("app=sglang,zone=us-east"), None, None).mode().unwrap();
+        assert_eq!(
+            m,
+            K8sDiscoveryMode::Plain {
+                label_selector: "app=sglang,zone=us-east".to_string()
+            }
+        );
     }
 }

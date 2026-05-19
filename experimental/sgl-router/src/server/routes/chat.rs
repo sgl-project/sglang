@@ -187,7 +187,9 @@ pub async fn chat_completions(
     // selection is host-affinity only).
     let guard = worker.load_guard();
     let prefill_load = estimate_prefill_tokens(&body);
-    let active_guard = ctx.active_load.register(worker.id.clone(), prefill_load, 0);
+    let active_guard =
+        ctx.active_load
+            .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
     // Snapshot the stale-request cancel token BEFORE moving the guard
     // into the spawned prefill task / streaming pump / response future.
     // The token is cheap to clone (it's an `Arc<...>` internally) and

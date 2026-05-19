@@ -73,14 +73,24 @@ async fn main() -> Result<()> {
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle. When no model uses `cache_aware_zmq`, the
-    // index is still constructed (cheap) but no subscribers are ever added.
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new();
+    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
+    // `cache_aware_zmq`, the index is still constructed (cheap) but no
+    // subscribers are ever added.
+    let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
+    let kv_index =
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .expect("default http client builds"),
+            Arc::clone(&block_size_oracle),
+        );
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
             kv_index.tree(),
             Arc::clone(&tokenizers),
+            Arc::clone(&block_size_oracle),
         )
         .context("build policy registry")?,
     );

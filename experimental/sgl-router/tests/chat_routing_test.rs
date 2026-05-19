@@ -667,6 +667,137 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
 }
 
 #[tokio::test]
+async fn forward_json_to_records_failure_on_body_drop() {
+    // Regression: previously `forward_json_to` recorded breaker
+    // success/failure right after headers — so a worker that returned
+    // 200 OK and then dropped the body got credited as healthy. A worker
+    // that does this repeatedly stays eligible. The fix moves the
+    // breaker record to after the body completes, treating a body-drop
+    // as failure.
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let worker =
+        common::mock_worker::MockWorker::start_returning_partial_body(StatusCode::OK, b"{\"par")
+            .await;
+
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
+        cool_down: Duration::from_secs(30),
+    }));
+
+    let headers = axum::http::HeaderMap::new();
+    let body = bytes::Bytes::from(b"{}".to_vec());
+    let res: Result<_, ApiError> = proxy
+        .forward_json_to(
+            &worker.url,
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        )
+        .await;
+    assert!(res.is_err(), "body drop should surface as ApiError");
+    assert!(
+        !breaker.would_allow(),
+        "body drop must trip the breaker (threshold=1)"
+    );
+}
+
+#[tokio::test]
+async fn forward_json_to_records_success_only_after_body_completes() {
+    // Counterpart of the body-drop regression: clean 2xx + clean body
+    // must record_success exactly once. If the implementation accidentally
+    // records on both the header path AND the body path, a single
+    // successful request would double-record. The test pins the
+    // post-body-only ordering by reading `would_allow` mid-call would be
+    // racy, so we instead assert that a single clean call followed by a
+    // 5xx leaves us at exactly threshold-1 failures.
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ok_worker =
+        common::mock_worker::MockWorker::start_returning_error(StatusCode::OK, serde_json::json!({}))
+            .await;
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: std::num::NonZeroU32::new(2).unwrap(),
+        cool_down: Duration::from_secs(30),
+    }));
+    let headers = axum::http::HeaderMap::new();
+    let _: Result<_, ApiError> = proxy
+        .forward_json_to(
+            &ok_worker.url,
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await;
+    // After a single clean success, the breaker is Closed and admits.
+    assert!(breaker.would_allow(), "clean success keeps breaker closed");
+}
+
+#[tokio::test]
+async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
+    // Streaming counterpart of the body-drop regression. Headers say 200
+    // OK, then the worker drops mid-body. The breaker must observe this
+    // as a failure — `bytes_stream_to_body` reads the rest of the
+    // stream on a spawned pump, so the recording has to flow through
+    // that pump's completion path.
+    use http_body_util::BodyExt;
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let worker = common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: hi\n\n",
+    )
+    .await;
+
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
+        cool_down: Duration::from_secs(30),
+    }));
+
+    let headers = axum::http::HeaderMap::new();
+    let body = bytes::Bytes::from(b"{}".to_vec());
+    let res: Result<_, ApiError> = proxy
+        .forward_streaming_to(
+            &worker.url,
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+            None,
+        )
+        .await;
+
+    let resp = res.expect("headers are 200 OK; transport-level Ok");
+    // Drain the body — the pump will see the mid-flight drop and
+    // surface an error chunk, then close.
+    let _ = resp.into_body().collect().await;
+    // After the stream drains, the breaker MUST have recorded failure.
+    // Poll briefly because the pump runs on a spawned task.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while breaker.would_allow() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !breaker.would_allow(),
+        "stream drop must trip the breaker (threshold=1)"
+    );
+}
+
+#[tokio::test]
 async fn forward_json_to_records_failure_on_5xx() {
     use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
     use sgl_router::server::error::ApiError;

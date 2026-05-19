@@ -92,9 +92,17 @@ async fn diff_and_emit(
                 })
                 .await?;
             }
-            if p.url != n.url || p.model_ids != n.model_ids {
-                // URL or model set change: treat as Removed+Added so the
-                // registry rebuilds cleanly.
+            if p.url != n.url
+                || p.model_ids != n.model_ids
+                || p.bootstrap_port != n.bootstrap_port
+            {
+                // URL, model set, or bootstrap_port change: treat as
+                // Removed+Added so the registry rebuilds cleanly. Without
+                // `bootstrap_port` in this set, editing a prefill worker's
+                // port in the TOML left the old value in the registry
+                // until restart (or until another field happened to
+                // change). PD chat injection then forwarded the stale
+                // port to the engine.
                 tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                 tx.send(DiscoveryEvent::Added(n.clone())).await?;
             }
@@ -284,6 +292,38 @@ mod tests {
             rx.try_recv().unwrap(),
             DiscoveryEvent::Removed { .. },
         ));
+    }
+
+    /// PD prefill workers carry a `bootstrap_port` that the chat handler
+    /// forwards to the engine. Editing the port in the TOML must surface
+    /// as Remove+Add so the registry replaces the stale spec; otherwise
+    /// the old port stays in flight until restart or another field
+    /// changes.
+    #[tokio::test]
+    async fn diff_and_emit_emits_removed_plus_added_on_bootstrap_port_change() {
+        let id = WorkerId("w1".into());
+        let prev_spec = WorkerSpec {
+            id: id.clone(),
+            url: "http://x:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("m1".into())],
+            bootstrap_port: Some(7000),
+        };
+        let next_spec = WorkerSpec {
+            bootstrap_port: Some(7001),
+            ..prev_spec.clone()
+        };
+        let mut prev: HashMap<WorkerId, WorkerSpec> =
+            [(id.clone(), prev_spec)].into_iter().collect();
+        let next: HashMap<WorkerId, WorkerSpec> =
+            [(id.clone(), next_spec)].into_iter().collect();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        diff_and_emit(&mut prev, next, &tx).await.unwrap();
+        let first = rx.try_recv().expect("port change must emit at least one event");
+        let second = rx.try_recv().expect("port change must emit Remove+Added pair");
+        assert!(matches!(first, DiscoveryEvent::Removed { .. }), "{first:?}");
+        assert!(matches!(second, DiscoveryEvent::Added(_)), "{second:?}");
     }
 
     #[tokio::test]

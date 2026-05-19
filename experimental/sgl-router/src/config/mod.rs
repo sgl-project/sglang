@@ -208,7 +208,11 @@ label_selector = "app=sglang"
     }
 
     #[test]
-    fn loads_k8s_pd_discovery_with_prefill_and_decode_selectors() {
+    fn rejects_k8s_pd_discovery_until_bootstrap_port_plumbing_lands() {
+        // K8s PD mode is currently unsupported: EndpointSlice doesn't carry
+        // the per-pod `sglang.ai/bootstrap-port` annotation, so workers
+        // would be emitted with `bootstrap_port: None` and the engine
+        // would reject them at runtime. Validate at config-load.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.toml");
         std::fs::write(
@@ -229,28 +233,12 @@ decode_selector = "app=sglang,role=decode"
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
-        match &c.discovery.backend {
-            DiscoveryBackend::K8s(k) => {
-                assert!(k.label_selector.is_none());
-                assert_eq!(
-                    k.prefill_selector.as_deref(),
-                    Some("app=sglang,role=prefill")
-                );
-                assert_eq!(k.decode_selector.as_deref(), Some("app=sglang,role=decode"));
-                match k.mode().unwrap() {
-                    K8sDiscoveryMode::PdDisaggregation {
-                        prefill_selector,
-                        decode_selector,
-                    } => {
-                        assert_eq!(prefill_selector, "app=sglang,role=prefill");
-                        assert_eq!(decode_selector, "app=sglang,role=decode");
-                    }
-                    other => panic!("expected PdDisaggregation, got {other:?}"),
-                }
-            }
-            _ => panic!("expected k8s backend"),
-        }
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PD-disaggregation") && msg.contains("not yet supported"),
+            "expected PD-not-supported error, got: {err}"
+        );
     }
 
     #[test]
@@ -336,34 +324,6 @@ namespace = "default"
         );
     }
 
-    /// An empty PD selector matches every endpoint (per k8s label-selector
-    /// grammar — no terms == always-true) and silently collapses the
-    /// prefill/decode distinction. Reject at config-load so operators see
-    /// the error instead of every worker being classified as Prefill.
-    #[test]
-    fn k8s_mode_rejects_empty_prefill_selector() {
-        let err = k8s_cfg(None, Some(""), Some("role=decode"))
-            .mode()
-            .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("prefill_selector") && msg.contains("empty"),
-            "expected empty-prefill-selector error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn k8s_mode_rejects_empty_decode_selector() {
-        let err = k8s_cfg(None, Some("role=prefill"), Some(""))
-            .mode()
-            .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("decode_selector") && msg.contains("empty"),
-            "expected empty-decode-selector error, got: {err}"
-        );
-    }
-
     /// Plain `label_selector = Some("")` STAYS valid — empty selector
     /// matches every EndpointSlice in the namespace, which is a documented
     /// k8s behavior and the user explicitly opts in to "match all" by
@@ -393,20 +353,17 @@ namespace = "default"
     }
 
     #[test]
-    fn k8s_mode_accepts_pd_with_both_selectors() {
-        let mode = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
+    fn k8s_mode_rejects_pd_until_pod_annotation_plumbing_lands() {
+        // See [`ConfigError::PdNotImplemented`] — EndpointSlice doesn't
+        // expose pod annotations, so bootstrap_port can't be populated.
+        let err = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
             .mode()
-            .unwrap();
-        match mode {
-            K8sDiscoveryMode::PdDisaggregation {
-                prefill_selector,
-                decode_selector,
-            } => {
-                assert_eq!(prefill_selector, "role=prefill");
-                assert_eq!(decode_selector, "role=decode");
-            }
-            other => panic!("expected PdDisaggregation, got {other:?}"),
-        }
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PD-disaggregation") && msg.contains("not yet supported"),
+            "expected PdNotImplemented, got: {err}"
+        );
     }
 
     #[test]

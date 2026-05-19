@@ -224,7 +224,20 @@ async fn register_one(
         spec.model_ids = vec![ModelId(name)];
     }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    registry.add_with_cb(spec, cb);
+    if let Err(e) = registry.add_with_cb(spec, cb) {
+        // Mixed PD + plain on the same model is rejected at registration
+        // time. Log loudly so the operator notices the conflicting
+        // worker — the alternative (silently dropping into either pool)
+        // makes the resolver surface the wrong 5xx code under partial
+        // outages. Skip the kv_index hook too: a worker we didn't add
+        // shouldn't drive cache-aware tree state.
+        tracing::error!(
+            worker_url = %worker_url,
+            error = %e,
+            "worker manager: refused to register worker due to mixed PD/plain configuration",
+        );
+        return;
+    }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
@@ -631,7 +644,7 @@ mod tests {
 
         // Mint a guard to force the active-load registry to create a
         // per-worker counters slot for this id.
-        let _g = active_load.register(id.clone(), 10, 1);
+        let _g = active_load.register(id.clone(), "test://", 10, 1);
         assert!(active_load.is_known(&id));
 
         // Now drive the Removed event and assert the counters slot is

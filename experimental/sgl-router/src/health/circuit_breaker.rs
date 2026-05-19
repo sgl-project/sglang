@@ -62,6 +62,32 @@ impl CircuitBreaker {
         }
     }
 
+    /// Non-mutating predicate: would [`allow`] return `true` if called
+    /// right now?
+    ///
+    /// Used by enumeration / filter paths (e.g.
+    /// [`crate::workers::registry::WorkerRegistry::healthy_workers_for`])
+    /// that need to inspect breaker readiness without claiming a half-open
+    /// probe slot. Calling `allow()` for filtering would leak probe slots
+    /// to unselected candidates and starve dispatch: the policy would
+    /// enumerate a worker as "healthy", then the proxy's `allow()` at
+    /// dispatch time would see `probe_in_flight=true` and reject.
+    ///
+    /// Semantics:
+    /// - `Closed` → `true`
+    /// - `Open` past `cool_down` → `true` (a probe slot is available)
+    /// - `Open` within `cool_down` → `false`
+    /// - `HalfOpen { probe_in_flight: true }` → `false`
+    /// - `HalfOpen { probe_in_flight: false }` → `true`
+    pub fn would_allow(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        match g.state {
+            State::Closed => true,
+            State::Open { opened_at } => opened_at.elapsed() >= self.config.cool_down,
+            State::HalfOpen { probe_in_flight } => !probe_in_flight,
+        }
+    }
+
     /// True if a request may proceed. Mutates state when transitioning
     /// from Open → HalfOpen.
     pub fn allow(&self) -> bool {
