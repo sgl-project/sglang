@@ -1,33 +1,18 @@
-// DeepSeek-V4 cookbook config — the DATA half of the deployment generator.
-// Paired with the engine skeleton at /src/snippets/_deployment.jsx via the
-// MDX page at /cookbook/autoregressive/DeepSeek/DeepSeek-V4.mdx.
+// DeepSeek-V4 cookbook config — paired with /src/snippets/_deployment.jsx.
 //
-// === SHAPE CONTRACT ===
+// SHAPE: must be a single literal `export const config = {...}` — no function
+// calls, spreads, fragment refs, or IIFE. Mintlify re-evaluates this export at
+// hydration time with module-level identifiers out of scope, so any non-literal
+// value fails with `ReferenceError`.
 //
-// This file is a single literal `export const config = {...}` with no
-// function calls, spreads, fragment references, or IIFE. Mintlify's `.jsx`
-// import re-evaluates the export expression at hydration time in a context
-// where module-level identifiers (other than the export itself) are out of
-// scope, so any non-literal value fails with `ReferenceError`. See
-// EXPERIMENT_RESULTS.md in the worktree `mintlify-probe` for the 5-probe
-// validation.
+// Cells are intentionally denormalized: each enumerates its full env + flags,
+// so changing a common flag means sweeping all cells.
 //
-// Every cell explicitly enumerates its full env + flags. There's deliberate
-// repetition between cells — that's the trade-off for being a pure data
-// blob that's trivial to parse, diff, validate, and (eventually) migrate
-// to literal YAML. To change a common flag (`--trust-remote-code`,
-// `--host {{HOST_IP}}`, ...) you do have to sweep all cells.
+// `verified: true` → green "Verified" badge; absence/false → yellow "Auto-Estimated".
 //
-// Engine fields consumed: modelName / supportedHardware / variants /
-// quantizations / strategies / nodesOptions / modelNames / placeholders /
-// curl / cells / multiNodeHints / dockerImages.
-//
-// Verified flag: a cell with `verified: true` shows the green "Verified"
-// badge; absence or `false` shows the yellow "Auto-Estimated" badge.
-//
-// Multi-node note: do NOT include `--nnodes` / `--node-rank` /
-// `--dist-init-addr` in cell.flags. The engine prepends them based on the
-// `match.nodes` id (`single` → 1, `multi-N` → N).
+// Multi-node: do NOT put `--nnodes` / `--node-rank` / `--dist-init-addr` in
+// cell.flags. The engine prepends them from `match.nodes` (`single` → 1,
+// `multi-N` → N).
 
 export const config = {
   modelName: "DeepSeek-V4",
@@ -92,6 +77,12 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   multiNodeHints: {
+    h100: [
+      "The following env vars may be needed depending on your cluster:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>",
+      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
+      "  NVSHMEM_HCA_LIST=<your-hca-list>",
+    ],
     gb200: [
       "The following env vars may be needed depending on your cluster:",
       "  GLOO_SOCKET_IFNAME=<your-nic>",
@@ -103,12 +94,12 @@ export const config = {
   // Per-hardware Docker image. Mirrors the "Docker Images by Hardware
   // Platform" table in §2 of DeepSeek-V4.mdx; if you change one, change both.
   dockerImages: {
-    h100:  "lmsysorg/sglang:dev",
-    h200:  "lmsysorg/sglang:deepseek-v4-hopper",
-    b200:  "lmsysorg/sglang:deepseek-v4-blackwell",
-    b300:  "lmsysorg/sglang:deepseek-v4-b300",
-    gb200: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
-    gb300: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
+    h100:  "lmsysorg/sglang:latest",
+    h200:  "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
   },
 
   // -----------------------------------------------------------------------
@@ -128,10 +119,45 @@ export const config = {
   playgroundFeatures: {
 
     // ----- Card 1: "Attention Parallelism" — 4 knobs (TP/DP/CP/DP-Attention) -----
+    //
+    // Per-chip constraints (engine schema): an entry can be either a bare
+    // value (`null`, `1`, ...) OR an object `{value, hide?, disable?,
+    // disableReason?, label?}`. `hide` / `disable` are constraint objects —
+    // keys are base-cell fields, values are arrays of allowed matches; the
+    // constraint fires only when EVERY key in it matches the current base
+    // (AND across keys).
+    //
+    //   hide    — chip omitted entirely (used for hard impossibilities like
+    //             Pro variant on TP=1: 1.4T-param Pro can't fit on 1 GPU).
+    //   disable — chip greyed out + tooltip (soft warning, user can still
+    //             see the option exists but is unsupported here).
+    //
+    // DeepSeek-V4 specifics:
+    //   - Pro variant won't fit on TP=1/2 regardless of hardware — hide.
+    //   - TP=16 means 16 ranks → single-node has at most 8 GPUs, so
+    //     TP=16 on single-node is impossible — disable (with a hint that
+    //     they should switch §3.1's "Nodes" to multi-2 first).
+    //   - Same constraints mirror onto DP.
     attention: {
       knobs: [
-        { id: "tp",     label: "TP", values: [null, 1, 2, 4, 8, 16] },
-        { id: "dp",     label: "DP", values: [null, 1, 2, 4, 8, 16] },
+        { id: "tp", label: "TP", values: [
+          null,
+          { value: 1, hide: { variant: ["pro"] } },
+          { value: 2, hide: { variant: ["pro"] } },
+          4,
+          8,
+          { value: 16, disable: { nodes: ["single"] },
+            disableReason: "TP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+        ]},
+        { id: "dp", label: "DP", values: [
+          null,
+          { value: 1, hide: { variant: ["pro"] } },
+          { value: 2, hide: { variant: ["pro"] } },
+          4,
+          8,
+          { value: 16, disable: { nodes: ["single"] },
+            disableReason: "DP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+        ]},
         { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, true, false],
@@ -157,7 +183,16 @@ export const config = {
             flags: ["--moe-runner-backend marlin"] },
         ],
       },
-      ep: { label: "EP", values: [null, 1, 2, 4, 8, 16] },
+      // EP=16 is similarly bounded by total ranks — disable on single-node.
+      ep: { label: "EP", values: [
+        null,
+        1,
+        2,
+        4,
+        8,
+        { value: 16, disable: { nodes: ["single"] },
+          disableReason: "EP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+      ]},
     },
 
     // ----- Card 3: "Parsers" — multi-toggle, one chip per item -----
@@ -216,6 +251,47 @@ export const config = {
         { id: "nixl",      label: "nixl" },
       ],
       writePolicies: ["auto", "write_through", "write_back", "write_through_selective"],
+    },
+
+    // ----- Card 7: "MegaMoE" — single-select chip group, Blackwell-only -----
+    // MegaMoE fuses MoE dispatch + GEMM into a single kernel for higher MoE
+    // throughput. Only runnable on Blackwell GPUs — `requiresHw` tells the
+    // engine to hide this card when the base cell's hw is outside the list.
+    //
+    // Each option carries:
+    //   flags        : spliced into the command (swaps the base's
+    //                  --moe-a2a-backend if present, otherwise appends)
+    //   env          : appended to the cell's env block
+    //   stripEnv     : env prefixes to drop from the base cell's env before
+    //                  applying this option (MegaMoE doesn't use the DeepEP
+    //                  dispatch buffer, so the SGLANG_DEEPEP_NUM_MAX_*
+    //                  budget shouldn't be set alongside it).
+    //
+    // Visibility gates (both checked at render time):
+    //   requiresHw       : base cell's hw MUST be in this list
+    //   excludesStrategy : hide when base cell's strategy is in this list
+    //                      (MegaMoE's throughput optimization is incompatible
+    //                      with low-latency mode)
+    //
+    // `disabled` is the no-op identity option; `w4a8` is the standard MegaMoE
+    // kernel; `w4a4` additionally enables the FP4-acts variant.
+    megamoe: {
+      requiresHw: ["b200", "b300", "gb200", "gb300"],
+      excludesStrategy: ["low-latency"],
+      stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
+      options: [
+        { id: "disabled", label: "Disabled" },
+        { id: "w4a8",     label: "W4A8",
+          flags: ["--moe-a2a-backend megamoe"],
+          env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
+        { id: "w4a4",     label: "W4A4",
+          flags: ["--moe-a2a-backend megamoe"],
+          env: [
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+          ] },
+      ],
     },
   },
 
@@ -287,13 +363,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -314,13 +384,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -343,26 +407,21 @@ export const config = {
       ],
     },
     {
+      // Note: this cell ships with `--moe-a2a-backend deepep` as the verified
+      // default. To run B200/B300 Pro max-throughput with MegaMoE, flip the
+      // MegaMoE chip in the §3.3 Playground — it strips the
+      // SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK env and swaps the moe
+      // backend automatically.
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-        "NVSHMEM_DISABLE_IB=1",
-        "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-      ],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-a2a-backend megamoe",
+        "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs 544",
         "--swa-full-tokens-ratio 0.075",
@@ -439,13 +498,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -466,13 +519,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -495,26 +542,18 @@ export const config = {
       ],
     },
     {
+      // Mirrors B200 Pro max-throughput; default is deepep (MegaMoE off).
+      // Use the §3.3 Playground MegaMoE chip to switch to megamoe.
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-        "SGLANG_OPT_USE_JIT_NORM=1",
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-        "SGLANG_OPT_USE_TOPK_V2=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-        "NVSHMEM_DISABLE_IB=1",
-        "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-      ],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-a2a-backend megamoe",
+        "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs 544",
         "--swa-full-tokens-ratio 0.075",
@@ -833,7 +872,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
-        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256",
       ],
       flags: [

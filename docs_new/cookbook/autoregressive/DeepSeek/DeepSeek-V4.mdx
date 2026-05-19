@@ -185,11 +185,9 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 **MegaMoE**
 
 MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
-on MoE layers. To enable it, use the **MegaMoE** toggle in the
-[command generator above](#3-model-deployment) — the generator will swap
-`--moe-a2a-backend deepep` for `--moe-a2a-backend megamoe` and add the
-relevant env vars automatically.
-
+on MoE layers. To enable it, use the **MegaMoE** chip in the §3.3 Playground
+below — the playground will swap `--moe-a2a-backend deepep` for
+`--moe-a2a-backend megamoe` and add the relevant env vars automatically.
 
 Two variants are exposed:
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
@@ -199,8 +197,10 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `balanced` / `cp` settings — it is only wired into the `max-throughput` recipe on Blackwell. When running MegaMoE, don't set `--moe-runner-backend` manually.
-- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 8320 for max-throughput).
+- MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the §3.1 base cell sits on Hopper (H100 / H200).
+- MegaMoE is **not supported on the low-latency strategy** — its throughput-oriented kernel fusion doesn't pay off at bs=1. The chip is hidden when §3.1's strategy is `low-latency`; switch to `balanced` or `max-throughput` to expose it.
+- When running MegaMoE, don't set `--moe-runner-backend` manually.
+- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 4096 for balanced, 8320 for max-throughput).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
