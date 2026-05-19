@@ -346,6 +346,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
         self._rollout_kv_pin_counts = defaultdict(int)
+        self._rollout_kv_pin_nodes = {}
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -419,6 +420,53 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def _rollout_kv_pin_key(self, key: RadixKey):
         return (key.extra_key, key.is_bigram, tuple(key.token_ids))
 
+    def _rollout_kv_pin_refcount_from_params(self, custom_params: dict) -> int:
+        """Returns the pin refcount to add for a single ``rollout_kv_commit`` call.
+
+        Trainers that commit a prefix once but expect N follower requests can pass
+        ``rollout_kv_pin_refcount=N`` (or ``rollout_kv_expected_followers=N``) so
+        the pin survives until all N followers have released it via
+        ``rollout_kv_auto_unprotect_on_finish`` or an explicit
+        ``rollout_kv_unprotect``.
+        """
+        for name in ("rollout_kv_pin_refcount", "rollout_kv_expected_followers"):
+            value = custom_params.get(name)
+            if value is not None:
+                return max(int(value), 1)
+        return 1
+
+    def _rollout_kv_release_pin(
+        self,
+        pin_key,
+        release_count: int = 1,
+        release_all: bool = False,
+    ) -> bool:
+        """Decrement (or fully drop) the persistent pin for ``pin_key``.
+
+        Returns ``True`` iff the pin's lock_ref was actually released (i.e. the
+        refcount dropped to zero). Returns ``False`` if there was nothing to
+        release or if more followers still hold the pin.
+        """
+        current = int(self._rollout_kv_pin_counts.get(pin_key, 0))
+        if current <= 0:
+            return False
+
+        next_count = 0 if release_all else current - max(int(release_count), 1)
+        if next_count > 0:
+            self._rollout_kv_pin_counts[pin_key] = next_count
+            return False
+
+        node = self._rollout_kv_pin_nodes.pop(pin_key, None)
+        self._rollout_kv_pin_counts.pop(pin_key, None)
+        if node is None or node is self.root_node:
+            logger.warning(
+                "RolloutKV attempted to release a missing pin: %s", pin_key
+            )
+            return False
+
+        self.dec_lock_ref(node)
+        return True
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -446,6 +494,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         rollout_kv_commit = bool(custom_params.get("rollout_kv_commit", False))
         rollout_kv_reuse_only = bool(custom_params.get("rollout_kv_reuse_only", False))
         rollout_kv_unprotect = bool(custom_params.get("rollout_kv_unprotect", False))
+        rollout_kv_auto_unprotect = bool(
+            custom_params.get("rollout_kv_auto_unprotect_on_finish", False)
+        )
 
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert and not rollout_kv_commit:
@@ -502,24 +553,29 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 rollout_kv_commit
                 and custom_params.get("rollout_kv_protect", True)
                 and key_len > 0
+                and rollout_kv_pin_key is not None
             ):
-                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-                self.inc_lock_ref(match_result.last_device_node)
-                self._rollout_kv_pin_counts[rollout_kv_pin_key] += 1
-        elif rollout_kv_unprotect and rollout_kv_pin_key is not None:
-            pin_count = self._rollout_kv_pin_counts.get(rollout_kv_pin_key, 0)
-            if pin_count > 0:
-                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-                if len(match_result.device_indices) == key_len:
-                    self.dec_lock_ref(match_result.last_device_node)
-                    if pin_count == 1:
-                        del self._rollout_kv_pin_counts[rollout_kv_pin_key]
-                    else:
-                        self._rollout_kv_pin_counts[rollout_kv_pin_key] -= 1
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
+                add_refs = self._rollout_kv_pin_refcount_from_params(custom_params)
+                if self._rollout_kv_pin_counts[rollout_kv_pin_key] <= 0:
+                    match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+                    self.inc_lock_ref(match_result.last_device_node)
+                    self._rollout_kv_pin_nodes[rollout_kv_pin_key] = (
+                        match_result.last_device_node
+                    )
+                self._rollout_kv_pin_counts[rollout_kv_pin_key] += add_refs
         else:
+            if rollout_kv_unprotect and rollout_kv_pin_key is not None:
+                self._rollout_kv_release_pin(
+                    rollout_kv_pin_key,
+                    release_count=int(
+                        custom_params.get("rollout_kv_unprotect_count", 1)
+                    ),
+                    release_all=bool(
+                        custom_params.get("rollout_kv_unprotect_all", False)
+                    ),
+                )
+            elif rollout_kv_auto_unprotect and rollout_kv_pin_key is not None:
+                self._rollout_kv_release_pin(rollout_kv_pin_key)
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
