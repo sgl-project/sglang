@@ -31,6 +31,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_POSITION,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
+    CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_FIELDS_PER_SLOT,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
@@ -73,6 +74,7 @@ _EXPECTED_PAIRS: Dict[str, int] = {
     "kRealKvHashModeOff": REAL_KV_HASH_MODE_OFF,
     "kRealKvHashModeBit": REAL_KV_HASH_MODE_BIT,
     "kRealKvHashModeAll": REAL_KV_HASH_MODE_ALL,
+    "kCanaryExpectedSkipSentinel": CANARY_EXPECTED_SKIP_SENTINEL,
 }
 
 

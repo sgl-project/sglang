@@ -36,6 +36,10 @@ REAL_KV_HASH_MODE_BIT: int = 1
 REAL_KV_HASH_MODE_ALL: int = 2
 REAL_KV_HASH_BIT_BYTES: int = 16
 
+# Skip-sentinel value for expected_write_{token_ids,positions}. Mirrored
+# as ``kCanaryExpectedSkipSentinel`` in canary.cuh.
+CANARY_EXPECTED_SKIP_SENTINEL: int = -1
+
 # Violation-row field offsets. Mirrors the kViolationField* constants.
 _VIOLATION_FIELD_KERNEL_KIND: int = 0
 _VIOLATION_FIELD_FAIL_REASON: int = 1
@@ -124,6 +128,7 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kRealKvHashModeOff",
     "kRealKvHashModeBit",
     "kRealKvHashModeAll",
+    "kCanaryExpectedSkipSentinel",
 )
 
 

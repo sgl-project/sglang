@@ -17,6 +17,7 @@ import random
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     VIOLATION_FIELDS,
@@ -81,8 +82,12 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         write_req_entry_starts=torch.zeros(1, dtype=torch.int64, device="cuda"),
         write_req_entry_counts=torch.full((1,), n, dtype=torch.int64, device="cuda"),
         write_req_active_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
-        expected_write_token_ids=torch.full((n,), -1, dtype=torch.int64, device="cuda"),
-        expected_write_positions=torch.full((n,), -1, dtype=torch.int64, device="cuda"),
+        expected_write_token_ids=torch.full(
+            (n,), CANARY_EXPECTED_SKIP_SENTINEL, dtype=torch.int64, device="cuda"
+        ),
+        expected_write_positions=torch.full(
+            (n,), CANARY_EXPECTED_SKIP_SENTINEL, dtype=torch.int64, device="cuda"
+        ),
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],

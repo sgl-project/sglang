@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
@@ -91,8 +92,12 @@ def _run(
     expected_write_positions: list[int] | None = None,
 ) -> None:
     n_write_padded = len(write_slot_indices) or 1
-    expected_write_token_ids = expected_write_token_ids or [-1] * n_write_padded
-    expected_write_positions = expected_write_positions or [-1] * n_write_padded
+    expected_write_token_ids = expected_write_token_ids or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
+    )
+    expected_write_positions = expected_write_positions or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
+    )
     canary_step(
         src_buf=src.flatten(),
         dst_buf=dst.flatten(),
@@ -556,10 +561,10 @@ def _i32_on(values: list[int], device: str) -> torch.Tensor:
 def _build_inputs_on(device: str, **plan_lists) -> dict:
     n_write = max(len(plan_lists["write_slot_indices"]), 1)
     expected_write_token_ids = plan_lists.get("expected_write_token_ids") or (
-        [-1] * n_write
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
     )
     expected_write_positions = plan_lists.get("expected_write_positions") or (
-        [-1] * n_write
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
     )
     return dict(
         verify_slot_indices=_i64_on(plan_lists["verify_slot_indices"], device),

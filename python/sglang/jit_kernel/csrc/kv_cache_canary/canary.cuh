@@ -34,6 +34,11 @@ constexpr int kFailReasonRealKvHash = 5;
 constexpr int kFailReasonInputTokenMismatch = 6;
 constexpr int kFailReasonInputPositionMismatch = 7;
 
+// Value the host fills into expected_write_{token_ids,positions} for
+// entries with no oracle prediction (always-on canary callers, or
+// padding past num_write under cuda-graph fixed-capacity buffers).
+constexpr int64_t kCanaryExpectedSkipSentinel = -1;
+
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
 // fingerprint entirely; ``BIT`` mixes the first 16 bytes of the
@@ -345,7 +350,7 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
     // so a buggy token / position cannot taint prev_hash and produce a
     // self-consistent chain that masks the input divergence.
     const int64_t expected_token = p.expected_write_token_ids[i];
-    if (expected_token != -1 && expected_token != token_id) {
+    if (expected_token != kCanaryExpectedSkipSentinel && expected_token != token_id) {
       record_violation(
           p,
           kFailReasonInputTokenMismatch,
@@ -357,7 +362,7 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
           0);
     }
     const int64_t expected_pos = p.expected_write_positions[i];
-    if (expected_pos != -1 && expected_pos != position) {
+    if (expected_pos != kCanaryExpectedSkipSentinel && expected_pos != position) {
       record_violation(
           p,
           kFailReasonInputPositionMismatch,
@@ -553,7 +558,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 24;
+constexpr int kConstantsCount = 25;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -584,6 +589,7 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kRealKvHashModeOff;
   dst[i++] = kRealKvHashModeBit;
   dst[i++] = kRealKvHashModeAll;
+  dst[i++] = kCanaryExpectedSkipSentinel;
 }
 
 }  // namespace
