@@ -27,6 +27,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.radix_cache import TreeNode
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -197,19 +198,20 @@ def walk_radix_cache_for_canary(
     :func:`canary_plan_step`. The walk visits every node reachable from the root and emits one entry per
     slot held by the node, chained by node-internal position (and across parent → child boundaries).
 
-    Subclasses of :class:`BasePrefixCache` not exposing a walkable ``root_node`` (e.g. chunk cache, C++
-    radix) return empty tensors — sweep degrades to running-only coverage on those backends.
+    Only :class:`RadixCache` is walked — other :class:`BasePrefixCache` implementations (chunk cache, C++
+    radix) return empty tensors, so sweep degrades to running-only coverage on those backends.
     """
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+
+    if not isinstance(radix_cache, RadixCache):
+        return _empty_walk_result(device=device)
+
     slot_list: List[int] = []
     position_list: List[int] = []
     prev_slot_list: List[int] = []
 
-    root = getattr(radix_cache, "root_node", None)
-    if root is None:
-        return _empty_walk_result(device=device)
-
     _walk_node(
-        node=root,
+        node=radix_cache.root_node,
         depth=0,
         parent_last_slot=-1,
         slot_list=slot_list,
@@ -228,7 +230,7 @@ def walk_radix_cache_for_canary(
 
 def _walk_node(
     *,
-    node: object,
+    node: "TreeNode",
     depth: int,
     parent_last_slot: int,
     slot_list: List[int],
@@ -240,13 +242,10 @@ def _walk_node(
     Each node contributes ``len(node.value)`` slots; intra-node chain is sequential and the first slot of a
     non-root node uses ``parent_last_slot`` as its predecessor (or ``-1`` when the walk begins at root).
     """
-    value = getattr(node, "value", None)
-    children = getattr(node, "children", None)
-
     node_slots: List[int] = []
-    if value is not None:
+    if node.value is not None:
         try:
-            node_slots = [int(s) for s in list(value)]
+            node_slots = [int(s) for s in list(node.value)]
         except (TypeError, ValueError):
             node_slots = []
 
@@ -258,13 +257,7 @@ def _walk_node(
         prev_slot_list.append(prev)
         last_slot_for_children = slot
 
-    if children is None:
-        return
-    try:
-        iterator = children.values() if hasattr(children, "values") else iter(children)
-    except TypeError:
-        return
-    for child in iterator:
+    for child in node.children.values():
         _walk_node(
             node=child,
             depth=depth + len(node_slots),
