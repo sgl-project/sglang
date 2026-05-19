@@ -654,15 +654,12 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = origin_input_ids
-        # origin_input_ids_unpadded must be array per the signature
-        # annotation; fall back to the already-coerced self.origin_input_ids
-        # when caller doesn't override (e.g., pre-image-padding).
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
-            if origin_input_ids_unpadded is not None
-            else self.origin_input_ids
+            if origin_input_ids_unpadded
+            else origin_input_ids  # Before image padding
         )
+        self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -1113,7 +1110,7 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = list(
+            self.surr_and_decode_ids = (
                 self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
             )
             self.cur_decode_ids_len = len(output_ids)
