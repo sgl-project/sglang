@@ -149,11 +149,6 @@ class FutureMap:
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
-            # Alias input_ids to the bonus_tokens channel view so the
-            # "input_ids = last committed token" invariant holds across
-            # spec/non-spec. Spec forward overwrites this (draft_forward /
-            # prepare_for_v2_verify); only matters between iters.
-            batch.input_ids = draft_input.bonus_tokens
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
