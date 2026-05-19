@@ -49,14 +49,14 @@ suite_amd = {
 # x86-specific BF16 BRGEMM/VNNI path on Arm and need dedicated fallbacks.
 suite_arm64 = {
     "per-commit-cpu-arm64": [
-        TestFile("../registered/cpu/test_activation.py"),
-        TestFile("../registered/cpu/test_decode.py"),
-        TestFile("../registered/cpu/arm64/test_moe.py"),
-        TestFile("../registered/cpu/test_norm.py"),
-        TestFile("../registered/cpu/test_qwen3.py"),
-        TestFile("../registered/cpu/test_rope.py"),
-        TestFile("../registered/cpu/test_server_args_backend.py"),
-        TestFile("../registered/cpu/test_topk.py"),
+        TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_decode.py"),
+        TestFile("cpu/arm64/test_moe.py"),
+        TestFile("cpu/test_norm.py"),
+        TestFile("cpu/test_qwen3.py"),
+        TestFile("cpu/test_rope.py"),
+        TestFile("cpu/test_server_args_backend.py"),
+        TestFile("cpu/test_topk.py"),
     ],
 }
 
