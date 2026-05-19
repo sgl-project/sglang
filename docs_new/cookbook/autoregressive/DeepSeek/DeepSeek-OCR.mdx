@@ -38,10 +38,6 @@ import { DeepSeekOCRDeployment } from "/src/snippets/autoregressive/deepseek-ocr
 
 <DeepSeekOCRDeployment />
 
-### 3.2 Configuration Tips
-
-For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
-
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -50,6 +46,52 @@ For basic API usage and request examples, please refer to:
 
 - [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
+### 4.2 OCR-Specific Prompts
+
+DeepSeek-OCR accepts recommended prompts from the model card:
+
+```text
+<image>
+<|grounding|>Convert the document to markdown.
+```
+
+```text
+<image>
+Free OCR.
+```
+
+**OpenAI-compatible image request example:**
+
+```python Example
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "deepseek-ai/DeepSeek-OCR-2",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<image>\n<|grounding|>Convert the document to markdown."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/your_image.jpg"}
+                },
+            ],
+        }
+    ],
+    "max_tokens": 512,
+}
+
+response = requests.post(url, json=data)
+print(response.text)
+```
+
+> Replace `deepseek-ai/DeepSeek-OCR-2` with `deepseek-ai/DeepSeek-OCR` to use the original OCR-1 model.
 
 ## 5. Benchmark
 

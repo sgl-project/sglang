@@ -69,6 +69,31 @@ This section provides a progressive guide from quick deployment to performance o
 
 <MiniMaxM2Deployment />
 
+### 3.2 System Requirements
+
+Recommended configurations — actual requirements depend on workload:
+
+| GPUs | Context Length Support |
+|------|----------------------|
+| 4× 96 GB GPUs | Up to 400K tokens |
+| 8× 144 GB GPUs | Up to 3M tokens |
+
+### 3.3 Testing Deployment
+
+After the server starts, verify with:
+
+```shell Command
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "MiniMaxAI/MiniMax-M2",
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]},
+            {"role": "user", "content": [{"type": "text", "text": "Who won the world series in 2020?"}]}
+        ]
+    }'
+```
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
