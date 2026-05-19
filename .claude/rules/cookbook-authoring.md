@@ -10,14 +10,14 @@ This guide tells future contributors (humans and coding agents) how to:
 Before doing either, read the file headers of the two engine files (they are
 the canonical contract specs):
 
-- [_deployment.jsx](./_deployment.jsx) — the 5-dim matrix widget. Header
+- [_deployment.jsx](../../docs_new/src/snippets/_deployment.jsx) — the 5-dim matrix widget. Header
   lists every config field the engine reads.
-- [_playground.jsx](./_playground.jsx) — the diff-based override widget.
+- [_playground.jsx](../../docs_new/src/snippets/_playground.jsx) — the diff-based override widget.
   Header lists the recognised `playgroundFeatures` axes and the
   `AXIS_HANDLERS` interface.
 
 A reference config to copy from:
-[configs/deepseek-ai/deepseek-v4.jsx](./configs/deepseek-ai/deepseek-v4.jsx).
+[configs/deepseek-ai/deepseek-v4.jsx](../../docs_new/src/snippets/configs/deepseek-ai/deepseek-v4.jsx).
 
 ---
 
@@ -90,7 +90,7 @@ this export at hydration time with module-level identifiers out of scope,
 and any non-literal value crashes with `ReferenceError`.
 
 **Required fields** (engine reads these — see
-[_deployment.jsx](./_deployment.jsx) header for the full contract):
+[_deployment.jsx](../../docs_new/src/snippets/_deployment.jsx) header for the full contract):
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -167,7 +167,7 @@ automatically.
 
 The Playground widget is opt-in per axis. Add only the axes that make sense
 for this model. Recognised axis keys and their schemas (full reference in
-[_playground.jsx](./_playground.jsx) header):
+[_playground.jsx](../../docs_new/src/snippets/_playground.jsx) header):
 
 | Axis key | Widget | Use when |
 |---|---|---|
@@ -284,7 +284,11 @@ Pick ONE "inherit base" sentinel and document it in the handler comment.
 
 ### 3.3 Implement the handler
 
-Add one entry to `AXIS_HANDLERS` in [_playground.jsx](./_playground.jsx).
+Add one entry to `AXIS_HANDLERS` in [_playground.jsx](../../docs_new/src/snippets/_playground.jsx).
+The handler owns everything: state init, apply (strip+insert), hidden-revert,
+AND the JSX render. Engine main loop iterates `AXIS_HANDLERS` and calls each
+method by name — adding a new axis is genuinely a one-place change.
+
 Template:
 
 ```js
@@ -325,12 +329,16 @@ Template:
   // to report its role banner. Omit if not needed.
   // getRenderHints: (value, fc) => ({ pdMode: ... }) | null,
 
+  // Returns the axis card JSX. The outer div MUST have key={axisId} so
+  // React can track it in the engine's map loop. Return null for
+  // axis-level gating (e.g. MegaMoE on Hopper).
   render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
     if (/* axis-level gating fails */) return null;
     return (
       <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
         <div style={s.title}>Axis Title</div>
-        {/* chip rows / sub-rows etc. */}
+        {/* chip rows / sub-rows. Read state from `value`; write via
+            `setValue(next)` (replaces the whole axis slot). */}
       </div>
     );
   },
@@ -346,12 +354,16 @@ Template:
   block.
 - Use lowercase HTML JSX tags only. Capitalized tags get rebound by
   Mintlify.
-- The render function must return a JSX element whose outer `<div>` has
-  `key={axisId}` (so React can track it in the engine's map loop).
-- Avoid mutating `value` — return a fresh object from event handlers,
-  e.g. `setValue({ ...value, foo: nextFoo })`.
-- If your apply needs information about the base cell (not just `sel`),
-  pull it from `fc` or `sel`. Don't reach into other axes' state.
+- Inside `render`, read state via `value` (the slice for this axis).
+  Write state via `setValue(next)` (replaces the whole slice). For
+  compound axes, do `setValue({ ...value, [k]: nextK })`.
+- Per-chip constraint handling: always call `h.evaluateChip(entry, base)`
+  inside `.map` and skip when `c.hidden`. Pass `c.disabled` /
+  `c.disableReason` to `renderChip` for the soft-warning case.
+- **Avoid the `in` operator wrapped in unary** (`!(x in y)`). Mintlify's
+  AST walker crashes on it (`TypeError: this[e] is not a function`). Use
+  `obj.key === undefined` or `obj.id !== undefined` instead. Bare
+  `if (key in obj)` (no surrounding `!`) is fine.
 
 ### 3.4 Document the per-cookbook schema
 
@@ -359,7 +371,7 @@ Edit the file header in `_playground.jsx` to add your new axis to the
 "Recognised keys" list, with a one-line description of its schema.
 Optionally add a paragraph below explaining its strip/insert policy.
 
-Update `_AUTHORING.md` §2.3 table to list the new axis.
+Update `cookbook-authoring.md` §2.3 table to list the new axis.
 
 ### 3.5 Migrate cookbooks that need it
 
@@ -396,8 +408,9 @@ Use this list when reviewing a new cookbook PR or a new axis PR.
 
 **New axis PR**:
 
-- [ ] `AXIS_HANDLERS` is the ONLY place that mentions the new axis id.
-- [ ] No `if (axisId === '<new>')` branches anywhere in the engine.
+- [ ] `AXIS_HANDLERS` is the ONLY place that mentions the new axis id
+      (apart from per-cookbook config). No `if (axisId === '<new>')`
+      branches anywhere in the engine.
 - [ ] `initState` is deterministic and idempotent (does not depend on
       the base cell).
 - [ ] `apply` is pure — does not mutate inputs.
@@ -405,6 +418,8 @@ Use this list when reviewing a new cookbook PR or a new axis PR.
       (avoids unnecessary re-renders).
 - [ ] `render` returns `null` when axis-level gating fails (whole card
       hidden) — does not render an empty placeholder.
+- [ ] `render` sets `key={axisId}` on its outer element.
+- [ ] No `!(x in y)` patterns introduced (Mintlify AST walker crashes).
 - [ ] File header lists the new axis in "Recognised keys".
 - [ ] §2.3 table in this file lists the new axis.
 - [ ] One existing cookbook config is updated to consume the new axis,

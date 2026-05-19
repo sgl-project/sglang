@@ -7,7 +7,7 @@
 //     import { config }    from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 //     <Playground config={config} />
 //
-// AUTHORING — read _AUTHORING.md in this directory for the step-by-step
+// AUTHORING — read .claude/rules/cookbook-authoring.md for the step-by-step
 // workflow on adding a new cookbook or extending the engine with a new
 // playground axis.
 //
@@ -40,12 +40,25 @@
 // part of the engine should ever switch on an axis id.
 //
 // Each handler exposes a uniform 4-method interface:
-//   initState(featureConfig)              → initial delta value
+//   initState(featureConfig)               → initial delta value
 //   revertHidden(value, fc, base, helpers) → next value (same ref if unchanged)
 //   apply({flags, env, value, fc, sel, helpers}) → next {flags, env}
 //   render({axisId, value, setValue, fc, base, s, helpers, renderChip}) → JSX | null
 // Plus one optional method:
-//   getRenderHints(value, fc)             → {pdMode?, ...} hints for renderer
+//   getRenderHints(value, fc)              → {pdMode?, ...} hints for renderer
+//
+// MINTLIFY GOTCHAS LEARNED THE HARD WAY
+// -------------------------------------
+// Mintlify's MDX/JSX AST walker has dispatch handlers for common node types
+// but NOT all. We hit one: `!(x in y)` — i.e. `in` operator inside `!()` —
+// crashes the walker with `TypeError: this[e] is not a function` because
+// the UnaryExpression visitor recurses into a BinaryExpression child whose
+// sub-handler is missing. Workaround patterns:
+//   - Avoid `!(... in ...)`. Use `obj.key === undefined` or
+//     `obj.id !== undefined` when checking key existence.
+//   - Bare `if (key in obj)` (not wrapped in unary) works fine.
+// If you hit a similar `this[e] is not a function` in dev server output,
+// look for unusual JS expressions you added; rewrite to plainer JS.
 //
 // MINTLIFY CAVEATS THIS FILE ROUTES AROUND
 // ----------------------------------------
@@ -148,7 +161,9 @@ export const Playground = ({ config }) => {
     }
     return {
       ...entry,
-      value: "value" in entry ? entry.value : entry.id,
+      // Rich option form has `id`; wrapper form has `value` (and no `id`).
+      // Avoid the `in` operator — Mintlify's AST walker crashes on it.
+      value: entry.id !== undefined ? entry.id : entry.value,
       label: entry.label,
       hidden,
       disabled,
@@ -159,8 +174,9 @@ export const Playground = ({ config }) => {
   // Lookup helpers used by both render code and revertHidden handlers.
   const findEntry = (entries, picked) => {
     for (const e of (entries || [])) {
+      // Same rich-vs-wrapper resolution as evaluateChip.
       const v = (e === null || typeof e !== "object")
-        ? e : ("value" in e ? e.value : e.id);
+        ? e : (e.id !== undefined ? e.id : e.value);
       if (v === picked) return e;
     }
     return null;
@@ -592,8 +608,8 @@ export const Playground = ({ config }) => {
 
       render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
-        const showModes  = (fc.modes      || []).length > 0;
-        const showIb     = (fc.ibDevices  || []).length > 0;
+        const showModes = (fc.modes     || []).length > 0;
+        const showIb    = (fc.ibDevices || []).length > 0;
         if (!showModes && !showIb) return null;
         return (
           <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
@@ -737,15 +753,13 @@ export const Playground = ({ config }) => {
     megamoe: {
       initState: () => "disabled",
 
-      // Centralised gate check — used by both render and revertHidden.
-      _gateOpen: (fc, base) => {
+      revertHidden: (value, fc, base, h) => {
+        // Axis-level gates: hw must be in requiresHw, strategy must NOT be in
+        // excludesStrategy. Same check is duplicated in the JSX render below
+        // for hiding the card; keep them in sync.
         const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
         const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        return hwGate && stratGate;
-      },
-
-      revertHidden: (value, fc, base, h) => {
-        if (!AXIS_HANDLERS.megamoe._gateOpen(fc, base)) {
+        if (!hwGate || !stratGate) {
           return value === "disabled" ? value : "disabled";
         }
         if (value !== "disabled" && h.isHidden(fc.options || [], value, base)) {
@@ -773,7 +787,12 @@ export const Playground = ({ config }) => {
       },
 
       render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
-        if (!AXIS_HANDLERS.megamoe._gateOpen(fc, base)) return null;
+        // Inline axis-level gate check (matches the one in revertHidden above).
+        // Kept in sync rather than extracted to a shared method to avoid the
+        // cross-reference complexity that hurt readability earlier.
+        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
+        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
+        if (!hwGate || !stratGate) return null;
         return (
           <div key={axisId} style={s.card}>
             <div style={s.title}>MegaMoE</div>
@@ -807,7 +826,9 @@ export const Playground = ({ config }) => {
       if (!fc) continue;
       const value = allDeltas[axisId];
       if (value === undefined) continue;
-      ({ flags, env } = handler.apply({ flags, env, value, fc, sel, h: helpers }));
+      const out = handler.apply({ flags, env, value, fc, sel, h: helpers });
+      flags = out.flags;
+      env = out.env;
       if (handler.getRenderHints) {
         const hints = handler.getRenderHints(value, fc) || {};
         if (hints.pdMode) pdMode = hints.pdMode;
@@ -1182,7 +1203,10 @@ export const Playground = ({ config }) => {
       let mutated = false;
       for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
         const fc = pgFeatures[axisId];
-        if (!fc || !(axisId in d)) continue;
+        // Avoid `!(axisId in d)` — Mintlify's AST walker crashes on the
+        // `in` operator wrapped in a unary. Use undefined check instead;
+        // deltas never store explicit-undefined values.
+        if (!fc || d[axisId] === undefined) continue;
         const nv = handler.revertHidden(d[axisId], fc, base, helpers);
         if (nv !== d[axisId]) {
           if (!mutated) { next = { ...d }; mutated = true; }
@@ -1295,10 +1319,11 @@ export const Playground = ({ config }) => {
         <button style={s.resetBtn} onClick={resetAll}>Reset all overrides</button>
       </div>
 
-      {/* Axes — one card per declared axis, in AXIS_HANDLERS declaration order.
-          Axes whose key is missing from pgFeatures are skipped entirely. Each
-          handler's render() may also return null for axis-level gating (e.g.
-          MegaMoE hidden on Hopper / low-latency). */}
+      {/* Axes — one card per declared axis, in AXIS_HANDLERS declaration
+          order. Axes whose key is missing from pgFeatures are skipped
+          entirely. Each handler's render() may also return null for
+          axis-level gating (e.g. MegaMoE hidden on Hopper / low-latency).
+          Engine never switches on axis id here. */}
       {Object.entries(AXIS_HANDLERS).map(([axisId, handler]) => {
         const fc = pgFeatures[axisId];
         if (!fc) return null;
