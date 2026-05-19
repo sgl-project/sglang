@@ -1765,9 +1765,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.server_args.incremental_streaming_output and is_stream
                 )
                 delta_text = recv_obj.output_strs[i]
-                # delta_output_ids is array.array('q') after the
-                # pyarray-tokens migration; cast to list at the HTTP
-                # boundary since orjson can't serialize array.array.
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
@@ -1811,7 +1808,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                # See pyarray-tokens note above: cast at HTTP boundary.
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)

@@ -213,7 +213,7 @@ class Session:
                 input_ids_unpadded += req.input_ids
         else:
             input_ids = req.input_ids
-            input_ids_unpadded = input_ids
+            input_ids_unpadded = req.input_ids
 
         new_req = Req(
             rid=req.rid,
