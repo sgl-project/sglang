@@ -140,13 +140,6 @@ class CanaryEndpoint:
         )
 
 
-_SLOT_HEAD = "HEAD"
-_SLOT_TAIL = "TAIL"
-_SLOT_SWEEP = "SWEEP"
-_HALF_K = "K"
-_HALF_V = "V"
-
-
 def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
     return tag in (
         CanaryLaunchTag.SWEEP_K_FULL,
@@ -156,28 +149,17 @@ def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
     )
 
 
-def _resolve_launch_tag(
-    *, slot: str, half: str, pool_kind: PoolKind
-) -> CanaryLaunchTag:
-    suffix = "FULL" if pool_kind is PoolKind.FULL else "SWA"
-    return CanaryLaunchTag[f"{slot}_{half}_{suffix}"]
-
-
 def _resolve_canary_buf(
     *,
     slot: str,
     half: str,
     group: CanaryBufferGroup,
 ) -> torch.Tensor:
-    if half == _HALF_K:
-        if slot == _SLOT_HEAD:
+    if half == "K":
+        if slot == "HEAD":
             return group.k_head
         return group.k_tail
-    if group.v_head is None or group.v_tail is None:
-        raise ValueError(
-            "kv-canary: cannot resolve V-half buffer on group without V half (MLA-style pool)"
-        )
-    if slot == _SLOT_HEAD:
+    if slot == "HEAD":
         return group.v_head
     return group.v_tail
 
@@ -187,7 +169,7 @@ def _resolve_real_kv_sources(
     half: str,
     group: CanaryBufferGroup,
 ) -> tuple[RealKvSource, ...]:
-    if half == _HALF_K:
+    if half == "K":
         return group.real_kv_sources_k
     return group.real_kv_sources_v
 
@@ -195,7 +177,6 @@ def _resolve_real_kv_sources(
 def build_endpoints_from_group(
     *,
     group: CanaryBufferGroup,
-    pool_kind: PoolKind,
     device_state: CanaryDeviceState,
 ) -> tuple[CanaryEndpoint, ...]:
     """Enumerate (slot × half) endpoints for one CanaryBufferGroup.
@@ -212,28 +193,33 @@ def build_endpoints_from_group(
     The SWA LUT (group.swa_index_lut) is threaded into the endpoint's full_to_swa_index_mapping for SWA
     groups and left None for FULL groups.
     """
-    halves: tuple[str, ...] = (_HALF_K, _HALF_V) if group.has_v_half else (_HALF_K,)
-    slots: tuple[str, ...] = (_SLOT_HEAD, _SLOT_TAIL, _SLOT_SWEEP)
+    pool_kind = group.kind
+    expected_suffix = pool_kind.name
 
     endpoints: list[CanaryEndpoint] = []
-    for slot in slots:
-        for half in halves:
-            tag = _resolve_launch_tag(slot=slot, half=half, pool_kind=pool_kind)
-            buf_slot = _SLOT_TAIL if slot == _SLOT_SWEEP else slot
-            canary_buf = _resolve_canary_buf(slot=buf_slot, half=half, group=group)
-            real_kv_sources = _resolve_real_kv_sources(half=half, group=group)
-            lut = group.swa_index_lut if pool_kind is PoolKind.SWA else None
-            slot_view = device_state.slot_run_counters[tag.value : tag.value + 1]
-            kernel_view = device_state.kernel_run_counters[tag.value : tag.value + 1]
-            endpoints.append(
-                CanaryEndpoint(
-                    kernel_kind=tag,
-                    canary_buf=canary_buf,
-                    full_to_swa_index_mapping=lut,
-                    real_kv_sources=real_kv_sources,
-                    slot_run_counter_view=slot_view,
-                    kernel_run_counter_view=kernel_view,
-                )
+    for tag in CanaryLaunchTag:
+        slot, half, suffix = tag.name.split("_")
+
+        if suffix != expected_suffix:
+            continue
+        if half == "V" and not group.has_v_half:
+            continue
+
+        buf_slot = "TAIL" if slot == "SWEEP" else slot
+        canary_buf = _resolve_canary_buf(slot=buf_slot, half=half, group=group)
+        real_kv_sources = _resolve_real_kv_sources(half=half, group=group)
+        lut = group.swa_index_lut if pool_kind is PoolKind.SWA else None
+        slot_view = device_state.slot_run_counters[tag.value : tag.value + 1]
+        kernel_view = device_state.kernel_run_counters[tag.value : tag.value + 1]
+        endpoints.append(
+            CanaryEndpoint(
+                kernel_kind=tag,
+                canary_buf=canary_buf,
+                full_to_swa_index_mapping=lut,
+                real_kv_sources=real_kv_sources,
+                slot_run_counter_view=slot_view,
+                kernel_run_counter_view=kernel_view,
             )
+        )
 
     return tuple(endpoints)
