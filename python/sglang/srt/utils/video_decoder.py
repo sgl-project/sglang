@@ -102,15 +102,23 @@ class VideoDecoderWrapper:
             return self._decoder.get_batch(indices).asnumpy()
 
     def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+        """Return frames at given indices as a torch tensor (NHWC, uint8). pin_memory is best-effort."""
         import torch
+
+        def _maybe_pin(t):
+            if t.device.type == "cpu":
+                try:
+                    return t.pin_memory()
+                except RuntimeError:
+                    return t
+            return t
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return _maybe_pin(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return _maybe_pin(torch.from_numpy(arr))
 
     @property
     def source_bytes(self) -> bytes | None:
