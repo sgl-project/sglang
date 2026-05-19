@@ -2310,6 +2310,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         token_values = envs.SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS.get()
+        legacy_token_values = envs.SGLANG_DSV4_MHC_PREWARM_TOKENS.get()
+        if not token_values and legacy_token_values:
+            token_values = legacy_token_values
+            logger.warning(
+                "SGLANG_DSV4_MHC_PREWARM_TOKENS is deprecated; use "
+                "SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS instead."
+            )
         if not token_values:
             return
 
