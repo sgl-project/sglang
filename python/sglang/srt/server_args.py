@@ -27,6 +27,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -6049,14 +6050,16 @@ class ServerArgs:
             "--kv-cache-canary-real-data",
             type=str,
             default=ServerArgs.kv_cache_canary_real_data,
-            choices=["off", "portion", "all"],
+            choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
-                "chain hash. 'off' (default) leaves the real_kv_hash slot field "
-                "at zero. 'portion' reads the first 16 bytes of the real KV "
-                "pool's slot at write time, folds through splitmix64, and "
-                "verifies on read; useful when corruption is suspected but "
-                "overhead must stay tiny. 'all' reads the full real-KV slot "
+                "chain hash. Choices are derived from the ``RealKvHashMode`` "
+                "enum (kv_cache_canary_verify.py) so the CLI surface and the "
+                "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
+                "leaves the real_kv_hash slot field at zero. 'bit' XOR-folds a "
+                "single bit per real-KV byte at write time and verifies on "
+                "read; useful when corruption is suspected but overhead must "
+                "stay tiny. 'all' splitmix64-folds the full real-KV slot "
                 "stride for maximum coverage at higher cost. Catches "
                 "corruption that the pure-canary path misses because the "
                 "canary slot itself is intact but the real KV got written "
@@ -6077,7 +6080,7 @@ class ServerArgs:
                 "writes; the sweep also catches drift on history slots that "
                 "were frozen earlier (e.g. PD-transfer bit-rot, idle dummy "
                 "writes, rowhammer-style flips). Requires "
-                "--kv-cache-canary-real-data in {portion, all} and "
+                "--kv-cache-canary-real-data in {bit, all} and "
                 "--kv-cache-canary in {log, raise}."
             ),
         )
@@ -7074,7 +7077,7 @@ class ServerArgs:
             if self.kv_cache_canary_real_data == "off":
                 raise ValueError(
                     "--kv-cache-canary-real-data-sweep-every-n-steps requires "
-                    "--kv-cache-canary-real-data in {portion, all}"
+                    "--kv-cache-canary-real-data in {bit, all}"
                 )
             if self.kv_cache_canary == "off":
                 raise ValueError(
