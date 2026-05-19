@@ -26,7 +26,11 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -58,6 +62,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -76,6 +81,12 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+
+if not _is_hip:
+    from sglang.srt.layers.utils.cp_utils import (
+        prepare_context_parallel_metadata,
+    )
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -93,6 +104,9 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
+    )
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -200,6 +214,16 @@ class MQALayer(nn.Module):
 
         rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
+        self.rotary_emb = get_rope_wrapper(
+            head_size=self.rope_head_dim,
+            rotary_dim=self.rope_head_dim,
+            max_position=config.max_position_embeddings,
+            base=rope_base,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+            device=get_global_server_args().device,
+        )
+
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
         assert self.compress_ratio in {0, 4, 128}
@@ -243,6 +267,7 @@ class MQALayer(nn.Module):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
+                rotary_emb=getattr(self, "rotary_emb", None),
             )
             if self.compress_ratio == 4:
                 self.indexer = C4Indexer(
@@ -252,10 +277,11 @@ class MQALayer(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("indexer", prefix),
                     alt_streams=self.alt_streams_indexer,
+                    rotary_emb=getattr(self, "rotary_emb", None),
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -395,6 +421,7 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        kv = kv.contiguous()
         fused_norm_rope_inplace(
             kv,
             self.kv_norm.weight.data,
@@ -409,7 +436,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4AttnBackend,
+        attn_backend,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
@@ -469,7 +496,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4AttnBackend,
+        attn_backend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
@@ -530,7 +557,10 @@ class MQALayer(nn.Module):
 
         attn_backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(attn_backend, DeepseekV4AttnBackend)
+            assert isinstance(
+                attn_backend,
+                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -594,6 +624,7 @@ class MQALayer(nn.Module):
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
             )
+            o_s = deep_gemm.ceil_to_ue8m0(o_s)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
@@ -717,6 +748,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            return y, post.squeeze(-1), comb, False
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
@@ -764,6 +811,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
+
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+            return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -837,7 +891,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -853,7 +910,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
         if _use_tp_moe_gather:
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
@@ -1288,7 +1348,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
