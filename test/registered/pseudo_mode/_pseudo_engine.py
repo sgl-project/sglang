@@ -106,6 +106,7 @@ class ActiveReqInfo:
     rid: str
     state: str
     output_len: int
+    output_tokens: List[int]
 
 
 class PseudoEngine:
@@ -325,6 +326,7 @@ class PseudoEngine:
                 rid=str(entry["rid"]),
                 state=str(entry["state"]),
                 output_len=int(entry["output_len"]),
+                output_tokens=[int(t) for t in entry["output_tokens"]],
             )
             for entry in payload
         ]
