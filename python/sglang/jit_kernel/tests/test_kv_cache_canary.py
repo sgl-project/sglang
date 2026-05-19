@@ -438,6 +438,56 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
     assert int(state["kernel_run_counter"].item()) >= 1
 
 
+def test_kernel_run_counter_increments_even_with_zero_threads():
+    """Regression for the e2e wiring bug: when the host has no verify
+    entries and no write-req chains (length-1 placeholder arrays with the
+    active mask zeroed), the kernel must still launch and atomicAdd the
+    ``kernel_run_counter`` so the §5 warmup health monitor sees liveness.
+
+    Pre-fix history: ``canary_step`` host stub returned early when
+    ``num_verify + num_write_reqs == 0`` and the runner additionally
+    short-circuited ``_run_kernel_pair`` when ``plan.num_verify +
+    plan.num_write == 0``; the cuda-graph capture path also recorded a
+    no-op kernel under the same guards. The combined effect was a
+    ``kernel_run_counter == 0`` after ``counter_zero_warmup_forwards``
+    forwards in production, raising the "kernel never ran after warmup"
+    panic even though every replay was actually running the kernel with
+    skip-sentinel masks.
+    """
+    slot_stride = 64
+    buf = _alloc_pool(4, slot_stride)
+    state = _alloc_state()
+
+    # Length-1 placeholder arrays for every plan field with the active
+    # masks zeroed — this mimics ``CanaryLaunchBuffers`` at capture time
+    # (verify_capacity / write_req_capacity must be >= 1 but the masks
+    # default to 0 = skip-sentinel).
+    _run(
+        src=buf,
+        dst=buf,
+        slot_stride_bytes=slot_stride,
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_req_ids=[0],
+        verify_prev_slot_indices=[-1],
+        verify_active_mask=[0],
+        write_slot_indices=[0],
+        write_token_ids=[0],
+        write_positions=[0],
+        write_req_ids=[0],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[0],
+        write_req_active_mask=[0],
+        state=state,
+        kernel_kind=KERNEL_KIND_HEAD,
+    )
+
+    assert int(state["is_errored"].item()) == 0
+    assert int(state["slot_run_counter"].item()) == 0
+    assert int(state["kernel_run_counter"].item()) >= 1
+
+
 def test_first_violation_preserved_across_cascading_mismatches():
     slot_stride = 128
     buf = _alloc_pool(8, slot_stride)

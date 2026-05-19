@@ -337,6 +337,18 @@ __device__ inline void run_write_req_chain(const CanaryParams& p, uint32_t req_t
 __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t total_threads = p.num_verify + p.num_write_reqs;
+
+  // Unconditional liveness counter: block 0 thread 0 ALWAYS increments the
+  // kernel-run counter before the early-return guard, even when the plan
+  // is fully inactive (skip-sentinel masks) or the launch has zero verify
+  // and zero write-req entries. The §5 health monitor uses this counter
+  // to detect "canary is actually executing" — tying the increment to
+  // active work would silently zero it during server warmup forwards (and
+  // any other no-work step) and trip a spurious "kernel never ran" panic.
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
+  }
+
   if (tid >= total_threads) {
     return;
   }
@@ -346,10 +358,6 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   } else {
     const uint32_t req_tid = tid - p.num_verify;
     run_write_req_chain(p, req_tid);
-  }
-
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
   }
 }
 
@@ -440,9 +448,10 @@ void canary_step(
       "canary: violation_ring_valid first dim must equal ring_capacity");
 
   const uint32_t total_threads = num_verify + num_write_reqs;
-  if (total_threads == 0) {
-    return;
-  }
+  // No early return on total_threads == 0: the kernel still has the
+  // unconditional kernel_run_counter atomicAdd at its entry, which the
+  // §5 health monitor relies on to detect "canary actually ran" across
+  // warmup / no-work forwards.
 
   CanaryParams p{};
   p.src_buf = static_cast<const uint8_t*>(src_buf.data_ptr());
@@ -484,7 +493,11 @@ void canary_step(
   p.real_kv_hash_mode = static_cast<int32_t>(real_kv_hash_mode);
 
   constexpr uint32_t kBlockSize = 128;
-  const uint32_t grid = (total_threads + kBlockSize - 1) / kBlockSize;
+  // Always launch at least one block so the liveness atomicAdd at the
+  // kernel entry runs even when total_threads == 0 (no verify entries
+  // and no write-req chains).
+  const uint32_t effective_threads = total_threads == 0 ? 1u : total_threads;
+  const uint32_t grid = (effective_threads + kBlockSize - 1) / kBlockSize;
   LaunchKernel(grid, kBlockSize, device)(canary_kernel, p);
 }
 

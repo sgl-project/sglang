@@ -308,10 +308,16 @@ class CanaryRunner:
                 )
                 event.record(stream=self._side_stream)
             self._poll_armed = True
-            if self._counters_event is not None and (
-                self._forward_step % max(1, self._config.health_print_every_n_forwards)
-                == 0
-            ):
+            # Counter D2H is intentionally decoupled from the periodic print
+            # interval (``health_print_every_n_forwards``). Refreshing the
+            # cached counters every forward lets the §5 warmup health check
+            # see fresh values by ``counter_zero_warmup_forwards`` (~64);
+            # tying the D2H to the 1024-forward print period would leave the
+            # host-side ``_latest_counters`` stuck at the step-0 snapshot and
+            # trip a spurious "kernel never ran" panic. The copies are four
+            # int64 non-blocking transfers on a side stream — negligible
+            # cost vs the verify workload.
+            if self._counters_event is not None:
                 self._counters_host[0].copy_(
                     self._device_state.kernel_run_counter_head.flatten()[0],
                     non_blocking=True,
@@ -368,11 +374,17 @@ class CanaryRunner:
         plan: BatchPlan,
         kernel_kind: int,
     ) -> None:
-        """Eager-path launch: fill the fixed buffers from the plan, then launch."""
+        """Eager-path launch: fill the fixed buffers from the plan, then launch.
+
+        Always launches the kernel — even when the plan has zero verify
+        entries and zero write entries — so the §5 liveness counter
+        (``kernel_run_counter``) advances on every forward. The kernel's
+        unconditional entry-side atomicAdd is what the health monitor uses
+        to detect "canary is actually executing"; gating the host launch
+        on plan size would silently zero the counter during no-work
+        forwards and trip a spurious "kernel never ran" panic.
+        """
         if not self._config.enabled:
-            return
-        total = plan.num_verify + plan.num_write
-        if total == 0:
             return
         self._launch.fill_from_plan(plan)
         self._launch_kernel_only(kernel_kind=kernel_kind)
