@@ -299,6 +299,7 @@ class Glm4MoeAttention(nn.Module):
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.use_qk_norm
         ):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             if self.use_qk_norm:
