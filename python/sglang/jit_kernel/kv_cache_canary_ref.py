@@ -29,6 +29,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _CANARY_FIELD_REAL_KV_HASH,
     _CANARY_FIELD_TOKEN_ID,
     CANARY_EXPECTED_SKIP_SENTINEL,
+    KERNEL_KIND_TAIL,
     REAL_KV_HASH_MODE_OFF,
     SKIP_CHAIN_SENTINEL,
     FailReason,
@@ -484,12 +485,18 @@ def _run_verify_entries(
 
         expected_real_kv_hash = real_kv_view.hash_slot(slot_idx)
 
+        # Tail's src is head_shadow, which stores pre-model-write real_kv_hash
+        # (head fires before the model writes). Skip the external real_kv_hash
+        # check on the tail path — head and sweep (both reading tail_shadow =
+        # post-write hash) cover this fail reason.
+        real_kv_check_enabled = sink._kernel_kind != KERNEL_KIND_TAIL
+
         fail_reason = FailReason.NONE
         if actual_position != expected_position:
             fail_reason = FailReason.POSITION_MONOTONIC
         elif not skip_chain_check and actual_prev_hash != expected_prev_hash:
             fail_reason = FailReason.HASH
-        elif actual_real_kv_hash != expected_real_kv_hash:
+        elif real_kv_check_enabled and actual_real_kv_hash != expected_real_kv_hash:
             fail_reason = FailReason.REAL_KV_HASH
         if fail_reason != FailReason.NONE:
             if fail_reason == FailReason.REAL_KV_HASH:

@@ -397,7 +397,7 @@ def test_verify_skips_chain_check_on_sentinel():
         write_req_entry_counts=[],
         write_req_active_mask=[],
         state=state,
-        kernel_kind=KERNEL_KIND_TAIL,
+        kernel_kind=KERNEL_KIND_HEAD,
     )
 
     assert int(state["is_errored"].item()) == 0
@@ -407,6 +407,9 @@ def test_verify_skips_chain_check_on_sentinel():
     # OFF the expected real_kv_hash is 0; a non-zero stored value must
     # still trigger kFailReasonRealKvHash even under the skip sentinel,
     # proving the real_kv_hash check is independent of the chain skip.
+    # Use HEAD here: the tail kernel intentionally skips the real_kv_hash
+    # check (its src is head_shadow, which carries pre-model-write hashes
+    # — see ``_launch_kernel_only`` and ``run_verify_entry``).
     buf_view[0, 3] = torch.tensor(
         to_signed_int64(0xCAFEBABECAFEBABE), dtype=torch.int64, device="cuda"
     )
@@ -427,7 +430,7 @@ def test_verify_skips_chain_check_on_sentinel():
         write_req_entry_counts=[],
         write_req_active_mask=[],
         state=state,
-        kernel_kind=KERNEL_KIND_TAIL,
+        kernel_kind=KERNEL_KIND_HEAD,
     )
 
     assert int(state["is_errored"].item()) == 1

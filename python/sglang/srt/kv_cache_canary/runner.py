@@ -402,7 +402,7 @@ class CanaryRunner:
         if alive_slots.numel() == 0:
             return
         plan = build_sweep_plan(
-            canary_buf=self._buffer_group.k_head,
+            canary_buf=self._buffer_group.k_tail,
             alive_slot_indices=alive_slots,
         )
         if plan.num_verify == 0:
@@ -522,15 +522,20 @@ class CanaryRunner:
         supplies the source).
 
         ``kernel_kind == KERNEL_KIND_SWEEP`` runs the verify-only sweep
-        endpoint, which reads from head's canary buffers and routes
-        violations into the sweep_k / sweep_v slots.
+        endpoint. Sweep fires at ``end_of_forward`` (post-model-write) and
+        verifies real_kv_hash for every alive slot, including the new write
+        positions of this forward. It must read from ``tail_endpoint`` (which
+        captures post-model-write real_kv_hash) — reading head_endpoint would
+        compare current (post-write) KV bytes against head's pre-write hash
+        for any slot the model just wrote to, producing a guaranteed false
+        positive on every new-position slot.
         """
         if kernel_kind == KERNEL_KIND_HEAD:
             dst, src = self._head_endpoint, self._tail_endpoint
         elif kernel_kind == KERNEL_KIND_TAIL:
             dst, src = self._tail_endpoint, self._head_endpoint
         elif kernel_kind == KERNEL_KIND_SWEEP:
-            dst, src = self._sweep_endpoint, self._head_endpoint
+            dst, src = self._sweep_endpoint, self._tail_endpoint
         else:
             raise ValueError(f"kv-canary: unknown kernel_kind {kernel_kind}")
         buffers = launch_buffers if launch_buffers is not None else self._launch

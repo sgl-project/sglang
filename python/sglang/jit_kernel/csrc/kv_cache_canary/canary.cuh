@@ -297,9 +297,19 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   // the raw input_ids from forward_batch); on verify it's elided. Token-field
   // tampering propagates into the chain hash via splitmix64_mix and is
   // caught at the next position's verify.
+  //
+  // The external real-KV fingerprint check (actual vs recomputed) is only
+  // valid when the peer shadow's stored real_kv_hash reflects post-model-
+  // write KV bytes. Head writes pre-model-forward (real_kv_hash = hash of
+  // pre-write bytes — garbage for new write positions), so the tail kernel,
+  // whose src is head_shadow, must skip this check; otherwise every alive
+  // slot whose KV was last written by an earlier forward would false-
+  // positive. Head's verify (src=tail_shadow) and sweep (src=tail_shadow)
+  // both read post-write hashes and run the check normally.
   const uint64_t actual_real_kv_hash =
       static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
   const uint64_t expected_real_kv_hash = compute_real_kv_hash(p, slot_idx);
+  const bool real_kv_check_enabled = (p.kernel_kind != kKernelKindTail);
 
   int32_t fail_reason = 0;
   uint64_t reported_expected = expected_prev_hash;
@@ -308,7 +318,7 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
     fail_reason = kFailReasonPositionMonotonic;
   } else if (!skip_chain_check && actual_prev_hash != expected_prev_hash) {
     fail_reason = kFailReasonHash;
-  } else if (actual_real_kv_hash != expected_real_kv_hash) {
+  } else if (real_kv_check_enabled && actual_real_kv_hash != expected_real_kv_hash) {
     fail_reason = kFailReasonRealKvHash;
     reported_expected = expected_real_kv_hash;
     reported_actual = actual_real_kv_hash;
