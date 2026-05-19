@@ -1127,22 +1127,22 @@ class HiCacheController:
         )
 
     def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 with 'd:'-prefixed keys."""
+        """Best-effort write draft KV pages to L3 (disambiguated by a `_draft` page-key suffix)."""
         if self.draft_io_mode == "off":
             return
         try:
-            draft_keys = [f"d:{h}" for h in hash_values]
             if self.draft_io_mode == "v2":
                 self.storage_backend.batch_set_v2(
                     [
                         PoolTransfer(
                             name=PoolName.DRAFT,
                             host_indices=host_indices,
-                            keys=draft_keys,
+                            keys=list(hash_values),
                         )
                     ]
                 )
             else:  # "generic"
+                draft_keys = [f"{h}_{PoolName.DRAFT}" for h in hash_values]
                 draft_data = [
                     self.mem_pool_host_draft.get_data_page(
                         host_indices[i * self.page_size]
@@ -1156,24 +1156,24 @@ class HiCacheController:
             )
 
     def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 with 'd:'-prefixed keys."""
+        """Best-effort read draft KV pages from L3 (mirrors :meth:`_draft_page_set`)."""
         if self.draft_io_mode == "off":
             return
         try:
-            draft_keys = [f"d:{h}" for h in hash_values]
             if self.draft_io_mode == "v2":
                 self.storage_backend.batch_get_v2(
                     [
                         PoolTransfer(
                             name=PoolName.DRAFT,
                             host_indices=host_indices,
-                            keys=draft_keys,
+                            keys=list(hash_values),
                         )
                     ]
                 )
                 return
 
             # "generic"
+            draft_keys = [f"{h}_{PoolName.DRAFT}" for h in hash_values]
             draft_dummy = [
                 self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
             ]

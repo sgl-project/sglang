@@ -617,14 +617,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         elif name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
-            # suffix scheme from the draft pool's own class.
+            # suffix scheme from the draft pool's own class. The `_draft`
+            # tag is what keeps these keys from colliding with target's
+            # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
             if isinstance(draft_pool, MLATokenToKVPoolHost):
-                suffixes = [f"_{self.mla_suffix}_k"]
+                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
-                    f"_{self.mha_suffix}_k",
-                    f"_{self.mha_suffix}_v",
+                    f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
+                    f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
                 ]
         key_multiplier = len(suffixes)
         component_keys = [
