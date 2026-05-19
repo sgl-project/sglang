@@ -53,6 +53,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     set_global_graph_memory_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -77,11 +78,6 @@ class BreakableCudaGraphRunner:
     graph capture of the eager kernel stream.
     """
 
-    # replay_prepare shares its buffer-population logic with the PCG runner —
-    # bind the method here without inheriting. __init__, capture, and replay
-    # diverge enough that inheritance would obscure more than it saves.
-    replay_prepare = PiecewiseCudaGraphRunner.replay_prepare
-
     def __init__(self, model_runner: ModelRunner):
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -102,6 +98,18 @@ class BreakableCudaGraphRunner:
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
         self.max_bs = model_runner.req_to_token_pool.size
+
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        if model_runner.server_args.enable_return_hidden_states:
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        if (
+            model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_eagle()
+        ):
+            if model_runner.is_draft_worker:
+                self.capture_hidden_mode = CaptureHiddenMode.LAST
+            else:
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         log_info_on_rank0(
             logger,
@@ -133,6 +141,17 @@ class BreakableCudaGraphRunner:
                 type(language_model).__name__,
             )
             return
+        self.use_input_embeds = self.is_multimodal
+        if self.use_input_embeds:
+            import inspect
+
+            sig = inspect.signature(self.layer_model.forward)
+            params = list(sig.parameters)
+            assert "input_embeds" in params, (
+                f"layer_model.forward must accept 'input_embeds' for "
+                f"multimodal BCG, got params: {params}"
+            )
+            self._input_embeds_arg_idx = params.index("input_embeds")
 
         # Memory pool
         if get_global_graph_memory_pool() is None:
@@ -178,6 +197,16 @@ class BreakableCudaGraphRunner:
                 input_embeds = None
                 mrope_positions = None
 
+        if model_runner.is_draft_worker:
+            from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
+
+            hidden_dim = get_draft_hidden_dim(model_runner)
+            self.static_draft_hidden_states = torch.zeros(
+                (self.max_num_tokens, hidden_dim),
+                dtype=model_runner.dtype,
+                device=self.device,
+            )
+
         self.buffers = PrefillInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -221,6 +250,7 @@ class BreakableCudaGraphRunner:
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                input_embeds=forward_batch.input_embeds,
             )
         return output
 
@@ -234,10 +264,17 @@ class BreakableCudaGraphRunner:
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
             ForwardBatch,
             ForwardMode,
         )
+
+        spec_info = None
+        if self.model_runner.is_draft_worker:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            spec_info = EagleDraftInput(
+                hidden_states=self.static_draft_hidden_states[:num_tokens],
+            )
 
         buffers = self.buffers
         bs = 1
@@ -292,8 +329,8 @@ class BreakableCudaGraphRunner:
                 buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
             ),
             spec_algorithm=None,
-            spec_info=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            spec_info=spec_info,
+            capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=None,
             global_forward_mode=ForwardMode.EXTEND,
             lora_ids=None,
@@ -341,6 +378,8 @@ class BreakableCudaGraphRunner:
             return False
         if forward_batch.forward_mode.is_target_verify():
             return False
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -374,6 +413,20 @@ class BreakableCudaGraphRunner:
 
         return graph, output
 
+    def replay_prepare(self, forward_batch, **kwargs):
+        static_forward_batch = PiecewiseCudaGraphRunner.replay_prepare(
+            self, forward_batch, **kwargs
+        )
+        if (
+            self.model_runner.is_draft_worker
+            and forward_batch.spec_info is not None
+        ):
+            num_tokens = len(forward_batch.input_ids)
+            self.static_draft_hidden_states[:num_tokens].copy_(
+                forward_batch.spec_info.hidden_states
+            )
+        return static_forward_batch
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -386,11 +439,24 @@ class BreakableCudaGraphRunner:
         captured_graph = self.graphs[static_num_tokens]
         captured_hidden = self.output_buffers[static_num_tokens]
 
-        # Closure replaces layer_model.forward for the duration of the outer
-        # model.forward call. Replays the captured CUDAGraph and hands the
-        # outer forward the captured hidden_states; logits_processor / pooler
-        # then runs eagerly on top with the live multi-req forward_batch.
         def replay_layer_forward(*args, **layer_kwargs):
+            ie = layer_kwargs.get("input_embeds") or (
+                args[self._input_embeds_arg_idx]
+                if self.use_input_embeds
+                and len(args) > self._input_embeds_arg_idx
+                else None
+            )
+            if self.use_input_embeds:
+                assert ie is not None, (
+                    "BCG replay expects input_embeds but got None"
+                )
+                self.buffers.input_embeds[:static_num_tokens].copy_(
+                    ie[:static_num_tokens]
+                )
+            else:
+                assert ie is None, (
+                    "BCG replay got unexpected input_embeds on non-multimodal model"
+                )
             captured_graph.replay()
             return captured_hidden
 
@@ -416,11 +482,7 @@ class BreakableCudaGraphRunner:
                     )
             finally:
                 self.layer_model.forward = original_layer_forward
-
         if isinstance(output, LogitsProcessorOutput):
-            # Slice trailing-padding off hidden_states; next_token_logits is
-            # bs-shaped from logits_processor (bs <= raw_num_tokens), so the
-            # slice is a no-op for that field but matches PCG's pattern.
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_tokens],
                 hidden_states=(
