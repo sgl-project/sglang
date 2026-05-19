@@ -630,10 +630,18 @@ class CanaryRunner:
     ) -> None:
         violation_log = self._device_state.violation_log
         positions: Optional[torch.Tensor] = None
+        out_cache_loc: Optional[torch.Tensor] = None
+        input_ids: Optional[torch.Tensor] = None
         if forward_batch is not None:
             positions = forward_batch.positions
             if positions.dtype != torch.int32:
                 positions = positions.to(torch.int32)
+            out_cache_loc = forward_batch.out_cache_loc
+            if out_cache_loc is not None and out_cache_loc.dtype != torch.int32:
+                out_cache_loc = out_cache_loc.to(torch.int32)
+            input_ids = forward_batch.input_ids
+            if input_ids is not None and input_ids.dtype != torch.int32:
+                input_ids = input_ids.to(torch.int32)
 
         for endpoint in self._endpoints_per_pool[pool_idx]:
             if not _endpoint_belongs_to_group(endpoint, group):
@@ -651,9 +659,9 @@ class CanaryRunner:
             endpoint.launch_per_forward(
                 verify_plan=verify_plan,
                 write_plan=self._write_plan_per_forward,
-                fb_input_ids=forward_batch.input_ids,
+                fb_input_ids=input_ids,
                 fb_positions=positions,
-                fb_out_cache_loc=forward_batch.out_cache_loc,
+                fb_out_cache_loc=out_cache_loc,
                 input_check_mode=self.config.input_check_mode,
                 expected_input_tokens=self._expected_input_tokens,
                 expected_input_positions=self._expected_input_positions,
