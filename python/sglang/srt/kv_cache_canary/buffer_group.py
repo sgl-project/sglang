@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -11,7 +11,7 @@ import torch
 from sglang.jit_kernel.kv_cache_canary_verify import RealKvSource
 
 
-class PoolKind(str, enum.Enum):
+class PoolKind(IntEnum):
     """Which attention regime a canary group belongs to.
 
     - ``FULL`` covers ``[0, K_req)``. Attached to plain MHA/MLA pools and as one of the two canaries on
@@ -20,8 +20,8 @@ class PoolKind(str, enum.Enum):
       ``BaseSWAKVPool``.
     """
 
-    FULL = "full"
-    SWA = "swa"
+    FULL = 0
+    SWA = 1
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

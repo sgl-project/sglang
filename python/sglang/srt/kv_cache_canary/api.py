@@ -98,7 +98,7 @@ def attach(
         "kv-canary: attached %d runner(s) in mode=%s kinds=%s",
         len(runners),
         config.mode.value,
-        [r.pool_kind.value for r in runners],
+        [r.pool_kind.name for r in runners],
     )
     return runners
 

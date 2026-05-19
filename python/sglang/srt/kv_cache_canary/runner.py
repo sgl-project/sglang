@@ -580,7 +580,7 @@ class CanaryRunner:
                 "kv-canary[%s]: protected %d forwards "
                 "(head=%d kernels / %d slots, tail=%d kernels / %d slots, "
                 "sweep=%d kernels / %d slots)",
-                self._pool_kind.value,
+                self._pool_kind.name,
                 step,
                 kernel_head,
                 slot_head,
