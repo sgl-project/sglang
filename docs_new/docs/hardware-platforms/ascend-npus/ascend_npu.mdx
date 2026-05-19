@@ -187,6 +187,7 @@ docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
 
   </Tab>
 </Tabs>
+
 2. Build an image based on Dockerfile
 ```bash Command
 # Clone the SGLang repository
@@ -302,10 +303,10 @@ python3 -m sglang.launch_server \
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
 
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --disaggregation-mode prefill \
@@ -326,10 +327,10 @@ python3 -m sglang.launch_server \
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
 
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -353,10 +354,10 @@ python3 -m sglang.launch_server \
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --disaggregation-mode decode \
@@ -373,10 +374,10 @@ python3 -m sglang.launch_server \
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
