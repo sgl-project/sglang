@@ -106,6 +106,62 @@ def _fused_virtual_topk_ids(
 
 
 @triton.jit
+def _token_lora_mapping_kernel(
+    seg_indptr_ptr,
+    req_to_lora_ptr,
+    adapter_enabled_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    NUM_SEGMENTS: tl.constexpr,
+    NUM_SEGMENT_BITS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offs < M
+
+    lo = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
+    hi = tl.full((BLOCK_SIZE,), NUM_SEGMENTS, dtype=tl.int32)
+    token_pos = offs.to(tl.int64)
+
+    for _ in tl.static_range(0, NUM_SEGMENT_BITS):
+        mid = (lo + hi) // 2
+        boundary = tl.load(seg_indptr_ptr + mid + 1, mask=valid, other=0).to(tl.int64)
+        lo = tl.where(boundary <= token_pos, mid + 1, lo)
+        hi = tl.where(boundary <= token_pos, hi, mid)
+
+    mapping = tl.load(req_to_lora_ptr + lo, mask=valid, other=-1).to(tl.int32)
+    safe_mapping = tl.maximum(mapping, 0)
+    active = tl.load(adapter_enabled_ptr + safe_mapping, mask=valid, other=0) > 0
+    result = tl.where((mapping >= 0) & active, mapping, -1)
+    tl.store(output_ptr + offs, result, mask=valid)
+
+
+def compute_token_lora_mapping(
+    seg_indptr: torch.Tensor,
+    req_to_lora: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Map token rows to active LoRA ids in one kernel for virtual experts."""
+    output = torch.empty((num_tokens,), dtype=torch.int32, device=seg_indptr.device)
+    num_segments = seg_indptr.numel() - 1
+    block_size = 256
+    grid = (triton.cdiv(num_tokens, block_size),)
+    _token_lora_mapping_kernel[grid](
+        seg_indptr,
+        req_to_lora,
+        adapter_enabled,
+        output,
+        num_tokens,
+        num_segments,
+        max(1, num_segments.bit_length()),
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
+@triton.jit
 def _fused_sanitize_expert_ids_kernel(
     expert_ids_ptr,
     output_ptr,
@@ -722,7 +778,14 @@ def _merged_experts_fused_moe_lora_add_impl(
         invoke_fused_moe_kernel,
     )
 
-    def _do_expand(a_slice_2d, b_slice_3d, out_slice):
+    def _do_expand(
+        a_slice_2d,
+        b_slice_3d,
+        out_slice,
+        *,
+        gated_a_input: bool = False,
+        gated_a_n_half: int = 0,
+    ):
         invoke_fused_moe_kernel(
             a_slice_2d,
             b_slice_3d,
@@ -750,17 +813,28 @@ def _merged_experts_fused_moe_lora_add_impl(
             add_output_mask=token_lora_mask,
             router_topk=topk_ids.shape[1],
             c_map=c_map if output_is_sorted else None,
+            gated_a_input=gated_a_input,
+            gated_a_n_half=gated_a_n_half,
         )
 
     if is_gated_expand:
         n_half = out_dim // 2
-        output_full_2d = output.view(-1, out_dim)
-        for s in range(2):
+        if n_half % b_stage_config["BLOCK_SIZE_N"] == 0:
             _do_expand(
-                intermediate_2d[:, s * expand_rank : (s + 1) * expand_rank],
-                lora_b_virtual[:, s * n_half : (s + 1) * n_half, :],
-                output_full_2d[:, s * n_half : (s + 1) * n_half],
+                intermediate_2d,
+                lora_b_virtual,
+                output,
+                gated_a_input=True,
+                gated_a_n_half=n_half,
             )
+        else:
+            output_full_2d = output.view(-1, out_dim)
+            for s in range(2):
+                _do_expand(
+                    intermediate_2d[:, s * expand_rank : (s + 1) * expand_rank],
+                    lora_b_virtual[:, s * n_half : (s + 1) * n_half, :],
+                    output_full_2d[:, s * n_half : (s + 1) * n_half],
+                )
     else:
         _do_expand(intermediate_2d, lora_b_virtual, output)
 

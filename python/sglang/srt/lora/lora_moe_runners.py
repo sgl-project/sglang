@@ -213,19 +213,14 @@ def _compute_token_lora_mapping(
     lora_info: LoRAInfo,
 ) -> torch.Tensor:
     """Map each token to its LoRA adapter index (-1 for no LoRA)."""
-    token_positions = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
+    from sglang.srt.lora.triton_ops.virtual_experts import compute_token_lora_mapping
+
+    return compute_token_lora_mapping(
+        lora_info.seg_indptr,
+        lora_info.req_to_lora,
+        lora_info.adapter_enabled,
+        hidden_states.shape[0],
     )
-    req_indices = torch.searchsorted(
-        lora_info.seg_indptr[1:].to(torch.int32),
-        token_positions,
-        right=True,
-    )
-    mapping = lora_info.req_to_lora.to(torch.int32)[req_indices]
-    valid = mapping >= 0
-    safe_mapping = mapping.clamp_min(0).long()
-    active = lora_info.adapter_enabled[safe_mapping] > 0
-    return torch.where(valid & active, mapping, torch.full_like(mapping, -1))
 
 
 def _compute_lora_alignment(

@@ -383,6 +383,8 @@ def fused_moe_kernel(
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     USE_C_MAP_OUTPUT: tl.constexpr,
+    GATED_A_INPUT: tl.constexpr,
+    GATED_A_N_HALF: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -467,8 +469,13 @@ def fused_moe_kernel(
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
     else:
+        if GATED_A_INPUT:
+            a_k_offset = tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_N_HALF, K, 0)
+        else:
+            a_k_offset = 0
         a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+            offs_token[:, None] // top_k * stride_am
+            + (offs_k[None, :] + a_k_offset) * stride_ak
         )
 
     if b_desc is not None:
@@ -740,6 +747,8 @@ def invoke_fused_moe_kernel(
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
     c_map: Optional[torch.Tensor] = None,
+    gated_a_input: bool = False,
+    gated_a_n_half: int = 0,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -826,6 +835,16 @@ def invoke_fused_moe_kernel(
         ), "c_map output remap is not supported for GPTQ/AWQ kernels"
         assert c_map.dtype == torch.int32
         assert c_map.stride(0) == 1
+    if gated_a_input:
+        assert not (
+            use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
+        ), "gated A remap is only supported for unquantized LoRA expand kernels"
+        assert not a_use_tma, "gated A remap is not supported with A TMA"
+        assert A.shape[1] >= 2 * K
+        assert gated_a_n_half > 0
+        assert (
+            gated_a_n_half % config["BLOCK_SIZE_N"] == 0
+        ), "gated A remap requires the gate/up output boundary to align to BLOCK_SIZE_N"
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -947,6 +966,8 @@ def invoke_fused_moe_kernel(
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             USE_C_MAP_OUTPUT=c_map is not None,
+            GATED_A_INPUT=gated_a_input,
+            GATED_A_N_HALF=gated_a_n_half,
             **config,
         )
 
