@@ -83,7 +83,7 @@ class SchedulerDllmMixin:
                 self.metrics_reporter.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
-                req.check_finished(new_accepted_len=new_tokens)
+                req.update_finish_state(new_accepted_len=new_tokens)
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
