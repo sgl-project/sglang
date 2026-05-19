@@ -76,12 +76,12 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-# torch.ops.custom.npu_hc_pre / npu_hc_post / inplace_partial_rotary_mul are
-# registered as a side-effect of importing the `custom_ops` wheel that ships
-# with the Ascend cann-8.5.0-a3 image. Import once at module load (NPU only)
-# so the per-callsite re-imports inside hc_pre / hc_post can drop.
+# NPU-only deps. `custom_ops` import registers torch.ops.custom.{npu_hc_pre,
+# npu_hc_post, inplace_partial_rotary_mul, ...} (cann-8.5.0-a3 wheel). Both are
+# imported once at module load so per-callsite re-imports can drop.
 if _is_npu:
     import custom_ops  # noqa: F401  registers torch.ops.custom.*
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -478,14 +478,10 @@ class MQALayer(nn.Module):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if _is_npu:
-            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
-            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
-            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
-            # different bf16 results vs the NPU-native kernel; with 43
-            # layers of cascade, that 1-2% per-layer drift flips argmax in
-            # tokens 5+. Match exact iforgetmyname behavior here.
-            import torch_npu
-
+            # NPU-native RMS norm: triton rms_normalize_triton drifts ~1 ULP
+            # per layer vs the kernel; over 43 layers that flips argmax. Use
+            # the kernel with an all-ones dummy weight (matches iforgetmyname
+            # q_b_norm_dummy_weight).
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -614,14 +610,8 @@ class MQALayer(nn.Module):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if _is_npu:
-            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
-            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
-            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
-            # different bf16 results vs the NPU-native kernel; with 43
-            # layers of cascade, that 1-2% per-layer drift flips argmax in
-            # tokens 5+. Match exact iforgetmyname behavior here.
-            import torch_npu
-
+            # See _compute_q_b — same NPU-native RMS workaround for the
+            # per-layer drift triton causes.
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:

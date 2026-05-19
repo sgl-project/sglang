@@ -1,3 +1,4 @@
+import logging
 import math
 from functools import lru_cache
 from typing import Optional
@@ -5,6 +6,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 # tilelang isn't shipped on every platform (e.g. Ascend NPU images) and the
 # only tilelang artifacts in this file are pass_configs that downstream
@@ -20,6 +23,11 @@ try:
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     }
 except ImportError:
+    logger.info(
+        "tilelang not installed; deepseek_v4_rope pass_configs unset. "
+        "Triton kernels in this module still run; only downstream tilelang.jit "
+        "consumers of pass_configs will need to handle the None."
+    )
     tilelang = None
     pass_configs = None
 

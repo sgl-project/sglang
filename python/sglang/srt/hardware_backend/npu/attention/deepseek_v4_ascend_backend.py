@@ -1,34 +1,12 @@
 """DeepSeek V4 attention backend on Ascend NPU.
 
-This bridges sgl-project/sglang's V4 model code (which expects a backend
-that mixes ``CompressorBackendMixin`` + ``C4IndexerBackendMixin`` on top of
-``AttentionBackend``) with ``AscendAttnBackend`` (the NPU implementation
-that knows nothing about V4's c4/c128 compress paths). The CUDA reference
-is ``DeepseekV4AttnBackend``; this class is its NPU counterpart.
-
-Strategy:
-
-* Inherit from ``AscendAttnBackend`` plus the two V4 mixins. The mixins
-  give us ``forward_compress`` / ``forward_core_compressor`` / ``forward_c4_indexer``
-  signatures the model calls. Their default implementations call CUDA JIT
-  kernels (``compress_forward``, ``compress_fused_norm_rope_inplace``,
-  ``act_quant``, ``rotate_activation``, etc.); on NPU each of these has to
-  be replaced with an ATB / torch_npu / pure-torch equivalent. We override
-  one method at a time as we hit them at runtime.
-
-* ``init_forward_metadata`` has to compute both the regular ascend metadata
-  and the V4 ``DSV4Metadata`` with ``DSV4AttnMetadata`` + indexer metadata
-  + c4/c128 compress metadata. We delegate the ascend half and add a thin
-  V4 layer on top.
-
-* ``forward()`` accepts V4-specific kwargs (``compress_ratio``, ``attn_sink``,
-  ``save_kv_cache``). For ``compress_ratio==0`` (regular MQA layers) we
-  delegate to ``AscendAttnBackend.forward``; for 4 / 128 we have to route
-  to the c4 / c128 sparse path.
-
-This file deliberately leaves the harder methods unimplemented behind
-``NotImplementedError`` with explicit messages — the goal is to surface
-exact method names + arguments at first NPU forward, then fill them in.
+NPU counterpart of the CUDA ``DeepseekV4AttnBackend``. Bridges V4 model code
+(which expects ``CompressorBackendMixin`` + ``C4IndexerBackendMixin`` on top
+of ``AttentionBackend``) with ``AscendAttnBackend``. MRO: ``AscendAttnBackend``
+supplies the NPU forward / metadata surface; the V4 mixins add the c4 / c128
+compress + indexer helpers. ``forward()`` routes by ``compress_ratio``:
+0 / 1 → dense SWA (``_forward_dense``), 4 / 128 → sparse compressed
+(``_forward_compressed`` via ``npu_sparse_attn_sharedkv``).
 """
 
 from __future__ import annotations
@@ -58,6 +36,7 @@ except ImportError as e:
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 
 if TYPE_CHECKING:
@@ -66,15 +45,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _stub(method_name: str):
-    raise NotImplementedError(
-        f"DeepseekV4AscendAttnBackend.{method_name} is not implemented yet on NPU. "
-        "The CUDA reference is in deepseek_v4_backend.py / dsv4/{compressor,indexer}.py; "
-        "the NPU port has to either (a) call into torch_npu / ATB / sgl_kernel_npu "
-        "for the corresponding fused op, or (b) provide a pure-torch fallback."
-    )
 
 
 def _build_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -155,9 +125,6 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
-        # Pull the V4-specific config that compute_kernel_metadata needs.
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
-
         cfg = model_runner.model_config
         self._dsv4_config = cfg
         tp_size = get_attention_tp_size()
@@ -183,7 +150,7 @@ class DeepseekV4AscendAttnBackend(
         )
 
     # ------------------------------------------------------------------
-    # V4-specific metadata + dispatch — all stubbed pending real impls.
+    # V4-specific metadata + dispatch.
     # ------------------------------------------------------------------
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
@@ -569,17 +536,12 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor],
         compress_ratio: int,
     ) -> torch.Tensor:
-        """ratio=4 / ratio=128 layers — sliding-window + compressed-KV
-        sparse attention via npu_sparse_attn_sharedkv with has_cmp_kv=True.
-
-        cmp_kv (compressed KV) is read from the c4 / c128 pool buffer,
-        which is currently zeros (compressor write path is still stubbed),
-        so the compressed contribution to the output is zero. cmp_sparse_
-        indices for c4 comes from forward_metadata.c4_topk_indices, which
-        forward_c4_indexer currently seeds with -1 (= no valid sparse
-        index) for the same reason. The point of this commit is to validate
-        the kernel-call shape/dtype contract end-to-end before we land the
-        compressor + indexer compute paths.
+        """ratio=4 / ratio=128 layers — sliding-window + compressed-KV sparse
+        attention via npu_sparse_attn_sharedkv with has_cmp_kv=True. cmp_kv is
+        read from the c4 / c128 pool (populated by the compressor when
+        SGLANG_DSV4_NPU_REAL_COMPRESSOR=1) and cmp_sparse_indices for c4 comes
+        from forward_metadata.c4_topk_indices (populated by the lightning
+        indexer when SGLANG_DSV4_NPU_REAL_INDEXER=1; -1 sentinel otherwise).
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
@@ -691,13 +653,9 @@ class DeepseekV4AscendAttnBackend(
             cache=swa_k,
         )
 
-    # PHASE-0 STUBS: all c4/c128 compressor / indexer paths are no-ops
-    # while we surface the full forward chain. attention forward already
-    # returns zeros for compress_ratio in (4, 128) (see forward()), so
-    # whatever these compute would only feed a zero attention anyway.
-    # The real impl of these (porting iforgetmyname's compressor/indexer
-    # NPU kernels onto main's KV pool layout) is the bulk of the V4-NPU
-    # attention port and lives behind these stubs.
+    # c4/c128 compressor + indexer entry points. ``forward_compress`` is a
+    # no-op on NPU (Compressor.forward_npu writes the pool inline rather than
+    # via the CUDA mixin set_extra_key_buffer chain).
 
     def forward_compress(self, *args, **kwargs):  # type: ignore[override]
         return None
@@ -709,17 +667,12 @@ class DeepseekV4AscendAttnBackend(
         layer_id: int,
         compressor,
     ) -> None:
-        """Run the OUTER attention compressor on NPU.
+        """Trigger the OUTER attention compressor on NPU.
 
-        On CUDA, ``CompressorBackendMixin.forward_core_compressor`` calls
-        ``compressor(x, forward_batch)`` (which produces compressed kv) and
-        then writes the result via ``token_to_kv_pool.set_extra_key_buffer*``.
-        On NPU, ``Compressor.forward_npu`` does the write inline (calls
-        ``set_compress_buffer`` and ``set_compress_state_buffer`` itself), so
-        we just trigger the compressor call and return — no separate set-
-        buffer step. Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR; flag off keeps
-        the previous stub (compressor never invoked, c4/c128 layers fall
-        back to dense SWA in forward()).
+        CUDA's ``forward_core_compressor`` does (compressor → set_extra_key_*).
+        On NPU, ``Compressor.forward_npu`` writes the KV pool inline, so we
+        just call the compressor. Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR;
+        when OFF, c4/c128 layers fall back to dense SWA in forward().
         """
         if forward_batch.forward_mode.is_idle():
             return
@@ -739,35 +692,15 @@ class DeepseekV4AscendAttnBackend(
         enable_multi_stream: bool = False,
         q_lora_ready=None,
     ) -> None:
-        """Wire up ``forward_metadata.c4_topk_indices`` for c4 sparse attention.
+        """Populate ``forward_metadata.c4_topk_indices`` for c4 sparse attention.
 
-        Stage 1 (this commit): seed ``c4_topk_indices`` with -1 sentinel so
-        downstream ``_forward_compressed`` (when implemented for ratio=4) can
-        read a well-shaped tensor. The real NPU compute path needs:
-          1. q from ``c4_indexer.wq_b(q_lora)`` + rope + hadamard rotation
-             (``compute_q`` in the model uses the tvm_ffi ``fused_rope``; on
-             NPU we need to inline ``_v4_rope_inplace_npu`` + a torch hadamard)
-          2. weights from ``c4_indexer.weights_proj(x)``
-          3. indexer-K cache (currently absent — comes from the c4 indexer
-             compressor write path which is also stubbed)
-          4. ``torch_npu.npu_dynamic_quant`` for q quantization
-          5. ``torch.ops.custom.npu_quant_lightning_indexer`` to produce the
-             real top-k indices
-        Each piece needs its own commit + 217 relaunch verification.
+        When SGLANG_DSV4_NPU_REAL_INDEXER=1, ``C4Indexer.forward_npu`` runs the
+        npu_quant_lightning_indexer and writes the real top-k indices itself;
+        we just seed the -1 sentinel so ``_forward_compressed`` reads a well-
+        shaped tensor on the OFF path or on idle ranks.
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 1 baseline: just seed c4_topk_indices=-1 sentinel for
-        # _forward_compressed to read. Real path requires forking main's
-        # Compressor / C4Indexer modules with NPU-style self-contained
-        # impl (see ascend ref iforgetmyname/dsv4_release nsa_indexer.py
-        # Compressor.forward_ori @ L241 — wkv + wgate + ape weighted sum
-        # + norm + rope + write KV pool, all in-module, no backend
-        # delegation). Stage 2A-I exploration (wq_b call + various store
-        # patterns) showed the issue isn't the wq_b op itself but the
-        # architectural mismatch — main's forward_compress is a triton
-        # mixin path with no NPU equivalent; we must fork the model
-        # modules, not the backend mixin.
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )

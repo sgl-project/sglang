@@ -22,6 +22,9 @@ from sglang.srt.utils import ceil_div, is_npu
 
 _is_npu = is_npu()
 
+if _is_npu:
+    import torch_npu
+
 logger = logging.getLogger(__name__)
 
 ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -423,7 +426,7 @@ class DeepSeekV4IndexerPool(KVCache):
 
 
 class DeepSeekV4LayerItem(NamedTuple):
-    compress_ratio: Literal[0, 4, 128]
+    compress_ratio: Literal[0, 1, 4, 128]
     compress_layer_id: int
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
@@ -1067,14 +1070,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if from_indexer:
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
             if device_type == "npu":
-                # Step 5d: write int8 K + float16 scale into the dedicated
-                # NPU buffer pair via torch_npu.npu_scatter_nd_update_
-                # (mirrors iforgetmyname NPUSingleBufferTokenToKVPool.
-                # set_kv_buffer). Both kv and kv_scale come from
-                # _compressor_epilog_npu's torch_npu.npu_dynamic_quant
-                # output (kv: int8 [T, dim], kv_scale: float16 [T, 1]).
-                import torch_npu  # local: NPU only
-
+                # NPU c4 indexer K/scale write via npu_scatter_nd_update_:
+                # int8 K + float16 scale come from _compressor_epilog_npu's
+                # npu_dynamic_quant output (kv: int8 [T, dim], scale: fp16 [T, 1]).
                 assert (
                     self.c4_indexer_kv_pool.npu_index_k_buffer is not None
                 ), "NPU index buffers not allocated — pool was init'd on CUDA?"

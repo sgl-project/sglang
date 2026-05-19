@@ -30,9 +30,8 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
                 f"NPU: setting KV cache dtype to bfloat16 for {model_arch} "
                 f"(fp8_e4m3 unsupported on Ascend)."
             )
-        assert server_args.kv_cache_dtype in (
-            "bfloat16",
-            "auto",
+        assert (
+            server_args.kv_cache_dtype == "bfloat16"
         ), f"NPU only supports bfloat16 KV cache for {model_arch}, got {server_args.kv_cache_dtype}"
     else:
         server_args.attention_backend = "dsv4"

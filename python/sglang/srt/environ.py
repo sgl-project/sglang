@@ -347,42 +347,16 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     # Activate the in-module NPU compute path inside dsv4 Compressor / C4Indexer.
-    # OFF (default): NPU c4/c128 layers fall back to dense SWA in the backend
-    # (current 2026-05-10 baseline; partial output but stable).
-    # ON: drives the iforgetmyname-style forward_ori / forward_npu_dsv4 branches
-    # — depends on DeepSeekV4TokenToKVPool.{get,set}_compress_{,state_}buffer
-    # and DeepseekV4AscendAttnBackend.forward_metadata.{c4,c128}_{state_,}*
-    # which arrive in roadmap steps 2-3.
     SGLANG_DSV4_NPU_REAL_COMPRESSOR = EnvBool(False)
-    # Sub-flag: route ratio-4/128 attention through _forward_compressed
-    # (has_cmp_kv=True kernel path) instead of the dense SWA fallback.
-    # Requires SGLANG_DSV4_NPU_REAL_COMPRESSOR=1 (so cmp_kv is populated).
-    # Currently aclnnSparseAttnSharedkv rejects the call — keep OFF until
-    # the size / sparse-indices mismatch is debugged. With it OFF, c4/c128
-    # layers stay on _forward_dense (matches the bit-for-bit baseline).
+    # Route ratio-4/128 attention through the has_cmp_kv kernel path.
     SGLANG_DSV4_NPU_SPARSE_ATTN = EnvBool(False)
-    # Sub-flag: log shapes/ranges of cmp_kv / cmp_block_table /
-    # cmp_sparse_indices on every _forward_compressed call. Use to debug
-    # aclnnSparseAttnSharedkv kernel rejections. Spammy — disable in prod.
+    # Log cmp_kv / cmp_block_table / cmp_sparse_indices per call (spammy).
     SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG = EnvBool(False)
-    # Sub-flag: when set, only ratio=128 is routed through _forward_compressed
-    # (c128 uses cmp_sparse_indices=None per iforgetmyname). c4 stays on
-    # dense fallback. Used to bisect kernel rejection: if c128 alone works,
-    # the issue is c4-specific (sparse indices format / -1 sentinel handling).
+    # Bisect-only: route just ratio=128 through _forward_compressed.
     SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY = EnvBool(False)
-    # Diagnostic: route c4 _forward_compressed with cmp_sparse_indices=None
-    # (same as c128) instead of the -1 sentinel topk path. Used to test
-    # whether kernel mis-handles -1 in sparse indices. With this on, c4
-    # attention reads ALL committed c4 history (kernel-decided length).
+    # Diagnostic: c4 _forward_compressed with cmp_sparse_indices=None.
     SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK = EnvBool(False)
-    # Step-5d: drive the real npu_quant_lightning_indexer for c4 sparse
-    # selection. Requires the int8 K + float16 scale buffer pair on
-    # DeepSeekV4IndexerPool (allocated automatically on NPU) and the inner
-    # c4 indexer compressor's li_kv_dtype="int8" path (set in
-    # C4Indexer.__init__). When OFF, C4Indexer.forward_npu returns the -1
-    # sentinel (current dense-equivalent fallback). When ON, runs the
-    # lightning indexer and returns real top-k indices for
-    # _forward_compressed.cmp_sparse_indices.
+    # Drive the real npu_quant_lightning_indexer for c4 sparse selection.
     SGLANG_DSV4_NPU_REAL_INDEXER = EnvBool(False)
 
     # MTHREADS & MUSA
