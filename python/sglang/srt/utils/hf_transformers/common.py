@@ -32,12 +32,16 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
+    LagunaConfig,
     LongcatFlashConfig,
+    MiniCPMV4_6Config,
+    MiniCPMV4_6VisionConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -79,6 +83,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MultiModalityConfig,
         KimiVLConfig,
         InternVLChatConfig,
+        LagunaConfig,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -94,23 +99,38 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
+        MiniCPMV4_6Config,
+        MiniCPMV4_6VisionConfig,
     ]
 }
 
-# DeepSeek V3.2 reuses the V3 config schema. Subclass the upstream transformers
-# class with the V3.2 model_type so AutoConfig.register passes its consistency
-# check (which requires class.model_type == registered key).
+# DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
+# transformers class with each model_type so AutoConfig.register passes its
+# consistency check (which requires class.model_type == registered key).
+# Default-value divergences (e.g. V4's topk_group) are handled in
+# model_config.py post-load.
 try:
     from transformers import DeepseekV3Config as _HFDeepseekV3Config
 
     class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v32"
 
+    class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4"
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+
+    # For kimi_k25_eagle3
+    class _KimiK2ConfigAlias(_HFDeepseekV3Config):
+        model_type = "kimi_k2"
+
+    _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
 except ImportError:
     pass
 
