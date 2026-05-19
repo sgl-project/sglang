@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_npu_ci
@@ -33,6 +34,7 @@ DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendW4A4(CustomTestCase):
     @classmethod
     def setUpClass(cls):

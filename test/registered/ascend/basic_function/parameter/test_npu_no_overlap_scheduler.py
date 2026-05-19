@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 
@@ -11,6 +13,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOverlapSchedule(CustomTestCase):
     """Testcase: Verify that the model can successfully process inference requests and achieve an accuracy of ≥ 0.65 when the overlap scheduler is disabled,
     covering all combination scenarios of radix cache (enabled/disabled) and chunked prefill (enabled/disabled).

@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH,
@@ -19,6 +21,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=False)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepEpQwen(CustomTestCase):
     """
     Testcase:Test the Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot model with DeepEP's low_latency mode enabled,

@@ -49,6 +49,7 @@ if torch.cuda.is_available():
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOriginalLogprob(unittest.TestCase):
     """Testcase: Verify the behavior and log probability alignment of SGLang under two configurations of the environment variable `SGLANG_RETURN_ORIGINAL_LOGPROB` (True/False),
         by comparing SGLang's output with reference values from Hugging Face.
