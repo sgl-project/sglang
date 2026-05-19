@@ -239,7 +239,7 @@ class MockModelRunner:
             kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
         )
 
-        # Required by backend with NSA-specific attributes
+        # Required by backend with DSA-specific attributes
         self.server_args = type(
             "ServerArgs",
             (),
@@ -248,8 +248,8 @@ class MockModelRunner:
                 "speculative_eagle_topk": None,
                 "speculative_num_draft_tokens": 0,
                 "enable_deterministic_inference": False,
-                "nsa_prefill_backend": "flashmla_sparse",
-                "nsa_decode_backend": "fa3",
+                "dsa_prefill_backend": "flashmla_sparse",
+                "dsa_decode_backend": "fa3",
             },
         )()
 
@@ -261,8 +261,8 @@ class TestNSAIndexer(CustomTestCase):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
         server_args.enable_dp_attention = False
-        server_args.nsa_prefill_backend = "flashmla_sparse"
-        server_args.nsa_decode_backend = "flashmla_sparse"
+        server_args.dsa_prefill_backend = "flashmla_sparse"
+        server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
 
         # Check GPU capability for FP8
