@@ -32,13 +32,14 @@ if _is_cuda:
 _is_hip = is_hip()
 
 
-def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
+def _get_block_sizes_for_extend_attention(Lq: int, Lv: int, max_len_extend: int):
     """
     Get block sizes and configuration for extend attention kernels.
 
     Args:
         Lq: Query head dimension
         Lv: Value head dimension
+        max_len_extend: Maximum extend length per sequence in the batch
 
     Returns:
         tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
@@ -59,7 +60,12 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
+    # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware.
+    #
+    # ``num_warps_override`` lets a hardware/shape-specific branch pin a
+    # warp count that differs from the generic "8 warps for Lq>64"
+    # heuristic at the bottom of this function.
+    num_warps_override = None
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
@@ -74,12 +80,30 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (32, 32)
         elif _is_cuda and CUDA_CAPABILITY[0] == 10:
             # Blackwell data-center architecture (GB200, B200, sm_100a)
-            # sm_100a has different register constraints from Hopper; Hopper block sizes
-            # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (64, 64)
-            else:
+            elif max_len_extend <= 16:
+                # Small-extend (e.g. spec verify with num_draft_tokens<=16):
+                # BLOCK_M=32 would waste most of the M-axis rows here, so
+                # keep the tighter tile. (Imported from PR #25550.)
                 BLOCK_M, BLOCK_N = (16, 64)
+            else:
+                # For Lq=512 (Gemma-4-31B full-attention layers) the
+                # default `(BLOCK_M=16, BLOCK_N=64, num_warps=8)` is
+                # ~2.1x slower per kernel call than `(32, 64, 4)` on real
+                # prefill shapes (head_dim=512, num_q=32, num_kv=16,
+                # extend_len 3.5k..8k tokens). Bumping BLOCK_M to 32
+                # doubles queries-per-K-load (better KV BW reuse).
+                # Halving num_warps from 8 to 4 keeps register pressure
+                # under the >255-reg PTX limit and avoids leaving warps
+                # idle when each program only has 32 query rows.
+                # PR #25550 also bumped BLOCK_M to 32 but kept
+                # num_warps=8; our microbench measured (32, 64, 4) as
+                # ~25 % faster than (32, 64, 8) at the Gemma-4-31B hot
+                # shape (see bench_prefill_attn.py). num_stages>1 did
+                # not help.
+                BLOCK_M, BLOCK_N = (32, 64)
+                num_warps_override = 4
         elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
             if Lq <= 256:
@@ -107,7 +131,11 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # Older architectures
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-        num_warps = 4 if Lq <= 64 else 8
+        num_warps = (
+            num_warps_override
+            if num_warps_override is not None
+            else (4 if Lq <= 64 else 8)
+        )
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
 
@@ -593,7 +621,7 @@ def extend_attention_fwd(
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
+        _get_block_sizes_for_extend_attention(Lq, Lv, max_len_extend)
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
@@ -1003,7 +1031,7 @@ def extend_attention_fwd_unified(
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
+        _get_block_sizes_for_extend_attention(Lq, Lv, max_len_extend)
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)

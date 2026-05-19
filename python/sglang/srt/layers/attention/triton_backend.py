@@ -109,6 +109,7 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_eagle_topk = model_runner.server_args.speculative_eagle_topk
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -226,6 +227,45 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+        # Scratch buffers for the TARGET_VERIFY -> decode-kernel fast path.
+        #
+        # The default extend kernel `_fwd_kernel` becomes inefficient on
+        # B200 (sm_100a) for the verify case with head_dim=512 because it
+        # is forced to BLOCK_M=16 by register pressure but only fills 6 of
+        # those 16 query rows per request, and lacks the split-K
+        # parallelism that makes the decode kernel fast at low M. Profiling
+        # showed the full-attention extend kernel is ~13x slower than the
+        # equivalent decode kernel on this workload.
+        #
+        # The verify-via-decode path runs `decode_attention_fwd` once per
+        # draft-token position (i = 0..num_draft_tokens-1). Each call sees
+        # `bs` queries (one per request, the i-th draft token of that req)
+        # against a slice of KV that grows by one token across calls. The
+        # buffers below are sized to hold one call's worth of metadata and
+        # are reused across the loop — they are independent of the main
+        # `kv_indptr` / `cuda_graph_kv_indices` buffers (which still hold
+        # the full `bs * seq_len` extend-style metadata for any other
+        # backend or layer that needs it).
+        self.verify_dec_kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+        )
+        self.verify_dec_num_kv_splits = torch.full(
+            (max_bs,), self.max_kv_splits, dtype=torch.int32, device=model_runner.device
+        )
+        # KV indices for one call's worth of decode-kernel verify.
+        # Sized for max_bs requests x max_context_len tokens; reused across
+        # all num_draft_tokens calls inside _forward_target_verify_via_decode.
+        # Skip the allocation when prefill / verify are disabled (decode-only
+        # backends like the draft worker).
+        if not self.skip_prefill:
+            self.verify_dec_kv_indices = torch.zeros(
+                (max_bs * self.max_context_len,),
+                dtype=torch.int64,
+                device=model_runner.device,
+            )
+        else:
+            self.verify_dec_kv_indices = None
 
     def get_num_kv_splits(
         self,
@@ -963,6 +1003,35 @@ class TritonAttnBackend(AttentionBackend):
                 q, o, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
+        # TARGET_VERIFY fast path for full-attention layers: route through the
+        # decode kernel instead of the extend kernel. The default extend
+        # kernel `_fwd_kernel` becomes badly under-utilised on B200 for the
+        # verify case (head_dim=512 forces BLOCK_M=16 by register pressure
+        # but only num_draft_tokens=6 of those rows are real, and there is
+        # no split-K parallelism), so the per-token-layer cost balloons to
+        # ~2x decode despite the verify being structurally a small-extend
+        # over a long prefix.
+        #
+        # We restrict this to non-sliding (full-attention) layers because
+        # (a) profiling shows ~73 % of the verify-attention wall-time lives
+        # there and (b) sliding extend on Gemma 4 is already efficient
+        # (~1.07x decode per token) so re-routing it would add cost
+        # without benefit.
+        #
+        # We also restrict to the "chain" draft case (topk == 1). For tree
+        # drafts (topk > 1) the spec uses a non-trivial custom_mask that
+        # the decode kernel can't honour, so we must keep the extend path.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and causal
+            and self.speculative_eagle_topk == 1
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
+            and self.verify_dec_kv_indices is not None
+        ):
+            return self._forward_target_verify_via_decode(
+                q, o, layer, forward_batch, logits_soft_cap, sinks
+            )
+
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = (
@@ -1151,6 +1220,123 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
         )
+
+        return o
+
+    def _forward_target_verify_via_decode(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor],
+    ):
+        """TARGET_VERIFY attention via num_draft_tokens decode-kernel calls.
+
+        Replaces the single extend-kernel call (which is severely under-
+        utilised on B200 for head_dim=512 + small num_draft_tokens) with a
+        sequence of decode-kernel calls, one per draft-token position. The
+        i-th call processes ``bs`` queries (the i-th draft token of each
+        request) against ``prefix_len + i + 1`` KV positions (i.e. the
+        prefix plus the first i+1 newly-written tokens). KV is already in
+        the cache pool by the time forward_extend runs.
+
+        Inputs follow the same contract as the rest of forward_extend:
+            q : [bs * num_draft_tokens, head_num * qk_head_dim]
+            o : pre-allocated output, same layout for v_head_dim.
+
+        Notes:
+        * Only valid for full-attention (non-sliding) layers; the sliding
+          extend kernel is already efficient on this workload.
+        * Only valid when topk == 1 (chain draft, no tree). When the spec
+          tree is non-trivial, ``custom_mask`` is set and we must fall
+          back to the extend kernel — caller must guard for this.
+        * Per-call workspaces (attn_logits / attn_lse) are reused across
+          the loop; this is safe because each decode_attention_fwd call
+          is a synchronous CUDA-graph-or-eager block from this thread's
+          point of view.
+        """
+        bs = len(forward_batch.req_pool_indices)
+        num_draft = self.num_draft_tokens
+        head_num = layer.tp_q_head_num
+        qk_head_dim = layer.qk_head_dim
+        v_head_dim = layer.v_head_dim
+
+        # Re-shape q so we can take per-position slices.
+        q3 = q.view(bs, num_draft, head_num * qk_head_dim)
+        o3 = o.view(bs, num_draft, head_num * v_head_dim)
+
+        # KV scaling (same convention as forward_extend / forward_decode).
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+
+        seq_lens_full = (
+            forward_batch.seq_lens
+        )  # [bs], includes the num_draft new tokens
+        # Per-call workspace (slice the cuda-graph buffers down to bs rows).
+        attn_logits = self.cuda_graph_attn_logits[:bs]
+        attn_lse = self.cuda_graph_attn_lse[:bs]
+        num_kv_splits_buf = self.verify_dec_num_kv_splits[:bs]
+
+        kv_indptr = self.verify_dec_kv_indptr[: bs + 1]
+        kv_indices_full = self.verify_dec_kv_indices
+
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        for i in range(num_draft):
+            # Effective per-call seq_lens: prefix + (i + 1) of the new tokens.
+            # prefix_len_j = seq_lens_full[j] - num_draft, so:
+            #     eff_lens_i[j] = seq_lens_full[j] - num_draft + i + 1
+            eff_lens_i = seq_lens_full - (num_draft - i - 1)
+
+            # Build per-call kv_indptr (cumulative) and kv_indices.
+            # The buffer is initialised to zeros at allocation; element 0 is
+            # already 0 and we never write past element bs, so we don't need
+            # to re-zero it (a scalar write would also be illegal during
+            # CUDA-graph capture).
+            kv_indptr[1 : bs + 1] = torch.cumsum(eff_lens_i, dim=0)
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                eff_lens_i,
+                kv_indptr,
+                None,
+                kv_indices_full,
+                self.req_to_token.stride(0),
+            )
+
+            # num_kv_splits per request based on eff_lens_i.
+            self.get_num_kv_splits(num_kv_splits_buf, eff_lens_i)
+
+            q_i = q3[:, i, :].reshape(bs, head_num, qk_head_dim)
+            o_i = o3[:, i, :].reshape(bs, head_num, v_head_dim)
+
+            self.decode_attention_fwd(
+                q_i,
+                k_buffer,
+                v_buffer,
+                o_i,
+                kv_indptr,
+                kv_indices_full,
+                attn_logits,
+                attn_lse,
+                num_kv_splits_buf,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
+            )
 
         return o
 
