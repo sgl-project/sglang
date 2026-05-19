@@ -31,6 +31,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
+if not _MOCK_MODE_AVAILABLE:
+    pytest.skip(
+        "awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3",
+        allow_module_level=True,
+    )
+
 pytestmark = pytest.mark.skip(
     reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
 )
