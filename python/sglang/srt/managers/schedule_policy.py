@@ -105,11 +105,13 @@ def match_prefix_for_req(
         req.prefix_indices,
         req.last_node,
         req.last_host_node,
+        req.best_match_node,
         req.host_hit_length,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
+        match_result.best_match_node,
         match_result.host_hit_length,
     )
     if match_result.mamba_branching_seqlen is not None:
@@ -158,19 +160,17 @@ class SchedulePolicy:
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
-    ) -> bool:
+    ) -> None:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return False
+            return
 
         policy = self._determine_active_policy(waiting_queue)
 
-        prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
-            prefix_computed = True
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -198,7 +198,6 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
-        return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
@@ -878,7 +877,7 @@ class PrefillAdder:
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
-                        last_host_node=req.last_host_node,
+                        best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
@@ -960,7 +959,7 @@ class PrefillAdder:
                 truncated = True
 
         # has_pending_chunk: persistent flag carrying chunked-resume state
-        # across iters. DLLM uses its own staging_queue + pending_middle_outputs counter.
+        # across iters. DLLM uses its own staging_queue + inflight_middle_chunks counter.
         if not req.is_dllm():
             req.has_pending_chunk = truncated
 
@@ -975,7 +974,7 @@ class PrefillAdder:
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
         # NOTE: A request finishes in two phases:
-        #   1) check_finished + release_kv_cache  (in process_batch_result)
+        #   1) update_finish_state + release_kv_cache  (in process_batch_result)
         #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
         # Preemption runs between these two phases (inside get_new_batch_prefill),
         # so running_batch may still contain requests whose KV cache is already freed.
