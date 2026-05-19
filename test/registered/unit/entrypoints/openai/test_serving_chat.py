@@ -32,7 +32,7 @@ from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTokenizerManager:
@@ -119,9 +119,12 @@ class ServingChatTestCase(unittest.TestCase):
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = conv_ins.audio_data = None
@@ -1393,6 +1396,52 @@ class ServingChatTestCase(unittest.TestCase):
         msg = response.choices[0].message
         self.assertIsNone(msg.content)
         self.assertEqual(msg.reasoning_content, "42")
+
+    # --- poolside_v1 (Laguna-XS.2) regression tests ---
+
+    def test_poolside_v1_enable_thinking_dispatch(self):
+        """Laguna chat template defaults `enable_thinking=false`. Parser must
+        follow that default — must NOT return True via the generic fallback.
+        After the reasoning-config refactor, this is driven by
+        `_PoolsideV1Detector.reasoning_default = "explicit_enable_thinking"`."""
+        self._setup_fallback("poolside_v1")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, False),  # no chat_template_kwargs → non-thinking (default)
+            ({}, False),  # empty kwargs → non-thinking
+            ({"enable_thinking": False}, False),  # explicit off
+            ({"enable_thinking": True}, True),  # explicit on
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+
+    def test_poolside_v1_does_not_double_prepend_think(self):
+        """When `enable_thinking=True` for poolside_v1, the HF chat template
+        already emits `<think>` via add_generation_prompt — server must NOT
+        append a second `<think>`. After the refactor this is guarded by
+        `_PoolsideV1Detector.thinks_internally = True` (inherited from Qwen3Detector).
+        """
+        self._setup_fallback("poolside_v1")
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "BASE_PROMPT"
+            conv_ins.image_data = conv_ins.audio_data = conv_ins.video_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = []
+            conv_mock.return_value = conv_ins
+            result = self.chat._apply_conversation_template(req, is_multimodal=False)
+        self.assertEqual(result.prompt, "BASE_PROMPT")
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

@@ -28,11 +28,14 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -43,13 +46,17 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     flatten_nested_list,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel
+from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -170,38 +177,46 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
 
+        text_config = config.text_config
+
         prefix = add_prefix("model", prefix)
 
-        self.vision_tower = Gemma4VisionEncoder(
-            config=config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
-        )
-
-        self.embed_vision = Gemma4MultimodalEmbedder(
-            config.vision_config,
-            config.text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_vision", prefix),
-        )
-
-        # Audio components
-        if getattr(config, "audio_config", None) is not None:
-            self.audio_tower = Gemma4AudioEncoder(
-                config=config.audio_config,
+        # Vision/audio encoders + their projection embedders are only consumed
+        # at the input-embedding stage, so they live on the first PP rank only.
+        if self.pp_group.is_first_rank:
+            self.vision_tower = Gemma4VisionEncoder(
+                config=config.vision_config,
                 quant_config=quant_config,
-                prefix=add_prefix("audio_tower", prefix),
+                prefix=add_prefix("vision_tower", prefix),
             )
-            self.embed_audio = Gemma4MultimodalEmbedder(
-                config.audio_config,
+            self.embed_vision = Gemma4MultimodalEmbedder(
+                config.vision_config,
                 config.text_config,
                 quant_config=quant_config,
-                prefix=add_prefix("embed_audio", prefix),
+                prefix=add_prefix("embed_vision", prefix),
             )
+            if getattr(config, "audio_config", None) is not None:
+                self.audio_tower = Gemma4AudioEncoder(
+                    config=config.audio_config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("audio_tower", prefix),
+                )
+                self.embed_audio = Gemma4MultimodalEmbedder(
+                    config.audio_config,
+                    config.text_config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("embed_audio", prefix),
+                )
+            else:
+                self.audio_tower = None
+                self.embed_audio = None
         else:
+            self.vision_tower = PPMissingLayer()
+            self.embed_vision = PPMissingLayer()
             self.audio_tower = None
             self.embed_audio = None
 
@@ -212,15 +227,34 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             config.text_config.vocab_size,
         )
 
-        # Text model
+        # Text model — internal Gemma4TextModel is already PP-aware.
         self.language_model = Gemma4TextModel(
             config.text_config,
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
+        # Tied embeddings: under PP the embed_tokens lives on the first rank
+        # while logits run on the last rank, so we can't reuse the embedding
+        # module directly.  For PP=1 keep the original tying; for PP>1
+        # materialize a real ParallelLMHead on the last rank and route the
+        # checkpoint embedding into it during load_weights.
+        text_tie = getattr(text_config, "tie_word_embeddings", True)
+        if self.pp_group.world_size == 1 and text_tie:
+            self.lm_head = self.language_model.embed_tokens
+        elif self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                text_config.vocab_size,
+                text_config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_aux_hidden_states = False
 
         self.post_init()
 
@@ -547,17 +581,26 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs: object,
-    ) -> LogitsProcessor:
+    ) -> Union[LogitsProcessor, PPProxyTensors]:
         """Forward pass for multimodal Gemma4."""
-        if (input_ids is None) ^ (input_embeds is not None):
+        is_first_rank = self.pp_group.is_first_rank
+        is_last_rank = self.pp_group.is_last_rank
+
+        # Only the first PP rank consumes input_ids/input_embeds; later stages
+        # receive activations through pp_proxy_tensors.
+        if is_first_rank and (input_ids is None) ^ (input_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
         positions += 1
         per_layer_inputs = None
-        if input_ids is not None:
+        # PLE table and the per-layer projection live on the first rank only,
+        # so non-first ranks must skip this and pull per_layer_inputs from the
+        # PP proxy (forwarded by Gemma4TextModel).
+        if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
             ple_ids[input_ids == self.config.image_token_id] = pad_id
@@ -566,9 +609,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.
-        # Gemma 4 uses bidirectional attention for image soft tokens.
-        # Only TritonAttnBackend supports this; incompatible with CUDA Graph and
-        # chunked prefill.
+        # mm_inputs is preserved on every PP rank up to the first-rank embed
+        # routine, so each rank's attn_backend can install the mask locally.
         if (
             forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.contains_image_inputs()
@@ -579,7 +621,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 mask_dtype=torch.bool,
             )
 
-        # Use general_mm_embed_routine for handling multimodal data
+        # general_mm_embed_routine already handles PP: it skips the embedding
+        # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -591,15 +634,43 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             },
             positions=positions,
             per_layer_inputs=per_layer_inputs,
+            pp_proxy_tensors=pp_proxy_tensors,
             **kwargs,
         )
 
-        # Process hidden states through logits processor
+        if not is_last_rank:
+            # `hidden_states` is actually a PPProxyTensors flowing to the next
+            # stage; logits processing happens on the last rank only.
+            return hidden_states
+
+        # Unpack aux_hidden_states if Eagle3 capture is active
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        # PP=1 keeps the original tied-weight behavior of using embed_tokens
+        # directly; under PP we route through the dedicated lm_head module.
+        head = (
+            self.language_model.embed_tokens
+            if self.pp_group.world_size == 1
+            and getattr(self.config.text_config, "tie_word_embeddings", True)
+            else self.lm_head
+        )
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            head,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def tie_weights(self, recompute_mapping=False):
+        # Under PP, embed_tokens (first rank) and lm_head (last rank) live on
+        # different processes, so HF's automatic tying would crash on the
+        # PPMissingLayer side.  load_weights routes the embedding into lm_head
+        # on the last rank explicitly, so the tie is a no-op under PP.
+        if self.pp_group.world_size > 1:
+            return
         return self.language_model.tie_weights()
 
     # Standard stacked-params mapping for fused QKV / GateUp linears
@@ -754,6 +825,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 full = f"{mod_name}.{buf_name}" if mod_name else buf_name
                 non_persistent_buffers.add(full)
 
+        text_tie = getattr(self.config.text_config, "tie_word_embeddings", True)
+        start_layer = self.language_model.start_layer
+        end_layer = self.language_model.end_layer
+
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
@@ -765,6 +840,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 continue
 
             name = re.sub(r"^model\.", "", name)
+
+            if pp_filter_load_weight(
+                name,
+                loaded_weight,
+                pp_group=self.pp_group,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                params_dict=params_dict,
+                loaded_params=loaded_params,
+                tie_word_embeddings=text_tie,
+                embed_weight_name="language_model.embed_tokens.weight",
+                first_rank_only_patterns=(
+                    "language_model.embed_tokens",
+                    "language_model.per_layer_model_projection",
+                    "language_model.per_layer_projection_norm",
+                    "vision_tower.",
+                    "embed_vision.",
+                    "audio_tower.",
+                    "embed_audio.",
+                ),
+                last_rank_only_prefixes=("language_model.norm.", "lm_head."),
+            ):
+                continue
 
             # HF has router.per_expert_scale and experts.* on the decoder layer;
             # remap into our moe.* subtree since Gemma4MoE owns both.
@@ -791,6 +889,41 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 and (m := re.search(r"layers\.(\d+)\.", name)) is not None
                 and int(m.group(1)) in k_eq_v_layers
             )
+
+            # Per-expert checkpoint format used by compressed-tensors / FP8
+            # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
+            # separate key with shape (out, in):
+            #   experts.<id>.gate_proj.{weight,weight_scale}
+            #   experts.<id>.up_proj.{weight,weight_scale}
+            #   experts.<id>.down_proj.{weight,weight_scale}
+            # These need to be folded into sglang's fused FusedMoE params:
+            #   experts.w13_weight[_scale]  (gate->shard "w1", up->shard "w3")
+            #   experts.w2_weight[_scale]   (down->shard "w2")
+            per_expert_match = re.match(
+                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
+                r"\.(weight|weight_scale)$",
+                name,
+            )
+            if per_expert_match:
+                prefix = per_expert_match.group(1)
+                expert_id = int(per_expert_match.group(2))
+                proj = per_expert_match.group(3)
+                suffix = per_expert_match.group(4)
+                if proj == "gate_proj":
+                    base, sid = "w13_weight", "w1"
+                elif proj == "up_proj":
+                    base, sid = "w13_weight", "w3"
+                else:  # down_proj
+                    base, sid = "w2_weight", "w2"
+                if suffix == "weight_scale":
+                    base += "_scale"
+                fused_name = prefix + base
+                if fused_name in params_dict:
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
+                    loaded_params.add(fused_name)
+                continue
 
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
@@ -898,6 +1031,41 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
+
+    def get_embed(self):
+        return self.language_model.embed_tokens.weight
+
+    def get_embed_and_head(self):
+        if self.pp_group.world_size > 1:
+            # Under PP, embed_tokens lives on the first rank and lm_head on the
+            # last; neither rank holds both tensors, so we can't return the
+            # pair locally without a cross-stage gather.  Callers (RL weight
+            # sync, remote weight loader) currently assume a single-rank view —
+            # fail loudly rather than dereference a PPMissingLayer.
+            raise NotImplementedError(
+                "get_embed_and_head() is not implemented for Gemma4 "
+                "multimodal under pipeline parallelism. embed_tokens lives "
+                "on the first PP rank and lm_head on the last; use "
+                "--pp-size 1 if you need this API."
+            )
+        embed = self.language_model.embed_tokens.weight
+        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        return embed, embed
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        text_config = self.config.text_config
+        if layer_ids is None:
+            num_layers = text_config.num_hidden_layers
+            self.language_model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForConditionalGeneration

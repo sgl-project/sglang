@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
+import torch
+
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -15,7 +17,8 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -109,6 +112,26 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def supports_target_verify_for_draft(self) -> bool:
+        return self.is_dflash()
+
+    def create_future_map(
+        self,
+        max_running_requests: int,
+        chunked_prefill_size: int,
+        context_len: int,
+        device: torch.device,
+    ) -> FutureMap:
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            max_running_requests,
+            chunked_prefill_size,
+            context_len,
+            device,
+            self,
+        )
+
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
 
@@ -195,8 +218,10 @@ class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
+    EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
     FROZEN_KV_MTP_DRAFT = auto()
+    FROZEN_KV_MTP_DRAFT_EXTEND = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
@@ -207,12 +232,16 @@ class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
+            SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
+            SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
         }
 
@@ -229,11 +258,11 @@ class SpecInput(ABC):
         pass
 
     def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> Tuple[List[int], List[int]]:
         c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
+        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
         global_num_tokens_for_logprob = [
-            x * c2 for x in forward_batch.global_num_tokens_for_logprob
+            x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
