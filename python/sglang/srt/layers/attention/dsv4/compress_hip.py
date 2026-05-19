@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
+    fused_softmax_pool_triton,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
@@ -258,10 +259,16 @@ class CompressorHip(_CompressorBase):
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_triton(
+                    kv_and_score_to_compress.kv_score,
+                    kv_and_score_to_compress._item_size,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             assert kv_compressed.dtype == torch.float32
 
@@ -390,9 +397,16 @@ class CompressorHip(_CompressorBase):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+        if self.use_hip_fused_compress:
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
+        else:
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         if self.use_hip_fused_compress:
             freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
