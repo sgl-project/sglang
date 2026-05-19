@@ -755,7 +755,7 @@ jobs:
             test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_48p_in65k_out1k5_prefix100_33ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          - name: test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_20ms
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms
             prefill_size: 2
             decode_size: 2
             router_size: 1
