@@ -5,19 +5,14 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary import VIOLATION_FIELDS
+from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL as _SKIP_SENTINEL,
+    VIOLATION_FIELDS,
+)
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-# Skip-sentinel value used by the expected_write_* launch buffers. A
-# write entry whose expected token or position is set to this value
-# tells the canary kernel to skip the pseudo-mode input cross-check for
-# that entry (no oracle prediction available, or the active count is
-# below capacity).
-_SKIP_SENTINEL: int = -1
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -50,12 +45,30 @@ class BatchPlan:
     num_write: int
     num_write_reqs: int
 
-    # Pseudo-mode oracle predictions for the write entries. When set, the
-    # canary kernel cross-checks each write entry's actual input token /
-    # position against these expected values. None on non-pseudo callers;
-    # the kernel sees skip-sentinel (-1) fixed buffers and runs unchanged.
+    # Pseudo-mode oracle predictions for the write entries. Set as a
+    # paired non-None tuple in pseudo-mode; both None otherwise.
     expected_write_token_ids: Optional[List[int]] = None
     expected_write_positions: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        tokens = self.expected_write_token_ids
+        positions = self.expected_write_positions
+        if (tokens is None) != (positions is None):
+            raise ValueError(
+                "kv-canary: expected_write_token_ids and expected_write_positions "
+                "must both be set or both be None"
+            )
+        if tokens is not None:
+            if len(tokens) != self.num_write:
+                raise ValueError(
+                    f"kv-canary: expected_write_token_ids length {len(tokens)} "
+                    f"!= num_write {self.num_write}"
+                )
+            if len(positions) != self.num_write:
+                raise ValueError(
+                    f"kv-canary: expected_write_positions length {len(positions)} "
+                    f"!= num_write {self.num_write}"
+                )
 
 
 def plan_batch_from_forward_batch(
@@ -600,21 +613,13 @@ class CanaryLaunchBuffers:
             self.write_token_ids[nw:].zero_()
             self.write_positions[nw:].zero_()
 
+        # Oracle-off callers leave these buffers in their canonical
+        # all-sentinel state from allocate(); pseudo-mode rewrites [:nw]
+        # and restores the tail. The kernel skips entries where
+        # write_req_active_mask is zero, so the tail being stale doesn't
+        # produce false violations — but keeping it at the sentinel value
+        # keeps reset_to_skip_sentinel a mask-only no-op (see below).
         if plan.expected_write_token_ids is not None:
-            if len(plan.expected_write_token_ids) != plan.num_write:
-                raise RuntimeError(
-                    f"kv-canary: expected_write_token_ids length "
-                    f"{len(plan.expected_write_token_ids)} must equal num_write "
-                    f"{plan.num_write}"
-                )
-            if (
-                plan.expected_write_positions is None
-                or len(plan.expected_write_positions) != plan.num_write
-            ):
-                raise RuntimeError(
-                    "kv-canary: expected_write_positions must be set in lockstep "
-                    "with expected_write_token_ids and match num_write"
-                )
             if nw > 0:
                 self.expected_write_token_ids[:nw].copy_(
                     to_i64(plan.expected_write_token_ids, slice(0, nw))
@@ -625,9 +630,6 @@ class CanaryLaunchBuffers:
             if nw < self.write_capacity:
                 self.expected_write_token_ids[nw:].fill_(_SKIP_SENTINEL)
                 self.expected_write_positions[nw:].fill_(_SKIP_SENTINEL)
-        else:
-            self.expected_write_token_ids.fill_(_SKIP_SENTINEL)
-            self.expected_write_positions.fill_(_SKIP_SENTINEL)
 
         nwr = plan.num_write_reqs
         if nwr > 0:
@@ -650,8 +652,9 @@ class CanaryLaunchBuffers:
         """Reset all active masks so the recorded kernel becomes a no-op.
 
         Used at capture time and at replay-time when no valid plan exists.
+        The expected_write_* buffers do not need touching here: the
+        kernel early-exits on a zero write_req_active_mask before reading
+        them.
         """
         self.verify_active_mask.zero_()
         self.write_req_active_mask.zero_()
-        self.expected_write_token_ids.fill_(_SKIP_SENTINEL)
-        self.expected_write_positions.fill_(_SKIP_SENTINEL)
