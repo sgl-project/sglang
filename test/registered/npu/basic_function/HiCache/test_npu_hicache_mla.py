@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
@@ -25,6 +27,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendMlaHicache(CustomTestCase):
 
     @classmethod
