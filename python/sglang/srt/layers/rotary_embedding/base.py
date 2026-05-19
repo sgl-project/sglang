@@ -87,7 +87,10 @@ class RotaryEmbedding(MultiPlatformOp):
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
-                from vllm._custom_ops import rotary_embedding
+                try:
+                    from vllm._custom_ops import rotary_embedding
+                except ImportError:
+                    rotary_embedding = None
 
             self.use_fallback_kernel = True
             self.fallback_rotary_embedding = rotary_embedding
