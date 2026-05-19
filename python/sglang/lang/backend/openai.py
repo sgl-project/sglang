@@ -395,8 +395,7 @@ def openai_completion(
                     kwargs.pop("stop")
                 ret = client.chat.completions.create(messages=prompt, **kwargs)
                 if not ret.choices or any(
-                    c.message is None or c.message.content is None
-                    for c in ret.choices
+                    c.message is None or c.message.content is None for c in ret.choices
                 ):
                     raise ValueError("LLM returned empty or filtered response")
                 if len(ret.choices) == 1:
