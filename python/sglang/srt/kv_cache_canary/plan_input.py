@@ -101,14 +101,12 @@ def build_plan_input_per_forward(
         fb_prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32).contiguous()
         fb_extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32).contiguous()
     else:
-        fb_prefix_lens = (
-            (forward_batch.seq_lens - 1).clamp(min=0).to(torch.int32).contiguous()
-        )
+        fb_prefix_lens = (forward_batch.seq_lens - 1).to(torch.int32).contiguous()
         fb_extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
 
-    extra_slot = torch.zeros(1, dtype=torch.int32, device=device)
-    extra_position = torch.zeros(1, dtype=torch.int32, device=device)
-    extra_prev = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_slot = torch.zeros(0, dtype=torch.int32, device=device)
+    extra_position = torch.zeros(0, dtype=torch.int32, device=device)
+    extra_prev = torch.zeros(0, dtype=torch.int32, device=device)
     extra_num_valid = torch.zeros(1, dtype=torch.int32, device=device)
 
     return PlanInput(
@@ -148,9 +146,9 @@ def build_plan_input_running_sweep(
     fb_prefix_lens = seq_lens.to(torch.int32).contiguous()
     fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
 
-    extra_slot = torch.zeros(1, dtype=torch.int32, device=device)
-    extra_position = torch.zeros(1, dtype=torch.int32, device=device)
-    extra_prev = torch.zeros(1, dtype=torch.int32, device=device)
+    extra_slot = torch.zeros(0, dtype=torch.int32, device=device)
+    extra_position = torch.zeros(0, dtype=torch.int32, device=device)
+    extra_prev = torch.zeros(0, dtype=torch.int32, device=device)
     extra_num_valid = torch.zeros(1, dtype=torch.int32, device=device)
 
     return PlanInput(
@@ -256,6 +254,7 @@ def walk_radix_cache_for_canary(
         slot_buf=slot_buf,
         position_buf=position_buf,
         prev_slot_buf=prev_slot_buf,
+        is_root=True,
     )
 
     slot_tensor = torch.tensor(slot_buf, dtype=torch.int32)
@@ -272,18 +271,22 @@ def _walk_radix_subtree(
     slot_buf: list[int],
     position_buf: list[int],
     prev_slot_buf: list[int],
+    is_root: bool,
 ) -> None:
     if isinstance(node.value, torch.Tensor):
         node_slots = [int(s) for s in node.value.tolist()]
     else:
         node_slots = []
 
+    emit_slots = not is_root and node.lock_ref == 0
+
     chain_last_slot = parent_last_slot
     for j, slot in enumerate(node_slots):
         prev = parent_last_slot if j == 0 else node_slots[j - 1]
-        slot_buf.append(slot)
-        position_buf.append(depth + j)
-        prev_slot_buf.append(prev)
+        if emit_slots:
+            slot_buf.append(slot)
+            position_buf.append(depth + j)
+            prev_slot_buf.append(prev)
         chain_last_slot = slot
 
     child_depth = depth + len(node_slots)
@@ -295,6 +298,7 @@ def _walk_radix_subtree(
             slot_buf=slot_buf,
             position_buf=position_buf,
             prev_slot_buf=prev_slot_buf,
+            is_root=False,
         )
 
 
