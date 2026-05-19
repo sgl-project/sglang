@@ -26,13 +26,14 @@ from __future__ import annotations
 import logging
 import unittest
 from test.registered.pseudo_mode._test_utils import (
-    register_pseudo_a_ci,
     requires_cuda,
 )
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 logger = logging.getLogger(__name__)
 
-register_pseudo_a_ci()
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 @requires_cuda

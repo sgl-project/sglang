@@ -36,13 +36,14 @@ from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
 from test.registered.pseudo_mode._test_utils import (
     PSEUDO_MODE_MODEL,
-    register_pseudo_a_ci,
     requires_cuda,
 )
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 logger = logging.getLogger(__name__)
 
-register_pseudo_a_ci()
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 # Page size is 1 by default on sglang Qwen3 path; we choose a prompt
