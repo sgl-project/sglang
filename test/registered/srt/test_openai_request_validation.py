@@ -21,7 +21,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageUserParam,
     ChatCompletionRequest,
     CompletionRequest,
-    ResponseFormat,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -157,9 +156,7 @@ class TestContinueFinalMessageValidation(unittest.TestCase):
         self.assertIsNone(self.chat._validate_request(req))
 
     def test_single_user_message_no_continue_is_allowed(self):
-        self.assertIsNone(
-            self.chat._validate_request(_chat(messages=[_USER_MSG]))
-        )
+        self.assertIsNone(self.chat._validate_request(_chat(messages=[_USER_MSG])))
 
     def test_single_assistant_no_continue_is_allowed(self):
         req = _chat(
@@ -189,9 +186,7 @@ class TestLogitBiasRangeValidation(unittest.TestCase):
         self.assertEqual(_completion(logit_bias={"1": 100.0}).logit_bias["1"], 100.0)
 
     def test_completion_bias_at_minus_100_is_allowed(self):
-        self.assertEqual(
-            _completion(logit_bias={"1": -100.0}).logit_bias["1"], -100.0
-        )
+        self.assertEqual(_completion(logit_bias={"1": -100.0}).logit_bias["1"], -100.0)
 
     def test_completion_no_logit_bias_is_allowed(self):
         self.assertIsNone(_completion().logit_bias)
