@@ -85,7 +85,6 @@ pub async fn zmq_send_task(sock: zmq::Socket, mut rx: mpsc::Receiver<Vec<u8>>) {
 
     while let Some(data) = rx.recv().await {
         loop {
-            println!("Attempting to send ZMQ message of length {}", data.len());
             match sock.send_multipart(&[MSGPACK_MAGIC, data.as_slice()], zmq::DONTWAIT) {
                 Ok(()) => break,
                 Err(zmq::Error::EAGAIN) => {

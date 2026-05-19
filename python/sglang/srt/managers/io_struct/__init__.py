@@ -250,9 +250,11 @@ def sock_send(
 ):
     # if the msgpack magic number is not used, fallback to pickle
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
-        logger.debug(
-            f"Sending pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Sending pickle object of type %s since SGLANG_IPC_USE_MSGPACK is disabled",
+                type(obj),
+            )
         socket.send_pyobj(obj, flags=flags)
         return
 
@@ -260,26 +262,34 @@ def sock_send(
         from .msgpack_struct import serialize
 
         magic_number = MSGPACK_MAGIC_NUMBER
-        logger.debug(
-            f"Sending msgpack object of type {type(obj)} with magic number {magic_number}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Sending msgpack object of type %s with magic number %s",
+                type(obj),
+                magic_number,
+            )
         socket.send_multipart([magic_number, serialize(obj)], flags=flags)
     else:
         from .pickle_struct import serialize
 
         magic_number = PICKLE_MAGIC_NUMBER
-        logger.debug(
-            f"Sending pickle object of type {type(obj)} with magic number {magic_number}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Sending pickle object of type %s with magic number %s",
+                type(obj),
+                magic_number,
+            )
         socket.send_multipart([magic_number, serialize(obj)], flags=flags)
 
 
 def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
         obj = socket.recv_pyobj(flags=flags)
-        logger.debug(
-            f"Receiving pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Receiving pickle object of type %s since SGLANG_IPC_USE_MSGPACK is disabled",
+                type(obj),
+            )
         return obj
 
     magic_number, data = socket.recv_multipart(flags=flags)
@@ -287,15 +297,19 @@ def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.S
         from .msgpack_struct import deserialize
 
         obj = deserialize(data)
-        logger.debug(
-            f"Received msgpack object of type {type(obj)} with magic number {magic_number}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Received msgpack object of type %s with magic number %s",
+                type(obj),
+                magic_number,
+            )
         return obj
     else:
         from .pickle_struct import deserialize
 
         obj = deserialize(data)
-        logger.debug(f"Received pickle object of type {type(obj)}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Received pickle object of type %s", type(obj))
         return obj
 
 

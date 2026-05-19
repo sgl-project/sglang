@@ -127,6 +127,11 @@ class CpuPageTracker:
         """Return and clear all accumulated free indices (sent with next batch)."""
         if not self._pending_free:
             return None
+        # Common case: a single freed-indices tensor — skip torch.cat.
+        if len(self._pending_free) == 1:
+            result = self._pending_free[0]
+            self._pending_free.clear()
+            return result
         result = torch.cat(self._pending_free)
         self._pending_free.clear()
         return result
@@ -327,23 +332,50 @@ class CpuScheduler(Scheduler):
         if da["mode"] == "extend":
             prefix_lens = da["prefix_lens"]    # int64 CPU tensor [bs]
             extend_lens = da["extend_lens"]    # int64 CPU tensor [bs]
-            pt = 0
-            for i in range(len(req_pool_indices)):
-                req_idx = req_pool_indices[i].item()
-                pre = prefix_lens[i].item()
-                ext = extend_lens[i].item()
+            bs = req_pool_indices.numel()
+            # Single-request fast path — skip the index construction overhead.
+            if bs == 1:
+                req_idx = int(req_pool_indices[0])
+                pre = int(prefix_lens[0])
+                ext = int(extend_lens[0])
                 pool.req_to_token[req_idx, pre : pre + ext] = (
-                    out_cache_loc[pt : pt + ext].to(torch.int32)
+                    out_cache_loc[:ext].to(torch.int32)
                 )
-                pt += ext
+            else:
+                # Vectorized scatter: build (row, col) index pairs once, then
+                # do a single fancy-indexed write. Avoids the O(bs) Python loop
+                # and O(bs) .item() calls in the original implementation.
+                extend_lens_long = extend_lens.long()
+                # For each token in out_cache_loc, its (req_pool_row, col) is:
+                #   row = repeat_interleave(req_pool_indices, extend_lens)
+                #   col = (prefix_lens repeated) + (per-request 0..ext-1 offset)
+                row_idx = torch.repeat_interleave(req_pool_indices.long(), extend_lens_long)
+                # Per-token offset within its request's extend slice.
+                # cumulative_extend[i] is the start of req i's slice in out_cache_loc.
+                cumulative_extend = torch.cumsum(extend_lens_long, dim=0)
+                # Compute per-token starts via repeat_interleave of the slice offsets.
+                slice_starts = torch.cat(
+                    [torch.zeros(1, dtype=torch.long), cumulative_extend[:-1]]
+                )
+                # token_idx_within_slice[k] = k - slice_starts of its request
+                total_tokens = int(cumulative_extend[-1])
+                token_indices = torch.arange(total_tokens, dtype=torch.long)
+                slice_start_per_token = torch.repeat_interleave(slice_starts, extend_lens_long)
+                token_offset = token_indices - slice_start_per_token
+                col_idx = (
+                    torch.repeat_interleave(prefix_lens.long(), extend_lens_long)
+                    + token_offset
+                )
+                pool.req_to_token[row_idx, col_idx] = out_cache_loc.to(torch.int32)
 
         elif da["mode"] == "decode":
-            # seq_lens_minus1[i] is the position to write the new decode slot
+            # Single indexed write instead of a per-request Python loop:
+            # for each i, set pool.req_to_token[req_pool_indices[i], seq_lens_minus1[i]] = out_cache_loc[i]
             seq_lens_minus1 = da["seq_lens_minus1"]  # int64 CPU tensor [bs]
-            for i in range(len(req_pool_indices)):
-                req_idx = req_pool_indices[i].item()
-                pos = seq_lens_minus1[i].item()
-                pool.req_to_token[req_idx, pos] = out_cache_loc[i].to(torch.int32)
+            pool.req_to_token[
+                req_pool_indices.long(),
+                seq_lens_minus1.long(),
+            ] = out_cache_loc.to(torch.int32)
 
         # Sync free page count from the GPU worker's authoritative allocator
         free_pages = da.get("free_pages_remaining")

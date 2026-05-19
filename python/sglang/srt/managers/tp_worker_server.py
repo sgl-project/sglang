@@ -182,9 +182,21 @@ class TpWorkerServer:
         self.socket.send(pickle.dumps(handshake))
         logger.info("TpWorkerServer handshake sent")
 
+        # Phase 0 instrumentation: aggregate run_loop sub-step times for the
+        # decode-step path so we can see where the per-step time actually goes.
+        _loop_count = 0
+        _loop_recv_sum = 0.0      # time waiting on recv_multipart (incl. idle)
+        _loop_unpickle_sum = 0.0  # pickle.loads of payload
+        _loop_dispatch_sum = 0.0  # actual work (delegates to existing aggregator inside)
+        _loop_repickle_sum = 0.0  # pickle.dumps of result
+        _loop_send_sum = 0.0      # socket.send_multipart
+        _loop_window = 100
+
         while True:
             try:
+                _t0 = time.perf_counter()
                 parts = self.socket.recv_multipart()
+                _t1 = time.perf_counter()
             except zmq.ZMQError as exc:
                 logger.error("TpWorkerServer ZMQ error: %s", exc)
                 break
@@ -194,16 +206,47 @@ class TpWorkerServer:
 
             method = parts[0]
             payload: dict = pickle.loads(parts[1]) if len(parts) > 1 else {}
+            _t2 = time.perf_counter()
 
             try:
                 result = self._dispatch(method, payload)
-                self.socket.send_multipart([STATUS_OK, pickle.dumps(result)])
+                _t3 = time.perf_counter()
+                reply = pickle.dumps(result)
+                _t4 = time.perf_counter()
+                self.socket.send_multipart([STATUS_OK, reply])
+                _t5 = time.perf_counter()
             except SystemExit:
                 self.socket.send_multipart([STATUS_OK, pickle.dumps(None)])
                 break
             except Exception as exc:
                 logger.exception("TpWorkerServer error in method %r", method)
                 self.socket.send_multipart([STATUS_ERROR, pickle.dumps(str(exc))])
+                continue
+
+            # Aggregate per-step
+            if method == M_DECODE_STEP or method == M_FORWARD_GENERATION:
+                _loop_count += 1
+                _loop_recv_sum += _t1 - _t0
+                _loop_unpickle_sum += _t2 - _t1
+                _loop_dispatch_sum += _t3 - _t2
+                _loop_repickle_sum += _t4 - _t3
+                _loop_send_sum += _t5 - _t4
+                if _loop_count >= _loop_window:
+                    logger.info(
+                        "TpWorkerServer run_loop[%d steps] avg ms: recv_wait=%.2f "
+                        "unpickle=%.2f dispatch=%.2f repickle=%.2f send=%.2f total=%.2f",
+                        _loop_count,
+                        _loop_recv_sum / _loop_count * 1000,
+                        _loop_unpickle_sum / _loop_count * 1000,
+                        _loop_dispatch_sum / _loop_count * 1000,
+                        _loop_repickle_sum / _loop_count * 1000,
+                        _loop_send_sum / _loop_count * 1000,
+                        (_loop_recv_sum + _loop_unpickle_sum + _loop_dispatch_sum
+                         + _loop_repickle_sum + _loop_send_sum) / _loop_count * 1000,
+                    )
+                    _loop_count = 0
+                    _loop_recv_sum = _loop_unpickle_sum = _loop_dispatch_sum = 0.0
+                    _loop_repickle_sum = _loop_send_sum = 0.0
 
     def run_in_thread(self) -> threading.Thread:
         """Start the event loop in a background daemon thread and return it."""
@@ -466,17 +509,59 @@ class TpWorkerServer:
             result = w.forward_batch_generation(batch)
             forward_batch_time = time.perf_counter()
             result.deferred_alloc = batch._deferred_alloc
-            _move_generation_result_to_cpu(result, method=M_DECODE_STEP)
+            # CRITICAL: drop next_token_logits — a [batch, vocab_size] GPU tensor
+            # (~155 MB at batch=200 / vocab=152k) that the scheduler never reads.
+            # If it pickles, it sends 155 MB per decode step over ZMQ.
+            if result.logits_output is not None:
+                result.logits_output.next_token_logits = None
+            _move_generation_result_to_cpu(result)
+            # Slim reply for M_DECODE_STEP: include only what the scheduler reads.
+            # Pickling a full GenerationBatchResult walks 15+ Optional dataclass
+            # fields and historically dragged in the huge next_token_logits.
+            slim_result = {
+                "_slim_decode": True,
+                "next_token_ids": result.next_token_ids,
+                "deferred_alloc": result.deferred_alloc,
+                "accept_lens": result.accept_lens,
+                "can_run_cuda_graph": result.can_run_cuda_graph,
+                "num_accepted_drafts": result.num_accepted_drafts,
+            }
+            # logits_output only carries useful logprob arrays when return_logprob
+            # is set on the batch; otherwise the whole thing is dead weight.
+            if (
+                result.logits_output is not None
+                and getattr(batch, "return_logprob", False)
+            ):
+                slim_result["logits_output"] = result.logits_output
+            if result.routed_experts_output is not None:
+                slim_result["routed_experts_output"] = result.routed_experts_output
+            if result.expert_distribution_metrics is not None:
+                slim_result["expert_distribution_metrics"] = result.expert_distribution_metrics
             move_result_to_cpu_time = time.perf_counter()
-            logger.debug(
-                "TpWorkerServer decode_step times: control=%.3f sec, allocate_kv=%.3f sec, "
-                "forward_batch=%.3f sec, move_to_cpu=%.3f sec",
-                decode_control_time - start_time,
-                allocate_kv_time - decode_control_time,
-                forward_batch_time - allocate_kv_time,
-                move_result_to_cpu_time - forward_batch_time,
-            )
-            return result
+            # Aggregate timings every N steps so we can see worker-side breakdown
+            # without flooding the log.
+            self._decode_step_count = getattr(self, "_decode_step_count", 0) + 1
+            self._decode_step_control_sum = getattr(self, "_decode_step_control_sum", 0.0) + (decode_control_time - start_time)
+            self._decode_step_alloc_sum = getattr(self, "_decode_step_alloc_sum", 0.0) + (allocate_kv_time - decode_control_time)
+            self._decode_step_forward_sum = getattr(self, "_decode_step_forward_sum", 0.0) + (forward_batch_time - allocate_kv_time)
+            self._decode_step_move_sum = getattr(self, "_decode_step_move_sum", 0.0) + (move_result_to_cpu_time - forward_batch_time)
+            if self._decode_step_count >= 100:
+                logger.info(
+                    "TpWorkerServer decode_step[%d steps] avg ms: control=%.2f alloc_kv=%.2f forward=%.2f move_to_cpu=%.2f total=%.2f",
+                    self._decode_step_count,
+                    self._decode_step_control_sum / self._decode_step_count * 1000,
+                    self._decode_step_alloc_sum / self._decode_step_count * 1000,
+                    self._decode_step_forward_sum / self._decode_step_count * 1000,
+                    self._decode_step_move_sum / self._decode_step_count * 1000,
+                    (self._decode_step_control_sum + self._decode_step_alloc_sum +
+                     self._decode_step_forward_sum + self._decode_step_move_sum) / self._decode_step_count * 1000,
+                )
+                self._decode_step_count = 0
+                self._decode_step_control_sum = 0.0
+                self._decode_step_alloc_sum = 0.0
+                self._decode_step_forward_sum = 0.0
+                self._decode_step_move_sum = 0.0
+            return slim_result
 
         if method == M_FORWARD_GENERATION:
             batch = payload["batch"]
@@ -497,6 +582,10 @@ class TpWorkerServer:
                 self._decode_cache = batch
             else:
                 self._decode_cache = None
+            # Drop the [batch, vocab_size] next_token_logits — never read by the
+            # scheduler, would pickle as 100+ MB per step.
+            if result.logits_output is not None:
+                result.logits_output.next_token_logits = None
             _move_generation_result_to_cpu(result)
             move_result_to_cpu_time = time.perf_counter()
             logger.debug(
@@ -639,7 +728,7 @@ def _move_model_worker_batch_to_device(
 # Helper: move GPU tensors in GenerationBatchResult to CPU before pickling
 # ---------------------------------------------------------------------------
 
-def _move_generation_result_to_cpu(result: "GenerationBatchResult", method = None) -> None:
+def _move_generation_result_to_cpu(result: "GenerationBatchResult") -> None:
     """In-place copy of all GPU tensors in *result* to CPU.
 
     Called by the server before pickling the result so the client can
@@ -660,8 +749,11 @@ def _move_generation_result_to_cpu(result: "GenerationBatchResult", method = Non
         _needs_sync = True
         return t.to("cpu", non_blocking=True)
 
-    # deferred_alloc may contain GPU tensors (req_pool_indices, out_cache_loc)
-    if result.deferred_alloc is not None and method != M_DECODE_STEP:
+    # deferred_alloc may contain GPU tensors (req_pool_indices, out_cache_loc).
+    # Always move to CPU so the scheduler process can read them without
+    # initializing a CUDA context (and so .item() calls in update_cache_from_scheduler
+    # don't trigger per-request GPU syncs).
+    if result.deferred_alloc is not None:
         result.deferred_alloc = {
             k: _cpu_nb(v) for k, v in result.deferred_alloc.items()
         }
@@ -670,7 +762,7 @@ def _move_generation_result_to_cpu(result: "GenerationBatchResult", method = Non
     result.accept_lens = _cpu_nb(result.accept_lens)
 
     lo = result.logits_output
-    if lo is not None and method != M_DECODE_STEP:
+    if lo is not None:
         lo.next_token_logprobs = _cpu_nb(getattr(lo, "next_token_logprobs", None))
         lo.input_token_logprobs = _cpu_nb(getattr(lo, "input_token_logprobs", None))
         lo.hidden_states = _cpu_nb(getattr(lo, "hidden_states", None))

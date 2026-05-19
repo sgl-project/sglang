@@ -40,6 +40,7 @@ Protocol (see tp_worker_server.py for the server side):
 
 import logging
 import pickle
+import time
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -367,7 +368,22 @@ class TpWorkerClientGroup(BaseTpWorker):
         # _decode_fast_valid is True once the server(s) have a cached GPU decode
         # batch from a full M_FORWARD_GENERATION with decode mode.
         self._decode_fast_valid: bool = False
-        self._last_req_pool_cpu: Optional[torch.Tensor] = None
+        # Tuple fingerprint of req_pool_indices for O(batch) equality without
+        # repeated .cpu().long()/torch.equal() per step.
+        self._last_req_pool_fp: Optional[Tuple[int, ...]] = None
+
+        # Perf counters — logged periodically. Decode-step path is the hot loop.
+        self._decode_fast_hits: int = 0
+        self._decode_fast_misses: int = 0
+        self._decode_full_calls: int = 0
+        # Wall-clock send-to-recv timing (microseconds), aggregated per window.
+        self._rt_count: int = 0
+        self._rt_send_sum_us: float = 0.0
+        self._rt_recv_sum_us: float = 0.0
+        self._rt_max_us: float = 0.0
+        self._rt_window: int = 100  # log every N forward calls
+        # rt_min initialized to a large value so the first sample replaces it
+        self._rt_min_us: float = float("inf")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -376,12 +392,51 @@ class TpWorkerClientGroup(BaseTpWorker):
     def _fanout_forward(self, method: bytes, **kwargs) -> Any:
         """Send *method* to all workers and return rank-0's result."""
         # Phase 1: enqueue requests on all sockets (ZMQ send is non-blocking).
+        t0 = time.perf_counter()
         for client in self._clients:
             client._rpc_send(method, **kwargs)
+        t_after_send = time.perf_counter()
         # Phase 2: collect replies; return rank-0's, discard the rest.
         result = self._lead._rpc_recv()
         for client in self._clients[1:]:
             client._rpc_recv()
+        t_after_recv = time.perf_counter()
+        send_us = (t_after_send - t0) * 1e6
+        recv_us = (t_after_recv - t_after_send) * 1e6
+        dt_us = send_us + recv_us
+        self._rt_count += 1
+        self._rt_send_sum_us += send_us
+        self._rt_recv_sum_us += recv_us
+        if dt_us > self._rt_max_us:
+            self._rt_max_us = dt_us
+        if dt_us < self._rt_min_us:
+            self._rt_min_us = dt_us
+        if self._rt_count >= self._rt_window:
+            total = self._decode_fast_hits + self._decode_fast_misses + self._decode_full_calls
+            hit_rate = (
+                self._decode_fast_hits / max(1, total) * 100.0
+            )
+            logger.info(
+                "TpWorkerClient[%d ops] us send=%.0f recv=%.0f min=%.0f max=%.0f "
+                "| decode_fast hits=%d misses=%d full=%d (hit_rate=%.1f%%)",
+                self._rt_count,
+                self._rt_send_sum_us / self._rt_count,
+                self._rt_recv_sum_us / self._rt_count,
+                self._rt_min_us,
+                self._rt_max_us,
+                self._decode_fast_hits,
+                self._decode_fast_misses,
+                self._decode_full_calls,
+                hit_rate,
+            )
+            self._rt_count = 0
+            self._rt_send_sum_us = 0.0
+            self._rt_recv_sum_us = 0.0
+            self._rt_max_us = 0.0
+            self._rt_min_us = float("inf")
+            self._decode_fast_hits = 0
+            self._decode_fast_misses = 0
+            self._decode_full_calls = 0
         return result
 
     def _fanout_rpc(self, method: bytes, **kwargs) -> Any:
@@ -397,21 +452,21 @@ class TpWorkerClientGroup(BaseTpWorker):
     # Decode fast-path helpers
     # ------------------------------------------------------------------
 
-    def _req_pool_cpu(self, batch: "ModelWorkerBatch") -> torch.Tensor:
+    def _req_pool_fingerprint(self, batch: "ModelWorkerBatch") -> Tuple[int, ...]:
+        """Cheap fingerprint of req_pool_indices for change-detection.
+
+        Under CpuScheduler req_pool_indices is already a CPU tensor — tolist()
+        is a fast contiguous read.  Tuple equality is then O(batch) ints.
+        Avoids the per-step .cpu().long() + torch.equal() pair.
+        """
         rpi = batch.req_pool_indices
         if torch.is_tensor(rpi):
-            return rpi.cpu().long()
-        return torch.tensor(rpi, dtype=torch.long)
+            return tuple(rpi.tolist())
+        return tuple(rpi)
 
-    def _batch_composition_unchanged(self, batch: "ModelWorkerBatch") -> bool:
-        """True if req_pool_indices is identical to the last cached decode batch."""
-        if self._last_req_pool_cpu is None:
-            return False
-        curr = self._req_pool_cpu(batch)
-        return (
-            len(curr) == len(self._last_req_pool_cpu)
-            and torch.equal(curr, self._last_req_pool_cpu)
-        )
+    def _batch_composition_unchanged_fp(self, fp: Tuple[int, ...]) -> bool:
+        """True if the given fingerprint matches the cached one."""
+        return self._last_req_pool_fp is not None and fp == self._last_req_pool_fp
 
     def _build_decode_control(self, batch: "ModelWorkerBatch") -> dict:
         """Extract the delta fields needed for a decode_step control message.
@@ -428,13 +483,18 @@ class TpWorkerClientGroup(BaseTpWorker):
             or bool(getattr(si, "grammars", None))
             or bool(batch.has_grammar)
         )
+        # Skip indices_to_free unless there's something to free — saves a few
+        # bytes off the wire and avoids a no-op .to(device) on the GPU side.
+        itf = batch.indices_to_free
+        if itf is not None and torch.is_tensor(itf) and itf.numel() == 0:
+            itf = None
         control = {
             "input_ids": batch.input_ids,
             "seq_lens": batch.seq_lens,
             "seq_lens_cpu": batch.seq_lens_cpu,
             "orig_seq_lens": batch.orig_seq_lens,
             "seq_lens_sum": batch.seq_lens_sum,
-            "indices_to_free": batch.indices_to_free,
+            "indices_to_free": itf,
             "sampling_info": si if needs_si else None,
             # Mamba state (None for non-Mamba models — zero overhead).
             "mamba_track_indices": batch.mamba_track_indices,
@@ -460,18 +520,46 @@ class TpWorkerClientGroup(BaseTpWorker):
     ) -> "GenerationBatchResult":
         # Decode fast path: send only the small delta control message when the
         # GPU workers already have a valid cached batch from the previous step.
-        if (
-            model_worker_batch.forward_mode.is_decode()
-            and self._decode_fast_valid
-            and self._batch_composition_unchanged(model_worker_batch)
-        ):
-            control = self._build_decode_control(model_worker_batch)
-            result = self._fanout_forward(M_DECODE_STEP, **control)
-            # Update composition tracker (seq_lens changed but indices stable).
-            self._last_req_pool_cpu = self._req_pool_cpu(model_worker_batch)
+        if model_worker_batch.forward_mode.is_decode():
+            fp = self._req_pool_fingerprint(model_worker_batch)
+            if self._decode_fast_valid and self._batch_composition_unchanged_fp(fp):
+                control = self._build_decode_control(model_worker_batch)
+                slim = self._fanout_forward(M_DECODE_STEP, **control)
+                self._last_req_pool_fp = fp
+                self._decode_fast_hits += 1
+                # Slim reply: rehydrate into GenerationBatchResult.
+                # Pickling the full dataclass walks 15+ Optional fields and
+                # cost 200ms+/step at batch=200; the slim dict carries only
+                # what the scheduler actually consumes for decode.
+                if isinstance(slim, dict) and slim.get("_slim_decode"):
+                    from sglang.srt.managers.utils import GenerationBatchResult
+                    return GenerationBatchResult(
+                        next_token_ids=slim["next_token_ids"],
+                        deferred_alloc=slim.get("deferred_alloc"),
+                        accept_lens=slim.get("accept_lens"),
+                        can_run_cuda_graph=slim.get("can_run_cuda_graph", False),
+                        num_accepted_drafts=slim.get("num_accepted_drafts", 0),
+                        logits_output=slim.get("logits_output"),
+                        routed_experts_output=slim.get("routed_experts_output"),
+                        expert_distribution_metrics=slim.get("expert_distribution_metrics"),
+                    )
+                return slim
+            # Fast path eligible (is_decode) but composition changed — miss.
+            self._decode_fast_misses += 1
+            full_method = b"forward_batch_generation"
+            result = self._fanout_forward(
+                full_method,
+                batch=model_worker_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                is_verify=is_verify,
+                skip_attn_backend_init=skip_attn_backend_init,
+            )
+            self._decode_fast_valid = True
+            self._last_req_pool_fp = fp
             return result
 
-        # Full path: send the complete ModelWorkerBatch.
+        # Non-decode forward (extend / idle / mixed): full path.
+        self._decode_full_calls += 1
         result = self._fanout_forward(
             b"forward_batch_generation",
             batch=model_worker_batch,
@@ -479,14 +567,9 @@ class TpWorkerClientGroup(BaseTpWorker):
             is_verify=is_verify,
             skip_attn_backend_init=skip_attn_backend_init,
         )
-        # Update fast-path tracking state.
-        if model_worker_batch.forward_mode.is_decode():
-            self._decode_fast_valid = True
-            self._last_req_pool_cpu = self._req_pool_cpu(model_worker_batch)
-        else:
-            # Non-decode (extend / idle) invalidates the GPU decode cache.
-            self._decode_fast_valid = False
-            self._last_req_pool_cpu = None
+        # Non-decode (extend / idle) invalidates the GPU decode cache.
+        self._decode_fast_valid = False
+        self._last_req_pool_fp = None
         return result
 
     def forward_batch_embedding(self, model_worker_batch: "ModelWorkerBatch"):

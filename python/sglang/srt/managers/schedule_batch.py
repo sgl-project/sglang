@@ -2520,11 +2520,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # For CPU schedulers (req_to_token_pool on CPU), snapshot the active
         # rows so the GPU worker can sync its GPU tensor before the forward pass.
+        # Pure decode steps don't need this: the GPU req_to_token already holds
+        # the correct rows from the previous step's _allocate_kv_deferred write,
+        # and the decode fast path reuses the cached GPU batch.  Cloning the
+        # snapshot here would be [batch_size * max_context_len * 4] bytes of
+        # unused memcpy per decode step.
         if (
             self.req_to_token_pool is not None
             and self.req_to_token_pool.device == "cpu"
             and self.req_pool_indices is not None
             and len(self.req_pool_indices) > 0
+            and not self.forward_mode.is_decode()
         ):
             req_to_token_cpu = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices.long()

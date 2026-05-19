@@ -1598,21 +1598,55 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        # Per-substep timing aggregator (Phase 0 of the perf-regression plan).
+        # Cost is ~1us per step; logs once every N=100 iterations of non-empty batches.
+        _t_recv = 0.0
+        _t_sched = 0.0
+        _t_run = 0.0
+        _t_proc = 0.0
+        _t_count = 0
+        _t_decode_count = 0
+        _t_window = 100
         while True:
+            _t0 = time.perf_counter()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            _t1 = time.perf_counter()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            _t2 = time.perf_counter()
 
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                _t3 = time.perf_counter()
                 self.process_batch_result(batch, result)
+                _t4 = time.perf_counter()
+                _t_recv += _t1 - _t0
+                _t_sched += _t2 - _t1
+                _t_run += _t3 - _t2
+                _t_proc += _t4 - _t3
+                _t_count += 1
+                if batch.forward_mode.is_decode():
+                    _t_decode_count += 1
+                if _t_count >= _t_window:
+                    logger.info(
+                        "Scheduler event_loop[%d iters, %d decode] avg ms: "
+                        "recv=%.2f sched=%.2f run=%.2f proc=%.2f total=%.2f",
+                        _t_count, _t_decode_count,
+                        _t_recv / _t_count * 1000,
+                        _t_sched / _t_count * 1000,
+                        _t_run / _t_count * 1000,
+                        _t_proc / _t_count * 1000,
+                        (_t_recv + _t_sched + _t_run + _t_proc) / _t_count * 1000,
+                    )
+                    _t_recv = _t_sched = _t_run = _t_proc = 0.0
+                    _t_count = _t_decode_count = 0
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
