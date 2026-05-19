@@ -1,12 +1,12 @@
-"""Global violation sink and per-launch health counters shared by all canary launches on one runner."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
 from sglang.jit_kernel.kv_cache_canary_verify import VIOLATION_FIELDS
+from sglang.srt.kv_cache_canary.config import CanaryConfig
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -56,3 +56,69 @@ class ViolationLog:
         """Reset to all-zero (forgets all past violations)."""
         self.violation_ring.zero_()
         self.violation_write_index.zero_()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CanaryDeviceState:
+    """All device-side state owned by one CanaryRunner instance.
+
+    One instance per ModelRunner. Held on the same device as the KV pool. All tensors are allocated up
+    front (sizes fixed by CanaryConfig + cuda-graph capture capacity) and reused across forward steps —
+    no per-step allocation.
+
+    Fields:
+        violation_log: The single ViolationLog shared by every launch (head / tail / sweep × K / V ×
+            FULL / SWA). All kernels atomicAdd into violation_log.violation_write_index and stamp their
+            CanaryLaunchTag into each violation row.
+        kernel_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. The
+            kernel itself does NOT index this array; runner takes a 1-element view at tag's slot (via
+            CanaryEndpoint.kernel_run_counter_view, §2.4) and hands a shape [1] tensor to the kernel,
+            which atomicAdds 1 regardless of whether the plan had any active entry. Health watchdog
+            reads this array to confirm "canary path actually ran".
+        slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
+            view-handed-to-kernel pattern as kernel_run_counters; each launch adds its active entry
+            count to its slot. Used for periodic stats ("protected N tokens").
+        violation_signal_host: Pinned-host uint8 scalar, shape [1]. async D2H snapshot of
+            (violation_log.violation_write_index > 0). Snapshotted on a side stream at end_of_step N
+            (§6.4) and consumed at start of step N+1 after pump_event.synchronize(); this 1-step delay
+            is intentional — bug is detected one step later but forward path stays sync-free. Slot
+            contents at raise time may already have been overwritten by step N+1's head/tail; the
+            violation_ring row (kernel-side snapshot) is the authoritative record, not live canary_buf.
+        allreduce_buf: Device byte buffer used for cross-rank allreduce of is_errored, shape [1], uint8.
+            Only allocated when CanaryConfig.allreduce_violation_signal is True.
+    """
+
+    violation_log: ViolationLog
+    kernel_run_counters: torch.Tensor
+    slot_run_counters: torch.Tensor
+    violation_signal_host: torch.Tensor
+    allreduce_buf: Optional[torch.Tensor]
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        config: CanaryConfig,
+        device: torch.device,
+        num_tags: int,
+    ) -> "CanaryDeviceState":
+        if num_tags <= 0:
+            raise ValueError(
+                f"kv-canary: CanaryDeviceState num_tags must be positive, got {num_tags}"
+            )
+        violation_log = ViolationLog.allocate(
+            ring_capacity=config.ring_capacity, device=device
+        )
+        kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
+        slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
+        violation_signal_host = torch.zeros(1, dtype=torch.uint8, pin_memory=True)
+        allreduce_buf: Optional[torch.Tensor] = None
+        if config.allreduce_violation_signal:
+            allreduce_buf = torch.zeros(1, dtype=torch.uint8, device=device)
+        return cls(
+            violation_log=violation_log,
+            kernel_run_counters=kernel_run_counters,
+            slot_run_counters=slot_run_counters,
+            violation_signal_host=violation_signal_host,
+            allreduce_buf=allreduce_buf,
+        )
