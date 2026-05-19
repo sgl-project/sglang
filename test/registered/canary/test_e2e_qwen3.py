@@ -60,30 +60,32 @@ class TestKvCacheCanaryPerturbRaise(CanaryE2EBase):
     allow_launch_failure = True
 
     def test_perturbation_triggers_canary_violation(self) -> None:
-        if self.launch_failed:
-            return  # canary raised during warmup; expected signal.
-
-        results: List[dict] = self.send_parallel_requests(
-            n=128, max_new_tokens=32, timeout=30.0
-        )
-        triggered = any(
-            "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
-        )
-
-        # Give the server a moment, then probe /health.
-        time.sleep(1.5)
-        try:
-            health_ok = (
-                requests.get(self.base_url + "/health", timeout=5).status_code == 200
+        if not self.launch_failed:
+            results: List[dict] = self.send_parallel_requests(
+                n=128, max_new_tokens=32, timeout=30.0
             )
-        except requests.exceptions.RequestException:
-            health_ok = False
+            triggered = any(
+                "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
+            )
 
-        self.assertTrue(
-            triggered or not health_ok,
-            f"Expected canary to fire under perturb+raise, but server still "
-            f"healthy and no failed requests; first 3 responses: {results[:3]}",
-        )
+            # Give the server a moment, then probe /health.
+            time.sleep(1.5)
+            try:
+                health_ok = (
+                    requests.get(self.base_url + "/health", timeout=5).status_code
+                    == 200
+                )
+            except requests.exceptions.RequestException:
+                health_ok = False
+
+            self.assertTrue(
+                triggered or not health_ok,
+                f"Expected canary to fire under perturb+raise, but server still "
+                f"healthy and no failed requests; first 3 responses: {results[:3]}",
+            )
+        # Hard-assert the per-step path is what caught it (req_to_token perturb
+        # corrupts slots the head/tail kernels verify directly).
+        self.assert_violation_kind_logged(["head_k", "head_v", "tail_k", "tail_v"])
 
 
 if __name__ == "__main__":

@@ -7,9 +7,11 @@ declares its model + extra server args + the actual assertions.
 
 from __future__ import annotations
 
+import io
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import ClassVar, Dict, List, Optional
+from typing import ClassVar, Dict, Iterable, List, Optional
 
 import requests
 
@@ -58,6 +60,10 @@ class CanaryE2EBase(CustomTestCase):
     process: ClassVar[Optional[object]] = None
     launch_failed: ClassVar[bool] = False
     launch_exception: ClassVar[Optional[BaseException]] = None
+    # Captured server stdout/stderr (in-memory). Populated via the
+    # popen_launch_server tee. Used by assert_violation_kind_logged().
+    _stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _stderr_buf: ClassVar[Optional[io.StringIO]] = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -69,6 +75,8 @@ class CanaryE2EBase(CustomTestCase):
         cls.process = None
         cls.launch_failed = False
         cls.launch_exception = None
+        cls._stdout_buf = io.StringIO()
+        cls._stderr_buf = io.StringIO()
 
         env = os.environ.copy()
         if cls.perturb_prob > 0:
@@ -93,6 +101,7 @@ class CanaryE2EBase(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=other_args,
                 env=env,
+                return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
             )
         except Exception as exc:
             if not cls.allow_launch_failure:
@@ -153,3 +162,33 @@ class CanaryE2EBase(CustomTestCase):
         """Sanity-check /health responds 200 (post-traffic liveness)."""
         resp = requests.get(self.base_url + "/health", timeout=timeout)
         self.assertEqual(resp.status_code, 200, resp.text)
+
+    def assert_violation_kind_logged(
+        self,
+        kind_prefixes: Iterable[str],
+        *,
+        flush_wait_seconds: float = 2.0,
+    ) -> None:
+        """Assert at least one ``canary_kind: <p>...`` line was emitted to
+        captured server stderr, where ``<p>`` starts with one of ``kind_prefixes``.
+
+        Hard proof that a specific verify path fired (e.g. ``sweep_*`` proves
+        the periodic sweep caught the perturbation, not the per-step path).
+        The tee thread from ``popen_launch_server`` may still be flushing
+        after the server dies; ``flush_wait_seconds`` gives it time to drain.
+        """
+        if flush_wait_seconds > 0:
+            time.sleep(flush_wait_seconds)
+        haystack = (self._stderr_buf.getvalue() if self._stderr_buf else "") + (
+            self._stdout_buf.getvalue() if self._stdout_buf else ""
+        )
+        prefixes = list(kind_prefixes)
+        hits = [p for p in prefixes if f"canary_kind:       {p}" in haystack]
+        if hits:
+            return
+        excerpt = haystack[-2000:] if len(haystack) > 2000 else haystack
+        self.fail(
+            f"Expected a 'canary_kind: <kind>' line with kind in {prefixes} in "
+            f"captured server output, but none found. Tail of captured output "
+            f"(last 2000 chars):\n{excerpt}"
+        )

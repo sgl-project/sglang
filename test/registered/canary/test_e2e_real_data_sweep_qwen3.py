@@ -109,29 +109,32 @@ class TestCanaryRealDataSweepPerturbed(_CanaryRealDataSweepBase):
     allow_launch_failure = True
 
     def test_perturbed_burst_triggers_sweep_raise(self) -> None:
-        if self.launch_failed:
-            return  # canary raised during warmup; expected signal.
-
-        results: List[Dict[str, object]] = self.send_parallel_requests(
-            n=200, max_new_tokens=32, timeout=30.0
-        )
-        triggered = any(
-            "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
-        )
-
-        time.sleep(1.5)
-        try:
-            health_ok = (
-                requests.get(self.base_url + "/health", timeout=5).status_code == 200
+        if not self.launch_failed:
+            results: List[Dict[str, object]] = self.send_parallel_requests(
+                n=200, max_new_tokens=32, timeout=30.0
             )
-        except requests.exceptions.RequestException:
-            health_ok = False
+            triggered = any(
+                "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
+            )
 
-        self.assertTrue(
-            triggered or not health_ok,
-            f"Expected sweep to fire under perturb+raise, but server still "
-            f"healthy and no failed requests; first 3 responses: {results[:3]}",
-        )
+            time.sleep(1.5)
+            try:
+                health_ok = (
+                    requests.get(self.base_url + "/health", timeout=5).status_code
+                    == 200
+                )
+            except requests.exceptions.RequestException:
+                health_ok = False
+
+            self.assertTrue(
+                triggered or not health_ok,
+                f"Expected sweep to fire under perturb+raise, but server still "
+                f"healthy and no failed requests; first 3 responses: {results[:3]}",
+            )
+        # Hard-assert the SWEEP path caught it. The perturb hook targets
+        # alive slots NOT in this step's verify list, so the per-step path
+        # cannot observe the byte flip -- only the periodic sweep can.
+        self.assert_violation_kind_logged(["sweep_k", "sweep_v"])
 
 
 if __name__ == "__main__":
