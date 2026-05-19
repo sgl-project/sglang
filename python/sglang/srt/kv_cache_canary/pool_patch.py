@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 _CANARY_ATTACHED_ATTR = "_kv_cache_canary_attached"
-_DEFAULT_READ_BYTES = 32
+_DEFAULT_REAL_KV_READ_BYTES = 32
 
 _BufInfoTriple = Tuple[List[int], List[int], List[int]]
 
@@ -126,7 +126,7 @@ class CanaryPoolAdapter(Protocol):
     def build_real_kv_sources(
         self,
         pool: KVCache,
-        kind: PoolKind,
+        kind: PoolKind,  # FULL or SWA
         half: Literal["K", "V"],
         read_bytes: int,
     ) -> tuple[RealKvSource, ...]:
@@ -134,9 +134,32 @@ class CanaryPoolAdapter(Protocol):
         canary should fingerprint for this (kind, half). read_bytes is the leading-byte budget per
         slot per source. Empty tuple disables the mixin for this endpoint."""
 
-    def slot_count(self, pool: KVCache, kind: PoolKind) -> int: ...
 
-    def swa_index_lut(self, pool: KVCache) -> Optional[torch.Tensor]: ...
+def _slot_count(pool: KVCache, kind: PoolKind) -> int:
+    if isinstance(pool, SWAKVPool):
+        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+        return int(sub_pool.k_buffer[0].shape[0])
+    if isinstance(pool, DeepSeekV4TokenToKVPool):
+        if kind is PoolKind.SWA:
+            return (
+                int(pool.swa_kv_pool.kv_buffer[0].shape[0]) * pool.swa_kv_pool.page_size
+            )
+        return int(pool.c4_kv_pool.kv_buffer[0].shape[0]) * pool.c4_kv_pool.page_size
+    if isinstance(pool, MLATokenToKVPool):
+        return int(pool.kv_buffer[0].shape[0])
+    if isinstance(pool, MHATokenToKVPool):
+        return int(pool.k_buffer[0].shape[0])
+    raise NotImplementedError(
+        f"kv-canary: cannot derive slot_count for pool class {type(pool).__name__}"
+    )
+
+
+def _swa_index_lut(pool: KVCache) -> Optional[torch.Tensor]:
+    if isinstance(pool, SWAKVPool):
+        return pool.full_to_swa_index_mapping
+    if isinstance(pool, DeepSeekV4TokenToKVPool):
+        return pool.full_to_swa_index_mapping
+    return None
 
 
 _ADAPTERS: Dict[Type, CanaryPoolAdapter] = {}
@@ -166,7 +189,7 @@ def _resolve_adapter(pool: KVCache) -> CanaryPoolAdapter:
 def _resolve_read_bytes(config: CanaryConfig) -> int:
     if config.real_kv_hash_mode is RealKvHashMode.OFF:
         return 0
-    return _DEFAULT_READ_BYTES
+    return _DEFAULT_REAL_KV_READ_BYTES
 
 
 def _build_buffer_group(
@@ -177,7 +200,7 @@ def _build_buffer_group(
     device: torch.device,
     read_bytes: int,
 ) -> CanaryBufferGroup:
-    num_slots = adapter.slot_count(pool, kind)
+    num_slots = _slot_count(pool, kind)
     has_v = adapter.has_v_half(pool)
 
     k_head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
@@ -200,7 +223,7 @@ def _build_buffer_group(
         adapter.build_real_kv_sources(pool, kind, "V", read_bytes) if has_v else ()
     )
 
-    swa_index_lut = adapter.swa_index_lut(pool) if kind is PoolKind.SWA else None
+    swa_index_lut = _swa_index_lut(pool) if kind is PoolKind.SWA else None
 
     return CanaryBufferGroup(
         kind=kind,
@@ -267,6 +290,10 @@ def _patch_buf_info_method(
     has_v_half: bool,
     page_size: int,
 ) -> None:
+    if not hasattr(pool, method_name):
+        raise AttributeError(
+            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
+        )
     original = getattr(pool, method_name)
 
     def patched() -> _BufInfoTriple:
@@ -306,6 +333,10 @@ def _splice_canary_buf_info(
     v_head_entry = _entry_triple(group.v_head, page_size=page_size)
     v_tail_entry = _entry_triple(group.v_tail, page_size=page_size)
 
+    if len(ptrs) % 2 != 0:
+        raise RuntimeError(
+            f"kv-canary: K/V split adapter expects even-length buf_info list, got {len(ptrs)}"
+        )
     mid = len(ptrs) // 2
     return (
         [k_head_entry[0]]
@@ -341,12 +372,6 @@ class _MHAAdapter:
 
     def has_v_half(self, pool: MHATokenToKVPool) -> bool:
         return True
-
-    def slot_count(self, pool: MHATokenToKVPool, kind: PoolKind) -> int:
-        return int(pool.k_buffer[0].shape[0])
-
-    def swa_index_lut(self, pool: MHATokenToKVPool) -> Optional[torch.Tensor]:
-        return None
 
     def build_real_kv_sources(
         self,
@@ -389,12 +414,6 @@ class _MLAAdapter:
 
     def has_v_half(self, pool: MLATokenToKVPool) -> bool:
         return False
-
-    def slot_count(self, pool: MLATokenToKVPool, kind: PoolKind) -> int:
-        return int(pool.kv_buffer[0].shape[0])
-
-    def swa_index_lut(self, pool: MLATokenToKVPool) -> Optional[torch.Tensor]:
-        return None
 
     def build_real_kv_sources(
         self,
@@ -465,13 +484,6 @@ class _SWAAdapter:
     def has_v_half(self, pool: SWAKVPool) -> bool:
         return True
 
-    def slot_count(self, pool: SWAKVPool, kind: PoolKind) -> int:
-        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
-        return int(sub_pool.k_buffer[0].shape[0])
-
-    def swa_index_lut(self, pool: SWAKVPool) -> Optional[torch.Tensor]:
-        return pool.full_to_swa_index_mapping
-
     def build_real_kv_sources(
         self,
         pool: SWAKVPool,
@@ -509,16 +521,6 @@ class _DeepSeekV4Adapter:
 
     def has_v_half(self, pool: DeepSeekV4TokenToKVPool) -> bool:
         return False
-
-    def slot_count(self, pool: DeepSeekV4TokenToKVPool, kind: PoolKind) -> int:
-        if kind is PoolKind.SWA:
-            return (
-                int(pool.swa_kv_pool.kv_buffer[0].shape[0]) * pool.swa_kv_pool.page_size
-            )
-        return int(pool.c4_kv_pool.kv_buffer[0].shape[0]) * pool.c4_kv_pool.page_size
-
-    def swa_index_lut(self, pool: DeepSeekV4TokenToKVPool) -> Optional[torch.Tensor]:
-        return getattr(pool, "full_to_swa_index_mapping", None)
 
     def build_real_kv_sources(
         self,
@@ -568,23 +570,25 @@ class _DeepSeekV4Adapter:
     def install_full_group(
         self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
     ) -> None:
-        _patch_dsv4_buf_info(pool, method_name="get_contiguous_buf_infos", group=group)
+        _patch_dsv4_contiguous_buf_info(pool, group=group)
 
     def install_swa_group(
         self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
     ) -> None:
-        _patch_dsv4_buf_info(pool, method_name="get_state_buf_infos", group=group)
+        _patch_dsv4_state_buf_info(pool, group=group)
 
 
-def _patch_dsv4_buf_info(
+def _patch_dsv4_contiguous_buf_info(
     pool: DeepSeekV4TokenToKVPool,
     *,
-    method_name: str,
     group: CanaryBufferGroup,
 ) -> None:
-    original = getattr(pool, method_name, None)
-    if original is None:
-        return
+    method_name = "get_contiguous_buf_infos"
+    if not hasattr(pool, method_name):
+        raise AttributeError(
+            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
+        )
+    original = getattr(pool, method_name)
 
     c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
     indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
@@ -601,13 +605,57 @@ def _patch_dsv4_buf_info(
     def patched() -> _BufInfoTriple:
         ptrs, lens, item_lens = original()
         if len(ptrs) != expected_total:
-            return _splice_canary_buf_info(
-                ptrs=ptrs,
-                lens=lens,
-                item_lens=item_lens,
-                group=group,
-                has_v_half=False,
-                page_size=page_size,
+            raise RuntimeError(
+                f"DSV4 buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
+            )
+        return _splice_packed_buf_info(
+            ptrs=ptrs,
+            lens=lens,
+            item_lens=item_lens,
+            segment_offsets=segment_offsets,
+            group=group,
+            page_size=page_size,
+        )
+
+    setattr(pool, method_name, patched)
+
+
+def _patch_dsv4_state_buf_info(
+    pool: DeepSeekV4TokenToKVPool,
+    *,
+    group: CanaryBufferGroup,
+) -> None:
+    method_name = "get_state_buf_infos"
+    if not hasattr(pool, method_name):
+        raise AttributeError(
+            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
+        )
+    original = getattr(pool, method_name)
+
+    swa_layer_num = len(pool.swa_kv_pool.kv_buffer)
+    compress_state_count = sum(1 for p in pool.compress_state_pools if p is not None)
+    indexer_compress_state_count = sum(
+        1 for p in pool.indexer_compress_state_pools if p is not None
+    )
+    if compress_state_count == 0 and indexer_compress_state_count == 0:
+        raise NotImplementedError(
+            "kv-canary: DSV4 SWA segmentation has empty compress_state_pools and "
+            "indexer_compress_state_pools — cannot splice head/tail canary per segment"
+        )
+    segment_offsets = [
+        0,
+        swa_layer_num,
+        swa_layer_num + compress_state_count,
+    ]
+    expected_total = swa_layer_num + compress_state_count + indexer_compress_state_count
+
+    page_size = pool.page_size
+
+    def patched() -> _BufInfoTriple:
+        ptrs, lens, item_lens = original()
+        if len(ptrs) != expected_total:
+            raise RuntimeError(
+                f"DSV4 state buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
             )
         return _splice_packed_buf_info(
             ptrs=ptrs,
