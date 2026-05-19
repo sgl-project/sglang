@@ -145,11 +145,12 @@ class CanaryRunner:
             write_entry_capacity, dtype=torch.int32, device=device
         )
 
+        use_cuda_pump = device.type == "cuda" and torch.cuda.is_available()
         self._pump_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
+            torch.cuda.Stream(device=device) if use_cuda_pump else None
         )
         self._pump_event: Optional[torch.cuda.Event] = (
-            torch.cuda.Event() if torch.cuda.is_available() else None
+            torch.cuda.Event() if use_cuda_pump else None
         )
         self._previous_pump_event: Optional[torch.cuda.Event] = None
 
@@ -289,7 +290,7 @@ class CanaryRunner:
         else:
             local_errored = False
         self._previous_pump_event = self._pump_event
-        if torch.cuda.is_available():
+        if self._device.type == "cuda" and torch.cuda.is_available():
             self._pump_event = torch.cuda.Event()
 
         any_rank_errored = local_errored
