@@ -42,6 +42,7 @@ _OPENAI_BYPASS = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
 # accelerator when CODEC_OPENAI_BYPASS=1 + the caller hands us an ndarray.
 try:
     import numpy as _np  # type: ignore[import-untyped]
+
     _HAVE_NUMPY = True
 except ImportError:  # pragma: no cover - numpy is in sglang's reqs
     _np = None
@@ -84,6 +85,7 @@ def _normalise_ids_to_list(ids: IdsLike) -> List[int]:
             )
         return list(struct.unpack(f"<{len(b) // 4}I", b))
     raise TypeError(f"codec_frame: unsupported ids type {type(ids).__name__}")
+
 
 # ---------------------------------------------------------------------------
 # Proto schema (returned by GET /codec/schema for client code generation)
@@ -287,9 +289,7 @@ def decode_protobuf_request(data: bytes) -> dict:
                     n = shift = 0
                     while True:
                         if p >= len(chunk):
-                            raise ValueError(
-                                "Codec: truncated varint in prompt_ids"
-                            )
+                            raise ValueError("Codec: truncated varint in prompt_ids")
                         b = chunk[p]
                         p += 1
                         n |= (b & 0x7F) << shift
@@ -297,9 +297,7 @@ def decode_protobuf_request(data: bytes) -> dict:
                             break
                         shift += 7
                         if shift > 35:
-                            raise ValueError(
-                                "Codec: varint overflow in prompt_ids"
-                            )
+                            raise ValueError("Codec: varint overflow in prompt_ids")
                     ids.append(n)
                 result["prompt_ids"] = ids
             elif field == 4:  # repeated string stop

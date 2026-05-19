@@ -19,7 +19,6 @@ from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
 from sglang.srt.entrypoints.codec_dispatcher import (
     CODEC_BOLT_ON_DISPATCH,
     ToolRegistry,
-    dispatch_call,
     dispatch_call_async,
     reinject_ids_into_context,
 )
@@ -315,6 +314,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     self.tokenizer_manager, "tokenizer_map_hash", ""
                 )
                 import asyncio as _asyncio
+
                 self._codec_dispatcher_registry = await _asyncio.to_thread(
                     ToolRegistry.from_env, tokenizer_hash
                 )
@@ -337,8 +337,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 else:
                     n_prev = n_prev_tokens.get(index, 0)
                     new_ids = (
-                        output_ids[n_prev:] if is_buffer
-                        else list(output_ids[n_prev:])
+                        output_ids[n_prev:] if is_buffer else list(output_ids[n_prev:])
                     )
                     n_prev_tokens[index] = len(output_ids)
 
@@ -390,7 +389,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                         # simple append matches the contract
                                         # in reinject_ids_into_context.
                                         new_ids = reinject_ids_into_context(
-                                            new_ids, result.response_ids,
+                                            new_ids,
+                                            result.response_ids,
                                         )
                                 except Exception as e:
                                     # Dispatch failure surfaces to the client
@@ -399,9 +399,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                     # is logged but doesn't tear down the
                                     # stream.
                                     import logging as _log
+
                                     _log.getLogger(__name__).warning(
                                         "codec_dispatcher: dispatch_call(%s) failed: %s",
-                                        ev.name, e,
+                                        ev.name,
+                                        e,
                                     )
 
                 yield encode_frame(

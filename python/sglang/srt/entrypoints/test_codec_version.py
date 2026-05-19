@@ -14,8 +14,6 @@ from __future__ import annotations
 import json
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from sglang.srt.entrypoints.codec_version import (
     HEADER_VERSION_INTRODUCED,
@@ -33,7 +31,6 @@ from sglang.srt.entrypoints.codec_version import (
     version_policy_document,
     version_policy_mode,
 )
-
 
 # ── parse helpers ────────────────────────────────────────────────────────────
 
@@ -393,9 +390,9 @@ def test_matrix_needs_upgrade(monkeypatch, cfg, client_version):
     _apply(monkeypatch, cfg["env"])
     expected = cfg["expected_426"][client_version]
     actual = needs_upgrade(client_version)
-    assert actual == expected, (
-        f"server={cfg['name']} client={client_version} expected 426={expected} got 426={actual}"
-    )
+    assert (
+        actual == expected
+    ), f"server={cfg['name']} client={client_version} expected 426={expected} got 426={actual}"
 
 
 @pytest.mark.parametrize("cfg", SERVER_CONFIGS, ids=[c["name"] for c in SERVER_CONFIGS])
@@ -468,9 +465,9 @@ def test_matrix_426_body_features_match_config(monkeypatch, cfg):
     body = json.loads(resp.body)
     features = set(body["required_features"])
     expected = set(collect_required_features())
-    assert features == expected, (
-        f"server={cfg['name']} expected required_features={expected} got {features}"
-    )
+    assert (
+        features == expected
+    ), f"server={cfg['name']} expected required_features={expected} got {features}"
 
 
 def test_matrix_default_off_emits_zero_v04_wire(monkeypatch):

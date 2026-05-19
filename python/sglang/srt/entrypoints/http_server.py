@@ -354,9 +354,11 @@ async def lifespan(fast_api_app: FastAPI):
     # skipped; the server continues without that format's dict and
     # the negotiator falls through to gzip/br for those requests.
     try:
-        from sglang.srt.entrypoints import codec_compression as _codec_comp
         import logging as _logging
         import os as _os
+
+        from sglang.srt.entrypoints import codec_compression as _codec_comp
+
         _codec_log = _logging.getLogger("sglang.codec")
         for _fmt, _env in (
             ("msgpack", "CODEC_ZSTD_DICT_MSGPACK_PATH"),
@@ -372,12 +374,18 @@ async def lifespan(fast_api_app: FastAPI):
                 _hash = _codec_comp.get_zstd_dict_hash(_fmt) or "(unknown)"
                 _codec_log.info(
                     "codec: loaded zstd dict for %s from %s (%s, %d bytes)",
-                    _fmt, _path, _hash, len(_bytes),
+                    _fmt,
+                    _path,
+                    _hash,
+                    len(_bytes),
                 )
             except OSError as _e:
                 _codec_log.warning(
                     "codec: failed to load %s from %s: %s — falling back to gzip for %s",
-                    _env, _path, _e, _fmt,
+                    _env,
+                    _path,
+                    _e,
+                    _fmt,
                 )
     except ImportError:
         # codec_compression not available in this build; nothing to do.
@@ -1650,7 +1658,8 @@ async def well_known_version_policy():
     document because its presence advertises that older clients will
     be rejected.
     """
-    from fastapi.responses import JSONResponse, Response as FastResponse
+    from fastapi.responses import JSONResponse
+    from fastapi.responses import Response as FastResponse
 
     from sglang.srt.entrypoints.codec_version import version_policy_document
 

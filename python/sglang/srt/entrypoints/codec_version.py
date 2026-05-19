@@ -32,7 +32,6 @@ from typing import Optional
 from fastapi import Request
 from fastapi.responses import Response
 
-
 # ── Version comparison ───────────────────────────────────────────────────────
 
 
