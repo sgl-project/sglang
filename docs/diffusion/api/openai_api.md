@@ -111,6 +111,27 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 
 This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
 
+**Python Example (b64_json response):**
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+
+img = client.images.edit(
+    prompt="A calico cat playing a piano on stage",
+    image=open("local_input_image.png", "rb"),
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(img.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
 **Curl Example (b64_json response):**
 
 ```bash
