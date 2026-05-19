@@ -24,6 +24,8 @@ use rmp::encode as mp;
 use zeromq::{Endpoint, PubSocket, Socket, SocketSend, ZmqMessage};
 
 use sgl_router::config::CacheAwareConfig;
+use sgl_router::config::{ActiveLoadConfig, ProxyConfig};
+
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
 use sgl_router::policies::kv_events::{compute_block_hashes, discovery::EventConfig, KvEventIndex};
@@ -149,6 +151,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
                 },
             ),
         },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
 

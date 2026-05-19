@@ -8,6 +8,64 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     pub models: Vec<ModelConfig>,
     pub discovery: DiscoveryConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub active_load: ActiveLoadConfig,
+}
+
+/// Outbound proxy tuning — controls how long the router waits on each
+/// per-worker HTTP request. The default mirrors SGLang's typical
+/// prefill / decode latency budget (long context windows take time);
+/// e2e tests typically lower it so per-request failures surface fast
+/// enough to trip the circuit breaker within the test's wall-time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Maximum time to wait for a single upstream HTTP request to
+    /// return headers + body. Default 60 s. The circuit breaker
+    /// records a failure when this fires; the chat handler's caller
+    /// observes `ApiError::UpstreamTimeout`.
+    #[serde(default = "default_proxy_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_proxy_request_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_proxy_request_timeout_secs(),
+        }
+    }
+}
+
+/// Active-load (per-request) tracking tuning — controls how long a
+/// leaked or stalled request entry stays in the registry before the
+/// janitor reclaims it. Setting it short in tests lets
+/// `test_stale_request_expired_returns_504` fire the janitor within
+/// the test's wall-time budget; production defaults to 5 minutes,
+/// matching SMG.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ActiveLoadConfig {
+    /// How long a request entry can live in the registry before the
+    /// janitor fires its `cancel_token` and the chat handler returns
+    /// 504 `stale_request_expired`. Default 300 s.
+    #[serde(default = "default_stale_request_timeout_secs")]
+    pub stale_request_timeout_secs: u64,
+}
+
+fn default_stale_request_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for ActiveLoadConfig {
+    fn default() -> Self {
+        Self {
+            stale_request_timeout_secs: default_stale_request_timeout_secs(),
+        }
+    }
 }
 
 /// Routing policy selector — the enum form lets serde reject unknown

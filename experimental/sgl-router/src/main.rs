@@ -91,13 +91,20 @@ async fn main() -> Result<()> {
     // worker's load forever. The registry is built BEFORE the manager
     // is spawned so the manager can call `forget_worker` on
     // `DiscoveryEvent::Removed`.
-    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::with_defaults();
-    // Sweep cadence = 30 s (1 / 10 of the default 5-minute timeout) is
-    // a comfortable compromise between detection latency and noise.
-    let janitor_handle = sgl_router::policies::active_load::spawn_janitor(
-        Arc::clone(&active_load),
-        std::time::Duration::from_secs(30),
+    let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
+    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
+        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        stale_timeout,
     );
+    // Sweep cadence is 1/10 of the configured timeout, clamped to
+    // [1 s, 60 s]. A short timeout (test setting) needs frequent
+    // sweeps to fire within the test's window; a long timeout
+    // (production) doesn't need sub-minute checks.
+    let sweep_interval = std::time::Duration::from_secs(
+        (cfg.active_load.stale_request_timeout_secs / 10).clamp(1, 60),
+    );
+    let janitor_handle =
+        sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
     // Spawn discovery + manager tasks.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
@@ -114,8 +121,10 @@ async fn main() -> Result<()> {
     ));
 
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(60))
-            .context("build proxy client")?,
+        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
+            cfg.proxy.request_timeout_secs,
+        ))
+        .context("build proxy client")?,
     );
 
     let ctx = Arc::new(

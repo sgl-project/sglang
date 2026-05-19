@@ -4,8 +4,8 @@
 mod common;
 
 use sgl_router::config::{
-    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, PolicyKind,
-    ServerConfig, StaticFileDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -44,6 +44,8 @@ fn config_for(_worker_url: &str) -> Config {
                 poll_interval_ms: 200,
             }),
         },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     }
 }
 

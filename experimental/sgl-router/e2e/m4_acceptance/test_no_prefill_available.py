@@ -43,7 +43,11 @@ def test_no_prefill_workers_available_returns_503(
             "qwen3-0.6b", gpu_ids=gpu_decode, disagg_mode="decode"
         ) as decode:
             spec = get_model_spec("qwen3-0.6b")
-            with Gateway() as gw:
+            # Short proxy timeout (2 s) so each spawned-prefill failure
+            # surfaces fast enough for the breaker to accumulate three
+            # failures within the test's 20-second warmup loop. Default
+            # 60 s would mean the breaker never opens in time.
+            with Gateway(proxy_request_timeout_secs=2) as gw:
                 gw.start_pd(
                     model_id=spec["model"],
                     tokenizer_path=spec["model"],

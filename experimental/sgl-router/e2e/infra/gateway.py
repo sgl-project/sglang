@@ -116,6 +116,8 @@ class Gateway:
         host: str = "127.0.0.1",
         port: int | None = None,
         binary: Path | None = None,
+        proxy_request_timeout_secs: int | None = None,
+        stale_request_timeout_secs: int | None = None,
     ):
         self.host = host
         self.port = port or _get_open_port()
@@ -128,6 +130,14 @@ class Gateway:
             self.binary = Path(env_binary)
         else:
             self.binary = DEFAULT_BINARY
+
+        # Test-side overrides for the router's tunables. Both default to
+        # `None`, in which case the router uses its production defaults
+        # (60 s proxy timeout, 300 s stale-request timeout). Tests set
+        # these short so per-request failures and stale-request expiry
+        # surface within the test's wall-time budget.
+        self.proxy_request_timeout_secs = proxy_request_timeout_secs
+        self.stale_request_timeout_secs = stale_request_timeout_secs
 
         self.process: subprocess.Popen | None = None
         self._config_path: Path | None = None
@@ -369,6 +379,21 @@ class Gateway:
 
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
+        # Optional tunables — only emit the [proxy] and [active_load]
+        # sections if a test has overridden them, so production defaults
+        # apply otherwise.
+        proxy_section = ""
+        if self.proxy_request_timeout_secs is not None:
+            proxy_section = (
+                f"\n[proxy]\nrequest_timeout_secs = {self.proxy_request_timeout_secs}\n"
+            )
+        active_load_section = ""
+        if self.stale_request_timeout_secs is not None:
+            active_load_section = (
+                f"\n[active_load]\nstale_request_timeout_secs = "
+                f"{self.stale_request_timeout_secs}\n"
+            )
+
         return f"""\
 [server]
 host = "{self.host}"
@@ -386,7 +411,7 @@ backend = "static_file"
 [discovery.static_file]
 path = "{workers_path}"
 poll_interval_ms = 200
-"""
+{proxy_section}{active_load_section}"""
 
     def _workers_path(self) -> Path:
         # Persist alongside the main config so cleanup is local.

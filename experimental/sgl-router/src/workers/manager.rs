@@ -236,8 +236,8 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig, ModelConfig,
-        PolicyKind, ServerConfig, StaticFileDiscoveryConfig,
+        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig,
+        ModelConfig, PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
@@ -269,6 +269,8 @@ mod tests {
                     poll_interval_ms: 200,
                 }),
             },
+            proxy: ProxyConfig::default(),
+            active_load: ActiveLoadConfig::default(),
         }
     }
 

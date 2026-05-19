@@ -69,6 +69,8 @@ mod tests {
                     },
                 ),
             },
+            proxy: crate::config::ProxyConfig::default(),
+            active_load: crate::config::ActiveLoadConfig::default(),
         }
     }
 

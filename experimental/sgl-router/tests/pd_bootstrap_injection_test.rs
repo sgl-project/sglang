@@ -23,8 +23,8 @@ use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, PolicyKind,
-    ServerConfig, StaticFileDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -57,6 +57,8 @@ fn config() -> Config {
                 poll_interval_ms: 200,
             }),
         },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     }
 }
 

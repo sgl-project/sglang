@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::{
-    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, PolicyKind,
-    ServerConfig, StaticFileDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -42,6 +42,8 @@ async fn forwards_whitelisted_headers_strips_others() {
                 poll_interval_ms: 200,
             }),
         },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
