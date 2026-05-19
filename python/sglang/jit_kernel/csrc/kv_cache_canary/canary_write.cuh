@@ -258,19 +258,27 @@ inline void canary_write_step_cuda(
       .verify(slot_run_counter)
       .verify(kernel_run_counter);
 
-  TensorMatcher({SymbolicSize{"real_kv_rows_0"}, SymbolicSize{"real_kv_cols_0"}})
+  SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
+  SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
+  TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
       .with_dtype<uint8_t>()
       .with_device<kDLCUDA>(device_)
       .verify(real_kv_buf_0);
-  TensorMatcher({SymbolicSize{"real_kv_rows_1"}, SymbolicSize{"real_kv_cols_1"}})
+  SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
+  SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
+  TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
       .with_dtype<uint8_t>()
       .with_device<kDLCUDA>(device_)
       .verify(real_kv_buf_1);
-  TensorMatcher({SymbolicSize{"real_kv_rows_2"}, SymbolicSize{"real_kv_cols_2"}})
+  SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
+  SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
+  TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
       .with_dtype<uint8_t>()
       .with_device<kDLCUDA>(device_)
       .verify(real_kv_buf_2);
-  TensorMatcher({SymbolicSize{"real_kv_rows_3"}, SymbolicSize{"real_kv_cols_3"}})
+  SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
+  SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
+  TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
       .with_dtype<uint8_t>()
       .with_device<kDLCUDA>(device_)
       .verify(real_kv_buf_3);
