@@ -3,6 +3,7 @@ import itertools
 import logging
 import pickle
 import random
+from array import array
 import threading
 import time
 import uuid
@@ -1007,7 +1008,7 @@ class MMReceiverBase(ABC):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            recv_req.input_ids,
+            array("q", recv_req.input_ids),
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,

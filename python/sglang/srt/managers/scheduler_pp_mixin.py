@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -583,7 +584,7 @@ class SchedulerPPMixin:
                 req = Req(
                     rid=str(i),
                     origin_input_text="",
-                    origin_input_ids=input_ids,
+                    origin_input_ids=array("q", input_ids),
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids

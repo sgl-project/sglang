@@ -1,6 +1,7 @@
 """Unit tests for UnifiedRadixCache"""
 
 import unittest
+from array import array
 from dataclasses import dataclass
 from typing import Optional
 from unittest import mock
@@ -477,8 +478,8 @@ class UnifiedRadixCacheSuite:
         req = self._make_req(req_to_token_pool)
         input_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 1)
-        req.origin_input_ids = input_ids
-        req.output_ids = output_ids
+        req.origin_input_ids = array("q", input_ids)
+        req.output_ids = array("q", output_ids)
         kv_len = len(input_ids) + len(output_ids)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -487,7 +488,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = input_ids + output_ids
+        req.fill_ids = array("q", input_ids + output_ids)
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
@@ -506,9 +507,9 @@ class UnifiedRadixCacheSuite:
         req = self._make_req(req_to_token_pool)
         prompt_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 7)
-        req.origin_input_ids = prompt_ids
-        req.output_ids = output_ids
-        req.fill_ids = prompt_ids + output_ids
+        req.origin_input_ids = array("q", prompt_ids)
+        req.output_ids = array("q", output_ids)
+        req.fill_ids = array("q", prompt_ids + output_ids)
         kv_len = len(req.fill_ids)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -550,8 +551,8 @@ class UnifiedRadixCacheSuite:
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 2)
-        req.origin_input_ids = tokens
-        req.output_ids = []
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -560,7 +561,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = tokens
+        req.fill_ids = array("q", tokens)
 
         avail_before = allocator.available_size()
         tree.cache_finished_req(req, is_insert=False)
@@ -575,9 +576,9 @@ class UnifiedRadixCacheSuite:
 
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 3)
-        req.origin_input_ids = tokens
-        req.output_ids = []
-        req.fill_ids = tokens[:]
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.fill_ids = array("q", tokens)
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -699,8 +700,8 @@ class UnifiedRadixCacheSuite:
         tail_extra = ps // 2
         input_ids = self._make_seq(1, 1) + list(range(8000, 8000 + tail_extra))
         req = self._make_req(req_to_token_pool)
-        req.origin_input_ids = input_ids
-        req.output_ids = []
+        req.origin_input_ids = array("q", input_ids)
+        req.output_ids = array("q")
         kv_len = len(input_ids)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -709,7 +710,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = input_ids
+        req.fill_ids = array("q", input_ids)
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 

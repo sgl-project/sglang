@@ -10,7 +10,7 @@ Simulated steps (per batch):
     4. finish   -- (origin + output)[:kv_committed_len] for radix cache.
 
 Usage:
-    python benchmark/bench_scheduler_token_storage.py
+    python benchmark/scheduler/bench_token_storage.py
 """
 
 from __future__ import annotations

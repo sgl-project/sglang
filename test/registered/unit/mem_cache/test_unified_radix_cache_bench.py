@@ -12,6 +12,7 @@ import random
 import statistics
 import time
 import unittest
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
@@ -635,9 +636,9 @@ def bench_cache_finished(
             kv_indices = mr.device_indices
 
         req = env.make_req()
-        req.origin_input_ids = list(seq)
-        req.output_ids = []
-        req.fill_ids = list(seq)
+        req.origin_input_ids = array("q", seq)
+        req.output_ids = array("q")
+        req.fill_ids = array("q", seq)
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)

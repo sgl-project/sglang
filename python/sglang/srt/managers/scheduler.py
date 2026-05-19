@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
@@ -1786,7 +1787,7 @@ class Scheduler(
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                recv_req.input_ids,
+                array("q", recv_req.input_ids),
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
@@ -1874,7 +1875,7 @@ class Scheduler(
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                recv_req.input_ids,
+                array("q", recv_req.input_ids),
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
@@ -1903,8 +1904,11 @@ class Scheduler(
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                # Most pad_input_ids implementations return List[int];
+                # wrap into array.array since Req.origin_input_ids no
+                # longer has a coercing setter.
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -2153,7 +2157,7 @@ class Scheduler(
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            recv_req.input_ids,
+            array("q", recv_req.input_ids),
             recv_req.sampling_params,
             positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
@@ -2176,8 +2180,9 @@ class Scheduler(
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                # See companion call site above for the array.array wrap rationale.
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
 
             req.extend_image_inputs(image_inputs)

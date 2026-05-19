@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    flatten_arrays_to_int64_tensor,
+    is_pin_memory_available,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -121,21 +125,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
-
-
-def _flatten_parts_to_int64_tensor(
-    parts: List[array], device, pin: bool
-) -> torch.Tensor:
-    """Flatten a list of array.array('q') buffers into one int64 tensor.
-
-    Uses NumPy here to speed up the conversion by using memcpy
-    instead of a per-element PyLong-to-int64 walk.
-    """
-    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
-    cpu_t = torch.from_numpy(combined)
-    if pin:
-        cpu_t = cpu_t.pin_memory()
-    return cpu_t.to(device, non_blocking=True)
 
 
 @lru_cache(maxsize=1)
@@ -624,7 +613,7 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Union[List[int], array],
+        origin_input_ids: array,
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -665,12 +654,15 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.origin_input_ids = origin_input_ids
+        # origin_input_ids_unpadded must be array per the signature
+        # annotation; fall back to the already-coerced self.origin_input_ids
+        # when caller doesn't override (e.g., pre-image-padding).
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else origin_input_ids  # Before image padding
+            if origin_input_ids_unpadded is not None
+            else self.origin_input_ids
         )
-        self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -943,47 +935,6 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
-
-    # TODO(Jialin): clean up callers that still assign list[int] to
-    # origin_input_ids / origin_input_ids_unpadded / output_ids / fill_ids,
-    # and we should drop the properties and setters eventually
-    @property
-    def origin_input_ids(self) -> array:
-        return self._origin_input_ids
-
-    @origin_input_ids.setter
-    def origin_input_ids(self, value: Union[List[int], array]) -> None:
-        self._origin_input_ids: array = (
-            value if isinstance(value, array) else array("q", value)
-        )
-
-    @property
-    def origin_input_ids_unpadded(self) -> array:
-        return self._origin_input_ids_unpadded
-
-    @origin_input_ids_unpadded.setter
-    def origin_input_ids_unpadded(self, value: Union[List[int], array]) -> None:
-        self._origin_input_ids_unpadded: array = (
-            value if isinstance(value, array) else array("q", value)
-        )
-
-    @property
-    def output_ids(self) -> array:
-        return self._output_ids
-
-    @output_ids.setter
-    def output_ids(self, value: Union[List[int], array]) -> None:
-        self._output_ids: array = (
-            value if isinstance(value, array) else array("q", value)
-        )
-
-    @property
-    def fill_ids(self) -> array:
-        return self._fill_ids
-
-    @fill_ids.setter
-    def fill_ids(self, value: Union[List[int], array]) -> None:
-        self._fill_ids: array = value if isinstance(value, array) else array("q", value)
 
     @property
     def seqlen(self) -> int:
@@ -1706,7 +1657,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = _flatten_parts_to_int64_tensor(input_ids, self.device, _pin)
+        self.input_ids = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1809,7 +1760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = _flatten_parts_to_int64_tensor(input_ids, self.device, _pin)
+        input_ids_tensor = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
