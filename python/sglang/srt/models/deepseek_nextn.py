@@ -161,9 +161,6 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -224,9 +221,6 @@ class DeepseekModelNextN(nn.Module):
                     torch.cuda.current_stream(),
                 )
 
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
         return hidden_states
 
 
@@ -312,6 +306,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
+
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # `is_nextn` is pinned to True for the NextN subclass; the parameter is kept
+        # only because the mixin's `do_load_weights` calls `self.post_load_weights`
+        # with `is_nextn=...` as a kwarg.
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]
