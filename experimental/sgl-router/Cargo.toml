@@ -81,3 +81,18 @@ tokio = { version = "1.42", features = ["test-util"] }
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"
+# M7-prep: Criterion benches that mirror the SMG `radix_tree_benchmark`
+# + `manual_policy_benchmark` so routing-decision latency can be
+# compared apples-to-apples against the gateway being deprecated.
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "tree_lookup"
+harness = false
+path = "benches/tree_lookup.rs"
+
+[[bench]]
+name = "policy_select"
+harness = false
+path = "benches/policy_select.rs"
