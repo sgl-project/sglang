@@ -357,12 +357,22 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
   if (seed_slot_idx < 0) {
     prev_hash = p.seed;
   } else {
+    // Read seed from OWN dst (this kernel's prior writes), not peer src:
+    // head's real_kv_hash sequence is pre-model-write and tail's is post-
+    // model-write; if either kernel seeded its chain from the peer, that
+    // chain would store one shadow's prev_hash field computed from the
+    // other shadow's real_kv_hash lineage, and the next forward's verify
+    // (which compares an actual loaded from peer against an expected
+    // recomputed from peer) would diverge by exactly that real_kv_hash
+    // delta — a guaranteed HASH false positive on every clean decode.
+    // Each shadow stays internally consistent (head=pre, tail=post) and
+    // the cross-shadow integrity check still runs at verify time.
     const uint64_t seed_prev_hash =
-        static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
-    const int64_t seed_token = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
-    const int64_t seed_position = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+        static_cast<uint64_t>(load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const int64_t seed_token = load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+    const int64_t seed_position = load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
     const uint64_t seed_real_kv_hash =
-        static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+        static_cast<uint64_t>(load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
     prev_hash = splitmix64_mix4(
         seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position), seed_real_kv_hash);
   }

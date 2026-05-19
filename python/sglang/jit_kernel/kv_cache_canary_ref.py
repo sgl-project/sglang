@@ -246,6 +246,10 @@ class _IntViewBundle:
         row_start = slot_idx * self._slot_stride_i64
         return int(self._src_i64[row_start + field].item())
 
+    def load_field_dst(self, slot_idx: int, field: int) -> int:
+        row_start = slot_idx * self._slot_stride_i64
+        return int(self._dst_i64[row_start + field].item())
+
     def store_field(self, slot_idx: int, field: int, value: int) -> None:
         row_start = slot_idx * self._slot_stride_i64
         self._dst_i64[row_start + field] = to_signed_int64(value & _U64_MASK)
@@ -542,12 +546,15 @@ def _run_write_chains(
             prev_hash = seed & _U64_MASK
         else:
             seed_prev_hash = (
-                int_views.load_field(seed_slot_idx, _CANARY_FIELD_PREV_HASH) & _U64_MASK
+                int_views.load_field_dst(seed_slot_idx, _CANARY_FIELD_PREV_HASH)
+                & _U64_MASK
             )
-            seed_token = int_views.load_field(seed_slot_idx, _CANARY_FIELD_TOKEN_ID)
-            seed_position = int_views.load_field(seed_slot_idx, _CANARY_FIELD_POSITION)
+            seed_token = int_views.load_field_dst(seed_slot_idx, _CANARY_FIELD_TOKEN_ID)
+            seed_position = int_views.load_field_dst(
+                seed_slot_idx, _CANARY_FIELD_POSITION
+            )
             seed_real_kv_hash = (
-                int_views.load_field(seed_slot_idx, _CANARY_FIELD_REAL_KV_HASH)
+                int_views.load_field_dst(seed_slot_idx, _CANARY_FIELD_REAL_KV_HASH)
                 & _U64_MASK
             )
             prev_hash = splitmix64_mix4(
