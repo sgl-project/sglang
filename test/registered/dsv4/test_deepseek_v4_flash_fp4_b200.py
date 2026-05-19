@@ -87,8 +87,8 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
         _gsm8k_check(self)
 
 
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+class TestDSV4FlashFP4NonMTPB200(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe without MTP: TP=4, DP=4, DeepEP, no speculative decoding."""
 
     @classmethod
     def setUpClass(cls):
