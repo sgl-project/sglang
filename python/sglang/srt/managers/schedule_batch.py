@@ -1463,7 +1463,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2392,15 +2391,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             else:
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    self.output_ids.to(torch.int64)
+                    self.input_ids
                 )
 
-        # Update fields
-        # Coerce to int64: torch sampling helpers (sampling_from_probs_torch /
-        # top_k_top_p_min_p_sampling_from_probs_torch) return int32 token ids,
-        # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
-        self.input_ids = self.output_ids.to(torch.int64)
-        self.output_ids = None
+        # input_ids was set at the end of the previous run_batch (overlap:
+        # -future_indices.indices placeholder; non-overlap: next_token_ids
+        # cast to int64). resolve_future / forward consumes it directly.
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
@@ -2508,8 +2504,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
 
-        if self.output_ids is not None:
-            self.output_ids = self.output_ids[keep_indices_device]
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids[keep_indices_device]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
@@ -2567,8 +2563,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            self.output_ids = torch.cat([self.output_ids, other.output_ids])
+        if self.input_ids is not None and other.input_ids is not None:
+            self.input_ids = torch.cat([self.input_ids, other.input_ids])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
