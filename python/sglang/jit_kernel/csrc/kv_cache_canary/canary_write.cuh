@@ -125,6 +125,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     running_prev_hash = splitmix64(kCanaryChainAnchor);
   }
 
+  int32_t entries_written = 0;
   for (int32_t j = 0; j < entry_count; ++j) {
     const int32_t i = entry_start + j;
     const int64_t slot_full = static_cast<int64_t>(p.fb_out_cache_loc[i]);
@@ -133,6 +134,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     if (slot < 0) {
       continue;
     }
+    ++entries_written;
     const int64_t token = static_cast<int64_t>(p.fb_input_ids[i]);
     const int64_t position = static_cast<int64_t>(p.fb_positions[i]);
 
@@ -181,8 +183,9 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
         static_cast<uint64_t>(real_kv_hash));
   }
 
-  // Each block contributes its entry_count to slot_run_counter once at exit.
-  atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(entry_count));
+  // Each block contributes its non-skipped entry count to slot_run_counter once at exit.
+  atomicAdd(
+      reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(entries_written));
 }
 
 }  // namespace
