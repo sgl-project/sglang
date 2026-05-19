@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 import requests
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -13,6 +14,7 @@ register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStep3p5FlashChainMTP(GSM8KMixin, DefaultServerBase):
     """Chain-style multi-layer EAGLE speculative decoding on Step-3.5-Flash.
 

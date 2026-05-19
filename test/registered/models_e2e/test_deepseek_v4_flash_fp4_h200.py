@@ -9,6 +9,8 @@ Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200 — only 4 used by 
 
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -41,6 +43,7 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4H200(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
@@ -86,6 +89,7 @@ class TestDSV4FlashFP4H200(
             kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipUnless(
     _flashinfer_has_sm90_cutlass_mxfp4(),
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
