@@ -207,7 +207,9 @@ def build_endpoints_from_group(
 
         buf_slot = "TAIL" if slot == "SWEEP" else slot
         canary_buf = _resolve_canary_buf(slot=buf_slot, half=half, group=group)
-        real_kv_sources = _resolve_real_kv_sources(half=half, group=group)
+        real_kv_sources = (
+            () if slot == "HEAD" else _resolve_real_kv_sources(half=half, group=group)
+        )
         lut = group.swa_index_lut if pool_kind is PoolKind.SWA else None
         slot_view = device_state.slot_run_counters[tag.value : tag.value + 1]
         kernel_view = device_state.kernel_run_counters[tag.value : tag.value + 1]
