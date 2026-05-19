@@ -38,8 +38,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
     cpu_offload_flags_for_layerwise_components,
+    layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -199,7 +201,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
-    # if true, add the legacy default DiT components
+    # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
@@ -209,6 +211,7 @@ class ServerArgs(DisaggArgsMixin):
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -677,19 +680,37 @@ class ServerArgs(DisaggArgsMixin):
         )
 
         if self.strict_ports:
+            requested_ports = []
             if needs_http:
-                self._require_port(self.port, "HTTP")
-            self._require_port(self.scheduler_port, "Scheduler")
+                requested_ports.append((self.port, "HTTP"))
+            requested_ports.append((self.scheduler_port, "Scheduler"))
             if self.master_port is not None:
-                self._require_port(self.master_port, "Master")
+                requested_ports.append((self.master_port, "Master"))
+            seen_ports: dict[int, str] = {}
+            for port, name in requested_ports:
+                if port in seen_ports:
+                    raise RuntimeError(
+                        f"{name} port {port} duplicates {seen_ports[port]} port and "
+                        "--strict-ports is enabled."
+                    )
+                seen_ports[port] = name
+                self._require_port(port, name)
         else:
+            settled_ports: set[int] = set()
             if needs_http:
                 self.port = self.settle_port(self.port)
+                settled_ports.add(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
-            self.scheduler_port = self.settle_port(initial_scheduler_port)
-            self.master_port = self.settle_port(self.master_port, 37)
+            self.scheduler_port = self.settle_port(
+                initial_scheduler_port, avoid=settled_ports
+            )
+            settled_ports.add(self.scheduler_port)
+            if self.master_port is not None:
+                self.master_port = self.settle_port(
+                    self.master_port, 37, avoid=settled_ports
+                )
 
     def _adjust_parallelism(self):
         sp_unspecified = self.sp_degree is None
@@ -813,14 +834,28 @@ class ServerArgs(DisaggArgsMixin):
             self.dit_layerwise_offload = False
             self.layerwise_offload_components = None
 
-    def should_configure_layerwise_offload_for_lazy_component(self) -> bool:
+    def is_arg_explicitly_set(self, arg_name: str) -> bool:
+        return arg_name in self._explicit_arg_names
+
+    def should_configure_layerwise_offload_for_lazy_component(
+        self, component_name: str
+    ) -> bool:
         """Return whether a lazy-loaded component should try layerwise offload.
 
         Lazy components are loaded after the normal pipeline-wide configuration
-        pass, so they should only attempt layerwise configuration when a
-        component scope is present.
+        pass, so they should only attempt layerwise configuration when their
+        component name is covered by the selected layerwise scope.
         """
-        return bool(self.layerwise_offload_components)
+        component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if not component_names:
+            return False
+        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+            return True
+        return layerwise_component_matches_any_selection(
+            component_name, component_names
+        )
 
     @property
     def is_dit_layerwise_offload_selected(self) -> bool:
@@ -838,13 +873,10 @@ class ServerArgs(DisaggArgsMixin):
         )
         if self.dit_layerwise_offload:
             if explicitly_set_component_names is None:
-                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS]
-            elif (
-                LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
-                not in explicitly_set_component_names
-            ):
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
                 explicitly_set_component_names = [
-                    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+                    LAYERWISE_OFFLOAD_DIT_GROUP,
                     *explicitly_set_component_names,
                 ]
 
@@ -1169,6 +1201,7 @@ class ServerArgs(DisaggArgsMixin):
             help="The number of warmup steps to perform for each resolution.",
         )
 
+        # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -1179,7 +1212,7 @@ class ServerArgs(DisaggArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
-            "It only selects the legacy default DiT components. Cannot be used together with cache-dit "
+            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
             "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
@@ -1189,10 +1222,11 @@ class ServerArgs(DisaggArgsMixin):
             nargs="+",
             default=ServerArgs.layerwise_offload_components,
             help="Select pipeline components for layerwise offload. "
-            "Use default to select the legacy default DiT components, "
+            "Use dit to select the DiT layerwise group, default for the default group "
+            "(currently text_encoder, image_encoder, and vae), "
             "or all to select every layerwise-offloadable component. "
             "This option does not imply --dit-layerwise-offload. Example: "
-            "--layerwise-offload-components text_encoder image_encoder.",
+            "--layerwise-offload-components text_encoder image_encoder vae.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -1200,11 +1234,8 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
-        parser.add_argument(
-            "--use-fsdp-inference",
-            action=StoreBoolean,
-            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
-        )
+
+        # offload flags
         parser.add_argument(
             "--text-encoder-cpu-offload",
             action=StoreBoolean,
@@ -1219,6 +1250,12 @@ class ServerArgs(DisaggArgsMixin):
             "--vae-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for VAE. Enable if run out of memory.",
+        )
+
+        parser.add_argument(
+            "--use-fsdp-inference",
+            action=StoreBoolean,
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
         )
         parser.add_argument(
             "--pin-cpu-memory",
@@ -1245,6 +1282,7 @@ class ServerArgs(DisaggArgsMixin):
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # quantization
         parser.add_argument(
             "--quantization",
             type=str,
@@ -1467,16 +1505,21 @@ class ServerArgs(DisaggArgsMixin):
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
+        self,
+        port: int,
+        port_inc: int = 42,
+        max_attempts: int = 100,
+        avoid: set[int] | None = None,
     ) -> int:
         """
         Find an available port with retry logic.
         """
         attempts = 0
         original_port = port
+        avoid = avoid or set()
 
         while attempts < max_attempts:
-            if is_port_available(port):
+            if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
                         f"Port {original_port} was unavailable, using port {port} instead"
@@ -1624,6 +1667,7 @@ class ServerArgs(DisaggArgsMixin):
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
+        server_args_kwargs["_explicit_arg_names"] = set(kwargs)
 
         for attr in attrs:
             if attr == "pipeline_config":
@@ -1659,6 +1703,8 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        explicit_arg_names = set(kwargs)
+
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
@@ -1667,6 +1713,7 @@ class ServerArgs(DisaggArgsMixin):
         convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
+        kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
     @staticmethod
@@ -1689,6 +1736,8 @@ class ServerArgs(DisaggArgsMixin):
                 provided_arg_names.add(arg_name)
         if "mode" in provided_arg_names:
             provided_arg_names.add("performance_mode")
+        if "layerwise_offload_modules" in provided_arg_names:
+            provided_arg_names.add("layerwise_offload_components")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1726,13 +1775,13 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            if self.use_fsdp_inference:
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
                 logger.warning(
-                    "layerwise offload components are selected, automatically disabling use_fsdp_inference."
+                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
             if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."

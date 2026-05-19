@@ -6,16 +6,22 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.managers.scheduler import Scheduler
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
@@ -225,8 +231,21 @@ def prepare_mlp_sync_batch_raw(
     return local_batch
 
 
-class SchedulerDPAttnMixin:
-    def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
+@dataclass(kw_only=True, slots=True, frozen=True)
+class SchedulerDPAttnAdapter:
+    tp_group: "GroupCoordinator"
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    tree_cache: BasePrefixCache
+    offload_tags: set[str]
+    ps: ParallelState
+    server_args: ServerArgs
+    model_config: ModelConfig
+    enable_overlap: bool
+    spec_algorithm: SpeculativeAlgorithm
+    get_require_mlp_sync: Callable[[], bool]
+
+    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -241,7 +260,7 @@ class SchedulerDPAttnMixin:
         )
 
     def maybe_prepare_mlp_sync_batch(
-        self: Scheduler,
+        self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
     ) -> Optional[ScheduleBatch]:
@@ -251,13 +270,13 @@ class SchedulerDPAttnMixin:
 
         Args:
             batch: The batch to process
-            need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
+            need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
-        if need_sync if need_sync is not None else self.require_mlp_sync:
+        if need_sync if need_sync is not None else self.get_require_mlp_sync():
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
-    def get_idle_batch(self: Scheduler) -> ScheduleBatch:
+    def get_idle_batch(self) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,
