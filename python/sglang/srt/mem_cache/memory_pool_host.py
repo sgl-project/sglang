@@ -37,28 +37,32 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_mps, is_npu, is_xpu
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if not (_is_npu or _is_xpu or _is_mps):
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
+if not (_is_cpu or _is_npu or _is_xpu or _is_mps):
+    try:
+        from sgl_kernel.kvcacheio import (
+            transfer_kv_all_layer,
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_all_layer_lf_pf,
+            transfer_kv_all_layer_lf_ph,
+            transfer_kv_all_layer_mla,
+            transfer_kv_all_layer_mla_lf_pf,
+            transfer_kv_direct,
+            transfer_kv_per_layer,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_per_layer_mla,
+            transfer_kv_per_layer_mla_pf_lf,
+            transfer_kv_per_layer_pf_lf,
+            transfer_kv_per_layer_ph_lf,
+        )
+    except ImportError:
+        pass
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 

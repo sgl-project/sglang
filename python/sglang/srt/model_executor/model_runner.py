@@ -814,7 +814,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             register_forward_hooks(self.model, server_args.forward_hooks)
 
         # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        if self.device != "cpu":
+            self.init_piecewise_cuda_graphs()
+        else:
+            self.piecewise_cuda_graph_runner = None
 
         self.prealloc_symmetric_memory_pool()
 
@@ -1075,16 +1078,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_draft_worker:
             if self.device == "cpu":
                 if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+                    try:
+                        # Bind OpenMP threads to CPU cores
+                        torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+                        # Set local size to hint SGLang to use shared memory based AllReduce
+                        os.environ["LOCAL_SIZE"] = str(self.tp_size)
+                        torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
 
-                    @torch.library.register_fake("sgl_kernel::shm_allgather")
-                    def _(data, dim):
-                        return torch.cat([data] * self.tp_size, dim=dim)
+                        @torch.library.register_fake("sgl_kernel::shm_allgather")
+                        def _(data, dim):
+                            return torch.cat([data] * self.tp_size, dim=dim)
+                    except AttributeError:
+                        logger.warning("sgl_kernel CPU ops not available, skipping CPU thread binding and SHM AllReduce")
 
                 else:
                     logger.warning(

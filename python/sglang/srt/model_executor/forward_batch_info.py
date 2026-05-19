@@ -431,6 +431,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Early exit: stop after this many layers. None means full forward.
+    exit_layer: Optional[int] = None
+
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
@@ -549,6 +552,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            exit_layer=batch.exit_layer,
             rids=[req.rid for req in batch.reqs],
         )
 

@@ -625,6 +625,7 @@ class Req(ReqDllmMixin):
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
+        exit_layer: Optional[int] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
@@ -704,6 +705,7 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.exit_layer = exit_layer
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1553,6 +1555,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Early exit: stop after this many layers. None means full forward.
+    exit_layer: Optional[int] = None
+
     # Whether to return captured experts
     return_routed_experts: bool = False
 
@@ -1611,6 +1616,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            exit_layer=min(
+                (req.exit_layer for req in reqs if req.exit_layer is not None),
+                default=None,
+            ),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
@@ -2589,6 +2598,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        if other.exit_layer is not None:
+            if self.exit_layer is None:
+                self.exit_layer = other.exit_layer
+            else:
+                self.exit_layer = min(self.exit_layer, other.exit_layer)
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:

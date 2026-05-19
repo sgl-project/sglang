@@ -6,12 +6,20 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+try:
+    from torch.cuda.memory import (
+        CUDAPluggableAllocator,
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+except (ImportError, AttributeError):
+    # CPU-only torch doesn't have these symbols
+    CUDAPluggableAllocator = None
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs

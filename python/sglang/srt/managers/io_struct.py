@@ -171,6 +171,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Early exit: stop after this many layers. None means full forward.
+    exit_layer: Optional[int] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
@@ -655,6 +657,7 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            exit_layer=self.exit_layer,
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
@@ -730,6 +733,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    # Early exit: stop after this many layers. None means full forward.
+    exit_layer: Optional[int] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
