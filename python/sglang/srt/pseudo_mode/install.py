@@ -62,10 +62,11 @@ def install_on_model_runner(
     install is meaningless. ``scheduler`` is optional only for unit
     tests that exercise the model-runner-only surface; production
     callers must pass it so admit / commit / finish hooks fire.
-    """
-    if getattr(model_runner, _INSTALLED_ATTR, False):
-        return
 
+    Re-entry is supported: each sub-installer maintains its own
+    idempotency sentinel, so the scheduler can call this a second time
+    once it has constructed the scheduler-side hooks.
+    """
     pool = model_runner.token_to_kv_pool
     runners = get_runners(pool)
     if not runners:
@@ -79,7 +80,7 @@ def install_on_model_runner(
     _install_plan_patch(oracle=oracle)
     if scheduler is not None:
         _install_scheduler_hooks(scheduler=scheduler, oracle=oracle)
-    else:
+    elif not getattr(model_runner, _INSTALLED_ATTR, False):
         logger.warning(
             "pseudo-mode install: scheduler argument is None; admit / "
             "commit_step / finish hooks are NOT installed"
@@ -177,7 +178,7 @@ def _patch_add_request_to_queue(
 
 
 def _admit_req_to_oracle(*, oracle: "PseudoOracle", req) -> None:
-    if req.rid in oracle._reqs:  # already admitted (e.g., re-entry path)
+    if oracle.has_req(req.rid):  # already admitted (e.g., re-entry path)
         return
     max_new_tokens = int(req.sampling_params.max_new_tokens)
     try:
@@ -212,7 +213,7 @@ def _patch_prepare_for_extend(*, oracle: "PseudoOracle") -> None:
     def patched(self_batch: "ScheduleBatch", *args, **kwargs):
         result = original(self_batch, *args, **kwargs)
         for req in self_batch.reqs:
-            if req.rid not in oracle._reqs:
+            if not oracle.has_req(req.rid):
                 continue
             try:
                 oracle.register_req_pool_mapping(
@@ -281,25 +282,28 @@ def _post_step_oracle_sync(
        per-req trace.
     """
     forward_mode = batch.forward_mode
+    if forward_mode is not None and forward_mode.is_target_verify():
+        # Spec target-verify produces no sampler output the oracle should
+        # commit; accept/reject bookkeeping is the spec worker's job.
+        return
     is_extend = forward_mode is not None and (
         forward_mode.is_extend() or forward_mode.is_mixed()
     )
     finished_rids: Set[str] = set()
     for req in batch.reqs:
         rid = req.rid
-        state = oracle._reqs.get(rid)
-        if state is None:
+        if not oracle.has_req(rid):
             continue
         if is_extend:
             # ``req.fill_ids = origin_input_ids + output_ids`` after each
             # extend step. The committed prompt prefix is therefore
             # ``len(req.fill_ids) - len(req.output_ids)`` clipped to the
             # prompt length.
-            prompt_len = len(state.origin_input_ids)
+            prompt_len = oracle.prefill_len(rid)
             committed_prompt = max(
                 0, min(prompt_len, len(req.fill_ids) - len(req.output_ids))
             )
-            delta = committed_prompt - state.committed_chunks
+            delta = committed_prompt - oracle.committed_chunks(rid)
             if delta > 0:
                 try:
                     oracle.register_chunk_commit(req_id=rid, chunk_size=delta)
@@ -308,7 +312,7 @@ def _post_step_oracle_sync(
 
         new_len = len(req.output_ids)
         prev_len = last_output_lens.get(rid, 0)
-        if state.in_decode:
+        if oracle.is_in_decode(rid):
             for k in range(prev_len, new_len):
                 try:
                     oracle.commit_step(

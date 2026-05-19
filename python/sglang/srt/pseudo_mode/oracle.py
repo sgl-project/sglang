@@ -83,6 +83,10 @@ class PseudoOracle:
             raise ValueError(
                 f"pseudo-oracle: vocab_size must be positive, got {vocab_size}"
             )
+        if not 0 <= eos_id < vocab_size:
+            raise ValueError(
+                f"pseudo-oracle: eos_id {eos_id} out of [0, {vocab_size})"
+            )
         self._seed: int = seed & _U64_MASK
         self._vocab_size: int = vocab_size
         self._eos_id: int = eos_id
@@ -100,6 +104,18 @@ class PseudoOracle:
     @property
     def eos_id(self) -> int:
         return self._eos_id
+
+    def has_req(self, req_id: str) -> bool:
+        return req_id in self._reqs
+
+    def prefill_len(self, req_id: str) -> int:
+        return len(self._reqs[req_id].origin_input_ids)
+
+    def committed_chunks(self, req_id: str) -> int:
+        return self._reqs[req_id].committed_chunks
+
+    def is_in_decode(self, req_id: str) -> bool:
+        return self._reqs[req_id].in_decode
 
     def admit(
         self,

@@ -237,8 +237,9 @@ class TestSchedulerAdmitHook(unittest.TestCase):
         )
         scheduler._add_request_to_queue(req)
 
-        self.assertIn("hook-rid-0", oracle._reqs)
-        self.assertEqual(oracle._reqs["hook-rid-0"].origin_input_ids, [1, 2, 3])
+        self.assertTrue(oracle.has_req("hook-rid-0"))
+        self.assertEqual(oracle.predict_input_token(req_id="hook-rid-0", position=0), 1)
+        self.assertEqual(oracle.predict_input_token(req_id="hook-rid-0", position=2), 3)
         # Original behavior preserved: req is queued.
         self.assertIs(scheduler.queued[0], req)
 
@@ -271,14 +272,16 @@ class TestSchedulerCommitAndFinishHook(unittest.TestCase):
         decode_mode = _StubForwardMode(extend=False, decode=True)
         batch = _StubScheduleBatch(reqs=[req], forward_mode=decode_mode)
         scheduler.process_batch_result(batch, result=None)
-        self.assertEqual(oracle._reqs["rfin"].output_history, [99])
+        # commit_step appended 99 → predict_input_token at position 3
+        # (first decode slot) returns the committed output token.
+        self.assertEqual(oracle.predict_input_token(req_id="rfin", position=3), 99)
 
         # Step 2: another output, then finish.
         req.output_ids = [99, 100]
         req.fill_ids = [7, 8, 9, 99, 100]
         req._finished = True
         scheduler.process_batch_result(batch, result=None)
-        self.assertNotIn("rfin", oracle._reqs)
+        self.assertFalse(oracle.has_req("rfin"))
 
 
 if __name__ == "__main__":
