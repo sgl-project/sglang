@@ -450,12 +450,14 @@ class SchedulerBatchResultProcessor:
 
             if req.finished():
                 # -1 because prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len -= 1
                 kv_committed_deltas.append(-1)
                 finished_status.append(True)
                 continue
 
             # -1 because prepare_for_decode pre-claimed the bonus slot.
             req.spec_verify_ct += 1
+            req.kv_committed_len += accept_lens[i] - 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.spec_num_correct_drafts += num_correct_drafts
@@ -475,19 +477,11 @@ class SchedulerBatchResultProcessor:
         ), "spec V2 overlap path requires relayer + cpu_future_indices"
         relayer.store_kv_committed_delta(result.cpu_future_indices, kv_committed_deltas)
         relayer.store_finished_status(result.cpu_future_indices, finished_status)
-        for slot_offset, req in enumerate(batch.reqs):
-            # Skip retracted reqs: reset_for_retract cleared their ctx and
-            # their channel slot holds zero-delta (see first loop). Re-binding
-            # the ctx here would make ``relayer_resolve_kv_committed_len``
-            # return baseline(0)+delta(0)=0 instead of the slot-restored
-            # attribute, causing ``_free_tail`` to trim kv_committed_len to 0
-            # on the next prefill and trip alloc's "reusing must have
-            # committed KV" assert.
-            if req.is_retracted:
-                continue
-            req.set_relayer_kv_committed_ctx(
-                relayer, result.cpu_future_indices, slot_offset
-            )
+        # ``req.kv_committed_len`` is updated in-place above (the same way
+        # main does it), so no ctx rebind is needed: same-iter attribute
+        # readers (e.g. filter_batch, retract path, mamba track) see the
+        # post-iter value immediately. The channel slot remains the source
+        # for the finished_status read in filter_batch.
 
         return predict_tokens
 
