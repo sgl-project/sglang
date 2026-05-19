@@ -100,6 +100,7 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEmbeddingLoraHFComparison(CustomTestCase):
     """Compare HF+LoRA vs SGLang+LoRA embedding outputs."""
 

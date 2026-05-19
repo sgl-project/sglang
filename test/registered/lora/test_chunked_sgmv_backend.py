@@ -43,7 +43,6 @@ def reset_kernel_cache():
     _chunked_lora_expand_kernel._clear_cache()
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class BatchComposition(Enum):
     UNIFORM = "uniform"
     MIXED = "mixed"
@@ -57,6 +56,7 @@ class BatchMode(Enum):
     TARGET_VERIFY = "verify"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestChunkedSGMV(unittest.TestCase):
 
     # Test configuration constants
@@ -1159,6 +1159,7 @@ class TestChunkedSGMV(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLmHeadPruningConsistency(unittest.TestCase):
     """Verify get_lm_head_pruned_lens (LoRA) stays consistent with
     LogitsProcessor._get_pruned_states (logits_processor).
