@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class TreeCacheBuildContext:
     """Radix Cache construction arguments."""
 
-    server_args: "ServerArgs"
+    server_args: ServerArgs
     params: CacheInitParams
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
@@ -37,7 +37,7 @@ class TreeCacheBuildContext:
     disable_radix_cache: bool
     effective_chunked_prefill_size: Optional[int]
     tp_worker: Any
-    model_config: "ModelConfig"
+    model_config: ModelConfig
     tp_size: int
     tp_rank: int
     tp_group: Any
