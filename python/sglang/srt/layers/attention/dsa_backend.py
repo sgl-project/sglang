@@ -9,19 +9,19 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
-from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
+from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.nsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.nsa.transform_index import (
+from sglang.srt.layers.attention.dsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.layers.attention.nsa.utils import (
+from sglang.srt.layers.attention.dsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 if _is_hip:
-    from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
+    from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
 
     try:
         from aiter import (  # noqa: F401
@@ -1913,7 +1913,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.srt.layers.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         return tilelang_sparse_fwd(
             q=q_all,
@@ -2521,8 +2521,8 @@ class DeepseekSparseAttnMultiStepBackend:
 
 
 # Backward-compat aliases (deprecated: use DSA class names)
-NativeSparseAttnBackend = DeepseekSparseAttnBackend
-NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-NSAMetadata = DSAMetadata
-NSAFlashMLAMetadata = DSAFlashMLAMetadata
-NSAIndexerMetadata = DSAIndexerMetadata
+DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
+DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+DSAMetadata = DSAMetadata
+DSAFlashMLAMetadata = DSAFlashMLAMetadata
+DSAIndexerMetadata = DSAIndexerMetadata

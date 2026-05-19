@@ -30,7 +30,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,

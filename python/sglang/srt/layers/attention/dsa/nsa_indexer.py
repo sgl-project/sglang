@@ -13,7 +13,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import (
+from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
@@ -995,7 +995,7 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
     ) -> Optional[torch.Tensor]:
         if not _is_npu:
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
@@ -1168,9 +1168,9 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
-            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)

@@ -35,7 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.attention.nsa.utils import (
+from sglang.srt.layers.attention.dsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_round_robin_split,

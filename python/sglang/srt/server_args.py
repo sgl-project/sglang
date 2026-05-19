@@ -1831,7 +1831,7 @@ class ServerArgs:
 
                     # Deferred import to avoid a circular import at module-load
                     # time (nsa.utils imports get_global_server_args).
-                    from sglang.srt.layers.attention.nsa.utils import (
+                    from sglang.srt.layers.attention.dsa.utils import (
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 

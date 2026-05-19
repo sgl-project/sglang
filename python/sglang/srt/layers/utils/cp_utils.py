@@ -66,7 +66,7 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
+    from sglang.srt.layers.attention.dsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
     )
@@ -88,7 +88,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
+    from sglang.srt.layers.attention.dsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
     )
@@ -238,7 +238,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    from sglang.srt.layers.attention.nsa.utils import (
+    from sglang.srt.layers.attention.dsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
     )
 
@@ -395,7 +395,7 @@ def prepare_context_parallel_metadata(
     cp_size,
     seqs_len,
 ):
-    from sglang.srt.layers.attention.nsa.utils import (
+    from sglang.srt.layers.attention.dsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
     )
 
@@ -512,7 +512,7 @@ def prepare_context_parallel_metadata(
     # would silently drop it whenever the scheduler packs multiple requests
     # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back
     # to 0), corrupting the indexer's ke_offset on prefix-cache hits.
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_nsa_enable_prefill_cp
 
     if is_nsa_enable_prefill_cp():
         kv_len_prev = prefix_sum_list[cp_rank]

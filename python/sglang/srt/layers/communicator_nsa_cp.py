@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import (
+from sglang.srt.layers.attention.dsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )

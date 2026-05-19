@@ -18,8 +18,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.dsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -71,7 +71,7 @@ class CompressorBackendMixin:
         compress_ratio: int,
         is_paged: bool = False,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.dsa.nsa_indexer import rotate_activation
 
         assert compress_ratio in (
             4,

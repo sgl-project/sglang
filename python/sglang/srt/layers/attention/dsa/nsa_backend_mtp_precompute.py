@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import compute_nsa_seqlens
+from sglang.srt.layers.attention.dsa.utils import compute_nsa_seqlens
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -325,4 +325,4 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         )
 
 # Backward-compat alias
-NativeSparseAttnBackendMTPPrecomputeMixin = DeepseekSparseAttnBackendMTPPrecomputeMixin
+DeepseekSparseAttnBackendMTPPrecomputeMixin = DeepseekSparseAttnBackendMTPPrecomputeMixin

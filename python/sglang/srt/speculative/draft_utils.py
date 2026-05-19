@@ -98,18 +98,18 @@ class DraftBackendFactory:
         )
 
     def _create_nsa_decode_backend(self):
-        from sglang.srt.layers.attention.nsa_backend import (
-            NativeSparseAttnMultiStepBackend,
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnMultiStepBackend,
         )
 
-        return NativeSparseAttnMultiStepBackend(
+        return DeepseekSparseAttnMultiStepBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
     def _create_nsa_prefill_backend(self):
-        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-        return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return DeepseekSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
         if not get_global_server_args().use_mla_backend:

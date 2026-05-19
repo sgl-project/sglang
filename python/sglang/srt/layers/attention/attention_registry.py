@@ -99,9 +99,9 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
-    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-    return NativeSparseAttnBackend(runner)
+    return DeepseekSparseAttnBackend(runner)
 
 
 @register_attention_backend("nsa")
