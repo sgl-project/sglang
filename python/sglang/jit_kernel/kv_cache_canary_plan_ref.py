@@ -157,9 +157,14 @@ def canary_plan_step_torch_reference(
     if copy_len < out_write_offsets_len:
         write_plan_out.write_offsets[copy_len:].zero_()
 
+    # Padding rows (rpi == 0) may carry sentinel prefix_lens larger than req_to_token's seq-len dimension.
+    # Clamp the gather index to the table width so the gather itself is in-bounds; the torch.where below
+    # discards the padding-row values anyway via the (prefix_lens > 0) AND not_padding mask.
+    max_seq_len = int(req_to_token_host.shape[1])
+    safe_seed_pos = torch.clamp(prefix_lens - 1, min=0, max=max(max_seq_len - 1, 0))
     seed_slot_full = torch.where(
-        prefix_lens > 0,
-        req_to_token_host[req_pool_indices, torch.clamp(prefix_lens - 1, min=0)],
+        (prefix_lens > 0) & not_padding,
+        req_to_token_host[req_pool_indices, safe_seed_pos],
         torch.full_like(prefix_lens, -1),
     )
     if full_to_swa_index_mapping is not None:
