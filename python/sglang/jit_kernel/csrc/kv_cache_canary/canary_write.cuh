@@ -130,6 +130,9 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     const int64_t slot_full = static_cast<int64_t>(p.fb_out_cache_loc[i]);
     const int64_t slot =
         swa_translate_one(slot_full, p.full_to_swa_index_mapping, p.swa_lut_len, p.swa_mapping_present);
+    if (slot < 0) {
+      continue;
+    }
     const int64_t token = static_cast<int64_t>(p.fb_input_ids[i]);
     const int64_t position = static_cast<int64_t>(p.fb_positions[i]);
 

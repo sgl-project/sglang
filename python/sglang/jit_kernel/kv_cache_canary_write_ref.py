@@ -176,6 +176,8 @@ def canary_write_step_torch_reference(
         for j in range(entry_count):
             i = entry_start + j
             slot = int(slot_indices_all[i].item())
+            if slot < 0:
+                continue
             token = int(tokens_all[i].item())
             position = int(positions_all[i].item())
             real_kv_hash_signed = int(real_kv_hashes_all[i].item())
