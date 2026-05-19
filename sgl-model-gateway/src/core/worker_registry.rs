@@ -260,9 +260,10 @@ impl WorkerRegistry {
         self.model_index
             .entry(model_id.clone())
             .and_modify(|existing| {
-                // Create new snapshot with the additional worker
+                // Create new snapshot with the additional worker and maintain deterministic order
                 let mut new_workers: Vec<Arc<dyn Worker>> = existing.iter().cloned().collect();
                 new_workers.push(worker.clone());
+                new_workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
                 *existing = Arc::from(new_workers.into_boxed_slice());
             })
             .or_insert_with(|| Arc::from(vec![worker.clone()].into_boxed_slice()));
@@ -394,10 +395,15 @@ impl WorkerRegistry {
 
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
-        self.type_workers
+        let mut workers: Vec<Arc<dyn Worker>> = self.type_workers
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Enforce deterministic sorting by URL for consistent worker ordering
+        workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
+
+        workers
     }
 
     /// Update worker health status and sync to mesh
@@ -421,7 +427,7 @@ impl WorkerRegistry {
 
     /// Get all prefill workers (regardless of bootstrap_port)
     pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.workers
+        let mut workers: Vec<Arc<dyn Worker>> = self.workers
             .iter()
             .filter_map(|entry| {
                 let worker = entry.value();
@@ -430,7 +436,13 @@ impl WorkerRegistry {
                     _ => None,
                 }
             })
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting by URL to handle K8s pod out-of-order issues
+        // and ensure consistent worker selection across multiple registry instances.
+        workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
+
+        workers
     }
 
     /// Get all decode workers
@@ -440,10 +452,15 @@ impl WorkerRegistry {
 
     /// Get all workers by connection mode
     pub fn get_by_connection(&self, connection_mode: &ConnectionMode) -> Vec<Arc<dyn Worker>> {
-        self.connection_workers
+        let mut workers: Vec<Arc<dyn Worker>> = self.connection_workers
             .get(connection_mode)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Enforce deterministic sorting by URL for consistent worker ordering
+        workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
+
+        workers
     }
 
     /// Get the number of workers in the registry
@@ -458,30 +475,45 @@ impl WorkerRegistry {
 
     /// Get all workers
     pub fn get_all(&self) -> Vec<Arc<dyn Worker>> {
-        self.workers
+        let mut workers: Vec<Arc<dyn Worker>> = self.workers
             .iter()
             .map(|entry| entry.value().clone())
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting by URL for consistent worker ordering
+        workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
+
+        workers
     }
 
     /// Get all workers with their IDs
     pub fn get_all_with_ids(&self) -> Vec<(WorkerId, Arc<dyn Worker>)> {
-        self.workers
+        let mut workers: Vec<(WorkerId, Arc<dyn Worker>)> = self.workers
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting by URL for consistent worker ordering
+        workers.sort_unstable_by(|a, b| a.1.url().cmp(b.1.url()));
+
+        workers
     }
 
     /// Get all worker URLs
     pub fn get_all_urls(&self) -> Vec<String> {
-        self.workers
+        let mut urls: Vec<String> = self.workers
             .iter()
             .map(|entry| entry.value().url().to_string())
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting for consistent URL lists
+        urls.sort_unstable();
+
+        urls
     }
 
     pub fn get_all_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
-        self.workers
+        let mut urls: Vec<(String, Option<String>)> = self.workers
             .iter()
             .map(|entry| {
                 (
@@ -489,16 +521,26 @@ impl WorkerRegistry {
                     entry.value().api_key().clone(),
                 )
             })
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting for consistent URL lists
+        urls.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        urls
     }
 
     /// Get all model IDs with workers (lock-free)
     pub fn get_models(&self) -> Vec<String> {
-        self.model_index
+        let mut models: Vec<String> = self.model_index
             .iter()
             .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting for consistent model lists
+        models.sort_unstable();
+
+        models
     }
 
     /// Get workers filtered by multiple criteria
@@ -526,7 +568,7 @@ impl WorkerRegistry {
         };
 
         // Apply remaining filters
-        workers
+        let mut filtered_workers: Vec<Arc<dyn Worker>> = workers
             .into_iter()
             .filter(|w| {
                 // Check worker_type if specified
@@ -557,7 +599,13 @@ impl WorkerRegistry {
 
                 true
             })
-            .collect()
+            .collect();
+
+        // Enforce deterministic sorting by URL to handle K8s pod out-of-order issues
+        // and ensure consistent worker selection across multiple registry instances.
+        filtered_workers.sort_unstable_by(|a, b| a.url().cmp(b.url()));
+
+        filtered_workers
     }
 
     /// Get worker statistics (lock-free)
