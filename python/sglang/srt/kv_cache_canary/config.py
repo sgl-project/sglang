@@ -56,9 +56,7 @@ def parse_real_kv_hash_mode(value: "str | RealKvHashMode | None") -> RealKvHashM
     raise ValueError(f"kv-canary: unknown RealKvHashMode value {value!r}")
 
 
-PseudoOracleCallback = Callable[
-    ["ForwardBatch"], Tuple[torch.Tensor, torch.Tensor]
-]
+PseudoOracleCallback = Callable[["ForwardBatch"], Tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -371,7 +371,9 @@ def _swa_translate_orphan_indices(
     if lut_len > 0:
         safe = torch.where(safe >= lut_len, torch.full_like(safe, lut_len - 1), safe)
     translated = lut_device[safe.to(torch.int64)]
-    return torch.where(sentinel_mask, indices.to(torch.int32), translated.to(torch.int32))
+    return torch.where(
+        sentinel_mask, indices.to(torch.int32), translated.to(torch.int32)
+    )
 
 
 def _empty_walk_result(

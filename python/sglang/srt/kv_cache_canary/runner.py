@@ -140,11 +140,15 @@ class CanaryRunner:
         self._tp_rank: int = int(tp_rank)
         self._req_to_token_pool: Optional["ReqToTokenPool"] = req_to_token_pool
         self._radix_cache: Optional["BasePrefixCache"] = radix_cache
-        self._per_forward_extras_capacity: int = max(1, int(per_forward_extras_capacity))
+        self._per_forward_extras_capacity: int = max(
+            1, int(per_forward_extras_capacity)
+        )
         self._running_sweep_extras_capacity: int = max(
             1, int(running_sweep_extras_capacity)
         )
-        self._radix_sweep_extras_capacity: int = max(1, int(radix_sweep_extras_capacity))
+        self._radix_sweep_extras_capacity: int = max(
+            1, int(radix_sweep_extras_capacity)
+        )
         self._pseudo_token_capacity: int = max(1, int(pseudo_token_capacity))
 
         self._violation_log = ViolationLog.allocate(
@@ -276,7 +280,7 @@ class CanaryRunner:
         )
 
     def run_tail(self, *, forward_batch: "ForwardBatch") -> None:
-        """Per-forward TAIL launch: re-uses the same per-forward plans from :meth:`run_head`."""
+        """Per-forward TAIL launch: reuses the same per-forward plans from :meth:`run_head`."""
         if not self._config.enabled:
             return
         if self._last_per_forward_plan_input is None:
@@ -435,9 +439,7 @@ class CanaryRunner:
         if oracle is None:
             return
         expected_tokens, expected_positions = oracle(forward_batch)
-        n_tokens = min(
-            self._pseudo_token_capacity, int(expected_tokens.shape[0])
-        )
+        n_tokens = min(self._pseudo_token_capacity, int(expected_tokens.shape[0]))
         if n_tokens <= 0:
             return
         self._pseudo_buffers.expected_tokens[:n_tokens].copy_(
@@ -637,18 +639,14 @@ def _allocate_launch_plans(
     device: torch.device,
 ) -> _LaunchPlans:
     return _LaunchPlans(
-        verify_plan=VerifyPlan.allocate(
-            verify_capacity=verify_capacity, device=device
-        ),
+        verify_plan=VerifyPlan.allocate(verify_capacity=verify_capacity, device=device),
         write_plan=WritePlan.allocate(
             write_req_capacity=write_req_capacity, device=device
         ),
     )
 
 
-def _allocate_pseudo_buffers(
-    *, capacity: int, device: torch.device
-) -> _PseudoBuffers:
+def _allocate_pseudo_buffers(*, capacity: int, device: torch.device) -> _PseudoBuffers:
     return _PseudoBuffers(
         expected_tokens=torch.zeros(capacity, dtype=torch.int32, device=device),
         expected_positions=torch.zeros(capacity, dtype=torch.int32, device=device),
