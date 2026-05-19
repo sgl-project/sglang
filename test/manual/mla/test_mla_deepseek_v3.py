@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,14 +12,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
-)
-
-# DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
-register_amd_ci(
-    est_time=221,
-    suite="stage-b-test-1-gpu-small-amd",
-    disabled="see https://github.com/sgl-project/sglang/issues/12574",
 )
 
 
