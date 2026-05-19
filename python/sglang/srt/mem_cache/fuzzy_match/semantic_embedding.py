@@ -46,7 +46,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
-    _MIN_SEMBLEND_VERSION = "0.3.8"
+    _MIN_SEMBLEND_VERSION = "0.3.9"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
@@ -118,12 +118,16 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         cache_end_pos: int,
         radix_tree=None,
     ) -> bool:
+        import time as _time
+        t_decode_start = _time.monotonic()
         prompt_text = self._decode(request, token_ids[cache_start_pos:cache_end_pos])
+        t_decode_ms = (_time.monotonic() - t_decode_start) * 1000
         request_id = getattr(request, "rid", None) or getattr(request, "request_id", None)
         if request_id is None:
             logger.debug("[SemanticEmbedding] request has no rid; skipping registration")
             return False
-        return self._adapter.register_donor(
+        t_submit_start = _time.monotonic()
+        ok = self._adapter.register_donor(
             request_id=str(request_id),
             token_ids=list(token_ids),
             kv_cache=kv_cache,
@@ -132,6 +136,17 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
             prompt_text=prompt_text,
             radix_tree=radix_tree,
         )
+        t_submit_ms = (_time.monotonic() - t_submit_start) * 1000
+        logger.info(
+            "[FUZZY] cache_on_request_finished: rid=%s tokens=%d "
+            "decode=%.1fms submit=%.1fms ok=%s",
+            request_id,
+            cache_end_pos - cache_start_pos,
+            t_decode_ms,
+            t_submit_ms,
+            ok,
+        )
+        return ok
 
     def match_on_prefix_miss(
         self,
