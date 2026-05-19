@@ -575,6 +575,11 @@ class DeepseekV2MoE(nn.Module):
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+                    apply_routed_scaling_factor_on_output=(
+                        True
+                        if _use_aiter
+                        else self.experts.should_fuse_routed_scaling_factor_in_topk
+                    ),
                 )
             self.topk = TopK(**topk_kwargs)
 
@@ -601,6 +606,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_mori()
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -826,10 +832,9 @@ class DeepseekV2MoE(nn.Module):
             if server_args.enable_eplb
             else None
         )
+        defer_shared = not self.experts.moe_runner_config.inplace
         if hidden_states.shape[0] > 0:
-            if (
-                not self._fuse_shared_experts_inside_sbo
-            ):  # TODO: check if it supports mtp
+            if not defer_shared and not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -893,6 +898,15 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+
+        if (
+            defer_shared
+            and hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+        ):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
@@ -1922,6 +1936,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        hidden_states_orig = hidden_states
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -1942,6 +1957,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1961,13 +1977,24 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and not self.mlp.experts.moe_runner_config.inplace
+        ):
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        else:
+            _mlp_ctx = nullcontext()
+
+        with _mlp_ctx:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2347,6 +2374,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "kv_a_proj_with_mqa",
             ]
 
+        # Quant configs like Quark may rely on the model to provide fused-module
+        # mappings so exclusion checks can unfuse derived names back to the
+        # checkpoint's source layer names.
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
+
         self.pp_group = get_pp_group()
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -2414,7 +2447,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
         elif (
             self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 256
+            # Allow-list of n_routed_experts values that have been validated
+            # for shared-experts fusion under this code path. Currently:
+            #   256 -> DeepSeek-V3 / R1
+            #   384 -> Kimi-K2.5 (text_config wraps DeepseekV3ForCausalLM)
+            or self.config.n_routed_experts not in (256, 384)
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."
@@ -2527,9 +2564,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # TODO (Qiaolin-Yu): check if other draft models need similar layer id
+            # adjustment
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
