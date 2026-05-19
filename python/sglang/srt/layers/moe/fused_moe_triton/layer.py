@@ -302,6 +302,7 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -1040,7 +1041,7 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        if get_moe_a2a_backend().is_ascend_fuseep():
+        if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)

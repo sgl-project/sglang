@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
-_PARAMS_BYTES = 2
+_PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
 
 def _get_fuseep_buffer(layer: "FusedMoE"):
