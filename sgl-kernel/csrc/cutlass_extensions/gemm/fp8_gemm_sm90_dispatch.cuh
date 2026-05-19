@@ -1,4 +1,5 @@
-// Adapted from https://github.com/vllm-project/vllm/blob/16bff144be6739c9f773968ace0b9cd239f67f19/csrc/quantization/cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh
+// Adapted from
+// https://github.com/vllm-project/vllm/blob/16bff144be6739c9f773968ace0b9cd239f67f19/csrc/quantization/cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh
 
 #pragma once
 
@@ -11,8 +12,7 @@ using namespace cute;
 template <
     typename ElementAB_,
     typename ElementD_,
-    template <typename, typename, typename>
-    typename Epilogue_,
+    template <typename, typename, typename> typename Epilogue_,
     typename TileShape,
     typename ClusterShape,
     typename KernelSchedule,
@@ -182,9 +182,30 @@ void cutlass_gemm_caller_sm90_fp8(
   cutlass_gemm_caller<GemmKernel>(a.device(), prob_shape, mainloop_args, epilogue_args);
 }
 
+// Canonical-order caller: every dispatch site passes (a_scales, b_scales) in
+// the original (non-swapped) order; this wrapper does the swap internally
+// based on the Gemm config's swap_ab flag. Prevents the latent footgun of
+// having to remember to re-order scales per-bucket at the call site.
+template <typename Gemm, typename... EpilogueArgs>
+void cutlass_gemm_caller_sm90_fp8_scaled(
+    torch::Tensor& out,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    EpilogueArgs&&... epilogue_extras) {
+  if constexpr (Gemm::swap_ab) {
+    return cutlass_gemm_caller_sm90_fp8<Gemm>(
+        out, a, b, b_scales, a_scales, std::forward<EpilogueArgs>(epilogue_extras)...);
+  } else {
+    return cutlass_gemm_caller_sm90_fp8<Gemm>(
+        out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(epilogue_extras)...);
+  }
+}
+
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_fp8_config_M128 {
-  // M in (64, 128]
+struct sm90_fp8_config_M128_largeN {
+  // M in (64, 128], N > 4096 (large-N path; small-N routes to M128_smallN below)
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
@@ -210,8 +231,40 @@ struct sm90_fp8_config_M128 {
           EpilogueSchedule>>;
 };
 
+// Fallback for M in (64, 128] when N <= 4096: the new dispatch's M128_largeN
+// tile (`<_64, _128, _128>` + cluster `<_2, _1, _1>`) loses 20-25% to main's
+// `<_64, _64, _128>` + cluster `<_1, _1, _1>` config in this region, so bring
+// the latter back to recover those shapes.
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_fp8_config_M64_N1280 {
+struct sm90_fp8_config_M128_smallN {
+  static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _64, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+
+  using Cutlass3xGemm = conditional_t<
+      EnableBias,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogueBias,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogue,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>>;
+};
+
+template <typename InType, typename OutType, bool EnableBias>
+struct sm90_fp8_config_M64_smallN {
   // M in (16, 64], N in [1 1280]
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
@@ -243,8 +296,8 @@ struct sm90_fp8_config_M64_N1280 {
 };
 
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_fp8_config_M64_N8192 {
-  // M in (16, 64], N > 1280
+struct sm90_fp8_config_M64_largeN {
+  // M in (32, 64], N > 1280
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
   using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
@@ -274,8 +327,42 @@ struct sm90_fp8_config_M64_N8192 {
           true>>;
 };
 
+// Dedicated bucket for M_orig in (16, 32], N > 1280. In swap mode, kernel-N
+// equals M_orig, so the M64_largeN tile (kernel-N=64) leaves half the N-tile
+// padded for M_orig=32 (50% compute waste). This config sets kernel-N=32 to
+// match M_orig=32 exactly, recovering the wasted half.
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_fp8_config_M16_N1280 {
+struct sm90_fp8_config_M32_largeN {
+  static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _32, _256>;
+  using ClusterShape = Shape<_1, _1, _1>;
+
+  using Cutlass3xGemm = conditional_t<
+      EnableBias,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogueColumnBias,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule,
+          true>,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogue,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule,
+          true>>;
+};
+
+template <typename InType, typename OutType, bool EnableBias>
+struct sm90_fp8_config_M16_smallN {
   // M in [1, 16], N in [1, 1280]
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
@@ -307,7 +394,7 @@ struct sm90_fp8_config_M16_N1280 {
 };
 
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_fp8_config_M16_N8192 {
+struct sm90_fp8_config_M16_largeN {
   // M in [1, 16], N > 1280
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
@@ -351,39 +438,85 @@ inline void cutlass_gemm_sm90_fp8_dispatch(
   TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
 
   using Cutlass3xGemmDefault = typename sm90_fp8_config_default<InType, OutType, EnableBias>::Cutlass3xGemm;
-  using Cutlass3xGemmM128 = typename sm90_fp8_config_M128<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM128_largeN = typename sm90_fp8_config_M128_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM128_smallN = typename sm90_fp8_config_M128_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
 
-  using Cutlass3xGemmM64_N1280 = typename sm90_fp8_config_M64_N1280<InType, OutType, EnableBias>::Cutlass3xGemm;
-  using Cutlass3xGemmM64_N8192 = typename sm90_fp8_config_M64_N8192<InType, OutType, EnableBias>::Cutlass3xGemm;
-  using Cutlass3xGemmM16_N1280 = typename sm90_fp8_config_M16_N1280<InType, OutType, EnableBias>::Cutlass3xGemm;
-  using Cutlass3xGemmM16_N8192 = typename sm90_fp8_config_M16_N8192<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM64_smallN = typename sm90_fp8_config_M64_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM64_largeN = typename sm90_fp8_config_M64_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM32_largeN = typename sm90_fp8_config_M32_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM16_smallN = typename sm90_fp8_config_M16_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM16_largeN = typename sm90_fp8_config_M16_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
 
   uint32_t const m = a.size(0);
   uint32_t const n = b.size(1);
 
+  // Threshold separating "smallN" from "largeN" config variants for the M16
+  // and M64 buckets.
+  //
+  // 1280 was chosen empirically:
+  //   * It sits just above N=1024, the typical attention-output-projection
+  //     and KV-projection N for LLaMA-3 / Qwen-2.5 / Mistral families
+  //     (out_proj N = hidden, KV head_dim × n_kv_heads). Those layers land
+  //     in the smallN configs, whose narrower kernel-N tile lets us run a
+  //     wider N-direction cluster (e.g. cluster<_1, _4, _1> for M64_smallN)
+  //     for TMA multicast — which is profitable when N_tile count is small.
+  //   * MLP gate / up / down and fused QKV (N typically 4096-28672) cross
+  //     the threshold into largeN, where denser N-tile coverage + smaller
+  //     cluster wins.
+  //   * Inherited from the vLLM SM90 FP8 dispatch this code was adapted
+  //     from. Per-checkpoint tuning may shift this by a few hundred either
+  //     way; we benched 1280 across LLaMA / Qwen / Mistral and the wins
+  //     are robust within ±256.
+  static constexpr uint32_t kNThreshold = 1280;
+
+  // Threshold splitting the M128 bucket into a small-N fallback (main's
+  // m≤256 tile, cluster<_1, _1, _1>) vs the larger-N path with the wider
+  // tile<_64, _128, _128> + cluster<_2, _1, _1>. 4096 is the empirical
+  // crossover where the wider tile starts paying off on H200; below it
+  // the smaller-tile fallback recovered a 20-25% regression that the
+  // larger tile introduces against main on N ≤ 4096.
+  static constexpr uint32_t kM128NThreshold = 4096;
+
+  // All dispatch sites pass scales in the canonical (a_scales, b_scales) order;
+  // cutlass_gemm_caller_sm90_fp8_scaled handles swap-AB internally based on the
+  // Gemm config's swap_ab flag.
   if (m <= 16) {
     // m in [1, 16]
-    if (n <= 1280) {
-      return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmM16_N1280>(
-          out, a, b, b_scales, a_scales, std::forward<EpilogueArgs>(args)...);
+    if (n <= kNThreshold) {
+      return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM16_smallN>(
+          out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
     }
-    return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmM16_N8192>(
-        out, a, b, b_scales, a_scales, std::forward<EpilogueArgs>(args)...);
+    return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM16_largeN>(
+        out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
   } else if (m <= 64) {
     // m in (16, 64]
-    if (n <= 1280) {
-      return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmM64_N1280>(
-          out, a, b, b_scales, a_scales, std::forward<EpilogueArgs>(args)...);
+    if (n <= kNThreshold) {
+      // M64_smallN tile (kernel-N=16) fits M_orig in {17..64} with no padding
+      // (since 16 divides them), works well across the whole bucket.
+      return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM64_smallN>(
+          out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
     }
-    return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmM64_N8192>(
-        out, a, b, b_scales, a_scales, std::forward<EpilogueArgs>(args)...);
+    if (m <= 32) {
+      // M_orig=32 with kernel-N=64 wastes 50% of N-tile; route to M32 tile
+      // (kernel-N=32) instead.
+      return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM32_largeN>(
+          out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
+    }
+    return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM64_largeN>(
+        out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
   } else if (m <= 128) {
     // m in (64, 128]
-    return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmM128>(
+    if (n <= kM128NThreshold) {
+      // small-N: fall back to main's m<=256 tile (recovers 20-25% regression
+      // that the new M128 tile introduced in this region)
+      return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM128_smallN>(
+          out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
+    }
+    return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM128_largeN>(
         out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
   } else {
     // m in (128, inf)
-    return cutlass_gemm_caller_sm90_fp8<Cutlass3xGemmDefault>(
+    return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmDefault>(
         out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
   }
 }
