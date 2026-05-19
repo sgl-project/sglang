@@ -614,7 +614,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.is_chunked <= 0:
+            if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -670,7 +670,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
+                req.inflight_middle_chunks -= 1
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -692,7 +692,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
