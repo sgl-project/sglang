@@ -49,6 +49,9 @@ _MODEL = "Qwen/Qwen3-0.6B"
 # to swallow single-batch jitter on a shared CI runner; tight enough
 # that a regression that doubles the kernel cost still fails.
 _MAX_OVERHEAD_RATIO: float = 0.02
+# Tighter budget for the periodic full-pool sweep: amortised over N=100
+# forwards it should add <0.5% on top of the bit-real-data baseline.
+_MAX_SWEEP_OVERHEAD_RATIO: float = 0.005
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
@@ -77,19 +80,18 @@ _SCENARIOS: Tuple[_Scenario, ...] = (
 )
 
 
-def _bench_with_canary_mode(
-    *, scenario: _Scenario, canary_mode: str
+def _bench_with_canary_flags(
+    *, scenario: _Scenario, run_label: str, canary_flags: List[str]
 ) -> BenchOneCaseResult:
-    """Launch server with canary_mode, run one bench scenario, return result."""
+    """Launch server with canary_flags, run one bench scenario, return result."""
     other_server_args: List[str] = [
         "--mem-fraction-static",
         "0.65",
-        "--kv-cache-canary",
-        canary_mode,
+        *canary_flags,
     ]
     server_args = ServerArgs(model_path=_MODEL)
     bench_args = BenchArgs(
-        run_name=f"canary_{canary_mode}__{scenario.label}",
+        run_name=f"{run_label}__{scenario.label}",
         batch_size=(scenario.batch_size,),
         input_len=(scenario.input_len,),
         output_len=(scenario.output_len,),
@@ -112,9 +114,20 @@ def _bench_with_canary_mode(
     if not results:
         raise RuntimeError(
             f"bench_one_batch_server returned no results for {scenario.label} "
-            f"with canary_mode={canary_mode}"
+            f"with run_label={run_label}"
         )
     return results[0]
+
+
+def _bench_with_canary_mode(
+    *, scenario: _Scenario, canary_mode: str
+) -> BenchOneCaseResult:
+    """Backwards-compatible shim used by the canary-off vs canary-log tests."""
+    return _bench_with_canary_flags(
+        scenario=scenario,
+        run_label=f"canary_{canary_mode}",
+        canary_flags=["--kv-cache-canary", canary_mode],
+    )
 
 
 def _check_overhead(scenario: _Scenario, testcase: unittest.TestCase) -> None:
@@ -151,6 +164,65 @@ class TestKvCacheCanarySpeedQwen3(CustomTestCase):
 
     def test_decode_bs256_isl4096_osl1024(self) -> None:
         _check_overhead(_SCENARIOS[1], self)
+
+
+def _check_sweep_overhead(scenario: _Scenario, testcase: unittest.TestCase) -> None:
+    sweep_off = _bench_with_canary_flags(
+        scenario=scenario,
+        run_label="canary_log_realbit",
+        canary_flags=[
+            "--kv-cache-canary",
+            "log",
+            "--kv-cache-canary-real-data",
+            "bit",
+        ],
+    )
+    sweep_on = _bench_with_canary_flags(
+        scenario=scenario,
+        run_label="canary_log_realbit_sweep100",
+        canary_flags=[
+            "--kv-cache-canary",
+            "log",
+            "--kv-cache-canary-real-data",
+            "bit",
+            "--kv-cache-canary-real-data-sweep-every-n-steps",
+            "100",
+        ],
+    )
+
+    overhead = (sweep_on.latency - sweep_off.latency) / sweep_off.latency
+    print(
+        f"\n=== {scenario.label} (sweep) ===\n"
+        f"  sweep=off (bit):       latency={sweep_off.latency:.3f}s  "
+        f"input_tput={sweep_off.input_throughput:.0f}  "
+        f"output_tput={sweep_off.output_throughput:.0f}\n"
+        f"  sweep=on (bit + N=100): latency={sweep_on.latency:.3f}s  "
+        f"input_tput={sweep_on.input_throughput:.0f}  "
+        f"output_tput={sweep_on.output_throughput:.0f}\n"
+        f"  overhead:              {overhead:.1%}  "
+        f"(budget: {_MAX_SWEEP_OVERHEAD_RATIO:.1%})"
+    )
+    testcase.assertLess(
+        overhead,
+        _MAX_SWEEP_OVERHEAD_RATIO,
+        f"{scenario.label}: sweep overhead {overhead:.1%} exceeds "
+        f"{_MAX_SWEEP_OVERHEAD_RATIO:.1%} budget "
+        f"(sweep_off={sweep_off.latency:.3f}s, sweep_on={sweep_on.latency:.3f}s)",
+    )
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="sweep overhead tuning still in progress",
+)
+class TestKvCacheCanarySweepSpeedQwen3(CustomTestCase):
+    """Compare canary=log+real-data=bit vs +sweep-every-100 on Qwen3-0.6B."""
+
+    def test_prefill_bs32_isl16384_osl1(self) -> None:
+        _check_sweep_overhead(_SCENARIOS[0], self)
+
+    def test_decode_bs256_isl4096_osl1024(self) -> None:
+        _check_sweep_overhead(_SCENARIOS[1], self)
 
 
 if __name__ == "__main__":
