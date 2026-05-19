@@ -295,7 +295,7 @@ class PseudoEngine:
             out.append(
                 CanaryViolationView.from_row(
                     row=entry["row"],
-                    shadow_kind=entry["kind"],
+                    canary_kind=entry["kind"],
                     write_index=entry["write_index"],
                 )
             )

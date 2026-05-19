@@ -16,11 +16,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_ACTUAL_HASH,
     _VIOLATION_FIELD_EXPECTED_HASH,
     _VIOLATION_FIELD_EXPECTED_POSITION,
-    _VIOLATION_FIELD_EXPECTED_REQ_ID,
     _VIOLATION_FIELD_FAIL_REASON,
     _VIOLATION_FIELD_KERNEL_KIND,
     _VIOLATION_FIELD_POSITION,
-    _VIOLATION_FIELD_REQ_ID,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
     KERNEL_KIND_HEAD,
@@ -38,31 +36,26 @@ def _make_row(
     kernel_kind: int,
     fail_reason: int,
     slot_idx: int = 0,
-    req_id: int = 0,
     token_id: int = 0,
     position: int = 0,
     expected_hash: int = 0,
     actual_hash: int = 0,
-    expected_req_id: int = 0,
     expected_position: int = 0,
 ) -> list[int]:
     """Build a violation row by field-offset constant.
 
-    Mirrors the helper in the canary test for input mismatch formatting
-    — keeping the construction by offset (not by positional index)
-    means a layout change in ``_VIOLATION_FIELD_*`` surfaces at this
-    test boundary rather than silently shifting the decoded values.
+    Constructing by offset (not by positional index) means a layout
+    change in ``_VIOLATION_FIELD_*`` surfaces at this test boundary
+    rather than silently shifting the decoded values.
     """
     row = [0] * VIOLATION_FIELDS
     row[_VIOLATION_FIELD_KERNEL_KIND] = kernel_kind
     row[_VIOLATION_FIELD_FAIL_REASON] = fail_reason
     row[_VIOLATION_FIELD_SLOT_IDX] = slot_idx
-    row[_VIOLATION_FIELD_REQ_ID] = req_id
     row[_VIOLATION_FIELD_TOKEN_ID] = token_id
     row[_VIOLATION_FIELD_POSITION] = position
     row[_VIOLATION_FIELD_EXPECTED_HASH] = expected_hash
     row[_VIOLATION_FIELD_ACTUAL_HASH] = actual_hash
-    row[_VIOLATION_FIELD_EXPECTED_REQ_ID] = expected_req_id
     row[_VIOLATION_FIELD_EXPECTED_POSITION] = expected_position
     return row
 
@@ -75,28 +68,24 @@ class TestFromRowFieldDecode(unittest.TestCase):
             kernel_kind=KERNEL_KIND_HEAD,
             fail_reason=int(FailReason.HASH),
             slot_idx=3,
-            req_id=5,
             token_id=7,
             position=11,
             expected_hash=0xDEADBEEF,
             actual_hash=0xCAFEBABE,
-            expected_req_id=5,
             expected_position=11,
         )
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="head_k", write_index=4
+            row=row, canary_kind="head_k", write_index=4
         )
-        self.assertEqual(view.shadow_kind, "head_k")
+        self.assertEqual(view.canary_kind, "head_k")
         self.assertEqual(view.kernel_kind, "HEAD")
         self.assertEqual(view.fail_reason, "HASH")
         self.assertEqual(view.fail_reason_int, int(FailReason.HASH))
         self.assertEqual(view.slot_idx, 3)
-        self.assertEqual(view.req_id, 5)
         self.assertEqual(view.token_id, 7)
         self.assertEqual(view.position, 11)
         self.assertEqual(view.expected_hash, 0xDEADBEEF)
         self.assertEqual(view.actual_hash, 0xCAFEBABE)
-        self.assertEqual(view.expected_req_id, 5)
         self.assertEqual(view.expected_position, 11)
         self.assertEqual(view.write_index, 4)
         self.assertTrue(view.is_real())
@@ -106,14 +95,13 @@ class TestFromRowFieldDecode(unittest.TestCase):
             kernel_kind=KERNEL_KIND_TAIL,
             fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
             slot_idx=9,
-            req_id=2,
             token_id=999,
             position=4,
             expected_hash=123,
             actual_hash=999,
         )
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="tail_k", write_index=1
+            row=row, canary_kind="tail_k", write_index=1
         )
         self.assertEqual(view.fail_reason, "INPUT_TOKEN_MISMATCH")
         self.assertEqual(view.kernel_kind, "TAIL")
@@ -128,12 +116,11 @@ class TestFromRowFieldDecode(unittest.TestCase):
             kernel_kind=KERNEL_KIND_HEAD,
             fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
             slot_idx=1,
-            req_id=11,
             position=17,
             expected_position=16,
         )
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="head_v", write_index=2
+            row=row, canary_kind="head_v", write_index=2
         )
         self.assertEqual(view.fail_reason, "INPUT_POSITION_MISMATCH")
         self.assertEqual(view.expected_position, 16)
@@ -146,7 +133,7 @@ class TestFromRowSentinelRow(unittest.TestCase):
     def test_none_row_is_not_real(self) -> None:
         row = [0] * VIOLATION_FIELDS
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="head_k", write_index=0
+            row=row, canary_kind="head_k", write_index=0
         )
         self.assertEqual(view.fail_reason, "NONE")
         self.assertEqual(view.fail_reason_int, int(FailReason.NONE))
@@ -162,7 +149,7 @@ class TestFromRowUnknownReason(unittest.TestCase):
             fail_reason=99,  # not in FailReason
         )
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="head_k", write_index=1
+            row=row, canary_kind="head_k", write_index=1
         )
         self.assertEqual(view.fail_reason, "unknown(99)")
         self.assertEqual(view.fail_reason_int, 99)
@@ -173,23 +160,23 @@ class TestFromRowUnknownReason(unittest.TestCase):
 class TestStrRendering(unittest.TestCase):
     """``__str__`` includes the essentials for log inspection."""
 
-    def test_str_carries_shadow_kernel_reason_slot_req_pos(self) -> None:
+    def test_str_carries_canary_kernel_reason_slot_token_pos(self) -> None:
         row = _make_row(
             kernel_kind=KERNEL_KIND_TAIL,
-            fail_reason=int(FailReason.REQ_ID),
+            fail_reason=int(FailReason.TOKEN_ID),
             slot_idx=42,
-            req_id=7,
+            token_id=7,
             position=3,
         )
         view = CanaryViolationView.from_row(
-            row=row, shadow_kind="tail_v", write_index=5
+            row=row, canary_kind="tail_v", write_index=5
         )
         text = str(view)
-        self.assertIn("shadow=tail_v", text)
+        self.assertIn("canary=tail_v", text)
         self.assertIn("kernel=TAIL", text)
-        self.assertIn("reason=REQ_ID", text)
+        self.assertIn("reason=TOKEN_ID", text)
         self.assertIn("slot=42", text)
-        self.assertIn("req_id=7", text)
+        self.assertIn("token=7", text)
         self.assertIn("pos=3", text)
         self.assertIn("write_index=5", text)
 

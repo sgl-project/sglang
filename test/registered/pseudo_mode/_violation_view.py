@@ -21,11 +21,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_ACTUAL_HASH,
     _VIOLATION_FIELD_EXPECTED_HASH,
     _VIOLATION_FIELD_EXPECTED_POSITION,
-    _VIOLATION_FIELD_EXPECTED_REQ_ID,
     _VIOLATION_FIELD_FAIL_REASON,
     _VIOLATION_FIELD_KERNEL_KIND,
     _VIOLATION_FIELD_POSITION,
-    _VIOLATION_FIELD_REQ_ID,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
     KERNEL_KIND_HEAD,
@@ -40,17 +38,15 @@ logger = logging.getLogger(__name__)
 class CanaryViolationView:
     """One canary violation, decoded for test-side inspection."""
 
-    shadow_kind: str
+    canary_kind: str
     kernel_kind: str
     fail_reason: str
     fail_reason_int: int
     slot_idx: int
-    req_id: int
     token_id: int
     position: int
     expected_hash: int
     actual_hash: int
-    expected_req_id: int
     expected_position: int
     write_index: int
 
@@ -59,12 +55,12 @@ class CanaryViolationView:
         cls,
         *,
         row: List[int],
-        shadow_kind: str,
+        canary_kind: str,
         write_index: int,
     ) -> "CanaryViolationView":
         """Build a view from one ``_pull_first_violation`` row.
 
-        ``shadow_kind`` must be one of the four ``VIOLATION_KINDS``
+        ``canary_kind`` must be one of the four ``VIOLATION_KINDS``
         (head_k / head_v / tail_k / tail_v); the caller already knows
         which slot it pulled from.
         """
@@ -81,17 +77,15 @@ class CanaryViolationView:
         }.get(kernel_kind_int, str(kernel_kind_int))
 
         return cls(
-            shadow_kind=shadow_kind,
+            canary_kind=canary_kind,
             kernel_kind=kernel_kind,
             fail_reason=fail_reason,
             fail_reason_int=fail_reason_int,
             slot_idx=int(row[_VIOLATION_FIELD_SLOT_IDX]),
-            req_id=int(row[_VIOLATION_FIELD_REQ_ID]),
             token_id=int(row[_VIOLATION_FIELD_TOKEN_ID]),
             position=int(row[_VIOLATION_FIELD_POSITION]),
             expected_hash=int(row[_VIOLATION_FIELD_EXPECTED_HASH]),
             actual_hash=int(row[_VIOLATION_FIELD_ACTUAL_HASH]),
-            expected_req_id=int(row[_VIOLATION_FIELD_EXPECTED_REQ_ID]),
             expected_position=int(row[_VIOLATION_FIELD_EXPECTED_POSITION]),
             write_index=int(write_index),
         )
@@ -102,8 +96,8 @@ class CanaryViolationView:
 
     def __str__(self) -> str:
         return (
-            f"CanaryViolation(shadow={self.shadow_kind} "
+            f"CanaryViolation(canary={self.canary_kind} "
             f"kernel={self.kernel_kind} reason={self.fail_reason} "
-            f"slot={self.slot_idx} req_id={self.req_id} "
+            f"slot={self.slot_idx} token={self.token_id} "
             f"pos={self.position} write_index={self.write_index})"
         )
