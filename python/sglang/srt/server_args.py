@@ -6095,18 +6095,19 @@ class ServerArgs:
             "--kv-cache-canary-real-data",
             type=str,
             default=ServerArgs.kv_cache_canary_real_data,
-            choices=["off", "bit", "all"],
+            choices=["off", "portion", "all"],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
                 "chain hash. 'off' (default) leaves the real_kv_hash slot field "
-                "at zero. 'bit' reads the first 16 bytes of the real KV pool's "
-                "slot at write time, folds through splitmix64, and verifies on "
-                "read; useful when corruption is suspected but overhead must "
-                "stay tiny. 'all' reads the full real-KV slot stride for "
-                "maximum coverage at higher cost. Catches corruption that the "
-                "pure-canary path misses because the canary slot itself is "
-                "intact but the real KV got written wrong (attn-kernel "
-                "idle-logic misconfig; PD transfer bit-rot)."
+                "at zero. 'portion' reads the first 16 bytes of the real KV "
+                "pool's slot at write time, folds through splitmix64, and "
+                "verifies on read; useful when corruption is suspected but "
+                "overhead must stay tiny. 'all' reads the full real-KV slot "
+                "stride for maximum coverage at higher cost. Catches "
+                "corruption that the pure-canary path misses because the "
+                "canary slot itself is intact but the real KV got written "
+                "wrong (attn-kernel idle-logic misconfig; PD transfer "
+                "bit-rot)."
             ),
         )
         parser.add_argument(
@@ -6122,7 +6123,7 @@ class ServerArgs:
                 "writes; the sweep also catches drift on history slots that "
                 "were frozen earlier (e.g. PD-transfer bit-rot, idle dummy "
                 "writes, rowhammer-style flips). Requires "
-                "--kv-cache-canary-real-data in {bit, all} and "
+                "--kv-cache-canary-real-data in {portion, all} and "
                 "--kv-cache-canary in {log, raise}."
             ),
         )
@@ -7119,7 +7120,7 @@ class ServerArgs:
             if self.kv_cache_canary_real_data == "off":
                 raise ValueError(
                     "--kv-cache-canary-real-data-sweep-every-n-steps requires "
-                    "--kv-cache-canary-real-data in {bit, all}"
+                    "--kv-cache-canary-real-data in {portion, all}"
                 )
             if self.kv_cache_canary == "off":
                 raise ValueError(

@@ -3,8 +3,9 @@
 Two paired scenarios:
 
 - ``TestCanaryRealDataSweepClean``: ``--kv-cache-canary=raise`` with
-  ``--kv-cache-canary-real-data=bit`` and sweep every 5 steps, no fault
-  injection. Server must stay healthy under a parallel request burst.
+  ``--kv-cache-canary-real-data=portion`` and sweep every 5 steps, no
+  fault injection. Server must stay healthy under a parallel request
+  burst.
 - ``TestCanaryRealDataSweepPerturbed``: same config plus
   ``SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB=0.01``. The sweep path must
   fire — either the launch warmup catches it, or live traffic does.
@@ -28,7 +29,7 @@ register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _CanaryRealDataSweepBase(CanaryE2EBase):
-    """Common config: canary=raise + real-data=bit + sweep every 5 steps.
+    """Common config: canary=raise + real-data=portion + sweep every 5 steps.
 
     The base class already injects ``--kv-cache-canary raise``, so we
     only layer the real-data + sweep flags via ``extra_server_args``.
@@ -39,7 +40,7 @@ class _CanaryRealDataSweepBase(CanaryE2EBase):
     model = _MODEL
     extra_server_args = [
         "--kv-cache-canary-real-data",
-        "bit",
+        "portion",
         "--kv-cache-canary-real-data-sweep-every-n-steps",
         "5",
     ]
@@ -109,7 +110,7 @@ class TestCanaryRealDataSweepPerturbed(_CanaryRealDataSweepBase):
 
     extra_server_args = [
         "--kv-cache-canary-real-data",
-        "bit",
+        "portion",
         "--kv-cache-canary-real-data-sweep-every-n-steps",
         "1",
     ]

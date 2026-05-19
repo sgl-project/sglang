@@ -6,7 +6,7 @@ copied one block too few from the donor leaf to the new branch. The
 recipient req then read garbage KV bytes at the boundary block, and
 subsequent decodes silently advanced from corrupt state.
 
-How the canary would catch it: with ``--kv-cache-canary-real-data=bit``
+How the canary would catch it: with ``--kv-cache-canary-real-data=portion``
 the slot identity stored at the boundary block would not match the
 recipient req's ``(req_id, position)`` pair on the first decode after
 the prefix hit. The head kernel writes a ``REAL_KV_HASH`` violation

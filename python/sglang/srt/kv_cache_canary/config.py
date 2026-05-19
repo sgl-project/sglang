@@ -39,7 +39,7 @@ class RealKvHashMode(str, enum.Enum):
 
     - ``OFF`` (default): the feature is disabled; the kernel stores 0
       in the ``real_kv_hash`` field and skips the comparison.
-    - ``BIT``: read 16 bytes of the real-KV slot at the configured
+    - ``PORTION``: read 16 bytes of the real-KV slot at the configured
       pool layer and fold through splitmix64. Cheap default for
       always-on production.
     - ``ALL``: read the full real-KV slot stride and fold through
@@ -48,7 +48,7 @@ class RealKvHashMode(str, enum.Enum):
     """
 
     OFF = "off"
-    BIT = "bit"
+    PORTION = "portion"
     ALL = "all"
 
     @classmethod
@@ -157,7 +157,7 @@ def real_kv_hash_mode_to_int(mode: RealKvHashMode) -> int:
     """
     if mode is RealKvHashMode.OFF:
         return 0
-    if mode is RealKvHashMode.BIT:
+    if mode is RealKvHashMode.PORTION:
         return 1
     if mode is RealKvHashMode.ALL:
         return 2
@@ -170,13 +170,13 @@ def real_kv_hash_read_bytes(
     """Return how many real-KV bytes the kernel reads per slot for ``mode``.
 
     - ``OFF`` -> 0 (kernel takes the early-out path).
-    - ``BIT`` -> 16 bytes (a fixed cheap prefix; matches
-      ``REAL_KV_HASH_BIT_BYTES``).
+    - ``PORTION`` -> 16 bytes (a fixed cheap prefix; matches
+      ``REAL_KV_HASH_PORTION_BYTES``).
     - ``ALL`` -> ``real_kv_slot_stride_bytes`` (the full slot).
     """
     if mode is RealKvHashMode.OFF:
         return 0
-    if mode is RealKvHashMode.BIT:
+    if mode is RealKvHashMode.PORTION:
         return min(16, int(real_kv_slot_stride_bytes))
     if mode is RealKvHashMode.ALL:
         return int(real_kv_slot_stride_bytes)

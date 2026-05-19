@@ -55,10 +55,10 @@ def install_on_model_runner(
     too — so patching the bound method is the single point that covers both
     the eager and the captured-into-cuda-graph paths.
 
-    ``real_kv_hash_mode`` (one of ``off`` / ``bit`` / ``all``, default
+    ``real_kv_hash_mode`` (one of ``off`` / ``portion`` / ``all``, default
     ``off``) controls whether a fingerprint of the real KV-cache slot is
     folded into the canary's chain hash. ``off`` leaves the field zero;
-    ``bit`` hashes the first 16 bytes of the real slot; ``all`` hashes
+    ``portion`` hashes the first 16 bytes of the real slot; ``all`` hashes
     the full slot stride.
 
     ``real_data_sweep_every_n_steps`` controls the periodic full-pool sweep

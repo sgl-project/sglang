@@ -222,7 +222,7 @@ class _IntViewBundle:
 class _RealKvView:
     """Host-side reader for the optional real-KV slot buffer.
 
-    In ``OFF`` mode :meth:`hash_slot` always returns 0; in ``BIT`` /
+    In ``OFF`` mode :meth:`hash_slot` always returns 0; in ``PORTION`` /
     ``ALL`` modes it pulls ``read_bytes`` consecutive bytes starting at
     the slot's stride offset and folds them through splitmix64 in 8-byte
     chunks (zero-padded if ``read_bytes`` is not a multiple of 8). The

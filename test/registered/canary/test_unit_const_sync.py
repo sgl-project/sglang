@@ -36,10 +36,10 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_HEAD,
     KERNEL_KIND_SWEEP,
     KERNEL_KIND_TAIL,
-    REAL_KV_HASH_BIT_BYTES,
     REAL_KV_HASH_MODE_ALL,
-    REAL_KV_HASH_MODE_BIT,
     REAL_KV_HASH_MODE_OFF,
+    REAL_KV_HASH_MODE_PORTION,
+    REAL_KV_HASH_PORTION_BYTES,
     SKIP_CHAIN_SENTINEL,
     VIOLATION_FIELDS,
     FailReason,
@@ -74,7 +74,7 @@ _EXPECTED_PAIRS: Dict[str, int] = {
     "kFailReasonInputTokenMismatch": int(FailReason.INPUT_TOKEN_MISMATCH),
     "kFailReasonInputPositionMismatch": int(FailReason.INPUT_POSITION_MISMATCH),
     "kRealKvHashModeOff": REAL_KV_HASH_MODE_OFF,
-    "kRealKvHashModeBit": REAL_KV_HASH_MODE_BIT,
+    "kRealKvHashModePortion": REAL_KV_HASH_MODE_PORTION,
     "kRealKvHashModeAll": REAL_KV_HASH_MODE_ALL,
     "kCanaryExpectedSkipSentinel": CANARY_EXPECTED_SKIP_SENTINEL,
     "kSkipChainSentinel": SKIP_CHAIN_SENTINEL,
@@ -116,11 +116,11 @@ class TestPythonCppConstantSync(unittest.TestCase):
         kinds = (KERNEL_KIND_HEAD, KERNEL_KIND_TAIL, KERNEL_KIND_SWEEP)
         self.assertEqual(len(set(kinds)), len(kinds))
 
-    def test_real_kv_hash_bit_bytes_within_slot_stride(self) -> None:
+    def test_real_kv_hash_portion_bytes_within_slot_stride(self) -> None:
         # 16 bytes = 2 int64 fields' worth; we pick a fixed cheap prefix
-        # rather than a stride-derived value so the bit budget is the
+        # rather than a stride-derived value so the portion budget is the
         # same regardless of the real-KV pool's element size.
-        self.assertEqual(REAL_KV_HASH_BIT_BYTES, 16)
+        self.assertEqual(REAL_KV_HASH_PORTION_BYTES, 16)
 
 
 if __name__ == "__main__":

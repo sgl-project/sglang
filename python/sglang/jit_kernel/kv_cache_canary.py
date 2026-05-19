@@ -29,13 +29,13 @@ _CANARY_FIELD_PREV_HASH: int = 2
 _CANARY_FIELD_REAL_KV_HASH: int = 3
 
 # Modes for ``--kv-cache-canary-real-data``. ``OFF`` disables the
-# real-KV mix entirely (the real_kv_hash field stays zero); ``BIT`` mixes
-# a 16-byte prefix of the real slot; ``ALL`` mixes the full real-slot
-# stride. Mirrored in C++ as ``kRealKvHashMode*`` constants.
+# real-KV mix entirely (the real_kv_hash field stays zero); ``PORTION``
+# mixes a 16-byte prefix of the real slot; ``ALL`` mixes the full
+# real-slot stride. Mirrored in C++ as ``kRealKvHashMode*`` constants.
 REAL_KV_HASH_MODE_OFF: int = 0
-REAL_KV_HASH_MODE_BIT: int = 1
+REAL_KV_HASH_MODE_PORTION: int = 1
 REAL_KV_HASH_MODE_ALL: int = 2
-REAL_KV_HASH_BIT_BYTES: int = 16
+REAL_KV_HASH_PORTION_BYTES: int = 16
 
 # Skip-sentinel value for expected_write_{token_ids,positions}. Mirrored
 # as ``kCanaryExpectedSkipSentinel`` in canary.cuh.
@@ -133,7 +133,7 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kFailReasonInputTokenMismatch",
     "kFailReasonInputPositionMismatch",
     "kRealKvHashModeOff",
-    "kRealKvHashModeBit",
+    "kRealKvHashModePortion",
     "kRealKvHashModeAll",
     "kCanaryExpectedSkipSentinel",
     "kSkipChainSentinel",
@@ -238,7 +238,7 @@ def canary_step(
                                      is accepted.
         real_kv_read_bytes:          Number of leading bytes per real-KV slot folded into the fingerprint. ``0``
                                      disables the mixin.
-        real_kv_hash_mode:           One of :data:`REAL_KV_HASH_MODE_OFF` / :data:`REAL_KV_HASH_MODE_BIT` /
+        real_kv_hash_mode:           One of :data:`REAL_KV_HASH_MODE_OFF` / :data:`REAL_KV_HASH_MODE_PORTION` /
                                      :data:`REAL_KV_HASH_MODE_ALL`. ``OFF`` makes the mixin a no-op regardless of
                                      ``real_kv_read_bytes``.
 

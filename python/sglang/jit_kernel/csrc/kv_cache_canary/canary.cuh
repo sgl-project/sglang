@@ -55,10 +55,10 @@ constexpr int kKernelKindSweep = 2;
 
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
-// fingerprint entirely; ``BIT`` mixes the first 16 bytes of the
+// fingerprint entirely; ``PORTION`` mixes the first 16 bytes of the
 // real-KV slot, ``ALL`` mixes the full real-KV slot stride.
 constexpr int kRealKvHashModeOff = 0;
-constexpr int kRealKvHashModeBit = 1;
+constexpr int kRealKvHashModePortion = 1;
 constexpr int kRealKvHashModeAll = 2;
 
 struct CanaryParams {
@@ -620,7 +620,7 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kFailReasonInputTokenMismatch;
   dst[i++] = kFailReasonInputPositionMismatch;
   dst[i++] = kRealKvHashModeOff;
-  dst[i++] = kRealKvHashModeBit;
+  dst[i++] = kRealKvHashModePortion;
   dst[i++] = kRealKvHashModeAll;
   dst[i++] = kCanaryExpectedSkipSentinel;
   dst[i++] = kSkipChainSentinel;

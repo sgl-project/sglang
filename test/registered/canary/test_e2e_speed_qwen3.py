@@ -62,7 +62,7 @@ _MODEL = "Qwen/Qwen3-0.6B"
 # that a regression that doubles the kernel cost still fails.
 _MAX_OVERHEAD_RATIO: float = 0.02
 # Tighter budget for the periodic full-pool sweep: amortised over N=100
-# forwards it should add <0.5% on top of the bit-real-data baseline.
+# forwards it should add <0.5% on top of the portion-real-data baseline.
 _MAX_SWEEP_OVERHEAD_RATIO: float = 0.005
 
 
@@ -181,22 +181,22 @@ class TestKvCacheCanarySpeedQwen3(CustomTestCase):
 def _check_sweep_overhead(scenario: _Scenario, testcase: unittest.TestCase) -> None:
     sweep_off = _bench_with_canary_flags(
         scenario=scenario,
-        run_label="canary_log_realbit",
+        run_label="canary_log_realportion",
         canary_flags=[
             "--kv-cache-canary",
             "log",
             "--kv-cache-canary-real-data",
-            "bit",
+            "portion",
         ],
     )
     sweep_on = _bench_with_canary_flags(
         scenario=scenario,
-        run_label="canary_log_realbit_sweep100",
+        run_label="canary_log_realportion_sweep100",
         canary_flags=[
             "--kv-cache-canary",
             "log",
             "--kv-cache-canary-real-data",
-            "bit",
+            "portion",
             "--kv-cache-canary-real-data-sweep-every-n-steps",
             "100",
         ],
@@ -205,10 +205,10 @@ def _check_sweep_overhead(scenario: _Scenario, testcase: unittest.TestCase) -> N
     overhead = (sweep_on.latency - sweep_off.latency) / sweep_off.latency
     print(
         f"\n=== {scenario.label} (sweep) ===\n"
-        f"  sweep=off (bit):       latency={sweep_off.latency:.3f}s  "
+        f"  sweep=off (portion):       latency={sweep_off.latency:.3f}s  "
         f"input_tput={sweep_off.input_throughput:.0f}  "
         f"output_tput={sweep_off.output_throughput:.0f}\n"
-        f"  sweep=on (bit + N=100): latency={sweep_on.latency:.3f}s  "
+        f"  sweep=on (portion + N=100): latency={sweep_on.latency:.3f}s  "
         f"input_tput={sweep_on.input_throughput:.0f}  "
         f"output_tput={sweep_on.output_throughput:.0f}\n"
         f"  overhead:              {overhead:.1%}  "
@@ -228,7 +228,7 @@ def _check_sweep_overhead(scenario: _Scenario, testcase: unittest.TestCase) -> N
     reason="sweep overhead tuning still in progress",
 )
 class TestKvCacheCanarySweepSpeedQwen3(CustomTestCase):
-    """Compare canary=log+real-data=bit vs +sweep-every-100 on Qwen3-0.6B."""
+    """Compare canary=log+real-data=portion vs +sweep-every-100 on Qwen3-0.6B."""
 
     def test_prefill_bs32_isl16384_osl1(self) -> None:
         _check_sweep_overhead(_SCENARIOS[0], self)
