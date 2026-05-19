@@ -114,9 +114,9 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
+- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the "run-ci-extra" label, opting the PR into the extra test workflow (`pr-test-extra.yml`).
 - `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
-- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
+- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
 - `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly, bypassing stage boundaries. Each `<test-spec>` is pytest-style `<file>::<TestClass>[.<test_method>]` (the `::TestClass` and `.<test_method>` parts are optional). The handler resolves each spec, groups specs by their registered runner-label, and dispatches one [Rerun Test workflow](https://github.com/sgl-project/sglang/actions/workflows/rerun-test.yml) per group. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py` (multiple at once).
 

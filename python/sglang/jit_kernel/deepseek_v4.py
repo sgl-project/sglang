@@ -146,18 +146,6 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
-    args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
-    kernel_class = f"RMSNormKernel<{args}>"
-    return load_jit(
-        make_name("rmsnorm_head"),
-        *args,
-        cuda_files=["deepseek_v4/rmsnorm.cuh"],
-        cuda_wrappers=[("run_self", f"{kernel_class}::run_self")],
-    )
-
-
-@cache_once
 def _jit_fused_rope_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
@@ -1005,16 +993,6 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(
-    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    if out is None:
-        out = q.new_empty(q.shape)
-    module.run_self(q, out, eps)
-    return out
-
-
 @cache_once
 def _jit_torch_cublas_bf16_fp32() -> Any:
     import torch.utils.cpp_extension
@@ -1096,7 +1074,6 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
-
     else:
         return torch.nn.functional.linear(x.float(), y.float())
 

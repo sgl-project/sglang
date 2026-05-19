@@ -860,8 +860,6 @@ def biased_topk_impl(
             topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -904,7 +902,6 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
     else:
-
         from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
 
         topk_weights, topk_ids = moe_fused_gate(
@@ -917,11 +914,7 @@ def biased_topk_jit_kernel_impl(
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
-        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
-            torch.int32
-        )
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
         return topk_weights, topk_ids
 
 
@@ -1439,7 +1432,6 @@ def select_experts(
         )
     elif custom_routing_function is None:
         if scoring_func != "sqrtsoftplus":
-            print(f"kkkkk {scoring_func=}", flush=True)
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
         if scoring_func == "sqrtsoftplus":
@@ -1496,6 +1488,18 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
+        # Benchmark-only: override gating with uniform round-robin expert assignment
+        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
+        num_tokens, k = topk_ids.shape
+        num_experts = router_logits.shape[1]
+        offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
+        steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
+        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
+            topk_ids.dtype
+        )
+        topk_weights = torch.ones_like(topk_weights) / k
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
