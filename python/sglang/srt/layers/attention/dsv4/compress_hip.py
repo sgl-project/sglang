@@ -97,7 +97,7 @@ class CompressorHip(_CompressorBase):
 
     @cached_property
     def use_fused_compress(self) -> bool:
-        return False
+        return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
 
     @cached_property
     def use_hip_fused_compress(self) -> bool:
@@ -449,7 +449,13 @@ class CompressorHip(_CompressorBase):
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.use_fused_compress:
+        if self.use_fused_compress and (
+            envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_extend_without_speculative()
+            )
+        ):
             return self.compress_fused(kv_score, forward_batch)
 
         self.compress_decode = self.compress_decode_paged
