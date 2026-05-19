@@ -1,14 +1,18 @@
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +36,17 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 0.1  # seconds per 1024 tokens
+    max: float = 30.0  # seconds, upper bound for the linear timeout
 
 
 class PoolName(str, Enum):
@@ -43,6 +56,14 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
+    # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
+    DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
+    DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
     def __str__(self) -> str:
         return self.value
@@ -74,6 +95,16 @@ class PoolTransfer:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
+    indices_from_pool: Optional[PoolName] = None
+
+
+@dataclass(frozen=True)
+class SidecarPoolSpec:
+    """Pool whose transfer indices are reused from one real source pool."""
+
+    pool_name: PoolName
+    indices_from_pool: PoolName
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
 @dataclass

@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -83,14 +83,29 @@ class WeightChecker:
     def _compare(self):
         assert self._snapshot_tensors is not None
 
+        skip_compare_names = {
+            name
+            for name, param in self._model_state()
+            if getattr(param, "_skip_weight_check", False)
+        }
         _check_tensors(
-            expect_tensors=_postprocess_tensors(self._snapshot_tensors),
-            actual_tensors=_postprocess_tensors(dict(self._model_state())),
+            expect_tensors=_postprocess_tensors(
+                self._snapshot_tensors, skip_compare_names
+            ),
+            actual_tensors=_postprocess_tensors(
+                dict(self._model_state()), skip_compare_names
+            ),
         )
 
     def _compute_checksum(self) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
+
+        skip_compare_names = {
+            name
+            for name, param in self._model_state()
+            if getattr(param, "_skip_weight_check", False)
+        }
 
         # Reuse the snapshot/compare postprocess pipeline so fp8 weights are
         # dequantized to bf16 before hashing — two (qweight, scale) pairs that
@@ -98,7 +113,7 @@ class WeightChecker:
         checksums = {
             name: _hash_tensor(tensor.data)
             for name, should_compare, tensor in _postprocess_tensors(
-                dict(self._model_state())
+                dict(self._model_state()), skip_compare_names
             )
             if should_compare
         }
@@ -202,16 +217,17 @@ def _random_like(t: torch.Tensor):
 
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
+    skip_compare_names: Set[str],
 ) -> Iterable[Tuple[str, bool, torch.Tensor]]:
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    skip_compare_names = []
+    skip_compare_names = set(skip_compare_names)
 
     # Skip non-persistent buffers (registered with persistent=False; recomputed
     # after weight load and not part of the synced payload).
     for name in raw:
         if _is_non_persistent_buffer_name(name):
-            skip_compare_names.append(name)
+            skip_compare_names.add(name)
             logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
 
     # dequant fp8
@@ -221,10 +237,11 @@ def _postprocess_tensors(
         # Match: `something.weight`, `something.experts.w2_weight`
         if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
     ]
-    skip_compare_names += quant_names
-    skip_compare_names += [
+    quant_scale_names = [
         name.replace("weight", "weight_scale_inv") for name in quant_names
     ]
+    skip_compare_names.update(quant_names)
+    skip_compare_names.update(quant_scale_names)
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
@@ -232,10 +249,13 @@ def _postprocess_tensors(
         try:
             if w_s.dtype == torch.int32:
                 # UE8M0 packed format (Blackwell DeepGEMM)
-                w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+                w_s_for_dequant = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            else:
+                w_s_for_dequant = w_s
+
             w_dequant = block_quant_dequant(
                 w_q,
-                w_s,
+                w_s_for_dequant,
                 # TODO do not hardcode
                 block_size=[128, 128],
                 dtype=torch.bfloat16,

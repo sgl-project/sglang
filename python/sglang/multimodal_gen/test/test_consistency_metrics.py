@@ -169,3 +169,6 @@ def test_save_consistency_failure_artifact(tmp_path, monkeypatch):
     assert artifact_path.suffix == ".png"
     assert (tmp_path / "consistency_failures" / "summary.json").exists()
     assert (tmp_path / "consistency_failures" / "index.html").exists()
+    assert (
+        tmp_path / "consistency_failures" / "generated" / "unit_image_fail_1gpu.png"
+    ).exists()
