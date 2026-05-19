@@ -1,70 +1,83 @@
-"""Sampler-override hookpoint self-unit tests."""
+"""install_oracle_sampler registration into sglang's sampler-backend registry."""
 
 from __future__ import annotations
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-    from sglang.srt.mock_mode.sampler_override import sampler_override_is_active
-except ImportError:
-    MockEngine = None
-    sampler_override_is_active = None
-
+from sglang.srt.kv_cache_canary.mock_model import sampler as oracle_sampler_module
+from sglang.srt.kv_cache_canary.mock_model.oracle import HashOracle, ScriptedOracle
+from sglang.srt.kv_cache_canary.mock_model.sampler import (
+    _OracleSampler,
+    install_oracle_sampler,
+)
+from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES, Sampler
+from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
-pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
-)
+
+def test_install_oracle_sampler_registers_oracle_backend() -> None:
+    oracle = HashOracle(seed=1, vocab_size=100)
+
+    install_oracle_sampler(oracle=oracle)
+
+    assert "oracle" in _CUSTOM_SAMPLER_FACTORIES
+    assert "oracle" in SAMPLING_BACKEND_CHOICES
 
 
-def test_sampler_override_forces_oracle_token() -> None:
-    engine = MockEngine.launch(model="Qwen/Qwen3-0.6B", num_hidden_layers=1)
-    reqs = [engine.admit(prompt=[i, i + 1, i + 2], max_new_tokens=1) for i in range(32)]
-    engine.step_until_idle(max_steps=8)
+def test_install_oracle_sampler_factory_produces_oracle_sampler() -> None:
+    oracle = HashOracle(seed=2, vocab_size=100)
+    install_oracle_sampler(oracle=oracle)
 
-    for req in reqs:
-        observed = engine.output_history(req)
-        expected = [
-            engine.oracle.predict_output_token(req=req, step=s)
-            for s in range(len(observed))
-        ]
-        assert observed == expected
-    engine.shutdown()
+    factory = _CUSTOM_SAMPLER_FACTORIES["oracle"]
+    instance = factory()
+
+    assert isinstance(instance, _OracleSampler)
+    assert isinstance(instance, Sampler)
 
 
-def test_sampler_path_still_executes() -> None:
-    engine = MockEngine.launch(
-        model="Qwen/Qwen3-0.6B",
-        num_hidden_layers=1,
-    )
-    engine.admit(prompt=[1, 2, 3, 4], max_new_tokens=2, top_p=0.8, temperature=0.7)
+def test_install_oracle_sampler_twice_replaces_oracle() -> None:
+    oracle_a = HashOracle(seed=10, vocab_size=100)
+    oracle_b = ScriptedOracle(table={(0, 0): 77})
 
-    engine.step()
-    sampler_stats = engine.sampler_stats()
+    install_oracle_sampler(oracle=oracle_a)
+    assert oracle_sampler_module._REGISTERED_ORACLE is oracle_a
 
-    assert sampler_stats.top_p_invocations > 0
-    assert sampler_stats.temperature_invocations > 0
-    engine.shutdown()
+    install_oracle_sampler(oracle=oracle_b)
+    assert oracle_sampler_module._REGISTERED_ORACLE is oracle_b
 
 
-def test_top_p_intermediate_results_not_asserted() -> None:
-    engine = MockEngine.launch(model="Qwen/Qwen3-0.6B", num_hidden_layers=1)
-    engine.admit(prompt=[1, 2, 3, 4], max_new_tokens=2, top_p=0.5)
-    engine.step()
+def test_install_oracle_sampler_is_idempotent_for_backend_registration() -> None:
+    install_oracle_sampler(oracle=HashOracle(seed=3, vocab_size=100))
+    first_factory = _CUSTOM_SAMPLER_FACTORIES["oracle"]
 
-    engine.assert_no_canary_violations()
+    install_oracle_sampler(oracle=HashOracle(seed=4, vocab_size=100))
+    second_factory = _CUSTOM_SAMPLER_FACTORIES["oracle"]
 
-    engine.shutdown()
+    assert first_factory is second_factory
 
 
-def test_eos_token_propagates_to_req() -> None:
-    engine = MockEngine.launch(model="Qwen/Qwen3-0.6B", num_hidden_layers=1)
-    req = engine.admit(prompt=[1, 2, 3], max_new_tokens=8, eos_at=2)
+def test_oracle_sampler_forward_raises_without_stashed_req_pool_indices() -> None:
+    install_oracle_sampler(oracle=HashOracle(seed=5, vocab_size=100))
+    oracle_sampler_module._LAST_REQ_POOL_INDICES = None
+    sampler = _CUSTOM_SAMPLER_FACTORIES["oracle"]()
 
-    engine.step_until_idle(max_steps=10)
+    with pytest.raises(RuntimeError, match="req_pool_indices not stashed"):
+        sampler.forward(
+            logits_output=_DummyLogitsOutput(),
+            sampling_info=None,
+            return_logprob=False,
+            top_logprobs_nums=[],
+            token_ids_logprobs=[],
+            positions=None,
+        )
 
-    assert engine.is_finished(req)
-    engine.shutdown()
+
+class _DummyLogitsOutput:
+    """Stand-in for LogitsProcessorOutput; only next_token_logits is accessed in the error path."""
+
+    def __init__(self) -> None:
+        import torch
+
+        self.next_token_logits = torch.zeros((1, 2), dtype=torch.float32)

@@ -1,135 +1,182 @@
-"""Canary kernel and mock-oracle wiring self-unit tests."""
+"""fill_expected_inputs writes oracle-derived (token, position) into canary placeholders, and
+apply_mock_model_defaults pre-fills the dependent ServerArgs flags when mock_model is opted in.
+"""
 
 from __future__ import annotations
 
-import os
+import dataclasses
 
 import pytest
+import torch
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-    from sglang.srt.mock_mode.canary_wiring import (
-        FAIL_REASON_BIT_INPUT_POSITION_MISMATCH,
-        FAIL_REASON_BIT_INPUT_TOKEN_MISMATCH,
-    )
-except ImportError:
-    MockEngine = None
-    FAIL_REASON_BIT_INPUT_TOKEN_MISMATCH = None
-    FAIL_REASON_BIT_INPUT_POSITION_MISMATCH = None
-
+from sglang.srt.kv_cache_canary.mock_model import sampler as oracle_sampler_module
+from sglang.srt.kv_cache_canary.mock_model.args_modifier import (
+    apply_mock_model_defaults,
+)
+from sglang.srt.kv_cache_canary.mock_model.oracle import ScriptedOracle
+from sglang.srt.kv_cache_canary.mock_model.sampler import (
+    fill_expected_inputs,
+    install_oracle_sampler,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
-pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
-)
+
+@dataclasses.dataclass
+class _StubForwardMode:
+    extend: bool
+
+    def is_extend(self) -> bool:
+        return self.extend
 
 
-def _launch(**kwargs) -> "MockEngine":
-    return MockEngine.launch(model="Qwen/Qwen3-0.6B", num_hidden_layers=1, **kwargs)
+@dataclasses.dataclass
+class _StubForwardBatch:
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    req_pool_indices: torch.Tensor
+    forward_mode: _StubForwardMode
+    extend_seq_lens: object
 
 
-def test_mock_expected_tokens_filled_from_oracle() -> None:
-    engine = _launch()
-    engine.admit(prompt=[1, 2, 3, 4], max_new_tokens=1)
-    engine.step()
+def test_fill_expected_inputs_decode_one_token_per_req() -> None:
+    table = {(5, 10): 111, (7, 20): 333}
+    install_oracle_sampler(oracle=ScriptedOracle(table=table))
 
-    plan = engine.last_write_plan()
-    expected_tokens = engine.last_mock_expected_tokens()
-
-    assert expected_tokens.shape[0] == plan.num_write_entries
-    assert expected_tokens.tolist() == [1, 2, 3, 4]
-    engine.shutdown()
-
-
-def test_mock_expected_positions_filled_from_oracle() -> None:
-    engine = _launch()
-    engine.admit(prompt=[10, 20, 30], max_new_tokens=1)
-    engine.step()
-
-    plan = engine.last_write_plan()
-    expected_positions = engine.last_mock_expected_positions()
-
-    assert expected_positions.shape[0] == plan.num_write_entries
-    assert expected_positions.tolist() == [0, 1, 2]
-    engine.shutdown()
-
-
-def test_mock_mode_on_enables_write_step_comparison() -> None:
-    engine = _launch(canary_mock_mode_on=True)
-    req = engine.admit(prompt=[1, 2, 3], max_new_tokens=1)
-    engine.pin_expectation(req=req, step=0, expected_input_token=999999)
-
-    engine.step()
-    violations = engine.canary_violations()
-
-    assert any(
-        v.fail_reason_bits & FAIL_REASON_BIT_INPUT_TOKEN_MISMATCH for v in violations
+    fb = _StubForwardBatch(
+        input_ids=torch.tensor([0, 0], dtype=torch.int64),
+        positions=torch.tensor([10, 20], dtype=torch.int64),
+        req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
+        forward_mode=_StubForwardMode(extend=False),
+        extend_seq_lens=None,
     )
-    engine.shutdown()
+    tokens_out = torch.zeros(8, dtype=torch.int32)
+    positions_out = torch.zeros(8, dtype=torch.int32)
+
+    fill_expected_inputs(
+        forward_batch=fb,
+        expected_input_tokens_out=tokens_out,
+        expected_input_positions_out=positions_out,
+    )
+
+    assert tokens_out[:2].tolist() == [111, 333]
+    assert positions_out[:2].tolist() == [10, 20]
 
 
-def test_mock_mode_off_dummy_tensors_safe() -> None:
-    engine = _launch(canary_mock_mode_on=False)
-    engine.admit(prompt=[1, 2, 3], max_new_tokens=1)
+def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
+    table = {(5, 0): 11, (5, 1): 22, (5, 2): 33, (7, 0): 99}
+    install_oracle_sampler(oracle=ScriptedOracle(table=table))
 
-    engine.step()
-    engine.assert_no_canary_violations()
+    fb = _StubForwardBatch(
+        input_ids=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
+        positions=torch.tensor([0, 1, 2, 0], dtype=torch.int64),
+        req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
+        forward_mode=_StubForwardMode(extend=True),
+        extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
+    )
+    tokens_out = torch.zeros(8, dtype=torch.int32)
+    positions_out = torch.zeros(8, dtype=torch.int32)
 
-    engine.shutdown()
+    fill_expected_inputs(
+        forward_batch=fb,
+        expected_input_tokens_out=tokens_out,
+        expected_input_positions_out=positions_out,
+    )
+
+    assert tokens_out[:4].tolist() == [11, 22, 33, 99]
+    assert positions_out[:4].tolist() == [0, 1, 2, 0]
 
 
-def test_mock_input_perturb_env_detects_violation() -> None:
-    os.environ["SGLANG_MOCK_INPUT_PERTURB_PROB"] = "0.01"
-    try:
-        engine = _launch(canary_mock_mode_on=True)
-        engine.admit(prompt=list(range(1, 65)), max_new_tokens=4)
+def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None:
+    install_oracle_sampler(oracle=ScriptedOracle(table={}))
 
-        deadline_step = 0
-        while not engine.canary_violations() and deadline_step < 240:
-            engine.step()
-            deadline_step += 1
-        violations = engine.canary_violations()
+    fb = _StubForwardBatch(
+        input_ids=torch.empty(0, dtype=torch.int64),
+        positions=torch.empty(0, dtype=torch.int64),
+        req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
+        forward_mode=_StubForwardMode(extend=False),
+        extend_seq_lens=None,
+    )
+    tokens_out = torch.zeros(4, dtype=torch.int32)
+    positions_out = torch.zeros(4, dtype=torch.int32)
 
-        assert any(
-            v.fail_reason_bits
-            & (
-                FAIL_REASON_BIT_INPUT_TOKEN_MISMATCH
-                | FAIL_REASON_BIT_INPUT_POSITION_MISMATCH
-            )
-            for v in violations
+    fill_expected_inputs(
+        forward_batch=fb,
+        expected_input_tokens_out=tokens_out,
+        expected_input_positions_out=positions_out,
+    )
+
+    assert oracle_sampler_module._LAST_REQ_POOL_INDICES == [5, 7]
+
+
+def test_fill_expected_inputs_raises_without_install_oracle_sampler() -> None:
+    oracle_sampler_module._REGISTERED_ORACLE = None
+
+    fb = _StubForwardBatch(
+        input_ids=torch.tensor([0], dtype=torch.int64),
+        positions=torch.tensor([0], dtype=torch.int64),
+        req_pool_indices=torch.tensor([1], dtype=torch.int64),
+        forward_mode=_StubForwardMode(extend=False),
+        extend_seq_lens=None,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="fill_expected_inputs called before install_oracle_sampler"
+    ):
+        fill_expected_inputs(
+            forward_batch=fb,
+            expected_input_tokens_out=torch.zeros(4, dtype=torch.int32),
+            expected_input_positions_out=torch.zeros(4, dtype=torch.int32),
         )
-        engine.shutdown()
-    finally:
-        os.environ.pop("SGLANG_MOCK_INPUT_PERTURB_PROB", None)
 
 
-def test_violation_row_carries_req_id_and_position() -> None:
-    engine = _launch(canary_mock_mode_on=True)
-    req = engine.admit(prompt=[1, 2, 3], max_new_tokens=1)
-    bogus = 999999
-    engine.pin_expectation(req=req, step=0, expected_input_token=bogus, position=1)
+def test_apply_mock_model_defaults_no_op_when_disabled() -> None:
+    from sglang.srt.server_args import ServerArgs
 
-    engine.step()
-    violations = engine.canary_violations()
+    original = ServerArgs(model_path="dummy", mock_model_enabled=False)
+    result = apply_mock_model_defaults(original)
 
-    assert any(
-        v.req_id == req.req_id and v.position == 1 and v.expected == bogus
-        for v in violations
+    assert result is original
+    assert result.load_format == "auto"
+
+
+def test_apply_mock_model_defaults_fills_holes_when_enabled() -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    original = ServerArgs(model_path="dummy", mock_model_enabled=True)
+    result = apply_mock_model_defaults(original)
+
+    assert result.load_format == "dummy"
+    assert result.num_hidden_layers_override == 1
+    assert result.sampling_backend == "oracle"
+    assert result.kv_cache_canary == "raise"
+    assert result.kv_cache_canary_input_check_mode == "ON"
+
+
+def test_apply_mock_model_defaults_preserves_user_overrides() -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    original = ServerArgs(
+        model_path="dummy",
+        mock_model_enabled=True,
+        num_hidden_layers_override=4,
+        kv_cache_canary="on",
     )
-    engine.shutdown()
+    result = apply_mock_model_defaults(original)
+
+    assert result.num_hidden_layers_override == 4
+    assert result.kv_cache_canary == "on"
+    assert result.load_format == "dummy"
 
 
-def test_violation_does_not_cascade_to_next_verify() -> None:
-    engine = _launch(canary_mock_mode_on=True)
-    req = engine.admit(prompt=[1, 2, 3], max_new_tokens=2)
-    engine.pin_expectation(req=req, step=0, expected_input_token=999999)
+def test_apply_mock_model_defaults_is_idempotent() -> None:
+    from sglang.srt.server_args import ServerArgs
 
-    engine.step()
-    first_count = len(engine.canary_violations())
-    engine.step()
-    second_count = len(engine.canary_violations())
+    original = ServerArgs(model_path="dummy", mock_model_enabled=True)
+    first = apply_mock_model_defaults(original)
+    second = apply_mock_model_defaults(first)
 
-    assert second_count == first_count
-    engine.shutdown()
+    assert first.load_format == second.load_format
+    assert first.sampling_backend == second.sampling_backend
+    assert first.kv_cache_canary == second.kv_cache_canary
