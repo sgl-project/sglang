@@ -215,8 +215,10 @@ class Session:
             else:
                 input_ids_unpadded += req_input_ids_arr
         else:
-            input_ids = req.input_ids
-            input_ids_unpadded = req.input_ids
+            # Req fields are array.array('q') (no setter coercion); wrap
+            # the List[int] coming from io_struct.req.input_ids here.
+            input_ids = array("q", req.input_ids)
+            input_ids_unpadded = input_ids
 
         new_req = Req(
             rid=req.rid,
