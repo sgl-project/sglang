@@ -2095,7 +2095,7 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
-            if model_arch == "MiMoV2ForCausalLM":
+            if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
                 )
@@ -2195,12 +2195,29 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif model_arch == "Gemma4ForConditionalGeneration":
-            if is_sm100_supported():
-                self.attention_backend = "trtllm_mha"
+            default_attention_backend = (
+                "trtllm_mha" if is_sm100_supported() else "triton"
+            )
+            if self.is_attention_backend_not_set():
+                self.attention_backend = default_attention_backend
+                logger.info(
+                    f"Use {self.attention_backend} as default attention backend for Gemma4"
+                )
             else:
-                self.attention_backend = "triton"
-            logger.info(
-                f"Use {self.attention_backend} as default attention backend for Gemma4"
+                # If only one split backend is set, keep the other side on a
+                # Gemma4-compatible fallback instead of letting generic backend
+                # selection choose an unsupported backend later.
+                if self.attention_backend is None:
+                    self.attention_backend = default_attention_backend
+
+            prefill_backend, decode_backend = self.get_attention_backends()
+            accepted_backends = ("trtllm_mha", "triton")
+            assert (
+                prefill_backend in accepted_backends
+                and decode_backend in accepted_backends
+            ), (
+                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                f"got prefill={prefill_backend}, decode={decode_backend}"
             )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
@@ -3721,7 +3738,7 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-        # Validate model type: only support Qwen models for now
+        # Validate model type for encoder disaggregation
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if (self.encoder_only or self.language_only) and model_arch not in [
@@ -3737,9 +3754,11 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "MiMoV2ForCausalLM",
         ]:
             raise ValueError(
-                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+                f"Model type {model_arch} is not supported for encoder disaggregation. "
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:

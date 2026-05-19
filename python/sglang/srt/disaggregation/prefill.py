@@ -254,7 +254,7 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.stream_output([req], req.return_logprob)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 
@@ -311,10 +311,10 @@ class PrefillBootstrapQueue:
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                self.scheduler.stream_output([req], req.return_logprob)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
+                if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 if self.scheduler.enable_hicache_storage:
                     # to release prefetch events associated with the request
@@ -383,7 +383,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
@@ -483,7 +483,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -523,7 +523,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -635,7 +635,7 @@ class SchedulerDisaggregationPrefillMixin:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
+                    self.batch_result_processor.logprob_result_processor.add_logprob_return_values(
                         i,
                         req,
                         logprob_pt,
@@ -678,7 +678,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if extend_logprob_start_len < extend_input_len:
                         # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
+                        self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
                             i,
                             req,
                             logits_output,
@@ -693,7 +693,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -765,7 +765,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
-                if self.enable_metrics:
+                if self.metrics_reporter.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 logger.warning_once(
@@ -791,12 +791,12 @@ class SchedulerDisaggregationPrefillMixin:
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
-                    self.kv_transfer_latency_ms = metrics["latency_ms"]
+                    self.metrics_reporter.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
-                    self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                    self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
-        self.stream_output(
+        self.output_streamer.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,

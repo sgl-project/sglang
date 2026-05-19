@@ -146,6 +146,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
         self.activation = config.hidden_act
+        self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # Conv1d layer
@@ -240,6 +241,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
             dtype=config.torch_dtype,
+            **(
+                {"activation": self.output_gate_type}
+                if self.output_gate_type is not None
+                else {}
+            ),
         )
 
         self.out_proj = RowParallelLinear(
