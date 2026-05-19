@@ -30,6 +30,7 @@ from sglang.srt.kv_cache_canary.plan_input import (
     build_plan_input_per_forward,
     build_plan_input_radix_sweep,
     build_plan_input_running_sweep,
+    walk_radix_cache_for_canary,
 )
 from sglang.srt.kv_cache_canary.pool_patch import attach_canary_buffers
 from sglang.srt.kv_cache_canary.violation_state import CanaryDeviceState
@@ -514,6 +515,43 @@ class CanaryRunner:
     def _collect_real_kv_perturb_candidates(
         self, forward_batch: "ForwardBatch"
     ) -> list[int]:
+        out_cache_loc = forward_batch.out_cache_loc
+        excluded: set[int] = set()
+        if out_cache_loc is not None:
+            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
+
+        orphan_slots = self._collect_radix_orphan_slots(excluded=excluded)
+        if orphan_slots:
+            return orphan_slots
+        return self._collect_running_req_slots(
+            forward_batch=forward_batch, excluded=excluded
+        )
+
+    def _collect_radix_orphan_slots(self, *, excluded: set[int]) -> list[int]:
+        if self._radix_cache is None:
+            return []
+        slot_tensor, _, _ = walk_radix_cache_for_canary(
+            radix_cache=self._radix_cache,
+            alive_running_req_pool_indices=set(),
+        )
+        if slot_tensor.numel() == 0:
+            return []
+        candidates: list[int] = []
+        for raw_slot in slot_tensor.tolist():
+            slot = int(raw_slot)
+            if slot < 0:
+                continue
+            if slot in excluded:
+                continue
+            candidates.append(slot)
+        return candidates
+
+    def _collect_running_req_slots(
+        self,
+        *,
+        forward_batch: "ForwardBatch",
+        excluded: set[int],
+    ) -> list[int]:
         snapshot = self._alive_reqs_snapshot
         if snapshot is not None:
             req_pool_indices = snapshot.req_pool_indices
@@ -527,11 +565,6 @@ class CanaryRunner:
         table = self._req_to_token_pool.req_to_token
         if not isinstance(table, torch.Tensor) or table.numel() == 0:
             return []
-
-        out_cache_loc = forward_batch.out_cache_loc
-        excluded: set[int] = set()
-        if out_cache_loc is not None:
-            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
 
         req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
         seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
