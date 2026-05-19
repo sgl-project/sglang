@@ -152,7 +152,8 @@ class CanaryRunner:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
-    def forward_step(self, forward_batch: "ForwardBatch") -> None:
+    def forward_step_before_model(self, forward_batch: "ForwardBatch") -> None:
+        """SOT §6.2 step 1: perturb hook + plan + head launches. Stashes plan for the tail launches."""
         if self.config.mode == "off":
             return
         if self._req_to_token_pool is None:
@@ -163,10 +164,11 @@ class CanaryRunner:
 
         for pool_idx, groups in enumerate(self._groups_per_pool):
             for group in groups:
-                window = self._swa_window_size if group.kind is PoolKind.SWA else 0
                 plan_input = build_plan_input_per_forward(
                     forward_batch=forward_batch,
-                    swa_window_size=window,
+                    swa_window_size=(
+                        self._swa_window_size if group.kind is PoolKind.SWA else 0
+                    ),
                     full_to_swa_index_mapping=group.swa_index_lut,
                 )
                 self._invoke_plan(
@@ -183,23 +185,46 @@ class CanaryRunner:
                     forward_batch=forward_batch,
                 )
 
+    def forward_step_after_model(self) -> None:
+        """SOT §6.2 step 3: tail launches reusing the plan stashed by forward_step_before_model."""
+        if self.config.mode == "off":
+            return
+        forward_batch = self._last_forward_batch
+        if forward_batch is None:
+            return
+
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                self._launch_endpoints(
+                    pool_idx=pool_idx,
+                    group=group,
+                    tag_filter=_is_tail_tag,
+                    verify_plan=self._verify_plan_per_forward,
+                    forward_batch=forward_batch,
+                )
+
+    def forward_step(
+        self,
+        forward_batch: "ForwardBatch",
+        run_model: Callable[[], object],
+    ) -> object:
+        """Convenience wrapper: head launches -> run_model() -> tail launches -> end_of_step.
+
+        SOT §6.2 sequence. Callers that need finer control (e.g. cuda-graph replay) should call
+        forward_step_before_model / forward_step_after_model / end_of_step explicitly.
+        """
+        self.forward_step_before_model(forward_batch)
+        output = run_model()
+        self.forward_step_after_model()
+        self.end_of_step()
+        return output
+
     def end_of_step(self) -> None:
+        """SOT §6.4: sweep + async D2H pump + step bump + drain previous pump + allreduce + raise."""
         if self.config.mode == "off":
             return
 
-        forward_batch = self._last_forward_batch
-        if forward_batch is not None:
-            for pool_idx, groups in enumerate(self._groups_per_pool):
-                for group in groups:
-                    self._launch_endpoints(
-                        pool_idx=pool_idx,
-                        group=group,
-                        tag_filter=_is_tail_tag,
-                        verify_plan=self._verify_plan_per_forward,
-                        forward_batch=forward_batch,
-                    )
-
-        self.maybe_run_sweep(forward_batch=forward_batch)
+        self.maybe_run_sweep()
 
         if self._pump_stream is not None and self._pump_event is not None:
             violation_log = self._device_state.violation_log
@@ -250,9 +275,7 @@ class CanaryRunner:
         if any_rank_errored and not self._raised:
             self._raise_violation()
 
-    def maybe_run_sweep(
-        self, *, forward_batch: Optional["ForwardBatch"] = None
-    ) -> None:
+    def maybe_run_sweep(self) -> None:
         if self.config.sweep_every_n_steps == 0:
             return
         if (
@@ -264,6 +287,7 @@ class CanaryRunner:
         self._last_sweep_step = self._step_counter
 
         running_snapshot: Optional[AliveReqSnapshot] = None
+        forward_batch = self._last_forward_batch
         if (
             forward_batch is not None
             and forward_batch.req_pool_indices is not None
