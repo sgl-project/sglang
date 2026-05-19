@@ -3,11 +3,11 @@ import itertools
 import logging
 import pickle
 import random
-from array import array
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
