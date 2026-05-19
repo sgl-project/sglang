@@ -117,7 +117,12 @@ class CpuPageTracker:
         """Accumulate freed slot indices to forward to the GPU worker."""
         if indices.numel() == 0:
             return
-        cpu_indices = indices.cpu()
+        # IMPORTANT: clone to detach from any parent storage. ``indices`` is
+        # typically a slice/view of ``req_to_token_pool.req_to_token`` (shape
+        # [4096, 32772] int32 ≈ 512 MB). Pickling a view ships the *whole*
+        # backing storage, which adds ~500 MB per prefill batch to the IPC
+        # payload. The clone allocates a tiny fresh tensor.
+        cpu_indices = indices.detach().to("cpu", copy=True).contiguous().clone()
         self._pending_free.append(cpu_indices)
         # Approximate count update (page-aligned unique pages)
         freed_pages = int(torch.unique(cpu_indices // self.page_size).numel())
@@ -325,15 +330,41 @@ class CpuScheduler(Scheduler):
 
         @DynamicGradMode()
         def _loop():
+            import logging
+            _log = logging.getLogger("sglang.srt.managers.scheduler_cpu")
+            # Per-substep aggregator. Splits decode vs extend so the prefill
+            # phase ttft cost is identifiable separately from steady-state.
+            _t_recv = 0.0
+            _t_wait = 0.0
+            _t_upd = 0.0
+            _t_next = 0.0
+            _t_send = 0.0
+            _t_proc = 0.0
+            _t_count = 0
+            _t_decode = 0
+            _t_window = 100
+            # Split send into build (get_model_worker_batch) + fanout (pickle+ZMQ).
+            _t_build = 0.0
+            _t_fanout = 0.0
+            # Track prefill-only timings separately so the per-prefill cost
+            # isn't averaged away by the much larger pool of decode iters.
+            _t_p_send = 0.0
+            _t_p_build = 0.0
+            _t_p_fanout = 0.0
+            _t_p_wait = 0.0
+            _t_p_total = 0.0
+            _t_p_count = 0
             # pending: (batch, handle) for the in-flight forward, or None.
             pending = None
             while True:
+                _ts0 = time.perf_counter()
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
                 if self._engine_paused:
                     if pending is None:
                         continue
                     # If paused, drain the in-flight request first.
+                _ts1 = time.perf_counter()
 
                 # 1. Recv the in-flight result, update batch state so
                 #    get_next_batch_to_run sees the right output.
@@ -342,6 +373,8 @@ class CpuScheduler(Scheduler):
                 if pending is not None:
                     prev_batch, handle = pending
                     prev_result = self.model_worker.forward_batch_generation_wait(handle)
+                _ts2 = time.perf_counter()
+                if prev_batch is not None:
                     # Mirror the in-line work from Scheduler.run_batch:
                     #   - update_cache_from_scheduler (CPU-side req_to_token write)
                     #   - batch.output_ids = result.next_token_ids
@@ -358,10 +391,12 @@ class CpuScheduler(Scheduler):
                     else:
                         prev_result.extend_input_len_per_req = None
                         prev_result.extend_logprob_start_len_per_req = None
+                _ts3 = time.perf_counter()
 
                 # 2. Get next batch (uses prev_batch's freshly-updated state).
                 batch = self.get_next_batch_to_run()
                 self.cur_batch = batch
+                _ts4 = time.perf_counter()
 
                 # 3. Issue next forward (send-only; worker forwards in parallel
                 #    with our process_batch_result below).
@@ -385,8 +420,16 @@ class CpuScheduler(Scheduler):
                         pending = None
                         continue
                     if self.is_generation:
+                        _tb0 = time.perf_counter()
                         worker_batch = batch.get_model_worker_batch()
+                        _tb1 = time.perf_counter()
                         handle = self.model_worker.forward_batch_generation_start(worker_batch)
+                        _tb2 = time.perf_counter()
+                        _t_build += _tb1 - _tb0
+                        _t_fanout += _tb2 - _tb1
+                        if batch.forward_mode.is_extend():
+                            _t_p_build += _tb1 - _tb0
+                            _t_p_fanout += _tb2 - _tb1
                         new_pending = (batch, handle)
                     else:
                         # Embedding / non-generation: not worth pipelining,
@@ -403,11 +446,60 @@ class CpuScheduler(Scheduler):
                     # idle.
                     if prev_batch is None:
                         self.on_idle()
+                _ts5 = time.perf_counter()
 
                 # 4. While the worker is busy with `batch`, do the slow
                 #    process_batch_result on `prev_batch`.
                 if prev_batch is not None and prev_result is not None:
                     self.process_batch_result(prev_batch, prev_result)
+                _ts6 = time.perf_counter()
+
+                # Accumulate timings only when there's actual work.
+                if batch is not None or prev_batch is not None:
+                    _t_recv += _ts1 - _ts0
+                    _t_wait += _ts2 - _ts1
+                    _t_upd += _ts3 - _ts2
+                    _t_next += _ts4 - _ts3
+                    _t_send += _ts5 - _ts4
+                    _t_proc += _ts6 - _ts5
+                    _t_count += 1
+                    if batch is not None and batch.forward_mode.is_decode():
+                        _t_decode += 1
+                    if batch is not None and batch.forward_mode.is_extend():
+                        _t_p_count += 1
+                        _t_p_send += _ts5 - _ts4
+                        _t_p_wait += _ts2 - _ts1
+                        _t_p_total += _ts6 - _ts0
+                    if _t_count >= _t_window:
+                        _log.info(
+                            "CpuSched pipelined[%d iters, %d decode, %d prefill] avg ms: "
+                            "recv=%.2f wait=%.2f upd=%.2f next=%.2f send=%.2f (build=%.2f fanout=%.2f) proc=%.2f total=%.2f",
+                            _t_count, _t_decode, _t_p_count,
+                            _t_recv / _t_count * 1000,
+                            _t_wait / _t_count * 1000,
+                            _t_upd / _t_count * 1000,
+                            _t_next / _t_count * 1000,
+                            _t_send / _t_count * 1000,
+                            _t_build / _t_count * 1000,
+                            _t_fanout / _t_count * 1000,
+                            _t_proc / _t_count * 1000,
+                            (_t_recv + _t_wait + _t_upd + _t_next + _t_send + _t_proc) / _t_count * 1000,
+                        )
+                        if _t_p_count > 0:
+                            _log.info(
+                                "CpuSched pipelined[%d prefill] avg ms: "
+                                "wait=%.2f send=%.2f (build=%.2f fanout=%.2f) iter_total=%.2f",
+                                _t_p_count,
+                                _t_p_wait / _t_p_count * 1000,
+                                _t_p_send / _t_p_count * 1000,
+                                _t_p_build / _t_p_count * 1000,
+                                _t_p_fanout / _t_p_count * 1000,
+                                _t_p_total / _t_p_count * 1000,
+                            )
+                        _t_recv = _t_wait = _t_upd = _t_next = _t_send = _t_proc = 0.0
+                        _t_build = _t_fanout = 0.0
+                        _t_p_send = _t_p_build = _t_p_fanout = _t_p_wait = _t_p_total = 0.0
+                        _t_count = _t_decode = _t_p_count = 0
 
                 # 5. Advance.
                 pending = new_pending
