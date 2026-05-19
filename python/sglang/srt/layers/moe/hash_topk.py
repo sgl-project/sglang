@@ -42,7 +42,14 @@ class HashTopK(nn.Module):
             requires_grad=False,
         )
 
-        assert not apply_routed_scaling_factor_on_output, "not implemented"
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
+        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+            raise NotImplementedError(
+                "HashTopK + apply_routed_scaling_factor_on_output is not supported "
+                "with fused shared experts; pass --disable-shared-experts-fusion."
+            )
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
@@ -124,6 +131,9 @@ class HashTopK(nn.Module):
 
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
+
+        if self.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * self.routed_scaling_factor
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)

@@ -261,6 +261,18 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        # Hybrid checkpoints (e.g. nvidia/DeepSeek-V4-Pro-NVFP4) declare FP8
+        # linear/attention in `quantization_config` but ship the NVFP4 MoE
+        # details (group_size, exclude_modules) in a sibling
+        # `hf_quant_config.json`. Pull that meta in here so Fp8Config can
+        # build an embedded ModelOptFp4Config for the MoE branch.
+        if (
+            hf_quant_config.get("quant_method") == "fp8"
+            and str(hf_quant_config.get("moe_quant_algo", "")).upper() == "NVFP4"
+        ):
+            nvfp4_meta = model_config._extract_nvfp4_moe_meta()
+            if nvfp4_meta is not None:
+                hf_quant_config["nvfp4_moe_meta"] = nvfp4_meta
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.

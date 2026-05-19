@@ -100,6 +100,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
 
@@ -152,11 +153,16 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        nvfp4_moe_config: Optional["ModelOptFp4Config"] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
+        # Hybrid FP8 (linear/attn) + NVFP4 (MoE) checkpoints (e.g.
+        # nvidia/DeepSeek-V4-Pro-NVFP4): when set, FusedMoE layers are routed
+        # through `ModelOptNvFp4FusedMoEMethod` instead of `Fp8MoEMethod`.
+        self.nvfp4_moe_config = nvfp4_moe_config
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -237,6 +243,9 @@ class Fp8Config(QuantizationConfig):
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
             weight_block_size = [1, 32]
+        nvfp4_moe_config = cls._maybe_build_nvfp4_moe_config(
+            config, packed_modules_mapping
+        )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
@@ -244,6 +253,38 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            nvfp4_moe_config=nvfp4_moe_config,
+        )
+
+    @staticmethod
+    def _maybe_build_nvfp4_moe_config(
+        config: Dict[str, Any],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+    ) -> Optional["ModelOptFp4Config"]:
+        """Build a `ModelOptFp4Config` for the MoE branch when this is a hybrid
+        FP8-linear + NVFP4-MoE checkpoint (e.g. nvidia/DeepSeek-V4-Pro-NVFP4).
+
+        The NVFP4 details (`group_size`, `exclude_modules`) come from
+        `hf_quant_config.json`. `weight_utils.get_quant_config` injects them
+        into the dict before calling `from_config` when it detects the hybrid
+        scheme. If `nvfp4_moe_meta` is missing the model is plain FP8 and we
+        return None.
+        """
+        moe_quant_algo = config.get("moe_quant_algo")
+        if not (isinstance(moe_quant_algo, str) and moe_quant_algo.upper() == "NVFP4"):
+            return None
+        meta = config.get("nvfp4_moe_meta")
+        if not meta:
+            return None
+        group_size = meta.get("group_size")
+        assert group_size is not None, "nvfp4_moe_meta present but group_size missing"
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+
+        return ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=int(group_size),
+            exclude_modules=list(meta.get("exclude_modules") or []),
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     def get_quant_method(
@@ -266,6 +307,20 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
+
+            # Hybrid FP8 (linear) + NVFP4 (MoE) checkpoints: route MoE through
+            # the NVFP4 method while linear/attention stay on the FP8 path.
+            # This takes precedence over the `is_fp4_experts` mxfp4 branches
+            # below, which expect MXFP4 (`weight_scale_inv`) layout rather
+            # than NVFP4 (`weight_scale` + `weight_scale_2`).
+            if self.nvfp4_moe_config is not None:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    ModelOptNvFp4FusedMoEMethod,
+                )
+
+                if self.nvfp4_moe_config.is_layer_excluded(prefix):
+                    return None
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_moe_config)
 
             fp8_method = Fp8MoEMethod(self)
 
@@ -304,6 +359,8 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
+        if self.nvfp4_moe_config is not None:
+            self.nvfp4_moe_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
 
 class Fp8LinearMethod(LinearMethodBase):
