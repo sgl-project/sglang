@@ -26,7 +26,6 @@ class TestQwen3_6Responses(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--enable-multimodal",
                 "--cuda-graph-max-bs=4",
             ],
         )
