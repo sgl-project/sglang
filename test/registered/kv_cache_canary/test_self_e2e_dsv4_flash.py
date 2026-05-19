@@ -57,7 +57,7 @@ class TestNoPerturbNoViolation(_DSV4FlashBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_DSV4FlashBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.01
+    perturb_prob: ClassVar[float] = 0.5
     allow_launch_failure: ClassVar[bool] = True
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
@@ -91,7 +91,7 @@ class TestRealDataBit(_DSV4FlashBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         *_DSV4_BASE_ARGS,
         "--kv-cache-canary-real-data",
-        "portion",
+        "bit",
     ]
 
     def test_real_data_bit(self) -> None:
@@ -129,7 +129,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_DSV4FlashBase, unittest.Test
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.05"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "11"
         super().setUpClass()
 
@@ -163,14 +163,16 @@ class TestSweepOrphanRadixDetectsViolation(_DSV4FlashBase, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.05"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "12"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls) -> None:
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB", None)
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED", None)
+        os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN", None)
         super().tearDownClass()
 
     def test_sweep_orphan_radix_detects_violation(self) -> None:
