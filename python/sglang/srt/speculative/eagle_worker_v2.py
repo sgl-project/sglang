@@ -147,8 +147,10 @@ class EagleDraftWorker(BaseDraftWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -356,13 +358,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -439,6 +434,17 @@ class EagleDraftWorker(BaseDraftWorker):
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
+
+        # Must be after the reshape: some backends assert out_cache_loc.shape[0] == bs.
+        # Skip during CUDA graph capture; the graph runner calls
+        # init_forward_metadata_capture_cuda_graph separately.
+        if (
+            self.speculative_num_steps > 1
+            and not forward_batch.forward_mode.is_idle()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            forward_batch.out_cache_loc = out_cache_loc[0]
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
 
         # Return values
         score_list: List[torch.Tensor] = []
