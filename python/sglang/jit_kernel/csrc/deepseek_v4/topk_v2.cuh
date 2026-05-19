@@ -340,6 +340,7 @@ topk_fused_transform(const __grid_constant__ TopKParams params) {
     Large::stage1_init(smem);
     device::PDLWaitPrimary<true>();
     Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
+    device::PDLTriggerSecondary<true>();
     Large::stage1(s_topk_indices, length, smem);
     Large::stage1_epilogue(transform, offset, ws, smem);
     cooperative_groups::this_cluster().sync();
