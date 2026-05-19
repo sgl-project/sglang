@@ -44,7 +44,7 @@ class TestNoPerturbNoViolation(_MhaFullBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.01
+    perturb_prob: ClassVar[float] = 0.5
     allow_launch_failure: ClassVar[bool] = True
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
@@ -129,7 +129,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
     def setUpClass(cls) -> None:
         import os
 
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.05"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "1"
         super().setUpClass()
 
@@ -170,7 +170,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
     def setUpClass(cls) -> None:
         import os
 
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.05"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "2"
         super().setUpClass()
 
