@@ -40,6 +40,11 @@ REAL_KV_HASH_BIT_BYTES: int = 16
 # as ``kCanaryExpectedSkipSentinel`` in canary.cuh.
 CANARY_EXPECTED_SKIP_SENTINEL: int = -1
 
+# Sentinel for verify_prev_slot_indices: skip the chain hash check on
+# this entry. Distinct from -1 (chain head, expected_prev_hash = seed).
+# Mirrored as ``kSkipChainSentinel`` in canary.cuh.
+SKIP_CHAIN_SENTINEL: int = -2
+
 # Violation-row field offsets. Mirrors the kViolationField* constants.
 _VIOLATION_FIELD_KERNEL_KIND: int = 0
 _VIOLATION_FIELD_FAIL_REASON: int = 1
@@ -129,6 +134,7 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kRealKvHashModeBit",
     "kRealKvHashModeAll",
     "kCanaryExpectedSkipSentinel",
+    "kSkipChainSentinel",
 )
 
 

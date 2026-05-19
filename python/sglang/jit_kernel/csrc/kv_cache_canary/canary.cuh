@@ -39,6 +39,12 @@ constexpr int kFailReasonInputPositionMismatch = 7;
 // padding past num_write under cuda-graph fixed-capacity buffers).
 constexpr int64_t kCanaryExpectedSkipSentinel = -1;
 
+// Sentinel for verify_prev_slot_indices: skip the chain hash check on
+// this entry. Distinct from -1 ("chain head, expected_prev_hash = seed")
+// so sweep-mode plans can verify an alive slot's real_kv_hash without
+// requiring the full chain to be reconstructible across the sweep set.
+constexpr int64_t kSkipChainSentinel = -2;
+
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
 // fingerprint entirely; ``BIT`` mixes the first 16 bytes of the
@@ -261,7 +267,10 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
       static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
 
   uint64_t expected_prev_hash;
-  if (prev_slot_idx < 0) {
+  const bool skip_chain_check = (prev_slot_idx == kSkipChainSentinel);
+  if (skip_chain_check) {
+    expected_prev_hash = 0;
+  } else if (prev_slot_idx < 0) {
     expected_prev_hash = p.seed;
   } else {
     const uint64_t prev_prev_hash =
@@ -289,7 +298,7 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   uint64_t reported_actual = actual_prev_hash;
   if (actual_position != expected_position) {
     fail_reason = kFailReasonPositionMonotonic;
-  } else if (actual_prev_hash != expected_prev_hash) {
+  } else if (!skip_chain_check && actual_prev_hash != expected_prev_hash) {
     fail_reason = kFailReasonHash;
   } else if (actual_real_kv_hash != expected_real_kv_hash) {
     fail_reason = kFailReasonRealKvHash;
@@ -363,15 +372,7 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
     }
     const int64_t expected_pos = p.expected_write_positions[i];
     if (expected_pos != kCanaryExpectedSkipSentinel && expected_pos != position) {
-      record_violation(
-          p,
-          kFailReasonInputPositionMismatch,
-          slot_idx,
-          token_id,
-          position,
-          0,
-          0,
-          expected_pos);
+      record_violation(p, kFailReasonInputPositionMismatch, slot_idx, token_id, position, 0, 0, expected_pos);
     }
 
     const uint64_t real_kv_hash = compute_real_kv_hash(p, slot_idx);
@@ -558,7 +559,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 25;
+constexpr int kConstantsCount = 26;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -590,6 +591,7 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kRealKvHashModeBit;
   dst[i++] = kRealKvHashModeAll;
   dst[i++] = kCanaryExpectedSkipSentinel;
+  dst[i++] = kSkipChainSentinel;
 }
 
 }  // namespace
