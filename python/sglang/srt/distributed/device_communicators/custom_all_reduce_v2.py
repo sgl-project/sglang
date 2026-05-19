@@ -202,7 +202,7 @@ def can_use_custom_all_reduce_v2(
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
-        supported_world_size=list(range(2, 9)),
+        supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
         cls_name="CustomAllReduceV2",
     )
     return full_nvlink is True
