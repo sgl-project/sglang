@@ -1539,6 +1539,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         batch = None
+        disable_overlap_for_batch = False
         
         while True:
             # Receive requests
