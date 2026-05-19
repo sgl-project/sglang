@@ -60,6 +60,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
 
+        if request.stream and (request.n or 1) > 1:
+            return (
+                "Streaming is not supported when n > 1. "
+                "Either set stream=false or set n=1."
+            )
+
         return None
 
     def _convert_to_internal_request(
