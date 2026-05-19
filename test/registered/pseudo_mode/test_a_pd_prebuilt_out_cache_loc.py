@@ -13,31 +13,29 @@ to a slot whose stored ``(req_id, position)`` does not match the
 oracle's expected pair.
 
 Honesty note: PD disaggregation is **out of scope for pseudo-mode v1**.
-The testing README §"v1 scope" item 7 explicitly defers
-``PD / TP / PP`` to v2. The :class:`PseudoEngine` harness wires a
-single-process, single-rank scheduler; there is no prefill server or
-decode server pair, no KV transfer channel, and no prebuilt batch
-exchange in this configuration. Marking this scenario as ``skip`` (not
+The harness wires a single-process, single-rank scheduler; there is no
+prefill server or decode server pair, no KV transfer channel, and no
+prebuilt batch exchange. Marking this scenario as ``skip`` (not
 ``expectedFailure``) because the bug path simply cannot be exercised
-through the v1 harness — flipping to a real regression requires the
-PD plumbing tracked under v2.
+in this configuration — flipping to a real regression requires
+multi-process PD plumbing the harness does not yet wire.
 """
 
 from __future__ import annotations
 
 import logging
 import unittest
-
-import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from test.registered.pseudo_mode._test_utils import (
+    register_pseudo_a_ci,
+    requires_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+register_pseudo_a_ci()
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
+@requires_cuda
 @unittest.skip(
     "sglang#24230 lives on the PD-disaggregation path; pseudo-mode v1 is "
     "single-process / single-rank and does not exercise the prefill->decode "

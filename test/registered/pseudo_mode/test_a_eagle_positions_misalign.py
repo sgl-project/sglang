@@ -16,9 +16,8 @@ Honesty note: EAGLE end-to-end in pseudo-mode requires a draft model
 path, which is not auto-resolved by the harness today. ``launch`` will
 forward ``speculative_algorithm="EAGLE"`` but ServerArgs validation
 demands ``speculative_draft_model_path``. We mark this test as
-``expectedFailure`` until the harness wires a dummy-weights draft model
-(tracked as a v1 follow-up; spec decoding is listed under v1 scope item
-7 in the testing README).
+``expectedFailure`` until the harness wires a dummy-weights draft
+model.
 """
 
 from __future__ import annotations
@@ -27,20 +26,18 @@ import logging
 import unittest
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
-
-import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from test.registered.pseudo_mode._test_utils import (
+    PSEUDO_MODE_MODEL,
+    register_pseudo_a_ci,
+    requires_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+register_pseudo_a_ci()
 
 
-_MODEL: str = "Qwen/Qwen3-0.6B"
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
+@requires_cuda
 class TestEaglePositionsMisalign(unittest.TestCase):
     """Run a few EAGLE draft+verify decode steps and assert clean canary."""
 
@@ -57,7 +54,7 @@ class TestEaglePositionsMisalign(unittest.TestCase):
         path that the harness does not yet auto-provision.
         """
         with PseudoEngine.launch(
-            model=_MODEL,
+            model=PSEUDO_MODE_MODEL,
             num_hidden_layers=1,
             speculative_algorithm="EAGLE",
             radix_cache=False,

@@ -14,20 +14,18 @@ the prefix hit. The head kernel writes a ``REAL_KV_HASH`` violation
 input-feed path on the next step).
 
 Honesty note: pseudo-mode v1 disables the radix cache by design. The
-testing README §1 and the oracle-contract notes (Case 4) document that
-v1 sets ``--disable-radix-cache`` to keep the oracle contract clean —
-the oracle is a CPU-side per-(req, position) predictor and does not
-know which sub-range of the prefix sglang decided to reuse. Flipping
+oracle is a CPU-side per-(req, position) predictor and does not know
+which sub-range of the prefix sglang decided to reuse. Flipping
 ``radix_cache=True`` here exercises the production path but the
 oracle's ``expected_input_tokens`` for the shared-prefix entries does
 not yet emit ``SKIP_SENTINEL``, so the head kernel will fire
 ``INPUT_TOKEN_MISMATCH`` on prefix-cache *hits* (oracle thinks the req
 should re-feed the original tokens, sglang correctly skips them).
 
-This test is marked ``expectedFailure`` until the v2 oracle plumbing
-lets the harness signal "this entry was supplied by prefix-cache, skip
-the input assert" — at which point the assertion becomes a real
-regression for sglang#22819.
+This test is marked ``expectedFailure`` until the oracle gains a hook
+to signal "this entry was supplied by prefix-cache, skip the input
+assert" — at which point the assertion becomes a real regression for
+sglang#22819.
 """
 
 from __future__ import annotations
@@ -36,17 +34,17 @@ import logging
 import unittest
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
-
-import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from test.registered.pseudo_mode._test_utils import (
+    PSEUDO_MODE_MODEL,
+    register_pseudo_a_ci,
+    requires_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+register_pseudo_a_ci()
 
 
-_MODEL: str = "Qwen/Qwen3-0.6B"
 # Page size is 1 by default on sglang Qwen3 path; we choose a prompt
 # length that lands the prefix on a likely radix block multiple. The
 # exact block size is sglang-internal, so we pick a power of two that
@@ -55,7 +53,7 @@ _MODEL: str = "Qwen/Qwen3-0.6B"
 _SHARED_PREFIX_LEN: int = 128
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
+@requires_cuda
 class TestRadixBlockBoundaryCorruption(unittest.TestCase):
     """Two reqs with an exact-block-size shared prefix hitting the radix cache."""
 
@@ -78,7 +76,7 @@ class TestRadixBlockBoundaryCorruption(unittest.TestCase):
         prompt_b = shared_prefix + suffix_b
 
         with PseudoEngine.launch(
-            model=_MODEL,
+            model=PSEUDO_MODE_MODEL,
             num_hidden_layers=1,
             radix_cache=True,
             cuda_graph=False,

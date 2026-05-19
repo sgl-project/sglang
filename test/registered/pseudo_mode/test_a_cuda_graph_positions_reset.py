@@ -26,64 +26,69 @@ import logging
 import unittest
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
-
-import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from test.registered.pseudo_mode._test_utils import (
+    PSEUDO_MODE_MODEL,
+    register_pseudo_a_ci,
+    requires_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+register_pseudo_a_ci()
 
 
-_MODEL: str = "Qwen/Qwen3-0.6B"
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
+@requires_cuda
 class TestCudaGraphPositionsReset(unittest.TestCase):
     """Span CUDA-graph capture and replay boundaries with multiple reqs."""
 
     def test_decode_across_capture_replay_clean(self) -> None:
-        """Drive decode steps that exercise capture + replay for the
-        same batch shape and assert no canary violations.
+        """Force batch-shape shrink across capture/replay boundaries.
 
-        With the sglang#24401 fix, every replay rewrites the full
-        ``positions`` tensor and the head kernel sees the oracle-expected
-        position at every entry. Without the fix, a replay's tail entry
-        retains a stale position from the previous replay and the head
-        kernel writes ``INPUT_POSITION_MISMATCH``.
+        sglang#24401 specifically manifested on a replay whose batch
+        had fewer reqs than the captured shape: stale tail entries kept
+        the previous replay's positions. Admit three reqs of unequal
+        depths so the running batch shrinks as the shortest one
+        finishes — this is the adversarial pattern that surfaced the
+        bug. ``assert_no_canary_violations`` after each drain phase
+        catches ``INPUT_POSITION_MISMATCH`` on the head kernel.
         """
         with PseudoEngine.launch(
-            model=_MODEL,
+            model=PSEUDO_MODE_MODEL,
             num_hidden_layers=1,
             cuda_graph=True,
             radix_cache=False,
         ) as engine:
-            # Step 1: admit two reqs whose prompt lengths differ so the
-            # decode batch shape is exercised on both capture and replay.
-            handle_a = engine.admit(
-                prompt=fake_prompt(48, seed=0xAAAA), max_new_tokens=6
+            # Step 1: admit three reqs of unequal max_new_tokens. The
+            # shortest finishes mid-stream so the running batch shrinks
+            # from 3 -> 2 -> 1 across captured replays — the production
+            # pattern that surfaced sglang#24401.
+            handle_short = engine.admit(
+                prompt=fake_prompt(48, seed=0xAAAA), max_new_tokens=2
             )
-            handle_b = engine.admit(
-                prompt=fake_prompt(80, seed=0xBBBB), max_new_tokens=6
+            handle_mid = engine.admit(
+                prompt=fake_prompt(80, seed=0xBBBB), max_new_tokens=4
+            )
+            handle_long = engine.admit(
+                prompt=fake_prompt(112, seed=0xCCCC), max_new_tokens=8
             )
 
-            # Step 2: drive prefills + a few decode steps. Each call to
-            # ``step`` runs one outer event-loop iteration; the canary
-            # is pulled at the end of every step inside step_until.
-            engine.step_until(handle_a, n=5)
+            # Step 2: drive several joint-decode steps so the captured
+            # graph holds the bs=3 shape at least once.
+            engine.step_until(handle_short, n=2)
+            engine.assert_no_canary_violations()
 
-            # Step 3: drive the second req to a similar depth, which
-            # triggers replays of the same captured shape after handle_a
-            # has finished or evicted.
-            engine.step_until(handle_b, n=5)
+            # Step 3: short req is finished now; the next decode steps
+            # shrink the batch to bs=2 (replays of a previously-captured
+            # shape with a now-stale tail entry would be caught here).
+            engine.step_until(handle_mid, n=4)
+            engine.assert_no_canary_violations()
 
-            # Step 4: drain anything left so the captured graph has run
-            # at least once more after both reqs touched it.
+            # Step 4: shrink again to bs=1 for the final stretch.
+            engine.step_until(handle_long, n=8)
+
+            # Step 5: drain anything left so the captured graph has run
+            # at least once more after both shape-shrink boundaries.
             engine.step_until_idle(max_steps=8)
-
-            # Step 5: final canary check — must be clean across every
-            # capture + replay boundary that ran above.
             engine.assert_no_canary_violations()
 
 

@@ -37,22 +37,22 @@ import logging
 import unittest
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
-
-import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from test.registered.pseudo_mode._test_utils import (
+    PSEUDO_MODE_MODEL,
+    register_pseudo_a_ci,
+    requires_cuda,
+)
 
 logger = logging.getLogger(__name__)
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+register_pseudo_a_ci()
 
 
-_MODEL: str = "Qwen/Qwen3-0.6B"
 _PROMPT_LEN: int = 64
 _MAX_NEW_TOKENS: int = 4
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
+@requires_cuda
 class TestBatchCompositionCrossBatch(unittest.TestCase):
     """Same prompt in two batch compositions must produce no canary violations."""
 
@@ -111,7 +111,7 @@ class TestBatchCompositionCrossBatch(unittest.TestCase):
     def _run_singleton(self, prompt: list[int]) -> list[list[str]]:
         """Run ``prompt`` as a singleton batch and return per-step active rids."""
         with PseudoEngine.launch(
-            model=_MODEL,
+            model=PSEUDO_MODE_MODEL,
             num_hidden_layers=1,
             radix_cache=False,
             cuda_graph=False,
@@ -129,7 +129,7 @@ class TestBatchCompositionCrossBatch(unittest.TestCase):
     ) -> tuple[list[list[str]], str]:
         """Run ``prompt`` alongside two filler reqs; return per-step active rids."""
         with PseudoEngine.launch(
-            model=_MODEL,
+            model=PSEUDO_MODE_MODEL,
             num_hidden_layers=1,
             radix_cache=False,
             cuda_graph=False,
