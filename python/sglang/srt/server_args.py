@@ -677,6 +677,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     kv_cache_canary: str = "off"
     kv_cache_canary_real_data: str = "off"
+    enable_pseudo_mode: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -949,6 +950,10 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Pseudo-mode forces a couple of related flags before load-format
+        # selection so the dummy-load short-circuit picks up the override.
+        self._handle_pseudo_mode()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3527,6 +3532,32 @@ class ServerArgs:
             )
         return False
 
+    def _handle_pseudo_mode(self) -> None:
+        if not self.enable_pseudo_mode:
+            return
+        if self.kv_cache_canary == "off":
+            logger.warning(
+                "--enable-pseudo-mode forces --kv-cache-canary=raise (was 'off')"
+            )
+            self.kv_cache_canary = "raise"
+        elif self.kv_cache_canary == "log":
+            logger.warning(
+                "--enable-pseudo-mode upgrades --kv-cache-canary from 'log' "
+                "to 'raise' (pseudo-mode mismatches are hard test failures)"
+            )
+            self.kv_cache_canary = "raise"
+        if self.load_format == "auto":
+            logger.warning(
+                "--enable-pseudo-mode forces --load-format=dummy (was 'auto')"
+            )
+            self.load_format = "dummy"
+        if not self.disable_overlap_schedule:
+            logger.info(
+                "--enable-pseudo-mode keeps overlap scheduling on; overlap is "
+                "a deliberate pseudo-mode target. Pass --disable-overlap-"
+                "schedule explicitly to opt out."
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -6042,6 +6073,21 @@ class ServerArgs:
                 "server keeps running (production-safe). 'raise' performs a "
                 "cross-rank allreduce of the error flag and raises on every rank "
                 "to avoid TP deadlocks (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--enable-pseudo-mode",
+            action="store_true",
+            default=ServerArgs.enable_pseudo_mode,
+            help=(
+                "Enable pseudo-mode testing. Forces the sampler output to an "
+                "oracle prediction, asserts model.forward input_ids / positions "
+                "against the same oracle, and routes mismatches through the "
+                "kv-cache canary. Combined with ``--load-format=dummy`` and "
+                "``--json-model-override-args '{\"num_hidden_layers\": 1}'`` "
+                "this yields a fast scheduler-fuzz harness. Implies "
+                "``--kv-cache-canary=raise`` (warn-and-override) and forces "
+                "``--load-format=dummy`` if unset."
             ),
         )
         parser.add_argument(

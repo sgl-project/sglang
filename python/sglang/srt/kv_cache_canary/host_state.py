@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary import VIOLATION_FIELDS
+from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL as _SKIP_SENTINEL,
+    VIOLATION_FIELDS,
+)
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 
 if TYPE_CHECKING:
@@ -37,10 +40,40 @@ class BatchPlan:
     write_req_seed_slot_indices: List[int]
     write_req_entry_starts: List[int]
     write_req_entry_counts: List[int]
+    # Per-write-req ``req_pool_idx`` of the req that contributed each row.
+    # Length == num_write_reqs. Host-only bookkeeping (the canary kernel
+    # never reads it); the pseudo-mode oracle uses it to look up the
+    # logical req id from a write-req row when emitting expected_*.
+    write_req_pool_indices: List[int]
 
     num_verify: int
     num_write: int
     num_write_reqs: int
+
+    # Pseudo-mode oracle predictions for the write entries. Set as a
+    # paired non-None tuple in pseudo-mode; both None otherwise.
+    expected_write_token_ids: Optional[List[int]] = None
+    expected_write_positions: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        tokens = self.expected_write_token_ids
+        positions = self.expected_write_positions
+        if (tokens is None) != (positions is None):
+            raise ValueError(
+                "kv-canary: expected_write_token_ids and expected_write_positions "
+                "must both be set or both be None"
+            )
+        if tokens is not None:
+            if len(tokens) != self.num_write:
+                raise ValueError(
+                    f"kv-canary: expected_write_token_ids length {len(tokens)} "
+                    f"!= num_write {self.num_write}"
+                )
+            if len(positions) != self.num_write:
+                raise ValueError(
+                    f"kv-canary: expected_write_positions length {len(positions)} "
+                    f"!= num_write {self.num_write}"
+                )
 
 
 def plan_batch_from_forward_batch(
@@ -217,6 +250,7 @@ def _append_write_entries(
     accumulator.write_req_seed_slot_indices.append(seed_slot)
     accumulator.write_req_entry_starts.append(entry_start)
     accumulator.write_req_entry_counts.append(n)
+    accumulator.write_req_pool_indices.append(req_pool_idx)
 
     for offset in range(n):
         pos = k_req + offset
@@ -248,6 +282,7 @@ class _PlanAccumulator:
         self.write_req_seed_slot_indices: List[int] = []
         self.write_req_entry_starts: List[int] = []
         self.write_req_entry_counts: List[int] = []
+        self.write_req_pool_indices: List[int] = []
 
     def into_plan(self) -> Optional[BatchPlan]:
         num_verify = len(self.verify_positions)
@@ -266,6 +301,7 @@ class _PlanAccumulator:
             write_req_seed_slot_indices=self.write_req_seed_slot_indices,
             write_req_entry_starts=self.write_req_entry_starts,
             write_req_entry_counts=self.write_req_entry_counts,
+            write_req_pool_indices=self.write_req_pool_indices,
             num_verify=num_verify,
             num_write=num_write,
             num_write_reqs=num_write_reqs,
@@ -461,6 +497,8 @@ class CanaryLaunchBuffers:
     write_slot_indices: torch.Tensor
     write_token_ids: torch.Tensor
     write_positions: torch.Tensor
+    expected_write_token_ids: torch.Tensor
+    expected_write_positions: torch.Tensor
     write_req_seed_slot_indices: torch.Tensor
     write_req_entry_starts: torch.Tensor
     write_req_entry_counts: torch.Tensor
@@ -491,6 +529,9 @@ class CanaryLaunchBuffers:
         def zeros_i32(n: int) -> torch.Tensor:
             return torch.zeros(n, dtype=torch.int32, device=device)
 
+        def full_i64(n: int, value: int) -> torch.Tensor:
+            return torch.full((n,), value, dtype=torch.int64, device=device)
+
         return cls(
             verify_capacity=int(verify_capacity),
             write_capacity=int(write_capacity),
@@ -502,6 +543,8 @@ class CanaryLaunchBuffers:
             write_slot_indices=zeros_i64(write_capacity),
             write_token_ids=zeros_i64(write_capacity),
             write_positions=zeros_i64(write_capacity),
+            expected_write_token_ids=full_i64(write_capacity, _SKIP_SENTINEL),
+            expected_write_positions=full_i64(write_capacity, _SKIP_SENTINEL),
             write_req_seed_slot_indices=zeros_i64(write_req_capacity),
             write_req_entry_starts=zeros_i64(write_req_capacity),
             write_req_entry_counts=zeros_i64(write_req_capacity),
@@ -578,6 +621,24 @@ class CanaryLaunchBuffers:
             self.write_token_ids[nw:].zero_()
             self.write_positions[nw:].zero_()
 
+        # Oracle-off callers leave these buffers in their canonical
+        # all-sentinel state from allocate(); pseudo-mode rewrites [:nw]
+        # and restores the tail. The kernel skips entries where
+        # write_req_active_mask is zero, so the tail being stale doesn't
+        # produce false violations — but keeping it at the sentinel value
+        # keeps reset_to_skip_sentinel a mask-only no-op (see below).
+        if plan.expected_write_token_ids is not None:
+            if nw > 0:
+                self.expected_write_token_ids[:nw].copy_(
+                    to_i64(plan.expected_write_token_ids, slice(0, nw))
+                )
+                self.expected_write_positions[:nw].copy_(
+                    to_i64(plan.expected_write_positions, slice(0, nw))
+                )
+            if nw < self.write_capacity:
+                self.expected_write_token_ids[nw:].fill_(_SKIP_SENTINEL)
+                self.expected_write_positions[nw:].fill_(_SKIP_SENTINEL)
+
         nwr = plan.num_write_reqs
         if nwr > 0:
             self.write_req_seed_slot_indices[:nwr].copy_(
@@ -599,6 +660,9 @@ class CanaryLaunchBuffers:
         """Reset all active masks so the recorded kernel becomes a no-op.
 
         Used at capture time and at replay-time when no valid plan exists.
+        The expected_write_* buffers do not need touching here: the
+        kernel early-exits on a zero write_req_active_mask before reading
+        them.
         """
         self.verify_active_mask.zero_()
         self.write_req_active_mask.zero_()

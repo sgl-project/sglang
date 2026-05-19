@@ -31,6 +31,13 @@ constexpr int kFailReasonPosition = 2;
 constexpr int kFailReasonHash = 3;
 constexpr int kFailReasonPositionMonotonic = 4;
 constexpr int kFailReasonRealKvHash = 5;
+constexpr int kFailReasonInputTokenMismatch = 6;
+constexpr int kFailReasonInputPositionMismatch = 7;
+
+// Value the host fills into expected_write_{token_ids,positions} for
+// entries with no oracle prediction (always-on canary callers, or
+// padding past num_write under cuda-graph fixed-capacity buffers).
+constexpr int64_t kCanaryExpectedSkipSentinel = -1;
 
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
@@ -73,6 +80,12 @@ struct CanaryParams {
   const int64_t* __restrict__ write_slot_indices;
   const int64_t* __restrict__ write_token_ids;
   const int64_t* __restrict__ write_positions;
+  // Per-write-entry oracle predictions, length == num_write. A value of -1
+  // is the skip-sentinel: that entry's input cross-check is bypassed (used
+  // for production canary callers that do not run an oracle, and to pad
+  // beyond the active count under cuda-graph fixed-capacity buffers).
+  const int64_t* __restrict__ expected_write_token_ids;
+  const int64_t* __restrict__ expected_write_positions;
 
   // Per-write-req arrays, length == num_write_reqs. One driver thread per row
   // walks the splitmix64 chain across this req's writes in sequence.
@@ -333,6 +346,34 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
     const int64_t token_id = p.write_token_ids[i];
     const int64_t position = p.write_positions[i];
 
+    // Pseudo-mode input cross-check. Runs BEFORE the chain hash is mixed
+    // so a buggy token / position cannot taint prev_hash and produce a
+    // self-consistent chain that masks the input divergence.
+    const int64_t expected_token = p.expected_write_token_ids[i];
+    if (expected_token != kCanaryExpectedSkipSentinel && expected_token != token_id) {
+      record_violation(
+          p,
+          kFailReasonInputTokenMismatch,
+          slot_idx,
+          token_id,
+          position,
+          static_cast<uint64_t>(expected_token),
+          static_cast<uint64_t>(token_id),
+          0);
+    }
+    const int64_t expected_pos = p.expected_write_positions[i];
+    if (expected_pos != kCanaryExpectedSkipSentinel && expected_pos != position) {
+      record_violation(
+          p,
+          kFailReasonInputPositionMismatch,
+          slot_idx,
+          token_id,
+          position,
+          0,
+          0,
+          expected_pos);
+    }
+
     const uint64_t real_kv_hash = compute_real_kv_hash(p, slot_idx);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, token_id);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, position);
@@ -389,6 +430,8 @@ void canary_step(
     tvm::ffi::TensorView write_req_entry_starts,
     tvm::ffi::TensorView write_req_entry_counts,
     tvm::ffi::TensorView write_req_active_mask,
+    tvm::ffi::TensorView expected_write_token_ids,
+    tvm::ffi::TensorView expected_write_positions,
     int64_t seed,
     tvm::ffi::TensorView violation_ring,
     tvm::ffi::TensorView violation_ring_valid,
@@ -424,7 +467,9 @@ void canary_step(
       .with_device<kDLCUDA>(device_)
       .verify(write_slot_indices)
       .verify(write_token_ids)
-      .verify(write_positions);
+      .verify(write_positions)
+      .verify(expected_write_token_ids)
+      .verify(expected_write_positions);
 
   TensorMatcher({N_write_reqs})
       .with_dtype<int64_t>()
@@ -474,6 +519,8 @@ void canary_step(
   p.write_slot_indices = static_cast<const int64_t*>(write_slot_indices.data_ptr());
   p.write_token_ids = static_cast<const int64_t*>(write_token_ids.data_ptr());
   p.write_positions = static_cast<const int64_t*>(write_positions.data_ptr());
+  p.expected_write_token_ids = static_cast<const int64_t*>(expected_write_token_ids.data_ptr());
+  p.expected_write_positions = static_cast<const int64_t*>(expected_write_positions.data_ptr());
   p.write_req_seed_slot_indices = static_cast<const int64_t*>(write_req_seed_slot_indices.data_ptr());
   p.write_req_entry_starts = static_cast<const int64_t*>(write_req_entry_starts.data_ptr());
   p.write_req_entry_counts = static_cast<const int64_t*>(write_req_entry_counts.data_ptr());
@@ -511,7 +558,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 22;
+constexpr int kConstantsCount = 25;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -537,9 +584,12 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kFailReasonHash;
   dst[i++] = kFailReasonPositionMonotonic;
   dst[i++] = kFailReasonRealKvHash;
+  dst[i++] = kFailReasonInputTokenMismatch;
+  dst[i++] = kFailReasonInputPositionMismatch;
   dst[i++] = kRealKvHashModeOff;
   dst[i++] = kRealKvHashModeBit;
   dst[i++] = kRealKvHashModeAll;
+  dst[i++] = kCanaryExpectedSkipSentinel;
 }
 
 }  // namespace

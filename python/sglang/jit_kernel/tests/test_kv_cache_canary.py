@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
@@ -87,7 +88,16 @@ def _run(
     real_kv_slot_stride_bytes: int = 0,
     real_kv_read_bytes: int = 0,
     real_kv_hash_mode: int = 0,
+    expected_write_token_ids: list[int] | None = None,
+    expected_write_positions: list[int] | None = None,
 ) -> None:
+    n_write_padded = len(write_slot_indices) or 1
+    expected_write_token_ids = expected_write_token_ids or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
+    )
+    expected_write_positions = expected_write_positions or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
+    )
     canary_step(
         src_buf=src.flatten(),
         dst_buf=dst.flatten(),
@@ -103,6 +113,8 @@ def _run(
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
         write_req_active_mask=_i32(write_req_active_mask or [0]),
+        expected_write_token_ids=_i64(expected_write_token_ids),
+        expected_write_positions=_i64(expected_write_positions),
         seed=seed,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],
@@ -547,6 +559,13 @@ def _i32_on(values: list[int], device: str) -> torch.Tensor:
 
 
 def _build_inputs_on(device: str, **plan_lists) -> dict:
+    n_write = max(len(plan_lists["write_slot_indices"]), 1)
+    expected_write_token_ids = plan_lists.get("expected_write_token_ids") or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
+    )
+    expected_write_positions = plan_lists.get("expected_write_positions") or (
+        [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
+    )
     return dict(
         verify_slot_indices=_i64_on(plan_lists["verify_slot_indices"], device),
         verify_positions=_i64_on(plan_lists["verify_positions"], device),
@@ -563,6 +582,8 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
         write_req_entry_starts=_i64_on(plan_lists["write_req_entry_starts"], device),
         write_req_entry_counts=_i64_on(plan_lists["write_req_entry_counts"], device),
         write_req_active_mask=_i32_on(plan_lists["write_req_active_mask"], device),
+        expected_write_token_ids=_i64_on(expected_write_token_ids, device),
+        expected_write_positions=_i64_on(expected_write_positions, device),
     )
 
 

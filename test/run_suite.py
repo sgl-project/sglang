@@ -268,7 +268,9 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
+    # Registered tests under test/registered/. Leading-underscore module
+    # names are the Python convention for test-internal helpers (e.g.
+    # ``pseudo_mode/_pseudo_engine.py``) and are not test entry points.
     files = [
         f
         for f in glob.glob(
@@ -277,6 +279,7 @@ def run_a_suite(args):
         if not f.endswith("/conftest.py")
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
+        and not os.path.basename(f).startswith("_")
     ]
 
     # JIT kernel tests and benchmarks (live alongside kernel source)

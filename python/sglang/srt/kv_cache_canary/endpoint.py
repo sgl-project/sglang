@@ -106,6 +106,8 @@ class CanaryEndpoint:
                 write_req_entry_starts=launch_buffers.write_req_entry_starts,
                 write_req_entry_counts=launch_buffers.write_req_entry_counts,
                 write_req_active_mask=launch_buffers.write_req_active_mask,
+                expected_write_token_ids=launch_buffers.expected_write_token_ids,
+                expected_write_positions=launch_buffers.expected_write_positions,
                 seed=int(seed),
                 violation_ring=violation_slot.violation_ring,
                 violation_ring_valid=violation_slot.violation_ring_valid,

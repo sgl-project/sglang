@@ -446,6 +446,9 @@ class Scheduler(
         self.init_model_worker()
         self.install_device_timer_on_runners()
 
+        if self.server_args.enable_pseudo_mode:
+            self._install_pseudo_mode_scheduler_hooks()
+
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
@@ -684,6 +687,36 @@ class Scheduler(
             from sglang.srt.managers.tp_worker import TpModelWorker
 
             self.tp_worker = TpModelWorker(**worker_kwargs)
+
+    def _install_pseudo_mode_scheduler_hooks(self) -> None:
+        """Wire pseudo-mode scheduler hooks (admit / commit / finish).
+
+        The model-runner-side install already constructed the oracle on
+        ``tp_worker.model_runner.pseudo_oracle``; we re-enter the
+        pseudo-mode install with ``scheduler=self`` to add the
+        scheduler-bound hooks atop the existing model_runner-bound
+        ones.
+        """
+        from sglang.srt.pseudo_mode.install import (
+            install_harness_ipc_handlers,
+            install_on_model_runner,
+        )
+
+        model_runner = self.tp_worker.model_runner
+        oracle = getattr(model_runner, "pseudo_oracle", None)
+        if oracle is None:
+            logger.warning(
+                "enable_pseudo_mode set but model_runner.pseudo_oracle is "
+                "missing; scheduler hooks NOT installed"
+            )
+            return
+        install_on_model_runner(
+            model_runner=model_runner, oracle=oracle, scheduler=self
+        )
+        # Harness IPC handlers (``_pseudo_*`` methods) are no-ops in
+        # production — they only fire when a test harness sends matching
+        # RpcReqInput messages.
+        install_harness_ipc_handlers(scheduler=self)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():

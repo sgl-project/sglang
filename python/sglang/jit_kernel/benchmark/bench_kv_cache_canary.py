@@ -28,6 +28,7 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     VIOLATION_FIELDS,
@@ -118,6 +119,12 @@ def _launch(
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
         write_req_active_mask=_i32([1] * n_write_reqs if n_write_reqs else [0]),
+        expected_write_token_ids=_i64(
+            [CANARY_EXPECTED_SKIP_SENTINEL] * max(n_write, 1)
+        ),
+        expected_write_positions=_i64(
+            [CANARY_EXPECTED_SKIP_SENTINEL] * max(n_write, 1)
+        ),
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],

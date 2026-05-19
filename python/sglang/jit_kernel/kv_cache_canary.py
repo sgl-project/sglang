@@ -36,6 +36,10 @@ REAL_KV_HASH_MODE_BIT: int = 1
 REAL_KV_HASH_MODE_ALL: int = 2
 REAL_KV_HASH_BIT_BYTES: int = 16
 
+# Skip-sentinel value for expected_write_{token_ids,positions}. Mirrored
+# as ``kCanaryExpectedSkipSentinel`` in canary.cuh.
+CANARY_EXPECTED_SKIP_SENTINEL: int = -1
+
 # Violation-row field offsets. Mirrors the kViolationField* constants.
 _VIOLATION_FIELD_KERNEL_KIND: int = 0
 _VIOLATION_FIELD_FAIL_REASON: int = 1
@@ -79,6 +83,8 @@ class FailReason(enum.IntEnum):
     HASH = 3
     POSITION_MONOTONIC = 4
     REAL_KV_HASH = 5
+    INPUT_TOKEN_MISMATCH = 6
+    INPUT_POSITION_MISMATCH = 7
 
 
 @cache_once
@@ -117,9 +123,12 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kFailReasonHash",
     "kFailReasonPositionMonotonic",
     "kFailReasonRealKvHash",
+    "kFailReasonInputTokenMismatch",
+    "kFailReasonInputPositionMismatch",
     "kRealKvHashModeOff",
     "kRealKvHashModeBit",
     "kRealKvHashModeAll",
+    "kCanaryExpectedSkipSentinel",
 )
 
 
@@ -154,6 +163,8 @@ def canary_step(
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
     write_req_active_mask: torch.Tensor,
+    expected_write_token_ids: torch.Tensor,
+    expected_write_positions: torch.Tensor,
     seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
@@ -219,6 +230,11 @@ def canary_step(
         write_req_entry_starts,
         write_req_entry_counts:      ``int64 [N_write_reqs]`` — slice of the per-slot arrays owned by each write-req.
         write_req_active_mask:       ``int32 [N_write_reqs]`` — 1 = process, 0 = skip.
+        expected_write_token_ids,
+        expected_write_positions:    ``int64 [N_write]`` — per-write-entry oracle predictions for the input token and
+                                     position. A value of ``-1`` is the skip-sentinel: the kernel skips that entry's
+                                     input-mismatch check. Non-pseudo callers fill both buffers with ``-1`` and pay
+                                     no per-entry cost beyond two loads and two compares.
         seed:                        Chain anchor used wherever a slot has no predecessor (``CanaryConfig.seed``).
         violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — append-only sink. Each populated
                                      row is fill-once: never overwritten.
@@ -278,6 +294,8 @@ def canary_step(
         write_req_entry_starts,
         write_req_entry_counts,
         write_req_active_mask,
+        expected_write_token_ids,
+        expected_write_positions,
         to_signed_int64(int(seed)),
         violation_ring,
         violation_ring_valid,

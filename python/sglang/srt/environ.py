@@ -667,6 +667,22 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
 
+    # Pseudo-mode sampler-override perturbation (testing only).
+    # When >0, the pseudo-mode sampler override writes the WRONG token
+    # into ``batch_next_token_ids`` with this per-element probability so
+    # the canary's ``INPUT_TOKEN_MISMATCH`` detection fires on the next
+    # forward. Combined with ``--enable-pseudo-mode`` + ``--kv-cache-
+    # canary=raise`` this provides the fault-injection harness used by
+    # the pseudo-mode canary self-test.
+    SGLANG_PSEUDO_INPUT_PERTURB_PROB = EnvFloat(0.0)
+    SGLANG_PSEUDO_INPUT_PERTURB_SEED = EnvInt(0)
+    # Position-side counterpart: when >0 perturb ``forward_batch.positions``
+    # so the canary's ``INPUT_POSITION_MISMATCH`` detection fires. Positions
+    # are computed by sglang scheduler internals; the v1 install path
+    # leaves this unwired with a TODO (see install.py).
+    SGLANG_PSEUDO_INPUT_POSITION_PERTURB_PROB = EnvFloat(0.0)
+    SGLANG_PSEUDO_INPUT_POSITION_PERTURB_SEED = EnvInt(0)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
