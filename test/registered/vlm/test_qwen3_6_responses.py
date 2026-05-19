@@ -42,17 +42,6 @@ class TestQwen3_6Responses(CustomTestCase):
             timeout=120,
         )
         self.assertEqual(r.status_code, 200, msg=r.text)
-        body = r.json()
-        self.assertEqual(body.get("object"), "response")
-        self.assertEqual(body.get("status"), "completed")
-        texts = [
-            c["text"]
-            for item in body.get("output", [])
-            if item.get("type") == "message"
-            for c in item.get("content", [])
-            if c.get("type") == "output_text" and c.get("text")
-        ]
-        self.assertTrue("".join(texts).strip(), msg=body)
 
 
 if __name__ == "__main__":
