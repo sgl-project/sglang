@@ -52,8 +52,13 @@ pub enum PdPools {
     /// Non-PD deployment: the model is served by plain workers.
     Plain { workers: Vec<Arc<Worker>> },
     /// PD-disaggregation deployment: the model has prefill and/or decode
-    /// workers. Either pool may be empty (e.g. all prefill workers'
-    /// circuit breakers are open).
+    /// workers. Either OR BOTH pools may be empty (e.g. every prefill
+    /// worker's circuit breaker is open, or every PD worker on the
+    /// model is currently unhealthy). The `*_candidates` helpers are
+    /// the only safe consumers — they map an empty pool to the
+    /// appropriate `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable`
+    /// error. Callers that read this variant directly MUST treat an
+    /// empty pool as a transient failure, not as "zero work".
     Pd {
         prefill: Vec<Arc<Worker>>,
         decode: Vec<Arc<Worker>>,
@@ -96,12 +101,14 @@ impl PdPoolResolver {
     ///
     /// Returns `Err(NoHealthyWorkers)` only when the model has zero
     /// **registered** workers (healthy or not). When the model is
-    /// registered as PD but every breaker is currently open, returns
-    /// `Ok(Pd { prefill: [], decode: [] })` so `prefill_candidates` /
-    /// `decode_candidates` can surface the more specific
-    /// `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable` code —
-    /// operators alerting on partial-pool failures see the same code
-    /// whether the empty pool is empty by registration or by breaker.
+    /// registered as PD but every PD worker is currently unhealthy
+    /// (any failure path that flips `breaker.allow()` to false),
+    /// returns `Ok(Pd { prefill: [], decode: [] })` so
+    /// `prefill_candidates` / `decode_candidates` can surface the more
+    /// specific `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable`
+    /// code — operators alerting on partial-pool failures see the same
+    /// code whether the empty pool is empty by registration or by
+    /// transient health state.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
         let all = self.workers.healthy_workers_for(model);
         if all.is_empty() {
@@ -398,12 +405,13 @@ mod tests {
         ]);
         let resolver = PdPoolResolver::new(r);
         let model = ModelId("m".into());
-        // Trip both breakers (threshold = 3 in the default config).
+        // Trip both breakers. Loop on `allow()` (not a fixed count) so
+        // the test stays correct if the default `CircuitBreakerConfig`
+        // threshold ever changes.
         for w in resolver.workers.workers_for(&model) {
-            for _ in 0..3 {
+            while w.breaker.allow() {
                 w.breaker.record_failure();
             }
-            assert!(!w.breaker.allow());
         }
         // resolve() still returns a PD shape (both pools empty) — the
         // PD intent is preserved across the breaker-open state.
@@ -700,11 +708,12 @@ mod tests {
             .into_iter()
             .filter(|w| w.mode() == WorkerMode::Decode)
             .collect::<Vec<_>>();
+        // Trip every decode breaker; loop on `allow()` for threshold
+        // resilience.
         for w in &pool {
-            for _ in 0..3 {
+            while w.breaker.allow() {
                 w.breaker.record_failure();
             }
-            assert!(!w.breaker.allow());
         }
         // resolver path: healthy_workers_for returns empty, but the
         // model is registered as PD (decode peers exist), so resolve()
