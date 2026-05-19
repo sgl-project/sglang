@@ -188,7 +188,5 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 )
             self.spec_info = spec_info
         else:
-            # Non-spec disagg decode: input_ids = last_tokens_tensor is the input for
-            # the next decode forward. prepare_for_decode no longer swaps in
-            # this PR, so set it here.
+            # Non-spec: input_ids feeds the next decode forward directly.
             self.input_ids = last_tokens_tensor
