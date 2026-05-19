@@ -52,8 +52,13 @@ def install_sampler_override(
         return
 
     original_sample = model_runner.sample
-    perturb_prob = _clamp_unit(envs.SGLANG_PSEUDO_INPUT_PERTURB_PROB.get())
+    perturb_prob = _read_perturb_prob()
     perturb_seed = int(envs.SGLANG_PSEUDO_INPUT_PERTURB_SEED.get())
+    perturb_state: _PerturbState = _PerturbState(
+        prob=perturb_prob,
+        vocab_size=oracle.vocab_size,
+        seed=perturb_seed,
+    )
 
     def patched_sample(
         self: "ModelRunner",
@@ -68,13 +73,8 @@ def install_sampler_override(
             forward_batch=forward_batch,
             device=real_next_tokens.device,
         )
-        if perturb_prob > 0.0:
-            forced = _maybe_perturb_tokens(
-                tokens=forced,
-                prob=perturb_prob,
-                seed=perturb_seed,
-                vocab_size=oracle.vocab_size,
-            )
+        if perturb_state.prob > 0.0:
+            forced = perturb_state.maybe_perturb(forced)
         real_next_tokens.copy_(forced)
         return real_next_tokens
 
@@ -82,36 +82,51 @@ def install_sampler_override(
     setattr(model_runner, _SAMPLE_PATCHED_ATTR, True)
 
 
-def _clamp_unit(value: float) -> float:
-    if value < 0.0:
-        return 0.0
-    if value > 1.0:
-        return 1.0
-    return value
+def _read_perturb_prob() -> float:
+    raw = envs.SGLANG_PSEUDO_INPUT_PERTURB_PROB.get()
+    if not 0.0 <= raw <= 1.0:
+        clamped = max(0.0, min(1.0, raw))
+        logger.warning(
+            "pseudo-mode: SGLANG_PSEUDO_INPUT_PERTURB_PROB %f out of [0,1]; "
+            "clamped to %f",
+            raw,
+            clamped,
+        )
+        return clamped
+    return raw
 
 
-def _maybe_perturb_tokens(
-    *,
-    tokens: torch.Tensor,
-    prob: float,
-    seed: int,
-    vocab_size: int,
-) -> torch.Tensor:
-    """Replace a random subset of ``tokens`` with an offset wrong value.
+class _PerturbState:
+    """Stateful RNG holder for the input-token perturbation self-test.
 
-    The replacement token is ``(original + 1) % vocab_size`` so the
-    perturbed value is always distinct from the oracle prediction yet
-    still in-vocab. Used by the canary self-test path to exercise
-    ``INPUT_TOKEN_MISMATCH``.
+    Holding the ``torch.Generator`` across calls (instead of rebuilding
+    it with the same seed every step) ensures the perturbation mask
+    actually advances; otherwise the same positions would be perturbed
+    every forward and the test would not exercise the canary's full
+    coverage.
     """
-    if prob <= 0.0 or tokens.numel() == 0:
-        return tokens
-    generator = torch.Generator(device=tokens.device).manual_seed(seed)
-    mask = (
-        torch.rand(tokens.shape, device=tokens.device, generator=generator) < prob
-    )
-    if not bool(mask.any()):
-        return tokens
-    perturbed = tokens.clone()
-    perturbed[mask] = (perturbed[mask] + 1) % vocab_size
-    return perturbed
+
+    __slots__ = ("prob", "vocab_size", "_seed", "_generators")
+
+    def __init__(self, *, prob: float, vocab_size: int, seed: int) -> None:
+        self.prob: float = prob
+        self.vocab_size: int = vocab_size
+        self._seed: int = seed
+        self._generators: dict = {}
+
+    def maybe_perturb(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.prob <= 0.0 or tokens.numel() == 0:
+            return tokens
+        generator = self._generators.get(tokens.device)
+        if generator is None:
+            generator = torch.Generator(device=tokens.device).manual_seed(self._seed)
+            self._generators[tokens.device] = generator
+        mask = (
+            torch.rand(tokens.shape, device=tokens.device, generator=generator)
+            < self.prob
+        )
+        if not bool(mask.any()):
+            return tokens
+        perturbed = tokens.clone()
+        perturbed[mask] = (perturbed[mask] + 1) % self.vocab_size
+        return perturbed
