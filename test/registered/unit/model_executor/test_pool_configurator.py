@@ -449,7 +449,16 @@ class TestDSAModelConfigurator(unittest.TestCase):
             )
 
     @staticmethod
-    def _device_pool_bytes(pool):
+    def _full_gpu_cache_bytes(pool):
+        kv_bytes = sum(buf[: pool.size].nbytes for buf in pool.kv_buffer)
+        index_pages = pool.size // pool.page_size
+        index_bytes = sum(
+            buf[:index_pages].nbytes for buf in pool.index_k_with_scale_buffer
+        )
+        return kv_bytes + index_bytes
+
+    @staticmethod
+    def _hisparse_device_pool_bytes(pool):
         return sum(buf.nbytes for buf in pool.kv_buffer) + sum(
             buf.nbytes for buf in pool.index_k_with_scale_buffer
         )
@@ -481,9 +490,9 @@ class TestDSAModelConfigurator(unittest.TestCase):
                 with self._pool_shape_only_allocation():
                     pool = self._make_nsa_pool(config.max_total_num_tokens)
 
-                actual_device_bytes = self._device_pool_bytes(pool)
+                actual_gpu_bytes = self._full_gpu_cache_bytes(pool)
 
-                self.assertLessEqual(actual_device_bytes, available_gpu)
+                self.assertLessEqual(actual_gpu_bytes, available_gpu)
                 self.assertEqual(config.max_total_num_tokens % self.PAGE_SIZE, 0)
 
     def test_hisparse_gpu_and_cpu_pool_fit_memory_budget(self):
@@ -509,7 +518,7 @@ class TestDSAModelConfigurator(unittest.TestCase):
                                 available_cpu,
                             )
                         if (
-                            self._device_pool_bytes(expected_device_pool)
+                            self._hisparse_device_pool_bytes(expected_device_pool)
                             > available_gpu
                         ):
                             continue
@@ -540,7 +549,9 @@ class TestDSAModelConfigurator(unittest.TestCase):
                                     available_cpu,
                                 )
 
-                            actual_gpu_bytes = self._device_pool_bytes(device_pool)
+                            actual_gpu_bytes = self._hisparse_device_pool_bytes(
+                                device_pool
+                            )
                             actual_cpu_bytes = self._host_pool_bytes(host_pool)
 
                             self.assertGreaterEqual(
