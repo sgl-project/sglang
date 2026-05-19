@@ -2431,7 +2431,7 @@ class ServerArgs:
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
+        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2448,6 +2448,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
