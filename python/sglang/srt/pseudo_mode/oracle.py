@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary_ref import splitmix64_mix
+from sglang.jit_kernel.kv_cache_canary_ref import splitmix64
 
 if TYPE_CHECKING:
     from sglang.srt.kv_cache_canary.host_state import BatchPlan
@@ -46,16 +46,21 @@ class _ReqState:
 
     ``committed_chunks`` is the number of prompt tokens already supplied
     via prior chunked-prefill forwards; it advances only when
-    :meth:`PseudoOracle.register_chunk_commit` is called. ``in_decode``
-    flips to True once the request leaves the extend phase entirely
-    (committed_chunks == len(origin_input_ids)).
+    :meth:`PseudoOracle.register_chunk_commit` is called. ``req_id_hash``
+    is the stable splitmix64 input derived from ``req_id`` once at admit
+    so ``predict_output_token`` does not rebuild a blake2b digest per
+    hot-path call.
     """
 
     origin_input_ids: List[int]
-    output_history: List[int] = field(default_factory=list)
     eos_at: int
+    req_id_hash: int
+    output_history: List[int] = field(default_factory=list)
     committed_chunks: int = 0
-    in_decode: bool = False
+
+    @property
+    def in_decode(self) -> bool:
+        return self.committed_chunks == len(self.origin_input_ids)
 
 
 class PseudoOracle:
@@ -122,6 +127,7 @@ class PseudoOracle:
         self._reqs[req_id] = _ReqState(
             origin_input_ids=list(origin_input_ids),
             eos_at=effective_eos_at,
+            req_id_hash=self._hash_req_id(req_id),
         )
 
     def register_req_pool_mapping(self, *, req_pool_idx: int, req_id: str) -> None:
@@ -138,7 +144,9 @@ class PseudoOracle:
         self._req_pool_to_id[req_pool_idx] = req_id
 
     def predict_input_token(self, *, req_id: str, position: int) -> int:
-        state = self._reqs[req_id]
+        state = self._reqs.get(req_id)
+        if state is None:
+            raise KeyError(f"pseudo-oracle: predict_input_token unknown req_id {req_id!r}")
         prefill_len = len(state.origin_input_ids)
         if position < 0:
             raise ValueError(
@@ -156,14 +164,16 @@ class PseudoOracle:
         return state.output_history[offset]
 
     def predict_output_token(self, *, req_id: str, step: int) -> int:
-        state = self._reqs[req_id]
+        state = self._reqs.get(req_id)
+        if state is None:
+            raise KeyError(f"pseudo-oracle: predict_output_token unknown req_id {req_id!r}")
         if step < 0:
             raise ValueError(
                 f"pseudo-oracle: predict_output_token {req_id!r} step {step} < 0"
             )
         if step >= state.eos_at:
             return self._eos_id
-        return self._output_token_hash(req_id=req_id, step=step) % self._vocab_size
+        return splitmix64(self._seed ^ state.req_id_hash ^ step) % self._vocab_size
 
     def predict_input_tokens_for_plan(
         self,
@@ -205,12 +215,12 @@ class PseudoOracle:
         device: torch.device,
     ) -> torch.Tensor:
         req_pool_indices = forward_batch.req_pool_indices.tolist()
-        out = torch.empty(len(req_pool_indices), dtype=torch.int64, device=device)
-        for i, req_pool_idx in enumerate(req_pool_indices):
+        values: List[int] = []
+        for req_pool_idx in req_pool_indices:
             req_id = self._req_pool_to_id[int(req_pool_idx)]
             step = len(self._reqs[req_id].output_history)
-            out[i] = self.predict_output_token(req_id=req_id, step=step)
-        return out
+            values.append(self.predict_output_token(req_id=req_id, step=step))
+        return torch.tensor(values, dtype=torch.int64, device=device)
 
     def register_chunk_commit(self, *, req_id: str, chunk_size: int) -> None:
         """Advance per-req chunk bookkeeping after a chunked-prefill step.
@@ -225,7 +235,11 @@ class PseudoOracle:
                 f"pseudo-oracle: register_chunk_commit {req_id!r} chunk_size "
                 f"{chunk_size} must be > 0"
             )
-        state = self._reqs[req_id]
+        state = self._reqs.get(req_id)
+        if state is None:
+            raise KeyError(
+                f"pseudo-oracle: register_chunk_commit unknown req_id {req_id!r}"
+            )
         new_committed = state.committed_chunks + chunk_size
         prefill_len = len(state.origin_input_ids)
         if new_committed > prefill_len:
@@ -235,17 +249,16 @@ class PseudoOracle:
                 f"only {prefill_len} tokens"
             )
         state.committed_chunks = new_committed
-        if new_committed == prefill_len:
-            state.in_decode = True
 
     def commit_step(self, *, req_id: str, output_token: int) -> None:
-        state = self._reqs[req_id]
-        if not state.in_decode and state.committed_chunks != len(state.origin_input_ids):
+        state = self._reqs.get(req_id)
+        if state is None:
+            raise KeyError(f"pseudo-oracle: commit_step unknown req_id {req_id!r}")
+        if not state.in_decode:
             raise RuntimeError(
                 f"pseudo-oracle: commit_step {req_id!r} before all prompt chunks "
                 f"committed ({state.committed_chunks}/{len(state.origin_input_ids)})"
             )
-        state.in_decode = True
         state.output_history.append(int(output_token))
 
     def finish(self, *, req_id: str) -> None:
@@ -256,6 +269,7 @@ class PseudoOracle:
         ]
         for idx in stale_pool_indices:
             del self._req_pool_to_id[idx]
+        del self._reqs[req_id]
 
     def _expected_k_req(self, *, req_id: str, is_decode: bool) -> int:
         state = self._reqs[req_id]
@@ -263,14 +277,10 @@ class PseudoOracle:
             return len(state.origin_input_ids) + len(state.output_history) - 1
         return state.committed_chunks
 
-    def _output_token_hash(self, *, req_id: str, step: int) -> int:
-        req_id_hash = self._hash_req_id(req_id)
-        chained = splitmix64_mix(
-            prev_hash=self._seed, token_id=req_id_hash, position=0
-        )
-        return splitmix64_mix(prev_hash=chained, token_id=step, position=0)
-
     @staticmethod
     def _hash_req_id(req_id: str) -> int:
+        # blake2b for a stable 8-byte digest across Python processes
+        # (PYTHONHASHSEED randomises builtin hash()); 8 bytes is the
+        # uint64 surface used by the splitmix64 finalizer downstream.
         digest = hashlib.blake2b(req_id.encode("utf-8"), digest_size=8).digest()
         return int.from_bytes(digest, byteorder="little", signed=False)

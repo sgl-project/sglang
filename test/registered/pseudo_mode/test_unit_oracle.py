@@ -1,9 +1,9 @@
 """Unit tests for :class:`PseudoOracle`.
 
-Covers each of the 10 edge cases enumerated in
-``pseudo-model-based-testing/03-oracle-contract-edge-cases.md`` plus
-the regression-protection test for the
-``expected_position == plan.write_positions`` paradox: oracle must
+Covers prefill / decode / chunked-prefill / preempt-resume / overlap /
+spec-draft-step / EOS / cross-rank determinism cases plus the
+regression-protection test for the
+``expected_position == plan.write_positions`` paradox: the oracle must
 recompute expected_position from per-req committed state, not echo
 back the planner's value.
 """
@@ -344,7 +344,8 @@ class TestLifecycleRoundTrip(unittest.TestCase):
             42,
         )
         oracle.finish(req_id="r0")
-        # _req_pool_to_id mapping is cleared; history retained for post-mortem.
+        # Both the pool mapping and the per-req state are dropped on
+        # finish so long-running servers don't accumulate dead reqs.
         with self.assertRaises(KeyError):
             oracle.predict_next_tokens_for_active_batch(
                 forward_batch=_StubForwardBatch(
@@ -353,13 +354,23 @@ class TestLifecycleRoundTrip(unittest.TestCase):
                 ),
                 device=torch.device("cpu"),
             )
-        # History is still readable through predict_input_token.
+        with self.assertRaises(KeyError):
+            oracle.predict_input_token(req_id="r0", position=3)
+
+    def test_readmit_after_finish_works(self) -> None:
+        oracle = _make_oracle()
+        _admit_simple(oracle, req_id="r0", prompt=[1, 2, 3], req_pool_idx=7)
+        oracle.register_chunk_commit(req_id="r0", chunk_size=3)
+        oracle.commit_step(req_id="r0", output_token=42)
+        oracle.finish(req_id="r0")
+        _admit_simple(oracle, req_id="r0", prompt=[9, 8, 7], req_pool_idx=11)
+        oracle.register_chunk_commit(req_id="r0", chunk_size=3)
         self.assertEqual(
-            oracle.predict_input_token(req_id="r0", position=3),
-            42,
+            oracle.predict_input_token(req_id="r0", position=0),
+            9,
         )
 
-    def test_double_admit_raises(self) -> None:
+    def test_double_admit_without_finish_raises(self) -> None:
         oracle = _make_oracle()
         _admit_simple(oracle, req_id="r0", prompt=[1])
         with self.assertRaises(ValueError):
