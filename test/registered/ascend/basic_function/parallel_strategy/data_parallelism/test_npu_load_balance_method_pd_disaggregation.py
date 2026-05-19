@@ -92,7 +92,9 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env={"TRANSFORMERS_VERBOSITY": "error",}
+            env={
+                "TRANSFORMERS_VERBOSITY": "error",
+            }
         )
 
     @classmethod
