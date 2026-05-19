@@ -2146,6 +2146,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -2178,9 +2179,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    server_args.disaggregation_mode,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
