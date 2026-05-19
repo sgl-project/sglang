@@ -44,9 +44,9 @@ class CanaryConfig:
             per forward — canary itself knows no oracle.
         perturb_req_to_token_prob: For canary self-test only. 0 = disabled; positive (e.g. 1e-4) = each
             forward step has this probability of trampling a random req_to_token entry to drive a violation.
-            Reads from SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN env var if not set explicitly.
+            Reads from SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB env var if not set explicitly.
         perturb_real_kv_prob: Same as above but trampling real KV bytes (only meaningful when
-            real_kv_hash_mode != OFF). Reads from SGLANG_KV_CANARY_PERTURB_REAL_KV if not set.
+            real_kv_hash_mode != OFF). Reads from SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB if not set.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
         allreduce_violation_signal: True = end-of-step pump performs cross-rank allreduce on the local
@@ -90,8 +90,8 @@ class CanaryConfig:
             sweep_every_n_steps=envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get(),
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             input_check_mode=CanaryInputCheckMode[input_check_raw],
-            perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN.get(),
-            perturb_real_kv_prob=envs.SGLANG_KV_CANARY_PERTURB_REAL_KV.get(),
+            perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
+            perturb_real_kv_prob=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get(),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
             allreduce_violation_signal=envs.SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL.get(),
         )

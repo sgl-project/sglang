@@ -84,7 +84,7 @@ class TestRealDataBit(_MhaFullBase, unittest.TestCase):
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
         "--kv-cache-canary-real-data",
-        "portion",
+        "bit",
     ]
 
     def test_real_data_bit(self) -> None:
