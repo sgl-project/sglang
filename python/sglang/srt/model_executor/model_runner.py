@@ -2705,9 +2705,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _install_pseudo_mode(self) -> None:
         """Construct the oracle, attach the model-runner-side hooks.
 
-        Scheduler-side hooks (admit / commit / finish) are wired by
-        :func:`sglang.srt.pseudo_mode.install.install_scheduler_hooks`
-        from the Scheduler constructor once the tp_worker reports back.
+        Scheduler-side hooks (admit / commit / finish) are wired by the
+        scheduler later via a second call to ``install_on_model_runner``
+        with ``scheduler=self`` from ``Scheduler._install_pseudo_mode_scheduler_hooks``.
         We stash the oracle on ``self.pseudo_oracle`` for the scheduler
         to pick up.
         """
@@ -2715,10 +2715,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.pseudo_mode.oracle import PseudoOracle
 
         eos_ids = self.model_config.hf_eos_token_id
-        eos_id = next(iter(eos_ids)) if eos_ids else 0
+        if not eos_ids:
+            raise RuntimeError(
+                "enable_pseudo_mode requires the model to advertise at least "
+                "one EOS token id; model_config.hf_eos_token_id is empty"
+            )
+        # Lowest id is a deterministic, model-agnostic pick when the
+        # config exposes multiple EOS tokens. Multi-EOS models will
+        # never emit any non-lowest one under pseudo-mode (the oracle
+        # decides when to fire EOS), so dropping the rest is sound.
+        eos_id = min(int(x) for x in eos_ids)
         self.pseudo_oracle = PseudoOracle(
             vocab_size=int(self.model_config.vocab_size),
-            eos_id=int(eos_id),
+            eos_id=eos_id,
         )
         install_on_model_runner(
             model_runner=self,
