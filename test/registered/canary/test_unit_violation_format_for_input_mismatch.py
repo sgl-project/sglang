@@ -16,8 +16,19 @@ from __future__ import annotations
 import unittest
 
 from sglang.jit_kernel.kv_cache_canary import (
+    _VIOLATION_FIELD_ACTUAL_HASH,
+    _VIOLATION_FIELD_EXPECTED_HASH,
+    _VIOLATION_FIELD_EXPECTED_POSITION,
+    _VIOLATION_FIELD_EXPECTED_REQ_ID,
+    _VIOLATION_FIELD_FAIL_REASON,
+    _VIOLATION_FIELD_KERNEL_KIND,
+    _VIOLATION_FIELD_POSITION,
+    _VIOLATION_FIELD_REQ_ID,
+    _VIOLATION_FIELD_SLOT_IDX,
+    _VIOLATION_FIELD_TOKEN_ID,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
+    VIOLATION_FIELDS,
     FailReason,
 )
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
@@ -39,18 +50,20 @@ def _make_row(
     expected_req_id: int = 0,
     expected_position: int = 0,
 ) -> list[int]:
-    return [
-        kernel_kind,
-        fail_reason,
-        slot_idx,
-        req_id,
-        token_id,
-        position,
-        expected_hash,
-        actual_hash,
-        expected_req_id,
-        expected_position,
-    ]
+    # Build by field-offset index so a layout change in
+    # _VIOLATION_FIELD_* surfaces here at test time, not in the kernel.
+    row = [0] * VIOLATION_FIELDS
+    row[_VIOLATION_FIELD_KERNEL_KIND] = kernel_kind
+    row[_VIOLATION_FIELD_FAIL_REASON] = fail_reason
+    row[_VIOLATION_FIELD_SLOT_IDX] = slot_idx
+    row[_VIOLATION_FIELD_REQ_ID] = req_id
+    row[_VIOLATION_FIELD_TOKEN_ID] = token_id
+    row[_VIOLATION_FIELD_POSITION] = position
+    row[_VIOLATION_FIELD_EXPECTED_HASH] = expected_hash
+    row[_VIOLATION_FIELD_ACTUAL_HASH] = actual_hash
+    row[_VIOLATION_FIELD_EXPECTED_REQ_ID] = expected_req_id
+    row[_VIOLATION_FIELD_EXPECTED_POSITION] = expected_position
+    return row
 
 
 class TestFormatViolationInputTokenMismatch(unittest.TestCase):
