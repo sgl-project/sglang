@@ -20,7 +20,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_cpu, cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -83,7 +83,7 @@ class WhisperAttention(torch.nn.Module):
         self.attn = RadixAttention(
             self.num_heads,
             head_dim,
-            scaling=1.0,
+            scaling=self.scaling,
             num_kv_heads=self.num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -104,7 +104,6 @@ class WhisperAttention(torch.nn.Module):
         if self.is_cross_attention:
             # Cross-attention: KV cached during prefill, read from pool during decode.
             q, _ = self.q_proj(hidden_states)
-            q = q * self.scaling
             if cross_hidden_states is not None:
                 kv, _ = self.kv_proj(cross_hidden_states)
                 k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
@@ -115,23 +114,55 @@ class WhisperAttention(torch.nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
-            q = q * self.scaling
 
             if self.is_encoder:
                 num_heads = self.attn.tp_q_head_num
                 head_dim = self.attn.head_dim
                 batch_size, seq_len, _ = hidden_states.shape
+                if _is_cpu and _is_amx_available:
+                    # reshape to [total_tokens, num_heads, head_dim] for flash_attn_varlen_func
+                    q = q.reshape(batch_size * seq_len, num_heads, head_dim)
+                    k = k.reshape(batch_size * seq_len, num_heads, head_dim)
+                    v = v.reshape(batch_size * seq_len, num_heads, head_dim)
 
-                q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-                k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-                v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+                    seqlens = torch.arange(
+                        0,
+                        (batch_size + 1) * seq_len,
+                        step=seq_len,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    attn_output = torch.ops.sgl_kernel.flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q=seqlens,
+                        cu_seqlens_k=seqlens,
+                        max_seqlen_q=seq_len,
+                        max_seqlen_k=seq_len,
+                        causal=False,
+                    )
+                    # reshape back to [batch_size, seq_len, num_heads * head_dim]
+                    attn_output = attn_output.reshape(
+                        batch_size, seq_len, num_heads * head_dim
+                    )
+                else:
+                    q = q.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
+                    k = k.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
+                    v = v.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
 
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, scale=1.0
-                )
-                attn_output = attn_output.permute(0, 2, 1, 3).reshape(
-                    batch_size, seq_len, num_heads * head_dim
-                )
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, scale=self.scaling
+                    )
+                    attn_output = attn_output.permute(0, 2, 1, 3).reshape(
+                        batch_size, seq_len, num_heads * head_dim
+                    )
             else:
                 attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=True)
 
