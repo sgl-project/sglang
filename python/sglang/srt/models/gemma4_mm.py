@@ -56,7 +56,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel
+from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -181,15 +181,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
 
-        # KV sharing in the language model can't span PP stages — refuse early.
         text_config = config.text_config
-        num_kv_shared = getattr(text_config, "num_kv_shared_layers", 0)
-        if num_kv_shared > 0 and self.pp_group.world_size > 1:
-            raise ValueError(
-                "Pipeline parallelism is not supported for Gemma4 models with "
-                f"num_kv_shared_layers > 0 (got {num_kv_shared}); KV sharing "
-                "creates inter-stage dependencies on the KV cache."
-            )
 
         prefix = add_prefix("model", prefix)
 
@@ -833,9 +825,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 full = f"{mod_name}.{buf_name}" if mod_name else buf_name
                 non_persistent_buffers.add(full)
 
-        pp_world_size = self.pp_group.world_size
-        is_first_rank = self.pp_group.is_first_rank
-        is_last_rank = self.pp_group.is_last_rank
         text_tie = getattr(self.config.text_config, "tie_word_embeddings", True)
         start_layer = self.language_model.start_layer
         end_layer = self.language_model.end_layer
@@ -852,53 +841,28 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
             name = re.sub(r"^model\.", "", name)
 
-            # PP filtering: each rank only owns a slice of the language model
-            # plus a subset of the multimodal-encoder / embedding modules.
-            if pp_world_size > 1:
-                # Layer-id filter for transformer layers.
-                if "language_model.layers." in name:
-                    m_layer = re.search(r"language_model\.layers\.(\d+)\.", name)
-                    if m_layer is not None:
-                        lid = int(m_layer.group(1))
-                        if lid < start_layer or lid >= end_layer:
-                            continue
-
-                # Vision/audio encoders + their embedders only on first rank.
-                if not is_first_rank and (
-                    "vision_tower." in name
-                    or "embed_vision." in name
-                    or "audio_tower." in name
-                    or "embed_audio." in name
-                ):
-                    continue
-
-                # Tied embed → lm_head routing on the last rank.
-                if (
-                    text_tie
-                    and is_last_rank
-                    and name == "language_model.embed_tokens.weight"
-                ):
-                    head_param = params_dict.get("lm_head.weight")
-                    if head_param is not None:
-                        wl = getattr(head_param, "weight_loader", default_weight_loader)
-                        wl(head_param, loaded_weight)
-                        loaded_params.add("lm_head.weight")
-                    continue
-
-                # Embedding-side modules live on the first rank only.
-                if not is_first_rank and (
-                    "language_model.embed_tokens" in name
-                    or "language_model.per_layer_model_projection" in name
-                    or "language_model.per_layer_projection_norm" in name
-                ):
-                    continue
-
-                # Final norm and lm_head live on the last rank only.
-                if not is_last_rank and (
-                    name.startswith("language_model.norm.")
-                    or name.startswith("lm_head.")
-                ):
-                    continue
+            if pp_filter_load_weight(
+                name,
+                loaded_weight,
+                pp_group=self.pp_group,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                params_dict=params_dict,
+                loaded_params=loaded_params,
+                tie_word_embeddings=text_tie,
+                embed_weight_name="language_model.embed_tokens.weight",
+                first_rank_only_patterns=(
+                    "language_model.embed_tokens",
+                    "language_model.per_layer_model_projection",
+                    "language_model.per_layer_projection_norm",
+                    "vision_tower.",
+                    "embed_vision.",
+                    "audio_tower.",
+                    "embed_audio.",
+                ),
+                last_rank_only_prefixes=("language_model.norm.", "lm_head."),
+            ):
+                continue
 
             # HF has router.per_expert_scale and experts.* on the decoder layer;
             # remap into our moe.* subtree since Gemma4MoE owns both.
@@ -1072,6 +1036,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return self.language_model.embed_tokens.weight
 
     def get_embed_and_head(self):
+        if self.pp_group.world_size > 1:
+            # Under PP, embed_tokens lives on the first rank and lm_head on the
+            # last; neither rank holds both tensors, so we can't return the
+            # pair locally without a cross-stage gather.  Callers (RL weight
+            # sync, remote weight loader) currently assume a single-rank view —
+            # fail loudly rather than dereference a PPMissingLayer.
+            raise NotImplementedError(
+                "get_embed_and_head() is not implemented for Gemma4 "
+                "multimodal under pipeline parallelism. embed_tokens lives "
+                "on the first PP rank and lm_head on the last; use "
+                "--pp-size 1 if you need this API."
+            )
         embed = self.language_model.embed_tokens.weight
         # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
         return embed, embed

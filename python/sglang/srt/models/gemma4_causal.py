@@ -70,6 +70,59 @@ Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
 
 
+def pp_filter_load_weight(
+    name,
+    loaded_weight,
+    *,
+    pp_group,
+    start_layer,
+    end_layer,
+    params_dict,
+    loaded_params,
+    tie_word_embeddings,
+    embed_weight_name,
+    first_rank_only_patterns=(),
+    last_rank_only_prefixes=(),
+    head_param_name="lm_head.weight",
+):
+    """Shared PP filter for Gemma4 load_weights paths.
+
+    Returns True if the caller should ``continue`` (handled or skipped),
+    False otherwise.  No-op when ``pp_group.world_size == 1``.
+
+    Handles three concerns in order:
+      1. Drop transformer-layer weights outside [start_layer, end_layer).
+      2. Route the tied ``embed_tokens.weight`` to ``lm_head`` on the last
+         rank (under PP, embed and lm_head live on different ranks so they
+         can't be tied via module aliasing).
+      3. Skip rank-local module weights on the wrong rank.
+    """
+    if pp_group.world_size <= 1:
+        return False
+
+    layer_id = get_layer_id(name)
+    if layer_id is not None and (layer_id < start_layer or layer_id >= end_layer):
+        return True
+
+    if tie_word_embeddings and pp_group.is_last_rank and name == embed_weight_name:
+        head_param = params_dict.get(head_param_name)
+        if head_param is not None:
+            wl = getattr(head_param, "weight_loader", default_weight_loader)
+            wl(head_param, loaded_weight)
+            loaded_params.add(head_param_name)
+        return True
+
+    if not pp_group.is_first_rank and any(p in name for p in first_rank_only_patterns):
+        return True
+
+    if not pp_group.is_last_rank and any(
+        name.startswith(p) for p in last_rank_only_prefixes
+    ):
+        return True
+
+    return False
+
+
 class Gemma4Router(nn.Module):
     """Router for Gemma4 MoE that preprocesses input before projection.
 
@@ -689,6 +742,28 @@ class Gemma4TextModel(PreTrainedModel):
             getattr(config, "vocab_size_per_layer_input", None) or config.vocab_size
         )
 
+        # PLE-enabled variants (E2B/E4B) forward `per_layer_inputs` through
+        # the PP proxy, but cuda_graph_runner hardcodes the proxy schema to
+        # {hidden_states, residual} and silently drops any extra keys at
+        # replay time.  Empirically this corrupts E4B output to garbage on
+        # non-first PP ranks (eager path produces correct output and
+        # GSM8K ~0.92, cuda-graph path emits token soup).  Refuse the
+        # combination until the runner becomes schema-aware; users can run
+        # PP + PLE eagerly with --disable-cuda-graph.
+        if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
+            sa = get_global_server_args()
+            if sa is not None and not sa.disable_cuda_graph:
+                raise ValueError(
+                    "Pipeline parallelism is currently incompatible with "
+                    "per-layer-input (PLE) embeddings under CUDA graph: "
+                    "the runner's PP proxy schema is hardcoded to "
+                    "{hidden_states, residual} and silently drops "
+                    "per_layer_inputs, corrupting per-layer contributions on "
+                    "non-first PP ranks. Workarounds: (a) pass "
+                    "--disable-cuda-graph to fall back to eager replay, or "
+                    "(b) use tensor parallelism (--tp-size) instead of PP."
+                )
+
         if self.pp_group.is_first_rank:
             self.embed_tokens = Gemma4TextScaledWordEmbedding(
                 config.vocab_size,
@@ -965,18 +1040,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
 
-        # KV sharing makes a late layer's attention read the cache produced by
-        # an earlier layer; with PP those layers can sit on different stages,
-        # which the runtime can't service across pipeline boundaries.  Refuse
-        # the combination up front rather than silently corrupting outputs.
-        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-        if num_kv_shared > 0 and self.pp_group.world_size > 1:
-            raise ValueError(
-                "Pipeline parallelism is not supported for Gemma4 models with "
-                f"num_kv_shared_layers > 0 (got {num_kv_shared}); KV sharing "
-                "creates inter-stage dependencies on the KV cache."
-            )
-
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1095,12 +1158,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 full = f"{mod_name}.{buf_name}" if mod_name else buf_name
                 non_persistent_buffers.add(full)
 
-        pp_world_size = self.pp_group.world_size
-        is_first_rank = self.pp_group.is_first_rank
-        is_last_rank = self.pp_group.is_last_rank
-        start_layer = self.model.start_layer
-        end_layer = self.model.end_layer
-
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             name = name.replace("model.language_model.", "model.")
@@ -1111,45 +1168,24 @@ class Gemma4ForCausalLM(PreTrainedModel):
             if ".experts." in name and ".moe.experts." not in name:
                 name = name.replace(".experts.", ".moe.experts.")
 
-            # PP filtering: each rank only owns a slice of the layer stack and
-            # a subset of the stage-local components.
-            if pp_world_size > 1:
-                layer_id = get_layer_id(name)
-                if layer_id is not None and (
-                    layer_id < start_layer or layer_id >= end_layer
-                ):
-                    continue
-
-                # tie_word_embeddings under PP: the only consumer of
-                # `model.embed_tokens.weight` on the last rank is `lm_head`,
-                # so route the tensor there directly.
-                if (
-                    self.config.tie_word_embeddings
-                    and is_last_rank
-                    and name == "model.embed_tokens.weight"
-                ):
-                    head_param = params_dict.get("lm_head.weight")
-                    if head_param is not None:
-                        weight_loader = getattr(
-                            head_param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(head_param, loaded_weight)
-                        loaded_params.add("lm_head.weight")
-                    continue
-
-                # Embedding-side modules live on the first rank only.
-                if not is_first_rank and (
-                    "embed_tokens" in name
-                    or "per_layer_model_projection" in name
-                    or "per_layer_projection_norm" in name
-                ):
-                    continue
-
-                # Final norm + lm_head live on the last rank only.
-                if not is_last_rank and (
-                    name.startswith("model.norm.") or name.startswith("lm_head.")
-                ):
-                    continue
+            if pp_filter_load_weight(
+                name,
+                loaded_weight,
+                pp_group=self.pp_group,
+                start_layer=self.model.start_layer,
+                end_layer=self.model.end_layer,
+                params_dict=params_dict,
+                loaded_params=loaded_params,
+                tie_word_embeddings=self.config.tie_word_embeddings,
+                embed_weight_name="model.embed_tokens.weight",
+                first_rank_only_patterns=(
+                    "embed_tokens",
+                    "per_layer_model_projection",
+                    "per_layer_projection_norm",
+                ),
+                last_rank_only_prefixes=("model.norm.", "lm_head."),
+            ):
+                continue
 
             # attention_k_eq_v: full-attention layers have no v_proj in the
             # checkpoint (K and V share weights).  When we see a k_proj weight
@@ -1249,6 +1285,19 @@ class Gemma4ForCausalLM(PreTrainedModel):
         return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self):
+        if self.pp_group.world_size > 1:
+            # Under PP, embed_tokens lives on the first rank and lm_head on
+            # the last; neither rank holds both tensors, so we can't return
+            # the pair locally without a cross-stage gather.  Callers (RL
+            # weight sync, remote weight loader) currently assume a
+            # single-rank view — fail loudly rather than dereference a
+            # PPMissingLayer.
+            raise NotImplementedError(
+                "get_embed_and_head() is not implemented for Gemma4ForCausalLM "
+                "under pipeline parallelism. embed_tokens lives on the first "
+                "PP rank and lm_head on the last; use --pp-size 1 if you "
+                "need this API."
+            )
         embed = self._shard_weight(self.model.embed_tokens.weight)
         head = self._shard_weight(self.lm_head.weight)
         return embed, head
