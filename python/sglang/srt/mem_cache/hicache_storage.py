@@ -29,6 +29,7 @@ class HiCacheStorageConfig:
     enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    model_identity_hash: Optional[str] = None
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
@@ -324,8 +325,11 @@ class HiCacheFile(HiCacheStorage):
             storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
+        identity_hash = storage_config.model_identity_hash or ""
         enable_pp = pp_size > 1
         self.config_suffix = f"_{model_name}"
+        if identity_hash:
+            self.config_suffix += f"_{identity_hash}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:

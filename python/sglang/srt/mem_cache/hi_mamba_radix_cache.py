@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
+from sglang.srt.mem_cache.hiradix_cache import compute_model_identity_hash
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
@@ -139,6 +140,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
+        self._model_identity_hash = compute_model_identity_hash(server_args)
         attach_hybrid_pool_to_mamba_cache(
             self,
             params,
@@ -1345,6 +1347,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=served_model_name,
+                model_identity_hash=self._model_identity_hash,
                 storage_backend_extra_config=extra_config,
                 host_pools=self.host_pool_group.entries,
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import heapq
 import json
 import logging
@@ -65,6 +66,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def compute_model_identity_hash(server_args: ServerArgs) -> str:
+    """Compute a short hash that uniquely identifies the model and KV layout.
+
+    Incorporates model_path, revision, dtype, quantization, and kv_cache_dtype
+    so that HiCache storage files written by one model configuration cannot be
+    silently reloaded by an incompatible configuration sharing the same
+    served_model_name.
+    """
+    identity_parts = [
+        os.path.normpath(server_args.model_path) if server_args.model_path else "",
+        server_args.revision or "",
+        (server_args.dtype or "auto").lower(),
+        server_args.quantization or "",
+        (server_args.kv_cache_dtype or "auto").lower(),
+    ]
+    identity_str = "|".join(identity_parts)
+    return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
+
+
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -122,6 +142,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
+        self._model_identity_hash = compute_model_identity_hash(server_args)
         if isinstance(self.kv_cache, NSATokenToKVPool):
             attach_hybrid_nsa_pool_to_hiradix_cache(
                 self,
@@ -148,6 +169,7 @@ class HiRadixCache(RadixCache):
                 storage_backend=server_args.hicache_storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=server_args.served_model_name,
+                model_identity_hash=self._model_identity_hash,
                 storage_backend_extra_config=extra_config,
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
@@ -359,6 +381,7 @@ class HiRadixCache(RadixCache):
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=served_model_name,
+                model_identity_hash=self._model_identity_hash,
                 storage_backend_extra_config=extra_config,
                 **self._get_hybrid_storage_attach_kwargs(),
             )

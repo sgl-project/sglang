@@ -195,20 +195,25 @@ class HiCacheSiMM(HiCacheStorage):
                 self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
+                self.model_identity_hash = storage_config.model_identity_hash or ""
             else:
                 self.model_name = ""
                 self.is_mla_backend = False
                 self.local_rank = 0
                 self.pp_rank = 0
                 self.pp_size = 1
+                self.model_identity_hash = ""
 
             self.enable_pp = self.pp_size > 1
+            identity_suffix = (
+                f"_{self.model_identity_hash}" if self.model_identity_hash else ""
+            )
             if self.enable_pp:
-                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-                self.mla_suffix = f"{self.pp_rank}"
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}{identity_suffix}"
+                self.mla_suffix = f"{self.pp_rank}{identity_suffix}"
             else:
-                self.mha_suffix = f"{self.local_rank}"
-                self.mla_suffix = ""
+                self.mha_suffix = f"{self.local_rank}{identity_suffix}"
+                self.mla_suffix = identity_suffix.lstrip("_") if identity_suffix else ""
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)

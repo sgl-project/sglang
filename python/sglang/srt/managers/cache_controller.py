@@ -256,11 +256,13 @@ class HiCacheController:
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
+        model_identity_hash: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
     ):
+        self.model_identity_hash = model_identity_hash
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
@@ -331,6 +333,7 @@ class HiCacheController:
                     storage_backend=storage_backend,
                     prefetch_threshold=prefetch_threshold,
                     model_name=model_name,
+                    model_identity_hash=model_identity_hash,
                     storage_backend_extra_config=storage_backend_extra_config,
                 )
             except ValueError as e:
@@ -457,6 +460,7 @@ class HiCacheController:
         storage_backend: str,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
+        model_identity_hash: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
         """Attach (enable) storage backend at runtime.
@@ -483,7 +487,7 @@ class HiCacheController:
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
+            model_name, storage_backend_extra_config, model_identity_hash
         )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
@@ -602,6 +606,7 @@ class HiCacheController:
         self,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        model_identity_hash: Optional[str] = None,
     ):
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
@@ -644,6 +649,7 @@ class HiCacheController:
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            model_identity_hash=model_identity_hash or self.model_identity_hash,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
