@@ -3770,16 +3770,28 @@ class ServerArgs:
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1"),
+                OR a JSON per-GPU mapping (e.g., '{"0":"mlx5_4","1":"mlx5_5"}'),
+                OR a path to a .json file containing such a mapping.
+                JSON forms are parsed downstream by get_ib_devices_for_gpu()
+                in mooncake_transfer_engine.py.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            Validated device string, or None if input is None.
         """
         if device_str is None:
             logger.warning(
                 "No IB devices specified for Mooncake backend, falling back to auto discovery."
             )
             return None
+
+        # Pass through JSON per-GPU mappings and .json file paths unchanged.
+        # get_ib_devices_for_gpu() in mooncake_transfer_engine.py already
+        # supports these formats for per-GPU rail alignment on multi-rail
+        # fabrics where GPU indices don't match NIC indices.
+        stripped = device_str.strip()
+        if stripped.startswith("{") or stripped.endswith(".json"):
+            return device_str
 
         # Strip whitespace from device names
         devices = [d.strip() for d in device_str.split(",") if d.strip()]
