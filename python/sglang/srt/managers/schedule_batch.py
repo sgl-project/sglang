@@ -56,6 +56,9 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -2229,16 +2232,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
-        total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
-        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
-
         new_estimate_ratio = (
-            total_decoded_tokens
-            + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / (
-            total_max_new_tokens + 1
-        )  # avoid zero division
-        new_estimate_ratio = min(1.0, new_estimate_ratio)
+            NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
+        )
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
