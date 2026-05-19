@@ -116,6 +116,25 @@ class TpWorkerServer:
         # Cached GPU-resident batch for the decode fast path (M_DECODE_STEP).
         # Set after every decode M_FORWARD_GENERATION; cleared on non-decode.
         self._decode_cache: Optional["ModelWorkerBatch"] = None
+        # FutureMap-style GPU-resident future slots — the wire contract for
+        # cross-process 2-ahead pipelined decode. Keyed by an integer slot id
+        # the scheduler chooses; value is the GPU ``next_token_ids`` tensor
+        # sampled at that step.
+        #
+        # When the scheduler sends ``input_slot`` in a decode control message,
+        # the worker reads ``input_ids`` from this map instead of expecting
+        # them in the payload — so the scheduler can send batch N+1 without
+        # waiting for batch N's reply.
+        #
+        # The active Python event loop (``event_loop_pipelined``) is 1-ahead
+        # and never sets these fields, so the map stays empty in practice.
+        # The Rust scheduler (in progress) is expected to set them and drive
+        # 2-ahead pipelining from across the IPC boundary.
+        #
+        # All GPU reads / writes here ride the default CUDA stream, so the
+        # natural in-order semantics give us correct "store-then-read"
+        # ordering between consecutive decode steps without explicit syncs.
+        self._future_tokens: dict = {}
 
     # ------------------------------------------------------------------
     # Startup
@@ -474,7 +493,16 @@ class TpWorkerServer:
             mr.token_to_kv_pool_allocator.free(indices_to_free.to(device))
 
         # 2. Update per-step delta fields (move to GPU device).
-        batch.input_ids = payload["input_ids"].to(device, non_blocking=True)
+        # ``input_slot`` is the 2-ahead pipeline contract (active when a Rust
+        # scheduler drives the loop): scheduler sends N+1 before recv'ing N,
+        # references N's output_slot here, and we resolve input_ids from the
+        # GPU buffer the previous step's sampling wrote. Same default CUDA
+        # stream ⇒ correct store/read ordering. Each slot is consumed once.
+        input_slot = payload.get("input_slot")
+        if input_slot is not None:
+            batch.input_ids = self._future_tokens.pop(input_slot)
+        else:
+            batch.input_ids = payload["input_ids"].to(device, non_blocking=True)
         batch.seq_lens = payload["seq_lens"].to(device, non_blocking=True)
         batch.seq_lens_cpu = payload["seq_lens_cpu"]          # stays on CPU
         batch.orig_seq_lens = payload["orig_seq_lens"].to(device, non_blocking=True)
@@ -536,6 +564,15 @@ class TpWorkerServer:
             result = w.forward_batch_generation(batch)
             forward_batch_time = time.perf_counter()
             result.deferred_alloc = batch._deferred_alloc
+            # FutureMap contract: if the scheduler asked us to publish this
+            # step's sampled tokens at a slot, capture the GPU reference
+            # before D2H. Keeping it in self._future_tokens prevents the
+            # caching allocator from reclaiming the GPU tensor between
+            # steps. The CPU copy below builds a separate tensor that goes
+            # back to the scheduler on the wire; both coexist.
+            output_slot = payload.get("output_slot")
+            if output_slot is not None and result.next_token_ids is not None:
+                self._future_tokens[output_slot] = result.next_token_ids
             _drop_ipc_unsafe_logits(result.logits_output, batch)
             _move_generation_result_to_cpu(result)
             slim_result = _build_slim_reply(result, batch)

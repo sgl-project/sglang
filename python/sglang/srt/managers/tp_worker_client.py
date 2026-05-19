@@ -553,12 +553,28 @@ class TpWorkerClientGroup(BaseTpWorker):
             )
         return slim
 
-    def _build_decode_control(self, batch: "ModelWorkerBatch") -> dict:
+    def _build_decode_control(
+        self,
+        batch: "ModelWorkerBatch",
+        *,
+        input_slot: Optional[int] = None,
+        output_slot: Optional[int] = None,
+    ) -> dict:
         """Extract the delta fields needed for a decode_step control message.
 
         Only fields that change between consecutive decode steps are included.
         Stable fields (req_pool_indices, lora_ids, forward_mode, etc.) remain
         on the GPU worker from the cached batch.
+
+        FutureMap wire contract — for 2-ahead pipelined decode driven from a
+        Rust scheduler:
+        - ``input_slot``: the worker resolves input_ids from its GPU future
+          slots at this slot id, ignoring the payload's input_ids field.
+          Use when the previous batch's sampled tokens haven't been
+          recv'd yet.
+        - ``output_slot``: the worker stores this step's sampled tokens at
+          this slot id so the *next* step can refer to them by slot.
+        Active Python event loops never pass these; the Rust scheduler will.
         """
         si = batch.sampling_info
         # Include sampling_info only when penalties or grammars are active;
@@ -574,7 +590,10 @@ class TpWorkerClientGroup(BaseTpWorker):
         if itf is not None and torch.is_tensor(itf) and itf.numel() == 0:
             itf = None
         control = {
-            "input_ids": batch.input_ids,
+            # When input_slot is set the worker ignores this and reads from
+            # its future-slots dict instead. Sending None here saves the
+            # pickle of a tensor that's about to be discarded.
+            "input_ids": None if input_slot is not None else batch.input_ids,
             "seq_lens": batch.seq_lens,
             "seq_lens_cpu": batch.seq_lens_cpu,
             "orig_seq_lens": batch.orig_seq_lens,
@@ -589,6 +608,12 @@ class TpWorkerClientGroup(BaseTpWorker):
             "global_num_tokens": batch.global_num_tokens,
             "global_num_tokens_for_logprob": batch.global_num_tokens_for_logprob,
         }
+        # FutureMap fields; omitted when None so the wire stays small and
+        # the worker's payload.get(...) returns None by default.
+        if input_slot is not None:
+            control["input_slot"] = input_slot
+        if output_slot is not None:
+            control["output_slot"] = output_slot
         return control
 
     # ------------------------------------------------------------------
@@ -656,16 +681,26 @@ class TpWorkerClientGroup(BaseTpWorker):
         pp_proxy_tensors=None,
         is_verify: bool = False,
         skip_attn_backend_init: bool = False,
+        input_slot: Optional[int] = None,
+        output_slot: Optional[int] = None,
     ):
         """Send the forward request and return a handle for the matching wait.
 
-        Returns a tuple ``(send_t0, is_decode_fast, fingerprint_to_install)``.
-        The caller passes this to ``forward_batch_generation_wait``.
+        ``input_slot`` / ``output_slot`` (decode fast path only) plumb the
+        FutureMap contract — see ``_build_decode_control``. Pass either or
+        both when driving the 2-ahead pipeline; leave both ``None`` for the
+        normal 1-ahead overlap (current Python default).
+
+        Returns a tuple ``(send_t0, is_decode_fast, fingerprint, kind)``.
         """
         if model_worker_batch.forward_mode.is_decode():
             fp = self._req_pool_fingerprint(model_worker_batch)
             if self._decode_fast_valid and self._batch_composition_unchanged_fp(fp):
-                control = self._build_decode_control(model_worker_batch)
+                control = self._build_decode_control(
+                    model_worker_batch,
+                    input_slot=input_slot,
+                    output_slot=output_slot,
+                )
                 send_t0 = self._fanout_send_only(M_DECODE_STEP, **control)
                 return (send_t0, True, fp, "fast")
             send_t0 = self._fanout_send_only(
