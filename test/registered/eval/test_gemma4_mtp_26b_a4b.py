@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=720, suite="nightly-eval-text-2-gpu", nightly=True)
+register_cuda_ci(est_time=720, stage="extra-a", runner_config="2-gpu-large")
 
 MODEL_NAME = "26B-A4B"
 TARGET_PATH = "google/gemma-4-26B-A4B-it"
