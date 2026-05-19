@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,24 +40,27 @@ class LayerTransferCounter:
 
     The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
     translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided CUDA stream.
+    within the provided device stream (when available).
     """
 
     def __init__(
         self,
         num_layers: int,
-        load_stream: torch.cuda.Stream,
+        load_stream,
+        load_stream_ctx,
         lmc_connector: LMCacheLayerwiseConnector,
         printable: bool = False,
     ):
         self.num_layers = num_layers
         self.load_stream = load_stream
+        self.load_stream_ctx = load_stream_ctx
         self.lmc_connector = lmc_connector
 
     def wait_until(self, layer_id: int):
         # Ensure ordering of the async loads wrt compute stream(s).
-        self.load_stream.synchronize()
-        with self.load_stream:
+        if self.load_stream is not None:
+            self.load_stream.synchronize()
+        with self.load_stream_ctx:
             self.lmc_connector.load_kv_layerwise(layer_id)
 
 
@@ -65,7 +69,7 @@ class LMCRadixCache(RadixCache):
 
     This subclass adds:
       - LMCache connector setup (device/host buffers, TP rank/size)
-      - Two CUDA streams for async load/store
+        - Two device streams for async load/store (when supported)
       - Layer-wise transfer executor wiring to the KV cache
       - Overridden `match_prefix` to fetch missing prefix chunks from LMCache
       - Extended cache_finalization paths to store back into LMCache
@@ -103,14 +107,24 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        device_module = torch.get_device_module(self.device)
+        if hasattr(device_module, "Stream") and hasattr(device_module, "stream"):
+            self.load_stream = device_module.Stream()
+            self.store_stream = device_module.Stream()
+            self.load_stream_ctx = device_module.stream(self.load_stream)
+            self.store_stream_ctx = device_module.stream(self.store_stream)
+        else:
+            self.load_stream = None
+            self.store_stream = None
+            self.load_stream_ctx = nullcontext()
+            self.store_stream_ctx = nullcontext()
 
         self.layer_done_executor = LayerTransferCounter(
             num_layers=(
                 model_config.num_hidden_layers if model_config is not None else 0
             ),
             load_stream=self.load_stream,
+            load_stream_ctx=self.load_stream_ctx,
             lmc_connector=self.lmcache_connector,
         )
         kvcache.register_layer_transfer_counter(self.layer_done_executor)
@@ -169,7 +183,7 @@ class LMCRadixCache(RadixCache):
             ]
         )
 
-        with torch.cuda.stream(self.load_stream):
+        with self.load_stream_ctx:
             num_retrieved = self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=key.token_ids,  # full page-aligned key
@@ -249,7 +263,7 @@ class LMCRadixCache(RadixCache):
             kv_indices=kv_indices,
             offset=0,
         )
-        with torch.cuda.stream(self.store_stream):
+        with self.store_stream_ctx:
             self.lmcache_connector.store_kv(store_md)
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
@@ -259,7 +273,8 @@ class LMCRadixCache(RadixCache):
         if self.disable:
             return EvictResult()
 
-        self.store_stream.synchronize()
+        if self.store_stream is not None:
+            self.store_stream.synchronize()
         with self._node_lock:
             for node in self._in_flight_nodes:
                 self.dec_lock_ref(node)
