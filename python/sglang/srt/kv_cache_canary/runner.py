@@ -107,20 +107,13 @@ def _resolve_real_kv_kernel_args(
 
 
 class CanaryRunner:
-    """Top-level orchestrator for KV cache canary.
-
-    One instance lives on each rank. Owns the GPU-side violation buffer +
-    counters, the side stream that asynchronously copies the ``is_errored``
-    flag and health counters back to host, and the log/raise policy.
-
-    Per-request host state is intentionally absent: every forward derives
-    its plan from the sglang ``ForwardBatch`` (req_to_token_pool, input_ids,
-    positions, seq_lens) and the splitmix64 chain hash is computed on
-    device.
+    """Per-rank orchestrator: owns the GPU violation buffer + counters,
+    the side stream that async-D2Hs the ``is_errored`` flag + counters,
+    and the log / raise policy.
 
     .. warning::
-        Several pieces in this class are critical safety logic and must NOT
-        be simplified away by an automated pass:
+        These three pieces are critical safety logic and must NOT be
+        removed by an automated /simplify pass:
 
         - the side-stream + event-based async D2H pump
           (``_record_poll_events`` / ``_pull_latest_from_events``) — keeps

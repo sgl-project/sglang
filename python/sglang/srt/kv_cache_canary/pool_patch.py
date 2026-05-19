@@ -26,23 +26,12 @@ _CANARY_SHADOW_GROUPS_ATTR = "_kv_cache_canary_shadow_groups"
 
 
 class PoolKind(str, enum.Enum):
-    """Identifier for which logical canary attaches to a pool.
+    """Which attention regime a canary group belongs to.
 
-    For sglang's logical canary model there are only two attention regimes:
-
-    - ``FULL`` — standard full-prefix attention. Attached to any
-      ``MHATokenToKVPool`` / ``MLATokenToKVPool``-style pool, AND as one
-      of the two canaries on every SWA system (rule from the spec:
-      "正常 SWA 系统其实就是 2 条都走"). The verify range covers
-      ``[0, K_req)``.
-    - ``SWA`` — sliding-window attention. Attached as the second canary
-      on every ``BaseSWAKVPool`` (sglang ``SWAKVPool``, DSV4
-      ``DeepSeekV4TokenToKVPool``). The verify range covers
-      ``[max(0, K_req - window), K_req)``.
-
-    Spec / draft / target pools are treated as ``FULL`` (no sliding-window
-    cap); the runner distinguishes them only at install time by which pool
-    the canary attaches to, not by a different ``PoolKind``.
+    - ``FULL`` covers ``[0, K_req)``. Attached to plain MHA/MLA pools and
+      as one of the two canaries on every SWA system.
+    - ``SWA`` covers ``[max(0, K_req - window), K_req)``. Attached as the
+      second canary on every ``BaseSWAKVPool``.
     """
 
     FULL = "full"
@@ -53,24 +42,11 @@ class PoolKind(str, enum.Enum):
 class CanaryShadowGroup:
     """One canary's worth of shadow tensors on a pool.
 
-    Each entry corresponds to one ``(kernel_kind, half)`` of the
-    head/tail × K/V product:
-
-    - ``k_head`` / ``k_tail``: K-half shadow buffers (always present).
-    - ``v_head`` / ``v_tail``: V-half shadow buffers (``None`` for
-      single-``kv_buffer`` pools like MLA / DSV4-style).
-
-    The same group is wrapped in two :class:`~CanaryEndpoint` instances
-    inside :class:`~CanaryRunner` (head + tail), so the K/V split lives
-    here as data while the head/tail symmetry lives in the endpoint.
-
-    The optional ``real_kv_source`` references the underlying **real** KV
-    pool's layer-0 K buffer (uint8-view, flat across slots). When
-    ``--kv-cache-canary-real-data`` is on, the canary kernel reads a
-    portion of this tensor at the same slot index it is writing the
-    canary fingerprint for, hashes the bytes through splitmix64, and
-    stores / verifies the result against the ``real_kv_hash`` slot
-    field. ``None`` means the feature is disabled for this group.
+    K/V split lives here; head/tail symmetry lives in :class:`CanaryEndpoint`.
+    ``v_head`` / ``v_tail`` are ``None`` for single-buffer pools (MLA / DSV4).
+    ``real_kv_source`` is the underlying real KV layer-0 K buffer used by
+    the canary-with-real-data fingerprint; ``None`` disables that feature
+    for the group.
     """
 
     kind: PoolKind

@@ -16,30 +16,14 @@ if TYPE_CHECKING:
 class BatchPlan:
     """Per-forward layout the canary kernel consumes.
 
-    All per-req information is derived from the sglang ``ForwardBatch`` at
-    plan time — there is no host-side per-request state. The host emits raw
-    ``(req_id, token_id, position, slot_idx)`` arrays plus per-write-req
-    chain-seed pointers; the kernel walks the splitmix64 chain itself.
+    Three parallel tile sets — per-verify-entry, per-write-entry, and
+    per-write-req — built from the live ``ForwardBatch``. The kernel
+    grid spans ``num_verify + num_write_reqs`` threads (one verify
+    thread per entry plus one driver thread per write-req).
 
-    Layout:
-
-    - **Per-verify-entry** (length ``num_verify``):
-      ``verify_slot_indices`` / ``verify_positions`` / ``verify_req_ids`` /
-      ``verify_prev_slot_indices``. ``verify_prev_slot_indices[i] == -1``
-      means "this is position 0 of its req; expected prev_hash = kSeed".
-      Otherwise it's the slot index for position ``verify_positions[i] - 1``
-      of the same req.
-    - **Per-write-entry** (length ``num_write``):
-      ``write_slot_indices`` / ``write_token_ids`` / ``write_positions`` /
-      ``write_req_ids``.
-    - **Per-write-req** (length ``num_write_reqs``):
-      ``write_req_seed_slot_indices`` (-1 = K_req_old == 0 -> kSeed),
-      ``write_req_entry_starts`` (offset into per-write-entry arrays),
-      ``write_req_entry_counts``.
-
-    The kernel grid spans ``num_verify + num_write_reqs`` threads — one
-    verify thread per entry plus one driver thread per write-req that walks
-    its chain sequentially.
+    ``verify_prev_slot_indices[i] == -1`` flags position 0 of a req
+    (chain seed = kSeed). ``write_req_seed_slot_indices[i] == -1``
+    flags ``K_req_old == 0`` for the same reason.
     """
 
     verify_req_ids: List[int]
@@ -66,26 +50,15 @@ def plan_batch_from_forward_batch(
     forward_batch: "ForwardBatch",
     config: CanaryConfig,
 ) -> Optional[BatchPlan]:
-    """Translate a ``ForwardBatch`` into per-slot kernel expectations.
+    """Translate a ``ForwardBatch`` into a :class:`BatchPlan`.
 
-    Every per-req field is read fresh from ``forward_batch`` — no canary
-    host-side state is maintained. The chain hash is computed by the kernel
-    on device using slot[i-1]'s stored ``(prev_hash, token, position)``.
+    Verify range is full ``[0, K_req)`` for non-SWA pools (every historical
+    position re-verified each forward); SWA pools clip to the most recent
+    ``swa_window_size`` slots because older positions in ``req_to_token``
+    point at slots that have been evicted to other reqs.
 
-    K_req (already-written token count per req) is recovered as
-    ``extend_prefix_lens`` (chunked prefill) or ``seq_lens - 1`` (decode /
-    target_verify). The verify range is the full ``[0, K_req)`` window —
-    every historical token gets verified every forward (user requirement:
-    a 10k-token decode step verifies all 10k positions). For SWA pools the
-    range is reduced to ``[K_req - window_size, K_req)`` since older slots
-    are no longer addressable through the SWA index mapping. Slot indices
-    for the verify range are pulled from
-    ``forward_batch.req_to_token_pool.req_to_token`` (the canary trusts
-    this map; cross-checks come from the kernel side via req_id and
-    position fields stored in the slot itself).
-
-    Returns ``None`` when the plan would be empty (no out_cache_loc, unknown
-    forward mode, etc.).
+    Returns ``None`` for empty / unsupported batches (no out_cache_loc,
+    unknown forward mode, missing extend lens).
     """
     if forward_batch.out_cache_loc is None or forward_batch.out_cache_loc.numel() == 0:
         return None
