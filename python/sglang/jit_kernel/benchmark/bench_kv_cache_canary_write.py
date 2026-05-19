@@ -33,6 +33,7 @@ from sglang.jit_kernel.kv_cache_canary_write import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _BS_AXIS = [1, 4, 32, 128, 256, 1024]
