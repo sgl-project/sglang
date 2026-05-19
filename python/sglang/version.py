@@ -1,3 +1,4 @@
+# probe-lora-bug-25690: diagnostic probe — do not merge
 try:
     from sglang._version import __version__, __version_tuple__
 except ImportError:
