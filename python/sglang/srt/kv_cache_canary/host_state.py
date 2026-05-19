@@ -40,6 +40,11 @@ class BatchPlan:
     write_req_seed_slot_indices: List[int]
     write_req_entry_starts: List[int]
     write_req_entry_counts: List[int]
+    # Per-write-req ``req_pool_idx`` of the req that contributed each row.
+    # Length == num_write_reqs. Host-only bookkeeping (the canary kernel
+    # never reads it); the pseudo-mode oracle uses it to look up the
+    # logical req id from a write-req row when emitting expected_*.
+    write_req_pool_indices: List[int]
 
     num_verify: int
     num_write: int
@@ -245,6 +250,7 @@ def _append_write_entries(
     accumulator.write_req_seed_slot_indices.append(seed_slot)
     accumulator.write_req_entry_starts.append(entry_start)
     accumulator.write_req_entry_counts.append(n)
+    accumulator.write_req_pool_indices.append(req_pool_idx)
 
     for offset in range(n):
         pos = k_req + offset
@@ -276,6 +282,7 @@ class _PlanAccumulator:
         self.write_req_seed_slot_indices: List[int] = []
         self.write_req_entry_starts: List[int] = []
         self.write_req_entry_counts: List[int] = []
+        self.write_req_pool_indices: List[int] = []
 
     def into_plan(self) -> Optional[BatchPlan]:
         num_verify = len(self.verify_positions)
@@ -294,6 +301,7 @@ class _PlanAccumulator:
             write_req_seed_slot_indices=self.write_req_seed_slot_indices,
             write_req_entry_starts=self.write_req_entry_starts,
             write_req_entry_counts=self.write_req_entry_counts,
+            write_req_pool_indices=self.write_req_pool_indices,
             num_verify=num_verify,
             num_write=num_write,
             num_write_reqs=num_write_reqs,

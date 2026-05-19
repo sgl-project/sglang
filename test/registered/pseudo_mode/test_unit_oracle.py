@@ -46,7 +46,7 @@ class _StubForwardBatch:
 
 @dataclass
 class _StubBatchPlan:
-    write_req_ids: List[int]
+    write_req_pool_indices: List[int]
     write_positions: List[int]
     write_req_entry_starts: List[int]
     write_req_entry_counts: List[int]
@@ -403,7 +403,7 @@ class TestPredictInputTokensForPlanIndependentPosition(unittest.TestCase):
         oracle.register_chunk_commit(req_id="r0", chunk_size=3)
 
         plan = _StubBatchPlan(
-            write_req_ids=[2, 2, 2],
+            write_req_pool_indices=[2],
             # Planner-claimed positions are wrong (this is the #25015 simulation).
             write_positions=[5, 6, 7],
             write_req_entry_starts=[0],
@@ -433,7 +433,7 @@ class TestPredictInputTokensForPlanIndependentPosition(unittest.TestCase):
         # In decode the entry feeds last-committed token; position = seq_len - 1
         # = prefill_len + len(output_history) - 1 = 2 + 2 - 1 = 3.
         plan = _StubBatchPlan(
-            write_req_ids=[1],
+            write_req_pool_indices=[1],
             write_positions=[99],  # planner lie
             write_req_entry_starts=[0],
             write_req_entry_counts=[1],

@@ -209,11 +209,10 @@ class PseudoOracle:
         expected_tokens: List[int] = []
         expected_positions: List[int] = []
         for wreq_idx in range(plan.num_write_reqs):
-            start = plan.write_req_entry_starts[wreq_idx]
             count = plan.write_req_entry_counts[wreq_idx]
             if count == 0:
                 continue
-            req_pool_idx = plan.write_req_ids[start]
+            req_pool_idx = plan.write_req_pool_indices[wreq_idx]
             req_id = self._req_pool_to_id[req_pool_idx]
             expected_k_req = self._expected_k_req(req_id=req_id, is_decode=is_decode)
             for j in range(count):

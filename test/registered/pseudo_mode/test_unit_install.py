@@ -112,7 +112,7 @@ class _StubScheduler:
 class _StubBatchPlan:
     """Tiny BatchPlan stand-in matching the fields the patch touches."""
 
-    write_req_ids: List[int]
+    write_req_pool_indices: List[int]
     write_positions: List[int]
     write_req_entry_starts: List[int]
     write_req_entry_counts: List[int]
@@ -170,7 +170,7 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
         original_plan_fn = _canary_host_state.plan_batch_from_forward_batch
         try:
             stub_plan = _StubBatchPlan(
-                write_req_ids=[0],
+                write_req_pool_indices=[0],
                 write_positions=[3],
                 write_req_entry_starts=[0],
                 write_req_entry_counts=[1],
@@ -191,7 +191,7 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
             with mock.patch(
                 "sglang.srt.pseudo_mode.install.dataclasses.replace",
                 wraps=lambda obj, **kw: _StubBatchPlan(
-                    write_req_ids=obj.write_req_ids,
+                    write_req_pool_indices=obj.write_req_pool_indices,
                     write_positions=obj.write_positions,
                     write_req_entry_starts=obj.write_req_entry_starts,
                     write_req_entry_counts=obj.write_req_entry_counts,
