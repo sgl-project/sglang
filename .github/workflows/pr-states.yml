@@ -10,7 +10,7 @@ on:
     # Listen to pr-test* lifecycle so reruns initiated by slash commands
     # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) -- which don't
     # refire pull_request_target -- still refresh the CI-states block.
-    workflows: ["PR Test", "PR Test Extra"]
+    workflows: ["PR Test Base", "PR Test Extra"]
     types: [requested, completed]
 
 permissions:

@@ -33,7 +33,7 @@ def _make_req(
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
-    req.is_chunked = 0
+    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache_protected_len = 0
     req.skip_radix_cache_insert = False
