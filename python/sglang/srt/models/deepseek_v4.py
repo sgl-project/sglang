@@ -473,6 +473,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
@@ -486,13 +487,14 @@ class MQALayer(nn.Module):
         stream_compressor.wait_stream(current_stream)
         stream_indexer.wait_stream(current_stream)
 
+        x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
+            qkv_a, _ = self.wqkv_a(x_linear)
             qkv_a_ready = current_stream.record_event()
 
-        q_lora = self._compute_q_a(x, qkv_a=qkv_a)
+        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
@@ -509,7 +511,7 @@ class MQALayer(nn.Module):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
 
@@ -533,12 +535,14 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
+            qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
-            q_lora, _ = self.wq_a(x)
+            q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
@@ -557,7 +561,11 @@ class MQALayer(nn.Module):
                 q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
 
-            kv = qkv_a[..., self.q_lora_rank :] if qkv_a is not None else self.wkv(x)[0]
+            kv = (
+                qkv_a[..., self.q_lora_rank :]
+                if qkv_a is not None
+                else self.wkv(x_linear)[0]
+            )
 
             from sglang.srt.layers.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -600,7 +608,7 @@ class MQALayer(nn.Module):
             if use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 kv = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -613,7 +621,9 @@ class MQALayer(nn.Module):
                     forward_batch=forward_batch,
                 )
             else:
-                self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, qkv_a=qkv_a
+                )
                 kv = None
 
         del qkv_a
@@ -635,6 +645,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        x_quant=None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
@@ -668,12 +679,22 @@ class MQALayer(nn.Module):
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             q = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, q_out
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
             )
             kv = None
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, q_out
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
             )
 
         # The cache write is always fused / already done by _forward_prepare* --
@@ -935,12 +956,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.input_layernorm,
         )
         if not norm_fused:
-            hidden_states = self.input_layernorm(hidden_states)
+            if _use_aiter and _is_gfx95_supported:
+                x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    self.rms_norm_eps,
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+                x_quant = None
+        else:
+            x_quant = None
 
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            x_quant=x_quant,
         )
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
