@@ -47,6 +47,13 @@ class CanaryBufferGroup:
     ``real_kv_source`` is the underlying real KV layer-0 K buffer used by
     the canary-with-real-data fingerprint; ``None`` disables that feature
     for the group.
+
+    ``swa_index_lut`` is the pool's ``full_to_swa_index_mapping`` (a
+    ``[size_full + 1]`` int LUT whose final entry is ``-1`` sentinel) when
+    this group lives on an SWA sub-pool whose slot index space differs
+    from the FULL pool. ``None`` otherwise — FULL groups, MHA/MLA pools,
+    and DSV4 (where full and swa share the same index space) all leave
+    it unset and the plan consumes full-pool indices directly.
     """
 
     kind: PoolKind
@@ -58,6 +65,7 @@ class CanaryBufferGroup:
     v_slot_stride_bytes: int
     real_kv_source: Optional[torch.Tensor] = None
     real_kv_slot_stride_bytes: int = 0
+    swa_index_lut: Optional[torch.Tensor] = None
 
     @property
     def has_v_half(self) -> bool:
@@ -129,6 +137,7 @@ def _allocate_buffer_group(
     k_template: torch.Tensor,
     v_template: Optional[torch.Tensor],
     real_kv_source: Optional[torch.Tensor] = None,
+    swa_index_lut: Optional[torch.Tensor] = None,
 ) -> CanaryBufferGroup:
     """Allocate a fresh canary buffer group sized off the provided slot templates.
 
@@ -178,6 +187,7 @@ def _allocate_buffer_group(
         v_slot_stride_bytes=v_slot_stride_bytes,
         real_kv_source=real_kv_source,
         real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        swa_index_lut=swa_index_lut,
     )
 
 
@@ -255,16 +265,26 @@ def _attach_swa(
     )
 
     full_sub_pool = getattr(pool, "full_kv_pool", None)
+    swa_lut: Optional[torch.Tensor]
     if full_sub_pool is not None:
         full_k_template, full_v_template = _pull_kv_templates(
             sub_pool=full_sub_pool, label="SWA full sub-pool"
         )
+        # Real SWAKVPool: swa sub-pool has its own (smaller) slot index space,
+        # so plan-side indices (sourced from full-pool req_to_token) must be
+        # translated through this LUT before the kernel dereferences the SWA
+        # canary buffer. Last entry of the LUT is the -1 sentinel.
+        if hasattr(pool, "full_to_swa_index_mapping"):
+            swa_lut = pool.full_to_swa_index_mapping
+        else:
+            swa_lut = None
     else:
         # DSV4 case: no separate full_kv_pool. Fall back to swa templates;
         # the resulting FULL group's canary buffer lives in the swa-sub-pool slot
         # index space (verify range covers the entire prefix).
         full_k_template = swa_k_template
         full_v_template = swa_v_template
+        swa_lut = None
 
     full_group = _allocate_buffer_group(
         kind=PoolKind.FULL,
@@ -277,6 +297,7 @@ def _attach_swa(
         k_template=swa_k_template,
         v_template=swa_v_template,
         real_kv_source=swa_k_template,
+        swa_index_lut=swa_lut,
     )
     buffer_groups[PoolKind.FULL] = full_group
     buffer_groups[PoolKind.SWA] = swa_group
