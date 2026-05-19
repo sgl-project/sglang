@@ -8,6 +8,7 @@ from transformers import WhisperConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -193,7 +194,7 @@ class WhisperEncoderLayer(torch.nn.Module):
             quant_config=quant_config,
             is_encoder=True,
         )
-        self.self_attn_layer_norm = torch.nn.LayerNorm(orig_embed_dim)
+        self.self_attn_layer_norm = LayerNorm(orig_embed_dim)
 
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
@@ -201,7 +202,7 @@ class WhisperEncoderLayer(torch.nn.Module):
 
         self.fc1 = ColumnParallelLinear(orig_embed_dim, config.encoder_ffn_dim)
         self.fc2 = RowParallelLinear(config.encoder_ffn_dim, orig_embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(orig_embed_dim)
+        self.final_layer_norm = LayerNorm(orig_embed_dim)
 
     def forward(
         self,
@@ -263,8 +264,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
         )
-
-        self.self_attn_layer_norm = torch.nn.LayerNorm(orig_embed_dim)
+        self.self_attn_layer_norm = LayerNorm(orig_embed_dim)
         self.encoder_attn = WhisperAttention(
             orig_embed_dim=orig_embed_dim,
             embed_dim=self.embed_dim,
@@ -273,10 +273,10 @@ class WhisperDecoderLayer(torch.nn.Module):
             quant_config=quant_config,
             is_cross_attention=True,
         )
-        self.encoder_attn_layer_norm = torch.nn.LayerNorm(orig_embed_dim)
+        self.encoder_attn_layer_norm = LayerNorm(orig_embed_dim)
         self.fc1 = ColumnParallelLinear(orig_embed_dim, config.decoder_ffn_dim)
         self.fc2 = RowParallelLinear(config.decoder_ffn_dim, orig_embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(orig_embed_dim)
+        self.final_layer_norm = LayerNorm(orig_embed_dim)
 
     def forward(
         self,
@@ -334,7 +334,7 @@ class WhisperEncoder(torch.nn.Module):
                 for id in range(config.encoder_layers)
             ]
         )
-        self.layer_norm = torch.nn.LayerNorm(config.d_model)
+        self.layer_norm = LayerNorm(config.d_model)
 
     def forward(
         self,
@@ -383,8 +383,7 @@ class WhisperDecoder(torch.nn.Module):
                 for layer_idx in range(config.decoder_layers)
             ]
         )
-
-        self.layer_norm = torch.nn.LayerNorm(config.d_model)
+        self.layer_norm = LayerNorm(config.d_model)
 
     def forward(
         self,

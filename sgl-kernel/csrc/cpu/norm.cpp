@@ -410,13 +410,13 @@ void fused_rmsnorm_gated_kernel_impl(
 
 }  // anonymous namespace
 
-template <typename scalar_t>
+template <typename scalar_t, typename packed_t, typename param_t>
 void fused_add_layernorm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
-    const scalar_t* __restrict__ weight,
-    const scalar_t* __restrict__ bias,
+    const packed_t* __restrict__ weight,
+    const param_t* __restrict__ bias,
     float* __restrict__ buffer,
     int64_t batch_size,
     int64_t seq_len,
@@ -505,17 +505,27 @@ void fused_add_layernorm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
         fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
-        bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        if constexpr (std::is_same_v<packed_t, float>) {
+          w_fvec0 = fVec::loadu(weight + d);
+          w_fvec1 = fVec::loadu(weight + d + fVec::size());
+        } else {
+          bVec w_bvec = bVec::loadu(weight + d);
+          std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        }
 
         x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
         x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
 
         if (has_bias) {
-          bVec b_bvec = bVec::loadu(bias + d);
           fVec b_fvec0, b_fvec1;
-          std::tie(b_fvec0, b_fvec1) = at::vec::convert_to_float(b_bvec);
+          if constexpr (std::is_same_v<param_t, float>) {
+            b_fvec0 = fVec::loadu(bias + d);
+            b_fvec1 = fVec::loadu(bias + d + fVec::size());
+          } else {
+            bVec b_bvec = bVec::loadu(bias + d);
+            std::tie(b_fvec0, b_fvec1) = at::vec::convert_to_float(b_bvec);
+          }
           x_fvec0 += b_fvec0;
           x_fvec1 += b_fvec1;
         }
@@ -614,7 +624,8 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   int64_t inp_dim{input.dim()};
   TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  if (bias.has_value()) {
+  bool has_bias = bias.has_value();
+  if (has_bias) {
     CHECK_DIM(1, bias.value());
     CHECK_EQ(bias.value().size(0), weight.size(0));
   }
@@ -633,20 +644,41 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
-    fused_add_layernorm_kernel_impl<scalar_t>(
-        output.data_ptr<scalar_t>(),
-        input.data_ptr<scalar_t>(),
-        nullptr,
-        weight.data_ptr<scalar_t>(),
-        conditional_data_ptr<scalar_t>(bias),
-        buffer.data_ptr<float>(),
-        batch_size,
-        seq_len,
-        hidden_size,
-        input_strideN,
-        eps);
-  });
+  if (has_bias) {
+    CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input.scalar_type(), bias.value().scalar_type(), "layernorm_kernel", [&] {
+      CPU_DISPATCH_PACKED_TYPES(weight.scalar_type(), "layernorm_kernel", [&] {
+        fused_add_layernorm_kernel_impl<scalar_t, packed_t, param_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            nullptr,
+            weight.data_ptr<packed_t>(),
+            conditional_data_ptr<param_t>(bias),
+            buffer.data_ptr<float>(),
+            batch_size,
+            seq_len,
+            hidden_size,
+            input_strideN,
+            eps);
+      });
+    });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
+      CPU_DISPATCH_PACKED_TYPES(weight.scalar_type(), "layernorm_kernel", [&] {
+        fused_add_layernorm_kernel_impl<scalar_t, packed_t, scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            nullptr,
+            weight.data_ptr<packed_t>(),
+            nullptr,
+            buffer.data_ptr<float>(),
+            batch_size,
+            seq_len,
+            hidden_size,
+            input_strideN,
+            eps);
+      });
+    });
+  }
   return output;
 }
 
@@ -950,7 +982,8 @@ at::Tensor fused_add_layernorm_cpu(
   TORCH_CHECK(res_dim == 2 || res_dim == 3, "Expected residual dim to be 2 or 3, but got ", res_dim);
 
   CHECK_DIM(1, weight);
-  if (bias.has_value()) {
+  bool has_bias{bias.has_value()};
+  if (has_bias) {
     CHECK_DIM(1, bias.value());
     CHECK_EQ(bias.value().size(0), weight.size(0));
   }
@@ -976,19 +1009,41 @@ at::Tensor fused_add_layernorm_cpu(
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
-    fused_add_layernorm_kernel_impl<scalar_t>(
-        output.data_ptr<scalar_t>(),
-        input.data_ptr<scalar_t>(),
-        residual.data_ptr<scalar_t>(),
-        weight.data_ptr<scalar_t>(),
-        conditional_data_ptr<scalar_t>(bias),
-        buffer.data_ptr<float>(),
-        batch_size,
-        seq_len,
-        hidden_size,
-        input_strideN,
-        eps);
-  });
+  if (has_bias) {
+    CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
+        input.scalar_type(), bias.value().scalar_type(), "fused_add_layernorm_kernel", [&] {
+          CPU_DISPATCH_PACKED_TYPES(weight.scalar_type(), "layernorm_kernel", [&] {
+            fused_add_layernorm_kernel_impl<scalar_t, packed_t, param_t>(
+                output.data_ptr<scalar_t>(),
+                input.data_ptr<scalar_t>(),
+                residual.data_ptr<scalar_t>(),
+                weight.data_ptr<packed_t>(),
+                conditional_data_ptr<param_t>(bias),
+                buffer.data_ptr<float>(),
+                batch_size,
+                seq_len,
+                hidden_size,
+                input_strideN,
+                eps);
+          });
+        });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
+      CPU_DISPATCH_PACKED_TYPES(weight.scalar_type(), "layernorm_kernel", [&] {
+        fused_add_layernorm_kernel_impl<scalar_t, packed_t, scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            residual.data_ptr<scalar_t>(),
+            weight.data_ptr<packed_t>(),
+            conditional_data_ptr<scalar_t>(bias),
+            buffer.data_ptr<float>(),
+            batch_size,
+            seq_len,
+            hidden_size,
+            input_strideN,
+            eps);
+      });
+    });
+  }
   return output;
 }

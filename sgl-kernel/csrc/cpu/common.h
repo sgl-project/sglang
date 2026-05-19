@@ -77,6 +77,10 @@ namespace {
         using packed_t = uint8_t;                                \
         return __VA_ARGS__();                                    \
       }                                                          \
+      case at::ScalarType::Float: {                              \
+        using packed_t = float;                                  \
+        return __VA_ARGS__();                                    \
+      }                                                          \
       default:                                                   \
         TORCH_CHECK(false, "Unsupported floating data type.\n"); \
     }                                                            \

@@ -331,13 +331,24 @@ class TestLayerNorm(CustomTestCase):
         m=[4096, 1024],
         n=[4096, 4109],
         dtype=[torch.float16, torch.bfloat16],
+        weight_is_float=[True, False],
+        bias_is_float=[True, False],
     )
-    def test_norm_input_2d(self, m: int, n: int, dtype: torch.dtype) -> None:
+    def test_norm_input_2d(
+        self,
+        m: int,
+        n: int,
+        dtype: torch.dtype,
+        weight_is_float: bool,
+        bias_is_float: bool,
+    ) -> None:
         x = torch.randn([m, n], dtype=dtype)
         x = make_non_contiguous(x)
         hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        bias = torch.randn(hidden_size, dtype=dtype)
+        weight = torch.randn(
+            hidden_size, dtype=torch.float32 if weight_is_float else dtype
+        )
+        bias = torch.randn(hidden_size, dtype=torch.float32 if bias_is_float else dtype)
         variance_epsilon = 1e-6
 
         ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
@@ -383,13 +394,25 @@ class TestLayerNorm(CustomTestCase):
         m=[1, 4],
         n=[4096, 4109, 2304],
         dtype=[torch.float16, torch.bfloat16],
+        weight_is_float=[True, False],
+        bias_is_float=[True, False],
     )
-    def test_norm_input_3d(self, l: int, m: int, n: int, dtype: torch.dtype) -> None:
+    def test_norm_input_3d(
+        self,
+        l: int,
+        m: int,
+        n: int,
+        dtype: torch.dtype,
+        weight_is_float: bool,
+        bias_is_float: bool,
+    ) -> None:
         x = torch.randn([l, m, n], dtype=dtype)
         x = make_non_contiguous(x)
         hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        bias = torch.randn(hidden_size, dtype=dtype)
+        weight = torch.randn(
+            hidden_size, dtype=torch.float32 if weight_is_float else dtype
+        )
+        bias = torch.randn(hidden_size, dtype=torch.float32 if bias_is_float else dtype)
         variance_epsilon = 1e-6
 
         ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
