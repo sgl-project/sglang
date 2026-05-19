@@ -1,11 +1,23 @@
+"""CanaryConfig. Schema retained from the legacy module minus the ``seed`` field (anchor is hardcoded in
+jit_kernel; see kernels.md §6.1) plus a ``pseudo_mode`` toggle for caller-driven write-time expectation checks
+(kernels.md §2.6, §2.8).
+"""
+
 from __future__ import annotations
 
 import enum
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
+import torch
+
+from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
+from sglang.jit_kernel.kv_cache_canary_write import CanaryPseudoMode
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +28,7 @@ class CanaryMode(str, enum.Enum):
     RAISE = "raise"
 
     @classmethod
-    def parse(cls, value: str | "CanaryMode" | None) -> "CanaryMode":
+    def parse(cls, value: "str | CanaryMode | None") -> "CanaryMode":
         if value is None:
             return cls.OFF
         if isinstance(value, cls):
@@ -24,68 +36,58 @@ class CanaryMode(str, enum.Enum):
         return cls(value)
 
 
-class RealKvHashMode(str, enum.Enum):
-    """``--kv-cache-canary-real-data`` modes.
+def parse_real_kv_hash_mode(value: "str | RealKvHashMode | None") -> RealKvHashMode:
+    """Parse a server-arg value into the jit_kernel :class:`RealKvHashMode` IntEnum.
 
-    Controls whether the canary kernel reads a portion of the real KV pool
-    on each write and stores a splitmix64 fingerprint of it into the
-    extra ``real_kv_hash`` slot field, then re-reads + re-hashes on
-    verify and compares. Catches corruption that is invisible to the
-    pure-canary path because both the canary read and write paths
-    operate correctly but the **real KV** pool got written wrong
-    (e.g. attn-kernel idle-logic misconfiguration; PD transfer bit-rot).
-
-    Modes:
-
-    - ``OFF`` (default): the feature is disabled; the kernel stores 0
-      in the ``real_kv_hash`` field and skips the comparison.
-    - ``PORTION``: read 16 bytes of the real-KV slot at the configured
-      pool layer and fold through splitmix64. Cheap default for
-      always-on production.
-    - ``ALL``: read the full real-KV slot stride and fold through
-      splitmix64. Higher overhead, used when stronger evidence is
-      needed (e.g. a confirmed corruption investigation).
+    Accepts the new BIT / ALL / OFF names, plus the legacy ``portion`` alias that the existing CLI flag still
+    uses (mapped to BIT — both are "cheap fingerprint of a leading prefix").
     """
+    if value is None:
+        return RealKvHashMode.OFF
+    if isinstance(value, RealKvHashMode):
+        return value
+    lowered = str(value).lower()
+    if lowered in ("off", "0"):
+        return RealKvHashMode.OFF
+    if lowered in ("bit", "portion"):
+        return RealKvHashMode.BIT
+    if lowered in ("all", "full"):
+        return RealKvHashMode.ALL
+    raise ValueError(f"kv-canary: unknown RealKvHashMode value {value!r}")
 
-    OFF = "off"
-    PORTION = "portion"
-    ALL = "all"
 
-    @classmethod
-    def parse(cls, value: str | "RealKvHashMode" | None) -> "RealKvHashMode":
-        if value is None:
-            return cls.OFF
-        if isinstance(value, cls):
-            return value
-        return cls(value)
+PseudoOracleCallback = Callable[
+    ["ForwardBatch"], Tuple[torch.Tensor, torch.Tensor]
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryConfig:
+    """Configuration for one canary runner.
+
+    Schema is retained from the legacy module with two exceptions:
+
+    - ``seed`` is dropped — the chain anchor is now the hardcoded :data:`CANARY_CHAIN_ANCHOR` constant in
+      ``jit_kernel.kv_cache_canary_verify`` (kernels.md §6.1).
+    - ``pseudo_mode`` and ``pseudo_oracle`` are added — when ``pseudo_mode == ON`` the runner invokes the
+      oracle once per forward to produce ``(pseudo_expected_tokens, pseudo_expected_positions)`` for
+      ``canary_write_step`` (kernels.md §2.6).
+    """
+
     mode: CanaryMode
-    violation_ring_capacity: int = 256
+    violation_ring_capacity: int = 1024
     health_print_every_n_forwards: int = 1024
     counter_zero_warmup_forwards: int = 64
     perturb_req_to_token_prob: float = 0.0
     perturb_req_to_token_seed: int = 0
-    # Sliding-window-attention window length, in tokens. Non-None ONLY for
-    # canary runners attached to a SWA pool — SWA's req_to_token mapping
-    # only addresses the most recent ``swa_window_size`` slots of a req
-    # (older positions get evicted / overwritten), so the verify range
-    # must be clipped to ``[K_req - swa_window_size, K_req)``. Reading
-    # outside that window lands on slots that belong to other reqs and
-    # would trip a (spurious) violation.
     swa_window_size: Optional[int] = None
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
-    # Periodic full-pool sweep of every alive slot's real_kv_hash. 0 = off.
-    # Sweep verifies in addition to the per-step head/tail launches, using
-    # the same kernel with verify_prev_slot_indices = kSkipChainSentinel.
+    real_kv_read_bytes: int = 16
     real_data_sweep_every_n_steps: int = 0
-    # Self-test: probabilistically flip one byte of the real KV pool at an
-    # alive-but-not-verified-this-step slot, to prove sweep's independent
-    # detection value. 0 = off.
     real_perturb_bytes_prob: float = 0.0
     real_perturb_bytes_seed: int = 0
+    pseudo_mode: CanaryPseudoMode = CanaryPseudoMode.OFF
+    pseudo_oracle: Optional[PseudoOracleCallback] = None
 
     def __post_init__(self) -> None:
         if self.real_data_sweep_every_n_steps < 0:
@@ -103,12 +105,21 @@ class CanaryConfig:
                 "kv-canary: real_perturb_bytes_seed must be >= 0, "
                 f"got {self.real_perturb_bytes_seed}"
             )
+        if self.real_kv_read_bytes < 0:
+            raise ValueError(
+                "kv-canary: real_kv_read_bytes must be >= 0, "
+                f"got {self.real_kv_read_bytes}"
+            )
+        if self.pseudo_mode is CanaryPseudoMode.ON and self.pseudo_oracle is None:
+            raise ValueError(
+                "kv-canary: pseudo_mode == ON requires a pseudo_oracle callback"
+            )
 
     @classmethod
     def from_server_args(
         cls,
-        mode: str | CanaryMode | None,
-        real_kv_hash_mode: str | RealKvHashMode | None = None,
+        mode: "str | CanaryMode | None",
+        real_kv_hash_mode: "str | RealKvHashMode | None" = None,
         real_data_sweep_every_n_steps: int = 0,
     ) -> "CanaryConfig":
         parsed = CanaryMode.parse(mode)
@@ -134,7 +145,7 @@ class CanaryConfig:
             mode=parsed,
             perturb_req_to_token_prob=perturb_prob,
             perturb_req_to_token_seed=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get(),
-            real_kv_hash_mode=RealKvHashMode.parse(real_kv_hash_mode),
+            real_kv_hash_mode=parse_real_kv_hash_mode(real_kv_hash_mode),
             real_data_sweep_every_n_steps=int(real_data_sweep_every_n_steps),
             real_perturb_bytes_prob=real_perturb_prob,
             real_perturb_bytes_seed=int(
@@ -145,38 +156,3 @@ class CanaryConfig:
     @property
     def enabled(self) -> bool:
         return self.mode is not CanaryMode.OFF
-
-
-def real_kv_hash_mode_to_int(mode: RealKvHashMode) -> int:
-    """Map :class:`RealKvHashMode` to the kernel's int constants.
-
-    Mirrors ``REAL_KV_HASH_MODE_*`` in ``jit_kernel/kv_cache_canary.py``
-    and ``kRealKvHashMode*`` in ``canary.cuh``. Kept centralised here so
-    the int wire format is in one place.
-    """
-    if mode is RealKvHashMode.OFF:
-        return 0
-    if mode is RealKvHashMode.PORTION:
-        return 1
-    if mode is RealKvHashMode.ALL:
-        return 2
-    raise ValueError(f"kv-canary: unknown RealKvHashMode {mode!r}")
-
-
-def real_kv_hash_read_bytes(
-    mode: RealKvHashMode, real_kv_slot_stride_bytes: int
-) -> int:
-    """Return how many real-KV bytes the kernel reads per slot for ``mode``.
-
-    - ``OFF`` -> 0 (kernel takes the early-out path).
-    - ``PORTION`` -> 16 bytes (a fixed cheap prefix; matches
-      ``REAL_KV_HASH_PORTION_BYTES``).
-    - ``ALL`` -> ``real_kv_slot_stride_bytes`` (the full slot).
-    """
-    if mode is RealKvHashMode.OFF:
-        return 0
-    if mode is RealKvHashMode.PORTION:
-        return min(16, int(real_kv_slot_stride_bytes))
-    if mode is RealKvHashMode.ALL:
-        return int(real_kv_slot_stride_bytes)
-    raise ValueError(f"kv-canary: unknown RealKvHashMode {mode!r}")
