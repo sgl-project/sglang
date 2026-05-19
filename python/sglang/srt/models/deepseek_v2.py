@@ -1975,6 +1975,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if (
             isinstance(self.mlp, DeepseekV2MoE)
             and not self.mlp.experts.moe_runner_config.inplace
+            and not torch.compiler.is_compiling()
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
