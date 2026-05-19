@@ -1778,8 +1778,7 @@ class Scheduler(
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+                recv_req.input_ids = array("q", [1]) * seq_length
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
@@ -1788,7 +1787,7 @@ class Scheduler(
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                array("q", recv_req.input_ids),
+                recv_req.input_ids,
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
@@ -1876,7 +1875,7 @@ class Scheduler(
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                array("q", recv_req.input_ids),
+                recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
@@ -2155,7 +2154,7 @@ class Scheduler(
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            array("q", recv_req.input_ids),
+            recv_req.input_ids,
             recv_req.sampling_params,
             positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,

@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -981,6 +982,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        input_ids = array("q", input_ids)
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params

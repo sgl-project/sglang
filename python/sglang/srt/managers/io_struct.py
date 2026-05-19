@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -711,9 +712,8 @@ class GenerateReqInput(BaseReq):
 class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
-    # TODO(Jialin): Migrate to python array.
-    # The input token ids.
-    input_ids: List[int]
+    # The input token ids
+    input_ids: array
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -1027,9 +1027,8 @@ class EmbeddingReqInput(BaseReq):
 class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
-    # TODO(Jialin): Migrate to python array.
-    # The input token ids.
-    input_ids: List[int]
+    # The input token ids
+    input_ids: array
     # The image inputs
     image_inputs: dict
     # The token type ids

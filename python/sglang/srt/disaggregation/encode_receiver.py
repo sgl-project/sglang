@@ -589,7 +589,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -1008,7 +1008,7 @@ class MMReceiverBase(ABC):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            array("q", recv_req.input_ids),
+            recv_req.input_ids,
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,
