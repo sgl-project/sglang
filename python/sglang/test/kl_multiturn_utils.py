@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Callable
 
 from sglang.test.kl_test_utils import (
@@ -145,7 +146,13 @@ def _interleave_order(n: int, branches_per_group: int) -> list[int] | None:
 
 
 def _generate_maybe_interleaved(
-    base_url, inputs, max_new_tokens, order=None, sampling_temperature: float = 1
+    base_url,
+    inputs,
+    max_new_tokens,
+    order=None,
+    sampling_temperature: float = 1,
+    request_batch_size: int | None = None,
+    inter_batch_delay_s: float = 0,
 ):
     """Generate with optional interleaved submission order.
 
@@ -153,22 +160,31 @@ def _generate_maybe_interleaved(
     original order so the caller always sees results[i] corresponds to
     inputs[i].
     """
-    if order is None:
-        return _generate(
-            base_url,
-            inputs,
-            max_new_tokens,
-            return_logprob=True,
-            temperature=sampling_temperature,
-        )
-    ordered = [inputs[i] for i in order]
-    results = _generate(
-        base_url,
-        ordered,
-        max_new_tokens,
-        return_logprob=True,
-        temperature=sampling_temperature,
+    ordered = inputs if order is None else [inputs[i] for i in order]
+    if not ordered:
+        return []
+
+    batch_size = (
+        request_batch_size
+        if request_batch_size is not None and request_batch_size > 0
+        else len(ordered)
     )
+    results = []
+    for start in range(0, len(ordered), batch_size):
+        results.extend(
+            _generate(
+                base_url,
+                ordered[start : start + batch_size],
+                max_new_tokens,
+                return_logprob=True,
+                temperature=sampling_temperature,
+            )
+        )
+        if batch_size < len(ordered) and inter_batch_delay_s > 0:
+            time.sleep(inter_batch_delay_s)
+
+    if order is None:
+        return results
     unordered = [None] * len(results)
     for idx, orig in enumerate(order):
         unordered[orig] = results[idx]
@@ -423,6 +439,8 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     branches_per_group: int = 0,
     replay_batch_size: int = 1,
     sampling_temperature: float = 1,
+    request_batch_size: int | None = None,
+    inter_batch_delay_s: float = 0,
 ):
     """Verify logprobs when decode cache is hit.
 
@@ -453,12 +471,13 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
 
     # Turn 1: populate cache, no assertion, no interleaving
     _flush_cache(base_url)
-    results = _generate(
+    results = _generate_maybe_interleaved(
         base_url,
         first_turn_input_ids,
         max_new_tokens,
-        return_logprob=True,
-        temperature=sampling_temperature,
+        sampling_temperature=sampling_temperature,
+        request_batch_size=request_batch_size,
+        inter_batch_delay_s=inter_batch_delay_s,
     )
     assert len(results) == n
 
@@ -478,6 +497,8 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
             max_new_tokens,
             order,
             sampling_temperature=sampling_temperature,
+            request_batch_size=request_batch_size,
+            inter_batch_delay_s=inter_batch_delay_s,
         )
         assert len(results) == n
 
