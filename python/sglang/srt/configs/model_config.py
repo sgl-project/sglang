@@ -1553,6 +1553,7 @@ multimodal_model_archs = [
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "Pi05ForActionPrediction",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
@@ -1577,6 +1578,16 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
+
+
+def is_vla_model(model_architectures: List[str]):
+    """Check if the model is a Vision-Language-Action (VLA) model.
+
+    VLA models output continuous action vectors instead of text tokens.
+    They require a different forward/output path in the scheduler.
+    """
+    vla_archs = {"Pi05ForActionPrediction"}
+    return any(arch in vla_archs for arch in model_architectures)
 
 
 def is_audio_model(model_architectures: List[str]):

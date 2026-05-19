@@ -179,6 +179,8 @@ def get_processor(
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
+    _tokenizer_only_model_types = {"internvl_chat", "pi05"}
+
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
