@@ -11,6 +11,10 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
+        # Helm chart templates embed Go template syntax ({{- ... -}})
+        # that is not valid YAML on its own; the rendered output is
+        # validated by `helm template` / `helm lint`.
+        exclude: ^experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)$
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files

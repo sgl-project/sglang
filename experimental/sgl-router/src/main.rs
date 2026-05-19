@@ -20,19 +20,33 @@ struct Cli {
 /// `try_init` errors, some other code has already installed a subscriber,
 /// so the `tracing::debug!` below is delivered through THAT subscriber —
 /// no recursive init.
-fn init_tracing(default_level: &str) -> Result<()> {
+///
+/// `format` selects the output shape: `"json"` emits one JSON record per
+/// line (target for production / k8s log aggregators), anything else
+/// falls back to the human-readable text format. The `RUST_LOG`
+/// environment variable always wins over `default_level`.
+fn init_tracing(default_level: &str, format: &str) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
-    if let Err(e) = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .try_init()
-    {
+    let install_result = if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .json()
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .try_init()
+    };
+    if let Err(e) = install_result {
         // A second install attempt; the existing subscriber is fine.
         // Surface the attempted default level so an operator can see
         // what we tried.
         tracing::debug!(
             default_level = %default_level,
+            format = %format,
             error = %e,
             "tracing subscriber already installed; continuing"
         );
@@ -56,7 +70,7 @@ async fn main() -> Result<()> {
     let cfg = sgl_router::config::Config::from_path(&cli.config)
         .with_context(|| format!("load config from {}", cli.config.display()))?;
 
-    init_tracing(&cfg.observability.log_level)?;
+    init_tracing(&cfg.observability.log_level, &cfg.observability.log_format)?;
 
     tracing::info!(
         "sgl-router {} starting on {}:{}",
@@ -193,7 +207,19 @@ mod tests {
 
     #[test]
     fn init_tracing_is_idempotent() {
-        let _ = init_tracing("info");
-        let _ = init_tracing("info");
+        let _ = init_tracing("info", "text");
+        let _ = init_tracing("info", "text");
+    }
+
+    #[test]
+    fn init_tracing_accepts_json_format() {
+        // Doesn't matter whether we win or lose the race against another
+        // subscriber install — the function must return Ok either way.
+        assert!(init_tracing("info", "json").is_ok());
+    }
+
+    #[test]
+    fn init_tracing_unknown_format_falls_back_to_text() {
+        assert!(init_tracing("info", "xml-because-why-not").is_ok());
     }
 }
