@@ -96,6 +96,91 @@ runs:
             return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' ');
           };
 
+          const FAILURE_HINT_PATTERNS = [
+            /FAILED:/i,
+            /TIMEOUT:/i,
+            /Traceback \(most recent call last\):/i,
+            /ModuleNotFoundError/i,
+            /ImportError/i,
+            /SyntaxError/i,
+            /NameError/i,
+            /TypeError/i,
+            /AttributeError/i,
+            /RuntimeError/i,
+            /returned exit code/i,
+            /Scheduler hit an exception/i,
+          ];
+          const MAX_FAILED_JOB_LOGS = 10;
+          const MAX_HINTS_PER_JOB = 8;
+
+          function normalizeLogData(data) {
+            if (typeof data === 'string') {
+              return data;
+            }
+            if (Buffer.isBuffer(data)) {
+              return data.toString('utf8');
+            }
+            if (data instanceof ArrayBuffer) {
+              return Buffer.from(data).toString('utf8');
+            }
+            return JSON.stringify(data);
+          }
+
+          function stripLogPrefix(line) {
+            return line.replace(/^\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s*/, '').trim();
+          }
+
+          function extractFailureHints(logText) {
+            const hints = [];
+            const seen = new Set();
+            for (const line of logText.split(/\r?\n/)) {
+              const text = stripLogPrefix(line);
+              if (!text || !FAILURE_HINT_PATTERNS.some(pattern => pattern.test(text))) {
+                continue;
+              }
+              const hint = text.slice(0, 500);
+              if (!seen.has(hint)) {
+                seen.add(hint);
+                hints.push(hint);
+              }
+              if (hints.length >= MAX_HINTS_PER_JOB) {
+                break;
+              }
+            }
+            return hints;
+          }
+
+          async function getJobFailureHints(job) {
+            try {
+              const response = await github.request(
+                'GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs',
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  job_id: job.id,
+                }
+              );
+              return extractFailureHints(normalizeLogData(response.data));
+            } catch (err) {
+              return [`Unable to fetch job logs: ${err.message}`];
+            }
+          }
+
+          async function formatFailedJobs(failedJobs) {
+            const lines = [];
+            for (const job of failedJobs.slice(0, MAX_FAILED_JOB_LOGS)) {
+              const hints = await getJobFailureHints(job);
+              lines.push(`- ${job.name} (${job.conclusion})`);
+              for (const hint of hints) {
+                lines.push(`  - ${hint}`);
+              }
+            }
+            if (failedJobs.length > MAX_FAILED_JOB_LOGS) {
+              lines.push(`- ... ${failedJobs.length - MAX_FAILED_JOB_LOGS} more failed job(s) omitted`);
+            }
+            return lines.join('\n');
+          }
+
           // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
           // GitHub returns 304 Not Modified for unchanged data, which is FREE (no rate limit cost).
           let lastEtag = '';
@@ -172,7 +257,7 @@ runs:
                 if (job.status === 'completed') {
                   completedCount++;
                   if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
-                    failedJobs.push(job.name);
+                    failedJobs.push(job);
                   }
                 } else {
                   allCompleted = false;
@@ -211,8 +296,9 @@ runs:
 
             // Fail fast if any jobs failed
             if (failedJobs.length > 0) {
+              const failureDetails = await formatFailedJobs(failedJobs);
               core.setOutput('result', 'failure');
-              core.setFailed(`${stageName} jobs failed: ${failedJobs.join(', ')}`);
+              core.setFailed(`${stageName} jobs failed:\n${failureDetails}`);
               return;
             }
 
