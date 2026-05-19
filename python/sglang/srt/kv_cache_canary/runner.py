@@ -198,6 +198,7 @@ class CanaryRunner:
             return
 
         self.perturb_hook(forward_batch)
+        self._perturb_real_kv_hook(forward_batch)
         self._last_forward_batch = forward_batch
 
         if self.config.input_check_mode == CanaryInputCheckMode.ON:
@@ -419,28 +420,140 @@ class CanaryRunner:
                 f"at step={self._step_counter}; canary path is not executing"
             )
 
-    def perturb_hook(self, forward_batch: "ForwardBatch") -> None:
+    def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self.config.perturb_req_to_token_prob <= 0.0:
             return
         table = self._req_to_token_pool.req_to_token
         if not isinstance(table, torch.Tensor) or table.numel() == 0:
             return
-
+        if forward_batch is None:
+            return
         if torch.rand((), device="cpu").item() >= self.config.perturb_req_to_token_prob:
             return
 
-        rows, cols = int(table.shape[0]), int(table.shape[1])
-        if rows <= 1 or cols <= 1:
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        if req_pool_indices is None or seq_lens is None:
             return
 
-        row = int(torch.randint(1, rows, (1,)).item())
-        col = int(torch.randint(0, cols, (1,)).item())
-        original = int(table[row, col].item())
-        new_value = (original + 1) & 0x7FFFFFFF
+        req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
+        seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+        active_pairs: list[tuple[int, int]] = []
+        for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+            req_pool_idx_int = int(req_pool_idx)
+            seq_len_int = int(seq_len)
+            if seq_len_int <= 0:
+                continue
+            for pos in range(seq_len_int):
+                active_pairs.append((req_pool_idx_int, pos))
+        if not active_pairs:
+            return
+
+        pick = int(torch.randint(0, len(active_pairs), (1,)).item())
+        req_pool_idx, position = active_pairs[pick]
+        rows, cols = int(table.shape[0]), int(table.shape[1])
+        if req_pool_idx < 0 or req_pool_idx >= rows or position < 0 or position >= cols:
+            return
+
+        original = int(table[req_pool_idx, position].item())
+        slot_upper = rows * cols
+        if slot_upper <= 1:
+            return
+        new_value = int(torch.randint(0, slot_upper, (1,)).item())
         if new_value == original:
-            new_value = (original + 2) & 0x7FFFFFFF
-        table[row, col] = new_value
-        self._perturb_undo = (row, col, original)
+            new_value = (original + 1) % slot_upper
+        table[req_pool_idx, position] = new_value
+        self._perturb_undo = (req_pool_idx, position, original)
+
+    def _perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+        if self.config.perturb_real_kv_prob <= 0.0:
+            return
+        if forward_batch is None:
+            return
+        if torch.rand((), device="cpu").item() >= self.config.perturb_real_kv_prob:
+            return
+
+        candidate_slots = self._collect_real_kv_perturb_candidates(forward_batch)
+        if not candidate_slots:
+            return
+
+        groups_for_pools: list[tuple[int, CanaryBufferGroup]] = []
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                if group.real_kv_sources_k:
+                    groups_for_pools.append((pool_idx, group))
+        if not groups_for_pools:
+            return
+
+        pool_pick = int(torch.randint(0, len(groups_for_pools), (1,)).item())
+        _, group = groups_for_pools[pool_pick]
+        sources = group.real_kv_sources_k
+        source_pick = int(torch.randint(0, len(sources), (1,)).item())
+        source = sources[source_pick]
+        if source.read_bytes <= 0 or source.num_bytes_per_token <= 0:
+            return
+
+        slot_pick = int(torch.randint(0, len(candidate_slots), (1,)).item())
+        slot_idx = int(candidate_slots[slot_pick])
+        row = slot_idx // max(1, source.page_size)
+        col_base = (slot_idx % max(1, source.page_size)) * source.num_bytes_per_token
+        max_offset = min(int(source.read_bytes), int(source.num_bytes_per_token))
+        if max_offset <= 0:
+            return
+        if row < 0 or row >= int(source.tensor.shape[0]):
+            return
+        byte_offset = int(torch.randint(0, max_offset, (1,)).item())
+        col = col_base + byte_offset
+        if col < 0 or col >= int(source.tensor.shape[1]):
+            return
+
+        flat = source.tensor
+        original_byte = int(flat[row, col].item())
+        flat[row, col] = original_byte ^ 0xFF
+
+    def _collect_real_kv_perturb_candidates(
+        self, forward_batch: "ForwardBatch"
+    ) -> list[int]:
+        snapshot = self._alive_reqs_snapshot
+        if snapshot is not None:
+            req_pool_indices = snapshot.req_pool_indices
+            seq_lens = snapshot.seq_lens
+        else:
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+        if req_pool_indices is None or seq_lens is None:
+            return []
+
+        table = self._req_to_token_pool.req_to_token
+        if not isinstance(table, torch.Tensor) or table.numel() == 0:
+            return []
+
+        out_cache_loc = forward_batch.out_cache_loc
+        excluded: set[int] = set()
+        if out_cache_loc is not None:
+            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
+
+        req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
+        seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+        rows, cols = int(table.shape[0]), int(table.shape[1])
+        candidate_slots: list[int] = []
+        for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+            req_pool_idx_int = int(req_pool_idx)
+            seq_len_int = int(seq_len)
+            if req_pool_idx_int < 0 or req_pool_idx_int >= rows:
+                continue
+            upper = min(seq_len_int, cols)
+            if upper <= 0:
+                continue
+            row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+            for raw_slot in row_slots:
+                slot = int(raw_slot)
+                if slot < 0:
+                    continue
+                if slot in excluded:
+                    continue
+                candidate_slots.append(slot)
+        return candidate_slots
 
     def _print_periodic_stats(self) -> None:
         period = self.config.stats_print_every_n_steps
@@ -583,6 +696,18 @@ def _endpoint_belongs_to_group(
     return suffix == group.kind.name
 
 
+def _canary_kind_label(tag: CanaryLaunchTag) -> str:
+    name_lower = tag.name.lower()
+    if tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    ):
+        return name_lower
+    return f"per_forward_{name_lower}"
+
+
 def _format_violation(
     *,
     row: list[int],
@@ -602,8 +727,10 @@ def _format_violation(
     ) = row
     try:
         tag_label = CanaryLaunchTag(int(kernel_kind)).name
+        canary_kind = _canary_kind_label(CanaryLaunchTag(int(kernel_kind)))
     except ValueError:
         tag_label = f"unknown({int(kernel_kind)})"
+        canary_kind = tag_label
     bits = int(fail_reason_bits)
     reasons: list[str] = []
     if bits & 0x1:
@@ -622,6 +749,7 @@ def _format_violation(
                 f"KV cache canary violation detected (kernel_kind={tag_label}, "
                 f"slot_idx={int(slot_idx)}, position={int(position)})"
             ),
+            f"canary_kind:       {canary_kind}",
             f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}",
             (
                 f"  stored:   token_id={int(stored_token)}   position={int(position)} "
