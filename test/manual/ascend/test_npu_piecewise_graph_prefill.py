@@ -1,6 +1,8 @@
 import subprocess
 import unittest
 
+import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH,
@@ -14,6 +16,7 @@ from sglang.test.test_utils import (
 TOKENS_TO_CAPTURE = [i for i in range(128, 4096, 128)]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
     model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
     other_args = [
