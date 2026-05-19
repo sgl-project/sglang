@@ -322,6 +322,26 @@ module.exports = {
             time:       true,
         },
 
+        // ── TERMINAL BRIDGE (WebSocket exec + telemetry, port 5062) ───
+        {
+            name:              'fm-terminal-bridge',
+            script:            'agents/terminal_bridge.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'64M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                TERMINAL_PORT:    '5062',
+                PYTHONUNBUFFERED: '1',
+                NODE_ENV:         'production',
+            },
+            error_file: `${ROOT}/logs/fm-terminal-bridge-error.log`,
+            out_file:   `${ROOT}/logs/fm-terminal-bridge-out.log`,
+            time:       true,
+        },
+
         // ── v10003.42 APEX OMNI-MATRIX NODES ─────────────────────────
 
         // Cloudflare tunnel — bash wrapper prevents PM2 crash loop

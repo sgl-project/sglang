@@ -258,7 +258,187 @@
 
         </div>
     </div>
+
+    <!-- ── LIVE TERMINAL ──────────────────────────────────────────────────── -->
+    <div class="glass-panel overflow-hidden">
+        <!-- toggle header -->
+        <div class="px-6 py-4 flex items-center justify-between cursor-pointer select-none border-b border-white/5"
+             onclick="document.getElementById('term-body').classList.toggle('hidden')">
+            <div class="flex items-center gap-3">
+                <div class="flex gap-1.5">
+                    <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
+                    <span class="w-3 h-3 rounded-full bg-yellow-500/80"></span>
+                    <span class="w-3 h-3 rounded-full bg-green-500/80" id="ws-dot-header"></span>
+                </div>
+                <h2 class="text-sm font-bold text-white uppercase tracking-wider font-mono flex items-center gap-2">
+                    Live Terminal
+                    <span class="text-[9px] px-2 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-mono tracking-widest" id="term-lang-badge">BASH</span>
+                </h2>
+                <span class="text-[10px] text-zinc-500 font-mono">Bash · Python · Node.js · JSON · NLP Translation</span>
+            </div>
+            <div class="flex items-center gap-3">
+                <div class="flex gap-1" id="ws-indicator">
+                    <span class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" id="ws-dot"></span>
+                    <span class="text-[10px] text-zinc-500 font-mono" id="ws-label">connecting...</span>
+                </div>
+                <span class="text-zinc-500 text-xs">▼</span>
+            </div>
+        </div>
+
+        <div id="term-body">
+            <div class="grid grid-cols-1 xl:grid-cols-[1fr_300px] gap-0">
+
+                <!-- ── Terminal pane ── -->
+                <div class="border-r border-white/5">
+                    <!-- toolbar -->
+                    <div class="px-4 py-2 flex items-center gap-2 border-b border-white/5 flex-wrap"
+                         style="background:rgba(0,0,0,.3)">
+                        <!-- lang buttons -->
+                        <div class="flex gap-1">
+                            <button onclick="setTermLang(this,'bash')"   data-lang="bash"   class="term-lang-btn active-lang px-3 py-1 text-[9px] font-mono tracking-widest rounded border">BASH</button>
+                            <button onclick="setTermLang(this,'python')" data-lang="python" class="term-lang-btn px-3 py-1 text-[9px] font-mono tracking-widest rounded border">PYTHON</button>
+                            <button onclick="setTermLang(this,'node')"   data-lang="node"   class="term-lang-btn px-3 py-1 text-[9px] font-mono tracking-widest rounded border">NODE</button>
+                            <button onclick="setTermLang(this,'json')"   data-lang="json"   class="term-lang-btn px-3 py-1 text-[9px] font-mono tracking-widest rounded border">JSON</button>
+                        </div>
+                        <div class="h-4 w-px bg-white/10"></div>
+                        <!-- NLP toggle -->
+                        <button id="nlp-toggle-btn" onclick="toggleNLP()"
+                            class="px-3 py-1 text-[9px] font-mono tracking-widest rounded border border-zinc-700 text-zinc-400 hover:text-purple-400 hover:border-purple-500/40 transition-colors">
+                            NLP OFF
+                        </button>
+                        <!-- NLP mode buttons (shown when NLP on) -->
+                        <div id="nlp-mode-row" class="hidden flex gap-1">
+                            <button onclick="setNLPMode(this,'explain')"  data-mode="explain"  class="nlp-mode-btn active-nlp-mode px-2 py-1 text-[8px] font-mono rounded border">EXPLAIN</button>
+                            <button onclick="setNLPMode(this,'encode')"   data-mode="encode"   class="nlp-mode-btn px-2 py-1 text-[8px] font-mono rounded border">ENCODE</button>
+                            <button onclick="setNLPMode(this,'convert')"  data-mode="convert"  class="nlp-mode-btn px-2 py-1 text-[8px] font-mono rounded border">CONVERT</button>
+                        </div>
+                        <div class="ml-auto flex gap-2">
+                            <button onclick="clearTerminal()"
+                                class="px-3 py-1 text-[9px] font-mono tracking-widest rounded border border-zinc-700 text-zinc-400 hover:text-white transition-colors">
+                                CLEAR
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- output -->
+                    <div id="term-output"
+                         class="font-mono text-[11px] leading-relaxed p-4 custom-scrollbar overflow-y-auto"
+                         style="height:320px;background:#050a06;">
+                        <div class="text-cyan-500/50 mb-2">╔══════════════════════════════════════╗</div>
+                        <div class="text-cyan-500/50">║  FractalMesh Live Terminal  v1.0     ║</div>
+                        <div class="text-cyan-500/50">║  Bash · Python · Node.js · JSON      ║</div>
+                        <div class="text-cyan-500/50 mb-2">╚══════════════════════════════════════╝</div>
+                        <div class="text-cyan-400/60 italic">Connecting to terminal bridge on ws://localhost:5062...</div>
+                    </div>
+
+                    <!-- NLP output strip -->
+                    <div id="nlp-strip" class="hidden border-t border-purple-500/20 px-4 py-3"
+                         style="background:rgba(168,85,247,.05)">
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="text-[9px] font-mono tracking-widest text-purple-400 uppercase">NLP Translation</span>
+                            <span class="text-[9px] text-zinc-600 font-mono" id="nlp-mode-label">EXPLAIN</span>
+                        </div>
+                        <div id="nlp-output" class="font-mono text-[11px] text-purple-300/80 leading-relaxed whitespace-pre-wrap min-h-[40px]">
+                            Run a command to see translation.
+                        </div>
+                    </div>
+
+                    <!-- input row -->
+                    <div class="flex items-center border-t border-white/5" style="background:#050a06;">
+                        <span class="px-3 font-mono text-[13px] font-bold text-green-400 select-none" id="term-prompt">$</span>
+                        <input id="term-input" type="text" autocomplete="off" spellcheck="false"
+                            class="flex-1 bg-transparent outline-none font-mono text-[12px] text-green-300 py-3 placeholder-zinc-700 caret-green-400"
+                            placeholder="Enter command or plain English instruction..."
+                            onkeydown="termKeyDown(event)">
+                        <button onclick="execCommand()"
+                            class="px-4 py-3 font-mono text-[9px] tracking-widest text-green-400 hover:text-white border-l border-white/5 hover:bg-green-500/10 transition-colors">
+                            EXEC&nbsp;→
+                        </button>
+                    </div>
+                </div>
+
+                <!-- ── Right panel ── -->
+                <div class="flex flex-col">
+                    <!-- Telemetry feed -->
+                    <div class="flex-1 flex flex-col border-b border-white/5">
+                        <div class="px-4 py-2 border-b border-white/5 flex items-center gap-2" style="background:rgba(0,0,0,.2)">
+                            <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                            <span class="text-[9px] font-mono tracking-widest text-zinc-400 uppercase">Live Telemetry</span>
+                        </div>
+                        <div id="telem-feed" class="flex-1 overflow-y-auto custom-scrollbar font-mono text-[9px] leading-relaxed px-3 py-2 space-y-0.5"
+                             style="height:200px;background:#030508;">
+                            <div class="text-zinc-600">Waiting for log stream...</div>
+                        </div>
+                    </div>
+
+                    <!-- Quick commands -->
+                    <div style="background:rgba(0,0,0,.15)">
+                        <div class="px-4 py-2 border-b border-white/5">
+                            <span class="text-[9px] font-mono tracking-widest text-zinc-400 uppercase">Quick Commands</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-1 p-2">
+                            <button onclick="quickCmd('pm2 list')"          class="qcmd-btn">PM2 LIST</button>
+                            <button onclick="quickCmd('df -h')"             class="qcmd-btn">DISK</button>
+                            <button onclick="quickCmd('free -h')"           class="qcmd-btn">MEMORY</button>
+                            <button onclick="quickCmd('uptime')"            class="qcmd-btn">UPTIME</button>
+                            <button onclick="quickCmd('ps aux | grep python3 | grep -v grep | head -8')" class="qcmd-btn">PY PROCS</button>
+                            <button onclick="quickCmd('ls ~/fmsaas/logs/ | tail -8')" class="qcmd-btn">LOGS</button>
+                        </div>
+                    </div>
+
+                    <!-- Code converter -->
+                    <div style="background:rgba(0,0,0,.1)">
+                        <div class="px-4 py-2 border-t border-white/5">
+                            <span class="text-[9px] font-mono tracking-widest text-zinc-400 uppercase">Code Converter</span>
+                        </div>
+                        <div class="px-3 pb-3 space-y-2">
+                            <div class="flex items-center gap-1 text-[10px] font-mono">
+                                <select id="conv-from" class="flex-1 bg-zinc-900 border border-zinc-700 text-zinc-300 px-2 py-1 rounded outline-none text-[10px]">
+                                    <option value="bash">Bash</option>
+                                    <option value="python">Python</option>
+                                    <option value="node">Node.js</option>
+                                    <option value="json">JSON</option>
+                                </select>
+                                <span class="text-zinc-600">→</span>
+                                <select id="conv-to" class="flex-1 bg-zinc-900 border border-zinc-700 text-zinc-300 px-2 py-1 rounded outline-none text-[10px]">
+                                    <option value="python">Python</option>
+                                    <option value="bash">Bash</option>
+                                    <option value="node">Node.js</option>
+                                    <option value="json">JSON</option>
+                                </select>
+                            </div>
+                            <textarea id="conv-input" rows="2"
+                                class="w-full bg-zinc-900 border border-zinc-700 text-green-300 font-mono text-[10px] px-2 py-1 rounded outline-none resize-none"
+                                placeholder="Paste code..."></textarea>
+                            <button onclick="convertCode()"
+                                class="w-full py-1.5 text-[9px] font-mono tracking-widest rounded border border-zinc-700 text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors">
+                                CONVERT →
+                            </button>
+                            <div id="conv-result" class="hidden font-mono text-[9px] text-green-300 bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 max-h-24 overflow-y-auto whitespace-pre-wrap leading-relaxed"></div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
 </div>
+
+<style>
+    .term-lang-btn         { color:#6b7280; border-color:rgba(255,255,255,.08); background:transparent; transition:all .15s; }
+    .term-lang-btn:hover   { color:#4ade80; border-color:rgba(74,222,128,.3); background:rgba(74,222,128,.05); }
+    .active-lang           { color:#4ade80!important; border-color:rgba(74,222,128,.4)!important; background:rgba(74,222,128,.08)!important; }
+    .nlp-mode-btn          { color:#6b7280; border-color:rgba(255,255,255,.08); background:transparent; transition:all .15s; }
+    .active-nlp-mode       { color:#c084fc!important; border-color:rgba(192,132,252,.4)!important; background:rgba(192,132,252,.08)!important; }
+    .qcmd-btn              { padding:.35rem .5rem; font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:.1em; color:#71717a; border:1px solid rgba(255,255,255,.06); border-radius:.25rem; background:transparent; cursor:pointer; transition:all .15s; }
+    .qcmd-btn:hover        { color:#4ade80; border-color:rgba(74,222,128,.25); background:rgba(74,222,128,.04); }
+    .term-out-line         { display:block; color:#4ade80; }
+    .term-err-line         { display:block; color:#f87171; }
+    .term-cmd-line         { display:block; color:#22d3ee; }
+    .term-sys-line         { display:block; color:rgba(34,211,238,.5); font-style:italic; }
+    .term-nlp-line         { display:block; color:#c084fc; border-left:2px solid rgba(192,132,252,.3); padding-left:8px; margin:2px 0; }
+</style>
 
 <script>
     const initialSignals = [
@@ -450,7 +630,222 @@
         });
     }
 
-    window.addEventListener('DOMContentLoaded', () => { renderTable(); initCharts(); });
+    window.addEventListener('DOMContentLoaded', () => { renderTable(); initCharts(); initTerminal(); });
+
+    // ─── TERMINAL ENGINE ─────────────────────────────────────────────────────
+    const TERM = { ws:null, telWs:null, lang:'bash', nlpOn:false, nlpMode:'explain', history:[], histIdx:-1 };
+    const PROMPTS = { bash:'$ ', python:'>>> ', node:'> ', json:'{ ' };
+    const TERM_WS  = 'ws://localhost:5062/terminal';
+    const TELEM_WS = 'ws://localhost:5062/telemetry';
+
+    function setTermLang(el, lang) {
+        document.querySelectorAll('.term-lang-btn').forEach(b => b.classList.remove('active-lang'));
+        el.classList.add('active-lang');
+        TERM.lang = lang;
+        document.getElementById('term-prompt').textContent = PROMPTS[lang] || '$';
+        document.getElementById('term-lang-badge').textContent = lang.toUpperCase();
+    }
+
+    function toggleNLP() {
+        TERM.nlpOn = !TERM.nlpOn;
+        const btn   = document.getElementById('nlp-toggle-btn');
+        const strip = document.getElementById('nlp-strip');
+        const row   = document.getElementById('nlp-mode-row');
+        btn.textContent   = TERM.nlpOn ? 'NLP ON'  : 'NLP OFF';
+        btn.style.color   = TERM.nlpOn ? '#c084fc' : '';
+        btn.style.borderColor = TERM.nlpOn ? 'rgba(192,132,252,.4)' : '';
+        strip.classList.toggle('hidden', !TERM.nlpOn);
+        row.classList.toggle('hidden',   !TERM.nlpOn);
+    }
+
+    function setNLPMode(el, mode) {
+        document.querySelectorAll('.nlp-mode-btn').forEach(b => b.classList.remove('active-nlp-mode'));
+        el.classList.add('active-nlp-mode');
+        TERM.nlpMode = mode;
+        document.getElementById('nlp-mode-label').textContent = mode.toUpperCase();
+    }
+
+    function clearTerminal() {
+        document.getElementById('term-output').innerHTML = '';
+        termPrint('[CLEARED]', 'sys');
+    }
+
+    function termPrint(text, cls = 'out') {
+        const out = document.getElementById('term-output');
+        const classMap = { out:'term-out-line', err:'term-err-line', cmd:'term-cmd-line', sys:'term-sys-line', nlp:'term-nlp-line' };
+        String(text).split('\n').forEach(line => {
+            const span = Object.assign(document.createElement('span'), { className: classMap[cls] || 'term-out-line', textContent: line });
+            out.appendChild(span);
+            out.appendChild(document.createElement('br'));
+        });
+        const all = out.querySelectorAll('span');
+        if (all.length > 600) for (let i = 0; i < all.length - 600; i++) { all[i].nextSibling?.remove(); all[i].remove(); }
+        out.scrollTop = out.scrollHeight;
+    }
+
+    function setWsDot(state) {
+        const dot   = document.getElementById('ws-dot');
+        const label = document.getElementById('ws-label');
+        const hdr   = document.getElementById('ws-dot-header');
+        const colors = { green:'#4ade80', yellow:'#facc15', red:'#f87171' };
+        dot.style.background   = colors[state] || colors.yellow;
+        hdr.style.background   = colors[state] || colors.yellow;
+        label.textContent      = { green:'connected', yellow:'connecting...', red:'disconnected' }[state] || state;
+        dot.classList.toggle('animate-pulse', state !== 'green');
+    }
+
+    function termConnect() {
+        setWsDot('yellow');
+        let delay = 2000;
+        function tryConnect() {
+            try { TERM.ws = new WebSocket(TERM_WS); }
+            catch(_) { setWsDot('red'); return; }
+            TERM.ws.onopen  = () => { setWsDot('green'); termPrint('[OK] Terminal bridge connected — ws://localhost:5062', 'sys'); delay = 2000; };
+            TERM.ws.onmessage = ev => {
+                try {
+                    const m = JSON.parse(ev.data);
+                    if (m.type === 'stdout') termPrint(m.data, 'out');
+                    else if (m.type === 'stderr') termPrint(m.data, 'err');
+                    else if (m.type === 'exit')   termPrint(`[exit ${m.code}]`, 'sys');
+                    else if (m.type === 'system') termPrint(m.data, 'sys');
+                } catch(_) { termPrint(ev.data, 'out'); }
+            };
+            TERM.ws.onerror = () => setWsDot('red');
+            TERM.ws.onclose = () => {
+                setWsDot('red');
+                termPrint(`[CLOSED] Reconnecting in ${delay/1000}s…`, 'sys');
+                setTimeout(() => { delay = Math.min(delay * 2, 30000); tryConnect(); }, delay);
+            };
+        }
+        tryConnect();
+    }
+
+    function telemConnect() {
+        try { TERM.telWs = new WebSocket(TELEM_WS); }
+        catch(_) { return; }
+        TERM.telWs.onmessage = ev => {
+            try {
+                const m = JSON.parse(ev.data);
+                telemAppend(m.agent || 'sys', m.text || ev.data, m.level || 'info');
+            } catch(_) { telemAppend('sys', ev.data, 'info'); }
+        };
+        TERM.telWs.onclose = () => setTimeout(telemConnect, 8000);
+    }
+
+    function telemAppend(agent, text, level) {
+        const feed = document.getElementById('telem-feed');
+        const now  = new Date().toLocaleTimeString('en-AU', { hour12:false });
+        const cls  = level === 'err' ? 'text-red-400' : level === 'warn' ? 'text-yellow-400' : 'text-emerald-400';
+        const div  = document.createElement('div');
+        div.className = 'flex gap-1';
+        div.innerHTML = `<span class="text-zinc-600 shrink-0">[${now}]</span>`
+            + `<span class="text-cyan-500/60 shrink-0 w-24 truncate">${agent.slice(0,16)}</span>`
+            + `<span class="${cls} truncate">${String(text).slice(0,100)}</span>`;
+        feed.appendChild(div);
+        const lines = feed.querySelectorAll('div');
+        if (lines.length > 200) lines[0].remove();
+        feed.scrollTop = feed.scrollHeight;
+    }
+
+    async function execCommand() {
+        const input = document.getElementById('term-input');
+        const raw   = input.value.trim();
+        if (!raw) return;
+        TERM.history.unshift(raw);
+        if (TERM.history.length > 50) TERM.history.pop();
+        TERM.histIdx = -1;
+        input.value  = '';
+
+        termPrint((PROMPTS[TERM.lang] || '$ ') + raw, 'cmd');
+
+        let cmd = raw;
+        if (TERM.nlpOn && TERM.nlpMode === 'encode') {
+            const encoded = await nlpTranslate(raw, 'encode', TERM.lang);
+            if (encoded) { termPrint('[NLP→CODE] ' + encoded, 'nlp'); cmd = encoded; }
+        }
+
+        if (TERM.ws && TERM.ws.readyState === WebSocket.OPEN) {
+            TERM.ws.send(JSON.stringify({ cmd, lang: TERM.lang }));
+        } else {
+            termPrint('[OFFLINE] Bridge not running on :5062 — start: python3 agents/terminal_bridge.py', 'err');
+        }
+
+        if (TERM.nlpOn && TERM.nlpMode !== 'encode') {
+            setTimeout(async () => {
+                const recent = Array.from(document.getElementById('term-output').querySelectorAll('.term-out-line'))
+                    .slice(-15).map(el => el.textContent).join('\n');
+                if (recent.trim()) {
+                    const trans = await nlpTranslate(recent, TERM.nlpMode, TERM.lang);
+                    if (trans) {
+                        document.getElementById('nlp-output').textContent = trans;
+                        termPrint('[NLP] ' + trans, 'nlp');
+                    }
+                }
+            }, 1800);
+        }
+    }
+
+    function quickCmd(cmd) {
+        document.getElementById('term-input').value = cmd;
+        execCommand();
+    }
+
+    function termKeyDown(e) {
+        if (e.key === 'Enter') { execCommand(); return; }
+        const input = document.getElementById('term-input');
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            TERM.histIdx = Math.min(TERM.histIdx + 1, TERM.history.length - 1);
+            input.value = TERM.history[TERM.histIdx] || '';
+        } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            TERM.histIdx = Math.max(TERM.histIdx - 1, -1);
+            input.value = TERM.histIdx >= 0 ? TERM.history[TERM.histIdx] : '';
+        }
+    }
+
+    async function nlpTranslate(text, mode, lang) {
+        const prompts = {
+            explain: `Explain this ${lang} output in 1-2 plain English sentences:\n${text}`,
+            encode:  `Convert this plain English instruction to one executable ${lang} command (return ONLY the command):\n${text}`,
+            convert: `Briefly explain this code, then show the equivalent in ${lang}:\n${text}`,
+        };
+        const API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+            ? 'http://localhost:5058' : '';
+        try {
+            const r = await fetch(API_BASE + '/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: prompts[mode] || prompts.explain }),
+            });
+            return (await r.json()).reply || '';
+        } catch(_) { return ''; }
+    }
+
+    async function convertCode() {
+        const from  = document.getElementById('conv-from').value;
+        const to    = document.getElementById('conv-to').value;
+        const code  = document.getElementById('conv-input').value.trim();
+        if (!code) return;
+        const res = document.getElementById('conv-result');
+        res.classList.remove('hidden');
+        res.textContent = 'Converting…';
+        const prompt = `Convert the following ${from} code to ${to}. Return ONLY the converted code, no explanation:\n\n${code}`;
+        const API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+            ? 'http://localhost:5058' : '';
+        try {
+            const r = await fetch(API_BASE + '/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: prompt }),
+            });
+            res.textContent = (await r.json()).reply || '[No output]';
+        } catch(_) {
+            res.textContent = 'Backend offline — start fm-pod on :5058';
+        }
+    }
+
+    function initTerminal() { termConnect(); telemConnect(); }
 </script>
 </body>
 </html>
