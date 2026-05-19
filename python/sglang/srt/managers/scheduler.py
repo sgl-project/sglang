@@ -2272,7 +2272,7 @@ class Scheduler(
         )
 
         if batch.return_logprob:
-            batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
