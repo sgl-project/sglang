@@ -1,18 +1,4 @@
-"""C++/Python constant parity test for the kv_cache_canary jit_kernel.
-
-Parses ``python/sglang/jit_kernel/csrc/kv_cache_canary/canary_common.cuh`` via regex and compares the
-extracted ``k*`` constants against the Python-side counterparts. Catches any drift where one side renames /
-renumbers a constant without the other (e.g. shifting ``kCanaryFieldToken`` by +1 would break the device
-read pattern).
-
-Notes:
-- API names (``CanaryPseudoMode`` / ``pseudo_mode`` / ``kCanaryPseudoMode``) match the sglang-dev-d
-  jit_kernel implementation. The kernel SOT (kernels.md) has renamed the surface to
-  ``CanaryMockMode`` / ``mock_mode`` / ``kCanaryMockMode``; sync pending kernel-side rename. The
-  ``test_canary_mock_mode_enum`` case below intentionally pins the current (pseudo-named) enum.
-- This test is CPU-only (regex + Python imports); the registration still goes through the CUDA suite
-  because the kernel files this test pins are CUDA-side.
-"""
+"""C++/Python constant parity test for the kv_cache_canary jit_kernel."""
 
 from __future__ import annotations
 
@@ -184,11 +170,7 @@ def test_real_kv_hash_mode_enum() -> None:
 
 
 def test_canary_mock_mode_enum() -> None:
-    """C++ ``CanaryPseudoMode {kOff, kOn}`` parity with Python ``CanaryPseudoMode``.
-
-    Named ``mock_mode`` per testing.md SOT, but the in-tree implementation still uses the ``pseudo``
-    surface; this case pins whatever symbol pair the codebase currently exposes, regardless of name.
-    """
+    """C++ ``CanaryPseudoMode {kOff, kOn}`` parity with Python ``CanaryPseudoMode``."""
     members = _parse_enum_values(source=_read_cuh(), enum_name="CanaryPseudoMode")
     assert members["kOff"] == int(CanaryPseudoMode.OFF)
     assert members["kOn"] == int(CanaryPseudoMode.ON)

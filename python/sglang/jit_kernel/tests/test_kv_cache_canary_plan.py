@@ -1,14 +1,4 @@
-"""Differential test: Triton canary_plan_step vs the torch reference, byte-equal.
-
-Each test invokes both ``canary_plan_step`` (Triton) and ``canary_plan_step_torch_reference`` on identical
-inputs and asserts byte-equality on the four plan output tensors (verify_slot_indices, verify_positions,
-verify_prev_slot_indices, verify_num_valid) plus the WritePlan outputs (write_offsets,
-write_seed_slot_indices, write_num_valid_reqs).
-
-The hardcoded ``test_byte_equal_python_reference_hardcoded`` subset pins specific (bs=3, three prefix
-combinations) outputs against hand-computed expected verify_offsets / write_offsets / seed_slot_indices
-sequences, defending against a Triton + ref co-drift away from kernels.md §6 plan semantics.
-"""
+"""Differential test: Triton canary_plan_step vs the torch reference, byte-equal."""
 
 from __future__ import annotations
 
@@ -960,11 +950,7 @@ def test_byte_equal_python_reference() -> None:
 
 @pytest.mark.parametrize("hardcoded", [True])
 def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
-    """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots.
-
-    Defends against a Triton + ref co-drift away from kernels.md §6 plan semantics. Expected values are
-    computed straight from the (prefix, extend) inputs without importing the ref impl.
-    """
+    """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots."""
     assert hardcoded
 
     # Step 1: pin (prefix, extend) per req.

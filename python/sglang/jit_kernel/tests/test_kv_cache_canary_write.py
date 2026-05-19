@@ -1,17 +1,4 @@
-"""Differential test: CUDA canary_write_step vs the torch reference, byte-equal.
-
-Each test invokes both ``canary_write_step`` and ``canary_write_step_torch_reference`` on identical
-inputs and asserts byte-equality on the four globals (canary_buf, violation_ring, write_index, both
-counters). The hardcoded ``test_chain_link_byte_equal_5_step_hardcoded`` subset additionally pins each
-stored slot's 4 int64 fields against a Python-side ``splitmix64`` computation per kernels.md §6.1.
-
-Notes:
-- API names (``CanaryPseudoMode`` / ``pseudo_mode`` / ``pseudo_expected_*``) match the sglang-dev-d
-  jit_kernel implementation. The kernel SOT (kernels.md) renamed to
-  ``CanaryMockMode`` / ``mock_mode`` / ``mock_expected_*``; sync pending kernel-side rename.
-- The write wrapper raises if ``len(real_kv_sources) > 4``; we exercise that path via the
-  ``test_real_kv_source_above_4_raises`` case (no CUDA launch).
-"""
+"""Differential test: CUDA canary_write_step vs the torch reference, byte-equal."""
 
 from __future__ import annotations
 
@@ -1104,12 +1091,7 @@ def test_padding_block_skipped() -> None:
 
 @pytest.mark.parametrize("hardcoded", [True])
 def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
-    """5-step write chain with hand-computed splitmix64 expected fields per slot.
-
-    Defends against a ref + CUDA co-drift away from kernels.md §6.1 chain advance. Expected stored
-    ``prev_hash`` per slot is computed in Python via the splitmix64 helper; tokens / positions /
-    real_kv_hash come straight from the inputs.
-    """
+    """5-step write chain with hand-computed splitmix64 expected fields per slot."""
     assert hardcoded
     cuda_buf, ref_buf = _setup_pair()
     plan_cuda = make_write_plan(
