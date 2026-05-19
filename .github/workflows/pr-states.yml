@@ -56,11 +56,15 @@ jobs:
             if (context.payload.pull_request) {
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_dispatch') {
-              prNumber = parseInt(context.payload.inputs.pr_number, 10);
-              if (!prNumber) {
-                core.setFailed(`workflow_dispatch: invalid pr_number input '${context.payload.inputs.pr_number}'`);
+              // workflow_dispatch inputs are arbitrary strings; reject
+              // anything that isn't a pure digit sequence so trailing
+              // garbage like '123abc' doesn't silently truncate via parseInt.
+              const raw = context.payload.inputs.pr_number;
+              if (!/^\d+$/.test(raw)) {
+                core.setFailed(`workflow_dispatch: invalid pr_number input '${raw}' (must be digits only)`);
                 return;
               }
+              prNumber = parseInt(raw, 10);
             } else {
               core.info(`Unsupported event '${context.eventName}'; skipping.`);
               return;

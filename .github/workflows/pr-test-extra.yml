@@ -222,27 +222,63 @@ jobs:
       run_timeout_minutes: '60'
     secrets: inherit
 
+  # =============================================== aggregator ====================================================
+  # Mirrors pr-test.yml's `pr-test-finish`: one aggregator job that
+  # encodes the full job-graph membership in a single place. Downstream
+  # consumers (notify-pr-states) only need to depend on this job rather
+  # than re-listing every stage. Failures cascade up: this job fails if
+  # any dependent failed/cancelled.
+  pr-test-extra-finish:
+    needs:
+      [
+        check-changes,
+        call-gate,
+        sgl-kernel-build-wheels,
+        extra-a-test-1-gpu-small,
+        extra-a-test-1-gpu-large,
+        extra-a-test-2-gpu-large,
+        extra-b-test-4-gpu-h100,
+        extra-b-test-4-gpu-b200,
+        extra-b-test-8-gpu-h200,
+        extra-b-test-deepep-8-gpu-h200,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
+
   # =============================================== notify pr-states ====================================================
   # Explicit dispatch of pr-states.yml on every run completion (initial +
   # every rerun attempt). GitHub does not re-fire `workflow_run.completed`
   # for rerun attempts, so a `workflow_run` subscription only catches the
   # initial completion. `workflow_dispatch` is the only event GITHUB_TOKEN
   # is allowed to cascade-create, so this works regardless of who initiated
-  # the rerun. Runs unconditionally (`if: always()`) so the PR-body status
-  # block reflects the latest attempt even after cancellation / failure.
+  # the rerun. Depends only on pr-test-extra-finish (which aggregates
+  # everything) so the needs list stays maintenance-free.
+  #
+  # Fork PRs are excluded: `pull_request` event from a fork repo runs with
+  # a read-only GITHUB_TOKEN regardless of the declared `actions: write`,
+  # so the dispatch call would 403. Fork PRs already get pr-states updates
+  # from `pull_request_target.synchronize` on each push.
   notify-pr-states:
-    needs:
-      - check-changes
-      - call-gate
-      - sgl-kernel-build-wheels
-      - extra-a-test-1-gpu-small
-      - extra-a-test-1-gpu-large
-      - extra-a-test-2-gpu-large
-      - extra-b-test-4-gpu-h100
-      - extra-b-test-4-gpu-b200
-      - extra-b-test-8-gpu-h200
-      - extra-b-test-deepep-8-gpu-h200
-    if: always() && github.event_name == 'pull_request'
+    needs: [pr-test-extra-finish]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch pr-states refresh
