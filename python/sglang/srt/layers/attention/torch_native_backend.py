@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 class TorchNativeAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        super().__init__()
+        super().__init__(model_runner)
         self.forward_metadata = None
         self.device = model_runner.device
 

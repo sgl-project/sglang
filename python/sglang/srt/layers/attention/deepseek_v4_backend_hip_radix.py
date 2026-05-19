@@ -333,7 +333,7 @@ class DeepseekV4HipRadixBackend(
         topk=0,
         speculative_num_steps=0,
     ):
-        super().__init__()
+        super().__init__(model_runner)
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
         assert (

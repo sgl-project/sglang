@@ -92,7 +92,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
 
-        super().__init__()
+        super().__init__(model_runner)
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)

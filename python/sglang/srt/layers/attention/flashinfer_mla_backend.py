@@ -198,7 +198,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
-        super().__init__()
+        super().__init__(model_runner)
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len

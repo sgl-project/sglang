@@ -122,7 +122,7 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         topk: int = 1,
     ):
-        super().__init__()
+        super().__init__(model_runner)
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,

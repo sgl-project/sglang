@@ -122,7 +122,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         init_new_workspace: bool = False,
     ):
-        super().__init__()
+        super().__init__(model_runner)
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 

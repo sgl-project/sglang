@@ -106,6 +106,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self,
         model_runner: "ModelRunner",
     ) -> None:
+        super().__init__(model_runner)
         self.forward_metadata: FlashAttentionMetadata = None
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len

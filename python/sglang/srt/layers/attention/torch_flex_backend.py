@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 class TorchFlexAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        super().__init__()
+        super().__init__(model_runner)
         self.forward_metadata = None
         self.device = model_runner.device
         self.flex_attention = torch.compile(flex_attention, dynamic=True)

@@ -19,6 +19,7 @@ class HybridAttnBackend(AttentionBackend):
         prefill_backend: AttentionBackend,
         decode_backend: AttentionBackend,
     ):
+        super().__init__(model_runner)
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend

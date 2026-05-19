@@ -254,7 +254,7 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
 class AscendAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
-        super().__init__()
+        super().__init__(model_runner)
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id

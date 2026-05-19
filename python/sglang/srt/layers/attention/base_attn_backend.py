@@ -11,12 +11,36 @@ from sglang.srt.utils.common import is_npu
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
 
 
 class AttentionBackend(ABC):
-    """The base class of attention backends"""
+    """The base class of attention backends.
+
+    Pool refs live here (not on ForwardBatch) so that backend forward methods
+    can use ``self.req_to_token_pool`` / ``self.token_to_kv_pool`` directly
+    instead of threading them through every ForwardBatch instance.
+
+    Subclasses that already accept ``model_runner`` should call
+    ``super().__init__(model_runner)`` to populate these attrs automatically.
+    Subclasses that construct without a model_runner (e.g. TBOBackend which
+    wraps a primary backend) should call ``super().__init__()`` and set the
+    attrs explicitly if needed.
+    """
+
+    def __init__(self, model_runner=None) -> None:
+        if model_runner is not None:
+            # Runtime pool refs — set once at construction, not threaded
+            # through ForwardBatch.  Backends access these via ``self.*``.
+            self.req_to_token_pool: ReqToTokenPool = model_runner.req_to_token_pool
+            self.token_to_kv_pool: KVCache = model_runner.token_to_kv_pool
+
+            # Optional co-actor; nullable when feature is disabled.
+            self.hisparse_coordinator = getattr(
+                model_runner, "hisparse_coordinator", None
+            )
 
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):

@@ -102,7 +102,7 @@ class WaveAttnBackend(AttentionBackend):
             extend_attention_wave,
         )
 
-        super().__init__()
+        super().__init__(model_runner)
 
         # Set unique cache dir for each process to avoid cache write races
         import wave_lang.kernel.wave.cache as cache

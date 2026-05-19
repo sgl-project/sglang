@@ -41,7 +41,7 @@ class XPUAttentionBackend(AttentionBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        super().__init__()
+        super().__init__(model_runner)
 
         assert not (
             model_runner.sliding_window_size is not None

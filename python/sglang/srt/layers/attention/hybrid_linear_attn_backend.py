@@ -137,7 +137,7 @@ def track_mamba_states_if_needed(
 
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        super().__init__()
+        super().__init__(model_runner)
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0

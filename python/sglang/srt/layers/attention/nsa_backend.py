@@ -306,7 +306,7 @@ class NativeSparseAttnBackend(
         topk=0,
         speculative_num_steps=0,
     ):
-        super().__init__()
+        super().__init__(model_runner)
         self.forward_metadata: NSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
