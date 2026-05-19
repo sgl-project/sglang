@@ -157,6 +157,10 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
+    @property
+    def active_tag_count(self) -> int:
+        return len(self._active_tags)
+
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 

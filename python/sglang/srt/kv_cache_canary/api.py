@@ -104,7 +104,7 @@ def install_canary(
     logger.info(
         "install_canary: mode=%s tags=%d sweep_cadence=%d",
         config.mode,
-        len(runner._active_tags),
+        runner.active_tag_count,
         config.sweep_every_n_steps,
     )
     return runner
