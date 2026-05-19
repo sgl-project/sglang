@@ -323,6 +323,19 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
                 "Overlap scheduler is disabled for decoupled speculative decoding."
             )
 
+        if not server_args.disable_radix_cache:
+            server_args.disable_radix_cache = True
+            logger.warning(
+                "Radix cache is disabled for decoupled drafter."
+            )
+
+        if server_args.mamba_scheduler_strategy != "no_buffer":
+            server_args.mamba_scheduler_strategy = "no_buffer"
+            logger.warning(
+                "Mamba extra buffer is disabled for decoupled drafter engine. "
+                "Falling back to --mamba-scheduler-strategy no_buffer."
+            )
+
         if server_args.enable_mixed_chunk:
             server_args.enable_mixed_chunk = False
             logger.warning(

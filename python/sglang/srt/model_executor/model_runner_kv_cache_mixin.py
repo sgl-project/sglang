@@ -107,9 +107,17 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
+            mamba_slots_per_request = 1
+            if server_args.speculative_algorithm == "DECOUPLED_DRAFT":
+                decoupled_drafter_num_draft_tokens = int(
+                    server_args.speculative_num_draft_tokens or 0
+                )
+                # One slot holds the live request state. The decoupled drafter
+                # reserves additional rollback checkpoints per running request.
+                mamba_slots_per_request += 3 * decoupled_drafter_num_draft_tokens
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
-            )
+            ) * mamba_slots_per_request
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0

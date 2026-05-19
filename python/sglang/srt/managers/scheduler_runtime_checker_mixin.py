@@ -42,6 +42,7 @@ class PoolStats:
     mamba_usage: Optional[float] = None
     mamba_available_size: Optional[int] = None
     mamba_evictable_size: Optional[int] = None
+    decoupled_drafter_mamba_checkpoint_num_used: Optional[int] = None
 
     # HiSparse device/host breakdown for decode logs (plain KV pool only)
     hisparse_device_tokens: Optional[int] = None
@@ -80,6 +81,11 @@ class PoolStats:
             if not self.is_hybrid_swa:
                 parts.append(f"full token usage: {self.full_token_usage:.2f}")
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
+            if self.decoupled_drafter_mamba_checkpoint_num_used:
+                parts.append(
+                    "decoupled drafter mamba ckpt num: "
+                    f"{self.decoupled_drafter_mamba_checkpoint_num_used}"
+                )
         if not parts:
             parts.append(f"token usage: {self.full_token_usage:.2f}")
         return parts
@@ -103,6 +109,11 @@ class PoolStats:
                 f"mamba num: {self.mamba_num_used}",
                 f"mamba usage: {self.mamba_usage:.2f}",
             ]
+            if self.decoupled_drafter_mamba_checkpoint_num_used:
+                parts.append(
+                    "decoupled drafter mamba ckpt num: "
+                    f"{self.decoupled_drafter_mamba_checkpoint_num_used}"
+                )
         if self.is_hisparse:
             parts += [
                 f"#gpu token: {self.hisparse_device_tokens}",
@@ -198,6 +209,9 @@ class SchedulerRuntimeCheckerMixin:
             pool_stats.mamba_usage = mamba_stats.mamba_usage
             pool_stats.mamba_available_size = mamba_stats.mamba_available_size
             pool_stats.mamba_evictable_size = mamba_stats.mamba_evictable_size
+            pool_stats.decoupled_drafter_mamba_checkpoint_num_used = (
+                mamba_stats.decoupled_drafter_mamba_checkpoint_num_used
+            )
 
         return pool_stats
 
@@ -241,8 +255,14 @@ class SchedulerRuntimeCheckerMixin:
         full_num_used = self.token_to_kv_pool_allocator.size - (
             full_available_size + full_evictable_size
         )
+        # Allocated decoupled drafter checkpoint slots are intentionally counted
+        # as used mamba slots: they are reserved from mamba_pool.free_slots and
+        # are not evictable through the radix cache.
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
             mamba_available_size + mamba_evictable_size
+        )
+        decoupled_drafter_mamba_checkpoint_num_used = (
+            self._decoupled_drafter_mamba_checkpoint_slot_count()
         )
         full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
         mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
@@ -257,7 +277,21 @@ class SchedulerRuntimeCheckerMixin:
             mamba_usage=mamba_usage,
             mamba_available_size=mamba_available_size,
             mamba_evictable_size=mamba_evictable_size,
+            decoupled_drafter_mamba_checkpoint_num_used=(
+                decoupled_drafter_mamba_checkpoint_num_used
+            ),
         )
+
+    def _decoupled_drafter_mamba_checkpoint_slot_count(self: Scheduler) -> int:
+        if not self.spec_algorithm.is_decoupled_draft():
+            return 0
+
+        decoupled_drafter_num_checkpoint_slots = 0
+        for state in self.draft_req_table.values():
+            slots = state.mamba_checkpoint_slots
+            if slots is not None:
+                decoupled_drafter_num_checkpoint_slots += int(slots.numel())
+        return decoupled_drafter_num_checkpoint_slots
 
     def _get_swa_token_info(self: Scheduler) -> PoolStats:
         full_available_size = self.token_to_kv_pool_allocator.full_available_size()
