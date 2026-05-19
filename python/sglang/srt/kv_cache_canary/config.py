@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
@@ -11,6 +12,12 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+
+class CanaryMode(str, Enum):
+    OFF = "off"
+    ON = "on"
+    RAISE = "raise"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
