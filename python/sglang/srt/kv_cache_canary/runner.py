@@ -11,13 +11,19 @@ from sglang.jit_kernel.kv_cache_canary_verify import (
     CanaryLaunchTag,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_cache_canary_write import WritePlan
+from sglang.jit_kernel.kv_cache_canary_write import (
+    CanaryPseudoMode as CanaryInputCheckMode,
+)
+from sglang.jit_kernel.kv_cache_canary_write import (
+    WritePlan,
+)
 from sglang.srt.kv_cache_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_cache_canary.mock_model.sampler import fill_expected_inputs
 from sglang.srt.kv_cache_canary.plan_input import (
     AliveReqSnapshot,
     PlanInput,
@@ -180,6 +186,13 @@ class CanaryRunner:
 
         self.perturb_hook(forward_batch)
         self._last_forward_batch = forward_batch
+
+        if self.config.input_check_mode == CanaryInputCheckMode.ON:
+            fill_expected_inputs(
+                forward_batch=forward_batch,
+                expected_input_tokens_out=self._expected_input_tokens,
+                expected_input_positions_out=self._expected_input_positions,
+            )
 
         for pool_idx, groups in enumerate(self._groups_per_pool):
             for group in groups:
