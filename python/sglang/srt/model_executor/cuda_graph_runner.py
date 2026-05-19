@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.offloader import OffloaderV2, get_offloader
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -907,8 +908,20 @@ class CudaGraphRunner:
         else:
             captured_fn = run_once_fn
 
+        # IMPORTANT: (OffloaderV2) Drain alt_stream before capture so the
+        # captured graph sees buffers already filled by pre-capture eager
+        # prefetches; events recorded in eager are not visible inside a graph.
+        offloader = get_offloader()
+        if isinstance(offloader, OffloaderV2):
+            offloader.wait_for_prev_onload()
+
         with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
             out = captured_fn()
+
+            # IMPORTANT: (OffloaderV2) After all-layer forward finishes,
+            # have the capture stream join offloader's copy_stream, to avoid unjoined stream error.
+            if isinstance(offloader, OffloaderV2):
+                offloader.join_after_forward()
         return out
 
     def _create_device_graph(self):
@@ -1298,6 +1311,12 @@ class CudaGraphRunner:
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
+        # IMPORTANT: (OffloaderV2) Drain alt_stream before replay so prefetches
+        # issued by the previous eager / piecewise / earlier full-graph step
+        # complete before the replay reads / overwrites the same static slots.
+        offloader = get_offloader()
+        if isinstance(offloader, OffloaderV2):
+            offloader.wait_for_prev_onload()
         with ctx:
             self.graphs[graph_key].replay()
 

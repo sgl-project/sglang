@@ -18,6 +18,7 @@ from sglang.srt.compilation.piecewise_context_manager import (
     is_in_pcg_torch_compile,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.utils.offloader import OffloaderV2, get_offloader
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,12 @@ class CUDAPiecewiseBackend:
                 assert (
                     stream is not None
                 ), "PCG capture stream is not set, please check if runtime recompilation happened"
+                # IMPORTANT: (OffloaderV2) Drain alt_stream before this
+                # subgraph's capture starts; events recorded in eager (or in a
+                # previous subgraph) are not visible inside this graph.
+                offloader = get_offloader()
+                if isinstance(offloader, OffloaderV2):
+                    offloader.wait_for_prev_onload()
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
@@ -182,6 +189,12 @@ class CUDAPiecewiseBackend:
                         # the last graph, because the output of the last graph
                         # will not be used by any other cuda graph.
                         output = weak_ref_tensors(output)
+
+                    # IMPORTANT: (OffloaderV2) After all-layer forward finishes,
+                    # have the capture stream join offloader's copy_stream, to avoid unjoined stream error.
+                    offloader = get_offloader()
+                    if isinstance(offloader, OffloaderV2):
+                        offloader.join_after_forward()
 
             # here we always use weak ref for the output
             # to save memory
@@ -204,5 +217,11 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
+        # IMPORTANT: (OffloaderV2) Drain alt_stream before replay so prefetches
+        # issued by the previous eager / earlier subgraph step complete before
+        # this replay reads / overwrites the same static slots.
+        offloader = get_offloader()
+        if isinstance(offloader, OffloaderV2):
+            offloader.wait_for_prev_onload()
         entry.cudagraph.replay()
         return entry.output
