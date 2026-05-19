@@ -1407,7 +1407,9 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        if scoring_func != "sqrtsoftplus":
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+
         if scoring_func == "sqrtsoftplus":
             _biased_topk = (
                 biased_topk_jit_kernel_impl
@@ -1462,6 +1464,18 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
+        # Benchmark-only: override gating with uniform round-robin expert assignment
+        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
+        num_tokens, k = topk_ids.shape
+        num_experts = router_logits.shape[1]
+        offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
+        steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
+        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
+            topk_ids.dtype
+        )
+        topk_weights = torch.ones_like(topk_weights) / k
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
