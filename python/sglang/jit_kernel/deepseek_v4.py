@@ -1086,7 +1086,7 @@ def _dispatch_bf16_fp32_backend(
     x: torch.Tensor, y: torch.Tensor, *, algo: str
 ) -> torch.Tensor:
     if _use_aiter:
-        return tgemm.mm(x, y, otype=torch.float32)
+        return tgemm.mm(x, y, otype=x.dtype).float()
     elif algo == "cublas":
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
