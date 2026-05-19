@@ -115,7 +115,7 @@ def register_xpu_ci(
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
 ):
-    """Marker for XPU (Intel GPU) CI registration (parsed via AST; runtime no-op)."""
+    """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
