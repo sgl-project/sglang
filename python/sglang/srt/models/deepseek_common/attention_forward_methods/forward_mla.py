@@ -409,24 +409,29 @@ class DeepseekMLAForwardMixin:
                 # for extend, gather kv
                 cache_k_nope, cache_k_rope = (
                     forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                        self.attn_mqa,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
                     )
                 )
-                # all gather kv cache into forward_batch.dcp_kv_buffer
+                # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
                 local_cache_kv = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
                 get_dcp_group().all_gather_into_tensor(
-                    forward_batch.dcp_kv_buffer[
-                        : forward_batch.dcp_extend_prefix_lens_sum
+                    forward_batch.attn_dcp_metadata.dcp_kv_buffer[
+                        : forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum
                     ],
                     local_cache_kv,
                 )
 
-                # copy local kv cache into forward_batch.dcp_kv_buffer
-                forward_batch.dcp_kv_buffer[
-                    forward_batch.dcp_extend_prefix_lens_sum :, ..., : self.kv_lora_rank
+                # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+                forward_batch.attn_dcp_metadata.dcp_kv_buffer[
+                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum :,
+                    ...,
+                    : self.kv_lora_rank,
                 ] = k_nope
-                forward_batch.dcp_kv_buffer[
-                    forward_batch.dcp_extend_prefix_lens_sum :, ..., self.kv_lora_rank :
+                forward_batch.attn_dcp_metadata.dcp_kv_buffer[
+                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum :,
+                    ...,
+                    self.kv_lora_rank :,
                 ] = k_pe
             else:
                 logger.warning(

@@ -581,8 +581,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            if forward_batch.dcp_kv_buffer is not None:
-                k_buf = forward_batch.dcp_kv_buffer.to(q.dtype)
+            if (
+                forward_batch.attn_dcp_metadata is not None
+                and forward_batch.attn_dcp_metadta.dcp_kv_buffer is not None
+            ):
+                k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
                 k_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -950,10 +953,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             # mla paged prefill
             if forward_batch is not None:
-                if forward_batch.dcp_kv_indptr is not None:
-                    kv_indptr = forward_batch.dcp_kv_indptr
-                if forward_batch.dcp_kv_indices is not None:
-                    kv_indices = forward_batch.dcp_kv_indices
+                if forward_batch.attn_dcp_metadata is not None:
+                    if forward_batch.attn_dcp_metadata.dcp_kv_indptr is not None:
+                        kv_indptr = forward_batch.attn_dcp_metadata.dcp_kv_indptr
+                    if forward_batch.attn_dcp_metadata.dcp_kv_indices is not None:
+                        kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
                 qo_indptr,

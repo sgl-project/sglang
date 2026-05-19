@@ -241,7 +241,8 @@ class DeepseekMHAForwardMixin:
                 if get_dcp_world_size() > 1:
                     prefix_kv_a, prefix_k_pe = (
                         forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                            self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                            self.attn_mqa,
+                            forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
                         )
                     )
                     prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
