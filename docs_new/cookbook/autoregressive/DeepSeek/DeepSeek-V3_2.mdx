@@ -37,7 +37,15 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 <DeepSeekV32Deployment />
 
 ### 3.2 Configuration Tips
-For more detailed configuration tips, please refer to [DeepSeek-V3.2 Usage](../../../docs/basic_usage/deepseek_v32).
+
+- **DP Attention (`--enable-dp-attention --dp <dp-size>`):** Better for large-concurrency, high-throughput scenarios. Each DP worker independently handles prefill/decode batches; KV cache is not duplicated across TP ranks.
+- **TP Attention:** Better for low-latency, small-batch scenarios. Omit `--enable-dp-attention` to use plain TP attention.
+- **Short-sequence MHA prefill (adaptive):** For prefill sequences shorter than 2048 tokens (default threshold), the NSA backend automatically switches to standard MHA (using FlashAttention variable-length on SM90, TRT-LLM ragged MHA on SM100). To extend this to longer sequences set env var `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a larger value (potential minor accuracy trade-off).
+- **NSA prefill/decode attention kernels (`--nsa-prefill-backend`, `--nsa-decode-backend`):** The `nsa` backend is automatically selected for DeepSeek-V3.2. Available kernels: `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3` (Hopper only), `tilelang` (GPU/HPU/NPU), `aiter` (AMD, decode only), `trtllm` (Blackwell only). Defaults: Hopper BF16 KV → `flashmla_sparse` prefill / `fa3` decode; Hopper FP8 KV → `flashmla_kv` both; Blackwell BF16 → `flashmla_sparse` / `trtllm`; Blackwell FP8 → `trtllm` both.
+- **Index Cache:** Reuses indexer results across layers for efficiency at negligible accuracy cost. For **GLM-5** specifically, append `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for a better speed/accuracy tradeoff.
+- **HiSparse (experimental):** Reduces per-request GPU memory during long-context decode by offloading KV data to CPU pinned memory. Requires PD disaggregation mode (decode instance only). See [HiSparse Guide](../../../docs/advanced_features/hisparse_guide).
+- **NVFP4 on Blackwell:** Specify `--quantization modelopt_fp4` and `--moe-runner-backend flashinfer_trtllm` (recommended) / `flashinfer_cutlass` / `flashinfer_cutedsl`.
+- **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
 
 ## 4. Model Invocation
 
