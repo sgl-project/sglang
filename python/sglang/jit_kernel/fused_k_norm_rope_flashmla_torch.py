@@ -1,79 +1,72 @@
 """
-Pure-PyTorch reference implementation of FusedKNormRopeFlashMLAKernel.
+Optimized pure-PyTorch implementation of FusedKNormRopeFlashMLAKernel::forward.
 
-Matches the CUDA kernel in:
-  python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh
+Key optimizations over the naive version:
+  1. No Python loop over batch tokens — all ops are fully vectorized.
+  2. No .cpu() / .clone() round-trips — stays on the input device (GPU).
+  3. UE8M0 encode/decode via integer bit manipulation on tensors (no struct.unpack).
+  4. Per-warp FP8 quant via a single (B, 7, 64) reshape — no Python warp loop.
+  5. Cache scatter via flat index_put_ — one fused write per region.
 
-Algorithm per token (head_dim=512, rope_dim=64, nope_dim=448):
-  1.  RMSNorm with kv_weight over the full 512-element vector.
-  2.  RoPE on the last 64 elements  → stored as BF16 in the cache.
-  3.  Per-warp (64-element) abs-max UE8M0 quantisation of the first 448
-      nope elements  → stored as FP8 E4M3 in the cache.
-  4.  Pack everything into the FlashMLA paged kvcache byte tensor:
-
-      Per token slot  (576 bytes at  page_ptr + offset*576):
-        bytes   0 .. 447   FP8 E4M3 nope  (7 warps × 64 elems, 1 B each)
-        bytes 448 .. 575   BF16 rope      (64 elems × 2 B each)
-
-      Per scale slot  (8 bytes at  page_ptr + page_size*576 + offset*8):
-        bytes 0 .. 6       UE8M0 scale per nope warp (7 bytes)
-        byte  7            padding
-
-UE8M0 format:
-  An unsigned 8-bit biased exponent — effectively the exponent byte of a
-  float32 — representing a power-of-two scale factor.
-    encode: ue8m0 = (float32_bits(x) >> 23) & 0xFF
-    decode: inv_scale = float32_from_bits((254 - ue8m0) << 23)
-              i.e. 2^(127 − ue8m0)
+Fixed FlashMLA cache layout (head_dim=512, rope_dim=64, nope_dim=448):
+  value slot  @ page_ptr + offset * 576  (576 bytes):
+    [  0.. 447]  FP8 E4M3  nope  (7 warps × 64 elements, 1 byte each)
+    [448.. 575]  BF16      rope  (64 elements × 2 bytes)
+  scale slot  @ page_ptr + page_size * 576 + offset * 8  (8 bytes):
+    [0..6]       UE8M0 exponent byte per nope warp
+    [7]          padding
 """
 
 from __future__ import annotations
 
 import math
-import struct
 
 import torch
 
-# Maximum representable magnitude in float8_e4m3fn  (1.1111111 × 2^7)
 _FP8_E4M3_MAX: float = 448.0
 
-# Fixed dimensions required by the FlashMLA cache layout
+# Fixed dimensions required by the FlashMLA layout
 _HEAD_DIM   = 512
 _ROPE_DIM   = 64
 _NOPE_DIM   = _HEAD_DIM - _ROPE_DIM   # 448
-_NOPE_WARPS = 7                        # warps 0-6 own the nope region
-_EPW        = _NOPE_DIM // _NOPE_WARPS  # elements per nope warp = 64
+_NOPE_WARPS = 7                        # warps 0-6  (64 elems each)
+_EPW        = _NOPE_DIM // _NOPE_WARPS # elements per nope warp = 64
+_VALUE_BYTES = 576                     # bytes per value slot
 
 
 # ---------------------------------------------------------------------------
-# UE8M0 helpers  (scalar, matching CUDA cast_to_ue8m0 / inv_scale_ue8m0)
+# Vectorized UE8M0 helpers  (no Python loops, no struct.unpack)
 # ---------------------------------------------------------------------------
 
-def _cast_to_ue8m0(x: float) -> int:
+def _cast_to_ue8m0_tensor(x: torch.Tensor) -> torch.Tensor:
     """
-    Encode a positive float as UE8M0:
-    extract the biased IEEE-754 exponent byte  →  floor(log2(x)) + 127.
+    Vectorized UE8M0 encode: extract the biased IEEE-754 exponent byte.
+    Equivalent to (float32_bits(max(x, 1e-38)) >> 23) & 0xFF.
+
+    Input:  any shape, positive float32.
+    Output: same shape, int32 (values 0-255).
     """
-    bits: int = struct.unpack("I", struct.pack("f", float(max(x, 1e-38))))[0]
-    return (bits >> 23) & 0xFF
+    bits = x.float().clamp(min=1e-38).view(torch.int32)
+    return (bits >> 23) & 0xFF                      # (…) int32, values in [0,255]
 
 
-def _inv_scale_ue8m0(ue8m0: int) -> float:
+def _inv_scale_ue8m0_tensor(ue8m0: torch.Tensor) -> torch.Tensor:
     """
-    Decode UE8M0 → 1/scale:
-      scale     = 2^(ue8m0 − 127)
-      inv_scale = 2^(127 − ue8m0)
-    Reconstructed as a float32 with biased exponent (254 − ue8m0) and zero mantissa.
+    Vectorized UE8M0 decode → inv_scale = 2^(127 − ue8m0).
+    Reconstructs a float32 with biased exponent (254 − ue8m0) and zero mantissa.
+
+    Input:  any shape, int32 (UE8M0 exponent values).
+    Output: same shape, float32.
     """
-    inv_exp = 254 - int(ue8m0)
-    if inv_exp <= 0:       # ue8m0 >= 254 → scale >= 2^127, inv_scale → 0
-        return 0.0
-    bits = inv_exp << 23   # sign=0, mantissa=0 → exact power of two
-    return struct.unpack("f", struct.pack("I", bits))[0]
+    inv_exp  = (254 - ue8m0).clamp(min=0)           # (…) int32; 0 when ue8m0 >= 254
+    inv_bits = (inv_exp << 23).to(torch.int32)
+    inv_f    = inv_bits.view(torch.float32)
+    # ue8m0 >= 254 → scale ≥ 2^127 (overflow) → inv_scale = 0
+    return torch.where(ue8m0 >= 254, torch.zeros_like(inv_f), inv_f)
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Main entry point  (fully vectorized, GPU-resident)
 # ---------------------------------------------------------------------------
 
 def fused_k_norm_rope_flashmla_torch(
@@ -87,97 +80,116 @@ def fused_k_norm_rope_flashmla_torch(
     page_size: int,          # must be a power of 2  (e.g. 1, 2, 4, …)
 ) -> None:
     """
-    In-place fused K-norm + RoPE + FlashMLA cache store.
-    Writes directly into *kvcache*; returns nothing.
+    Fused K-norm + RoPE + FlashMLA paged cache store.
+    All operations stay on the same device as `kv`; no host round-trips.
     """
-    assert kv.shape[-1] == _HEAD_DIM, \
-        f"FlashMLA layout requires head_dim={_HEAD_DIM}, got {kv.shape[-1]}"
-    assert kv_weight.shape == (_HEAD_DIM,)
-    assert freqs_cis.shape[-1] == _ROPE_DIM, \
-        f"FlashMLA layout requires rope_dim={_ROPE_DIM}, got {freqs_cis.shape[-1]}"
+    assert kv.shape[-1] == _HEAD_DIM,       f"head_dim must be {_HEAD_DIM}"
+    assert freqs_cis.shape[-1] == _ROPE_DIM, f"rope_dim must be {_ROPE_DIM}"
     assert (page_size & (page_size - 1)) == 0, "page_size must be a power of 2"
 
     B = kv.shape[0]
     if B == 0:
         return
 
+    device    = kv.device
     page_bits = int(math.log2(page_size))
+    page_bytes = kvcache.shape[1]          # kPageBytes
 
     # ------------------------------------------------------------------
-    # Step 1: RMSNorm with kv_weight
+    # Step 1: Block-wide RMSNorm with kv_weight  (B, 512)
     #   norm_factor = rsqrt(mean(x²) + eps)
     #   out = x * norm_factor * kv_weight
-    # Matches the CUDA block-wide sum-of-squares + weight multiply.
     # ------------------------------------------------------------------
     x = kv.float()                                          # (B, 512)
-    rms = x.pow(2).mean(dim=-1, keepdim=True)               # (B,   1)
+    rms         = x.pow(2).mean(dim=-1, keepdim=True)       # (B,   1)
     norm_factor = torch.rsqrt(rms + eps)                    # (B,   1)
     x = x * norm_factor * kv_weight.float().unsqueeze(0)    # (B, 512)
 
     # ------------------------------------------------------------------
-    # Step 2: RoPE on the last rope_dim=64 elements  (warp 7 in CUDA)
+    # Step 2: RoPE on the last rope_dim=64 elements
     # freqs_cis row: [re0, im0, re1, im1, …]  length 64 → 32 complex pairs
     # ------------------------------------------------------------------
-    freq = freqs_cis[positions.long()]       # (B, 64)  fp32
-    freq_re = freq[:, 0::2]                 # (B, 32)  cosines
-    freq_im = freq[:, 1::2]                 # (B, 32)  sines
+    freq    = freqs_cis[positions.long()]        # (B,  64)
+    freq_re = freq[:, 0::2]                      # (B,  32) cosines
+    freq_im = freq[:, 1::2]                      # (B,  32) sines
 
-    x_nope = x[:, :_NOPE_DIM]              # (B, 448)
-    x_rope = x[:, _NOPE_DIM:]              # (B,  64)
-    xr = x_rope[:, 0::2]                   # (B,  32)
-    xi = x_rope[:, 1::2]                   # (B,  32)
+    x_nope = x[:, :_NOPE_DIM]                   # (B, 448)
+    x_rope = x[:, _NOPE_DIM:]                   # (B,  64)
+    xr = x_rope[:, 0::2]                        # (B,  32)
+    xi = x_rope[:, 1::2]                        # (B,  32)
 
-    # (x_re + j·x_im) × (freq_re + j·freq_im)
-    rotated_re = xr * freq_re - xi * freq_im   # (B, 32)
-    rotated_im = xr * freq_im + xi * freq_re   # (B, 32)
-    # Re-interleave → (B, 64)
-    rope_out = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+    rotated_re = xr * freq_re - xi * freq_im    # (B, 32)
+    rotated_im = xr * freq_im + xi * freq_re    # (B, 32)
+    rope_out   = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)  # (B, 64)
 
     # ------------------------------------------------------------------
-    # Step 3: Pack into the FlashMLA paged kvcache
-    # Work on CPU to allow byte-level tensor slicing; copy result back.
+    # Step 3: Per-warp FP8 E4M3 quantisation of the nope region
+    #
+    # Reshape to (B, 7, 64) so each [b, w, :] slice is one CUDA warp's
+    # 64 elements. All warp-level ops become dim=-1 reductions — no loop.
+    #
+    # Matches CUDA warps 0-6:
+    #   abs_max   = warp::reduce_max(fmaxf(fabs(x), fabs(y)))
+    #   scale_raw = fmaxf(1e-4, abs_max) / FP8_E4M3_MAX
     # ------------------------------------------------------------------
-    nope_cpu  = x_nope.cpu()
-    rope_cpu  = rope_out.cpu()
-    cache_cpu = kvcache.cpu().clone()    # clone so we can index-assign freely
+    x_warps = x_nope.reshape(B, _NOPE_WARPS, _EPW)          # (B, 7, 64)
 
-    for b in range(B):
-        loc    = int(out_loc[b].item())
-        page   = loc >> page_bits           # which page
-        offset = loc & (page_size - 1)      # slot within page
+    abs_max   = x_warps.abs().amax(dim=-1)                   # (B, 7)
+    scale_raw = abs_max.clamp(min=1e-4) / _FP8_E4M3_MAX      # (B, 7)
 
-        vbase = offset * 576                # byte offset of value slot in page
-        sbase = page_size * 576 + offset * 8  # byte offset of scale slot in page
+    ue8m0     = _cast_to_ue8m0_tensor(scale_raw)             # (B, 7) int32 [0,255]
+    inv_scale = _inv_scale_ue8m0_tensor(ue8m0)               # (B, 7) float32
 
-        # ---- BF16 rope region: value[448..576) ----
-        # Matches: reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result
-        rope_bf16  = rope_cpu[b].to(torch.bfloat16).contiguous()
-        rope_bytes = rope_bf16.view(torch.uint8)           # 64 × 2B = 128 bytes
-        cache_cpu[page, vbase + 448 : vbase + 576] = rope_bytes
+    fp8_nope = (x_warps * inv_scale.unsqueeze(-1)) \
+                   .clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX) \
+                   .to(torch.float8_e4m3fn)                  # (B, 7, 64)
 
-        # ---- FP8 nope region + UE8M0 scales: value[0..448) + scale[0..7) ----
-        # One iteration = one CUDA nope warp (lanes 0-31 of warps 0-6)
-        for w in range(_NOPE_WARPS):
-            warp_data = nope_cpu[b, w * _EPW : (w + 1) * _EPW]   # (64,) fp32
+    # ------------------------------------------------------------------
+    # Step 4: Compute flat byte addresses for all scatter writes
+    #
+    #   page   = out_loc >> page_bits
+    #   offset = out_loc & (page_size - 1)
+    #
+    #   value_base[b] = page[b] * page_bytes + offset[b] * 576
+    #   scale_base[b] = page[b] * page_bytes + page_size*576 + offset[b]*8
+    # ------------------------------------------------------------------
+    pages   = out_loc.long() >> page_bits                    # (B,)
+    offsets = out_loc.long() & (page_size - 1)               # (B,)
 
-            # Per-warp abs-max → UE8M0 scale
-            # Matches: abs_max = warp::reduce_max(…); scale_raw = max(1e-4, abs_max) / FP8_E4M3_MAX
-            abs_max   = warp_data.abs().max().item()
-            scale_raw = max(1e-4, abs_max) / _FP8_E4M3_MAX
-            ue8m0     = _cast_to_ue8m0(scale_raw)
-            inv_scale = _inv_scale_ue8m0(ue8m0)
+    value_base = pages * page_bytes + offsets * _VALUE_BYTES  # (B,)
+    scale_base = pages * page_bytes + page_size * _VALUE_BYTES + offsets * 8  # (B,)
 
-            # Quantise → FP8 E4M3  then reinterpret as uint8
-            # Matches: result = pack_fp8(x * inv_scale, y * inv_scale)
-            fp8   = (warp_data * inv_scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-            fp8_bytes = fp8.view(torch.uint8)
+    flat_cache = kvcache.view(-1)                            # (npages*page_bytes,) uint8
 
-            # Write FP8 values
-            bstart = vbase + w * _EPW
-            cache_cpu[page, bstart : bstart + _EPW] = fp8_bytes
+    # ------------------------------------------------------------------
+    # Step 5a: Scatter FP8 nope bytes → value[0..447]
+    #
+    # fp8_nope: (B, 448) reinterpreted as uint8 (1 byte per element).
+    # nope_idx: (B, 448) flat byte addresses.
+    # ------------------------------------------------------------------
+    fp8_bytes   = fp8_nope.reshape(B, _NOPE_DIM).view(torch.uint8)  # (B, 448)
+    nope_cols   = torch.arange(_NOPE_DIM, device=device)             # (448,)
+    nope_idx    = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)   # (B, 448)
+    flat_cache.index_put_((nope_idx.reshape(-1),), fp8_bytes.reshape(-1))
 
-            # Write per-warp UE8M0 scale byte
-            # Matches: static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0
-            cache_cpu[page, sbase + w] = ue8m0
+    # ------------------------------------------------------------------
+    # Step 5b: Scatter BF16 rope bytes → value[448..575]
+    #
+    # rope_out: (B, 64) fp32 → bf16 → (B, 128) uint8  (2 bytes per elem).
+    # ------------------------------------------------------------------
+    rope_bf16   = rope_out.to(torch.bfloat16)                        # (B,  64)
+    rope_bytes  = rope_bf16.view(torch.uint8)                        # (B, 128)
+    rope_cols   = torch.arange(128, device=device)                   # (128,)
+    rope_idx    = (value_base + _NOPE_DIM).unsqueeze(1) \
+                  + rope_cols.unsqueeze(0)                           # (B, 128)
+    flat_cache.index_put_((rope_idx.reshape(-1),), rope_bytes.reshape(-1))
 
-    kvcache.copy_(cache_cpu)
+    # ------------------------------------------------------------------
+    # Step 5c: Scatter UE8M0 scale bytes → scale[0..6]
+    #
+    # ue8m0: (B, 7) int32 → uint8.
+    # ------------------------------------------------------------------
+    ue8m0_bytes = ue8m0.to(torch.uint8)                              # (B, 7)
+    scale_cols  = torch.arange(_NOPE_WARPS, device=device)           # (7,)
+    scale_idx   = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)  # (B, 7)
+    flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))
