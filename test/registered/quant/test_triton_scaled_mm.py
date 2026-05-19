@@ -58,12 +58,14 @@ class TestScaledMM(CustomTestCase):
         """Test core functionality with reduced precision requirements"""
         test_configs = [
             (32, 32, 32, torch.int8, torch.float16, False),
+            (17, 64, 96, torch.int8, torch.float16, False),
             (64, 64, 64, torch.int8, torch.float16, True),
         ]
 
         try:
             torch.tensor([1.0], dtype=torch.float8_e4m3fn, device=self._device)
             test_configs.append((32, 32, 32, torch.float8_e4m3fn, torch.float16, False))
+            test_configs.append((17, 64, 96, torch.float8_e4m3fn, torch.float16, False))
         except:
             print("FP8 not supported, skipping")
 
