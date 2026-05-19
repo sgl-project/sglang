@@ -3,12 +3,17 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_HEAD,
+    KERNEL_KIND_SWEEP,
     KERNEL_KIND_TAIL,
     FailReason,
 )
@@ -25,6 +30,8 @@ from sglang.srt.kv_cache_canary.endpoint import (
 from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KIND_HEAD_K,
     VIOLATION_KIND_HEAD_V,
+    VIOLATION_KIND_SWEEP_K,
+    VIOLATION_KIND_SWEEP_V,
     VIOLATION_KIND_TAIL_K,
     VIOLATION_KIND_TAIL_V,
     VIOLATION_KINDS,
@@ -35,6 +42,10 @@ from sglang.srt.kv_cache_canary.host_state import (
 from sglang.srt.kv_cache_canary.pool_patch import (
     CanaryBufferGroup,
     PoolKind,
+)
+from sglang.srt.kv_cache_canary.sweep import (
+    build_sweep_plan,
+    compute_alive_owned_slots,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,11 +153,13 @@ class CanaryRunner:
         verify_capacity: int,
         write_capacity: int,
         write_req_capacity: int,
+        req_to_token_pool: Optional["ReqToTokenPool"] = None,
     ) -> None:
         self._config = config
         self._device = device
         self._pool_kind = buffer_group.kind
         self._has_v_half: bool = buffer_group.has_v_half
+        self._buffer_group = buffer_group
 
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
@@ -174,6 +187,20 @@ class CanaryRunner:
             use_head=False,
             real_kv=real_kv,
         )
+        # Sweep reads the latest head freeze; it never writes (sweep plans
+        # have num_write == 0), so dst_buf is harmless but must be a valid
+        # tensor — reuse head's canary buffers. K-half / V-half each gets
+        # its own sweep violation slot for the same reason head/tail do.
+        self._sweep_endpoint = self._make_endpoint(
+            kernel_kind=KERNEL_KIND_SWEEP,
+            buffer_group=buffer_group,
+            violation_kind_k=VIOLATION_KIND_SWEEP_K,
+            violation_kind_v=VIOLATION_KIND_SWEEP_V,
+            slot_run_counter=self._device_state.slot_run_counter_sweep,
+            kernel_run_counter=self._device_state.kernel_run_counter_sweep,
+            use_head=True,
+            real_kv=real_kv,
+        )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
         # records these specific addresses; replay-side host code refills
         # them in-place before ``graph.replay()`` so the recorded kernel
@@ -184,6 +211,25 @@ class CanaryRunner:
             write_capacity=write_capacity,
             write_req_capacity=write_req_capacity,
         )
+        # Sweep launch buffers are sized to verify every alive slot in the
+        # pool (= the canary buffer's slot count). Independent tensor
+        # instances so they cannot conflict with the per-step buffers that
+        # are baked into cuda-graph capture.
+        sweep_verify_capacity = int(buffer_group.k_head.shape[0])
+        self._sweep_launch: Optional[CanaryLaunchBuffers] = (
+            CanaryLaunchBuffers.allocate(
+                device=device,
+                verify_capacity=sweep_verify_capacity,
+                write_capacity=1,
+                write_req_capacity=1,
+            )
+            if config.real_data_sweep_every_n_steps > 0 and sweep_verify_capacity > 0
+            else None
+        )
+        self._sweep_every_n: int = int(config.real_data_sweep_every_n_steps)
+        self._req_to_token_pool: Optional["ReqToTokenPool"] = req_to_token_pool
+        self._last_forward_batch: Optional["ForwardBatch"] = None
+        self._last_plan: Optional[BatchPlan] = None
         self._side_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
         )
@@ -194,7 +240,7 @@ class CanaryRunner:
             for kind in VIOLATION_KINDS
         }
         self._counters_host = torch.zeros(
-            4, dtype=torch.int64, pin_memory=torch.cuda.is_available()
+            6, dtype=torch.int64, pin_memory=torch.cuda.is_available()
         )
         self._is_errored_event_per_kind: Dict[str, Optional[torch.cuda.Event]] = {
             kind: (torch.cuda.Event() if torch.cuda.is_available() else None)
@@ -207,7 +253,14 @@ class CanaryRunner:
         self._latest_is_errored_per_kind: Dict[str, int] = {
             kind: 0 for kind in VIOLATION_KINDS
         }
-        self._latest_counters: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._latest_counters: Tuple[int, int, int, int, int, int] = (
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
         self._raise_latch: bool = False
         self._last_log_time_per_reason: Dict[Tuple[str, int], float] = {}
         self._forward_step: int = 0
@@ -255,10 +308,32 @@ class CanaryRunner:
         return self._pool_kind
 
     def run_head(self, *, plan: BatchPlan) -> None:
+        self._last_plan = plan
         self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
 
     def run_tail(self, *, plan: BatchPlan) -> None:
         self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_TAIL)
+
+    def set_last_forward_batch(self, forward_batch: "ForwardBatch") -> None:
+        """Stash the current forward batch for sweep / perturb hooks.
+
+        Called by the api-level run_head wrapper so :meth:`_run_sweep` and
+        future self-test perturb code can pull alive req metadata without
+        threading the forward_batch through every kernel path.
+        """
+        self._last_forward_batch = forward_batch
+
+    def attach_req_to_token_pool(self, req_to_token_pool: "ReqToTokenPool") -> None:
+        """Bind the scheduler's ``req_to_token`` pool for sweep's alive-set lookup."""
+        self._req_to_token_pool = req_to_token_pool
+
+    @property
+    def last_plan(self) -> Optional[BatchPlan]:
+        return self._last_plan
+
+    @property
+    def device_state(self) -> CanaryDeviceState:
+        return self._device_state
 
     def end_of_forward(self) -> None:
         """Called once per forward (after run_tail) on the compute stream.
@@ -279,11 +354,50 @@ class CanaryRunner:
         self._record_poll_events()
         self._pull_latest_from_events()
         self._forward_step += 1
+
+        # Phase 3 self-test perturb hook is inserted here, after the
+        # per-step head/tail freeze and before the periodic sweep so the
+        # sweep observes the perturbation immediately.
+
+        if self._sweep_every_n > 0 and self._forward_step % self._sweep_every_n == 0:
+            self._run_sweep()
+
         local_flag = 1 if any(self._latest_is_errored_per_kind.values()) else 0
         global_flag = self._cross_rank_max(local_flag)
         self._maybe_health_check()
         if global_flag:
             self._handle_violation_global()
+
+    def _run_sweep(self) -> None:
+        """Verify every alive slot's real_kv_hash. Skip the chain hash check.
+
+        Reuses the per-step kernel via :data:`KERNEL_KIND_SWEEP`; the sweep
+        endpoint feeds into independent sweep_k / sweep_v violation slots
+        and its own slot/kernel run counters so the per-step health
+        accounting stays clean.
+        """
+        if self._sweep_launch is None:
+            return
+        if self._req_to_token_pool is None or self._last_forward_batch is None:
+            return
+        alive_slots = compute_alive_owned_slots(
+            req_to_token_pool=self._req_to_token_pool,
+            forward_batch=self._last_forward_batch,
+        )
+        if alive_slots.numel() == 0:
+            return
+        plan = build_sweep_plan(
+            canary_buf=self._buffer_group.k_head,
+            slot_stride_bytes=self._buffer_group.k_slot_stride_bytes,
+            alive_slot_indices=alive_slots,
+        )
+        if plan.num_verify == 0:
+            return
+        self._sweep_launch.fill_from_plan(plan)
+        self._launch_kernel_only(
+            kernel_kind=KERNEL_KIND_SWEEP,
+            launch_buffers=self._sweep_launch,
+        )
 
     def _pull_latest_from_events(self) -> None:
         """Non-blocking event.query() — if done, refresh host-cached values."""
@@ -349,6 +463,14 @@ class CanaryRunner:
                     self._device_state.slot_run_counter_tail.flatten()[0],
                     non_blocking=True,
                 )
+                self._counters_host[4].copy_(
+                    self._device_state.kernel_run_counter_sweep.flatten()[0],
+                    non_blocking=True,
+                )
+                self._counters_host[5].copy_(
+                    self._device_state.slot_run_counter_sweep.flatten()[0],
+                    non_blocking=True,
+                )
                 self._counters_event.record(stream=self._side_stream)
 
     def prepare_for_replay(self, *, plan: BatchPlan) -> None:
@@ -383,7 +505,12 @@ class CanaryRunner:
             return
         self._launch_kernel_only(kernel_kind=kernel_kind)
 
-    def _launch_kernel_only(self, *, kernel_kind: int) -> None:
+    def _launch_kernel_only(
+        self,
+        *,
+        kernel_kind: int,
+        launch_buffers: Optional[CanaryLaunchBuffers] = None,
+    ) -> None:
         """Launch one kernel pair from the current fixed-buffer contents.
 
         Shared by capture-time recording (skip-sentinel contents) and
@@ -393,12 +520,21 @@ class CanaryRunner:
         head/tail symmetry is captured by :class:`CanaryEndpoint` (each
         endpoint owns the destination canary buffers + violation buckets; the peer
         supplies the source).
+
+        ``kernel_kind == KERNEL_KIND_SWEEP`` runs the verify-only sweep
+        endpoint, which reads from head's canary buffers and routes
+        violations into the sweep_k / sweep_v slots.
         """
         if kernel_kind == KERNEL_KIND_HEAD:
             dst, src = self._head_endpoint, self._tail_endpoint
-        else:
+        elif kernel_kind == KERNEL_KIND_TAIL:
             dst, src = self._tail_endpoint, self._head_endpoint
-        dst.launch(src=src, launch_buffers=self._launch, seed=int(self._config.seed))
+        elif kernel_kind == KERNEL_KIND_SWEEP:
+            dst, src = self._sweep_endpoint, self._head_endpoint
+        else:
+            raise ValueError(f"kv-canary: unknown kernel_kind {kernel_kind}")
+        buffers = launch_buffers if launch_buffers is not None else self._launch
+        dst.launch(src=src, launch_buffers=buffers, seed=int(self._config.seed))
 
     def _run_kernel_pair(
         self,
@@ -460,7 +596,14 @@ class CanaryRunner:
         """Counter-zero detection (after warmup) + periodic liveness print."""
         step = self._forward_step
         period = max(1, self._config.health_print_every_n_forwards)
-        kernel_head, kernel_tail, slot_head, slot_tail = self._latest_counters
+        (
+            kernel_head,
+            kernel_tail,
+            slot_head,
+            slot_tail,
+            kernel_sweep,
+            slot_sweep,
+        ) = self._latest_counters
 
         if (
             not self._warmup_check_done
@@ -479,16 +622,33 @@ class CanaryRunner:
                 if self._config.mode is CanaryMode.RAISE:
                     raise RuntimeError(message)
 
+        if (
+            self._sweep_every_n > 0
+            and step >= self._sweep_every_n * 2
+            and kernel_sweep == 0
+        ):
+            message = (
+                f"kv-canary: sweep-every-n-steps={self._sweep_every_n} configured "
+                f"but kernel_run_counter_sweep stayed at 0 after {step} forwards. "
+                "The sweep path is not executing — refusing to continue silently."
+            )
+            logger.error(message)
+            if self._config.mode is CanaryMode.RAISE:
+                raise RuntimeError(message)
+
         if step > 0 and step % period == 0:
             logger.info(
                 "kv-canary[%s]: protected %d forwards "
-                "(head=%d kernels / %d slots, tail=%d kernels / %d slots)",
+                "(head=%d kernels / %d slots, tail=%d kernels / %d slots, "
+                "sweep=%d kernels / %d slots)",
                 self._pool_kind.value,
                 step,
                 kernel_head,
                 slot_head,
                 kernel_tail,
                 slot_tail,
+                kernel_sweep,
+                slot_sweep,
             )
 
     def _handle_violation_global(self) -> None:
@@ -579,11 +739,12 @@ class CanaryRunner:
         kernel_label = {
             KERNEL_KIND_HEAD: "HEAD",
             KERNEL_KIND_TAIL: "TAIL",
+            KERNEL_KIND_SWEEP: "SWEEP",
         }.get(int(kernel_kind), str(int(kernel_kind)))
 
         lines = [
             "kv-canary violation:",
-            f"  canary_kind:       {kind} (one of head_k/head_v/tail_k/tail_v)",
+            f"  canary_kind:       {kind} (one of head_k/head_v/tail_k/tail_v/sweep_k/sweep_v)",
             f"  kernel_kind:       {kernel_label}",
             f"  fail_reason:       {reason_name} ({_fail_reason_description(reason_int)})",
             f"  slot_idx:          {int(slot_idx)}",

@@ -45,6 +45,14 @@ constexpr int64_t kCanaryExpectedSkipSentinel = -1;
 // requiring the full chain to be reconstructible across the sweep set.
 constexpr int64_t kSkipChainSentinel = -2;
 
+// Mirror of the Python KERNEL_KIND_* constants. Stamped into every
+// violation row's kViolationFieldKernelKind so downstream reporting
+// can tell which hook fired and host-side counters / VIOLATION_KINDS
+// stay split by kind.
+constexpr int kKernelKindHead = 0;
+constexpr int kKernelKindTail = 1;
+constexpr int kKernelKindSweep = 2;
+
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
 // fingerprint entirely; ``BIT`` mixes the first 16 bytes of the
@@ -559,7 +567,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 26;
+constexpr int kConstantsCount = 29;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -592,6 +600,9 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kRealKvHashModeAll;
   dst[i++] = kCanaryExpectedSkipSentinel;
   dst[i++] = kSkipChainSentinel;
+  dst[i++] = kKernelKindHead;
+  dst[i++] = kKernelKindTail;
+  dst[i++] = kKernelKindSweep;
 }
 
 }  // namespace

@@ -34,6 +34,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_FIELDS_PER_SLOT,
     KERNEL_KIND_HEAD,
+    KERNEL_KIND_SWEEP,
     KERNEL_KIND_TAIL,
     REAL_KV_HASH_BIT_BYTES,
     REAL_KV_HASH_MODE_ALL,
@@ -77,6 +78,9 @@ _EXPECTED_PAIRS: Dict[str, int] = {
     "kRealKvHashModeAll": REAL_KV_HASH_MODE_ALL,
     "kCanaryExpectedSkipSentinel": CANARY_EXPECTED_SKIP_SENTINEL,
     "kSkipChainSentinel": SKIP_CHAIN_SENTINEL,
+    "kKernelKindHead": KERNEL_KIND_HEAD,
+    "kKernelKindTail": KERNEL_KIND_TAIL,
+    "kKernelKindSweep": KERNEL_KIND_SWEEP,
 }
 
 
@@ -106,13 +110,11 @@ class TestPythonCppConstantSync(unittest.TestCase):
         )
 
     def test_kernel_kind_constants_have_expected_layout(self) -> None:
-        # KERNEL_KIND_HEAD / TAIL are kernel-launch kwargs (not constexpr
-        # int in canary.cuh), so the kernel-reported layout cannot
-        # cover them; assert the documented values here as a separate
-        # guard against accidental flips.
         self.assertEqual(KERNEL_KIND_HEAD, 0)
         self.assertEqual(KERNEL_KIND_TAIL, 1)
-        self.assertNotEqual(KERNEL_KIND_HEAD, KERNEL_KIND_TAIL)
+        self.assertEqual(KERNEL_KIND_SWEEP, 2)
+        kinds = (KERNEL_KIND_HEAD, KERNEL_KIND_TAIL, KERNEL_KIND_SWEEP)
+        self.assertEqual(len(set(kinds)), len(kinds))
 
     def test_real_kv_hash_bit_bytes_within_slot_stride(self) -> None:
         # 16 bytes = 2 int64 fields' worth; we pick a fixed cheap prefix

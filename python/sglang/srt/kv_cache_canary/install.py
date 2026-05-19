@@ -101,6 +101,7 @@ def install_on_model_runner(
         verify_capacity=capacities.verify_capacity,
         write_capacity=capacities.write_capacity,
         write_req_capacity=capacities.write_req_capacity,
+        req_to_token_pool=model_runner.req_to_token_pool,
     )
     if not runners:
         return

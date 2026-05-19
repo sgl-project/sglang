@@ -78,12 +78,41 @@ class CanaryConfig:
     # would trip a (spurious) violation.
     swa_window_size: Optional[int] = None
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
+    # Periodic full-pool sweep of every alive slot's real_kv_hash. 0 = off.
+    # Sweep verifies in addition to the per-step head/tail launches, using
+    # the same kernel with verify_prev_slot_indices = kSkipChainSentinel.
+    real_data_sweep_every_n_steps: int = 0
+    # Self-test: probabilistically flip one byte of the real KV pool at an
+    # alive-but-not-verified-this-step slot, to prove sweep's independent
+    # detection value. 0 = off.
+    real_perturb_bytes_prob: float = 0.0
+    real_perturb_bytes_seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.real_data_sweep_every_n_steps < 0:
+            raise ValueError(
+                "kv-canary: real_data_sweep_every_n_steps must be >= 0, "
+                f"got {self.real_data_sweep_every_n_steps}"
+            )
+        if self.real_perturb_bytes_prob < 0.0:
+            raise ValueError(
+                "kv-canary: real_perturb_bytes_prob must be >= 0.0, "
+                f"got {self.real_perturb_bytes_prob}"
+            )
+        if self.real_perturb_bytes_seed < 0:
+            raise ValueError(
+                "kv-canary: real_perturb_bytes_seed must be >= 0, "
+                f"got {self.real_perturb_bytes_seed}"
+            )
 
     @classmethod
     def from_server_args(
         cls,
         mode: str | CanaryMode | None,
         real_kv_hash_mode: str | RealKvHashMode | None = None,
+        real_data_sweep_every_n_steps: int = 0,
+        real_perturb_bytes_prob: float = 0.0,
+        real_perturb_bytes_seed: int = 0,
     ) -> "CanaryConfig":
         parsed = CanaryMode.parse(mode)
         raw_prob = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get()
@@ -100,6 +129,9 @@ class CanaryConfig:
             perturb_req_to_token_prob=perturb_prob,
             perturb_req_to_token_seed=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get(),
             real_kv_hash_mode=RealKvHashMode.parse(real_kv_hash_mode),
+            real_data_sweep_every_n_steps=int(real_data_sweep_every_n_steps),
+            real_perturb_bytes_prob=float(real_perturb_bytes_prob),
+            real_perturb_bytes_seed=int(real_perturb_bytes_seed),
         )
 
     @property

@@ -57,6 +57,7 @@ _VIOLATION_FIELD_EXPECTED_POSITION: int = 7
 
 KERNEL_KIND_HEAD: int = 0
 KERNEL_KIND_TAIL: int = 1
+KERNEL_KIND_SWEEP: int = 2
 
 _U64_MASK: int = (1 << 64) - 1
 
@@ -135,6 +136,9 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kRealKvHashModeAll",
     "kCanaryExpectedSkipSentinel",
     "kSkipChainSentinel",
+    "kKernelKindHead",
+    "kKernelKindTail",
+    "kKernelKindSweep",
 )
 
 
