@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import List, Literal, NamedTuple, Union
 
 import torch
 
@@ -149,7 +149,7 @@ class HiSparseCoordinator:
             .contiguous()
         )
         self._device_buffer_arange_i32 = torch.arange(
-            self.device_buffer_size, dtype=torch.int32, device=device
+            self.padded_buffer_size, dtype=torch.int32, device=device
         )
 
         # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
@@ -327,7 +327,7 @@ class HiSparseCoordinator:
 
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
-        ] = self._device_buffer_arange_i32
+        ] = self._device_buffer_arange_i32[: self.device_buffer_size]
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -397,6 +397,13 @@ class HiSparseCoordinator:
                     chunk = all_new_indices[offset : offset + grow_size]
                     offset += grow_size
                     self.req_to_device_buffer[req_idx, current_cap:new_cap] = chunk
+                    hot_end = min(new_cap, self.device_buffer_size)
+                    if current_cap < hot_end:
+                        self.req_device_buffer_tokens[
+                            :, req_idx, current_cap:hot_end
+                        ] = self._device_buffer_arange_i32[current_cap:hot_end]
+                    if hot_end < new_cap:
+                        self.req_device_buffer_tokens[:, req_idx, hot_end:new_cap] = -1
                     self.req_device_buffer_token_locs[
                         :, req_idx, current_cap:new_cap
                     ] = chunk
@@ -590,6 +597,417 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def supports_hisparse_draft_slots(self) -> bool:
+        return not self.is_dsv4_hisparse
+
+    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+        """Grow under-sized buffers to padded_buffer_size so extra-page slots are valid."""
+        req_indices_cpu = req_pool_indices.cpu().tolist()
+        grow_reqs = []
+        total_grow = 0
+        for req_idx in req_indices_cpu:
+            current_cap = int(self.req_device_buffer_size[req_idx])
+            if current_cap >= self.padded_buffer_size:
+                continue
+            grow_reqs.append((req_idx, current_cap))
+            total_grow += self.padded_buffer_size - current_cap
+
+        if total_grow == 0:
+            return
+
+        all_new = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            total_grow
+        )
+        if all_new is None:
+            raise RuntimeError(
+                f"HiSparse: failed to grow buffers for draft slots (need {total_grow})"
+            )
+
+        offset = 0
+        for req_idx, current_cap in grow_reqs:
+            grow_size = self.padded_buffer_size - current_cap
+            chunk = all_new[offset : offset + grow_size]
+            offset += grow_size
+            self.req_to_device_buffer[
+                req_idx, current_cap : self.padded_buffer_size
+            ] = chunk
+            hot_end = min(self.padded_buffer_size, self.device_buffer_size)
+            if current_cap < hot_end:
+                self.req_device_buffer_tokens[:, req_idx, current_cap:hot_end] = (
+                    self._device_buffer_arange_i32[current_cap:hot_end]
+                )
+            if hot_end < self.padded_buffer_size:
+                self.req_device_buffer_tokens[
+                    :, req_idx, hot_end : self.padded_buffer_size
+                ] = -1
+            self.req_device_buffer_token_locs[
+                :, req_idx, current_cap : self.padded_buffer_size
+            ] = chunk
+            self.req_device_buffer_size[req_idx] = self.padded_buffer_size
+
+    def get_draft_device_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        num_tokens_per_req: int,
+        start_positions_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return device slots for a uniform draft allocation.
+
+        Draft tokens that still fit in the hot buffer reuse their logical hot
+        slots. Later draft tokens use the per-request extra-page area.
+        """
+        assert self.supports_hisparse_draft_slots()
+        start = self.device_buffer_size + 1
+        end = start + num_tokens_per_req
+        if end > self.padded_buffer_size:
+            raise ValueError(
+                f"Requested {num_tokens_per_req} draft slots but extra page only "
+                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
+                f"available (padded_buffer_size={self.padded_buffer_size}, "
+                f"device_buffer_size={self.device_buffer_size})."
+            )
+        self._ensure_padded_buffer(req_pool_indices)
+        self.req_device_buffer_tokens[
+            :, req_pool_indices, start : self.padded_buffer_size
+        ] = -1
+
+        total_slots = req_pool_indices.numel() * num_tokens_per_req
+        row_indices = torch.repeat_interleave(req_pool_indices, num_tokens_per_req)
+        pos_in_segment = torch.arange(total_slots, device=req_pool_indices.device) % (
+            num_tokens_per_req
+        )
+        start_positions = start_positions_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+        token_positions = (
+            torch.repeat_interleave(start_positions, num_tokens_per_req)
+            + pos_in_segment
+        )
+        col_indices = torch.where(
+            token_positions < self.device_buffer_size,
+            token_positions,
+            start + pos_in_segment,
+        )
+        if torch.any(col_indices >= self.padded_buffer_size):
+            raise ValueError(
+                "HiSparse draft slots exceed padded buffer: "
+                f"{col_indices.max().item()=} {self.padded_buffer_size=}"
+            )
+        self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
+            torch.int32
+        ).unsqueeze(0)
+        return self.req_to_device_buffer[row_indices, col_indices]
+
+    def get_draft_device_slots_variable(
+        self,
+        req_pool_indices: torch.Tensor,
+        tokens_per_req_cpu: torch.Tensor,
+        start_positions_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return device slots when each request needs a different draft count."""
+        assert self.supports_hisparse_draft_slots()
+        if tokens_per_req_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        start = self.device_buffer_size + 1
+        max_tokens = int(tokens_per_req_cpu.max().item())
+        if start + max_tokens > self.padded_buffer_size:
+            raise ValueError(
+                f"Max per-request draft slots ({max_tokens}) exceeds extra page "
+                f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
+            )
+
+        self._ensure_padded_buffer(req_pool_indices)
+        self.req_device_buffer_tokens[
+            :, req_pool_indices, start : self.padded_buffer_size
+        ] = -1
+
+        total_slots = int(tokens_per_req_cpu.sum().item())
+        if total_slots == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        tokens_per_req = tokens_per_req_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+
+        # Build fixed-shape gather indices. Zero-repeat requests naturally disappear.
+        row_indices = torch.repeat_interleave(req_pool_indices, tokens_per_req)
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=tokens_per_req.device),
+                tokens_per_req.cumsum(0),
+            ]
+        )
+        pos_in_segment = torch.arange(total_slots, device=tokens_per_req.device) - (
+            torch.repeat_interleave(offsets[:-1], tokens_per_req)
+        )
+
+        start_positions = start_positions_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+        token_positions = torch.repeat_interleave(start_positions, tokens_per_req) + (
+            pos_in_segment
+        )
+        col_indices = torch.where(
+            token_positions < self.device_buffer_size,
+            token_positions,
+            start + pos_in_segment,
+        )
+        if torch.any(col_indices >= self.padded_buffer_size):
+            raise ValueError(
+                "HiSparse variable draft slots exceed padded buffer: "
+                f"{col_indices.max().item()=} {self.padded_buffer_size=}"
+            )
+
+        self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
+            torch.int32
+        ).unsqueeze(0)
+        return self.req_to_device_buffer[row_indices, col_indices]
+
+    def prepare_verify_slots_spec_v2(
+        self,
+        req_pool_indices: torch.Tensor,
+        verify_cache_locs: torch.Tensor,
+        num_tokens_per_req: int,
+        start_positions_cpu: torch.Tensor,
+    ) -> None:
+        """Bind the current spec-v2 target-verify window to extra-page slots."""
+        assert self.supports_hisparse_draft_slots()
+        start = self.device_buffer_size + 1
+        end = start + num_tokens_per_req
+        if end > self.padded_buffer_size:
+            raise ValueError(
+                f"Spec-v2 verify needs {num_tokens_per_req} slots but extra page only "
+                f"has {self.padded_buffer_size - self.device_buffer_size - 1}."
+            )
+
+        self._ensure_padded_buffer(req_pool_indices)
+        self.req_device_buffer_tokens[
+            :, req_pool_indices, start : self.padded_buffer_size
+        ] = -1
+
+        total_slots = req_pool_indices.numel() * num_tokens_per_req
+        if verify_cache_locs.numel() != total_slots:
+            raise ValueError(
+                "HiSparse spec-v2 verify slot mismatch: "
+                f"expected {total_slots} cache locs, got {verify_cache_locs.numel()}."
+            )
+
+        row_indices = torch.repeat_interleave(req_pool_indices, num_tokens_per_req)
+        pos_in_segment = torch.arange(total_slots, device=req_pool_indices.device) % (
+            num_tokens_per_req
+        )
+        start_positions = start_positions_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+        token_positions = (
+            torch.repeat_interleave(start_positions, num_tokens_per_req)
+            + pos_in_segment
+        )
+        col_indices = torch.where(
+            token_positions < self.device_buffer_size,
+            token_positions,
+            start + pos_in_segment,
+        )
+        device_slots = self.req_to_device_buffer[row_indices, col_indices]
+        self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
+            torch.int32
+        ).unsqueeze(0)
+        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            verify_cache_locs
+        ] = device_slots
+
+    def finalize_accepted_tokens(
+        self,
+        req_pool_indices: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        num_correct_drafts_cpu: torch.Tensor,
+        accepted_token_positions: torch.Tensor,
+    ) -> None:
+        """Persist accepted speculative tokens and remap the newest token slot.
+
+        Accepted draft tokens inside the hot buffer keep their hot slots. Tokens
+        beyond the hot buffer are backed up to host, while the last accepted
+        token is copied into the newest-token slot for the next decode step.
+
+        Transactional: if host alloc fails, all mapping mutations are rolled back
+        so the coordinator stays consistent for the next iteration.
+        """
+        assert self.supports_hisparse_draft_slots()
+        if accepted_cache_locs.numel() == 0:
+            return
+
+        counts = num_correct_drafts.to(torch.int64) + 1
+        counts_cpu = num_correct_drafts_cpu.to(torch.int64) + 1
+        total_accepted = int(counts_cpu.sum().item())
+        if total_accepted != accepted_cache_locs.numel():
+            raise ValueError(
+                "HiSparse accepted token bookkeeping mismatch: "
+                f"expected {total_accepted} cache locs, got {accepted_cache_locs.numel()}."
+            )
+        if total_accepted != accepted_token_positions.numel():
+            raise ValueError(
+                "HiSparse accepted token position mismatch: "
+                f"expected {total_accepted} positions, "
+                f"got {accepted_token_positions.numel()}."
+            )
+
+        full_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        accepted_token_positions = accepted_token_positions.to(
+            device=accepted_cache_locs.device, dtype=torch.int64
+        )
+        in_hot_buffer = accepted_token_positions < self.device_buffer_size
+
+        # Snapshot mapping values before mutation for rollback.
+        draft_mapping_snapshot = full_to_device_mapping[draft_cache_locs].clone()
+        accepted_device_locs = full_to_device_mapping[accepted_cache_locs].clone()
+
+        full_to_device_mapping[draft_cache_locs] = 0
+        accepted_req_indices = torch.repeat_interleave(req_pool_indices, counts)
+        if torch.any(in_hot_buffer):
+            hot_cache_locs = accepted_cache_locs[in_hot_buffer]
+            hot_positions = accepted_token_positions[in_hot_buffer]
+            hot_req_indices = accepted_req_indices[in_hot_buffer]
+            hot_slots = self.req_to_device_buffer[hot_req_indices, hot_positions]
+            full_to_device_mapping[hot_cache_locs] = hot_slots
+
+        needs_backup = ~in_hot_buffer
+        backup_count = int(needs_backup.sum().item())
+        if backup_count > 0:
+            backup_positions = accepted_token_positions[needs_backup]
+            backup_req_indices = accepted_req_indices[needs_backup]
+            backup_device_locs = accepted_device_locs[needs_backup]
+
+            host_locs = self.mem_pool_host.alloc(backup_count)
+            if host_locs is None:
+                full_to_device_mapping[draft_cache_locs] = draft_mapping_snapshot
+                logger.error(
+                    "HiSparse: host alloc failed for %d accepted draft tokens, rolled back",
+                    backup_count,
+                )
+                return
+            host_locs = host_locs.to(device=self.device)
+
+            self.wait_for_pending_backup()
+            schedule_stream = device_module.current_stream()
+            device_locs_for_backup = backup_device_locs.contiguous()
+            with device_module.stream(self.decode_backup_stream):
+                self.decode_backup_stream.wait_stream(schedule_stream)
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs_for_backup,
+                    io_backend="kernel",
+                )
+                if host_locs.is_cuda:
+                    host_locs.record_stream(self.decode_backup_stream)
+                if device_locs_for_backup.is_cuda:
+                    device_locs_for_backup.record_stream(self.decode_backup_stream)
+            event = device_module.Event()
+            event.record(self.decode_backup_stream)
+            device_module.current_stream().wait_event(event)
+
+            self.req_to_host_pool[backup_req_indices, backup_positions] = host_locs
+
+        offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)]
+        )
+        last_offsets = offsets[1:] - 1
+        last_positions = accepted_token_positions[last_offsets]
+        newest_slots = self.req_to_device_buffer[
+            req_pool_indices, self.device_buffer_size
+        ]
+        last_logical = accepted_cache_locs[last_offsets]
+        last_slots = accepted_device_locs[last_offsets]
+        self.req_device_buffer_tokens[:, req_pool_indices, self.device_buffer_size] = (
+            last_positions.to(torch.int32).unsqueeze(0)
+        )
+        self.req_device_buffer_token_locs[
+            :, req_pool_indices, self.device_buffer_size
+        ] = newest_slots.to(torch.int32)
+        for idx in req_pool_indices.tolist():
+            self._skip_first_backup[idx] = True
+
+        same_slot = last_slots == newest_slots
+        if torch.any(~same_slot):
+            self.mem_pool_device.transfer_values_on_device(
+                dst_indices=newest_slots[~same_slot],
+                src_indices=last_slots[~same_slot],
+            )
+        full_to_device_mapping[last_logical] = newest_slots
+
+    def finalize_accepted_tokens_spec_v2(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        verify_cache_locs: torch.Tensor,
+        accept_index: torch.Tensor,
+    ) -> None:
+        """Commit accepted spec-v2 target-verify KV into HiSparse storage.
+
+        The target verify pass writes all draft-token KV into per-request
+        extra-page slots. accept_index is the source of truth for which slots
+        survive into host/newest-slot metadata.
+        """
+        assert self.supports_hisparse_draft_slots()
+        if verify_cache_locs.numel() == 0:
+            return
+
+        counts = (accept_index != -1).sum(dim=1).to(torch.int64)
+        total_accepted = int(counts.sum().item())
+        if total_accepted == 0:
+            full_to_device_mapping = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+            full_to_device_mapping[verify_cache_locs] = 0
+            return
+
+        flat_accept_index = accept_index.reshape(-1)
+        accepted_offsets = flat_accept_index[flat_accept_index >= 0].to(torch.int64)
+        if accepted_offsets.numel() != total_accepted:
+            raise ValueError(
+                "HiSparse spec-v2 accepted index mismatch: "
+                f"expected {total_accepted} accepted slots, "
+                f"got {accepted_offsets.numel()}."
+            )
+
+        offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)]
+        )
+        pos_in_segment = torch.arange(
+            total_accepted, dtype=torch.int64, device=counts.device
+        ) - torch.repeat_interleave(offsets[:-1], counts)
+        accepted_token_positions = (
+            torch.repeat_interleave(seq_lens.to(torch.int64), counts) + pos_in_segment
+        )
+
+        self.finalize_accepted_tokens(
+            req_pool_indices=req_pool_indices,
+            accepted_cache_locs=verify_cache_locs[accepted_offsets],
+            draft_cache_locs=verify_cache_locs,
+            num_correct_drafts=counts - 1,
+            num_correct_drafts_cpu=(counts - 1).cpu(),
+            accepted_token_positions=accepted_token_positions,
+        )
+
+    def get_front_topk_tokens(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        top_k_indices = self.req_to_device_buffer[req_pool_indices, : self.top_k].to(
+            torch.int32
+        )
+        topk_col_indices = torch.arange(self.top_k, device=self.device).unsqueeze(0)
+        # Mask out positions beyond each request's seq_len
+        mask = topk_col_indices >= seq_lens.unsqueeze(1)
+        top_k_indices[mask] = -1
+        return top_k_indices
+
     def naive_load_topk(
         self,
         req_pool_indices: torch.Tensor,
@@ -768,14 +1186,65 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        token_position_space: Literal["compressed", "full"] = "compressed",
+        num_steps: int = 1,
     ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
-        num_reqs = req_pool_indices.size(0)
+        """Swap selected top-k tokens into device memory and return their indices.
 
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        When num_steps > 1 (speculative multi-step):
+            seq_lens shape: [num_reqs * num_steps] flat req-major
+            top_k_result shape: [num_reqs, num_steps, top_k]
+            returns: [num_reqs, num_steps, top_k]
+        """
+        num_reqs = req_pool_indices.size(0)
+        needed = num_reqs * num_steps
+
+        if needed > self.top_k_device_locs_buffer.shape[0]:
+            self.top_k_device_locs_buffer = torch.full(
+                (needed, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        if num_steps > 1:
+            top_k_indices = self.top_k_device_locs_buffer[:needed].view(
+                num_reqs, num_steps, -1
+            )
+        else:
+            top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
-        # todo, adjustable for performance
+        swap_seq_lens = compressed_seq_lens
+        swap_top_k_result = top_k_result
+        if token_position_space == "full" and self.is_dsv4_hisparse:
+            if num_steps > 1:
+                seq_lens_for_compare = compressed_seq_lens.view(
+                    num_reqs, num_steps
+                ).unsqueeze(2)
+            else:
+                seq_lens_for_compare = compressed_seq_lens.unsqueeze(1)
+            valid_compressed_token = (
+                (top_k_result >= 0)
+                & (top_k_result < seq_lens_for_compare)
+                & ((top_k_result + 1) % self.compress_ratio == 0)
+            )
+            swap_top_k_result = torch.where(
+                valid_compressed_token,
+                top_k_result // self.compress_ratio,
+                torch.full_like(top_k_result, -1),
+            )
+            if num_steps > 1:
+                swap_seq_lens = (
+                    compressed_seq_lens.view(num_reqs, num_steps) // self.compress_ratio
+                ).reshape(-1)
+            else:
+                swap_seq_lens = compressed_seq_lens // self.compress_ratio
+        elif token_position_space != "compressed":
+            assert (
+                token_position_space == "full"
+            ), f"Unsupported token_position_space={token_position_space}"
+
         block_size = 1024
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
@@ -783,7 +1252,7 @@ class HiSparseCoordinator:
             else load_cache_to_device_buffer_mla
         )
         swap_in_fn(
-            top_k_tokens=top_k_result,
+            top_k_tokens=swap_top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
@@ -791,13 +1260,14 @@ class HiSparseCoordinator:
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
-            seq_lens=compressed_seq_lens,
+            seq_lens=swap_seq_lens,
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
-            page_size=1,
+            page_size=self.mem_pool_device.page_size if num_steps > 1 else 1,
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
+            num_steps=num_steps,
         )
         return top_k_indices

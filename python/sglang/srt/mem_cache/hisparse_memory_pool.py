@@ -2,7 +2,7 @@
 
 import logging
 import weakref
-from typing import Optional
+from typing import Optional, Tuple
 
 import psutil
 import torch
@@ -34,6 +34,27 @@ else:
             "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
             "It is not available on this backend."
         )
+
+
+def _hisparse_backup_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor
+) -> Tuple:
+    return (
+        logical_allocator.backup_state(),
+        hisparse_allocator.backup_state(),
+        mapping.clone(),
+    )
+
+
+def _hisparse_restore_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor, state: Tuple
+) -> None:
+    logical_state, hisparse_state, mapping_snapshot = state
+    logical_allocator.restore_state(logical_state)
+    hisparse_allocator.restore_state(hisparse_state)
+    mapping[: mapping_snapshot.shape[0]].copy_(mapping_snapshot)
+    if mapping_snapshot.shape[0] < mapping.shape[0]:
+        mapping[mapping_snapshot.shape[0] :] = 0
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
@@ -286,6 +307,51 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots."""
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots before freeing logical indices."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -384,9 +450,28 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             <= self.hisparse_attn_allocator.size
         )
 
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            # Draft extra-page mappings must stay live until accepted tokens are finalized.
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
+        )
+
 
 class DeepSeekV4SingleKVPoolHost:
-
     def __init__(
         self,
         device_pool: HiSparseC4DevicePool,
@@ -395,7 +480,6 @@ class DeepSeekV4SingleKVPoolHost:
         pin_memory: bool = True,
         device: str = "cpu",
     ):
-
         assert host_size > 0, "Host size must be specified and greater than 0"
         assert page_size == 1, "Host page size must be 1 for DeepSeekV4SingleKVPoolHost"
 
@@ -501,7 +585,6 @@ class DeepSeekV4SingleKVPoolHost:
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -775,4 +858,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
+        )
+
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
         )
