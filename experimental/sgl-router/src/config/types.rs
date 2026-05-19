@@ -97,27 +97,34 @@ pub struct ServerConfig {
 pub struct ObservabilityConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// `"text"` (default, dev-friendly) or `"json"` (production / k8s
-    /// log aggregators). JSON output is one record per line with
-    /// `timestamp`, `level`, `target`, `fields`, and any span attributes.
-    /// Falls back to `"text"` if the value is unrecognized.
-    #[serde(default = "default_log_format")]
-    pub log_format: String,
+    /// Selects the tracing-subscriber output format. Serde rejects
+    /// unrecognized values at config-load (`"jsonl"` and similar
+    /// plausible typos surface as an error instead of silently
+    /// degrading to text), matching the discoverability pattern used
+    /// by `policy` and `discovery.backend`.
+    #[serde(default)]
+    pub log_format: LogFormat,
+}
+
+/// `text` for human-readable dev output, `json` for one-line-per-record
+/// JSON suitable for k8s log aggregators (fluent-bit / vector / Loki).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_log_format() -> String {
-    "text".to_string()
-}
-
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
-            log_format: default_log_format(),
+            log_format: LogFormat::default(),
         }
     }
 }

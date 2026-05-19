@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use sgl_router::config::LogFormat;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -21,24 +22,23 @@ struct Cli {
 /// so the `tracing::debug!` below is delivered through THAT subscriber —
 /// no recursive init.
 ///
-/// `format` selects the output shape: `"json"` emits one JSON record per
-/// line (target for production / k8s log aggregators), anything else
-/// falls back to the human-readable text format. The `RUST_LOG`
-/// environment variable always wins over `default_level`.
-fn init_tracing(default_level: &str, format: &str) -> Result<()> {
+/// `format` selects the output shape: `Json` emits one JSON record per
+/// line (target for production / k8s log aggregators), `Text` is the
+/// human-readable default. The `RUST_LOG` environment variable always
+/// wins over `default_level`.
+fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
-    let install_result = if format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt()
+    let install_result = match format {
+        LogFormat::Json => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
             .json()
-            .try_init()
-    } else {
-        tracing_subscriber::fmt()
+            .try_init(),
+        LogFormat::Text => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
-            .try_init()
+            .try_init(),
     };
     if let Err(e) = install_result {
         // A second install attempt; the existing subscriber is fine.
@@ -46,12 +46,28 @@ fn init_tracing(default_level: &str, format: &str) -> Result<()> {
         // what we tried.
         tracing::debug!(
             default_level = %default_level,
-            format = %format,
+            ?format,
             error = %e,
             "tracing subscriber already installed; continuing"
         );
     }
     Ok(())
+}
+
+/// Install a minimal text-format subscriber BEFORE config parsing so a
+/// config-load error has somewhere to surface. The real subscriber
+/// (driven by `Config.observability`) is installed after; the second
+/// `try_init` is a no-op because a subscriber is already present.
+/// The bootstrap subscriber respects `RUST_LOG` so an operator can
+/// debug startup with `RUST_LOG=debug` even when the config file is
+/// missing or malformed.
+fn install_bootstrap_subscriber() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
 }
 
 /// Install SIGTERM and SIGINT handlers up front so a failure here surfaces
@@ -67,10 +83,14 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Bootstrap subscriber so a Config::from_path error has structured
+    // output. The configured-format subscriber installs after this and
+    // becomes a no-op via try_init's idempotency.
+    install_bootstrap_subscriber();
     let cfg = sgl_router::config::Config::from_path(&cli.config)
         .with_context(|| format!("load config from {}", cli.config.display()))?;
 
-    init_tracing(&cfg.observability.log_level, &cfg.observability.log_format)?;
+    init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
 
     tracing::info!(
         "sgl-router {} starting on {}:{}",
@@ -207,19 +227,14 @@ mod tests {
 
     #[test]
     fn init_tracing_is_idempotent() {
-        let _ = init_tracing("info", "text");
-        let _ = init_tracing("info", "text");
+        let _ = init_tracing("info", LogFormat::Text);
+        let _ = init_tracing("info", LogFormat::Text);
     }
 
     #[test]
     fn init_tracing_accepts_json_format() {
         // Doesn't matter whether we win or lose the race against another
         // subscriber install — the function must return Ok either way.
-        assert!(init_tracing("info", "json").is_ok());
-    }
-
-    #[test]
-    fn init_tracing_unknown_format_falls_back_to_text() {
-        assert!(init_tracing("info", "xml-because-why-not").is_ok());
+        assert!(init_tracing("info", LogFormat::Json).is_ok());
     }
 }
