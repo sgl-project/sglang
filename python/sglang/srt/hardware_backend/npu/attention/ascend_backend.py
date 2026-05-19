@@ -761,9 +761,7 @@ class AscendAttnBackend(AttentionBackend):
 
             # Update SWA mask: True = masked out (don't attend), False = attend
             seq_lens_int = seq_lens_cpu[:bs].int()
-            starts = torch.clamp(
-                seq_lens_int - self.sliding_window_size, min=0
-            )
+            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
             start_exp = starts.unsqueeze(1).to(self.device)
             seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
@@ -1299,9 +1297,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia:
                 is_swa = self._is_swa_layer(layer)
                 sparse_mode = 4 if is_swa else 3
-                pre_tokens = (
-                    layer.sliding_window_size if is_swa else SWA_INT_MAX
-                )
+                pre_tokens = layer.sliding_window_size if is_swa else SWA_INT_MAX
                 next_tokens = 0 if is_swa else SWA_INT_MAX
                 block_tables = self.forward_metadata.block_tables
                 k_view = k_cache.view(
@@ -2072,9 +2068,7 @@ class AscendAttnBackend(AttentionBackend):
             if paged_seq_lens_cpu_int is None:
                 actual_seq_len_kv = paged_seq_lens_cpu_list
             else:
-                actual_seq_len_kv = (
-                    paged_seq_lens_cpu_int.cpu().int().tolist()
-                )
+                actual_seq_len_kv = paged_seq_lens_cpu_int.cpu().int().tolist()
             num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
@@ -2289,9 +2283,7 @@ class AscendAttnBackend(AttentionBackend):
                 if paged_seq_lens_cpu_int is None:
                     actual_seq_len_kv = paged_seq_lens_cpu_list
                 else:
-                    actual_seq_len_kv = (
-                        paged_seq_lens_cpu_int.cpu().int().tolist()
-                    )
+                    actual_seq_len_kv = paged_seq_lens_cpu_int.cpu().int().tolist()
                 num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 q = q[:actual_bs]
