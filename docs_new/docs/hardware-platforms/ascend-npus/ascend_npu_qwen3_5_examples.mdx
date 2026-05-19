@@ -275,6 +275,31 @@ python3 -m sglang.launch_server \
 
 Not test yet.
 
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
+
+### Health Check
+
+```bash Command
+curl http://127.0.0.1:8000/health
+```
+
+A successful response returns HTTP 200 with an empty body.
+
+### Generate (Native Endpoint)
+
+```bash Command
+curl http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "What is the capital of France?",
+    "sampling_params": {"temperature": 0, "max_new_tokens": 128}
+  }'
+```
+
+The expected output should contain "Paris".
+
 ### Using Benchmark
 
 Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling) for details.
