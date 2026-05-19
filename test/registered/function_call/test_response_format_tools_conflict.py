@@ -149,7 +149,10 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         self.assertIn("response_format", err)
 
     def test_json_schema_with_named_tool_choice_returns_error(self):
-        from sglang.srt.entrypoints.openai.protocol import ToolChoice, ToolChoiceFuncName
+        from sglang.srt.entrypoints.openai.protocol import (
+            ToolChoice,
+            ToolChoiceFuncName,
+        )
 
         req = _make_request(
             tools=_make_tools(),
