@@ -315,9 +315,18 @@ def _post_step_oracle_sync(
         new_len = len(req.output_ids)
         prev_len = last_output_lens.get(rid, 0)
         if oracle.is_in_decode(rid):
+            # Commit the oracle's own prediction, NOT req.output_ids[k]. The
+            # sampler override normally writes the prediction, so this is a
+            # no-op in the steady state. Under SGLANG_PSEUDO_INPUT_PERTURB_PROB
+            # > 0 the sampler perturbs the override, and req.output_ids[k]
+            # diverges from the prediction. Keeping output_history aligned to
+            # the prediction (not the perturbed actual) is what lets the next
+            # forward's input cross-check observe the divergence and fire
+            # INPUT_TOKEN_MISMATCH.
             for k in range(prev_len, new_len):
                 try:
-                    oracle.commit_step(req_id=rid, output_token=int(req.output_ids[k]))
+                    expected = oracle.predict_output_token(req_id=rid, step=k)
+                    oracle.commit_step(req_id=rid, output_token=expected)
                 except (RuntimeError, KeyError) as exc:
                     logger.debug("pseudo-mode commit_step skipped: %s", exc)
                     break
@@ -473,7 +482,13 @@ def _handle_pseudo_allocator_stats(scheduler: "Scheduler") -> Dict[str, int]:
 
 
 def _handle_pseudo_active_reqs(scheduler: "Scheduler") -> List[Dict[str, Any]]:
-    """Return summary info for every req currently in waiting + running."""
+    """Return summary info for every req currently in waiting + running.
+
+    ``output_tokens`` carries the full output id list for the req as
+    sglang sees it (i.e. the value the sampler returned, perturbed or
+    not). The harness compares it against the oracle's predictions to
+    detect override drift end-to-end.
+    """
     out: List[Dict[str, Any]] = []
     for req in list(scheduler.waiting_queue):
         out.append(
@@ -481,6 +496,7 @@ def _handle_pseudo_active_reqs(scheduler: "Scheduler") -> List[Dict[str, Any]]:
                 "rid": req.rid,
                 "state": "waiting",
                 "output_len": len(req.output_ids),
+                "output_tokens": [int(t) for t in req.output_ids],
             }
         )
     running = getattr(scheduler, "running_batch", None)
@@ -491,6 +507,7 @@ def _handle_pseudo_active_reqs(scheduler: "Scheduler") -> List[Dict[str, Any]]:
                     "rid": req.rid,
                     "state": "running",
                     "output_len": len(req.output_ids),
+                    "output_tokens": [int(t) for t in req.output_ids],
                 }
             )
     return out
