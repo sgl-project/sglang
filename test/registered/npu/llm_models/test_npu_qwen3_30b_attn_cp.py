@@ -1,4 +1,5 @@
 import os
+import torch
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -17,6 +18,7 @@ register_npu_ci(
 @unittest.skip(
     "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
 )
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):
     """GSM8K accuracy test for Qwen3-30B-A3B mixed deployment on 4 NPUs.
 

@@ -2,6 +2,7 @@ import json
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
@@ -20,6 +21,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEnableThinking(CustomTestCase):
     """Testcase: Testing with the 'enable_thinking' feature enabled/disabled,
                  both streaming and non-streaming input requests successful

@@ -1,6 +1,7 @@
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
@@ -23,6 +24,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFimCompletion(CustomTestCase):
     """Testcase：Verify set --completion-template, the model's FIM (Fill-in-the-Middle) completion function work correctly.
 

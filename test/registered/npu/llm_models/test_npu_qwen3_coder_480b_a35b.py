@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH,
@@ -14,6 +16,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen3Coder480BA35B(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot model on the GSM8K dataset is no less than 0.94.
 
