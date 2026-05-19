@@ -136,171 +136,12 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            if req.finished() and req.finished_output:
+                # With the overlap schedule, a request will try to output twice and hit this line twice
+                # because of the one additional delayed token. This "continue" prevented the dummy output.
+                continue
 
-            if req.finished():
-                if req.finished_output:
-                    # With the overlap schedule, a request will try to output twice and hit this line twice
-                    # because of the one additional delayed token. This "continue" prevented the dummy output.
-                    continue
-                req.finished_output = True
-                if req.finished_len is None:
-                    req.finished_len = len(req.output_ids)
-                should_output = True
-            else:
-                if req.stream:
-                    stream_interval = (
-                        req.sampling_params.stream_interval
-                        or self.server_args.stream_interval
-                    )
-
-                    # origin stream_interval logic
-                    should_output = (
-                        len(req.output_ids) % stream_interval == 1
-                        if stream_interval > 1
-                        else len(req.output_ids) % stream_interval == 0
-                    )
-
-                    if should_output:
-                        # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
-                        should_output &= not req.check_match_stop_str_prefix()
-                else:
-                    should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                    )
-
-            if should_output:
-                send_token_offset = req.send_token_offset
-                send_output_token_logprobs_offset = (
-                    req.send_output_token_logprobs_offset
-                )
-                acc.rids.append(req.rid)
-                acc.http_worker_ipcs.append(req.http_worker_ipc)
-                acc.finished_reasons.append(
-                    req.finished_reason.to_json() if req.finished_reason else None
-                )
-                acc.decoded_texts.append(req.decoded_text)
-                decode_ids, read_offset = req.init_incremental_detokenize()
-
-                acc.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
-                # Exclude the tokens after stop condition
-                output_ids_ = req.output_ids_through_stop
-
-                req.send_decode_id_offset = len(decode_ids)
-                acc.read_offsets.append(read_offset)
-                acc.output_ids.append(output_ids_[send_token_offset:])
-                req.send_token_offset = len(output_ids_)
-                acc.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
-                acc.spaces_between_special_tokens.append(
-                    req.sampling_params.spaces_between_special_tokens
-                )
-                acc.no_stop_trim.append(req.sampling_params.no_stop_trim)
-                acc.prompt_tokens.append(len(req.origin_input_ids))
-                acc.reasoning_tokens.append(req.reasoning_tokens)
-                acc.completion_tokens.append(len(output_ids_))
-                acc.cached_tokens.append(req.cached_tokens)
-
-                # Collect detailed cache breakdown if available
-                acc.cached_tokens_details.append(self.get_cached_tokens_details(req))
-
-                acc.retraction_counts.append(req.retraction_count)
-
-                acc.time_stats.append(req.time_stats)
-
-                if not self.spec_algorithm.is_none():
-                    acc.spec_verify_ct.append(req.spec_verify_ct)
-                    acc.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
-                    acc.spec_correct_drafts_histogram.append(
-                        req.spec_correct_drafts_histogram
-                    )
-
-                if return_logprob:
-                    if (
-                        req.return_logprob
-                        and not req.input_logprob_sent
-                        # Decode server does not send input logprobs
-                        and self.disaggregation_mode != DisaggregationMode.DECODE
-                        # Only send when input logprobs have been computed (after prefill)
-                        and req.input_token_logprobs_val is not None
-                    ):
-                        acc.input_token_logprobs_val.append(
-                            req.input_token_logprobs_val
-                        )
-                        acc.input_token_logprobs_idx.append(
-                            req.input_token_logprobs_idx
-                        )
-                        acc.input_top_logprobs_val.append(req.input_top_logprobs_val)
-                        acc.input_top_logprobs_idx.append(req.input_top_logprobs_idx)
-                        acc.input_token_ids_logprobs_val.append(
-                            req.input_token_ids_logprobs_val
-                        )
-                        acc.input_token_ids_logprobs_idx.append(
-                            req.input_token_ids_logprobs_idx
-                        )
-                        req.input_logprob_sent = True
-                    else:
-                        acc.input_token_logprobs_val.append([])
-                        acc.input_token_logprobs_idx.append([])
-                        acc.input_top_logprobs_val.append([])
-                        acc.input_top_logprobs_idx.append([])
-                        acc.input_token_ids_logprobs_val.append([])
-                        acc.input_token_ids_logprobs_idx.append([])
-
-                    if req.return_logprob:
-                        logprob_end = max(len(output_ids_), 1)
-                        acc.output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        acc.output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        acc.output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        acc.output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        acc.output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        acc.output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[
-                                send_output_token_logprobs_offset:logprob_end
-                            ]
-                        )
-                        req.send_output_token_logprobs_offset = logprob_end
-                    else:
-                        acc.output_token_logprobs_val.append([])
-                        acc.output_token_logprobs_idx.append([])
-                        acc.output_top_logprobs_val.append([])
-                        acc.output_top_logprobs_idx.append([])
-                        acc.output_token_ids_logprobs_val.append([])
-                        acc.output_token_ids_logprobs_idx.append([])
-
-                if req.return_hidden_states:
-                    acc.output_hidden_states.append(req.hidden_states)
-                if req.return_routed_experts:
-                    acc.routed_experts.append(req.routed_experts)
-                if req.return_indexer_topk:
-                    acc.indexer_topk.append(req.indexer_topk)
-
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in acc.customized_info:
-                            acc.customized_info[k] = []
-                        acc.customized_info[k].append(
-                            v[send_token_offset : len(output_ids_)]
-                        )
+            acc.accept(req=req)
 
             if (
                 req.finished()
@@ -489,7 +330,158 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_idx = []
 
     def accept(self, *, req: Req) -> None:
-        raise NotImplementedError
+        if req.finished():
+            assert not req.finished_output
+            req.finished_output = True
+            if req.finished_len is None:
+                req.finished_len = len(req.output_ids)
+            should_output = True
+        else:
+            if req.stream:
+                stream_interval = (
+                    req.sampling_params.stream_interval or self.default_stream_interval
+                )
+
+                # origin stream_interval logic
+                should_output = (
+                    len(req.output_ids) % stream_interval == 1
+                    if stream_interval > 1
+                    else len(req.output_ids) % stream_interval == 0
+                )
+
+                if should_output:
+                    # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
+                    should_output &= not req.check_match_stop_str_prefix()
+            else:
+                should_output = (
+                    len(req.output_ids) % self.default_force_stream_interval == 0
+                )
+
+        if not should_output:
+            return
+
+        send_token_offset = req.send_token_offset
+        send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+        self.rids.append(req.rid)
+        self.http_worker_ipcs.append(req.http_worker_ipc)
+        self.finished_reasons.append(
+            req.finished_reason.to_json() if req.finished_reason else None
+        )
+        self.decoded_texts.append(req.decoded_text)
+        decode_ids, read_offset = req.init_incremental_detokenize()
+
+        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+
+        # Exclude the tokens after stop condition
+        output_ids_ = req.output_ids_through_stop
+
+        req.send_decode_id_offset = len(decode_ids)
+        self.read_offsets.append(read_offset)
+        self.output_ids.append(output_ids_[send_token_offset:])
+        req.send_token_offset = len(output_ids_)
+        self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+        self.spaces_between_special_tokens.append(
+            req.sampling_params.spaces_between_special_tokens
+        )
+        self.no_stop_trim.append(req.sampling_params.no_stop_trim)
+        self.prompt_tokens.append(len(req.origin_input_ids))
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.completion_tokens.append(len(output_ids_))
+        self.cached_tokens.append(req.cached_tokens)
+
+        # Collect detailed cache breakdown if available
+        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+
+        self.retraction_counts.append(req.retraction_count)
+
+        self.time_stats.append(req.time_stats)
+
+        if not self.spec_algorithm.is_none():
+            self.spec_verify_ct.append(req.spec_verify_ct)
+            self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+
+        if self.return_logprob:
+            if (
+                req.return_logprob
+                and not req.input_logprob_sent
+                # Decode server does not send input logprobs
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+                # Only send when input logprobs have been computed (after prefill)
+                and req.input_token_logprobs_val is not None
+            ):
+                self.input_token_logprobs_val.append(req.input_token_logprobs_val)
+                self.input_token_logprobs_idx.append(req.input_token_logprobs_idx)
+                self.input_top_logprobs_val.append(req.input_top_logprobs_val)
+                self.input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                self.input_token_ids_logprobs_val.append(
+                    req.input_token_ids_logprobs_val
+                )
+                self.input_token_ids_logprobs_idx.append(
+                    req.input_token_ids_logprobs_idx
+                )
+                req.input_logprob_sent = True
+            else:
+                self.input_token_logprobs_val.append([])
+                self.input_token_logprobs_idx.append([])
+                self.input_top_logprobs_val.append([])
+                self.input_top_logprobs_idx.append([])
+                self.input_token_ids_logprobs_val.append([])
+                self.input_token_ids_logprobs_idx.append([])
+
+            if req.return_logprob:
+                logprob_end = max(len(output_ids_), 1)
+                self.output_token_logprobs_val.append(
+                    req.output_token_logprobs_val[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                self.output_token_logprobs_idx.append(
+                    req.output_token_logprobs_idx[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                self.output_top_logprobs_val.append(
+                    req.output_top_logprobs_val[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                self.output_top_logprobs_idx.append(
+                    req.output_top_logprobs_idx[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                self.output_token_ids_logprobs_val.append(
+                    req.output_token_ids_logprobs_val[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                self.output_token_ids_logprobs_idx.append(
+                    req.output_token_ids_logprobs_idx[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
+                req.send_output_token_logprobs_offset = logprob_end
+            else:
+                self.output_token_logprobs_val.append([])
+                self.output_token_logprobs_idx.append([])
+                self.output_top_logprobs_val.append([])
+                self.output_top_logprobs_idx.append([])
+                self.output_token_ids_logprobs_val.append([])
+                self.output_token_ids_logprobs_idx.append([])
+
+        if req.return_hidden_states:
+            self.output_hidden_states.append(req.hidden_states)
+        if req.return_routed_experts:
+            self.routed_experts.append(req.routed_experts)
+        if req.return_indexer_topk:
+            self.indexer_topk.append(req.indexer_topk)
+
+        if req.customized_info is not None:
+            for k, v in req.customized_info.items():
+                if k not in self.customized_info:
+                    self.customized_info[k] = []
+                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
         self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
