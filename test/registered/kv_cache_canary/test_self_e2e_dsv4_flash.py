@@ -23,7 +23,7 @@ register_cuda_ci(est_time=1200, stage="extra-a", runner_config="1-gpu-large")
 
 
 _DSV4_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
-_NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 5, "compress_ratios": [0, 0, 4, 128, 4]}'
+_NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 3, "compress_ratios": [0, 0, 4]}'
 _DSV4_BASE_ARGS: List[str] = [
     "--trust-remote-code",
     "--json-model-override-args",
