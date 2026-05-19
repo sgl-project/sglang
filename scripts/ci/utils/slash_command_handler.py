@@ -282,23 +282,36 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
-def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def handle_tag_run_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
+):
     """
     Handles the /tag-run-ci-label command.
+
+    When tag_extra is True (triggered by the `extra` argument), also adds the
+    `run-ci-extra` label. pr-test-extra.yml gates on BOTH `run-ci` and
+    `run-ci-extra`, so both must be present for the extra workflow to run —
+    we always add `run-ci` alongside `run-ci-extra`. Reuses the same
+    `can_tag_run_ci_label` permission.
+
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_tag_run_ci_label", False):
         print("Permission denied: can_tag_run_ci_label is false.")
         return False
 
-    print("Permission granted. Adding 'run-ci' label.")
-    pr.add_to_labels("run-ci")
+    labels = ["run-ci"]
+    if tag_extra:
+        labels.append("run-ci-extra")
+    print(f"Permission granted. Adding labels: {labels}.")
+    for label in labels:
+        pr.add_to_labels(label)
 
     if react_on_success:
         comment.create_reaction("+1")
-        print("Label added and comment reacted.")
+        print("Labels added and comment reacted.")
     else:
-        print("Label added (reaction suppressed).")
+        print("Labels added (reaction suppressed).")
 
     return True
 
@@ -1071,19 +1084,24 @@ def main():
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
+    # `extra` argument opts in to also tagging `run-ci-extra`. Both
+    # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
+    # parser so the surface is symmetric.
+    tokens = first_line.split()
+    tag_extra = len(tokens) > 1 and "extra" in tokens[1:]
 
     if first_line.startswith("/tag-run-ci-label"):
-        handle_tag_run_ci(repo, pr, comment, user_perms)
+        handle_tag_run_ci(repo, pr, comment, user_perms, tag_extra=tag_extra)
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith("/tag-and-rerun-ci"):
         # Perform both actions, but suppress individual reactions
-        print("Processing combined command: /tag-and-rerun-ci")
+        print(f"Processing combined command: /tag-and-rerun-ci (tag_extra={tag_extra})")
 
         tagged = handle_tag_run_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo, pr, comment, user_perms, react_on_success=False, tag_extra=tag_extra
         )
 
         # Wait for the label to propagate before triggering rerun
