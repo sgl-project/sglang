@@ -764,11 +764,11 @@ def _format_violation(
             f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}",
             (
                 f"  stored:   token_id={int(stored_token)}   position={int(position)} "
-                f"prev_hash={stored_prev_hash:#018x} real_kv_hash={0:#018x}"
+                f"prev_hash={stored_prev_hash:#018x}"
             ),
             (
                 f"  expected: token_id={int(expected_token)}   position={int(position)} "
-                f"prev_hash={expected_prev_hash:#018x} real_kv_hash={0:#018x}"
+                f"prev_hash={expected_prev_hash:#018x}"
             ),
             (
                 f"  total_violations={total} ring_overflow={ring_overflow} "
