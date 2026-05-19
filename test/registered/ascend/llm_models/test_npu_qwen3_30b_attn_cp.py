@@ -1,4 +1,5 @@
 import os
+import torch
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -9,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=500, suite="nightly-4-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):
     """GSM8K accuracy test for Qwen3-30B-A3B mixed deployment on 4 NPUs.
 
