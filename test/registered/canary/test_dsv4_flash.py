@@ -15,6 +15,12 @@ Single-GPU constraint:
 - HF config's ``compress_ratios`` length must match ``num_hidden_layers``;
   using the first-5 prefix ``[0, 0, 4, 128, 4]`` exercises all three
   compression flavours (1 full / 2 c4 / 1 c128).
+- DSV4-Flash ships with FP4-packed MoE expert weights. The default
+  fused_experts_impl path expects bf16 / fp8 layouts and trips on
+  ``Hidden size mismatch`` in ``fused_moe.py:828``; ``--moe-runner-backend
+  marlin`` routes experts through the Marlin kernel which handles the
+  FP4 padding correctly (matches the upstream LowLatency FP4 recipe at
+  test/registered/dsv4/test_deepseek_v4_flash_fp4_h200.py).
 
 Test group: extra-a / 1-gpu-large (H100 80GB equivalent). Not base --
 launching DSV4 takes several minutes which is too heavy for the
@@ -63,6 +69,10 @@ class TestKvCacheCanaryDSV4Flash(CustomTestCase):
                 "1",
                 "--json-model-override-args",
                 _OVERRIDE_ARGS,
+                "--moe-runner-backend",
+                "marlin",
+                "--watchdog-timeout",
+                "900",
                 "--kv-cache-canary",
                 "raise",
                 "--mem-fraction-static",
