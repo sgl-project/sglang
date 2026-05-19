@@ -33,7 +33,7 @@ def apply_mock_model_defaults(server_args: "ServerArgs") -> "ServerArgs":
         - load_format = "dummy"            (no real weights loaded)
         - num_hidden_layers_override = 1   (minimum needed for a full attn + KV write)
         - sampling_backend = "oracle"      (so install_oracle_sampler is the live backend)
-        - kv_cache_canary_mode = "raise"   (mock_model without canary is mostly pointless)
+        - kv_cache_canary = "raise"        (mock_model without canary is mostly pointless)
         - kv_cache_canary_input_check_mode = "ON"  (turn on the input-id verification path)
 
     User-specified values are preserved - apply_mock_model_defaults only fills holes. Returns the

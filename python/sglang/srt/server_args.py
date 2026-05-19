@@ -876,6 +876,9 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
+        # Apply kv-canary mock_model defaults before sampling/load-format handlers run.
+        self._apply_mock_model_defaults()
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -1173,6 +1176,25 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _apply_mock_model_defaults(self):
+        """Bridge to kv-canary mock_model args_modifier per upper-level SOT §8.3.
+
+        The helper returns a new ServerArgs via dataclasses.replace; we copy the resolved
+        fields back into self because __post_init__ cannot reassign self. apply_mock_model_defaults
+        itself is contractually side-effect free.
+        """
+        from sglang.srt.kv_cache_canary.mock_model.args_modifier import (
+            apply_mock_model_defaults,
+        )
+
+        resolved = apply_mock_model_defaults(self)
+        if resolved is self:
+            return
+        for field in dataclasses.fields(self):
+            new_value = getattr(resolved, field.name)
+            if getattr(self, field.name) != new_value:
+                setattr(self, field.name, new_value)
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
