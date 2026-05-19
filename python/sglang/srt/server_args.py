@@ -2209,7 +2209,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch == "Gemma4ForConditionalGeneration":
+        elif model_arch in (
+            "Gemma4ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+        ):
             default_attention_backend = (
                 "trtllm_mha" if is_sm100_supported() else "triton"
             )
