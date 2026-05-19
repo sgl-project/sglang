@@ -753,6 +753,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             real_kv_hash_mode=server_args.kv_cache_canary_real_data,
         )
 
+        if server_args.enable_pseudo_mode:
+            self._install_pseudo_mode()
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -2698,6 +2701,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_group.barrier()
         with torch.inference_mode(), run_ctx or empty_context():
             run_once()
+
+    def _install_pseudo_mode(self) -> None:
+        """Construct the oracle, attach the model-runner-side hooks.
+
+        Scheduler-side hooks (admit / commit / finish) are wired by
+        :func:`sglang.srt.pseudo_mode.install.install_scheduler_hooks`
+        from the Scheduler constructor once the tp_worker reports back.
+        We stash the oracle on ``self.pseudo_oracle`` for the scheduler
+        to pick up.
+        """
+        from sglang.srt.pseudo_mode.install import install_on_model_runner
+        from sglang.srt.pseudo_mode.oracle import PseudoOracle
+
+        eos_ids = self.model_config.hf_eos_token_id
+        eos_id = next(iter(eos_ids)) if eos_ids else 0
+        self.pseudo_oracle = PseudoOracle(
+            vocab_size=int(self.model_config.vocab_size),
+            eos_id=int(eos_id),
+        )
+        install_on_model_runner(
+            model_runner=self,
+            oracle=self.pseudo_oracle,
+            scheduler=None,
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding
