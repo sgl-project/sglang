@@ -86,6 +86,25 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("'fake'", str(context.exception))
 
 
+class TestIBDeviceValidation(unittest.TestCase):
+    @patch("sglang.srt.server_args.os.listdir")
+    @patch("sglang.srt.server_args.os.path.isdir", return_value=True)
+    def test_json_gpu_mapping_allows_reusing_ib_devices_across_gpus(
+        self, mock_isdir, mock_listdir
+    ):
+        mock_listdir.return_value = ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"]
+        server_args = ServerArgs(model_path="dummy")
+        ib_mapping = json.dumps(
+            {
+                "0": "mlx5_0,mlx5_1",
+                "1": "mlx5_0,mlx5_1",
+                "2": "mlx5_2,mlx5_3",
+            }
+        )
+
+        self.assertEqual(server_args._validate_ib_devices(ib_mapping), ib_mapping)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

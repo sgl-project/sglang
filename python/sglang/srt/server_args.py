@@ -4124,7 +4124,8 @@ class ServerArgs:
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1"),
+                a JSON GPU-to-IB mapping, or a path to a JSON mapping file.
 
         Returns:
             Normalized comma-separated string of validated device names, or None if input is None.
@@ -4135,20 +4136,83 @@ class ServerArgs:
             )
             return None
 
+        device_str = device_str.strip()
+
+        def split_devices(devices_str: str) -> List[str]:
+            return [d.strip() for d in devices_str.split(",") if d.strip()]
+
+        def parse_json_mapping(mapping_str: str) -> Dict[int, List[str]]:
+            parsed_json = json.loads(mapping_str)
+            if not isinstance(parsed_json, dict):
+                raise ValueError("IB device JSON mapping must be a dictionary")
+
+            gpu_mapping: Dict[int, List[str]] = {}
+            for gpu_key, ib_devices in parsed_json.items():
+                if isinstance(gpu_key, str) and gpu_key.isdigit():
+                    gpu_id = int(gpu_key)
+                elif isinstance(gpu_key, int):
+                    gpu_id = gpu_key
+                else:
+                    raise ValueError(
+                        "Invalid IB device JSON mapping: keys must be integers "
+                        "or string representations of integers"
+                    )
+
+                if not isinstance(ib_devices, str):
+                    raise ValueError(
+                        "Invalid IB device JSON mapping: values must be strings"
+                    )
+
+                devices = split_devices(ib_devices)
+                if len(devices) == 0:
+                    raise ValueError(f"No valid IB devices specified for GPU {gpu_id}")
+                gpu_mapping[gpu_id] = devices
+
+            if not gpu_mapping:
+                raise ValueError("No valid GPU mappings found in IB device JSON")
+            return gpu_mapping
+
+        json_mapping: Optional[Dict[int, List[str]]] = None
+        json_mapping_path = device_str if device_str.endswith(".json") else None
+        if json_mapping_path is not None:
+            if not os.path.isfile(json_mapping_path):
+                raise RuntimeError(f"File {json_mapping_path} does not exist.")
+            try:
+                with open(json_mapping_path, "r") as f:
+                    json_mapping = parse_json_mapping(f.read())
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"Failed to parse JSON content from file {json_mapping_path}"
+                ) from e
+        else:
+            try:
+                json_mapping = parse_json_mapping(device_str)
+            except json.JSONDecodeError:
+                json_mapping = None
+
         # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
+        devices = (
+            [
+                device
+                for mapping_devices in json_mapping.values()
+                for device in mapping_devices
+            ]
+            if json_mapping is not None
+            else split_devices(device_str)
+        )
         if len(devices) == 0:
             raise ValueError("No valid IB devices specified")
 
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
+        if json_mapping is None:
+            # Deduplicate while preserving order for the legacy comma-separated format.
+            unique_devices = list(dict.fromkeys(devices))
+            if len(unique_devices) != len(devices):
+                logger.warning(
+                    "Duplicate IB devices specified: %s. Deduplicating to: %s",
+                    device_str,
+                    ",".join(unique_devices),
+                )
+                devices = unique_devices
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
@@ -4170,7 +4234,7 @@ class ServerArgs:
                 f"Available devices: {sorted(available_devices)}"
             )
 
-        return ",".join(devices)
+        return device_str if json_mapping is not None else ",".join(devices)
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
