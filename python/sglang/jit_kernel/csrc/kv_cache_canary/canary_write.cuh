@@ -32,7 +32,6 @@ constexpr int32_t kSwaMappingPresent = 1;
 struct WriteKernelParams {
   uint8_t* canary_buf;
   int64_t slot_stride_bytes;
-  int64_t canary_num_slots;
 
   // Plan tensors.
   const int32_t* write_offsets;
@@ -282,7 +281,6 @@ inline void canary_write_step_cuda(
       .verify(real_kv_source_params);
 
   const int64_t slot_stride_bytes = N_stride.unwrap();
-  const int64_t num_slots = N_slots.unwrap();
   const int32_t write_req_capacity = static_cast<int32_t>(N_write_reqs.unwrap());
   const int32_t ring_capacity = static_cast<int32_t>(N_ring.unwrap());
   const DLDevice device = device_.unwrap();
@@ -309,7 +307,6 @@ inline void canary_write_step_cuda(
   WriteKernelParams p{};
   p.canary_buf = static_cast<uint8_t*>(canary_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
-  p.canary_num_slots = num_slots;
   p.write_offsets = static_cast<const int32_t*>(write_offsets.data_ptr());
   p.write_seed_slot_indices = static_cast<const int32_t*>(write_seed_slot_indices.data_ptr());
   p.write_num_valid_reqs = static_cast<const int32_t*>(write_num_valid_reqs.data_ptr());
