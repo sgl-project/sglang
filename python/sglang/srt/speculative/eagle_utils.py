@@ -25,16 +25,10 @@ def apply_eagle_prefill_input_rotation(
 ) -> None:
     """EAGLE input rotation for draft prefill.
 
-    Each req's slice of batch.input_ids goes from [t_0..t_{n-1}] to
-    [t_1..t_{n-1}, t_n], where t_n is the req's next_token_ids entry.
-    Draft prefill then sees, at every position, the next token target
-    would predict; its hidden state at position i aligns with target's
-    label for position i+1, which is what makes EAGLE chain prediction
-    work.
-
-    Implementation: shift the whole flat per-req-concatenated tensor
-    left by 1 (one kernel), then scatter next_token_ids at each req's
-    segment tail (one kernel). Reassigns batch.input_ids.
+    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] with
+    t_n = next_token_ids[i]. Aligns draft's position-i hidden with
+    target's label at i+1 — the basis of EAGLE chain prediction.
+    Vectorized: one whole-tensor left shift + scatter at segment tails.
     """
     if batch.forward_mode.is_idle():
         return
