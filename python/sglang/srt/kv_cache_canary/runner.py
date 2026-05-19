@@ -66,7 +66,7 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pools: list["KVCache"],
+        pools: Optional[list["KVCache"]] = None,
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: Optional["ReqToTokenPool"] = None,
@@ -76,6 +76,7 @@ class CanaryRunner:
         per_forward_write_entry_capacity: int,
         sweep_verify_capacity: int,
         swa_window_size: int = 0,
+        buffer_groups_per_pool: Optional[list[tuple[CanaryBufferGroup, ...]]] = None,
     ) -> None:
         self.config = config
         self._device = device
@@ -84,14 +85,25 @@ class CanaryRunner:
         self._radix_cache = radix_cache
         self._swa_window_size = int(swa_window_size)
 
-        groups_per_pool: list[tuple[CanaryBufferGroup, ...]] = []
-        for pool in pools:
-            groups_per_pool.append(
-                attach_canary_buffers(pool=pool, config=config, device=device)
+        if buffer_groups_per_pool is not None:
+            if pools is not None:
+                raise ValueError(
+                    "kv-canary: pass either pools or buffer_groups_per_pool, not both"
+                )
+            self._groups_per_pool = tuple(
+                tuple(groups) for groups in buffer_groups_per_pool
             )
-        self._groups_per_pool: tuple[tuple[CanaryBufferGroup, ...], ...] = tuple(
-            groups_per_pool
-        )
+        else:
+            if pools is None:
+                raise ValueError(
+                    "kv-canary: either pools or buffer_groups_per_pool must be provided"
+                )
+            groups_per_pool: list[tuple[CanaryBufferGroup, ...]] = []
+            for pool in pools:
+                groups_per_pool.append(
+                    attach_canary_buffers(pool=pool, config=config, device=device)
+                )
+            self._groups_per_pool = tuple(groups_per_pool)
 
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)
