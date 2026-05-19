@@ -40,7 +40,6 @@ from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
-from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
