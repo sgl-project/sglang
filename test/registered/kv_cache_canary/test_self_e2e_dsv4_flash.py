@@ -23,7 +23,12 @@ register_cuda_ci(est_time=1200, stage="extra-a", runner_config="1-gpu-large")
 
 
 _DSV4_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
-_NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 3, "compress_ratios": [0, 0, 4]}'
+# SOT-required: 5 layers + compress_ratios [0, 0, 4, 128, 4] to cover all three
+# DSV4 compression flavours (full / c4 / c128). The 128 axis is the load-bearing
+# one — c128 is what makes DSV4 unique. TODO: c128_v2.cuh:442 currently raises
+# `CUDA error: an illegal instruction` on H200 with this truncated layer config;
+# investigate (PDL flag? sm-arch ptx? full-model layout assumption?) and restore.
+_NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 5, "compress_ratios": [0, 0, 4, 128, 4]}'
 _DSV4_BASE_ARGS: List[str] = [
     "--trust-remote-code",
     "--json-model-override-args",
