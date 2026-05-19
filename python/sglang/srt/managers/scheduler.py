@@ -103,7 +103,6 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
     FlushCacheReqInput,
-    FlushCacheReqOutput,
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -164,6 +163,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import (
     SchedulerDPAttnAdapter,
+)
+from sglang.srt.managers.scheduler_components.flush_wrapper import (
+    SchedulerFlushWrapper,
 )
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -991,7 +993,11 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
-        self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
+        self.flush_wrapper = SchedulerFlushWrapper(
+            flush_cache=self.flush_cache,
+            is_fully_idle=self.is_fully_idle,
+            ipc_channels=self.ipc_channels,
+        )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
@@ -1355,7 +1361,7 @@ class Scheduler(
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
-                (FlushCacheReqInput, self.flush_cache_wrapped),
+                (FlushCacheReqInput, self.flush_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1629,7 +1635,7 @@ class Scheduler(
                     if self.ipc_channels.recv_from_rpc is not None:
                         self.ipc_channels.recv_from_rpc.send_pyobj(output)
 
-        self._check_pending_flush()
+        self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -3010,32 +3016,6 @@ class Scheduler(
                 )
             )
 
-    def _check_pending_flush(self):
-        if self._pending_flush is None:
-            return
-
-        pending_req, deadline = self._pending_flush
-
-        if self.is_fully_idle():
-            success = self.flush_cache()
-            self._pending_flush = None
-            self.ipc_channels.send_to_tokenizer.send_output(
-                FlushCacheReqOutput(success=success), pending_req
-            )
-            return
-
-        if time.monotonic() >= deadline:
-            logging.warning(
-                "Deferred flush_cache timed out while waiting for idle state."
-            )
-            self._pending_flush = None
-            self.ipc_channels.send_to_tokenizer.send_output(
-                FlushCacheReqOutput(
-                    success=False, message="Timed out waiting for idle state."
-                ),
-                pending_req,
-            )
-
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -3065,25 +3045,6 @@ class Scheduler(
                 message="Ngram speculative decoding is not enabled.",
             )
         return self.external_corpus_manager.list(recv_req)
-
-    def flush_cache_wrapped(
-        self, recv_req: FlushCacheReqInput
-    ) -> Optional[FlushCacheReqOutput]:
-        if self._pending_flush is not None:
-            return FlushCacheReqOutput(
-                success=False,
-                message="Another flush_cache is already in progress.",
-            )
-
-        timeout_s = float(recv_req.timeout_s or 0.0)
-        if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self.flush_cache())
-
-        if self.is_fully_idle():
-            return FlushCacheReqOutput(success=self.flush_cache())
-
-        self._pending_flush = (recv_req, time.monotonic() + timeout_s)
-        return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
