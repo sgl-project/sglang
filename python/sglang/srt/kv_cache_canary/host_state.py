@@ -12,6 +12,14 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+# Skip-sentinel value used by the expected_write_* launch buffers. A
+# write entry whose expected token or position is set to this value
+# tells the canary kernel to skip the pseudo-mode input cross-check for
+# that entry (no oracle prediction available, or the active count is
+# below capacity).
+_SKIP_SENTINEL: int = -1
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BatchPlan:
     """Per-forward layout the canary kernel consumes.
@@ -41,6 +49,13 @@ class BatchPlan:
     num_verify: int
     num_write: int
     num_write_reqs: int
+
+    # Pseudo-mode oracle predictions for the write entries. When set, the
+    # canary kernel cross-checks each write entry's actual input token /
+    # position against these expected values. None on non-pseudo callers;
+    # the kernel sees skip-sentinel (-1) fixed buffers and runs unchanged.
+    expected_write_token_ids: Optional[List[int]] = None
+    expected_write_positions: Optional[List[int]] = None
 
 
 def plan_batch_from_forward_batch(
@@ -461,6 +476,8 @@ class CanaryLaunchBuffers:
     write_slot_indices: torch.Tensor
     write_token_ids: torch.Tensor
     write_positions: torch.Tensor
+    expected_write_token_ids: torch.Tensor
+    expected_write_positions: torch.Tensor
     write_req_seed_slot_indices: torch.Tensor
     write_req_entry_starts: torch.Tensor
     write_req_entry_counts: torch.Tensor
@@ -491,6 +508,9 @@ class CanaryLaunchBuffers:
         def zeros_i32(n: int) -> torch.Tensor:
             return torch.zeros(n, dtype=torch.int32, device=device)
 
+        def full_i64(n: int, value: int) -> torch.Tensor:
+            return torch.full((n,), value, dtype=torch.int64, device=device)
+
         return cls(
             verify_capacity=int(verify_capacity),
             write_capacity=int(write_capacity),
@@ -502,6 +522,8 @@ class CanaryLaunchBuffers:
             write_slot_indices=zeros_i64(write_capacity),
             write_token_ids=zeros_i64(write_capacity),
             write_positions=zeros_i64(write_capacity),
+            expected_write_token_ids=full_i64(write_capacity, _SKIP_SENTINEL),
+            expected_write_positions=full_i64(write_capacity, _SKIP_SENTINEL),
             write_req_seed_slot_indices=zeros_i64(write_req_capacity),
             write_req_entry_starts=zeros_i64(write_req_capacity),
             write_req_entry_counts=zeros_i64(write_req_capacity),
@@ -578,6 +600,35 @@ class CanaryLaunchBuffers:
             self.write_token_ids[nw:].zero_()
             self.write_positions[nw:].zero_()
 
+        if plan.expected_write_token_ids is not None:
+            if len(plan.expected_write_token_ids) != plan.num_write:
+                raise RuntimeError(
+                    f"kv-canary: expected_write_token_ids length "
+                    f"{len(plan.expected_write_token_ids)} must equal num_write "
+                    f"{plan.num_write}"
+                )
+            if (
+                plan.expected_write_positions is None
+                or len(plan.expected_write_positions) != plan.num_write
+            ):
+                raise RuntimeError(
+                    "kv-canary: expected_write_positions must be set in lockstep "
+                    "with expected_write_token_ids and match num_write"
+                )
+            if nw > 0:
+                self.expected_write_token_ids[:nw].copy_(
+                    to_i64(plan.expected_write_token_ids, slice(0, nw))
+                )
+                self.expected_write_positions[:nw].copy_(
+                    to_i64(plan.expected_write_positions, slice(0, nw))
+                )
+            if nw < self.write_capacity:
+                self.expected_write_token_ids[nw:].fill_(_SKIP_SENTINEL)
+                self.expected_write_positions[nw:].fill_(_SKIP_SENTINEL)
+        else:
+            self.expected_write_token_ids.fill_(_SKIP_SENTINEL)
+            self.expected_write_positions.fill_(_SKIP_SENTINEL)
+
         nwr = plan.num_write_reqs
         if nwr > 0:
             self.write_req_seed_slot_indices[:nwr].copy_(
@@ -602,3 +653,5 @@ class CanaryLaunchBuffers:
         """
         self.verify_active_mask.zero_()
         self.write_req_active_mask.zero_()
+        self.expected_write_token_ids.fill_(_SKIP_SENTINEL)
+        self.expected_write_positions.fill_(_SKIP_SENTINEL)
