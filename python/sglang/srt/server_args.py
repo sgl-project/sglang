@@ -701,6 +701,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False
+    lm_head_tp_size: int = 1
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
@@ -3071,6 +3072,9 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+            assert (
+                self.lm_head_tp_size == 1
+            ), "lm_head DP and lm_head TP cannot be enabled at the same time."
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -6173,6 +6177,12 @@ class ServerArgs:
             "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--lm-head-tp-size",
+            type=int,
+            default=1,
+            help="Configurable lm_head tp_size, supporting integers from 1 (default value) to world_size that are divisors of world_size",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",

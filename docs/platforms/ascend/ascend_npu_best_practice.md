@@ -157,13 +157,12 @@ do
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export TASK_QUEUE_ENABLE=1
         export SGLANG_NPU_FUSED_MOE_MODE=1
-        export SGLANG_LM_HEAD_TP=8
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
         --port 8001 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 \
         --mem-fraction-static 0.82 --max-running-requests 1024 --attention-backend ascend --device npu --quantization modelslim \
-        --moe-a2a-backend ascend_fuseep --enable-dp-attention --deepep-mode low_latency --moe-dense-tp 1 \
+        --moe-a2a-backend ascend_fuseep --enable-dp-attention --deepep-mode low_latency --moe-dense-tp 1 --lm-head-tp-size 8 \
         --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
         --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
