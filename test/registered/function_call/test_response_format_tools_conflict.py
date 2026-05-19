@@ -1,10 +1,12 @@
 """
-Unit tests for the validation guard that rejects the combination of
-response_format (json_schema / json_object) with active tool calling.
+Unit tests for the validation guard that rejects any output-constraint
+parameter combined with active tool calling.
 
-When both are present, the grammar constraint applied by response_format
-prevents the model from emitting tool-call tokens, so tool_calls is
-silently always null.  SGLang now returns a 400-level error instead.
+Any grammar constraint (response_format with json_schema / json_object /
+structural_tag, or the SGLang-specific 'regex' / 'ebnf' fields) forces the
+model to produce a specific shape and prevents it from emitting tool-call
+tokens.  tool_calls is then silently null.  SGLang now returns a 400-level
+error for all such combinations.
 
 These tests exercise _validate_request() directly without a live server.
 """
@@ -106,7 +108,6 @@ def _make_serving():
     serving._validate_request = OpenAIServingChat._validate_request.__get__(
         serving, OpenAIServingChat
     )
-    # _validate_request uses server_args.context_length and allow_auto_truncate
     serving.tokenizer_manager = MagicMock()
     serving.tokenizer_manager.server_args.context_length = None
     serving.tokenizer_manager.server_args.allow_auto_truncate = False
@@ -114,7 +115,7 @@ def _make_serving():
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests — response_format conflicts
 # ---------------------------------------------------------------------------
 
 
@@ -124,10 +125,10 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
     def setUp(self):
         self.serving = _make_serving()
 
-    # -- Conflict cases (should return an error string) ----------------------
+    # -- json_schema conflict cases ------------------------------------------
 
     def test_json_schema_with_tool_choice_auto_returns_error(self):
-        """The reproducer from the bug report: json_schema + tools + auto."""
+        """The reproducer from the original bug report."""
         req = _make_request(
             tools=_make_tools(),
             tool_choice="auto",
@@ -162,6 +163,8 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         err = self.serving._validate_request(req)
         self.assertIsNotNone(err)
 
+    # -- json_object conflict cases ------------------------------------------
+
     def test_json_object_with_tool_choice_auto_returns_error(self):
         req = _make_request(
             tools=_make_tools(),
@@ -181,10 +184,32 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         err = self.serving._validate_request(req)
         self.assertIsNotNone(err)
 
+    # -- structural_tag conflict cases ---------------------------------------
+
+    def test_structural_tag_with_tool_choice_auto_returns_error(self):
+        """structural_tag response_format with active tool calling is rejected."""
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="auto",
+            response_format=ResponseFormat(type="structural_tag"),
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+        self.assertIn("structural_tag", err)
+
+    def test_structural_tag_with_tool_choice_required_returns_error(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="required",
+            response_format=ResponseFormat(type="structural_tag"),
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+
     # -- Allowed cases (should return None) ----------------------------------
 
     def test_json_schema_with_tool_choice_none_is_allowed(self):
-        """tool_choice=none means the model will not call tools → no conflict."""
+        """tool_choice=none means the model will not call tools — no conflict."""
         req = _make_request(
             tools=_make_tools(),
             tool_choice="none",
@@ -202,8 +227,17 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         err = self.serving._validate_request(req)
         self.assertIsNone(err)
 
+    def test_structural_tag_with_tool_choice_none_is_allowed(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="none",
+            response_format=ResponseFormat(type="structural_tag"),
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNone(err)
+
     def test_no_response_format_with_tools_and_auto_is_allowed(self):
-        """Plain tool calling without response_format is the normal happy path."""
+        """Plain tool calling without any constraint is the normal happy path."""
         req = _make_request(tools=_make_tools(), tool_choice="auto")
         err = self.serving._validate_request(req)
         self.assertIsNone(err)
@@ -230,7 +264,7 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         self.assertIsNone(err)
 
     def test_json_schema_missing_schema_field_is_caught_first(self):
-        """The existing schema_ validation fires before our new check."""
+        """The existing schema_ validation fires before the conflict check."""
         bad_format = ResponseFormat(type="json_schema", json_schema=None)
         req = _make_request(
             tools=_make_tools(),
@@ -239,8 +273,89 @@ class TestResponseFormatToolsConflict(unittest.TestCase):
         )
         err = self.serving._validate_request(req)
         self.assertIsNotNone(err)
-        # Could be either error; important is that we don't crash
         self.assertIsInstance(err, str)
+
+
+# ---------------------------------------------------------------------------
+# Tests — regex / ebnf conflicts
+# ---------------------------------------------------------------------------
+
+
+class TestRegexEbnfToolsConflict(unittest.TestCase):
+    """Validate that regex/ebnf + active tool_choice is rejected."""
+
+    def setUp(self):
+        self.serving = _make_serving()
+
+    # -- Conflict cases ------------------------------------------------------
+
+    def test_regex_with_tool_choice_auto_returns_error(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="auto",
+            regex=r"\d+",
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+        self.assertIn("regex", err)
+
+    def test_regex_with_tool_choice_required_returns_error(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="required",
+            regex=r"\d+",
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+
+    def test_ebnf_with_tool_choice_auto_returns_error(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="auto",
+            ebnf='root ::= "yes" | "no"',
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+        self.assertIn("ebnf", err)
+
+    def test_ebnf_with_tool_choice_required_returns_error(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="required",
+            ebnf='root ::= "yes" | "no"',
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNotNone(err)
+
+    # -- Allowed cases -------------------------------------------------------
+
+    def test_regex_with_tool_choice_none_is_allowed(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="none",
+            regex=r"\d+",
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNone(err)
+
+    def test_ebnf_with_tool_choice_none_is_allowed(self):
+        req = _make_request(
+            tools=_make_tools(),
+            tool_choice="none",
+            ebnf='root ::= "yes" | "no"',
+        )
+        err = self.serving._validate_request(req)
+        self.assertIsNone(err)
+
+    def test_regex_without_tools_is_allowed(self):
+        req = _make_request(regex=r"\d+")
+        err = self.serving._validate_request(req)
+        self.assertIsNone(err)
+
+    def test_ebnf_without_tools_is_allowed(self):
+        req = _make_request(ebnf='root ::= "yes" | "no"')
+        err = self.serving._validate_request(req)
+        self.assertIsNone(err)
 
 
 if __name__ == "__main__":
