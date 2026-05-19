@@ -44,7 +44,6 @@ _LOG_RATE_LIMIT_SECONDS: float = 5.0
 
 _FAIL_REASON_DESCRIPTIONS: Dict[int, str] = {
     int(FailReason.NONE): "no failure",
-    int(FailReason.REQ_ID): "slot's stored req_id does not match the verifying req",
     int(FailReason.TOKEN_ID): "slot's stored token_id does not match the write entry",
     int(FailReason.POSITION): "slot's stored position does not match the write entry",
     int(FailReason.HASH): "slot's chain hash diverged from splitmix64 recomputation",
@@ -557,12 +556,10 @@ class CanaryRunner:
             kernel_kind,
             fail_reason,
             slot_idx,
-            req_id,
             token_id,
             position,
             expected_hash,
             actual_hash,
-            expected_req_id,
             expected_position,
         ) = first_violation
         u64_mask = (1 << 64) - 1
@@ -578,7 +575,6 @@ class CanaryRunner:
             f"  kernel_kind:       {kernel_label}",
             f"  fail_reason:       {reason_name} ({_fail_reason_description(int(fail_reason))})",
             f"  slot_idx:          {int(slot_idx)}",
-            f"  req_id:            expected={int(expected_req_id)} actual={int(req_id)}",
             f"  position:          expected={int(expected_position)} actual={int(position)}",
             f"  actual token_id:   {int(token_id)}",
         ]

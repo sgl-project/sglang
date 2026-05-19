@@ -70,13 +70,11 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
-        verify_req_ids=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_prev_slot_indices=torch.full((1,), -1, dtype=torch.int64, device="cuda"),
         verify_active_mask=torch.zeros(1, dtype=torch.int32, device="cuda"),
         write_slot_indices=torch.tensor(slot_indices, dtype=torch.int64, device="cuda"),
         write_token_ids=torch.tensor(tokens, dtype=torch.int64, device="cuda"),
         write_positions=torch.tensor(positions, dtype=torch.int64, device="cuda"),
-        write_req_ids=torch.full((n,), 1, dtype=torch.int64, device="cuda"),
         write_req_seed_slot_indices=torch.full(
             (1,), -1, dtype=torch.int64, device="cuda"
         ),

@@ -2,9 +2,8 @@
 
 Cover the stateless-redesign kernel signature: per-verify-entry arrays,
 per-write-req chains driven by one thread each, on-device splitmix64 chain
-hash recomputation, three independent verify fail_reasons (req_id /
-position monotonic / chain hash), and the violation buffer first-violation
-latch.
+hash recomputation, verify fail_reasons (position monotonic / chain hash /
+real-KV hash), and the violation buffer first-violation latch.
 """
 
 from __future__ import annotations
@@ -72,13 +71,11 @@ def _run(
     slot_stride_bytes: int,
     verify_slot_indices: list[int],
     verify_positions: list[int],
-    verify_req_ids: list[int],
     verify_prev_slot_indices: list[int],
     verify_active_mask: list[int],
     write_slot_indices: list[int],
     write_token_ids: list[int],
     write_positions: list[int],
-    write_req_ids: list[int],
     write_req_seed_slot_indices: list[int],
     write_req_entry_starts: list[int],
     write_req_entry_counts: list[int],
@@ -97,13 +94,11 @@ def _run(
         slot_stride_bytes=slot_stride_bytes,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
-        verify_req_ids=_i64(verify_req_ids or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
         verify_active_mask=_i32(verify_active_mask or [0]),
         write_slot_indices=_i64(write_slot_indices or [0]),
         write_token_ids=_i64(write_token_ids or [0]),
         write_positions=_i64(write_positions or [0]),
-        write_req_ids=_i64(write_req_ids or [0]),
         write_req_seed_slot_indices=_i64(write_req_seed_slot_indices or [-1]),
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
@@ -128,14 +123,14 @@ def _run(
 
 def _read_slot(
     buf: torch.Tensor, slot_idx: int, slot_stride_bytes: int
-) -> tuple[int, int, int, int, int]:
-    """Return ``(req_id, token_id, position, prev_hash, real_kv_hash)``."""
+) -> tuple[int, int, int, int]:
+    """Return ``(token_id, position, prev_hash, real_kv_hash)``."""
     row = buf[slot_idx, :CANARY_SLOT_BYTES].clone().view(torch.int64).cpu().tolist()
     return tuple(int(x) for x in row)
 
 
 def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
-    """First-write path: chain seeds from kSeed and stores (req, token, pos, prev_hash)."""
+    """First-write path: chain seeds from kSeed and stores (token, pos, prev_hash, real_kv_hash)."""
     slot_stride = 256
     dst = _alloc_pool(8, slot_stride)
     state = _alloc_state()
@@ -143,7 +138,6 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
     tokens = [10, 20, 30]
     positions = [0, 1, 2]
     slot_indices = [4, 5, 6]
-    req_id = 7
 
     _run(
         src=dst,
@@ -151,13 +145,11 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=slot_indices,
         write_token_ids=tokens,
         write_positions=positions,
-        write_req_ids=[req_id] * 3,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
@@ -171,8 +163,7 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
     # Recompute the expected chain in Python and bit-wise-match the stored prev_hash.
     expected_prev = _SEED
     for slot_idx, token, position in zip(slot_indices, tokens, positions):
-        rid, tid, pos, ph, real_kv_hash = _read_slot(dst, slot_idx, slot_stride)
-        assert rid == req_id
+        tid, pos, ph, real_kv_hash = _read_slot(dst, slot_idx, slot_stride)
         assert tid == token
         assert pos == position
         assert ph == to_signed_int64(expected_prev)
@@ -190,7 +181,6 @@ def test_verify_clean_round_trip_no_violation():
     tokens = [100, 200, 300]
     positions = [0, 1, 2]
     slot_indices = [0, 1, 2]
-    req_id = 11
 
     # Phase 1: write the chain.
     _run(
@@ -199,13 +189,11 @@ def test_verify_clean_round_trip_no_violation():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=slot_indices,
         write_token_ids=tokens,
         write_positions=positions,
-        write_req_ids=[req_id] * 3,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
@@ -222,13 +210,11 @@ def test_verify_clean_round_trip_no_violation():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=slot_indices,
         verify_positions=positions,
-        verify_req_ids=[req_id] * 3,
         verify_prev_slot_indices=[-1, slot_indices[0], slot_indices[1]],
         verify_active_mask=[1, 1, 1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
-        write_req_ids=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
@@ -238,59 +224,6 @@ def test_verify_clean_round_trip_no_violation():
     )
     assert int(state["is_errored"].item()) == 0
     assert int(state["first_violation_set"].item()) == 0
-
-
-def test_verify_req_id_mismatch_reports_req_id_fail_reason():
-    slot_stride = 128
-    buf = _alloc_pool(4, slot_stride)
-    state = _alloc_state()
-
-    _run(
-        src=buf,
-        dst=buf,
-        slot_stride_bytes=slot_stride,
-        verify_slot_indices=[],
-        verify_positions=[],
-        verify_req_ids=[],
-        verify_prev_slot_indices=[],
-        verify_active_mask=[],
-        write_slot_indices=[0],
-        write_token_ids=[42],
-        write_positions=[0],
-        write_req_ids=[5],
-        write_req_seed_slot_indices=[-1],
-        write_req_entry_starts=[0],
-        write_req_entry_counts=[1],
-        write_req_active_mask=[1],
-        state=state,
-        kernel_kind=KERNEL_KIND_HEAD,
-    )
-
-    # Verify expecting a different req_id — should trip kFailReasonReqId.
-    _run(
-        src=buf,
-        dst=buf,
-        slot_stride_bytes=slot_stride,
-        verify_slot_indices=[0],
-        verify_positions=[0],
-        verify_req_ids=[99],
-        verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
-        write_slot_indices=[],
-        write_token_ids=[],
-        write_positions=[],
-        write_req_ids=[],
-        write_req_seed_slot_indices=[],
-        write_req_entry_starts=[],
-        write_req_entry_counts=[],
-        write_req_active_mask=[],
-        state=state,
-        kernel_kind=KERNEL_KIND_TAIL,
-    )
-
-    assert int(state["is_errored"].item()) == 1
-    first = state["first_violation"].cpu().tolist()
-    assert int(first[1]) == FailReason.REQ_ID.value
 
 
 def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
@@ -304,13 +237,11 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=[0],
         write_token_ids=[42],
         write_positions=[0],
-        write_req_ids=[1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
@@ -327,13 +258,11 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[5],
-        verify_req_ids=[1],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
-        write_req_ids=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
@@ -359,13 +288,11 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=[0],
         write_token_ids=[42],
         write_positions=[0],
-        write_req_ids=[1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
@@ -374,9 +301,9 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    # Corrupt slot[0].prev_hash field (offset 24 bytes = field index 3).
+    # Corrupt slot[0].prev_hash field (offset 16 bytes = field index 2).
     buf_view = buf.view(torch.int64)
-    buf_view[0, 3] = torch.tensor(
+    buf_view[0, 2] = torch.tensor(
         to_signed_int64(0xDEADBEEFDEADBEEF), dtype=torch.int64, device="cuda"
     )
 
@@ -386,13 +313,11 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
-        verify_req_ids=[1],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
-        write_req_ids=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
@@ -418,13 +343,11 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
-        verify_req_ids=[1, 1],
         verify_prev_slot_indices=[-1, 0],
         verify_active_mask=[0, 0],
         write_slot_indices=[0, 1, 2],
         write_token_ids=[10, 20, 30],
         write_positions=[0, 1, 2],
-        write_req_ids=[1, 1, 1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
@@ -472,13 +395,11 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
         verify_positions=[0],
-        verify_req_ids=[0],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[0],
         write_slot_indices=[0],
         write_token_ids=[0],
         write_positions=[0],
-        write_req_ids=[0],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[0],
@@ -503,13 +424,11 @@ def test_first_violation_preserved_across_cascading_mismatches():
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=[0, 1, 2, 3],
         write_token_ids=[10, 20, 30, 40],
         write_positions=[0, 1, 2, 3],
-        write_req_ids=[1] * 4,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[4],
@@ -518,20 +437,18 @@ def test_first_violation_preserved_across_cascading_mismatches():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    # First mismatch: req_id mismatch at slot 0.
+    # First mismatch: position mismatch at slot 0 (stored=0, expected=7).
     _run(
         src=buf,
         dst=buf,
         slot_stride_bytes=slot_stride,
         verify_slot_indices=[0],
-        verify_positions=[0],
-        verify_req_ids=[999],
+        verify_positions=[7],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
-        write_req_ids=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
@@ -541,21 +458,19 @@ def test_first_violation_preserved_across_cascading_mismatches():
     )
     first_after_initial = state["first_violation"].cpu().tolist()
 
-    # Cascade: 20 more verify launches with wrong req_id.
+    # Cascade: 20 more verify launches with wrong positions on slots 1..3.
     for _ in range(20):
         _run(
             src=buf,
             dst=buf,
             slot_stride_bytes=slot_stride,
             verify_slot_indices=[1, 2, 3],
-            verify_positions=[1, 2, 3],
-            verify_req_ids=[888, 888, 888],
+            verify_positions=[99, 98, 97],
             verify_prev_slot_indices=[0, 1, 2],
             verify_active_mask=[1, 1, 1],
             write_slot_indices=[],
             write_token_ids=[],
             write_positions=[],
-            write_req_ids=[],
             write_req_seed_slot_indices=[],
             write_req_entry_starts=[],
             write_req_entry_counts=[],
@@ -635,7 +550,6 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
     return dict(
         verify_slot_indices=_i64_on(plan_lists["verify_slot_indices"], device),
         verify_positions=_i64_on(plan_lists["verify_positions"], device),
-        verify_req_ids=_i64_on(plan_lists["verify_req_ids"], device),
         verify_prev_slot_indices=_i64_on(
             plan_lists["verify_prev_slot_indices"], device
         ),
@@ -643,7 +557,6 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
         write_slot_indices=_i64_on(plan_lists["write_slot_indices"], device),
         write_token_ids=_i64_on(plan_lists["write_token_ids"], device),
         write_positions=_i64_on(plan_lists["write_positions"], device),
-        write_req_ids=_i64_on(plan_lists["write_req_ids"], device),
         write_req_seed_slot_indices=_i64_on(
             plan_lists["write_req_seed_slot_indices"] or [-1], device
         ),
@@ -753,13 +666,11 @@ def _empty_plan_lists() -> dict:
     return dict(
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
-        write_req_ids=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
@@ -773,7 +684,6 @@ def _scenario_write_only_single_req() -> dict:
         write_slot_indices=[0, 1, 2],
         write_token_ids=[101, 202, 303],
         write_positions=[0, 1, 2],
-        write_req_ids=[7, 7, 7],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
@@ -797,7 +707,6 @@ def _scenario_write_only_multi_req() -> dict:
         write_slot_indices=[0, 1, 2, 3],
         write_token_ids=[10, 20, 30, 40],
         write_positions=[0, 1, 0, 1],
-        write_req_ids=[5, 5, 9, 9],
         write_req_seed_slot_indices=[-1, -1],
         write_req_entry_starts=[0, 2],
         write_req_entry_counts=[2, 2],
@@ -818,7 +727,6 @@ def _scenario_verify_only_clean_chain() -> dict:
     plan.update(
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
-        verify_req_ids=[4, 4, 4],
         verify_prev_slot_indices=[-1, 0, 1],
         verify_active_mask=[1, 1, 1],
     )
@@ -831,34 +739,8 @@ def _scenario_verify_only_clean_chain() -> dict:
             slots=[0, 1, 2],
             tokens=[11, 22, 33],
             positions=[0, 1, 2],
-            req_id=4,
         ),
         plan=plan,
-    )
-
-
-def _scenario_verify_only_req_id_mismatch() -> dict:
-    plan = _empty_plan_lists()
-    plan.update(
-        verify_slot_indices=[0],
-        verify_positions=[0],
-        verify_req_ids=[99],  # mismatch: slot stored req_id=5
-        verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
-    )
-    return dict(
-        slot_stride=CANARY_SLOT_BYTES,
-        num_slots=4,
-        ring_capacity=4,
-        kernel_kind=KERNEL_KIND_TAIL,
-        prefill_writes=dict(
-            slots=[0],
-            tokens=[42],
-            positions=[0],
-            req_id=5,
-        ),
-        plan=plan,
-        expected_fail_reason=FailReason.REQ_ID,
     )
 
 
@@ -867,7 +749,6 @@ def _scenario_verify_only_position_mismatch() -> dict:
     plan.update(
         verify_slot_indices=[0],
         verify_positions=[5],  # mismatch: slot stored position=0
-        verify_req_ids=[1],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
     )
@@ -880,7 +761,6 @@ def _scenario_verify_only_position_mismatch() -> dict:
             slots=[0],
             tokens=[42],
             positions=[0],
-            req_id=1,
         ),
         plan=plan,
         expected_fail_reason=FailReason.POSITION_MONOTONIC,
@@ -892,7 +772,6 @@ def _scenario_verify_only_hash_mismatch() -> dict:
     plan.update(
         verify_slot_indices=[0],
         verify_positions=[0],
-        verify_req_ids=[1],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
     )
@@ -905,7 +784,6 @@ def _scenario_verify_only_hash_mismatch() -> dict:
             slots=[0],
             tokens=[42],
             positions=[0],
-            req_id=1,
         ),
         # Post-prefill we corrupt slot[0].prev_hash; verify should fire HASH.
         corrupt_prev_hash=dict(slot=0, value=0xDEADBEEFDEADBEEF),
@@ -921,13 +799,11 @@ def _scenario_mixed_write_and_verify() -> dict:
     plan.update(
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
-        verify_req_ids=[3, 3],
         verify_prev_slot_indices=[-1, 0],
         verify_active_mask=[1, 1],
         write_slot_indices=[2, 3],
         write_token_ids=[81, 82],
         write_positions=[2, 3],
-        write_req_ids=[3, 3],
         write_req_seed_slot_indices=[1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[2],
@@ -942,21 +818,19 @@ def _scenario_mixed_write_and_verify() -> dict:
             slots=[0, 1],
             tokens=[71, 72],
             positions=[0, 1],
-            req_id=3,
         ),
         plan=plan,
     )
 
 
 def _scenario_first_violation_latch_preserved() -> dict:
-    # Two verify entries on the same req; the first hits a REQ_ID mismatch,
-    # the second hits POSITION mismatch. The first-violation latch must
-    # preserve the REQ_ID row.
+    # Two verify entries on the same req, both hit POSITION mismatch (stored
+    # positions are 0/1, expected are 888/999). The first-violation latch
+    # must preserve entry 0's row across the cascade.
     plan = _empty_plan_lists()
     plan.update(
         verify_slot_indices=[0, 1],
-        verify_positions=[0, 999],
-        verify_req_ids=[42, 3],  # entry 0: REQ_ID mismatch wins latch.
+        verify_positions=[888, 999],
         verify_prev_slot_indices=[-1, 0],
         verify_active_mask=[1, 1],
     )
@@ -969,7 +843,6 @@ def _scenario_first_violation_latch_preserved() -> dict:
             slots=[0, 1],
             tokens=[71, 72],
             positions=[0, 1],
-            req_id=3,
         ),
         plan=plan,
     )
@@ -981,7 +854,6 @@ def _scenario_small_k_req() -> dict:
         write_slot_indices=[0],
         write_token_ids=[7],
         write_positions=[0],
-        write_req_ids=[1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
@@ -1011,7 +883,6 @@ def _scenario_large_k_req_1w() -> dict:
     plan.update(
         verify_slot_indices=verify_slots,
         verify_positions=positions,
-        verify_req_ids=[2] * n,
         verify_prev_slot_indices=verify_prev,
         verify_active_mask=[1] * n,
     )
@@ -1024,7 +895,6 @@ def _scenario_large_k_req_1w() -> dict:
             slots=write_slots,
             tokens=tokens,
             positions=positions,
-            req_id=2,
         ),
         plan=plan,
     )
@@ -1038,7 +908,6 @@ def _scenario_ring_buffer_small_capacity() -> dict:
     plan.update(
         verify_slot_indices=[0],
         verify_positions=[0],
-        verify_req_ids=[7],
         verify_prev_slot_indices=[-1],
         verify_active_mask=[1],
     )
@@ -1051,7 +920,6 @@ def _scenario_ring_buffer_small_capacity() -> dict:
             slots=[0],
             tokens=[42],
             positions=[0],
-            req_id=5,
         ),
         plan=plan,
     )
@@ -1070,13 +938,11 @@ def _scenario_real_kv_hash_clean_chain(*, mode_int: int, read_bytes: int) -> dic
     plan.update(
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
-        verify_req_ids=[3, 3, 3],
         verify_prev_slot_indices=[-1, 0, 1],
         verify_active_mask=[1, 1, 1],
         write_slot_indices=[0, 1, 2],
         write_token_ids=[101, 202, 303],
         write_positions=[0, 1, 2],
-        write_req_ids=[3, 3, 3],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
@@ -1123,7 +989,6 @@ def _scenario_real_kv_hash_corruption_caught() -> dict:
     plan.update(
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
-        verify_req_ids=[3, 3, 3],
         verify_prev_slot_indices=[-1, 0, 1],
         verify_active_mask=[1, 1, 1],
     )
@@ -1136,7 +1001,6 @@ def _scenario_real_kv_hash_corruption_caught() -> dict:
             slots=[0, 1, 2],
             tokens=[101, 202, 303],
             positions=[0, 1, 2],
-            req_id=3,
         ),
         plan=plan,
         real_kv=dict(
@@ -1161,13 +1025,11 @@ def _scenario_inactive_mask_skipped() -> dict:
     plan.update(
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
-        verify_req_ids=[1, 1],
         verify_prev_slot_indices=[-1, 0],
         verify_active_mask=[0, 0],
         write_slot_indices=[0, 1],
         write_token_ids=[10, 20],
         write_positions=[0, 1],
-        write_req_ids=[1, 1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[2],
@@ -1187,7 +1049,6 @@ _DIFFERENTIAL_SCENARIOS = {
     "write_only_single_req": _scenario_write_only_single_req,
     "write_only_multi_req": _scenario_write_only_multi_req,
     "verify_only_clean_chain": _scenario_verify_only_clean_chain,
-    "verify_only_req_id_mismatch": _scenario_verify_only_req_id_mismatch,
     "verify_only_position_mismatch": _scenario_verify_only_position_mismatch,
     "verify_only_hash_mismatch": _scenario_verify_only_hash_mismatch,
     "mixed_write_and_verify": _scenario_mixed_write_and_verify,
@@ -1212,7 +1073,6 @@ def _prefill_buffer_with_chain(
     slots: list[int],
     tokens: list[int],
     positions: list[int],
-    req_id: int,
     slot_stride: int,
     real_kv_buf: torch.Tensor | None = None,
     real_kv_slot_stride_bytes: int = 0,
@@ -1232,13 +1092,11 @@ def _prefill_buffer_with_chain(
         buf.device.type,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         verify_active_mask=[],
         write_slot_indices=slots,
         write_token_ids=tokens,
         write_positions=positions,
-        write_req_ids=[req_id] * n,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[n],
@@ -1319,7 +1177,6 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
             slots=prefill["slots"],
             tokens=prefill["tokens"],
             positions=prefill["positions"],
-            req_id=prefill["req_id"],
             slot_stride=slot_stride,
             real_kv_buf=real_kv_buf_cuda,
             real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
@@ -1330,7 +1187,7 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
         slot_idx = int(corrupt["slot"])
         value = to_signed_int64(int(corrupt["value"]) & ((1 << 64) - 1))
         src_view = src_initial.view(torch.int64).view(num_slots, slot_stride // 8)
-        src_view[slot_idx, 3] = value
+        src_view[slot_idx, 2] = value
 
     state_cuda = _alloc_diff_state(
         num_slots=num_slots,

@@ -27,7 +27,6 @@ from sglang.jit_kernel.kv_cache_canary import (
     _CANARY_FIELD_POSITION,
     _CANARY_FIELD_PREV_HASH,
     _CANARY_FIELD_REAL_KV_HASH,
-    _CANARY_FIELD_REQ_ID,
     _CANARY_FIELD_TOKEN_ID,
     REAL_KV_HASH_MODE_OFF,
     FailReason,
@@ -70,13 +69,11 @@ def canary_step_torch_reference(
     slot_stride_bytes: int,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
-    verify_req_ids: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
     verify_active_mask: torch.Tensor,
     write_slot_indices: torch.Tensor,
     write_token_ids: torch.Tensor,
     write_positions: torch.Tensor,
-    write_req_ids: torch.Tensor,
     write_req_seed_slot_indices: torch.Tensor,
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
@@ -108,15 +105,15 @@ def canary_step_torch_reference(
 
     - **Write path**: for every active write-req row, walk the splitmix64
       chain over ``[entry_starts, entry_starts + entry_counts)`` and
-      store ``(req_id, token_id, position, prev_hash)`` per slot. Chain
-      head is either ``seed`` (when ``seed_slot < 0``) or
+      store ``(token_id, position, prev_hash, real_kv_hash)`` per slot.
+      Chain head is either ``seed`` (when ``seed_slot < 0``) or
       ``splitmix64_mix`` of the seed slot's stored
       ``(prev_hash, token, position)``.
     - **Verify path**: for every active verify entry, load the slot's
       stored fields plus the previous slot's fields, recompute
-      ``expected_prev_hash`` via ``splitmix64_mix``, and compare three
-      fail reasons in the same priority order as the kernel: ``REQ_ID`` >
-      ``POSITION_MONOTONIC`` > ``HASH``.
+      ``expected_prev_hash`` via ``splitmix64_mix``, and compare fail
+      reasons in the same priority order as the kernel:
+      ``POSITION_MONOTONIC`` > ``HASH`` > ``REAL_KV_HASH``.
     - **Violation ring + first-violation latch**: ``first_violation`` is
       latched once per launch (CAS-style); ring rows fill sequentially
       until capacity. The CUDA kernel uses atomic CAS, so multiple
@@ -146,13 +143,11 @@ def canary_step_torch_reference(
     plan = _RefPlan.from_tensors(
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
-        verify_req_ids=verify_req_ids,
         verify_prev_slot_indices=verify_prev_slot_indices,
         verify_active_mask=verify_active_mask,
         write_slot_indices=write_slot_indices,
         write_token_ids=write_token_ids,
         write_positions=write_positions,
-        write_req_ids=write_req_ids,
         write_req_seed_slot_indices=write_req_seed_slot_indices,
         write_req_entry_starts=write_req_entry_starts,
         write_req_entry_counts=write_req_entry_counts,
@@ -292,13 +287,11 @@ class _RefPlan:
         *,
         verify_slot_indices: list,
         verify_positions: list,
-        verify_req_ids: list,
         verify_prev_slot_indices: list,
         verify_active_mask: list,
         write_slot_indices: list,
         write_token_ids: list,
         write_positions: list,
-        write_req_ids: list,
         write_req_seed_slot_indices: list,
         write_req_entry_starts: list,
         write_req_entry_counts: list,
@@ -306,13 +299,11 @@ class _RefPlan:
     ) -> None:
         self.verify_slot_indices = verify_slot_indices
         self.verify_positions = verify_positions
-        self.verify_req_ids = verify_req_ids
         self.verify_prev_slot_indices = verify_prev_slot_indices
         self.verify_active_mask = verify_active_mask
         self.write_slot_indices = write_slot_indices
         self.write_token_ids = write_token_ids
         self.write_positions = write_positions
-        self.write_req_ids = write_req_ids
         self.write_req_seed_slot_indices = write_req_seed_slot_indices
         self.write_req_entry_starts = write_req_entry_starts
         self.write_req_entry_counts = write_req_entry_counts
@@ -361,24 +352,20 @@ class _RefViolationSink:
         *,
         fail_reason: int,
         slot_idx: int,
-        req_id: int,
         token_id: int,
         position: int,
         expected_hash: int,
         actual_hash: int,
-        expected_req_id: int,
         expected_position: int,
     ) -> None:
         entry = [
             self._kernel_kind,
             int(fail_reason),
             int(slot_idx),
-            int(req_id),
             int(token_id),
             int(position),
             to_signed_int64(expected_hash & _U64_MASK),
             to_signed_int64(actual_hash & _U64_MASK),
-            int(expected_req_id),
             int(expected_position),
         ]
 
@@ -427,11 +414,9 @@ def _run_verify_entries(
             continue
         active += 1
         slot_idx = int(plan.verify_slot_indices[tid])
-        expected_req_id = int(plan.verify_req_ids[tid])
         expected_position = int(plan.verify_positions[tid])
         prev_slot_idx = int(plan.verify_prev_slot_indices[tid])
 
-        actual_req_id = int_views.load_field(slot_idx, _CANARY_FIELD_REQ_ID)
         actual_token_id = int_views.load_field(slot_idx, _CANARY_FIELD_TOKEN_ID)
         actual_position = int_views.load_field(slot_idx, _CANARY_FIELD_POSITION)
         actual_prev_hash = (
@@ -456,9 +441,7 @@ def _run_verify_entries(
         expected_real_kv_hash = real_kv_view.hash_slot(slot_idx)
 
         fail_reason = FailReason.NONE
-        if actual_req_id != expected_req_id:
-            fail_reason = FailReason.REQ_ID
-        elif actual_position != expected_position:
+        if actual_position != expected_position:
             fail_reason = FailReason.POSITION_MONOTONIC
         elif actual_prev_hash != expected_prev_hash:
             fail_reason = FailReason.HASH
@@ -474,12 +457,10 @@ def _run_verify_entries(
             sink.record(
                 fail_reason=int(fail_reason),
                 slot_idx=slot_idx,
-                req_id=actual_req_id,
                 token_id=actual_token_id,
                 position=actual_position,
                 expected_hash=expected_hash_field,
                 actual_hash=actual_hash_field,
-                expected_req_id=expected_req_id,
                 expected_position=expected_position,
             )
 
@@ -522,12 +503,10 @@ def _run_write_chains(
         for k in range(entry_count):
             i = entry_start + k
             slot_idx = int(plan.write_slot_indices[i])
-            req_id = int(plan.write_req_ids[i])
             token_id = int(plan.write_token_ids[i])
             position = int(plan.write_positions[i])
             real_kv_hash = real_kv_view.hash_slot(slot_idx)
 
-            int_views.store_field(slot_idx, _CANARY_FIELD_REQ_ID, req_id)
             int_views.store_field(slot_idx, _CANARY_FIELD_TOKEN_ID, token_id)
             int_views.store_field(slot_idx, _CANARY_FIELD_POSITION, position)
             int_views.store_field(slot_idx, _CANARY_FIELD_PREV_HASH, prev_hash)

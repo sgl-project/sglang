@@ -11,22 +11,21 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-VIOLATION_FIELDS: int = 10
-CANARY_FIELDS_PER_SLOT: int = 5
+VIOLATION_FIELDS: int = 8
+CANARY_FIELDS_PER_SLOT: int = 4
 CANARY_SLOT_BYTES: int = CANARY_FIELDS_PER_SLOT * 8
 
 # Slot field offsets (in 8-byte words). Mirrors the kCanaryField* constants
 # in ``canary.cuh``.
-_CANARY_FIELD_REQ_ID: int = 0
-_CANARY_FIELD_TOKEN_ID: int = 1
-_CANARY_FIELD_POSITION: int = 2
-_CANARY_FIELD_PREV_HASH: int = 3
+_CANARY_FIELD_TOKEN_ID: int = 0
+_CANARY_FIELD_POSITION: int = 1
+_CANARY_FIELD_PREV_HASH: int = 2
 # real_kv_hash: splitmix64 mix of a few bytes of the real KV pool's slot
 # data captured at write time. Verified by reading the same bytes again
 # at verify time; mismatch implies the real KV slot changed underneath
 # the canary (the attn-kernel-config / PD-transfer corruption modes
 # canary-with-real-data is designed to catch).
-_CANARY_FIELD_REAL_KV_HASH: int = 4
+_CANARY_FIELD_REAL_KV_HASH: int = 3
 
 # Modes for ``--kv-cache-canary-real-data``. ``OFF`` disables the
 # real-KV mix entirely (the real_kv_hash field stays zero); ``BIT`` mixes
@@ -41,13 +40,11 @@ REAL_KV_HASH_BIT_BYTES: int = 16
 _VIOLATION_FIELD_KERNEL_KIND: int = 0
 _VIOLATION_FIELD_FAIL_REASON: int = 1
 _VIOLATION_FIELD_SLOT_IDX: int = 2
-_VIOLATION_FIELD_REQ_ID: int = 3
-_VIOLATION_FIELD_TOKEN_ID: int = 4
-_VIOLATION_FIELD_POSITION: int = 5
-_VIOLATION_FIELD_EXPECTED_HASH: int = 6
-_VIOLATION_FIELD_ACTUAL_HASH: int = 7
-_VIOLATION_FIELD_EXPECTED_REQ_ID: int = 8
-_VIOLATION_FIELD_EXPECTED_POSITION: int = 9
+_VIOLATION_FIELD_TOKEN_ID: int = 3
+_VIOLATION_FIELD_POSITION: int = 4
+_VIOLATION_FIELD_EXPECTED_HASH: int = 5
+_VIOLATION_FIELD_ACTUAL_HASH: int = 6
+_VIOLATION_FIELD_EXPECTED_POSITION: int = 7
 
 KERNEL_KIND_HEAD: int = 0
 KERNEL_KIND_TAIL: int = 1
@@ -77,12 +74,11 @@ class FailReason(enum.IntEnum):
     """
 
     NONE = 0
-    REQ_ID = 1
-    TOKEN_ID = 2
-    POSITION = 3
-    HASH = 4
-    POSITION_MONOTONIC = 5
-    REAL_KV_HASH = 6
+    TOKEN_ID = 1
+    POSITION = 2
+    HASH = 3
+    POSITION_MONOTONIC = 4
+    REAL_KV_HASH = 5
 
 
 @cache_once
@@ -103,7 +99,6 @@ def _jit_canary_module() -> "Module":
 # truth; this list just labels the slots).
 _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kCanaryFieldsPerSlot",
-    "kCanaryFieldReqId",
     "kCanaryFieldTokenId",
     "kCanaryFieldPosition",
     "kCanaryFieldPrevHash",
@@ -112,14 +107,11 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kViolationFieldKernelKind",
     "kViolationFieldFailReason",
     "kViolationFieldSlotIdx",
-    "kViolationFieldReqId",
     "kViolationFieldTokenId",
     "kViolationFieldPosition",
     "kViolationFieldExpectedHash",
     "kViolationFieldActualHash",
-    "kViolationFieldExpectedReqId",
     "kViolationFieldExpectedPosition",
-    "kFailReasonReqId",
     "kFailReasonTokenId",
     "kFailReasonPosition",
     "kFailReasonHash",
@@ -153,13 +145,11 @@ def canary_step(
     slot_stride_bytes: int,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
-    verify_req_ids: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
     verify_active_mask: torch.Tensor,
     write_slot_indices: torch.Tensor,
     write_token_ids: torch.Tensor,
     write_positions: torch.Tensor,
-    write_req_ids: torch.Tensor,
     write_req_seed_slot_indices: torch.Tensor,
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
@@ -182,9 +172,8 @@ def canary_step(
     """One step of the KV-cache canary protocol against the shadow buffer.
 
     Shadow slot layout — each logical token tracked by the canary occupies one slot of ``slot_stride_bytes`` bytes
-    in ``src_buf`` / ``dst_buf``, holding 5 ``int64`` fields (see ``_CANARY_FIELD_*`` for offsets):
+    in ``src_buf`` / ``dst_buf``, holding 4 ``int64`` fields (see ``_CANARY_FIELD_*`` for offsets):
 
-    - ``req_id``       — id of the request that owns this slot.
     - ``token_id``     — vocab id of the token this slot represents.
     - ``position``     — sequence position of the token within its request.
     - ``prev_hash``    — running fingerprint over ``(token_id, position)`` of every chain element *strictly before*
@@ -197,11 +186,11 @@ def canary_step(
     A call does two independent operations on the shadow:
 
     1. **Verify** — for each active verify entry, recompute the expected ``prev_hash`` from the slot's predecessor
-       and check it against the slot's stored fields (plus ``req_id`` / ``position`` and, if enabled, the live
-       ``real_kv_hash``). Mismatches are *recorded* (not raised) into the violation sink; verification never throws.
+       and check it against the slot's stored fields (plus ``position`` and, if enabled, the live ``real_kv_hash``).
+       Mismatches are *recorded* (not raised) into the violation sink; verification never throws.
     2. **Write** — for each active write-req, populate a contiguous run of slots, walking the chain forward from
        either a designated predecessor slot (carrying chain state forward from a prior step) or the global ``seed``
-       (chain start), and stamping each slot's 5 fields.
+       (chain start), and stamping each slot's 4 fields.
 
     The two are independent: a call may verify only, write only, or do both. Returns ``None``; all effects are
     in-place mutation of the output tensors listed below.
@@ -213,7 +202,6 @@ def canary_step(
         slot_stride_bytes:           Bytes per logical slot in the shadow.
         verify_slot_indices:         ``int64 [N_verify]`` — slot of each verify entry.
         verify_positions:            ``int64 [N_verify]`` — position the caller expects that slot to carry.
-        verify_req_ids:              ``int64 [N_verify]`` — req id the caller expects that slot to carry.
         verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor
                                      the chain on ``seed`` (no predecessor available, e.g. position 0 or an SWA
                                      window head).
@@ -221,8 +209,7 @@ def canary_step(
                                      without taking effect at replay.
         write_slot_indices,
         write_token_ids,
-        write_positions,
-        write_req_ids:               ``int64 [N_write]`` — per-slot payload to install, flattened across all
+        write_positions:             ``int64 [N_write]`` — per-slot payload to install, flattened across all
                                      write-reqs.
         write_req_seed_slot_indices: ``int64 [N_write_reqs]`` — for each write-req, the slot to anchor its chain on,
                                      or ``-1`` to anchor on ``seed``.
@@ -279,13 +266,11 @@ def canary_step(
         slot_stride_bytes,
         verify_slot_indices,
         verify_positions,
-        verify_req_ids,
         verify_prev_slot_indices,
         verify_active_mask,
         write_slot_indices,
         write_token_ids,
         write_positions,
-        write_req_ids,
         write_req_seed_slot_indices,
         write_req_entry_starts,
         write_req_entry_counts,

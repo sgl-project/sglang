@@ -92,19 +92,16 @@ def _launch(
     slot_stride: int,
     verify_slot_indices: list[int],
     verify_positions: list[int],
-    verify_req_ids: list[int],
     verify_prev_slot_indices: list[int],
     write_slot_indices: list[int],
     write_token_ids: list[int],
     write_positions: list[int],
-    write_req_ids: list[int],
     write_req_seed_slot_indices: list[int],
     write_req_entry_starts: list[int],
     write_req_entry_counts: list[int],
     state: dict,
 ) -> None:
     n_verify = len(verify_slot_indices)
-    n_write = len(write_slot_indices)
     n_write_reqs = len(write_req_seed_slot_indices)
     canary_step(
         src_buf=src.flatten(),
@@ -112,13 +109,11 @@ def _launch(
         slot_stride_bytes=slot_stride,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
-        verify_req_ids=_i64(verify_req_ids or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
         verify_active_mask=_i32([1] * n_verify if n_verify else [0]),
         write_slot_indices=_i64(write_slot_indices or [0]),
         write_token_ids=_i64(write_token_ids or [0]),
         write_positions=_i64(write_positions or [0]),
-        write_req_ids=_i64(write_req_ids or [0]),
         write_req_seed_slot_indices=_i64(write_req_seed_slot_indices or [-1]),
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
@@ -160,12 +155,10 @@ def _context_len_step(context_len: int) -> None:
         slot_stride=slot_stride,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
-        verify_req_ids=[1] * context_len,
         verify_prev_slot_indices=verify_prev_slot_indices,
         write_slot_indices=[context_len],
         write_token_ids=[1234],
         write_positions=[context_len],
-        write_req_ids=[1],
         write_req_seed_slot_indices=[context_len - 1] if context_len > 0 else [-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
@@ -186,12 +179,10 @@ def _extend_chunk_step(chunk_size: int) -> None:
         slot_stride=slot_stride,
         verify_slot_indices=[],
         verify_positions=[],
-        verify_req_ids=[],
         verify_prev_slot_indices=[],
         write_slot_indices=list(range(chunk_size)),
         write_token_ids=[(i * 17) & 0xFFFF for i in range(chunk_size)],
         write_positions=list(range(chunk_size)),
-        write_req_ids=[1] * chunk_size,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[chunk_size],
@@ -210,12 +201,10 @@ def _decode_bs_step(batch_size: int) -> None:
 
     verify_slot_indices: list[int] = []
     verify_positions: list[int] = []
-    verify_req_ids: list[int] = []
     verify_prev_slot_indices: list[int] = []
     write_slot_indices: list[int] = []
     write_token_ids: list[int] = []
     write_positions: list[int] = []
-    write_req_ids: list[int] = []
     write_req_seed_slot_indices: list[int] = []
     write_req_entry_starts: list[int] = []
     write_req_entry_counts: list[int] = []
@@ -225,7 +214,6 @@ def _decode_bs_step(batch_size: int) -> None:
             slot = base + j
             verify_slot_indices.append(slot)
             verify_positions.append(j)
-            verify_req_ids.append(r + 1)
             verify_prev_slot_indices.append(-1 if j == 0 else base + j - 1)
         write_req_seed_slot_indices.append(base + history - 1)
         write_req_entry_starts.append(len(write_slot_indices))
@@ -233,7 +221,6 @@ def _decode_bs_step(batch_size: int) -> None:
         write_slot_indices.append(base + history)
         write_token_ids.append(((r + 1) * 5) & 0xFFFF)
         write_positions.append(history)
-        write_req_ids.append(r + 1)
 
     _launch(
         src=buf,
@@ -241,12 +228,10 @@ def _decode_bs_step(batch_size: int) -> None:
         slot_stride=slot_stride,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
-        verify_req_ids=verify_req_ids,
         verify_prev_slot_indices=verify_prev_slot_indices,
         write_slot_indices=write_slot_indices,
         write_token_ids=write_token_ids,
         write_positions=write_positions,
-        write_req_ids=write_req_ids,
         write_req_seed_slot_indices=write_req_seed_slot_indices,
         write_req_entry_starts=write_req_entry_starts,
         write_req_entry_counts=write_req_entry_counts,

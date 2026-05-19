@@ -10,31 +10,27 @@
 
 namespace {
 
-constexpr int kCanaryFieldsPerSlot = 5;
-constexpr int kCanaryFieldReqId = 0;
-constexpr int kCanaryFieldTokenId = 1;
-constexpr int kCanaryFieldPosition = 2;
-constexpr int kCanaryFieldPrevHash = 3;
-constexpr int kCanaryFieldRealKvHash = 4;
+constexpr int kCanaryFieldsPerSlot = 4;
+constexpr int kCanaryFieldTokenId = 0;
+constexpr int kCanaryFieldPosition = 1;
+constexpr int kCanaryFieldPrevHash = 2;
+constexpr int kCanaryFieldRealKvHash = 3;
 
-constexpr int kViolationFields = 10;
+constexpr int kViolationFields = 8;
 constexpr int kViolationFieldKernelKind = 0;
 constexpr int kViolationFieldFailReason = 1;
 constexpr int kViolationFieldSlotIdx = 2;
-constexpr int kViolationFieldReqId = 3;
-constexpr int kViolationFieldTokenId = 4;
-constexpr int kViolationFieldPosition = 5;
-constexpr int kViolationFieldExpectedHash = 6;
-constexpr int kViolationFieldActualHash = 7;
-constexpr int kViolationFieldExpectedReqId = 8;
-constexpr int kViolationFieldExpectedPosition = 9;
+constexpr int kViolationFieldTokenId = 3;
+constexpr int kViolationFieldPosition = 4;
+constexpr int kViolationFieldExpectedHash = 5;
+constexpr int kViolationFieldActualHash = 6;
+constexpr int kViolationFieldExpectedPosition = 7;
 
-constexpr int kFailReasonReqId = 1;
-constexpr int kFailReasonTokenId = 2;
-constexpr int kFailReasonPosition = 3;
-constexpr int kFailReasonHash = 4;
-constexpr int kFailReasonPositionMonotonic = 5;
-constexpr int kFailReasonRealKvHash = 6;
+constexpr int kFailReasonTokenId = 1;
+constexpr int kFailReasonPosition = 2;
+constexpr int kFailReasonHash = 3;
+constexpr int kFailReasonPositionMonotonic = 4;
+constexpr int kFailReasonRealKvHash = 5;
 
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
@@ -59,10 +55,9 @@ struct CanaryParams {
   // would require maintaining host-side per-req history, which is exactly
   // what the stateless redesign drops. Token tampering is caught indirectly
   // via the splitmix64 chain (a corrupt token_id propagates into prev_hash
-  // for the next position) and req_id / position cross-checks below.
+  // for the next position) and position cross-check below.
   const int64_t* __restrict__ verify_slot_indices;
   const int64_t* __restrict__ verify_positions;
-  const int64_t* __restrict__ verify_req_ids;
   // For verify entry i, the slot index of position (verify_positions[i] - 1)
   // for the same req. -1 means "this is position 0; expected prev_hash =
   // kSeed". The kernel reads (prev_token, prev_position, prev_prev_hash) from
@@ -78,7 +73,6 @@ struct CanaryParams {
   const int64_t* __restrict__ write_slot_indices;
   const int64_t* __restrict__ write_token_ids;
   const int64_t* __restrict__ write_positions;
-  const int64_t* __restrict__ write_req_ids;
 
   // Per-write-req arrays, length == num_write_reqs. One driver thread per row
   // walks the splitmix64 chain across this req's writes in sequence.
@@ -174,23 +168,19 @@ SGL_DEVICE void record_violation(
     const CanaryParams& p,
     int32_t fail_reason,
     int64_t slot_idx,
-    int64_t req_id,
     int64_t token_id,
     int64_t position,
     uint64_t expected_hash,
     uint64_t actual_hash,
-    int64_t expected_req_id,
     int64_t expected_position) {
   int64_t entry[kViolationFields];
   entry[kViolationFieldKernelKind] = static_cast<int64_t>(p.kernel_kind);
   entry[kViolationFieldFailReason] = static_cast<int64_t>(fail_reason);
   entry[kViolationFieldSlotIdx] = slot_idx;
-  entry[kViolationFieldReqId] = req_id;
   entry[kViolationFieldTokenId] = token_id;
   entry[kViolationFieldPosition] = position;
   entry[kViolationFieldExpectedHash] = static_cast<int64_t>(expected_hash);
   entry[kViolationFieldActualHash] = static_cast<int64_t>(actual_hash);
-  entry[kViolationFieldExpectedReqId] = expected_req_id;
   entry[kViolationFieldExpectedPosition] = expected_position;
 
   // First-violation latch: only the first writer wins; ensures the very first
@@ -241,11 +231,9 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
     return;
   }
   const int64_t slot_idx = p.verify_slot_indices[tid];
-  const int64_t expected_req_id = p.verify_req_ids[tid];
   const int64_t expected_position = p.verify_positions[tid];
   const int64_t prev_slot_idx = p.verify_prev_slot_indices[tid];
 
-  const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
   const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
   const int64_t actual_position = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
   const uint64_t actual_prev_hash =
@@ -263,11 +251,10 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
         splitmix64_mix(prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position));
   }
 
-  // Independent verify-path fail_reason categories:
-  // (b1) req_id cross-check, (b3) position monotonic, (a) chain hash,
-  // (c) real-KV fingerprint (when ``--kv-cache-canary-real-data`` is on).
-  // Token-id check applies only to the write path (where the host has the
-  // raw input_ids from forward_batch); on verify it's elided. Token-field
+  // Independent verify-path fail_reason categories: (b) position monotonic,
+  // (a) chain hash, (c) real-KV fingerprint (when ``--kv-cache-canary-real-data``
+  // is on). Token-id check applies only to the write path (where the host has
+  // the raw input_ids from forward_batch); on verify it's elided. Token-field
   // tampering propagates into the chain hash via splitmix64_mix and is
   // caught at the next position's verify.
   const uint64_t actual_real_kv_hash =
@@ -277,9 +264,7 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   int32_t fail_reason = 0;
   uint64_t reported_expected = expected_prev_hash;
   uint64_t reported_actual = actual_prev_hash;
-  if (actual_req_id != expected_req_id) {
-    fail_reason = kFailReasonReqId;
-  } else if (actual_position != expected_position) {
+  if (actual_position != expected_position) {
     fail_reason = kFailReasonPositionMonotonic;
   } else if (actual_prev_hash != expected_prev_hash) {
     fail_reason = kFailReasonHash;
@@ -293,12 +278,10 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
         p,
         fail_reason,
         slot_idx,
-        actual_req_id,
         actual_token_id,
         actual_position,
         reported_expected,
         reported_actual,
-        expected_req_id,
         expected_position);
   }
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
@@ -334,12 +317,10 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
   for (int64_t k = 0; k < entry_count; ++k) {
     const int64_t i = entry_start + k;
     const int64_t slot_idx = p.write_slot_indices[i];
-    const int64_t req_id = p.write_req_ids[i];
     const int64_t token_id = p.write_token_ids[i];
     const int64_t position = p.write_positions[i];
 
     const uint64_t real_kv_hash = compute_real_kv_hash(p, slot_idx);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, req_id);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, token_id);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, position);
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(prev_hash));
@@ -385,13 +366,11 @@ void canary_step(
     int64_t slot_stride_bytes,
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_positions,
-    tvm::ffi::TensorView verify_req_ids,
     tvm::ffi::TensorView verify_prev_slot_indices,
     tvm::ffi::TensorView verify_active_mask,
     tvm::ffi::TensorView write_slot_indices,
     tvm::ffi::TensorView write_token_ids,
     tvm::ffi::TensorView write_positions,
-    tvm::ffi::TensorView write_req_ids,
     tvm::ffi::TensorView write_req_seed_slot_indices,
     tvm::ffi::TensorView write_req_entry_starts,
     tvm::ffi::TensorView write_req_entry_counts,
@@ -423,7 +402,6 @@ void canary_step(
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
       .verify(verify_positions)
-      .verify(verify_req_ids)
       .verify(verify_prev_slot_indices);
   TensorMatcher({N_verify}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_active_mask);
 
@@ -432,8 +410,7 @@ void canary_step(
       .with_device<kDLCUDA>(device_)
       .verify(write_slot_indices)
       .verify(write_token_ids)
-      .verify(write_positions)
-      .verify(write_req_ids);
+      .verify(write_positions);
 
   TensorMatcher({N_write_reqs})
       .with_dtype<int64_t>()
@@ -477,14 +454,12 @@ void canary_step(
   p.slot_stride_bytes = slot_stride_bytes;
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
   p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
-  p.verify_req_ids = static_cast<const int64_t*>(verify_req_ids.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_active_mask = static_cast<const int32_t*>(verify_active_mask.data_ptr());
   p.num_verify = num_verify;
   p.write_slot_indices = static_cast<const int64_t*>(write_slot_indices.data_ptr());
   p.write_token_ids = static_cast<const int64_t*>(write_token_ids.data_ptr());
   p.write_positions = static_cast<const int64_t*>(write_positions.data_ptr());
-  p.write_req_ids = static_cast<const int64_t*>(write_req_ids.data_ptr());
   p.write_req_seed_slot_indices = static_cast<const int64_t*>(write_req_seed_slot_indices.data_ptr());
   p.write_req_entry_starts = static_cast<const int64_t*>(write_req_entry_starts.data_ptr());
   p.write_req_entry_counts = static_cast<const int64_t*>(write_req_entry_counts.data_ptr());
@@ -522,7 +497,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 26;
+constexpr int kConstantsCount = 22;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -530,7 +505,6 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   int64_t* dst = static_cast<int64_t*>(out.data_ptr());
   int i = 0;
   dst[i++] = kCanaryFieldsPerSlot;
-  dst[i++] = kCanaryFieldReqId;
   dst[i++] = kCanaryFieldTokenId;
   dst[i++] = kCanaryFieldPosition;
   dst[i++] = kCanaryFieldPrevHash;
@@ -539,14 +513,11 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kViolationFieldKernelKind;
   dst[i++] = kViolationFieldFailReason;
   dst[i++] = kViolationFieldSlotIdx;
-  dst[i++] = kViolationFieldReqId;
   dst[i++] = kViolationFieldTokenId;
   dst[i++] = kViolationFieldPosition;
   dst[i++] = kViolationFieldExpectedHash;
   dst[i++] = kViolationFieldActualHash;
-  dst[i++] = kViolationFieldExpectedReqId;
   dst[i++] = kViolationFieldExpectedPosition;
-  dst[i++] = kFailReasonReqId;
   dst[i++] = kFailReasonTokenId;
   dst[i++] = kFailReasonPosition;
   dst[i++] = kFailReasonHash;

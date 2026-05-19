@@ -26,12 +26,10 @@ class BatchPlan:
     flags ``K_req_old == 0`` for the same reason.
     """
 
-    verify_req_ids: List[int]
     verify_positions: List[int]
     verify_slot_indices: List[int]
     verify_prev_slot_indices: List[int]
 
-    write_req_ids: List[int]
     write_token_ids: List[int]
     write_positions: List[int]
     write_slot_indices: List[int]
@@ -183,7 +181,6 @@ def _append_verify_entries(
     window_start = k_req - len(slot_indices_for_verify)
     for j, slot_idx in enumerate(slot_indices_for_verify):
         pos = window_start + j
-        accumulator.verify_req_ids.append(req_pool_idx)
         accumulator.verify_positions.append(pos)
         accumulator.verify_slot_indices.append(int(slot_idx))
         if pos == 0:
@@ -225,7 +222,6 @@ def _append_write_entries(
         pos = k_req + offset
         token_id = input_ids_list[cursor + offset]
         slot_idx = out_cache_loc_list[cursor + offset]
-        accumulator.write_req_ids.append(req_pool_idx)
         accumulator.write_token_ids.append(int(token_id))
         # ForwardBatch.positions carries the canonical position for each
         # new token. Fall back to the prefix+offset derivation when the
@@ -241,12 +237,10 @@ class _PlanAccumulator:
     """Mutable per-list buffer that ``_build_plan`` fills row by row."""
 
     def __init__(self) -> None:
-        self.verify_req_ids: List[int] = []
         self.verify_positions: List[int] = []
         self.verify_slot_indices: List[int] = []
         self.verify_prev_slot_indices: List[int] = []
 
-        self.write_req_ids: List[int] = []
         self.write_token_ids: List[int] = []
         self.write_positions: List[int] = []
         self.write_slot_indices: List[int] = []
@@ -256,18 +250,16 @@ class _PlanAccumulator:
         self.write_req_entry_counts: List[int] = []
 
     def into_plan(self) -> Optional[BatchPlan]:
-        num_verify = len(self.verify_req_ids)
-        num_write = len(self.write_req_ids)
+        num_verify = len(self.verify_positions)
+        num_write = len(self.write_token_ids)
         num_write_reqs = len(self.write_req_seed_slot_indices)
         if num_verify == 0 and num_write == 0:
             return None
 
         return BatchPlan(
-            verify_req_ids=self.verify_req_ids,
             verify_positions=self.verify_positions,
             verify_slot_indices=self.verify_slot_indices,
             verify_prev_slot_indices=self.verify_prev_slot_indices,
-            write_req_ids=self.write_req_ids,
             write_token_ids=self.write_token_ids,
             write_positions=self.write_positions,
             write_slot_indices=self.write_slot_indices,
@@ -298,7 +290,7 @@ def _pull_verify_slot_indices(
     ``req_to_token`` map only addresses the most recent
     ``swa_window_size`` slots; older positions point at slots that have
     been evicted / reused by other reqs, so reading them would trip a
-    spurious req_id / position mismatch.
+    spurious position / hash mismatch.
     """
     if swa_window_size is not None and k_req > swa_window_size:
         window_start = k_req - swa_window_size
@@ -447,11 +439,10 @@ class CanaryLaunchBuffers:
     Holds three tile sets:
 
     1. **Per-verify-entry** (capacity ``verify_capacity``):
-       ``verify_slot_indices`` / ``verify_positions`` / ``verify_req_ids`` /
+       ``verify_slot_indices`` / ``verify_positions`` /
        ``verify_prev_slot_indices`` / ``verify_active_mask``.
     2. **Per-write-entry** (capacity ``write_capacity``):
-       ``write_slot_indices`` / ``write_token_ids`` / ``write_positions`` /
-       ``write_req_ids``.
+       ``write_slot_indices`` / ``write_token_ids`` / ``write_positions``.
     3. **Per-write-req** (capacity ``write_req_capacity``):
        ``write_req_seed_slot_indices`` / ``write_req_entry_starts`` /
        ``write_req_entry_counts`` / ``write_req_active_mask``.
@@ -465,13 +456,11 @@ class CanaryLaunchBuffers:
     write_req_capacity: int
     verify_slot_indices: torch.Tensor
     verify_positions: torch.Tensor
-    verify_req_ids: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_active_mask: torch.Tensor
     write_slot_indices: torch.Tensor
     write_token_ids: torch.Tensor
     write_positions: torch.Tensor
-    write_req_ids: torch.Tensor
     write_req_seed_slot_indices: torch.Tensor
     write_req_entry_starts: torch.Tensor
     write_req_entry_counts: torch.Tensor
@@ -508,13 +497,11 @@ class CanaryLaunchBuffers:
             write_req_capacity=int(write_req_capacity),
             verify_slot_indices=zeros_i64(verify_capacity),
             verify_positions=zeros_i64(verify_capacity),
-            verify_req_ids=zeros_i64(verify_capacity),
             verify_prev_slot_indices=zeros_i64(verify_capacity),
             verify_active_mask=zeros_i32(verify_capacity),
             write_slot_indices=zeros_i64(write_capacity),
             write_token_ids=zeros_i64(write_capacity),
             write_positions=zeros_i64(write_capacity),
-            write_req_ids=zeros_i64(write_capacity),
             write_req_seed_slot_indices=zeros_i64(write_req_capacity),
             write_req_entry_starts=zeros_i64(write_req_capacity),
             write_req_entry_counts=zeros_i64(write_req_capacity),
@@ -572,9 +559,6 @@ class CanaryLaunchBuffers:
             self.verify_positions[:num_active_verify].copy_(
                 to_i64(plan.verify_positions, v)
             )
-            self.verify_req_ids[:num_active_verify].copy_(
-                to_i64(plan.verify_req_ids, v)
-            )
             self.verify_prev_slot_indices[:num_active_verify].copy_(
                 to_i64(plan.verify_prev_slot_indices, v)
             )
@@ -589,12 +573,10 @@ class CanaryLaunchBuffers:
             )
             self.write_token_ids[:nw].copy_(to_i64(plan.write_token_ids, slice(0, nw)))
             self.write_positions[:nw].copy_(to_i64(plan.write_positions, slice(0, nw)))
-            self.write_req_ids[:nw].copy_(to_i64(plan.write_req_ids, slice(0, nw)))
         if nw < self.write_capacity:
             self.write_slot_indices[nw:].zero_()
             self.write_token_ids[nw:].zero_()
             self.write_positions[nw:].zero_()
-            self.write_req_ids[nw:].zero_()
 
         nwr = plan.num_write_reqs
         if nwr > 0:
