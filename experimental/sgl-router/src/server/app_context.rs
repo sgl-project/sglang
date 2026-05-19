@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
@@ -102,6 +103,8 @@ impl AppContext {
                         },
                     ),
                 },
+                proxy: crate::config::ProxyConfig::default(),
+                active_load: crate::config::ActiveLoadConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),

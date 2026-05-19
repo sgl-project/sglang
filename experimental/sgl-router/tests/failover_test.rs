@@ -78,6 +78,8 @@ model_ids = ["tiny"]
                 poll_interval_ms: 50,
             }),
         },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

@@ -34,6 +34,7 @@
 //! tiebreak, not a routing failure.
 
 use crate::config::CacheAwareConfig;
+
 use crate::discovery::ModelId;
 use crate::policies::kv_events::{compute_block_hashes, HashTree};
 use crate::policies::{Policy, SelectionContext};
@@ -283,6 +284,8 @@ mod tests {
                     },
                 ),
             },
+            proxy: crate::config::ProxyConfig::default(),
+            active_load: crate::config::ActiveLoadConfig::default(),
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
     }

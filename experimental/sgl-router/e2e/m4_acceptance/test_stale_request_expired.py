@@ -37,7 +37,15 @@ def test_stale_request_expired_returns_504(
     try:
         with spawn_worker("qwen3-0.6b", gpu_ids=gpu) as worker:
             spec = get_model_spec("qwen3-0.6b")
-            with Gateway() as gw:
+            # Short stale-request timeout (5 s) so the janitor fires
+            # within the test's wall-time. Default 300 s is production-
+            # sized.  Also keep the proxy request timeout above the
+            # stale timeout so the stale-cancel path wins the race
+            # against an upstream-timeout error.
+            with Gateway(
+                stale_request_timeout_secs=5,
+                proxy_request_timeout_secs=120,
+            ) as gw:
                 gw.start_regular(
                     model_id=spec["model"],
                     tokenizer_path=spec["model"],
@@ -56,7 +64,7 @@ def test_stale_request_expired_returns_504(
                             "messages": [{"role": "user", "content": "hi"}],
                             "max_tokens": 10,
                         },
-                        timeout=60.0,
+                        timeout=30.0,
                     )
                     elapsed = time.time() - start
                     assert resp.status_code == 504, (
