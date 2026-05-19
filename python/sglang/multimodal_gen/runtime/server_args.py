@@ -313,6 +313,13 @@ class ServerArgs(DisaggArgsMixin):
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
+    # SGLang backend for encoder stage
+    use_srt_encoders: bool = False
+    srt_encoder_url: str | None = None
+    srt_encoder_gpu: int | None = None
+    srt_encoder_mem_fraction: float = 0.8
+    srt_encoder_tp_size: int = 1
+
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
@@ -1493,6 +1500,39 @@ class ServerArgs(DisaggArgsMixin):
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
             "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
+
+        # SGLang backend for encoder stage
+        parser.add_argument(
+            "--use-srt-encoders",
+            type=bool,
+            default=ServerArgs.use_srt_encoders,
+            help="Use SGLang as a backend for encoder stage",
+        )
+        parser.add_argument(
+            "--srt-encoder-url",
+            type=str,
+            default=ServerArgs.srt_encoder_url,
+            help="Url of SGLang server for encoder stage",
+        )
+        parser.add_argument(
+            "--srt-encoder-gpu",
+            type=int,
+            default=ServerArgs.srt_encoder_gpu,
+            help="Base GPU ID for SGLang server",
+        )
+        parser.add_argument(
+            "--srt-encoder-mem-fraction",
+            type=float,
+            default=ServerArgs.srt_encoder_mem_fraction,
+            help="SGLang server mem fraction",
+        )
+        parser.add_argument(
+            "--srt-encoder-tp-size",
+            type=int,
+            default=ServerArgs.srt_encoder_tp_size,
+            help="SGLang server tp size",
+        )
+
         return parser
 
     def url(self):

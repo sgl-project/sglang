@@ -61,11 +61,11 @@ __all__ = [
 def _get_folding_tp_group(
     config: TextEncoderConfig,
 ) -> torch.distributed.ProcessGroup | None:
-    if config.parallel_folding:
-        if config.parallel_folding_mode == "sp":
-            return get_sp_group()
-        elif config.parallel_folding_mode == "ulysses":
-            return get_sp_group().ulysses_group
-        elif config.parallel_folding_mode == "ring":
-            return get_sp_group().ring_group
+    # if config.parallel_folding:
+    #    if config.parallel_folding_mode == "sp":
+    #        return get_sp_group()
+    #    elif config.parallel_folding_mode == "ulysses":
+    #        return get_sp_group().ulysses_group
+    #    elif config.parallel_folding_mode == "ring":
+    #        return get_sp_group().ring_group
     return get_tp_group()
