@@ -28,6 +28,7 @@ class _MhaFullBase(CanaryE2EBase):
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
     ]
 
 
@@ -68,6 +69,7 @@ class TestRealDataOff(_MhaFullBase, unittest.TestCase):
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--kv-cache-canary-real-data",
         "off",
     ]
@@ -83,6 +85,7 @@ class TestRealDataBit(_MhaFullBase, unittest.TestCase):
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--kv-cache-canary-real-data",
         "bit",
     ]
@@ -98,6 +101,7 @@ class TestRealDataAll(_MhaFullBase, unittest.TestCase):
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--kv-cache-canary-real-data",
         "all",
     ]
@@ -113,6 +117,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--kv-cache-canary-real-data",
         "all",
         "--kv-cache-canary-real-data-sweep-every-n-steps",
@@ -153,6 +158,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
         "--kv-cache-canary-real-data",
         "all",
         "--kv-cache-canary-real-data-sweep-every-n-steps",
