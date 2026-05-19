@@ -584,13 +584,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        if self.chat_encoding_spec is not None:
-            # Per-request wins; env is fallback default for benchmark
-            # workflows that can't pass per-request chat_template_kwargs.
-            thinking_requested = (request.chat_template_kwargs or {}).get(
-                "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-            )
-            thinking_mode = "thinking" if thinking_requested else "chat"
+        # Try custom encoding first (override in subclass for custom renderers)
+        thinking_requested = (request.chat_template_kwargs or {}).get(
+            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+        )
+        thinking_mode = "thinking" if thinking_requested else "chat"
+        prompt_ids = self._encode_messages(
+            [msg.model_dump() for msg in request.messages], request, thinking_mode
+        )
+
+        if prompt_ids is not None:
+            # Custom encoding handled it - no further processing needed
+            pass
+        elif self.chat_encoding_spec is not None:
+            # dsv4/dsv32 encoding path
             messages = [msg.model_dump() for msg in request.messages]
 
             # dsv4/dsv32 are text-only and consume string content; flatten
@@ -626,37 +633,34 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
 
-            # Try custom encoding first (override in subclass)
-            prompt_ids = self._encode_messages(messages, request, thinking_mode)
-            if prompt_ids is None:
-                # Default encoding (dsv4/dsv32)
-                if self.chat_encoding_spec == "dsv4":
-                    # V4 encoder only accepts "max" / "high" / None.
-                    # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
-                    # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
-                    effort_source = request.reasoning_effort
-                    if effort_source is None:
-                        env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
-                        if env_val:
-                            effort_source = env_val
-                    v4_reasoning_effort = (
-                        effort_source if effort_source in ("max", "high") else None
+            # Default encoding (dsv4/dsv32)
+            if self.chat_encoding_spec == "dsv4":
+                # V4 encoder only accepts "max" / "high" / None.
+                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
+                # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
+                effort_source = request.reasoning_effort
+                if effort_source is None:
+                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
+                    if env_val:
+                        effort_source = env_val
+                v4_reasoning_effort = (
+                    effort_source if effort_source in ("max", "high") else None
+                )
+                if request.task is not None:
+                    encoding_dsv4.attach_task_to_last_user_message(
+                        messages, request.task
                     )
-                    if request.task is not None:
-                        encoding_dsv4.attach_task_to_last_user_message(
-                            messages, request.task
-                        )
-                    real_input = encoding_dsv4.encode_messages(
-                        messages,
-                        thinking_mode=thinking_mode,
-                        reasoning_effort=v4_reasoning_effort,
-                    )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-                else:
-                    real_input = encoding_dsv32.encode_messages(
-                        messages, thinking_mode=thinking_mode
-                    )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                real_input = encoding_dsv4.encode_messages(
+                    messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=v4_reasoning_effort,
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            else:
+                real_input = encoding_dsv32.encode_messages(
+                    messages, thinking_mode=thinking_mode
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

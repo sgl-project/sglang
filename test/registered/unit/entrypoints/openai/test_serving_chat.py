@@ -1443,6 +1443,26 @@ class ServingChatTestCase(unittest.TestCase):
             result = self.chat._apply_conversation_template(req, is_multimodal=False)
         self.assertEqual(result.prompt, "BASE_PROMPT")
 
+    # ------------- hook method tests -------------
+    def test_encode_messages_returns_none_by_default(self):
+        """Default _encode_messages returns None (use standard encoding)."""
+        result = self.chat._encode_messages([], Mock(), False)
+        self.assertIsNone(result)
+
+    def test_decode_response_returns_text(self):
+        """Default _decode_response returns ret_item['text']."""
+        ret_item = {"text": "Hello world", "output_ids": [1, 2, 3]}
+        result = self.chat._decode_response(ret_item)
+        self.assertEqual(result, "Hello world")
+
+    def test_get_parsed_response_fields_passthrough(self):
+        """Default _get_parsed_response_fields passes through values."""
+        reasoning = "thinking..."
+        tool_calls = [{"name": "foo"}]
+        r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
+        self.assertEqual(r, reasoning)
+        self.assertEqual(t, tool_calls)
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
