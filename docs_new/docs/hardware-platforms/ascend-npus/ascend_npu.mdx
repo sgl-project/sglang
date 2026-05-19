@@ -425,6 +425,21 @@ python3 -m sglang.launch_server \
 
 Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
 
+### Which port to send requests to
+
+The port you use depends on your deployment mode:
+
+| Scenario | Where to send requests |
+|---|---|
+| Non-PD (single server) | The server's `--port` (e.g., `8000` in the examples above) |
+| PD disaggregation | The router's `--port` (e.g., `6688` in the examples above); do **not** send requests directly to prefill or decode servers |
+
+<Tip>
+SGLang serves on port `30000` by default if `--port` is not specified. The examples in this guide use explicit ports for clarity.
+
+If you are using PD disaggregation, replace `8000` with your router's port (e.g., `6688`) in the following examples.
+</Tip>
+
 ### Health Check
 
 ```bash Command
