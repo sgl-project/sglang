@@ -30,6 +30,33 @@ pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 300;
 /// well above tonic's 4 MiB decode default.
 pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Resolve the per-message size cap (bytes) applied to the Tonic encoder/decoder.
+//
+// TODO(grpc-args): promote SGLANG_TONIC_PAYLOAD to a proper `--grpc-max-message-size`
+// server argument once the launcher PR (3/4) wires server args through.
+fn resolve_max_message_size() -> usize {
+    match std::env::var("SGLANG_TONIC_PAYLOAD") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    bytes = n,
+                    "Using SGLANG_TONIC_PAYLOAD override for gRPC max message size"
+                );
+                n
+            }
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_GRPC_MAX_MESSAGE_SIZE,
+                    "Ignoring invalid SGLANG_TONIC_PAYLOAD; using default"
+                );
+                DEFAULT_GRPC_MAX_MESSAGE_SIZE
+            }
+        },
+        Err(_) => DEFAULT_GRPC_MAX_MESSAGE_SIZE,
+    }
+}
+
 /// Classify a bridge `PyErr` into the right gRPC `Status`.
 ///
 /// `PyValueError` / `PyTypeError` mean the client sent bad input — surface as
@@ -961,9 +988,10 @@ pub async fn run_grpc_server(
         response_timeout,
     };
 
+    let max_message_size = resolve_max_message_size();
     let svc = proto::sglang_service_server::SglangServiceServer::new(service)
-        .max_decoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(DEFAULT_GRPC_MAX_MESSAGE_SIZE);
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
 
     tracing::info!("gRPC server listening on {}", addr);
 
