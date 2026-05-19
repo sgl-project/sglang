@@ -90,6 +90,7 @@ class CanaryEndpoint:
             )
 
         for src_buf, dst_buf, stride, violation_slot in buf_specs:
+            # API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
             canary_step(
                 src_buf=src_buf.view(torch.uint8).flatten(),
                 dst_buf=dst_buf.view(torch.uint8).flatten(),

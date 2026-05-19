@@ -62,6 +62,7 @@ def splitmix64_mix(prev_hash: int, token_id: int, position: int) -> int:
     return splitmix64(combined)
 
 
+# API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
 def canary_step_torch_reference(
     *,
     src_buf: torch.Tensor,

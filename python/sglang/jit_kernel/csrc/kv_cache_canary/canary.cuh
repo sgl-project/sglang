@@ -378,6 +378,7 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   }
 }
 
+// API source of truth: docstring of canary_step in python/sglang/jit_kernel/kv_cache_canary.py
 void canary_step(
     tvm::ffi::TensorView src_buf,
     tvm::ffi::TensorView dst_buf,
