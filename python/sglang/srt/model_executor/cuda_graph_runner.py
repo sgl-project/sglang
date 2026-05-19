@@ -54,11 +54,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
-from sglang.srt.layers.moe.utils import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    should_record_nolora_graph,
-)
+from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -175,6 +171,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -183,7 +180,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int64)
+                torch.zeros((max_num_token,), dtype=torch.int32)
                 if is_hybrid_swa
                 else None
             )
@@ -208,10 +205,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+                is_mhc = hc_hidden_size is not None
+                hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
                 }
+                if not is_mhc:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_bs, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -290,6 +293,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # Padded SWA indices left over from a previous replay would point
+            # into real SWA slots, so set_kv_buffer on padded tokens would
+            # corrupt active requests' KV. Zero the whole buffer so padded
+            # positions map to the sentinel slot (matches piecewise runner).
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -386,23 +395,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
-# When capturing dual MoE backends, tracks which variant is being captured.
-# None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
-_capture_lora_variant: Optional[str] = None
 
 
 def get_is_capture_mode():
     return is_capture_mode
 
 
-def get_capture_lora_variant() -> Optional[str]:
-    """Return the lora variant being captured, or None if not in dual capture."""
-    return _capture_lora_variant
-
-
-def _set_capture_lora_variant(variant: Optional[str]):
-    global _capture_lora_variant
-    _capture_lora_variant = variant
+def compile_in_capture_mode(func):
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
 
 
 @contextmanager
@@ -544,19 +546,6 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
-    """Build a graph dict key from batch size, stream index, and lora variant.
-
-    Standalone function so it can be used by CudaGraphRunner.capture() even when
-    called on subclasses (e.g. EAGLEDraftCudaGraphRunner) that don't inherit from
-    CudaGraphRunner and thus lack the method.
-    """
-    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-    if variant_label is not None:
-        key = f"{variant_label}_{key}"
-    return key
-
-
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -606,7 +595,6 @@ class CudaGraphRunner:
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        self.record_nolora_graph = should_record_nolora_graph()
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
@@ -627,8 +615,10 @@ class CudaGraphRunner:
         self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
-                # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                # Draft workers can use TARGET_VERIFY mode.
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = self.speculative_num_draft_tokens
@@ -707,6 +697,9 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
         )
         self.buffers.share_buffers()
 
@@ -730,20 +723,6 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        """Build a graph dict key from batch size, stream index, and lora variant."""
-        return _default_make_graph_key(bs, stream_idx, variant_label)
-
-    def _resolve_lora_variant(self, forward_batch: ForwardBatch):
-        """Return the variant label for the given batch, or None if dual backends are off."""
-        if not getattr(self, "record_nolora_graph", False):
-            return None
-        if forward_batch.lora_ids is not None and any(
-            uid is not None for uid in forward_batch.lora_ids
-        ):
-            return "lora"
-        return "nolora"
-
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -759,9 +738,9 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
+        graph_key = cuda_graph_bs
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -858,13 +837,6 @@ class CudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
-            # When record_nolora_graph is set, capture each batch size twice:
-            # once with LoRA hooks and once without.
-            lora_variants = (
-                [("lora", True), ("nolora", False)]
-                if getattr(self, "record_nolora_graph", False)
-                else [(None, None)]
-            )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -876,21 +848,20 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                for variant_label, variant_has_lora in lora_variants:
-                    _set_capture_lora_variant(variant_label)
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                        key = _default_make_graph_key(bs, stream_idx, variant_label)
-                        self.graphs[key] = graph
-                        self.output_buffers[key] = output_buffers
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    (
+                        graph,
+                        output_buffers,
+                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                    # For pd_multiplexing, we need to save the graph and output buffers
+                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                    self.graphs[key] = graph
+                    self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -909,8 +880,6 @@ class CudaGraphRunner:
                     ):
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
-
-        _set_capture_lora_variant(None)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
@@ -981,7 +950,7 @@ class CudaGraphRunner:
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
         if (
-            enable_num_token_non_padded(self.model_runner.server_args)
+            enable_num_token_non_padded()
             and self.require_gathered_buffer
             and not self.nsa_enable_prefill_cp
         ):
@@ -1175,11 +1144,13 @@ class CudaGraphRunner:
                     and not is_enabled()
                 ):
                     enable()
+            attn_backend.on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -1253,9 +1224,7 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(
-                self.model_runner.server_args
-            ),
+            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -1281,6 +1250,9 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        # FIXME: implicit channel for backends (dsv4) that need forward_batch
+        # in replay metadata prep. Should become a real param on the interface.
+        attn_backend._replay_forward_batch = forward_batch
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1291,6 +1263,7 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
+        attn_backend._replay_forward_batch = None
 
         # Store fields
         self.raw_bs = raw_bs
@@ -1324,9 +1297,10 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+        else:
+            graph_key = self.bs
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={
@@ -1338,6 +1312,7 @@ class CudaGraphRunner:
         )
         with ctx:
             self.graphs[graph_key].replay()
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
@@ -1381,6 +1356,12 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.spec_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,
@@ -1392,7 +1373,7 @@ class CudaGraphRunner:
                     spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
