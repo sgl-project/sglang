@@ -210,15 +210,12 @@ SGL_DEVICE inline void record_violation(
   }
 }
 
-// Load one int64 field from a canary slot. slot_stride_bytes is the per-slot stride taken from
-// canary_buf.shape[1].
 SGL_DEVICE inline int64_t
 canary_load_field(const uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, int field) {
   const int64_t* p = reinterpret_cast<const int64_t*>(buf + slot_idx * slot_stride_bytes);
   return p[field];
 }
 
-// Store one int64 field into a canary slot.
 SGL_DEVICE inline void
 canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, int field, int64_t value) {
   int64_t* p = reinterpret_cast<int64_t*>(buf + slot_idx * slot_stride_bytes);
