@@ -281,7 +281,7 @@ class EagleVerifyInputV2Mixin:
             )
 
             if get_global_server_args().enable_mamba_extra_buffer():
-                set_mamba_track_indices_from_reqs(batch, req_to_token_pool)
+                set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
