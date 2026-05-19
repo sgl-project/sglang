@@ -1,8 +1,4 @@
 // CUDA write kernel and tvm-ffi entry for the KV cache canary.
-//
-// Algorithm: kernels.md §2.6 (canary_write_step / Implementation). One CUDA block per active write req,
-// single thread per block (chain is intrinsically serial). The host wrapper kv_cache_canary_write.py pins
-// the byte-equal contract; the torch reference is kv_cache_canary_write_ref.py.
 
 #pragma once
 

@@ -1,8 +1,4 @@
 // CUDA verify kernel and tvm-ffi entry for the KV cache canary.
-//
-// Algorithm: kernels.md §2.5 (canary_verify_step / Implementation). One CUDA thread per active verify
-// entry. The host wrapper kv_cache_canary_verify.py pins the byte-equal contract; the torch reference is
-// kv_cache_canary_verify_ref.py.
 
 #pragma once
 
