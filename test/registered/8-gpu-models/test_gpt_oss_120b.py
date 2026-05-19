@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -13,6 +15,7 @@ GPT_OSS_120B_MXFP4_MODEL_PATH = "openai/gpt-oss-120b"
 GPT_OSS_120B_EAGLE3_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGptOss120B(unittest.TestCase):
     """Unified test class for GPT-OSS-120B performance and accuracy.
 

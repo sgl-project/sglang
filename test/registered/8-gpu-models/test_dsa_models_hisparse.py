@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,6 +19,7 @@ register_cuda_ci(est_time=720, stage="base-c", runner_config="8-gpu-h200", night
 GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM5DPHiSparse(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -65,6 +66,7 @@ def _run_gsm8k(test_case):
     test_case.assertGreaterEqual(metrics["score"], 0.96)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -86,6 +88,7 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
         _run_gsm8k(self)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

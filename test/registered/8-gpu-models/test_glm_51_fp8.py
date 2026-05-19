@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -27,6 +29,7 @@ MTP_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGlm51Fp8(unittest.TestCase):
     """GLM-5.1 FP8 on H200/B200 (8-GPU, tp=8)."""
 
