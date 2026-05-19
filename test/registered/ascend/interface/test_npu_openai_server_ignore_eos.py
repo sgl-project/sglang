@@ -1,6 +1,7 @@
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -16,6 +17,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOpenAIServerIgnoreEOS(CustomTestCase):
     """Testcase: Test 'ignore_eos' is True, the EOS is ignored and continue reasoning
 
