@@ -97,11 +97,22 @@ class TestCanaryRealDataSweepPerturbed(_CanaryRealDataSweepBase):
     """Sweep ON + real-KV byte perturb: sweep path must raise.
 
     Perturb flips one real-KV byte on an alive-but-not-this-step-verified
-    slot, which only the periodic sweep can catch. Outcome: either the
-    server fails to come up (warmup sweep tripped) OR the burst returns
-    errors / /health flips to non-200.
+    slot. The slot enters the *next* step's verify range as seq_len grows,
+    so the per-step head can also see the corruption — to make sweep the
+    first observer (and thus the kind logged on raise), this subclass
+    forces ``--kv-cache-canary-real-data-sweep-every-n-steps=1`` so sweep
+    fires inside the same ``end_of_forward`` as the perturb, before the
+    next forward's head runs. Outcome: either the server fails to come up
+    (warmup sweep tripped) OR the burst returns errors / /health flips
+    to non-200.
     """
 
+    extra_server_args = [
+        "--kv-cache-canary-real-data",
+        "bit",
+        "--kv-cache-canary-real-data-sweep-every-n-steps",
+        "1",
+    ]
     server_env = {
         "SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB": "0.01",
         "SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED": "42",
