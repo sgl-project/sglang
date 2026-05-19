@@ -42,6 +42,7 @@ def install_on_model_runner(
     model_runner: ModelRunner,
     mode: Optional[str],
     real_kv_hash_mode: Optional[str] = None,
+    real_data_sweep_every_n_steps: int = 0,
 ) -> None:
     """Attach the canary to the model runner's pool and wire its hooks.
 
@@ -59,8 +60,15 @@ def install_on_model_runner(
     folded into the canary's chain hash. ``off`` leaves the field zero;
     ``bit`` hashes the first 16 bytes of the real slot; ``all`` hashes
     the full slot stride.
+
+    ``real_data_sweep_every_n_steps`` controls the periodic full-pool sweep
+    that verifies real_kv_hash on every alive slot. 0 disables it.
     """
-    config = CanaryConfig.from_server_args(mode, real_kv_hash_mode=real_kv_hash_mode)
+    config = CanaryConfig.from_server_args(
+        mode,
+        real_kv_hash_mode=real_kv_hash_mode,
+        real_data_sweep_every_n_steps=real_data_sweep_every_n_steps,
+    )
     if not config.enabled:
         return
 
@@ -101,6 +109,8 @@ def install_on_model_runner(
         verify_capacity=capacities.verify_capacity,
         write_capacity=capacities.write_capacity,
         write_req_capacity=capacities.write_req_capacity,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        tp_rank=model_runner.tp_rank,
     )
     if not runners:
         return

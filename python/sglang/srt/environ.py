@@ -666,6 +666,13 @@ class Envs:
     # for regression-testing the canary itself.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
+    # Real-KV-byte perturbation (testing only).
+    # When >0, the canary self-test hook flips one byte of the real KV pool
+    # at an alive-but-not-verified-this-step slot with this probability per
+    # forward, proving the periodic sweep's independent detection value.
+    # Requires --kv-cache-canary-real-data-sweep-every-n-steps > 0.
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
 
     # Pseudo-mode sampler-override perturbation (testing only).
     # When >0, the pseudo-mode sampler override writes the WRONG token

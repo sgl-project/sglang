@@ -7,6 +7,8 @@ import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
     CANARY_EXPECTED_SKIP_SENTINEL as _SKIP_SENTINEL,
+)
+from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
@@ -74,6 +76,24 @@ class BatchPlan:
                     f"kv-canary: expected_write_positions length {len(positions)} "
                     f"!= num_write {self.num_write}"
                 )
+
+    @classmethod
+    def empty(cls) -> "BatchPlan":
+        return cls(
+            verify_positions=[],
+            verify_slot_indices=[],
+            verify_prev_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_slot_indices=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_pool_indices=[],
+            num_verify=0,
+            num_write=0,
+            num_write_reqs=0,
+        )
 
 
 def plan_batch_from_forward_batch(
@@ -357,11 +377,15 @@ VIOLATION_KIND_HEAD_K: str = "head_k"
 VIOLATION_KIND_HEAD_V: str = "head_v"
 VIOLATION_KIND_TAIL_K: str = "tail_k"
 VIOLATION_KIND_TAIL_V: str = "tail_v"
-VIOLATION_KINDS: Tuple[str, str, str, str] = (
+VIOLATION_KIND_SWEEP_K: str = "sweep_k"
+VIOLATION_KIND_SWEEP_V: str = "sweep_v"
+VIOLATION_KINDS: Tuple[str, ...] = (
     VIOLATION_KIND_HEAD_K,
     VIOLATION_KIND_HEAD_V,
     VIOLATION_KIND_TAIL_K,
     VIOLATION_KIND_TAIL_V,
+    VIOLATION_KIND_SWEEP_K,
+    VIOLATION_KIND_SWEEP_V,
 )
 
 
@@ -426,8 +450,10 @@ class CanaryDeviceState:
     violation_slots: Dict[str, CanaryViolationSlot]
     slot_run_counter_head: torch.Tensor
     slot_run_counter_tail: torch.Tensor
+    slot_run_counter_sweep: torch.Tensor
     kernel_run_counter_head: torch.Tensor
     kernel_run_counter_tail: torch.Tensor
+    kernel_run_counter_sweep: torch.Tensor
 
     @classmethod
     def allocate(
@@ -442,8 +468,10 @@ class CanaryDeviceState:
             },
             slot_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),
             slot_run_counter_tail=torch.zeros(1, dtype=torch.int64, device=device),
+            slot_run_counter_sweep=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter_head=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter_tail=torch.zeros(1, dtype=torch.int64, device=device),
+            kernel_run_counter_sweep=torch.zeros(1, dtype=torch.int64, device=device),
         )
 
     def get_violation_slot(self, kind: str) -> CanaryViolationSlot:

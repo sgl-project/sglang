@@ -677,6 +677,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     kv_cache_canary: str = "off"
     kv_cache_canary_real_data: str = "off"
+    kv_cache_canary_real_data_sweep_every_n_steps: int = 0
     enable_pseudo_mode: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -6109,6 +6110,23 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--kv-cache-canary-real-data-sweep-every-n-steps",
+            type=int,
+            default=ServerArgs.kv_cache_canary_real_data_sweep_every_n_steps,
+            help=(
+                "Every N forward steps, run a full-pool sweep that verifies "
+                "real_kv_hash on every slot owned by an alive req in the "
+                "current batch (chain hash check is skipped in this path). "
+                "0 (default) disables the sweep. The per-step head/tail "
+                "canary only covers slots the current forward reads or "
+                "writes; the sweep also catches drift on history slots that "
+                "were frozen earlier (e.g. PD-transfer bit-rot, idle dummy "
+                "writes, rowhammer-style flips). Requires "
+                "--kv-cache-canary-real-data in {bit, all} and "
+                "--kv-cache-canary in {log, raise}."
+            ),
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
@@ -7095,6 +7113,18 @@ class ServerArgs:
             if not (1 <= len(self.gc_threshold) <= 3):
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
+                )
+
+        if self.kv_cache_canary_real_data_sweep_every_n_steps > 0:
+            if self.kv_cache_canary_real_data == "off":
+                raise ValueError(
+                    "--kv-cache-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-cache-canary-real-data in {bit, all}"
+                )
+            if self.kv_cache_canary == "off":
+                raise ValueError(
+                    "--kv-cache-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-cache-canary in {log, raise}"
                 )
 
     def check_lora_server_args(self):

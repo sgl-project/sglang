@@ -19,7 +19,7 @@ from sglang.srt.kv_cache_canary.pool_patch import (
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ def attach(
     verify_capacity: int,
     write_capacity: int,
     write_req_capacity: int,
+    req_to_token_pool: Optional["ReqToTokenPool"] = None,
+    tp_rank: int = 0,
 ) -> Optional[List[CanaryRunner]]:
     """Attach canaries to ``pool`` and create one runner per canary buffer group.
 
@@ -68,6 +70,8 @@ def attach(
                 verify_capacity=verify_capacity,
                 write_capacity=write_capacity,
                 write_req_capacity=write_req_capacity,
+                req_to_token_pool=req_to_token_pool,
+                tp_rank=tp_rank,
             )
         )
     setattr(pool, _GLOBAL_RUNNERS_KEY, runners)
@@ -115,6 +119,7 @@ def run_head(
         return {}
     plans: Dict[PoolKind, BatchPlan] = {}
     for runner in runners:
+        runner.set_last_forward_batch(forward_batch)
         plan = plan_batch_from_forward_batch(
             forward_batch=forward_batch, config=runner.config
         )

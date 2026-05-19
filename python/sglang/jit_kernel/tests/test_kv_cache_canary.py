@@ -16,6 +16,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
+    SKIP_CHAIN_SENTINEL,
     VIOLATION_FIELDS,
     FailReason,
     canary_step,
@@ -341,6 +342,97 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     assert int(state["is_errored"].item()) == 1
     first = state["first_violation"].cpu().tolist()
     assert int(first[1]) == FailReason.HASH.value
+
+
+def test_verify_skips_chain_check_on_sentinel():
+    """``verify_prev_slot_indices[i] == SKIP_CHAIN_SENTINEL`` (-2) skips the
+    chain hash check on that entry but still runs the position-monotonic
+    check and the real_kv_hash recompute+compare. Enables sweep-mode plans
+    that verify an alive slot's live real_kv_hash without requiring the
+    full chain to be reconstructible across the sweep set.
+    """
+    slot_stride = 128
+    buf = _alloc_pool(4, slot_stride)
+    state = _alloc_state()
+
+    _run(
+        src=buf,
+        dst=buf,
+        slot_stride_bytes=slot_stride,
+        verify_slot_indices=[],
+        verify_positions=[],
+        verify_prev_slot_indices=[],
+        verify_active_mask=[],
+        write_slot_indices=[0],
+        write_token_ids=[42],
+        write_positions=[0],
+        write_req_seed_slot_indices=[-1],
+        write_req_entry_starts=[0],
+        write_req_entry_counts=[1],
+        write_req_active_mask=[1],
+        state=state,
+        kernel_kind=KERNEL_KIND_HEAD,
+    )
+
+    # Corrupt slot[0].prev_hash. With the skip sentinel, the kernel must
+    # NOT report kFailReasonHash.
+    buf_view = buf.view(torch.int64)
+    buf_view[0, 2] = torch.tensor(
+        to_signed_int64(0xDEADBEEFDEADBEEF), dtype=torch.int64, device="cuda"
+    )
+
+    _run(
+        src=buf,
+        dst=buf,
+        slot_stride_bytes=slot_stride,
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
+        verify_active_mask=[1],
+        write_slot_indices=[],
+        write_token_ids=[],
+        write_positions=[],
+        write_req_seed_slot_indices=[],
+        write_req_entry_starts=[],
+        write_req_entry_counts=[],
+        write_req_active_mask=[],
+        state=state,
+        kernel_kind=KERNEL_KIND_TAIL,
+    )
+
+    assert int(state["is_errored"].item()) == 0
+    assert int(state["first_violation_set"].item()) == 0
+
+    # Also corrupt slot[0].real_kv_hash (field index 3). With real_kv mode
+    # OFF the expected real_kv_hash is 0; a non-zero stored value must
+    # still trigger kFailReasonRealKvHash even under the skip sentinel,
+    # proving the real_kv_hash check is independent of the chain skip.
+    buf_view[0, 3] = torch.tensor(
+        to_signed_int64(0xCAFEBABECAFEBABE), dtype=torch.int64, device="cuda"
+    )
+
+    _run(
+        src=buf,
+        dst=buf,
+        slot_stride_bytes=slot_stride,
+        verify_slot_indices=[0],
+        verify_positions=[0],
+        verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
+        verify_active_mask=[1],
+        write_slot_indices=[],
+        write_token_ids=[],
+        write_positions=[],
+        write_req_seed_slot_indices=[],
+        write_req_entry_starts=[],
+        write_req_entry_counts=[],
+        write_req_active_mask=[],
+        state=state,
+        kernel_kind=KERNEL_KIND_TAIL,
+    )
+
+    assert int(state["is_errored"].item()) == 1
+    first = state["first_violation"].cpu().tolist()
+    assert int(first[1]) == FailReason.REAL_KV_HASH.value
 
 
 def test_inactive_mask_rows_are_skipped_no_io_no_counter():

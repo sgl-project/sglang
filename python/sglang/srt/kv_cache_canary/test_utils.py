@@ -7,6 +7,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
+from sglang.srt.kv_cache_canary.sweep import (
+    compute_alive_owned_slots,
+    extract_active_rows,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -14,6 +18,17 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 logger = logging.getLogger(__name__)
 
 _PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
+_REAL_PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
+
+
+def _get_or_init_rng(
+    cache: Dict[int, random.Random], base_seed: int, rank: int
+) -> random.Random:
+    rng = cache.get(rank)
+    if rng is None:
+        rng = random.Random(_rng_seed_for_rank(base_seed, rank))
+        cache[rank] = rng
+    return rng
 
 
 def maybe_perturb_hook(
@@ -23,7 +38,7 @@ def maybe_perturb_hook(
     forward_batch: ForwardBatch,
 ) -> None:
     """Shared eager + replay self-test perturb hook."""
-    active_indices, active_seq_lens = _extract_active_rows(forward_batch)
+    active_indices, active_seq_lens = extract_active_rows(forward_batch)
     maybe_perturb_req_to_token(
         runner=runner,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -58,12 +73,9 @@ def maybe_perturb_req_to_token(
     if prob <= 0.0:
         return
 
-    rng = _PERTURB_RNG_CACHE.get(rank)
-    if rng is None:
-        rng = random.Random(
-            _rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank)
-        )
-        _PERTURB_RNG_CACHE[rank] = rng
+    rng = _get_or_init_rng(
+        _PERTURB_RNG_CACHE, runner.config.perturb_req_to_token_seed, rank
+    )
     if rng.random() >= prob:
         return
     table = req_to_token_pool.req_to_token
@@ -103,20 +115,66 @@ def maybe_perturb_req_to_token(
     )
 
 
-def _extract_active_rows(
-    forward_batch: Optional[ForwardBatch],
-) -> Tuple[Optional[List[int]], Optional[List[int]]]:
-    """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb."""
-    if forward_batch is None:
-        return None, None
-    if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
-        return None, None
-    indices = forward_batch.req_pool_indices.detach().cpu().tolist()
-    seq_lens = forward_batch.seq_lens.detach().cpu().tolist()
-    return indices, seq_lens
-
-
 def _rng_seed_for_rank(base_seed: int, rank: int) -> int:
     return (
         (base_seed & 0xFFFFFFFF) * 0x9E3779B1 + rank * 0xBF58476D1CE4E5B9
     ) & 0xFFFFFFFFFFFFFFFF
+
+
+def maybe_perturb_real_kv_bytes(
+    *,
+    runner: Optional[CanaryRunner],
+    req_to_token_pool: Optional[ReqToTokenPool],
+    forward_batch: Optional[ForwardBatch],
+) -> None:
+    """Self-test: flip one byte of real KV at an alive slot not in this step's
+    verify list, so only the periodic sweep can catch it.
+
+    Must run AFTER the per-step head/tail freeze and BEFORE the sweep launch.
+    """
+    if runner is None or forward_batch is None or req_to_token_pool is None:
+        return
+    prob = runner.config.real_perturb_bytes_prob
+    if prob <= 0.0:
+        return
+
+    rank = runner.tp_rank
+    rng = _get_or_init_rng(
+        _REAL_PERTURB_RNG_CACHE, runner.config.real_perturb_bytes_seed, rank
+    )
+    if rng.random() >= prob:
+        return
+
+    group = runner.buffer_group
+    if group.real_kv_source is None or group.real_kv_slot_stride_bytes <= 0:
+        return
+
+    alive = compute_alive_owned_slots(
+        req_to_token_pool=req_to_token_pool, forward_batch=forward_batch
+    )
+    if alive.numel() == 0:
+        return
+
+    last_plan = runner.last_plan
+    verify_this_step = (
+        set(last_plan.verify_slot_indices) if last_plan is not None else set()
+    )
+    alive_list = alive.detach().cpu().tolist()
+    idle_alive: List[int] = [
+        int(s) for s in alive_list if int(s) not in verify_this_step
+    ]
+    if not idle_alive:
+        return
+
+    slot_idx = idle_alive[rng.randrange(len(idle_alive))]
+    stride = int(group.real_kv_slot_stride_bytes)
+    byte_offset = rng.randrange(stride)
+    flat = group.real_kv_source.view(torch.uint8).flatten()
+    base = slot_idx * stride
+    flat[base + byte_offset] ^= 0xFF
+    logger.warning(
+        "kv-canary self-test: perturbed real KV bytes at slot=%d offset=%d (rank=%d)",
+        slot_idx,
+        byte_offset,
+        rank,
+    )

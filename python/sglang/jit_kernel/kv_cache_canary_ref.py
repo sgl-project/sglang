@@ -30,6 +30,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _CANARY_FIELD_TOKEN_ID,
     CANARY_EXPECTED_SKIP_SENTINEL,
     REAL_KV_HASH_MODE_OFF,
+    SKIP_CHAIN_SENTINEL,
     FailReason,
     to_signed_int64,
 )
@@ -459,7 +460,10 @@ def _run_verify_entries(
             int_views.load_field(slot_idx, _CANARY_FIELD_REAL_KV_HASH) & _U64_MASK
         )
 
-        if prev_slot_idx < 0:
+        skip_chain_check = prev_slot_idx == SKIP_CHAIN_SENTINEL
+        if skip_chain_check:
+            expected_prev_hash = 0
+        elif prev_slot_idx < 0:
             expected_prev_hash = seed & _U64_MASK
         else:
             prev_prev_hash = (
@@ -483,7 +487,7 @@ def _run_verify_entries(
         fail_reason = FailReason.NONE
         if actual_position != expected_position:
             fail_reason = FailReason.POSITION_MONOTONIC
-        elif actual_prev_hash != expected_prev_hash:
+        elif not skip_chain_check and actual_prev_hash != expected_prev_hash:
             fail_reason = FailReason.HASH
         elif actual_real_kv_hash != expected_real_kv_hash:
             fail_reason = FailReason.REAL_KV_HASH
@@ -553,7 +557,10 @@ def _run_write_chains(
             position = int(plan.write_positions[i])
 
             expected_token = int(plan.expected_write_token_ids[i])
-            if expected_token != CANARY_EXPECTED_SKIP_SENTINEL and expected_token != token_id:
+            if (
+                expected_token != CANARY_EXPECTED_SKIP_SENTINEL
+                and expected_token != token_id
+            ):
                 sink.record(
                     fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
                     slot_idx=slot_idx,
@@ -566,7 +573,10 @@ def _run_write_chains(
                     expected_position=0,
                 )
             expected_pos = int(plan.expected_write_positions[i])
-            if expected_pos != CANARY_EXPECTED_SKIP_SENTINEL and expected_pos != position:
+            if (
+                expected_pos != CANARY_EXPECTED_SKIP_SENTINEL
+                and expected_pos != position
+            ):
                 sink.record(
                     fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
                     slot_idx=slot_idx,
