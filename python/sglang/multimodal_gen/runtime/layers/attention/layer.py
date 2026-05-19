@@ -655,11 +655,11 @@ class USPAttention(nn.Module):
                 "USPAttention supports at most one replicated-token mode per call."
             )
 
-        # When ring > 1, convert replicated tokens to sharded so the
-        # standard ulysses + ring path can handle them.  The ulysses-only
-        # optimized paths below assume ring == 1.
+        # When both ulysses > 1 and ring > 1, convert replicated tokens
+        # to sharded so the standard ulysses + ring path can handle them.
+        # When ulysses == 1, ring handles the full tensor correctly.
         num_rep = num_replicated_prefix or num_replicated_suffix
-        if ring_size > 1 and num_rep > 0:
+        if ring_size > 1 and sp_size > 1 and num_rep > 0:
             return self._shard_replicated_and_forward(
                 q, k, v, num_replicated_prefix, num_replicated_suffix
             )
