@@ -46,7 +46,7 @@ class TestNPULogRequestsFormatJson(TestNPULogRequestsFormatText):
         self.inference_once()
 
         content = self.output_capturer.get_all()
-        ts_pattern = re.compile(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}]\s*')
+        ts_pattern = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}]\s*")
         received_found = False
         finished_found = False
         for line in content.splitlines():
@@ -55,10 +55,10 @@ class TestNPULogRequestsFormatJson(TestNPULogRequestsFormatText):
                 continue
 
             # Match valid timestamps
-            if s.startswith('['):
-                s = ts_pattern.sub('', s)
+            if s.startswith("["):
+                s = ts_pattern.sub("", s)
 
-            if not s.startswith('{'):
+            if not s.startswith("{"):
                 continue
             try:
                 data = json.loads(s)
