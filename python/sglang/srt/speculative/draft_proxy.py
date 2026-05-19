@@ -12,10 +12,10 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftMeshMessageType,
     DraftTailStreamOutputBatch,
 )
-from sglang.srt.speculative.decoupled_spec_trace import (
-    DecoupledSpecTraceEvent,
-    NullDecoupledSpecTracer,
-    trace_decoupled_spec,
+from sglang.srt.speculative.tracer import (
+    SpecTraceEvent,
+    NullSpecTracer,
+    trace_speculative,
 )
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 from sglang.srt.utils.network import get_zmq_socket
@@ -42,7 +42,7 @@ class DraftProxyThread:
     ) -> None:
         self.verifier_rank = int(verifier_rank)
         self.draft_tail_buffer = draft_tail_buffer
-        self.tracer = tracer or NullDecoupledSpecTracer()
+        self.tracer = tracer or NullSpecTracer()
         # verifier -> drafter send control messages
         self.control_send_sockets: dict[int, zmq.Socket] = {
             drafter_rank: get_zmq_socket(
@@ -83,8 +83,8 @@ class DraftProxyThread:
         self._apply_control_batch(batch)
         self._send_queue.put(batch)
 
-    @trace_decoupled_spec(
-        DecoupledSpecTraceEvent.DRAFT_PROXY_APPLY_CONTROL_BATCH,
+    @trace_speculative(
+        SpecTraceEvent.DRAFT_PROXY_APPLY_CONTROL_BATCH,
         inject_trace_enabled="collect_trace_stats",
     )
     def _apply_control_batch(
@@ -102,7 +102,7 @@ class DraftProxyThread:
         output_batch = self._recv_tail_stream_output_batch_from_socket()
         self._append_tail_stream_output_batch(output_batch)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFT_PROXY_RECV_TAIL_STREAM_BATCH)
+    @trace_speculative(SpecTraceEvent.DRAFT_PROXY_RECV_TAIL_STREAM_BATCH)
     def _recv_tail_stream_output_batch_from_socket(
         self,
     ) -> DraftTailStreamOutputBatch:
@@ -130,8 +130,8 @@ class DraftProxyThread:
             )
         return output_batch
 
-    @trace_decoupled_spec(
-        DecoupledSpecTraceEvent.DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH,
+    @trace_speculative(
+        SpecTraceEvent.DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH,
         inject_trace_enabled="collect_trace_stats",
     )
     def _append_tail_stream_output_batch(
@@ -145,7 +145,7 @@ class DraftProxyThread:
             collect_stats=collect_trace_stats,
         )
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH)
+    @trace_speculative(SpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH)
     def _send_control_batch(self, batch: DraftControlBatch) -> None:
         dst_drafter_rank = int(batch.dst_drafter_rank)
         socket = self.control_send_sockets.get(dst_drafter_rank)

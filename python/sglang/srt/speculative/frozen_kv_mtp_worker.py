@@ -64,6 +64,10 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
+from sglang.srt.speculative.tracer import (
+    SpecTraceEvent,
+    trace_speculative,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -493,6 +497,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch_result.can_run_cuda_graph,
         )
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT_EXTEND)
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
@@ -510,6 +515,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             mm_input_embeds=mm_input_embeds,
         )
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT_EXTEND)
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
         draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
@@ -558,6 +564,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.seq_lens_cpu = seq_lens_cpu_backup
             batch.req_pool_indices = req_pool_indices_backup
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT)
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return FrozenKVMTPVerifyInput.create_idle_input(
@@ -698,6 +705,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
+    @trace_speculative(SpecTraceEvent.MTP_VERIFY)
     def verify(self, batch: ScheduleBatch):
         spec_info: FrozenKVMTPVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()

@@ -24,10 +24,10 @@ from sglang.srt.speculative.decoupled_spec_io import (
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
 )
-from sglang.srt.speculative.decoupled_spec_trace import (
-    DecoupledSpecTraceEvent,
-    build_decoupled_spec_tracer,
-    trace_decoupled_spec,
+from sglang.srt.speculative.tracer import (
+    SpecTraceEvent,
+    build_tracer,
+    trace_speculative,
 )
 from sglang.srt.speculative.draft_proxy import DraftProxyThread
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
@@ -106,7 +106,7 @@ class SchedulerDecoupledSpecMixin:
             result_bind_endpoint=ipc_config.bind_endpoint,
             drafter_control_endpoints=ipc_config.connect_endpoints,
             draft_tail_buffer=self.draft_tail_buffer,
-            tracer=self.decoupled_spec_tracer,
+            tracer=self.tracer,
         )
         self.draft_proxy_thread.start()
 
@@ -124,7 +124,7 @@ class SchedulerDecoupledSpecMixin:
             control_bind_endpoint=ipc_config.bind_endpoint,
             verifier_result_endpoints=ipc_config.connect_endpoints,
             drafter_rank=ipc_config.rank,
-            tracer=self.decoupled_spec_tracer,
+            tracer=self.tracer,
         )
         self.token_sync_thread.start()
 
@@ -163,9 +163,9 @@ class SchedulerDecoupledSpecMixin:
             )
         ):
             return None
-        return self.decoupled_spec_tracer.start_timer()
+        return self.tracer.start_timer()
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.SCHEDULER_FORWARD_BATCH)
+    @trace_speculative(SpecTraceEvent.SCHEDULER_FORWARD_BATCH)
     def record_forward_latency(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -175,7 +175,7 @@ class SchedulerDecoupledSpecMixin:
         if start_ns is None:
             return
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS)
+    @trace_speculative(SpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS)
     def flush_draft_updates(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -235,13 +235,14 @@ class SchedulerDecoupledSpecMixin:
         elif batch.forward_mode.is_decode():
             self._snapshot_verify_inputs(batch)
 
-    def create_spec_tracer(self):
+    def create_tracer(self):
         enabled = bool(
-            getattr(self.server_args, "decoupled_spec_trace_dir", None)
+            getattr(self.server_args, "spec_trace_dir", None)
             and (
                 self.spec_algorithm.is_decoupled_verify()
                 or self.spec_algorithm.is_decoupled_draft()
                 or self.spec_algorithm.is_none()
+                or self.spec_algorithm.is_eagle()
             )
         )
         dp_rank = self.dp_rank or 0
@@ -252,20 +253,23 @@ class SchedulerDecoupledSpecMixin:
             forward_trace_prefix = "drafter"
         elif self.spec_algorithm.is_none():
             forward_trace_prefix = "decode"
+        elif self.spec_algorithm.is_eagle():
+            forward_trace_prefix = "mtp"
         else:
             forward_trace_prefix = "scheduler"
         file_names = {
             "scheduler.forward_batch": (
                 f"{forward_trace_prefix}-forward-batch_{rank_suffix}.csv"
             ),
+            "mtp.phase": f"mtp-phase_{rank_suffix}.csv",
             "verifier": f"verifier_{rank_suffix}.csv",
             "drafter": f"drafter_{rank_suffix}.csv",
             "draft_proxy": f"draft_proxy_verifier{dp_rank}.csv",
             "token_sync_thread": f"token_sync_thread_drafter{dp_rank}.csv",
         }
-        return build_decoupled_spec_tracer(
+        return build_tracer(
             enabled=enabled,
-            output_dir=getattr(self.server_args, "decoupled_spec_trace_dir", None),
+            output_dir=getattr(self.server_args, "spec_trace_dir", None),
             file_names=file_names,
         )
 
@@ -1016,7 +1020,7 @@ class SchedulerDecoupledSpecMixin:
             entry.pending_close = message
             self.draft_sleeping_reqs.pop(message.draft_key, None)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES)
+    @trace_speculative(SpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES)
     def sync_draft_requests(self: Scheduler) -> dict | None:
         """
         (called by decoupled drafter)
@@ -1146,7 +1150,7 @@ class SchedulerDecoupledSpecMixin:
         )
         return batch
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_SLEEP_REQUESTS)
+    @trace_speculative(SpecTraceEvent.DRAFTER_SLEEP_REQUESTS)
     def sleep_overrun_draft_requests(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
@@ -1185,7 +1189,7 @@ class SchedulerDecoupledSpecMixin:
             )
         return batch
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.DRAFTER_WAKE_REQUESTS)
+    @trace_speculative(SpecTraceEvent.DRAFTER_WAKE_REQUESTS)
     def wake_draft_sleeping_requests(self: Scheduler) -> Optional[dict]:
         window = self._draft_ahead_window()
         if window <= 0 or not self.draft_sleeping_reqs:
@@ -1572,7 +1576,7 @@ class SchedulerDecoupledSpecMixin:
                 list(snapshot.raw_tail_tokens),
             )
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH)
+    @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH)
     def _sync_verify_requests(self, batch: ScheduleBatch) -> dict | None:
         """
         Send DraftSync messages before verifier prefill/extend processing.
@@ -1638,7 +1642,7 @@ class SchedulerDecoupledSpecMixin:
         self._send_verify_control_batches(sync_messages=sync_messages)
         return trace_payload
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH)
+    @trace_speculative(SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH)
     def _snapshot_verify_inputs(self, batch: ScheduleBatch) -> dict | None:
         """
         Collect currently available draft tails, and bind them to a verifier request batch.
@@ -1701,7 +1705,7 @@ class SchedulerDecoupledSpecMixin:
             "output_lens_by_req": [len(req.output_ids) for req in target_reqs],
         }
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH)
+    @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH)
     def submit_verify_updates(
         self,
         batch: ScheduleBatch,

@@ -18,10 +18,10 @@ from sglang.srt.speculative.decoupled_spec_io import (
     VerifyCommit,
     iter_control_batch_messages,
 )
-from sglang.srt.speculative.decoupled_spec_trace import (
-    DecoupledSpecTraceEvent,
-    NullDecoupledSpecTracer,
-    trace_decoupled_spec,
+from sglang.srt.speculative.tracer import (
+    SpecTraceEvent,
+    NullSpecTracer,
+    trace_speculative,
 )
 from sglang.srt.utils.network import get_zmq_socket
 
@@ -55,7 +55,7 @@ class TokenSyncThread:
 
     def __post_init__(self) -> None:
         if self.tracer is None:
-            self.tracer = NullDecoupledSpecTracer()
+            self.tracer = NullSpecTracer()
         if (
             self.context is None
             or self.control_bind_endpoint is None
@@ -104,7 +104,7 @@ class TokenSyncThread:
         for socket in self.result_send_sockets.values():
             socket.close(linger=0)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET)
     def _drain_control_socket(self) -> bool | dict[str, Any]:
         pending_controls_before = self._pending_controls_size()
         num_control_batches = 0
@@ -138,7 +138,7 @@ class TokenSyncThread:
             "num_control_messages": num_control_messages,
         }
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH)
     def _recv_control_messages_from_socket(self) -> list[DraftControlMessage] | None:
         message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
         if not isinstance(message, DraftMeshMessage):
@@ -153,7 +153,7 @@ class TokenSyncThread:
             return None
         return iter_control_batch_messages(control_batch)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
     def drain_control_messages(self) -> list[DraftControlMessage]:
         """Drain all pending control messages while preserving arrival order."""
         drained_messages: list[DraftControlMessage] = []
@@ -162,8 +162,8 @@ class TokenSyncThread:
                 drained_messages.append(self._pending_controls.popleft())
         return drained_messages
 
-    @trace_decoupled_spec(
-        DecoupledSpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH
+    @trace_speculative(
+        SpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH
     )
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
@@ -172,7 +172,7 @@ class TokenSyncThread:
         self._outgoing_results.put(queued_batch)
         self._wakeup.set()
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS)
     def _drain_outgoing_results(self) -> bool | dict[str, Any]:
         queue_size_before = self._outgoing_results_size()
         did_work = False
@@ -212,7 +212,7 @@ class TokenSyncThread:
         for dst_verifier_rank, send_batch in batches_by_verifier.items():
             self._send_result_batch(dst_verifier_rank, send_batch)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_SEND_RESULT_BATCH)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_SEND_RESULT_BATCH)
     def _send_result_batch(
         self,
         dst_verifier_rank: int,
@@ -235,7 +235,7 @@ class TokenSyncThread:
         with self._pending_lock:
             return len(self._pending_controls)
 
-    @trace_decoupled_spec(DecoupledSpecTraceEvent.TOKEN_SYNC_IDLE_WAIT)
+    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_IDLE_WAIT)
     def _idle_wait(self) -> dict[str, Any]:
         queue_size_before = self._outgoing_results_size()
         pending_controls_before = self._pending_controls_size()

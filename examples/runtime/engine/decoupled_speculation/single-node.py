@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run decoupled speculation on a single node without Ray, "
-            "optionally comparing against normal decode."
+            "optionally comparing against a decode or MTP baseline."
         )
     )
     parser.add_argument(
@@ -148,18 +148,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="MoE A2A backend for the target/verifier engine, e.g. deepep.",
     )
-    parser.add_argument(
-        "--target-mamba-scheduler-strategy",
-        "--mamba-scheduler-strategy",
-        dest="target_mamba_scheduler_strategy",
-        choices=["auto", "no_buffer", "extra_buffer"],
-        default=None,
-        help=(
-            "Mamba scheduler strategy for the target/verifier engine. "
-            "Decoupled verifier and drafter engines disable radix cache, so "
-            "the default no_buffer strategy is normally sufficient."
-        ),
-    )
     parser.add_argument("--draft-tp-size", type=int, default=1)
     parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -221,7 +209,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Base port for this run. Spec dist-init uses base, decode uses "
+            "Base port for this run. Spec dist-init uses base, baseline uses "
             "base+1, verifier result endpoint uses base+2, and drafter control "
             "endpoints start at base+3."
         ),
@@ -238,14 +226,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional directory to write per-mode CSV/JSON outputs. "
-            "A normal comparison run writes decoupled-spec.csv, "
-            "decoupled-spec.json, decode.csv, and decode.json."
+            "A baseline comparison run writes decoupled-spec.csv/json plus "
+            "<baseline>.csv/json."
         ),
     )
     parser.add_argument(
-        "--skip-decode",
-        action="store_true",
-        help="Only run decoupled speculation and skip the normal decode baseline.",
+        "--baseline",
+        choices=["decode", "mtp", "none"],
+        default="decode",
+        help=(
+            "Baseline to run after decoupled speculation. 'mtp' uses SGLang's "
+            "builtin colocated, serial draft-verify MTP/EAGLE path."
+        ),
     )
     parser.add_argument(
         "--show-responses",
@@ -256,9 +248,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--decoupled-spec-trace-dir",
+        "--spec-trace-dir",
         default=None,
-        help="Directory for decoupled speculative decoding CSV trace files.",
+        help="Directory for speculative decoding CSV trace files.",
     )
     parser.add_argument(
         "--draft-ready-timeout-s",
@@ -311,14 +303,31 @@ def _port_available(port: int) -> bool:
     return True
 
 
-def _pick_free_port_block(num_ports: int) -> int:
+def _pick_free_port_block(
+    num_ports: int,
+    *,
+    avoid_ports: set[int] | None = None,
+) -> int:
+    avoid_ports = avoid_ports or set()
     for _ in range(256):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind((LOCAL_HOST, 0))
             base_port = int(sock.getsockname()[1])
-        if all(_port_available(base_port + offset) for offset in range(num_ports)):
+        candidate_ports = {base_port + offset for offset in range(num_ports)}
+        if candidate_ports & avoid_ports:
+            continue
+        if all(_port_available(port) for port in candidate_ports):
             return base_port
     raise RuntimeError(f"failed to find a free local block of {num_ports} ports")
+
+
+def _port_from_dist_init_addr(addr: str | None) -> int | None:
+    if addr is None:
+        return None
+    try:
+        return int(addr.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
 
 
 def _format_tcp_endpoint(port: int) -> str:
@@ -432,7 +441,7 @@ def run_draft_engine_process(
     bind_endpoint: str,
     connect_endpoints: list[str],
     deterministic: bool,
-    decoupled_spec_trace_dir: str | None,
+    spec_trace_dir: str | None,
     ready_queue,
     stop_reader,
 ) -> None:
@@ -449,7 +458,7 @@ def run_draft_engine_process(
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
-            decoupled_spec_trace_dir=decoupled_spec_trace_dir,
+            spec_trace_dir=spec_trace_dir,
         )
         _add_decoupled_endpoint_kwargs(
             engine_kwargs,
@@ -559,7 +568,7 @@ def start_draft_engines(
                     bind_endpoint=endpoint,
                     connect_endpoints=result_endpoints,
                     deterministic=args.deterministic,
-                    decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+                    spec_trace_dir=args.spec_trace_dir,
                     ready_queue=ready_queue,
                     stop_reader=stop_reader,
                 ),
@@ -634,7 +643,7 @@ def create_verifier_engine(
         speculative_num_draft_tokens=args.num_speculative_steps + 1,
         disable_radix_cache=True,
         enable_deterministic_inference=args.deterministic,
-        decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+        spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
     _add_decoupled_endpoint_kwargs(
@@ -649,10 +658,6 @@ def create_verifier_engine(
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
         engine_kwargs["moe_a2a_backend"] = args.target_moe_a2a_backend
-    if args.target_mamba_scheduler_strategy is not None:
-        engine_kwargs["mamba_scheduler_strategy"] = (
-            args.target_mamba_scheduler_strategy
-        )
     return sgl.Engine(**engine_kwargs)
 
 
@@ -667,17 +672,40 @@ def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
         dist_init_addr=dist_init_addr,
         enable_deterministic_inference=args.deterministic,
         disable_overlap_schedule=True,
-        decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+        spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
         engine_kwargs["moe_a2a_backend"] = args.target_moe_a2a_backend
-    if args.target_mamba_scheduler_strategy is not None:
-        engine_kwargs["mamba_scheduler_strategy"] = (
-            args.target_mamba_scheduler_strategy
-        )
+    return sgl.Engine(**engine_kwargs)
+
+
+def create_mtp_engine(args: argparse.Namespace, *, dist_init_addr: str):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(args.target_gpus)
+
+    import sglang as sgl
+
+    engine_kwargs: dict[str, Any] = dict(
+        model_path=args.target_model_path,
+        tp_size=args.target_tp_size,
+        dist_init_addr=dist_init_addr,
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=args.num_speculative_steps,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=args.num_speculative_steps + 1,
+        enable_deterministic_inference=args.deterministic,
+        disable_radix_cache=True,
+        disable_overlap_schedule=True,
+        mamba_scheduler_strategy="no_buffer",
+        spec_trace_dir=args.spec_trace_dir,
+        log_level="info",
+    )
+    if args.target_ep_size is not None:
+        engine_kwargs["ep_size"] = args.target_ep_size
+    if args.target_moe_a2a_backend is not None:
+        engine_kwargs["moe_a2a_backend"] = args.target_moe_a2a_backend
     return sgl.Engine(**engine_kwargs)
 
 
@@ -731,9 +759,15 @@ def main() -> None:
 
     num_verifiers = args.num_verifier_replicas
     num_drafters = args.num_draft_replicas
-    base_port = args.dist_init_port or _pick_free_port_block(3 + num_drafters)
+    explicit_dist_init_port = _port_from_dist_init_addr(args.dist_init_addr)
+    base_port = args.dist_init_port or _pick_free_port_block(
+        3 + num_drafters,
+        avoid_ports=(
+            {explicit_dist_init_port} if explicit_dist_init_port is not None else None
+        ),
+    )
     spec_dist_init_addr = args.dist_init_addr or f"{LOCAL_HOST}:{base_port}"
-    decode_dist_init_addr = f"{LOCAL_HOST}:{base_port + num_verifiers}"
+    baseline_dist_init_addr = f"{LOCAL_HOST}:{base_port + num_verifiers}"
     result_endpoint = _format_tcp_endpoint(base_port + 2 * num_verifiers)
     control_endpoints = [
         _format_tcp_endpoint(base_port + 3 * num_verifiers + index)
@@ -750,7 +784,7 @@ def main() -> None:
     draft_processes: list[mp.Process] = []
     draft_stop_senders = None
     verifier_engine = None
-    decode_engine = None
+    baseline_engine = None
     try:
         draft_processes, draft_stop_senders = start_draft_engines(
             args,
@@ -783,23 +817,31 @@ def main() -> None:
         draft_processes = []
         draft_stop_senders = None
 
-        decode_metrics = None
-        if not args.skip_decode:
-            print("creating_decode_engine...", flush=True)
-            decode_engine = create_decode_engine(
-                args,
-                dist_init_addr=decode_dist_init_addr,
-            )
-            print("running_decode_generate...", flush=True)
-            decode_outputs = run_engine_generate(
-                decode_engine,
+        baseline_metrics = None
+        if args.baseline != "none":
+            print(f"creating_{args.baseline}_engine...", flush=True)
+            if args.baseline == "decode":
+                baseline_engine = create_decode_engine(
+                    args,
+                    dist_init_addr=baseline_dist_init_addr,
+                )
+            elif args.baseline == "mtp":
+                baseline_engine = create_mtp_engine(
+                    args,
+                    dist_init_addr=baseline_dist_init_addr,
+                )
+            else:
+                raise ValueError(f"Unsupported baseline: {args.baseline}")
+            print(f"running_{args.baseline}_generate...", flush=True)
+            baseline_outputs = run_engine_generate(
+                baseline_engine,
                 input_ids=prompt_input_ids,
                 sampling_params=sampling_params,
             )
-            print("decode_generate_done", flush=True)
-            decode_metrics = _collect_mode_metrics(
-                mode="decode",
-                outputs=decode_outputs,
+            print(f"{args.baseline}_generate_done", flush=True)
+            baseline_metrics = _collect_mode_metrics(
+                mode=args.baseline,
+                outputs=baseline_outputs,
                 prompt_samples=prompt_samples,
             )
 
@@ -811,7 +853,7 @@ def main() -> None:
             total_rows=total_rows,
             prompt_samples=prompt_samples,
             spec_metrics=spec_metrics,
-            decode_metrics=decode_metrics,
+            baseline_metrics=baseline_metrics,
         )
         result["config"]["runner"] = "single_node_no_ray"
         result["config"]["target_gpus"] = args.target_gpus
@@ -827,8 +869,8 @@ def main() -> None:
                 print(f"  {output_path}")
             print(f"  {_write_summary_json(result, args.output_dir)}")
     finally:
-        if decode_engine is not None:
-            decode_engine.shutdown()
+        if baseline_engine is not None:
+            baseline_engine.shutdown()
         if verifier_engine is not None:
             verifier_engine.shutdown()
         shutdown_draft_engines(draft_processes, draft_stop_senders)

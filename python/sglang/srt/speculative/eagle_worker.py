@@ -55,6 +55,10 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.tracer import (
+    SpecTraceEvent,
+    trace_speculative,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
@@ -747,6 +751,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=capture_mode,
         )
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT)
     def draft(self, batch: ScheduleBatch):
         # Parse args
         if batch.forward_mode.is_idle():
@@ -924,6 +929,7 @@ class EAGLEWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
+    @trace_speculative(SpecTraceEvent.MTP_VERIFY)
     def verify(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
@@ -1099,6 +1105,7 @@ class EAGLEWorker(TpModelWorker):
             model=self.target_worker.model_runner.model,
         )
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT_EXTEND)
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
@@ -1143,6 +1150,7 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
+    @trace_speculative(SpecTraceEvent.MTP_DRAFT_EXTEND)
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
     ) -> EagleDraftInput:

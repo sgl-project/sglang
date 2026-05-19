@@ -346,7 +346,7 @@ class DraftActor:
         connect_endpoints: list[str],
         rank: int,
         deterministic: bool = False,
-        decoupled_spec_trace_dir: str | None = None,
+        spec_trace_dir: str | None = None,
     ):
         """Pin GPUs and create the draft engine with a preplanned endpoint."""
         self.assigned_gpu_ids = pin_actor_to_assigned_gpus(tp_size)
@@ -362,7 +362,7 @@ class DraftActor:
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
-            decoupled_spec_trace_dir=decoupled_spec_trace_dir,
+            spec_trace_dir=spec_trace_dir,
         )
         self.control_endpoint = bind_endpoint
 
@@ -422,7 +422,7 @@ def launch_draft_actors(
             connect_endpoints=endpoint_config.connect_endpoints,
             rank=endpoint_config.rank,
             deterministic=args.deterministic,
-            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+            spec_trace_dir=args.spec_trace_dir,
         )
         actors.append(actor)
     ray.get([actor.ready.remote() for actor in actors])
@@ -523,7 +523,7 @@ def create_remote_decoupled_spec_topology(
 
 @ray.remote
 class TargetActor:
-    """Ray actor that hosts either a decoupled verifier or normal decode engine."""
+    """Ray actor that hosts a decoupled verifier, decode, or MTP engine."""
 
     def __init__(
         self,
@@ -533,7 +533,6 @@ class TargetActor:
         tp_size: int,
         ep_size: int | None = None,
         moe_a2a_backend: str | None = None,
-        mamba_scheduler_strategy: str | None = None,
         nnodes: int,
         node_rank: int,
         dist_init_addr: str | None,
@@ -542,7 +541,7 @@ class TargetActor:
         connect_endpoints: list[str] | None = None,
         rank: int | None = None,
         deterministic: bool = False,
-        decoupled_spec_trace_dir: str | None = None,
+        spec_trace_dir: str | None = None,
         log_level: str | None = None,
     ):
         """Pin GPUs and initialize the target engine for one node rank."""
@@ -559,7 +558,7 @@ class TargetActor:
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
             enable_deterministic_inference=deterministic,
-            decoupled_spec_trace_dir=decoupled_spec_trace_dir,
+            spec_trace_dir=spec_trace_dir,
         )
         if log_level is not None:
             engine_kwargs["log_level"] = log_level
@@ -567,8 +566,6 @@ class TargetActor:
             engine_kwargs["ep_size"] = ep_size
         if moe_a2a_backend is not None:
             engine_kwargs["moe_a2a_backend"] = moe_a2a_backend
-        if mamba_scheduler_strategy is not None:
-            engine_kwargs["mamba_scheduler_strategy"] = mamba_scheduler_strategy
         if mode == "decoupled_spec":
             engine_kwargs.update(
                 speculative_algorithm="DECOUPLED_VERIFY",
@@ -581,6 +578,16 @@ class TargetActor:
             )
         elif mode == "decode":
             engine_kwargs["disable_overlap_schedule"] = True
+        elif mode == "mtp":
+            engine_kwargs.update(
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=speculative_num_steps,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=speculative_num_steps + 1,
+                disable_radix_cache=True,
+                disable_overlap_schedule=True,
+                mamba_scheduler_strategy="no_buffer",
+            )
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 

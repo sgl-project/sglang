@@ -589,7 +589,7 @@ class ServerArgs:
     decoupled_spec_bind_endpoint: Optional[str] = None
     decoupled_spec_connect_endpoints: Optional[List[str]] = None
     decoupled_spec_rank: Optional[int] = None
-    decoupled_spec_trace_dir: Optional[str] = None
+    spec_trace_dir: Optional[str] = None
 
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
@@ -5803,11 +5803,11 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--decoupled-spec-trace-dir",
+            "--spec-trace-dir",
             type=str,
-            default=ServerArgs.decoupled_spec_trace_dir,
+            default=ServerArgs.spec_trace_dir,
             help=(
-                "Directory for decoupled speculative decoding CSV trace files. "
+                "Directory for speculative decoding CSV trace files. "
                 "Tracing is enabled when this flag is provided."
             ),
         )

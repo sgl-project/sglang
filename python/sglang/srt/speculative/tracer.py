@@ -201,6 +201,17 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "pending_controls_before_wait",
         "pending_controls_after_wait",
     ),
+    ("mtp", "phase"): _fields(
+        "phase",
+        "forward_mode",
+        "batch_size",
+        "rids",
+        "output_lens_by_req",
+        "spec_steps",
+        "topk",
+        "num_correct_drafts",
+        "num_correct_drafts_by_req",
+    ),
 }
 
 
@@ -218,7 +229,7 @@ TraceHook = Callable[[Any, tuple[Any, ...], dict[str, Any], Any], None]
 TraceGetter = Callable[[Any], Any]
 
 
-class DecoupledSpecTraceEvent(Enum):
+class SpecTraceEvent(Enum):
     SCHEDULER_FORWARD_BATCH = auto()
     VERIFIER_BUILD_SYNC_BATCH = auto()
     VERIFIER_SNAPSHOT_TAIL_BATCH = auto()
@@ -238,6 +249,9 @@ class DecoupledSpecTraceEvent(Enum):
     TOKEN_SYNC_DRAIN_OUTGOING_RESULTS = auto()
     TOKEN_SYNC_DRAIN_CONTROL_SOCKET = auto()
     TOKEN_SYNC_IDLE_WAIT = auto()
+    MTP_DRAFT = auto()
+    MTP_VERIFY = auto()
+    MTP_DRAFT_EXTEND = auto()
 
 
 @dataclass(frozen=True)
@@ -253,8 +267,6 @@ class _TraceEventSpec:
 
 def _default_trace_getter(owner: Any) -> Any:
     tracer = getattr(owner, "tracer", None)
-    if tracer is None:
-        tracer = getattr(owner, "decoupled_spec_tracer", None)
     return tracer
 
 
@@ -520,7 +532,7 @@ def _scheduler_forward_fields(
     elif worker_role == "verifier":
         committed_lens_by_req = [len(req.output_ids) for req in batch.reqs]
     event_fields = dict(
-        duration_ms=owner.decoupled_spec_tracer.elapsed_ms(start_ns),
+        duration_ms=owner.tracer.elapsed_ms(start_ns),
         worker_role=worker_role,
         forward_mode=str(batch.forward_mode),
         model_forward_mode=model_forward_mode or str(batch.forward_mode),
@@ -547,79 +559,138 @@ def _scheduler_forward_fields(
     return event_fields
 
 
-TRACE_EVENT_SPECS: dict[DecoupledSpecTraceEvent, _TraceEventSpec] = {
-    DecoupledSpecTraceEvent.SCHEDULER_FORWARD_BATCH: _TraceEventSpec(
+def _trace_batch_fields(batch: Any) -> dict[str, Any]:
+    reqs = list(getattr(batch, "reqs", []) or [])
+    forward_mode = getattr(batch, "forward_mode", "")
+    return {
+        "forward_mode": str(forward_mode),
+        "batch_size": len(reqs),
+        "rids": [str(getattr(req, "rid", "")) for req in reqs],
+        "output_lens_by_req": [
+            len(getattr(req, "output_ids", []) or []) for req in reqs
+        ],
+    }
+
+
+def _find_verify_output(result: Any) -> Any:
+    if hasattr(result, "num_correct_drafts_per_req_cpu"):
+        return result
+    if isinstance(result, tuple):
+        for item in result:
+            if hasattr(item, "num_correct_drafts_per_req_cpu"):
+                return item
+    return None
+
+
+def _mtp_phase_fields(phase: str) -> TraceFieldsFn:
+    def fields(
+        owner: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        result: Any,
+    ) -> dict[str, Any]:
+        batch = args[0] if args else kwargs.get("batch")
+        batch_fields = _trace_batch_fields(batch)
+        verify_output = _find_verify_output(result) if phase == "verify" else None
+        num_correct_by_req = (
+            list(getattr(verify_output, "num_correct_drafts_per_req_cpu", []) or [])
+            if verify_output is not None
+            else []
+        )
+        return {
+            "phase": phase,
+            **batch_fields,
+            "spec_steps": int(getattr(owner, "speculative_num_steps", 0) or 0),
+            "topk": int(getattr(owner, "topk", 0) or 0),
+            "num_correct_drafts": sum(int(x) for x in num_correct_by_req),
+            "num_correct_drafts_by_req": [int(x) for x in num_correct_by_req],
+        }
+
+    return fields
+
+
+TRACE_EVENT_SPECS: dict[SpecTraceEvent, _TraceEventSpec] = {
+    SpecTraceEvent.SCHEDULER_FORWARD_BATCH: _TraceEventSpec(
         "scheduler", "forward_batch", _scheduler_forward_fields
     ),
-    DecoupledSpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH: _TraceEventSpec(
+    SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH: _TraceEventSpec(
         "verifier", "build_sync_batch", _payload_fields
     ),
-    DecoupledSpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH: _TraceEventSpec(
+    SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH: _TraceEventSpec(
         "verifier", "snapshot_tail_batch", _payload_fields
     ),
-    DecoupledSpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH: _TraceEventSpec(
+    SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH: _TraceEventSpec(
         "verifier", "build_update_batch", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES: _TraceEventSpec(
+    SpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES: _TraceEventSpec(
         "drafter", "sync_control_messages", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS: _TraceEventSpec(
+    SpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS: _TraceEventSpec(
         "drafter", "emit_draft_tokens", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_SLEEP_REQUESTS: _TraceEventSpec(
+    SpecTraceEvent.DRAFTER_SLEEP_REQUESTS: _TraceEventSpec(
         "drafter", "sleep_requests", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFTER_WAKE_REQUESTS: _TraceEventSpec(
+    SpecTraceEvent.DRAFTER_WAKE_REQUESTS: _TraceEventSpec(
         "drafter", "wake_requests", _payload_fields
     ),
-    DecoupledSpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH: _TraceEventSpec(
+    SpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH: _TraceEventSpec(
         "draft_proxy", "send_control_batch", _draft_proxy_send_control_fields
     ),
-    DecoupledSpecTraceEvent.DRAFT_PROXY_RECV_TAIL_STREAM_BATCH: _TraceEventSpec(
+    SpecTraceEvent.DRAFT_PROXY_RECV_TAIL_STREAM_BATCH: _TraceEventSpec(
         "draft_proxy", "recv_tail_stream_batch", _draft_proxy_recv_tail_fields
     ),
-    DecoupledSpecTraceEvent.DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH: _TraceEventSpec(
+    SpecTraceEvent.DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH: _TraceEventSpec(
         "draft_proxy", "append_tail_stream_batch", _draft_proxy_append_tail_fields
     ),
-    DecoupledSpecTraceEvent.DRAFT_PROXY_APPLY_CONTROL_BATCH: _TraceEventSpec(
+    SpecTraceEvent.DRAFT_PROXY_APPLY_CONTROL_BATCH: _TraceEventSpec(
         "draft_proxy", "apply_control_batch", _draft_proxy_apply_control_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH: _TraceEventSpec(
         "token_sync_thread", "recv_control_batch", _token_sync_control_message_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH: _TraceEventSpec(
         "token_sync_thread",
         "drain_control_batch",
         _token_sync_control_message_fields,
         _non_empty_result,
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH: _TraceEventSpec(
         "token_sync_thread",
         "enqueue_draft_result_batch",
         _token_sync_enqueue_result_fields,
         lambda owner, args, kwargs, result: bool(getattr(args[0], "outputs", [])),
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_SEND_RESULT_BATCH: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_SEND_RESULT_BATCH: _TraceEventSpec(
         "token_sync_thread", "send_result_batch", _token_sync_send_result_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS: _TraceEventSpec(
         "token_sync_thread", "drain_outgoing_results", _payload_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET: _TraceEventSpec(
         "token_sync_thread", "drain_control_socket", _payload_fields
     ),
-    DecoupledSpecTraceEvent.TOKEN_SYNC_IDLE_WAIT: _TraceEventSpec(
+    SpecTraceEvent.TOKEN_SYNC_IDLE_WAIT: _TraceEventSpec(
         "token_sync_thread", "idle_wait", _payload_fields
+    ),
+    SpecTraceEvent.MTP_DRAFT: _TraceEventSpec(
+        "mtp", "phase", _mtp_phase_fields("draft")
+    ),
+    SpecTraceEvent.MTP_VERIFY: _TraceEventSpec(
+        "mtp", "phase", _mtp_phase_fields("verify")
+    ),
+    SpecTraceEvent.MTP_DRAFT_EXTEND: _TraceEventSpec(
+        "mtp", "phase", _mtp_phase_fields("draft_extend")
     ),
 }
 
 
-def trace_decoupled_spec(
-    event: DecoupledSpecTraceEvent,
+def trace_speculative(
+    event: SpecTraceEvent,
     tracer_getter: TraceGetter | None = None,
     inject_trace_enabled: str | None = None,
 ):
-    """Trace one decoupled-spec event selected by enum."""
+    """Trace one speculative decoding event selected by enum."""
     event_spec = TRACE_EVENT_SPECS[event]
 
     def decorator(fn):
@@ -660,7 +731,7 @@ def trace_decoupled_spec(
     return decorator
 
 
-class NullDecoupledSpecTracer:
+class NullSpecTracer:
     enabled = False
 
     def start_timer(self) -> None:
@@ -685,7 +756,7 @@ class NullDecoupledSpecTracer:
         return
 
 
-class DecoupledSpecCsvTracer:
+class SpecCsvTracer:
     enabled = True
 
     def __init__(self, *, output_dir: str | Path, file_names: dict[str, str]) -> None:
@@ -697,7 +768,7 @@ class DecoupledSpecCsvTracer:
         self._files: dict[tuple[str, str], Any] = {}
         self._thread = threading.Thread(
             target=self._run,
-            name="sglang-decoupled-spec-trace-writer",
+            name="sglang-spec-trace-writer",
             daemon=True,
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -746,14 +817,14 @@ class DecoupledSpecCsvTracer:
                     break
                 self._write_event(event)
         except Exception:
-            logger.exception("Decoupled spec trace writer failed")
+            logger.exception("Spec trace writer failed")
         finally:
             self._flush_files()
             for file in self._files.values():
                 try:
                     file.close()
                 except Exception:
-                    logger.exception("Failed to close decoupled spec trace file")
+                    logger.exception("Failed to close spec trace file")
 
     def _write_event(self, event: _TraceEvent) -> None:
         op = str(event.row["op"])
@@ -772,7 +843,7 @@ class DecoupledSpecCsvTracer:
             try:
                 file.flush()
             except Exception:
-                logger.exception("Failed to flush decoupled spec trace file")
+                logger.exception("Failed to flush spec trace file")
 
     def _get_writer(self, component: str, op: str) -> csv.DictWriter:
         event_key = (component, op)
@@ -817,7 +888,7 @@ class DecoupledSpecCsvTracer:
         fieldnames = TRACE_EVENT_SCHEMAS.get(event_key)
         if fieldnames is None:
             raise ValueError(
-                f"Unknown decoupled spec trace event: component={component} op={op}"
+                f"Unknown spec trace event: component={component} op={op}"
             )
 
         expected = set(fieldnames)
@@ -825,39 +896,39 @@ class DecoupledSpecCsvTracer:
         missing = expected - actual
         if missing:
             raise ValueError(
-                "Missing decoupled spec trace fields for "
+                "Missing spec trace fields for "
                 f"component={component} op={op}: {sorted(missing)}"
             )
         extra = actual - expected
         if extra:
             raise ValueError(
-                "Unexpected decoupled spec trace fields for "
+                "Unexpected spec trace fields for "
                 f"component={component} op={op}: {sorted(extra)}"
             )
         null_fields = [key for key, value in row.items() if value is None]
         if null_fields:
             raise ValueError(
-                "Null decoupled spec trace fields for "
+                "Null spec trace fields for "
                 f"component={component} op={op}: {sorted(null_fields)}"
             )
 
     def _serialize_value(self, value: Any) -> str:
         if value is None:
-            raise ValueError("Decoupled spec trace fields cannot be None")
+            raise ValueError("Spec trace fields cannot be None")
         if isinstance(value, (str, int, float, bool)):
             return str(value)
         return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
-def build_decoupled_spec_tracer(
+def build_tracer(
     *,
     enabled: bool,
     output_dir: str | None,
     file_names: dict[str, str],
-) -> NullDecoupledSpecTracer | DecoupledSpecCsvTracer:
+) -> NullSpecTracer | SpecCsvTracer:
     if not enabled:
-        return NullDecoupledSpecTracer()
-    return DecoupledSpecCsvTracer(
-        output_dir=output_dir or "decoupled_spec_trace",
+        return NullSpecTracer()
+    return SpecCsvTracer(
+        output_dir=output_dir or "spec_trace",
         file_names=file_names,
     )

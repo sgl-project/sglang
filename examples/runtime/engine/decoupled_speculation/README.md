@@ -28,11 +28,21 @@ python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --draft-tp-size 1 \
   --max-new-tokens 128
 
+# Single prompt, compare against SGLang builtin colocated MTP/EAGLE.
+python examples/runtime/engine/decoupled_speculation/multi-node.py \
+  --prompt "Write a short haiku about distributed systems." \
+  --baseline mtp \
+  --target-model-path Qwen/Qwen3-32B \
+  --draft-model-path Qwen/Qwen3-0.6B \
+  --target-tp-size 4 \
+  --draft-tp-size 1 \
+  --max-new-tokens 128
+
 # Dataset batch, decoupled speculation only.
 python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --dataset-path /path/to/prompts.parquet \
   --batch-size 16 \
-  --skip-decode \
+  --baseline none \
   --target-model-path /path/to/target \
   --draft-model-path /path/to/draft \
   --target-tp-size 8 \
@@ -44,7 +54,7 @@ python examples/runtime/engine/decoupled_speculation/multi-node.py \
 python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --dataset-path /path/to/prompts.parquet \
   --batch-size 64 \
-  --skip-decode \
+  --baseline none \
   --target-model-path /path/to/target \
   --draft-model-path /path/to/draft \
   --nnodes 4 \
@@ -60,6 +70,18 @@ python examples/runtime/engine/decoupled_speculation/multi-node.py \
 python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --prompt "Explain speculative decoding." \
   --show-responses \
+  --output-dir ./decoupled_spec_outputs \
+  --target-model-path /path/to/target \
+  --draft-model-path /path/to/draft \
+  --target-tp-size 4 \
+  --draft-tp-size 1 \
+  --max-new-tokens 256
+
+# Write decoupled/decode/MTP tracer CSV files under one directory.
+python examples/runtime/engine/decoupled_speculation/multi-node.py \
+  --prompt "Explain speculative decoding." \
+  --baseline mtp \
+  --spec-trace-dir ./spec_traces \
   --output-dir ./decoupled_spec_outputs \
   --target-model-path /path/to/target \
   --draft-model-path /path/to/draft \

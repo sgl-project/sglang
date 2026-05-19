@@ -3,9 +3,10 @@
 Run decoupled speculative decoding for either an input prompt or a prompt dataset.
 
 By default, this compares decoupled speculative decoding against normal decode.
-Use `--skip-decode` to run decoupled speculation only and `--show-responses` to
-print full response text. When `--output-dir` is set, JSON output records full
-prompt and response text.
+Use `--baseline none` to run decoupled speculation only, `--baseline mtp` to
+compare against SGLang's builtin colocated MTP baseline, and `--show-responses`
+to print full response text. When `--output-dir` is set, JSON output records
+full prompt and response text.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run decoupled speculation on one prompt or a parquet prompt batch, "
-            "optionally comparing against normal decode."
+            "optionally comparing against a decode or MTP baseline."
         )
     )
     parser.add_argument(
@@ -187,18 +188,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="MoE A2A backend for the target/verifier engine, e.g. deepep.",
     )
-    parser.add_argument(
-        "--target-mamba-scheduler-strategy",
-        "--mamba-scheduler-strategy",
-        dest="target_mamba_scheduler_strategy",
-        choices=["auto", "no_buffer", "extra_buffer"],
-        default=None,
-        help=(
-            "Mamba scheduler strategy for the target/verifier engine. "
-            "Decoupled verifier and drafter engines disable radix cache, so "
-            "the default no_buffer strategy is normally sufficient."
-        ),
-    )
     parser.add_argument("--draft-tp-size", type=int, default=1)
     parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -269,7 +258,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Base port for this run. With V verifier replicas, spec dist-init "
-            "uses base..base+V-1, decode uses base+V..base+2V-1, verifier "
+            "uses base..base+V-1, baseline uses base+V..base+2V-1, verifier "
             "result endpoints use base+2V..base+3V-1, and drafter control "
             "endpoints start at base+3V."
         ),
@@ -286,14 +275,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional directory to write per-mode CSV/JSON outputs. "
-            "A normal comparison run writes decoupled-spec.csv, "
-            "decoupled-spec.json, decode.csv, and decode.json."
+            "A baseline comparison run writes decoupled-spec.csv/json plus "
+            "<baseline>.csv/json."
         ),
     )
     parser.add_argument(
-        "--skip-decode",
-        action="store_true",
-        help="Only run decoupled speculation and skip the normal decode baseline.",
+        "--baseline",
+        choices=["decode", "mtp", "none"],
+        default="decode",
+        help=(
+            "Baseline to run after decoupled speculation. 'mtp' uses SGLang's "
+            "builtin colocated, serial draft-verify MTP/EAGLE path."
+        ),
     )
     parser.add_argument(
         "--show-responses",
@@ -304,9 +297,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--decoupled-spec-trace-dir",
+        "--spec-trace-dir",
         default=None,
-        help="Directory for decoupled speculative decoding CSV trace files.",
+        help="Directory for speculative decoding CSV trace files.",
     )
     return parser.parse_args()
 
@@ -657,7 +650,6 @@ def launch_target_actors(
             tp_size=args.target_tp_size,
             ep_size=args.target_ep_size,
             moe_a2a_backend=args.target_moe_a2a_backend,
-            mamba_scheduler_strategy=args.target_mamba_scheduler_strategy,
             nnodes=target_nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
@@ -666,7 +658,7 @@ def launch_target_actors(
             connect_endpoints=connect_endpoints,
             rank=rank,
             deterministic=args.deterministic,
-            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+            spec_trace_dir=args.spec_trace_dir,
             log_level="info",
         )
         actors.append(actor)
@@ -862,7 +854,7 @@ def main() -> None:
         }
         num_verifiers = args.num_verifier_replicas
         reserved_dist_init_ports = set(spec_dist_init_ports)
-        if not args.skip_decode:
+        if args.baseline != "none":
             if args.dist_init_port is not None:
                 reserved_dist_init_ports.update(
                     args.dist_init_port + num_verifiers + replica_index
@@ -919,9 +911,9 @@ def main() -> None:
         shutdown_actors(draft_actors)
         draft_actors = []
 
-        decode_metrics = None
-        if not args.skip_decode:
-            decode_dist_init_addrs = [
+        baseline_metrics = None
+        if args.baseline != "none":
+            baseline_dist_init_addrs = [
                 derive_dist_init_addr_from_pg(
                     args,
                     pg,
@@ -929,13 +921,13 @@ def main() -> None:
                 )
                 for replica_index, pg in enumerate(spec_pgs)
             ]
-            decode_metrics = run_mode(
+            baseline_metrics = run_mode(
                 args=args,
-                mode="decode",
+                mode=args.baseline,
                 prompt_input_ids=prompt_input_ids,
                 sampling_params=sampling_params,
                 prompt_samples=prompt_samples,
-                dist_init_addrs=decode_dist_init_addrs,
+                dist_init_addrs=baseline_dist_init_addrs,
                 target_nnodes=target_nnodes,
                 target_gpus_per_node=target_gpus_per_node,
                 pgs=spec_pgs,
@@ -950,7 +942,7 @@ def main() -> None:
             total_rows=total_rows,
             prompt_samples=prompt_samples,
             spec_metrics=spec_metrics,
-            decode_metrics=decode_metrics,
+            baseline_metrics=baseline_metrics,
         )
         print_summary(result)
         if args.output_dir:

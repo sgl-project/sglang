@@ -416,7 +416,7 @@ class Scheduler(
                 self.attn_cp_size,
             )
         )
-        self.decoupled_spec_tracer = self.create_spec_tracer()
+        self.tracer = self.create_tracer()
 
         self.enable_kv_cache_events = bool(
             server_args.kv_events_config and self.attn_tp_rank == 0
@@ -712,6 +712,10 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        self.draft_worker.tracer = self.tracer
+        nested_draft_worker = getattr(self.draft_worker, "draft_worker", None)
+        if nested_draft_worker is not None:
+            nested_draft_worker.tracer = self.tracer
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (

@@ -240,6 +240,13 @@ def collect_mode_metrics(
                 "is missing meta_info['e2e_latency']; cannot compute request "
                 "duration without script-side timing."
             )
+        has_spec_acceptance_stats = (
+            accept_length is not None
+            or accept_rate is not None
+            or accepted_tokens > 0
+            or draft_tokens > 0
+            or verify_ct > 0
+        )
 
         request_metrics = {
             "batch_index": index,
@@ -255,6 +262,12 @@ def collect_mode_metrics(
             "request_latency_s": request_latency_s,
             "spec_accept_length": accept_length,
             "spec_accept_rate": accept_rate,
+            "spec_accepted_drafts": (
+                accepted_tokens if has_spec_acceptance_stats else None
+            ),
+            "spec_proposed_drafts": (
+                draft_tokens if has_spec_acceptance_stats else None
+            ),
             "spec_valid_accept_rate": valid_accept_rate,
             "spec_valid_accept_token_num": valid_accepted_tokens or None,
             "spec_valid_draft_token_num": valid_draft_tokens or None,
@@ -263,7 +276,7 @@ def collect_mode_metrics(
                 valid_accepted_tokens_by_position
             ),
             "spec_valid_draft_token_num_by_position": valid_draft_tokens_by_position,
-            "spec_verify_ct": verify_ct or None,
+            "spec_verify_ct": verify_ct if has_spec_acceptance_stats else None,
             "finish_reason": finish_reason,
             "output_text_preview": (
                 output_text[:512] if isinstance(output_text, str) else None
@@ -323,6 +336,36 @@ def collect_mode_metrics(
     )
 
 
+_SPEC_VALID_TOP_LEVEL_KEYS = (
+    "avg_spec_valid_accept_rate",
+    "avg_spec_valid_accept_rate_by_position",
+    "total_spec_valid_draft_token_num",
+    "total_spec_valid_accept_token_num",
+    "total_spec_valid_draft_token_num_by_position",
+    "total_spec_valid_accept_token_num_by_position",
+)
+
+_SPEC_VALID_REQUEST_KEYS = (
+    "spec_valid_accept_rate",
+    "spec_valid_accept_rate_by_position",
+    "spec_valid_accept_token_num",
+    "spec_valid_accept_token_num_by_position",
+    "spec_valid_draft_token_num",
+    "spec_valid_draft_token_num_by_position",
+)
+
+
+def _mode_metrics_result_dict(metrics: ModeMetrics) -> dict[str, Any]:
+    record = asdict(metrics)
+    if metrics.mode == "mtp":
+        for key in _SPEC_VALID_TOP_LEVEL_KEYS:
+            record.pop(key, None)
+        for item in record["per_request"]:
+            for key in _SPEC_VALID_REQUEST_KEYS:
+                item.pop(key, None)
+    return record
+
+
 def build_result(
     *,
     args: argparse.Namespace,
@@ -332,13 +375,14 @@ def build_result(
     total_rows: int,
     prompt_samples: list[PromptSample],
     spec_metrics: ModeMetrics,
-    decode_metrics: ModeMetrics | None = None,
+    baseline_metrics: ModeMetrics | None = None,
 ) -> dict[str, Any]:
     speedup = (
-        decode_metrics.generation_time_s / spec_metrics.generation_time_s
-        if decode_metrics is not None and spec_metrics.generation_time_s > 0
+        baseline_metrics.generation_time_s / spec_metrics.generation_time_s
+        if baseline_metrics is not None and spec_metrics.generation_time_s > 0
         else None
     )
+    baseline = baseline_metrics.mode if baseline_metrics is not None else "none"
     actor_env_vars = get_decoupled_spec_actor_env_vars()
     result = {
         "config": {
@@ -358,7 +402,6 @@ def build_result(
             "target_tp_size": args.target_tp_size,
             "target_ep_size": args.target_ep_size,
             "target_moe_a2a_backend": args.target_moe_a2a_backend,
-            "target_mamba_scheduler_strategy": args.target_mamba_scheduler_strategy,
             "num_verifier_replicas": args.num_verifier_replicas,
             "verify_ngpus": args.verify_ngpus,
             "draft_tp_size": args.draft_tp_size,
@@ -372,9 +415,9 @@ def build_result(
             "target_nnodes": target_nnodes,
             "target_gpus_per_node": target_gpus_per_node,
             "num_draft_replicas": args.num_draft_replicas,
-            "skip_decode": args.skip_decode,
+            "baseline": args.baseline,
             "show_responses": args.show_responses,
-            "decoupled_spec_trace_dir": args.decoupled_spec_trace_dir,
+            "spec_trace_dir": args.spec_trace_dir,
             "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL": actor_env_vars[
                 "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"
             ],
@@ -396,10 +439,11 @@ def build_result(
                 for sample in prompt_samples
             ],
         },
-        "decoupled_spec": asdict(spec_metrics),
+        "decoupled_spec": _mode_metrics_result_dict(spec_metrics),
     }
-    if decode_metrics is not None:
-        result["decode"] = asdict(decode_metrics)
+    if baseline_metrics is not None:
+        result[baseline] = _mode_metrics_result_dict(baseline_metrics)
+        result["baseline"] = baseline
         result["e2e_speedup"] = speedup
     return result
 
@@ -408,6 +452,8 @@ def _iter_output_modes(result: dict[str, Any]):
     yield "decoupled_spec", "decoupled-spec"
     if "decode" in result:
         yield "decode", "decode"
+    if "mtp" in result:
+        yield "mtp", "mtp"
 
 
 def _request_output_record(item: dict[str, Any]) -> dict[str, Any]:
@@ -437,8 +483,21 @@ def _csv_fieldnames_for_mode(mode_key: str) -> list[str]:
         fieldnames.extend(
             [
                 "num_speculative_steps",
+            ]
+        )
+    if mode_key in ("decoupled_spec", "mtp"):
+        fieldnames.extend(
+            [
                 "spec_accept_length",
                 "spec_accept_rate",
+                "spec_verify_ct",
+                "spec_accepted_drafts",
+                "spec_proposed_drafts",
+            ]
+        )
+    if mode_key == "decoupled_spec":
+        fieldnames.extend(
+            [
                 "spec_valid_accept_rate",
                 "spec_valid_accept_rate_by_position",
                 "spec_valid_accept_token_num",
@@ -457,11 +516,20 @@ def _csv_output_record(
 ) -> dict[str, Any]:
     record = _request_output_record(item)
     if mode_key == "decoupled_spec":
+        record.update({"num_speculative_steps": num_speculative_steps})
+    if mode_key in ("decoupled_spec", "mtp"):
         record.update(
             {
-                "num_speculative_steps": num_speculative_steps,
                 "spec_accept_length": item["spec_accept_length"],
                 "spec_accept_rate": item["spec_accept_rate"],
+                "spec_verify_ct": item["spec_verify_ct"],
+                "spec_accepted_drafts": item["spec_accepted_drafts"],
+                "spec_proposed_drafts": item["spec_proposed_drafts"],
+            }
+        )
+    if mode_key == "decoupled_spec":
+        record.update(
+            {
                 "spec_valid_accept_rate": item["spec_valid_accept_rate"],
                 "spec_valid_accept_rate_by_position": json.dumps(
                     item["spec_valid_accept_rate_by_position"],
@@ -510,11 +578,19 @@ def write_output_files(result: dict[str, Any], output_dir: str) -> list[Path]:
         requests = []
         for item in mode_items:
             record = _request_output_record(item)
-            if mode_key == "decoupled_spec":
+            if mode_key in ("decoupled_spec", "mtp"):
                 record.update(
                     {
                         "spec_accept_length": item["spec_accept_length"],
                         "spec_accept_rate": item["spec_accept_rate"],
+                        "spec_verify_ct": item["spec_verify_ct"],
+                        "spec_accepted_drafts": item["spec_accepted_drafts"],
+                        "spec_proposed_drafts": item["spec_proposed_drafts"],
+                    }
+                )
+            if mode_key == "decoupled_spec":
+                record.update(
+                    {
                         "spec_valid_accept_rate": item["spec_valid_accept_rate"],
                         "spec_valid_accept_rate_by_position": item[
                             "spec_valid_accept_rate_by_position"
@@ -565,11 +641,12 @@ def _print_response_block(label: str, text: str, *, indent: str = "    ") -> Non
 
 def print_summary(result: dict[str, Any]) -> None:
     spec = result["decoupled_spec"]
-    decode = result.get("decode")
+    baseline_name = result.get("baseline")
+    baseline = result.get(baseline_name) if baseline_name else None
     speedup = result.get("e2e_speedup")
     title = (
-        "decoupled_spec_vs_decode_batch"
-        if decode is not None
+        f"decoupled_spec_vs_{baseline_name}_batch"
+        if baseline is not None
         else "decoupled_spec_batch"
     )
     print(f"=== {title} ===")
@@ -600,17 +677,23 @@ def print_summary(result: dict[str, Any]) -> None:
         f"valid_draft_tokens_by_position="
         f"{spec['total_spec_valid_draft_token_num_by_position']}"
     )
-    if decode is not None:
-        print(
-            "decode: "
-            f"generation_time_s={decode['generation_time_s']:.3f}, "
-            f"generated_tokens={decode['total_generated_tokens']}, "
-            f"output_throughput={decode['output_throughput_tok_per_s']:.3f} tok/s"
+    if baseline is not None:
+        baseline_line = (
+            f"{baseline_name}: "
+            f"generation_time_s={baseline['generation_time_s']:.3f}, "
+            f"generated_tokens={baseline['total_generated_tokens']}, "
+            f"output_throughput={baseline['output_throughput_tok_per_s']:.3f} tok/s"
         )
+        if baseline_name == "mtp":
+            baseline_line += (
+                f", avg_spec_accept_length={baseline['avg_spec_accept_length']}, "
+                f"avg_spec_accept_rate={baseline['avg_spec_accept_rate']}"
+            )
+        print(baseline_line)
         print(
-            f"e2e_speedup: {speedup:.4f}"
+            f"e2e_speedup_vs_{baseline_name}: {speedup:.4f}"
             if speedup is not None
-            else "e2e_speedup: None"
+            else f"e2e_speedup_vs_{baseline_name}: None"
         )
     print("per_request:")
     for item in spec["per_request"]:
@@ -635,15 +718,32 @@ def print_summary(result: dict[str, Any]) -> None:
             f"{item['spec_valid_draft_token_num_by_position']}, "
             f"spec_verify_ct={item['spec_verify_ct']}"
         )
+    if baseline_name == "mtp" and baseline is not None:
+        print("mtp_per_request:")
+        for item in baseline["per_request"]:
+            print(
+                "  "
+                f"batch_index={item['batch_index']}, "
+                f"row_index={item['row_index']}, "
+                f"verifier_rank={item['verifier_rank']}, "
+                f"prompt_tokens={item['prompt_tokens']}, "
+                f"generated_tokens={item['generated_tokens']}, "
+                f"request_latency_s={item['request_latency_s']}, "
+                f"spec_accept_length={item['spec_accept_length']}, "
+                f"spec_accept_rate={item['spec_accept_rate']}, "
+                f"spec_verify_ct={item['spec_verify_ct']}, "
+                f"spec_accepted_drafts={item['spec_accepted_drafts']}, "
+                f"spec_proposed_drafts={item['spec_proposed_drafts']}"
+            )
     if result["config"].get("show_responses"):
         print("responses:")
-        decode_items = (
-            decode["per_request"]
-            if decode is not None
+        baseline_items = (
+            baseline["per_request"]
+            if baseline is not None
             else [None] * len(spec["per_request"])
         )
-        for spec_item, decode_item in zip(
-            spec["per_request"], decode_items, strict=True
+        for spec_item, baseline_item in zip(
+            spec["per_request"], baseline_items, strict=True
         ):
             print(
                 "  "
@@ -655,15 +755,16 @@ def print_summary(result: dict[str, Any]) -> None:
                 "decoupled_spec_response",
                 spec_item.get("output_text", ""),
             )
-            if decode_item is not None:
+            if baseline_item is not None:
                 if (
-                    spec_item["batch_index"] != decode_item["batch_index"]
-                    or spec_item["row_index"] != decode_item["row_index"]
+                    spec_item["batch_index"] != baseline_item["batch_index"]
+                    or spec_item["row_index"] != baseline_item["row_index"]
                 ):
                     raise RuntimeError(
-                        "Mismatched per-request ordering between decoupled_spec and decode"
+                        "Mismatched per-request ordering between decoupled_spec "
+                        f"and {baseline_name}"
                     )
                 _print_response_block(
-                    "decode_response",
-                    decode_item.get("output_text", ""),
+                    f"{baseline_name}_response",
+                    baseline_item.get("output_text", ""),
                 )
