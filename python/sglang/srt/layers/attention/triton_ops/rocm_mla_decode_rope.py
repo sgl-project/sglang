@@ -20,6 +20,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import torch
 import triton
 import triton.language as tl
 
@@ -115,7 +116,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
     # apply rotary embedding for q_pe, and k_pe (last token per batch of K_PE)
     LAST_SPLIT = split_kv_end == cur_batch_seq_len
-    k_pe_last_token = tl.zeros([BLOCK_R], dtype=q.dtype)
+    k_pe_last_token = tl.zeros([BLOCK_R], dtype=tl.float32)
 
     if USE_ROPE:
         if IS_NEOX_STYLE:
@@ -183,18 +184,15 @@ def _fwd_grouped_kernel_stage1_rope(
 
         # we only apply to the last token in the K_PE
         if LAST_SPLIT:
-            # debug assert
-            if (cur_batch == 0 and cur_head == 0) and split_kv_id < NUM_KV_SPLITS - 1:
-                tl.device_assert(False, "Only last split should compute k_pe")
 
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + cur_batch_seq_len - 1
             )
             offs_buf_k_pe_last_token = kv_loc * stride_buf_kbs + offs_qk_r
             offs_buf_k_pe_rot_last_token = kv_loc * stride_buf_kbs + offs_qk_rot_r
-            k_pe_last_token = tl.load(K_Buffer + offs_buf_k_pe_last_token)
+            k_pe_last_token = tl.load(K_Buffer + offs_buf_k_pe_last_token).to(tl.float32)
 
-            k_pe_rot_last_token = tl.load(K_Buffer + offs_buf_k_pe_rot_last_token)
+            k_pe_rot_last_token = tl.load(K_Buffer + offs_buf_k_pe_rot_last_token).to(tl.float32)
             k_pe_rot_last_token = tl.where(
                 mask_rotate, -k_pe_rot_last_token, k_pe_rot_last_token
             )
@@ -221,14 +219,15 @@ def _fwd_grouped_kernel_stage1_rope(
                 K_Buffer + offs_buf_k_pe,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
                 other=0.0,
-            )  # positional embedding part of keys
+            ).to(tl.float32)  # cast to fp32 for type consistency with rope
 
-            if (USE_ROPE and LAST_SPLIT) and start_n >= cur_batch_seq_len - BLOCK_N:
-                k_pe = tl.where(
-                    offs_n[None, :] != (split_kv_end - 1),
-                    k_pe,
-                    k_pe_last_token[:, None],
-                )
+            if USE_ROPE:
+                if LAST_SPLIT:
+                    k_pe = tl.where(
+                        offs_n[None, :] != (split_kv_end - 1),
+                        k_pe,
+                        k_pe_last_token[:, None],
+                    )
 
             # (16, 64) x (64, 32)
             # dot product of rope parts
@@ -436,4 +435,26 @@ def decode_attention_fwd_grouped_rope(
         use_rope,
         is_neox_style,
     )
-    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
+    batch, head_num = q.shape[0], q.shape[1]
+    Lv = v_buffer.shape[-1]
+    lse = attn_logits[:, :, :, -1:]
+    # num_kv_splits must be a per-batch tensor for the Triton kernel
+    if isinstance(num_kv_splits, int):
+        num_kv_splits_tensor = torch.full(
+            (batch,), num_kv_splits, dtype=torch.int32, device=q.device
+        )
+        max_kv_splits = num_kv_splits
+    else:
+        num_kv_splits_tensor = num_kv_splits
+        max_kv_splits = int(num_kv_splits.max().item())
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        lse,
+        q,
+        o,
+        1.0,  # v_scale: no KV cache quantization, output unscaled
+        v_buffer,
+        kv_indptr,
+        num_kv_splits_tensor,
+        max_kv_splits,
+    )

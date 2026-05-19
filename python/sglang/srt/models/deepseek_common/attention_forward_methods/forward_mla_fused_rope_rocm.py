@@ -25,6 +25,53 @@ if _is_hip:
     )
 
 
+def _get_cos_sin_cache(rotary_emb):
+    """Extract a (max_seq_len, rotary_dim) cos_sin_cache tensor.
+
+    The Triton kernel expects layout [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
+    per position.  Different RotaryEmbedding subclasses store the cache under
+    different attribute names and shapes; this helper normalises them all.
+    """
+
+    def _ensure_cuda_2d(t):
+        while t.dim() > 2:
+            t = t.squeeze(-2)
+        return t.cuda() if not t.is_cuda else t
+
+    # aiter RotaryEmbedding: separate cos_cache / sin_cache
+    # shape (max_seq_len, 1, 1, rotary_dim//2) each
+    if hasattr(rotary_emb, "cos_cache") and hasattr(rotary_emb, "sin_cache"):
+        cos = _ensure_cuda_2d(rotary_emb.cos_cache)
+        sin = _ensure_cuda_2d(rotary_emb.sin_cache)
+        return torch.cat((cos, sin), dim=-1)
+
+    # sglang RotaryEmbedding: combined cos_sin_cache buffer
+    # shape (max_seq_len, rotary_dim)
+    if hasattr(rotary_emb, "cos_sin_cache") and rotary_emb.cos_sin_cache is not None:
+        cache = rotary_emb.cos_sin_cache
+        return cache.cuda() if not cache.is_cuda else cache
+
+    # Phi3LongRoPE: long_short_cos_sin_cache
+    if hasattr(rotary_emb, "long_short_cos_sin_cache"):
+        cache = rotary_emb.long_short_cos_sin_cache
+        return cache.cuda() if not cache.is_cuda else cache
+
+    return None
+
+
+def _bmm_absorb(x, w, w_scale, w_scale_per_matrix=None):
+    """Batched matmul for MLA absorb, handling None weights gracefully."""
+    if w is None:
+        raise RuntimeError(
+            "MLA absorb weight (w_kc/w_vc) is None. "
+            "This may happen in dummy load mode where kv_b_proj "
+            "post-processing is skipped. Disable fused_decode_mla "
+            "with SGLANG_ROCM_FUSED_DECODE_MLA=0."
+        )
+    scale = w_scale_per_matrix if w_scale_per_matrix is not None else w_scale
+    return torch.bmm(x.to(torch.bfloat16).transpose(0, 1), w.to(torch.bfloat16) * scale)
+
+
 class DeepseekMLARocmForwardMixin:
 
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
@@ -42,9 +89,6 @@ class DeepseekMLARocmForwardMixin:
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
-        # NOTE: hidden_states can be a tuple for some quantization paths.
-        # For shape/device/dtype, use the first tensor; still pass the original
-        # hidden_states through linear ops which may accept tuple inputs.
         hidden_states_tensor = (
             hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         )
@@ -67,11 +111,8 @@ class DeepseekMLARocmForwardMixin:
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            q_nope_out = torch.bmm(
-                q_nope.to(torch.bfloat16).transpose(0, 1),
-                self.w_kc.to(torch.bfloat16) * self.w_scale,
-            )
+            w_scale_k = getattr(self, "w_scale_k", None)
+            q_nope_out = _bmm_absorb(q_nope, self.w_kc, self.w_scale, w_scale_k)
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
@@ -100,18 +141,28 @@ class DeepseekMLARocmForwardMixin:
 
         q_input[..., self.kv_lora_rank :] = q_pe
 
-        # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
-        # Use Fused ROPE with use_rope=OFF.
         attn_output = torch.empty(
             (q_len, self.num_local_heads, self.kv_lora_rank),
             dtype=q.dtype,
             device=q.device,
         )
-        attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
-            forward_batch.attn_backend.forward_metadata
+        metadata = forward_batch.attn_backend.forward_metadata
+        if hasattr(metadata, "kv_indptr"):
+            attn_logits = getattr(metadata, "attn_logits", None)
+            kv_indptr = metadata.kv_indptr
+            kv_indices = metadata.kv_indices
+        else:
+            attn_logits, _, kv_indptr, kv_indices, _, _, _ = metadata
+
+        if not hasattr(self, "_cached_cos_sin"):
+            self._cached_cos_sin = _get_cos_sin_cache(self.rotary_emb)
+        cos_sin_cache = self._cached_cos_sin
+        if cos_sin_cache is None:
+            enable_rope_fusion = False
+        num_kv_split = getattr(
+            forward_batch.attn_backend, "num_kv_splits",
+            getattr(forward_batch.attn_backend, "max_kv_splits", 16)
         )
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
-        num_kv_split = forward_batch.attn_backend.num_kv_splits
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
             attn_logits = torch.empty(
@@ -125,7 +176,6 @@ class DeepseekMLARocmForwardMixin:
                 device=q.device,
             )
 
-        # save current latent cache.
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mqa, forward_batch.out_cache_loc, k_input, None
         )
@@ -201,10 +251,9 @@ class DeepseekMLARocmForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                self.w_vc.to(torch.bfloat16) * self.w_scale,
+            w_scale_v = getattr(self, "w_scale_v", None)
+            attn_bmm_output = _bmm_absorb(
+                attn_output, self.w_vc, self.w_scale, w_scale_v
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
