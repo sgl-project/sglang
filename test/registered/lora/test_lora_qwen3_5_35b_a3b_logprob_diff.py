@@ -76,6 +76,7 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3_5_35B_A3B_LogprobDiff(CustomTestCase):
 
     def test_lora_qwen3_5_35b_a3b_logprob_accuracy(self):
