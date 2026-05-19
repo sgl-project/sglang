@@ -51,6 +51,12 @@ _FAIL_REASON_DESCRIPTIONS: Dict[int, str] = {
         FailReason.POSITION_MONOTONIC
     ): "verify-time position does not match what was written",
     int(FailReason.REAL_KV_HASH): "real-KV slot bytes changed underneath the canary",
+    int(
+        FailReason.INPUT_TOKEN_MISMATCH
+    ): "write-entry token_id diverged from the oracle's expected input token",
+    int(
+        FailReason.INPUT_POSITION_MISMATCH
+    ): "write-entry position diverged from the oracle's expected input position",
 }
 
 
@@ -569,16 +575,26 @@ class CanaryRunner:
             reason_name = f"unknown({int(fail_reason)})"
         kernel_label = {0: "HEAD", 1: "TAIL"}.get(int(kernel_kind), str(kernel_kind))
 
+        reason_int = int(fail_reason)
+        is_input_token = reason_int == int(FailReason.INPUT_TOKEN_MISMATCH)
+
         lines = [
             "kv-canary violation:",
             f"  canary_kind:       {kind} (one of head_k/head_v/tail_k/tail_v)",
             f"  kernel_kind:       {kernel_label}",
-            f"  fail_reason:       {reason_name} ({_fail_reason_description(int(fail_reason))})",
+            f"  fail_reason:       {reason_name} ({_fail_reason_description(reason_int)})",
             f"  slot_idx:          {int(slot_idx)}",
             f"  position:          expected={int(expected_position)} actual={int(position)}",
-            f"  actual token_id:   {int(token_id)}",
         ]
-        if int(fail_reason) in (
+        if is_input_token:
+            lines.append(
+                f"  token_id:          expected={int(expected_hash)} "
+                f"actual={int(actual_hash)}"
+            )
+        else:
+            lines.append(f"  actual token_id:   {int(token_id)}")
+
+        if reason_int in (
             int(FailReason.HASH),
             int(FailReason.REAL_KV_HASH),
         ):
