@@ -976,6 +976,14 @@ class Scheduler(
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
 
+        # Local import: kv_cache_canary.api pulls in jit_kernel modules; keep it lazy so non-canary
+        # scheduler instances don't pay the load cost.
+        from sglang.srt.kv_cache_canary.api import attach_radix_cache_to_pool
+
+        attach_radix_cache_to_pool(
+            self.token_to_kv_pool_allocator.get_kvcache(), self.tree_cache
+        )
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator

@@ -94,11 +94,9 @@ def install_on_model_runner(
 
     device = torch.device(model_runner.device)
     capacities = _compute_launch_capacities(model_runner=model_runner, config=config)
-    # TODO: radix-orphan sweep currently disabled — see SOT §6.2. The radix cache is built later by the
-    # scheduler (after this install runs at ModelRunner init), so it is not available here. The scheduler
-    # needs to invoke ``runner.attach_radix_cache(tree_cache)`` on each runner returned by
-    # ``api.get_runners(pool)`` after constructing its ``tree_cache``; until that wiring exists, sweep
-    # coverage degrades to running-reqs only.
+    # Radix cache is bound later by the scheduler via ``api.attach_radix_cache_to_pool`` once
+    # ``tree_cache`` exists; at this point in ModelRunner init the radix cache has not been built yet
+    # (SOT §6.2 sweep coverage).
     runners = attach(
         pool=pool,
         config=config,

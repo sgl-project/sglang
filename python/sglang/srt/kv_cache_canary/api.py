@@ -5,6 +5,8 @@ External surface:
 - :func:`attach` — install canary buffers + create a :class:`CanaryRunner` per attached
   :class:`CanaryBufferGroup`.
 - :func:`get_runners` — fetch the runners attached to a pool.
+- :func:`attach_radix_cache_to_pool` — late-binding helper invoked once the scheduler has built its
+  ``tree_cache`` (the canary's :func:`attach` runs at ``ModelRunner`` init, before the radix cache exists).
 - :func:`run_head` / :func:`run_tail` — per-forward driver delegating to each runner.
 - :func:`launch_canary_for_capture` — capture-only no-op recording.
 - :func:`prepare_replay` / :func:`finalize_replay` — replay-side hooks for cuda-graph runners.
@@ -120,6 +122,26 @@ def _per_kind_config(config: CanaryConfig, *, kind: PoolKind) -> CanaryConfig:
 def get_runners(pool: "KVCache") -> Optional[List[CanaryRunner]]:
     """Return the list of runners attached to the pool, or ``None``."""
     return getattr(pool, _GLOBAL_RUNNERS_KEY, None)
+
+
+def attach_radix_cache_to_pool(pool: "KVCache", radix_cache: "BasePrefixCache") -> None:
+    """Bind ``radix_cache`` to every canary runner attached to ``pool``.
+
+    No-op when canary is disabled or runners are not attached — keeps the scheduler call site cheap to
+    invoke unconditionally. Required for radix-orphan sweep coverage (SOT §6.2): the radix cache is built
+    by the scheduler after :func:`attach` already ran at ``ModelRunner`` init, so the runner needs a
+    late-binding hook.
+    """
+    runners = get_runners(pool)
+    if not runners:
+        return
+    for runner in runners:
+        runner.attach_radix_cache(radix_cache)
+    logger.info(
+        "kv-canary: bound radix cache %s to %d runner(s)",
+        type(radix_cache).__name__,
+        len(runners),
+    )
 
 
 def run_head(
