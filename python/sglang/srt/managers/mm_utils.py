@@ -5,6 +5,7 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import struct
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -1173,8 +1174,19 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
+    hash_bytes = hashlib.sha256(data).digest()[:16]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+
+def _mix_shape_with_gpu_hash(tensors, gpu_hash: int) -> int:
+    """Mix tensor shape metadata into the GPU hash result to prevent
+    collisions between different tensor partitions with the same values."""
+    hasher = hashlib.sha256()
+    hasher.update(gpu_hash.to_bytes(8, "big", signed=False))
+    for t in tensors:
+        shape_tag = f"{tuple(t.shape)}:{t.dtype}|".encode()
+        hasher.update(shape_tag)
+    return int.from_bytes(hasher.digest()[:16], "big")
 
 
 def tensor_hash(tensor_list) -> int:
@@ -1187,38 +1199,71 @@ def tensor_hash(tensor_list) -> int:
         tensors = [
             x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
         ]
-        # GPU path: concat + triton hash (unchanged)
+        # GPU path: triton hash + shape metadata mixing
         if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-            tensor = torch.concat(tensors)
-            return gpu_tensor_hash(tensor.cuda())
-        # CPU path: hash each tensor incrementally without concat
+            concat_tensor = torch.concat(tensors)
+            raw_hash = gpu_tensor_hash(concat_tensor.cuda())
+            return _mix_shape_with_gpu_hash(tensor_list, raw_hash)
+        # CPU path: hash each tensor with shape boundary markers
         hasher = hashlib.sha256()
         for t in tensors:
             t = t.detach().contiguous()
+            # Include shape and dtype as boundary markers to prevent
+            # different tensor partitions from producing the same hash
+            shape_tag = f"{tuple(t.shape)}:{t.dtype}|".encode()
+            hasher.update(shape_tag)
             hasher.update(memoryview(t.view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
+        hash_bytes = hasher.digest()[:16]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
     # Single tensor
     if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
+        raw_hash = gpu_tensor_hash(tensor.cuda())
+        return _mix_shape_with_gpu_hash([tensor], raw_hash)
     tensor = tensor.detach().contiguous()
     hasher = hashlib.sha256()
+    shape_tag = f"{tuple(tensor.shape)}:{tensor.dtype}|".encode()
+    hasher.update(shape_tag)
     hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
+    hash_bytes = hasher.digest()[:16]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
     if isinstance(f, list):
+        if len(f) == 0:
+            return data_hash(b"empty_list")
         if isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
+        # Serialize non-tensor list elements to bytes with type and
+        # structure markers to prevent cross-type and cross-structure collisions
+        parts = []
+
+        def serialize(item):
+            if isinstance(item, list):
+                parts.append(b"[")
+                for i in item:
+                    serialize(i)
+                parts.append(b"]")
+            elif isinstance(item, float):
+                parts.append(b"f" + struct.pack(">d", item))
+            elif isinstance(item, int):
+                parts.append(b"i" + struct.pack(">q", item))
+            else:
+                encoded = str(item).encode()
+                parts.append(b"s" + len(encoded).to_bytes(4, "big") + encoded)
+
+        serialize(f)
+        return data_hash(b"".join(parts))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
+        # Include shape and dtype metadata to prevent collisions between
+        # arrays with the same raw bytes but different shapes
+        meta = f"{arr.shape}:{arr.dtype}:".encode()
         hasher = hashlib.sha256()
+        hasher.update(meta)
         hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
+        hash_bytes = hasher.digest()[:16]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
