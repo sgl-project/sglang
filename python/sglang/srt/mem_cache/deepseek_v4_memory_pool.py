@@ -103,13 +103,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
-        # NPU bf16 mode: allocate the same PA_ND layout that
-        # iforgetmyname/dsv4_release uses for swa_kv_pool —
-        # (num_pages, page_size, num_kv_heads=1, dim) where dim packs
-        # K_nope (qk_nope_head_dim) and K_rope (qk_rope_head_dim) as bf16.
-        # That's the shape npu_sparse_attn_sharedkv expects with
-        # layout_kv="PA_ND". The CUDA fp8-packed-bytes layout is preserved
-        # for non-NPU paths.
+        # NPU bf16 swa_kv_pool layout: (num_pages, page_size, num_kv_heads=1,
+        # dim) where dim packs K_nope (qk_nope_head_dim) and K_rope
+        # (qk_rope_head_dim) as bf16. That's what npu_sparse_attn_sharedkv
+        # expects with layout_kv="PA_ND". The CUDA fp8-packed-bytes layout
+        # is preserved for non-NPU paths.
         is_npu_bf16 = _is_npu and self.store_dtype == torch.bfloat16
         if is_npu_bf16:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -325,9 +323,8 @@ class DeepSeekV4IndexerPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
-        # NPU layout: separate int8 K buffer + float16 scale buffer per layer,
-        # matching iforgetmyname/dsv4_release NPUSingleBufferTokenToKVPool so
-        # torch_npu.npu_scatter_nd_update_ + torch.ops.custom.npu_quant_
+        # NPU layout: separate int8 K buffer + float16 scale buffer per layer
+        # so torch_npu.npu_scatter_nd_update_ + torch.ops.custom.npu_quant_
         # lightning_indexer can read/write directly without unpacking the
         # CUDA-only uint8 packed layout. CUDA path keeps using
         # `index_k_with_scale_buffer` above; NPU path uses the buffers below.
@@ -547,14 +544,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
 
-        # Step-5c per-req c4/c128 slab allocator. Mirrors iforgetmyname's
-        # req_to_token_c4 / req_to_token_c128 (own allocator that gives each
-        # request its own contiguous slot range in c{N}_kv_pool, keyed by
-        # compressed-seq position not raw-kv position) — but stored INSIDE
-        # the V4 token-to-kv pool instead of the request pool to avoid
-        # scheduler-side surgery. Each req_pool_idx i gets a fixed slab of
-        # `max_pages_c{N}_per_req` pages starting at i * max_per_req.
-        # Per-page granularity uses the global page_size (matches our
+        # Per-req c4/c128 slab allocator: each req_pool_idx i gets a fixed
+        # slab of `max_pages_c{N}_per_req` pages starting at i * max_per_req,
+        # keyed by compressed-seq position (not raw-kv position) so that the
+        # request's c{N} pages stay contiguous regardless of how the raw-kv
+        # allocator scattered them. Stored INSIDE the V4 token-to-kv pool
+        # rather than the request pool to avoid scheduler-side surgery.
+        # Per-page granularity uses the global page_size (matches the
         # _forward_compressed cmp_kv reshape view).
         c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
         c128_n_pages_kernel = c128_size // page_size
@@ -845,23 +841,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_buffer(
         self, layer_id: int, loc: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Mirrors iforgetmyname's SWAC4C128KVPool.get_swa_buffer.
-
-        Returns the SWA layer's KV cache in PA_ND layout
+        """Return the SWA layer's KV cache in PA_ND layout
         (num_pages, page_size, num_kv_heads=1, dim). When ``loc`` is given,
         flatten across (num_pages, page_size) and gather the matching
         tokens — shape becomes (num_tokens, 1, dim).
         """
-        # HOTFIX: index swa_kv_pool.kv_buffer by raw layer_id, not by
+        # Index swa_kv_pool.kv_buffer by RAW layer_id, not by
         # item.compress_layer_id. compress_layer_id is a per-bucket counter
         # (c1_cnt / c4_cnt / c128_cnt each starting at 0), so writes from
-        # different ratios COLLIDE on the same kv_buffer slot. Eg layer 0
-        # (c1_cnt=0), layer 2 (c4_cnt=0), and layer 3 (c128_cnt=0) all hit
-        # kv_buffer[0] and overwrite each other; decode then reads the last
-        # writer's K instead of the layer's own K. swa_kv_pool is sized with
-        # layer_num=total_layers so per-layer slots already exist; just
-        # index them directly. Verified bit-perfect with iforgetmyname for
-        # the first 5 generated tokens of `Four ` after this fix.
+        # different ratios collide on the same kv_buffer slot (e.g. layer 0
+        # / c1_cnt=0, layer 2 / c4_cnt=0, and layer 3 / c128_cnt=0 all hit
+        # kv_buffer[0] and overwrite each other). swa_kv_pool is sized with
+        # layer_num=total_layers, so per-layer slots already exist.
         kv = self.swa_kv_pool.kv_buffer[layer_id]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
@@ -873,7 +864,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         from_indexer: bool = False,
         loc: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Mirrors iforgetmyname's SWAC4C128KVPool.get_compress_buffer.
+        """Return the compressed KV buffer for a c4 / c128 layer.
 
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
         ``None`` for ratio in (0, 1) (no compress KV exists). With ``loc``
@@ -981,10 +972,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
 
     # ------------------------------------------------------------------
-    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
-    # Mirror the iforgetmyname/dsv4_release SWAC4C128KVPool API on top of
-    # main's CompressStatePool / DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool.
-    #
+    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu on
+    # top of CompressStatePool / DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool.
     # CompressStatePool stores a single fused [kv | score] tensor of shape
     # (size, 2*coff*head_dim); split + cat is just a last-dim slice.
     # ------------------------------------------------------------------
@@ -998,8 +987,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         scale: Optional[torch.Tensor],
         from_indexer: bool,
     ) -> None:
-        # iforgetmyname stores kv and score side-by-side in a fused buffer;
-        # main's KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score]
+        # KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score]
         # (kv first half, score second half). We accept (T, 1, coff*head_dim)
         # tensors and write them into the matching half-slices.
         _ = scale  # int8 scale not modelled — current state-pool layout is float32
@@ -1133,9 +1121,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         from_indexer: bool,
     ) -> torch.Tensor:
         # Returns float16 dequant scale buffer. NPU has a dedicated
-        # `npu_index_scale_buffer` allocated alongside the int8 K buffer
-        # (matches iforgetmyname/dsv4_release NPUSingleBufferTokenToKVPool.
-        # dequant_scale_buffer). CUDA still uses the packed uint8 layout.
+        # `npu_index_scale_buffer` allocated alongside the int8 K buffer.
+        # CUDA still uses the packed uint8 layout.
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
         if self.c4_indexer_kv_pool.npu_index_scale_buffer is not None:

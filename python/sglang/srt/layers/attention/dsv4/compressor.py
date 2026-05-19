@@ -34,7 +34,6 @@ _is_npu = is_npu()
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
-    # iforgetmyname/dsv4_release hardware_backend/npu/utils.py:get_had_pow2.
     # bf16 Sylvester matrix with the n**-0.5 norm factor baked in by dividing
     # by sqrt(2) at each doubling (log2(n) steps total). `dtype` is accepted
     # for backward-compat with callers; ascend builds in bf16 only.
@@ -58,9 +57,8 @@ _walsh_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
 
 
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
-    # iforgetmyname/dsv4_release nsa_indexer.py:apply_hadamard. The n**-0.5
-    # scale is already baked into `hadamard_matrix` (see _walsh_hadamard_matrix
-    # above), so this is just `inp @ H` followed by bf16 cast.
+    # The n**-0.5 scale is already baked into `hadamard_matrix` (see
+    # _walsh_hadamard_matrix above), so this is just `inp @ H` then bf16 cast.
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
     return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
@@ -364,13 +362,12 @@ class Compressor(nn.Module):
         self.ape_converted = False
 
         if _is_npu:
-            # iforgetmyname/dsv4_release nsa_indexer.Compressor.__init__ L231
-            # registers a Walsh-Hadamard matrix that the NPU forward_ori uses
-            # for `apply_hadamard(kv, self.hadamard_matrix)` after rope. Build
-            # the same here; CUDA path uses triton fast_hadamard_transform via
-            # rotate_activation() instead and never touches this buffer.
-            # Build lazily on first NPU forward (init runs on CPU before
-            # weights move to NPU); cache key includes device so it's safe.
+            # Walsh-Hadamard matrix the NPU forward_npu path applies to kv
+            # after rope via `apply_hadamard(kv, self.hadamard_matrix)`. CUDA
+            # uses the triton fast_hadamard_transform in rotate_activation()
+            # and never touches this buffer. Built lazily on first NPU forward
+            # (init runs on CPU before weights move to NPU); cache key
+            # includes device so it's safe.
             self._npu_hadamard_built = False
 
     def apply_ape_hotfix(self):
@@ -378,10 +375,9 @@ class Compressor(nn.Module):
         self.ape_converted = True
 
         if _is_npu:
-            # The hotfix below permutes ape for the CUDA triton compress kernel
-            # layout. The NPU forward_npu path uses ape in its natural
-            # [ratio, coff*head_dim] layout (matches iforgetmyname's load
-            # convention), so skip the permute here.
+            # The hotfix below permutes ape for the CUDA triton compress
+            # kernel layout. The NPU forward_npu path uses ape in its natural
+            # [ratio, coff*head_dim] layout, so skip the permute here.
             return
 
         if self.overlap:
@@ -407,10 +403,9 @@ class Compressor(nn.Module):
             return x.new_empty(0, self.head_dim)
 
         if _is_npu:
-            # NPU path: do the full compress flow inline (writes go straight
-            # to the kv pool via set_compress_*_buffer; nothing to return for
-            # forward_core_compressor to write afterwards). Mirrors
-            # iforgetmyname/dsv4_release nsa_indexer.Compressor.forward_ori.
+            # NPU path: run the full compress flow inline. Writes go straight
+            # to the kv pool via set_compress_*_buffer, so there's nothing
+            # for forward_core_compressor to write afterwards.
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
@@ -441,12 +436,11 @@ class Compressor(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # NPU forward path — port of iforgetmyname/dsv4_release nsa_indexer.py
-    # Compressor.forward_ori (L241). The CUDA path above delegates to the
-    # backend mixin (triton compress_forward + compress_fused_norm_rope_inplace);
-    # NPU has no equivalent triton kernels, so we do the full per-request
-    # prefill + decode loop here, calling torch_npu fallbacks for rope and
-    # a torch matmul for the Walsh-Hadamard rotation.
+    # NPU forward path. The CUDA path above delegates to the backend mixin
+    # (triton compress_forward + compress_fused_norm_rope_inplace); NPU has
+    # no equivalent triton kernels, so the full per-request prefill + decode
+    # loop runs here, calling torch_npu fallbacks for rope and a torch matmul
+    # for the Walsh-Hadamard rotation.
     # ------------------------------------------------------------------
 
     def _ensure_npu_hadamard(self, device: torch.device) -> torch.Tensor:
@@ -467,7 +461,7 @@ class Compressor(nn.Module):
         """Inline NPU compress forward — writes compressed kv to the pool and
         returns ``None``.
 
-        Per-request loop matching iforgetmyname's ``forward_ori`` semantics:
+        Per-request loop:
 
         * Prefill: split the seq into ``cutoff = seqlen - seqlen % ratio``
           tokens to compress + ``remainder`` to stash as state. For overlap
@@ -496,10 +490,10 @@ class Compressor(nn.Module):
         self._ensure_npu_hadamard(device)
         dtype = x.dtype
         x_f32 = x.float()
-        # main fuses wkv + wgate into a single wkv_gate.weight
-        # ([2*coff*head_dim, hidden_size]); load_weights concats kv first then
-        # wgate (deepseek_v4.py L1513), so a [coff*hd, coff*hd] split along the
-        # output dim recovers iforgetmyname's separate wkv(x) and wgate(x).
+        # wkv + wgate are fused into a single wkv_gate.weight of shape
+        # [2*coff*head_dim, hidden_size]; load_weights concatenates kv first
+        # then wgate, so a [coff*hd, coff*hd] split along the output dim
+        # recovers separate wkv(x) / wgate(x).
         coff = 1 + int(overlap)
         W = self.wkv_gate.weight.float()
         kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
@@ -537,10 +531,7 @@ class Compressor(nn.Module):
             if is_prefill:
                 pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
                 # State writes index the compress STATE pool (flat ring buffer),
-                # not the full kv pool. Translate via the V4 token pool helper
-                # (matches the formula used by the CUDA compressor's get_raw_loc
-                # at compressor.py L226-233 and the NPU backend's
-                # _build_npu_compress_metadata).
+                # not the full kv pool. Translate via the V4 token pool helper.
                 raw_kv_loc = forward_batch.out_cache_loc[
                     seqlen_offset : seqlen_offset + seqlen
                 ]
@@ -559,7 +550,7 @@ class Compressor(nn.Module):
                 if overlap and cutoff >= ratio:
                     # Stash the trailing ratio tokens of the cutoff so the
                     # next decode step can do overlap compression across the
-                    # boundary — matches iforgetmyname forward_ori L281-286.
+                    # boundary.
                     kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
                     score_state_to_be_cached.append(
                         score[cutoff - ratio : cutoff] + self.ape
@@ -690,8 +681,7 @@ class Compressor(nn.Module):
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = self.norm(kv_out)
-            # iforgetmyname compressor rope: ComplexExpRotaryEmbedding.forward
-            # calls torch_npu.npu_rotary_mul with cos/sin in repeat_interleave(2)
+            # torch_npu.npu_rotary_mul takes cos/sin in repeat_interleave(2)
             # layout reshaped to (T, 1, 1, rope_dim). freqs_cis here is the
             # complex polar(1, theta) tensor built by precompute_freqs_cis;
             # cos=real, sin=imag at the rope_dim/2 frequency pair resolution.
@@ -732,11 +722,11 @@ class Compressor(nn.Module):
         return None
 
     def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
-        # Overlap layout from iforgetmyname Compressor.overlap_transform:
-        # given (n_chunks, ratio, coff*d), build (n_chunks, 2*ratio, d) where
-        # the first ratio rows hold the current chunk's left half (..., :d)
-        # and the last ratio rows hold the previous chunk's right half
-        # (..., d:). First chunk's right half is filled with `value`.
+        # Overlap layout: given (n_chunks, ratio, coff*d), build
+        # (n_chunks, 2*ratio, d) where the first ratio rows hold the current
+        # chunk's left half (..., :d) and the last ratio rows hold the
+        # previous chunk's right half (..., d:). First chunk's right half is
+        # filled with `value`.
         n_chunks, r, _ = tensor.shape
         d = self.head_dim
         out = tensor.new_full((n_chunks, 2 * r, d), value)
@@ -751,8 +741,8 @@ class Compressor(nn.Module):
         override_loc: Optional[torch.Tensor] = None,
     ) -> None:
         # Quant + write — quant only when this is an indexer compressor with
-        # int8 li_kv (matches iforgetmyname compressor_epilog L538). For the
-        # bf16 indexer / attention compressor branches, kv_scale is None.
+        # int8 li_kv. For the bf16 indexer / attention compressor branches,
+        # kv_scale is None.
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(self, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8" and self.is_in_indexer:
@@ -782,8 +772,7 @@ def _get_kv_indices(
     req_idx: int,
     seqlen: int,
 ) -> torch.Tensor:
-    # Inlined from iforgetmyname/dsv4_release ascend_backend.get_kv_indices:
-    # return the flat state-buffer indices of the trailing ``kv_len`` slots
+    # Return the flat state-buffer indices of the trailing ``kv_len`` slots
     # for request ``req_idx`` (used to gather the overlap window or one
     # ratio-chunk during decode compression).
     logic_start = max(0, seqlen - kv_len)

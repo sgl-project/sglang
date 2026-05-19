@@ -142,10 +142,10 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         group_list,
         output_dtype,
     ):
-        # Mirrors iforgetmyname/dsv4_release: ep_moe.layer.forward_npu
-        # bypasses MoeRunner and calls scheme.apply_without_routing_weights;
-        # the underlying NPUW8A8Int8DynamicMoEMethod kernel already implements
-        # this, just expose it through the scheme.
+        # NPU MoE forward bypasses MoeRunner and calls
+        # scheme.apply_without_routing_weights; the underlying
+        # NPUW8A8Int8DynamicMoEMethod kernel already implements this, so
+        # just expose it through the scheme.
         return self.kernel.apply_without_routing_weights(
             layer,
             hidden_states,

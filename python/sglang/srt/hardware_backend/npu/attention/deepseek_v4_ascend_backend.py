@@ -131,8 +131,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
         # V4-Flash config.json sets head_dim=512 directly (qk_nope_head_dim is
-        # null in HF config); mirror iforgetmyname/dsv4_release which uses
-        # self.config.head_dim verbatim for the metadata kernel arg.
+        # null in the HF config); pass head_dim verbatim to the metadata kernel.
         self._dsv4_head_dim = cfg.head_dim
         hf = getattr(cfg, "hf_config", cfg)
         self._dsv4_index_topk = getattr(hf, "index_topk", 512)
@@ -238,20 +237,18 @@ class DeepseekV4AscendAttnBackend(
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
         # NPU compress metadata: per-request tensors consumed by
-        # dsv4/{compressor,indexer}.py forward_npu. See iforgetmyname/dsv4_
-        # release ascend_backend.init_forward_metadata @ ~L735-790 for the
-        # reference impl on top of pre-allocated req_to_token_c{N} tables;
-        # main has no req_to_token_c{N}, so we compute equivalents on the
-        # fly from req_to_token + the V4 KV pool's swa translation.
+        # dsv4/{compressor,indexer}.py forward_npu. There is no per-ratio
+        # req_to_token mapping in the request pool, so we compute the
+        # equivalent on the fly from req_to_token + the V4 KV pool's
+        # swa translation.
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
-        # iforgetmyname Talantan1102/sglang#1: clamp seqused_kv >= 1 so idle
-        # ranks (where actual_seq_lengths_kv may contain 0) don't trip
-        # sparse-attn metadata with a zero-length entry, which has bitten the
-        # NPU kernel in the dpattn + idle-rank workload.
+        # Clamp seqused_kv >= 1: sparse-attn metadata rejects zero-length
+        # entries, which can otherwise appear on dp-attention idle ranks
+        # where actual_seq_lengths_kv contains 0.
         seqused_kv_safe = fm.actual_seq_lengths_kv.clamp(min=1)
         common = {
             "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
@@ -290,10 +287,9 @@ class DeepseekV4AscendAttnBackend(
                 torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
             )
 
-            # The lightning indexer is only attached to c4 layers.
-            # Pass actual_seq_lengths_q (no leading 0, B-element cumsum)
-            # exactly as iforgetmyname/dsv4_release builds it — a fresh
-            # contiguous int32 device tensor, not a slice.
+            # The lightning indexer is only attached to c4 layers. Pass
+            # actual_seq_lengths_q as a fresh contiguous int32 device tensor
+            # (no leading 0, B-element cumsum) — not a slice.
             actual_q = fm.actual_seq_lengths_q
             if actual_q is None:
                 actual_q = fm.actual_seq_lengths_kv
@@ -328,12 +324,10 @@ class DeepseekV4AscendAttnBackend(
         """Populate c{4,128}_{page_table,state_page_table,state_loc,loc} on
         forward_metadata for the NPU compressor / indexer forward_npu paths.
 
-        Reference: iforgetmyname/dsv4_release ascend_backend.init_forward_metadata
-        @ ~L735-790. iforgetmyname pre-allocates per-request mapping tables
-        (req_to_token_c4 / req_to_token_c4_state) when the request enters the
-        scheduler; main has no such tables, so we compute equivalents on the
-        fly from req_to_token + the V4 KV pool's swa translation. This is
-        slower but avoids cross-cutting allocator surgery on the request pool.
+        Computed on the fly from req_to_token + the V4 KV pool's swa
+        translation, since the request pool has no per-ratio mapping tables.
+        Slower than a prealloc per-request mapping but avoids cross-cutting
+        allocator surgery on the request pool.
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
@@ -413,8 +407,8 @@ class DeepseekV4AscendAttnBackend(
             setattr(fm, attr_loc, compress_out_loc)
 
             # c{ratio}_page_table — kernel-view page table for c{N}_kv_pool.
-            # Step 5c: read directly from the slab — gives each request its
-            # own dedicated kernel pages so cmp_kv reads at compressed seq
+            # Reading directly from the slab gives each request its own
+            # dedicated kernel pages, so cmp_kv reads at compressed seq
             # pos 0..N-1 land in the right physical slots regardless of how
             # the raw_kv allocator scattered the request's full pages.
             pages_table = pool.get_req_to_token_c_pages(ratio)
@@ -463,11 +457,11 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        # Honor save_kv_cache=True contract. With SGLANG_OPT_USE_OVERLAP_STORE_CACHE
-        # default TRUE, MQALayer._forward_prepare already writes K via store_cache
-        # and passes save_kv_cache=False here (no dup-write). With overlap=False,
-        # the previous code silently dropped the write — decode then read an
-        # unwritten swa_kv_pool and produced garbage. Always respect the flag.
+        # Honor the save_kv_cache=True contract. With SGLANG_OPT_USE_OVERLAP_STORE_CACHE
+        # (default TRUE), MQALayer._forward_prepare already writes K via store_cache
+        # and passes save_kv_cache=False here, so we skip the dup-write. With
+        # overlap=False, save_kv_cache=True is the only writer for swa_kv_pool
+        # and must run, otherwise decode reads an unwritten buffer.
         if save_kv_cache:
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch

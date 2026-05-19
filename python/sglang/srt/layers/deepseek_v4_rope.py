@@ -39,7 +39,6 @@ INT32 = "int32"
 
 @lru_cache(2)
 def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    # iforgetmyname/dsv4_release rotary_embedding/yarn.py:yarn_get_mscale
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
@@ -84,12 +83,6 @@ def precompute_freqs_cis(
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
-    # iforgetmyname does NOT bake mscale into cos/sin — verified by
-    # dumping Q/K post-rope on both servers. Our earlier "mscale on
-    # cos/sin" workaround was compensating for an unrelated KV cache
-    # collision bug in DeepSeekV4TokenToKVPool (compress_layer_id per-
-    # bucket counters overlapping). Once that's fixed, mscale-off is the
-    # architecturally correct shape.
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 

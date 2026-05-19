@@ -76,9 +76,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-# NPU-only deps. `custom_ops` import registers torch.ops.custom.{npu_hc_pre,
-# npu_hc_post, inplace_partial_rotary_mul, ...} (cann-8.5.0-a3 wheel). Both are
-# imported once at module load so per-callsite re-imports can drop.
+# NPU-only deps. `custom_ops` registers torch.ops.custom.{npu_hc_pre,
+# npu_hc_post, inplace_partial_rotary_mul, ...} from the cann-8.5.0-a3 wheel.
 if _is_npu:
     import custom_ops  # noqa: F401  registers torch.ops.custom.*
     import torch_npu
@@ -108,13 +107,11 @@ def _v4_rope_inplace_npu(
     time — see `deepseek_v4_rope.precompute_freqs_cis`. This function
     just reads what's stored; it does NOT apply mscale here.
 
-    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`
-    (same kernel iforgetmyname/dsv4_release uses) — torch fallback differs
-    by ~1 ULP per element vs the kernel because torch does bf16*bf16 muls
-    with bf16 accumulation while the NPU kernel accumulates in fp32.
-    43 layers × (Q + K) = 86 rope calls compound the drift; with the torch
-    fallback some prompts (those with marginal argmax decisions) flip
-    tokens vs iforgetmyname.
+    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`:
+    the torch fallback differs by ~1 ULP per element vs the kernel because
+    torch does bf16*bf16 muls with bf16 accumulation while the NPU kernel
+    accumulates in fp32; 43 layers × (Q + K) = 86 rope calls compound that
+    drift enough to flip argmax on marginal prompts.
     """
     if (
         _is_npu
@@ -314,16 +311,10 @@ class MQALayer(nn.Module):
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        # YARN correction applies to ALL layers regardless of compress_ratio.
-        # iforgetmyname/dsv4_release's get_rope_wrapper always passes
-        # `rope_scaling` to the rotary_emb constructor, so dense (ratio 0/1)
-        # layers get the same YARN-corrected inv_freq as compressed layers
-        # — only the rope base differs (rope_theta vs compress_rope_theta).
-        # Earlier this branched on compress_ratio and zeroed the YARN
-        # correction for dense layers; that left the 3 dense layers of
-        # V4-Flash (positions 0, 1, 43 in the 44-layer model) with raw
-        # extrapolation freqs while the model was trained with YARN —
-        # causing token-1+ divergence even after the mscale magnitude fix.
+        # YARN correction applies to ALL layers regardless of compress_ratio:
+        # dense (ratio 0/1) and compressed (ratio 4/128) layers share the same
+        # YARN-corrected inv_freq; only the rope base differs (rope_theta vs
+        # compress_rope_theta).
         original_seq_len = rope_scaling["original_max_position_embeddings"]
 
         freqs_cis = precompute_freqs_cis(
@@ -334,16 +325,6 @@ class MQALayer(nn.Module):
             factor=rope_scaling["factor"],
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
-            # V4-Flash YARN magnitude-scale: V4-Flash config.json doesn't
-            # include mscale / mscale_all_dim fields, so iforgetmyname's
-            # DeepseekScalingRotaryEmbedding falls back to defaults
-            # (mscale=1, mscale_all_dim=0) which yield self.mscale ≈ 1.2773
-            # for factor=16. main's precompute_freqs_cis previously omitted
-            # this scale entirely, producing rope magnitudes ~22% smaller
-            # than what the model was trained for → semantically broken
-            # output (231 step 5+ test: tokens like `[19,16,19,16,343,...]`
-            # = "1.1. (C.dir," vs the correct `[54994,1060,...]` =
-            # "jumps over the lazy dog" for prompt "The quick brown fox").
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
@@ -478,10 +459,9 @@ class MQALayer(nn.Module):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if _is_npu:
-            # NPU-native RMS norm: triton rms_normalize_triton drifts ~1 ULP
-            # per layer vs the kernel; over 43 layers that flips argmax. Use
-            # the kernel with an all-ones dummy weight (matches iforgetmyname
-            # q_b_norm_dummy_weight).
+            # NPU-native RMS norm with an all-ones dummy weight. triton
+            # rms_normalize_triton drifts ~1 ULP per layer vs the kernel; over
+            # 43 layers that flips argmax.
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:

@@ -887,9 +887,9 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        # Talantan1102/sglang#1: bool-indexed scatter `topk_ids[bool_mask, :] = -1`
-        # lowers to aclnnNonzeroV2 on NPU and randomly triggers aicore timeout
-        # under long-thinking AIME workload. torch.where avoids the nonzero scan.
+        # On NPU, bool-indexed scatter `topk_ids[bool_mask, :] = -1` lowers
+        # to aclnnNonzeroV2 and can trigger an aicore timeout under long
+        # workloads; `torch.where` avoids that nonzero scan.
         mask = (indices >= num_token_non_padded).unsqueeze(-1)
         topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
 
