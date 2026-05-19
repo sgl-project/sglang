@@ -325,6 +325,7 @@ def build_deepseek_v4_hicache_stack(
         item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
         num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
+        layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -357,6 +358,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
@@ -368,6 +370,7 @@ def build_deepseek_v4_hicache_stack(
             ),
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -378,6 +381,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -388,6 +392,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
@@ -430,6 +435,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
@@ -440,6 +446,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
