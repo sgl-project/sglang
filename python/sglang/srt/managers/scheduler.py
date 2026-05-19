@@ -2489,7 +2489,7 @@ class Scheduler(
             self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
+            running_loras = self._collect_committed_lora_ids(adder.can_run_list)
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
@@ -2670,6 +2670,23 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def _collect_committed_lora_ids(
+        self, prefill_can_run_list: List[Req]
+    ) -> set[Optional[str]]:
+        """Collect lora_ids already committed to the next batch so admission
+        can correctly enforce ``max_loras_per_batch``.
+
+        Includes (a) reqs in the current running decode batch and (b) reqs
+        already placed into the prefill adder's can_run_list — notably the
+        chunked_req, which is admitted unconditionally before the waiting
+        queue is processed. Without (b) a chunked LoRA prefill is invisible
+        to admission, allowing the scheduler to admit N+1 distinct adapters
+        when ``max_loras_per_batch=N``. See sgl-project/sglang#23141.
+        """
+        committed = {req.lora_id for req in self.running_batch.reqs}
+        committed.update(r.lora_id for r in prefill_can_run_list)
+        return committed
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
