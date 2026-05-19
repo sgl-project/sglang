@@ -264,6 +264,17 @@ class MinimaxM2Detector(BaseFormatDetector):
 
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
+                tool_call_end_pos = self._buf.find(self.tool_call_end_token)
+                next_function_pos = self._buf.find(self.tool_call_prefix)
+                if tool_call_end_pos != -1 and (
+                    next_function_pos == -1 or tool_call_end_pos < next_function_pos
+                ):
+                    self._buf = self._buf[
+                        tool_call_end_pos + len(self.tool_call_end_token) :
+                    ]
+                    self._reset_streaming_state()
+                    continue
+
                 # Look for function name pattern: <invoke name=name>
                 function_match = re.search(r"<invoke name=\"([^>]+)\">", self._buf)
                 if function_match:
@@ -345,8 +356,20 @@ class MinimaxM2Detector(BaseFormatDetector):
                     self._buf = self._buf[
                         end_pos + len(self.tool_call_function_end_token) :
                     ]
-                    self._reset_streaming_state(True)
                     self.current_tool_id += 1
+
+                    tool_call_end_pos = self._buf.find(self.tool_call_end_token)
+                    next_function_pos = self._buf.find(self.tool_call_prefix)
+                    if tool_call_end_pos != -1 and (
+                        next_function_pos == -1 or tool_call_end_pos < next_function_pos
+                    ):
+                        self._buf = self._buf[
+                            tool_call_end_pos + len(self.tool_call_end_token) :
+                        ]
+                        self._reset_streaming_state()
+                    else:
+                        self._reset_streaming_state(True)
+
                     continue
                 else:
                     # Tool call not complete yet, wait for more text
