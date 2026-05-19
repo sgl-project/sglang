@@ -952,6 +952,7 @@ class Scheduler(
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
+        # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -1904,9 +1905,6 @@ class Scheduler(
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
             if self.pad_input_ids_func:
-                # Most pad_input_ids implementations return List[int];
-                # wrap into array.array since Req.origin_input_ids no
-                # longer has a coercing setter.
                 req.origin_input_ids = array(
                     "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
