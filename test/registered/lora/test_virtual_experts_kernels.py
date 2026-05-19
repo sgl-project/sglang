@@ -40,6 +40,7 @@ from sglang.kernels.ops.moe.virtual_experts import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
     """Item B regression: post-EP-dispatch -1 sentinels must NOT be remapped."""
 
