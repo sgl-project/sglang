@@ -141,8 +141,13 @@ class CanaryRunner:
         self._perturb_undo: Optional[tuple[int, int, int]] = None
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
-    def attach_req_to_token_pool(self, req_to_token_pool: "ReqToTokenPool") -> None:
-        self._req_to_token_pool = req_to_token_pool
+        active: set[CanaryLaunchTag] = set()
+        for endpoints in self._endpoints_per_pool:
+            for endpoint in endpoints:
+                active.add(endpoint.kernel_kind)
+        self._active_tags: tuple[CanaryLaunchTag, ...] = tuple(
+            sorted(active, key=lambda tag: tag.value)
+        )
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
@@ -340,11 +345,10 @@ class CanaryRunner:
         if self._step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
             return
 
-        active_tags = self._active_tags()
-        if not active_tags:
+        if not self._active_tags:
             return
         counters = self._device_state.kernel_run_counters.detach().cpu().tolist()
-        zero_tags = [tag for tag in active_tags if int(counters[tag.value]) == 0]
+        zero_tags = [tag for tag in self._active_tags if int(counters[tag.value]) == 0]
         if zero_tags:
             names = ", ".join(tag.name for tag in zero_tags)
             raise RuntimeError(
@@ -385,7 +389,7 @@ class CanaryRunner:
             return
         protected = int(self._device_state.slot_run_counters.sum().item())
         violations = int(self._device_state.violation_log.violation_write_index.item())
-        active = len(self._active_tags())
+        active = len(self._active_tags)
         logger.info(
             "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
             "launch_tags_active=%d/%d",
@@ -464,13 +468,6 @@ class CanaryRunner:
                 violation_log=violation_log,
                 real_kv_hash_mode=self.config.real_kv_hash_mode,
             )
-
-    def _active_tags(self) -> list[CanaryLaunchTag]:
-        seen: set[CanaryLaunchTag] = set()
-        for endpoints in self._endpoints_per_pool:
-            for endpoint in endpoints:
-                seen.add(endpoint.kernel_kind)
-        return sorted(seen, key=lambda tag: tag.value)
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
