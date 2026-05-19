@@ -313,11 +313,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMHAAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TokenspeedMLABackend)
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
+            self.draft_extend_attn_backend,
+            (
+                TritonAttnBackend,
+                TRTLLMMLABackend,
+                TRTLLMHAAttnBackend,
+                TokenspeedMLABackend,
+            ),
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
