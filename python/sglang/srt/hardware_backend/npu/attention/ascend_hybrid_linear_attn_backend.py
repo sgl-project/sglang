@@ -219,7 +219,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        accept_steps: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
@@ -233,7 +233,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = accept_steps.shape[0]
+        request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -254,7 +254,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             device=dst_indices_tensor.device,
             dtype=torch.int64,
         )
-        last_steps = accept_steps.to(torch.int64)  # [N]
+        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
         move_intermediate_cache(
             ssm_states,
