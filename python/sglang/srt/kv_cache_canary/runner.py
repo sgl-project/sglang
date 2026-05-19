@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_EVERY_N_STEPS: int = 1000
 _HEALTH_CHECK_WARMUP_STEPS: int = 100
+_ON_MODE_VERBOSE_LIMIT: int = 10
 
 
 class CanaryRunner:
@@ -138,6 +139,7 @@ class CanaryRunner:
         self._last_sweep_step: int = -1
         self._sweep_passes: int = 0
         self._raised: bool = False
+        self._on_mode_violations_logged: int = 0
         self._perturb_undo: Optional[tuple[int, int, int]] = None
         self._last_forward_batch: Optional["ForwardBatch"] = None
         self._alive_reqs_snapshot: Optional[AliveReqSnapshot] = None
@@ -361,7 +363,11 @@ class CanaryRunner:
             step_when_pumped=self._step_counter,
         )
         if self.config.mode == "on":
-            logger.error(message)
+            self._on_mode_violations_logged += 1
+            if self._on_mode_violations_logged <= _ON_MODE_VERBOSE_LIMIT:
+                logger.warning(message)
+            else:
+                logger.debug(message)
             return
         self._raised = True
         raise RuntimeError(message)
