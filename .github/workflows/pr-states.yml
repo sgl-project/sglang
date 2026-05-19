@@ -3,22 +3,15 @@ name: PR States
 # pull_request_target (not pull_request) for fork-PR write access; safe
 # because we never check out PR head code, only API-read and PATCH the body.
 #
-# Three trigger sources, each covering a distinct gap:
-#   - pull_request_target: covers fresh push / open / label changes (all
-#     PRs including forks, since pull_request_target runs in base-repo
-#     context with full permissions).
-#   - workflow_run (pr-test* completion): covers the INITIAL completion of
-#     each pr-test / pr-test-extra run, including fork PRs. The notify-job
-#     below cannot fire for fork PRs (their `pull_request` GITHUB_TOKEN is
-#     read-only), so fork PRs rely on this path to update on completion.
-#     workflow_run does NOT re-fire for rerun attempts (GitHub reuses the
-#     workflow_run record across attempts), which is why we need the
-#     notify-job path too.
-#   - workflow_dispatch: explicit refresh fired by pr-test.yml /
-#     pr-test-extra.yml's notify-pr-states final job after every attempt
-#     completion. This catches rerun completions (initial + rerun) for
-#     non-fork PRs. `workflow_dispatch` is the only event GITHUB_TOKEN can
-#     cascade-create, so it works regardless of who initiated the rerun.
+# Three triggers, each covering a gap:
+#   - pull_request_target: push / open / label change (all PRs incl forks).
+#   - workflow_run: initial pr-test* completion (incl fork PRs; the
+#     notify-job below can't fire on forks — their pull_request
+#     GITHUB_TOKEN is forced read-only). Does NOT re-fire for rerun
+#     attempts, which is why workflow_dispatch is needed too.
+#   - workflow_dispatch: rerun completions for non-fork PRs, dispatched by
+#     pr-test*'s notify-pr-states job. workflow_dispatch is the only event
+#     GITHUB_TOKEN can cascade-create.
 
 on:
   pull_request_target:
@@ -38,10 +31,8 @@ permissions:
   actions: read
 
 concurrency:
-  # Dedupe per commit SHA when available, fall back to PR number for the
-  # workflow_dispatch path. Concurrent fires from pull_request_target +
-  # workflow_run + notify-job on the same push will queue rather than
-  # race on the body PATCH.
+  # Per-SHA dedupe (PR number for workflow_dispatch). Queues concurrent
+  # fires across the three triggers so they don't race on the body PATCH.
   group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || inputs.pr_number }}
   cancel-in-progress: false
 
@@ -95,9 +86,8 @@ jobs:
                 return;
               }
             } else if (context.eventName === 'workflow_dispatch') {
-              // workflow_dispatch inputs are arbitrary strings; reject
-              // anything that isn't a pure digit sequence so trailing
-              // garbage like '123abc' doesn't silently truncate via parseInt.
+              // Reject non-digit pr_number; parseInt('123abc', 10) returns
+              // 123 and would silently truncate trailing garbage.
               const raw = context.payload.inputs.pr_number;
               if (!/^\d+$/.test(raw)) {
                 core.setFailed(`workflow_dispatch: invalid pr_number input '${raw}' (must be digits only)`);
