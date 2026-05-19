@@ -300,7 +300,122 @@ class CpuScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def run_event_loop(self) -> None:
-        dispatch_event_loop(self)
+        import os
+        if os.environ.get("SGLANG_CPU_PIPELINE_OVERLAP", "0") == "1":
+            self.event_loop_pipelined()
+        else:
+            dispatch_event_loop(self)
+
+    def event_loop_pipelined(self) -> None:
+        """Send-ahead pipeline: send batch N+1's forward request to the GPU
+        worker before running ``process_batch_result`` for batch N.
+
+        Hides scheduler-side bookkeeping (~1-2 ms / step on Qwen2.5-1.5B
+        batch=200) behind the worker's GPU forward, at the cost of one
+        step's worth of "speculative" admission (no req can stop mid-step
+        without the next step's output being wasted).
+        """
+        import time
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.scheduler import (
+            DynamicGradMode,
+            ForwardMode,
+            set_time_batch,
+        )
+
+        @DynamicGradMode()
+        def _loop():
+            # pending: (batch, handle) for the in-flight forward, or None.
+            pending = None
+            while True:
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                if self._engine_paused:
+                    if pending is None:
+                        continue
+                    # If paused, drain the in-flight request first.
+
+                # 1. Recv the in-flight result, update batch state so
+                #    get_next_batch_to_run sees the right output.
+                prev_batch = None
+                prev_result = None
+                if pending is not None:
+                    prev_batch, handle = pending
+                    prev_result = self.model_worker.forward_batch_generation_wait(handle)
+                    # Mirror the in-line work from Scheduler.run_batch:
+                    #   - update_cache_from_scheduler (CPU-side req_to_token write)
+                    #   - batch.output_ids = result.next_token_ids
+                    #   - extend_input_len_per_req for return_logprob paths
+                    self.update_cache_from_scheduler(prev_batch, prev_result)
+                    prev_batch.output_ids = prev_result.next_token_ids
+                    if prev_batch.return_logprob:
+                        prev_result.extend_input_len_per_req = [
+                            req.extend_input_len for req in prev_batch.reqs
+                        ]
+                        prev_result.extend_logprob_start_len_per_req = [
+                            req.extend_logprob_start_len for req in prev_batch.reqs
+                        ]
+                    else:
+                        prev_result.extend_input_len_per_req = None
+                        prev_result.extend_logprob_start_len_per_req = None
+
+                # 2. Get next batch (uses prev_batch's freshly-updated state).
+                batch = self.get_next_batch_to_run()
+                self.cur_batch = batch
+
+                # 3. Issue next forward (send-only; worker forwards in parallel
+                #    with our process_batch_result below).
+                new_pending = None
+                if batch:
+                    self.forward_ct += 1
+                    self._profile_batch_predicate(batch)
+                    if self.forward_sleep_time is not None:
+                        time.sleep(self.forward_sleep_time)
+                    if batch.forward_mode == ForwardMode.EXTEND:
+                        set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
+                    if batch.forward_mode.is_prebuilt():
+                        # Prebuilt path doesn't go through the worker; fall back
+                        # to synchronous run_batch for this iteration.
+                        sync_result = self.run_batch(batch)
+                        # Process this and the prev result back-to-back; no overlap
+                        if prev_batch is not None and prev_result is not None:
+                            self.process_batch_result(prev_batch, prev_result)
+                        self.process_batch_result(batch, sync_result)
+                        self.last_batch = batch
+                        pending = None
+                        continue
+                    if self.is_generation:
+                        worker_batch = batch.get_model_worker_batch()
+                        handle = self.model_worker.forward_batch_generation_start(worker_batch)
+                        new_pending = (batch, handle)
+                    else:
+                        # Embedding / non-generation: not worth pipelining,
+                        # do synchronous run.
+                        sync_result = self.run_batch(batch)
+                        if prev_batch is not None and prev_result is not None:
+                            self.process_batch_result(prev_batch, prev_result)
+                        self.process_batch_result(batch, sync_result)
+                        self.last_batch = batch
+                        pending = None
+                        continue
+                else:
+                    # No new batch — if we had a pending, process it; otherwise
+                    # idle.
+                    if prev_batch is None:
+                        self.on_idle()
+
+                # 4. While the worker is busy with `batch`, do the slow
+                #    process_batch_result on `prev_batch`.
+                if prev_batch is not None and prev_result is not None:
+                    self.process_batch_result(prev_batch, prev_result)
+
+                # 5. Advance.
+                pending = new_pending
+                self.last_batch = batch
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                    self.self_check_during_busy()
+
+        _loop()
 
     # ------------------------------------------------------------------
     # Override: sync GPU-allocated slot indices back into CPU req_to_token

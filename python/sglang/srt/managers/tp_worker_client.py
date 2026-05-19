@@ -449,6 +449,70 @@ class TpWorkerClientGroup(BaseTpWorker):
         return result
 
     # ------------------------------------------------------------------
+    # Async send/recv split — used by the scheduler's send-ahead overlap
+    # pattern. ``_fanout_forward`` = ``_fanout_send_only`` + ``_fanout_recv``.
+    # ------------------------------------------------------------------
+
+    def _fanout_send_only(self, method: bytes, **kwargs) -> float:
+        """Non-blocking send of *method* to all workers.
+
+        Returns the perf_counter timestamp at which the send completed, used
+        by ``_fanout_recv`` to compute the send-to-recv aggregator slice.
+        """
+        t0 = time.perf_counter()
+        for client in self._clients:
+            client._rpc_send(method, **kwargs)
+        return t0
+
+    def _fanout_recv(self, send_t0: float) -> Any:
+        """Wait for rank-0's reply and drain the rest.
+
+        Pair with ``_fanout_send_only``. ``send_t0`` is the timestamp returned
+        by the matching send, used to keep the send/recv aggregator consistent
+        with the synchronous ``_fanout_forward`` path.
+        """
+        t_after_send = time.perf_counter()
+        result = self._lead._rpc_recv()
+        for client in self._clients[1:]:
+            client._rpc_recv()
+        t_after_recv = time.perf_counter()
+        send_us = (t_after_send - send_t0) * 1e6
+        recv_us = (t_after_recv - t_after_send) * 1e6
+        dt_us = send_us + recv_us
+        self._rt_count += 1
+        self._rt_send_sum_us += send_us
+        self._rt_recv_sum_us += recv_us
+        if dt_us > self._rt_max_us:
+            self._rt_max_us = dt_us
+        if dt_us < self._rt_min_us:
+            self._rt_min_us = dt_us
+        if self._rt_count >= self._rt_window:
+            total = self._decode_fast_hits + self._decode_fast_misses + self._decode_full_calls
+            hit_rate = self._decode_fast_hits / max(1, total) * 100.0
+            logger.info(
+                "TpWorkerClient[%d ops] us send=%.0f recv=%.0f min=%.0f max=%.0f "
+                "| decode_fast hits=%d misses=%d full=%d (hit_rate=%.1f%%)",
+                self._rt_count,
+                self._rt_send_sum_us / self._rt_count,
+                self._rt_recv_sum_us / self._rt_count,
+                self._rt_min_us,
+                self._rt_max_us,
+                self._decode_fast_hits,
+                self._decode_fast_misses,
+                self._decode_full_calls,
+                hit_rate,
+            )
+            self._rt_count = 0
+            self._rt_send_sum_us = 0.0
+            self._rt_recv_sum_us = 0.0
+            self._rt_max_us = 0.0
+            self._rt_min_us = float("inf")
+            self._decode_fast_hits = 0
+            self._decode_fast_misses = 0
+            self._decode_full_calls = 0
+        return result
+
+    # ------------------------------------------------------------------
     # Decode fast-path helpers
     # ------------------------------------------------------------------
 
@@ -467,6 +531,25 @@ class TpWorkerClientGroup(BaseTpWorker):
     def _batch_composition_unchanged_fp(self, fp: Tuple[int, ...]) -> bool:
         """True if the given fingerprint matches the cached one."""
         return self._last_req_pool_fp is not None and fp == self._last_req_pool_fp
+
+    def _maybe_rehydrate_decode_reply(self, slim):
+        """Rehydrate the worker's slim M_DECODE_STEP dict reply into a
+        ``GenerationBatchResult``.  Returns *slim* unchanged if it's already
+        a full result object (back-compat with the M_FORWARD_GENERATION path).
+        """
+        if isinstance(slim, dict) and slim.get("_slim_decode"):
+            from sglang.srt.managers.utils import GenerationBatchResult
+            return GenerationBatchResult(
+                next_token_ids=slim["next_token_ids"],
+                deferred_alloc=slim.get("deferred_alloc"),
+                accept_lens=slim.get("accept_lens"),
+                can_run_cuda_graph=slim.get("can_run_cuda_graph", False),
+                num_accepted_drafts=slim.get("num_accepted_drafts", 0),
+                logits_output=slim.get("logits_output"),
+                routed_experts_output=slim.get("routed_experts_output"),
+                expert_distribution_metrics=slim.get("expert_distribution_metrics"),
+            )
+        return slim
 
     def _build_decode_control(self, batch: "ModelWorkerBatch") -> dict:
         """Extract the delta fields needed for a decode_step control message.
@@ -527,23 +610,7 @@ class TpWorkerClientGroup(BaseTpWorker):
                 slim = self._fanout_forward(M_DECODE_STEP, **control)
                 self._last_req_pool_fp = fp
                 self._decode_fast_hits += 1
-                # Slim reply: rehydrate into GenerationBatchResult.
-                # Pickling the full dataclass walks 15+ Optional fields and
-                # cost 200ms+/step at batch=200; the slim dict carries only
-                # what the scheduler actually consumes for decode.
-                if isinstance(slim, dict) and slim.get("_slim_decode"):
-                    from sglang.srt.managers.utils import GenerationBatchResult
-                    return GenerationBatchResult(
-                        next_token_ids=slim["next_token_ids"],
-                        deferred_alloc=slim.get("deferred_alloc"),
-                        accept_lens=slim.get("accept_lens"),
-                        can_run_cuda_graph=slim.get("can_run_cuda_graph", False),
-                        num_accepted_drafts=slim.get("num_accepted_drafts", 0),
-                        logits_output=slim.get("logits_output"),
-                        routed_experts_output=slim.get("routed_experts_output"),
-                        expert_distribution_metrics=slim.get("expert_distribution_metrics"),
-                    )
-                return slim
+                return self._maybe_rehydrate_decode_reply(slim)
             # Fast path eligible (is_decode) but composition changed — miss.
             self._decode_fast_misses += 1
             full_method = b"forward_batch_generation"
@@ -574,6 +641,69 @@ class TpWorkerClientGroup(BaseTpWorker):
 
     def forward_batch_embedding(self, model_worker_batch: "ModelWorkerBatch"):
         return self._fanout_forward(b"forward_batch_embedding", batch=model_worker_batch)
+
+    # ------------------------------------------------------------------
+    # Split forward — send-only / wait pair used by the scheduler's
+    # pipelined event loop. Equivalent to ``forward_batch_generation``
+    # but lets the caller do other work between send and recv.
+    # ------------------------------------------------------------------
+
+    def forward_batch_generation_start(
+        self,
+        model_worker_batch: "ModelWorkerBatch",
+        pp_proxy_tensors=None,
+        is_verify: bool = False,
+        skip_attn_backend_init: bool = False,
+    ):
+        """Send the forward request and return a handle for the matching wait.
+
+        Returns a tuple ``(send_t0, is_decode_fast, fingerprint_to_install)``.
+        The caller passes this to ``forward_batch_generation_wait``.
+        """
+        if model_worker_batch.forward_mode.is_decode():
+            fp = self._req_pool_fingerprint(model_worker_batch)
+            if self._decode_fast_valid and self._batch_composition_unchanged_fp(fp):
+                control = self._build_decode_control(model_worker_batch)
+                send_t0 = self._fanout_send_only(M_DECODE_STEP, **control)
+                return (send_t0, True, fp, "fast")
+            send_t0 = self._fanout_send_only(
+                b"forward_batch_generation",
+                batch=model_worker_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                is_verify=is_verify,
+                skip_attn_backend_init=skip_attn_backend_init,
+            )
+            return (send_t0, True, fp, "miss")
+        # Non-decode: full path
+        send_t0 = self._fanout_send_only(
+            b"forward_batch_generation",
+            batch=model_worker_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            is_verify=is_verify,
+            skip_attn_backend_init=skip_attn_backend_init,
+        )
+        return (send_t0, False, None, "full")
+
+    def forward_batch_generation_wait(self, handle) -> "GenerationBatchResult":
+        """Wait for a previously-issued ``forward_batch_generation_start``."""
+        send_t0, is_decode, fp, kind = handle
+        result = self._fanout_recv(send_t0)
+        # Update fast-path tracking and counters to mirror
+        # ``forward_batch_generation`` semantics.
+        if kind == "fast":
+            self._decode_fast_hits += 1
+            self._last_req_pool_fp = fp
+            return self._maybe_rehydrate_decode_reply(result)
+        if kind == "miss":
+            self._decode_fast_misses += 1
+            self._decode_fast_valid = True
+            self._last_req_pool_fp = fp
+            return result
+        # kind == "full" — non-decode forward
+        self._decode_full_calls += 1
+        self._decode_fast_valid = False
+        self._last_req_pool_fp = None
+        return result
 
     def forward_batch_split_prefill(self, batch: "ScheduleBatch") -> "GenerationBatchResult":
         return self._fanout_forward(b"forward_batch_split_prefill", batch=batch)
