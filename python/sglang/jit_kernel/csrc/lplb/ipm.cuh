@@ -183,7 +183,9 @@ __global__ void ipm_solve_kernel(
     if (tid < 32) {
       d_max = 0.f;
       for (int j = tid; j < NV; j += 32) {
-        d_max = d[j] = x[j] * (c[j] - r[j]);
+        float val = x[j] * (c[j] - r[j]);
+        d[j] = val;
+        d_max = fmaxf(d_max, val);
       }
       for (int offset = 16; offset > 0; offset >>= 1) {
         d_max = fmaxf(d_max, __shfl_xor_sync(0xffffffff, d_max, offset));
