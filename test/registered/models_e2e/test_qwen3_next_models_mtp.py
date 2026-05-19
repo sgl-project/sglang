@@ -1,6 +1,8 @@
 import os
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
@@ -36,6 +38,7 @@ def _mtp_args(*, strategy, steps, topk, draft_tokens, track_interval):
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen3NextMTPTopk(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
@@ -68,7 +71,7 @@ class TestQwen3NextMTPTopk(
         "128",
     ]
 
-
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skip(
     "Manual-only: topk == 1 is covered by TestQwen3NextMTPLazyV2 and extra_buffer "
     "by TestQwen3NextMTPTopk. Kept runnable locally for the plain (topk=1, "
