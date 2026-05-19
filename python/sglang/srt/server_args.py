@@ -5351,20 +5351,40 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
         parser.add_argument(
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             dest="dsa_prefill_backend",
             default=ServerArgs.dsa_prefill_backend,
             type=str,
             choices=DSA_CHOICES,
-            help="NSA prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
-            "--nsa-decode-backend",
+            "--nsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-prefill-backend",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-prefill-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-decode-backend",
             dest="dsa_decode_backend",
             default=ServerArgs.dsa_decode_backend,
             type=str,
             choices=DSA_CHOICES,
-            help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-decode-backend",
+            dest="dsa_decode_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-decode-backend",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
@@ -6400,16 +6420,33 @@ class ServerArgs:
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
         parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
+            "--enable-dsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
-            "--nsa-prefill-cp-mode",
+            "--enable-nsa-prefill-context-parallel",
+            dest="enable_dsa_prefill_context_parallel",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-dsa-prefill-context-parallel",
+            help="[Deprecated] Use --enable-dsa-prefill-context-parallel instead.",
+        )
+        parser.add_argument(
+            "--dsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
             type=str,
             default=ServerArgs.dsa_prefill_cp_mode,
+            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            dest="dsa_prefill_cp_mode",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-prefill-cp-mode",
+            default=argparse.SUPPRESS,
+            type=str,
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
