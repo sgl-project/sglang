@@ -79,6 +79,8 @@ class FailReason(enum.IntEnum):
     HASH = 3
     POSITION_MONOTONIC = 4
     REAL_KV_HASH = 5
+    INPUT_TOKEN_MISMATCH = 6
+    INPUT_POSITION_MISMATCH = 7
 
 
 @cache_once
@@ -117,6 +119,8 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kFailReasonHash",
     "kFailReasonPositionMonotonic",
     "kFailReasonRealKvHash",
+    "kFailReasonInputTokenMismatch",
+    "kFailReasonInputPositionMismatch",
     "kRealKvHashModeOff",
     "kRealKvHashModeBit",
     "kRealKvHashModeAll",

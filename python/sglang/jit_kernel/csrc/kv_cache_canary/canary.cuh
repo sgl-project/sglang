@@ -31,6 +31,8 @@ constexpr int kFailReasonPosition = 2;
 constexpr int kFailReasonHash = 3;
 constexpr int kFailReasonPositionMonotonic = 4;
 constexpr int kFailReasonRealKvHash = 5;
+constexpr int kFailReasonInputTokenMismatch = 6;
+constexpr int kFailReasonInputPositionMismatch = 7;
 
 // Mirror of the Python REAL_KV_HASH_MODE_* constants in
 // jit_kernel/kv_cache_canary.py. ``OFF`` disables the real-KV
@@ -511,7 +513,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 22;
+constexpr int kConstantsCount = 24;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -537,6 +539,8 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kFailReasonHash;
   dst[i++] = kFailReasonPositionMonotonic;
   dst[i++] = kFailReasonRealKvHash;
+  dst[i++] = kFailReasonInputTokenMismatch;
+  dst[i++] = kFailReasonInputPositionMismatch;
   dst[i++] = kRealKvHashModeOff;
   dst[i++] = kRealKvHashModeBit;
   dst[i++] = kRealKvHashModeAll;

@@ -68,6 +68,8 @@ _EXPECTED_PAIRS: Dict[str, int] = {
     "kFailReasonHash": int(FailReason.HASH),
     "kFailReasonPositionMonotonic": int(FailReason.POSITION_MONOTONIC),
     "kFailReasonRealKvHash": int(FailReason.REAL_KV_HASH),
+    "kFailReasonInputTokenMismatch": int(FailReason.INPUT_TOKEN_MISMATCH),
+    "kFailReasonInputPositionMismatch": int(FailReason.INPUT_POSITION_MISMATCH),
     "kRealKvHashModeOff": REAL_KV_HASH_MODE_OFF,
     "kRealKvHashModeBit": REAL_KV_HASH_MODE_BIT,
     "kRealKvHashModeAll": REAL_KV_HASH_MODE_ALL,
