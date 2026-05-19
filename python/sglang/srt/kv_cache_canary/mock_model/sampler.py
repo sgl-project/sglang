@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _REGISTERED_ORACLE: Optional[Oracle] = None
 _ORACLE_BACKEND_NAME: str = "oracle"
 _ORACLE_BACKEND_REGISTERED: bool = False
+_LAST_REQ_POOL_INDICES: Optional[List[int]] = None
 
 
 def install_oracle_sampler(*, oracle: Oracle) -> None:
@@ -53,6 +54,8 @@ def fill_expected_inputs(
     keep mock-model running such that every (req_id, position) hit by the canary write loop is
     a valid oracle query.
     """
+    global _LAST_REQ_POOL_INDICES
+
     oracle = _REGISTERED_ORACLE
     if oracle is None:
         raise RuntimeError("fill_expected_inputs called before install_oracle_sampler")
@@ -60,11 +63,19 @@ def fill_expected_inputs(
     positions = forward_batch.positions
     input_ids = forward_batch.input_ids
     num_tokens = int(input_ids.shape[0])
+
+    req_pool_indices_per_row = [
+        int(v) for v in forward_batch.req_pool_indices.detach().to("cpu").tolist()
+    ]
+    _LAST_REQ_POOL_INDICES = req_pool_indices_per_row
+
     if num_tokens == 0:
         return
 
     req_id_per_token = _build_req_id_per_token(
-        forward_batch=forward_batch, num_tokens=num_tokens
+        forward_batch=forward_batch,
+        num_tokens=num_tokens,
+        req_pool_indices_per_row=req_pool_indices_per_row,
     )
     positions_cpu = positions.detach().to("cpu", dtype=torch.int64).tolist()
 
@@ -91,10 +102,12 @@ def fill_expected_inputs(
 
 
 def _build_req_id_per_token(
-    *, forward_batch: "ForwardBatch", num_tokens: int
+    *,
+    forward_batch: "ForwardBatch",
+    num_tokens: int,
+    req_pool_indices_per_row: List[int],
 ) -> List[int]:
-    req_pool_indices = forward_batch.req_pool_indices.detach().to("cpu").tolist()
-    bs = len(req_pool_indices)
+    bs = len(req_pool_indices_per_row)
 
     forward_mode = forward_batch.forward_mode
     if forward_mode is not None and forward_mode.is_extend():
@@ -109,21 +122,20 @@ def _build_req_id_per_token(
 
     out: List[int] = []
     for r in range(bs):
-        out.extend([int(req_pool_indices[r])] * int(lens[r]))
-    if len(out) < num_tokens:
-        out.extend(
-            [int(req_pool_indices[bs - 1] if bs > 0 else 0)] * (num_tokens - len(out))
-        )
-    elif len(out) > num_tokens:
-        out = out[:num_tokens]
+        out.extend([int(req_pool_indices_per_row[r])] * int(lens[r]))
+    assert (
+        len(out) == num_tokens
+    ), f"fill_expected_inputs: sum(lens)={len(out)} != num_tokens={num_tokens}"
     return out
 
 
 class _OracleSampler(Sampler):
     """Sampler subclass that bypasses logits and returns oracle-driven token ids per row.
 
-    Uses the per-forward row index as req_id (matches fill_expected_inputs row -> req mapping)
-    and forward positions tensor as the per-row position.
+    Uses req_pool_indices[r] as req_id (matches fill_expected_inputs row -> req mapping
+    so both sampler and canary write_step see identical (req_id, position) pairs) and the
+    forward positions tensor as the per-row position. req_pool_indices is stashed by
+    fill_expected_inputs into module-level _LAST_REQ_POOL_INDICES at forward_step_before_model.
     """
 
     def forward(
@@ -141,15 +153,30 @@ class _OracleSampler(Sampler):
                 "_OracleSampler.forward: no oracle registered (install_oracle_sampler not called)"
             )
 
+        req_pool_indices_per_row = _LAST_REQ_POOL_INDICES
+        if req_pool_indices_per_row is None:
+            raise RuntimeError(
+                "_OracleSampler.forward: req_pool_indices not stashed; "
+                "fill_expected_inputs must be called before sampling (input_check_mode == ON required)"
+            )
+
         logits = logits_output.next_token_logits
         device = logits.device
         bs = int(logits.shape[0])
+
+        assert len(req_pool_indices_per_row) == bs, (
+            f"_OracleSampler.forward: stashed req_pool_indices length "
+            f"{len(req_pool_indices_per_row)} != logits batch size {bs}"
+        )
 
         positions_cpu = positions.detach().to("cpu", dtype=torch.int64).tolist()
         token_ids: List[int] = [0] * bs
         for r in range(bs):
             token_ids[r] = int(
-                oracle.expected_token(req_id=r, position=int(positions_cpu[r]))
+                oracle.expected_token(
+                    req_id=int(req_pool_indices_per_row[r]),
+                    position=int(positions_cpu[r]),
+                )
             )
 
         batch_next_token_ids = torch.tensor(token_ids, dtype=torch.int32, device=device)
