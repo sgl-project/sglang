@@ -30,7 +30,7 @@ class TestXPUBasic(CustomTestCase):
             "xpu",
             "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.3",
+            "0.6",
             "--batch-size",
             "1",
         ]
