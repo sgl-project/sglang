@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.layers.attention.dsa.nsa_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.dsa_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     nsa_use_prefill_cp,
 )

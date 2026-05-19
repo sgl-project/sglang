@@ -71,7 +71,7 @@ class CompressorBackendMixin:
         compress_ratio: int,
         is_paged: bool = False,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.nsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 
         assert compress_ratio in (
             4,
