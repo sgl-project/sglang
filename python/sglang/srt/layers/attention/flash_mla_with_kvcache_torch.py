@@ -242,9 +242,6 @@ def _sm120_sparse_decode_fwd(
     return out, lse
 
 
-_use_triton_flashmla = os.environ.get("SGLANG_TRITON_FLASHMLA", "0") == "1"
-
-
 def flash_mla_with_kvcache_torch(**kwargs):
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -258,25 +255,6 @@ def flash_mla_with_kvcache_torch(**kwargs):
     extra_k_cache = kwargs.get("extra_k_cache")
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
-
-    if _use_triton_flashmla:
-        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
-            flash_mla_sparse_decode_triton,
-        )
-
-        out, lse = flash_mla_sparse_decode_triton(
-            q,
-            k_cache,
-            indices,
-            topk_length,
-            attn_sink,
-            head_dim_v,
-            softmax_scale,
-            extra_k_cache,
-            extra_indices,
-            extra_topk_length,
-        )
-        return (out, lse)
 
     out, lse = _sm120_sparse_decode_fwd(
         q,
