@@ -7,7 +7,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
-from sglang.srt.kv_cache_canary.sweep import compute_alive_owned_slots
+from sglang.srt.kv_cache_canary.sweep import (
+    compute_alive_owned_slots,
+    extract_active_rows,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -18,6 +21,16 @@ _PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
 _REAL_PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
 
 
+def _get_or_init_rng(
+    cache: Dict[int, random.Random], base_seed: int, rank: int
+) -> random.Random:
+    rng = cache.get(rank)
+    if rng is None:
+        rng = random.Random(_rng_seed_for_rank(base_seed, rank))
+        cache[rank] = rng
+    return rng
+
+
 def maybe_perturb_hook(
     *,
     runner: Optional[CanaryRunner],
@@ -25,7 +38,7 @@ def maybe_perturb_hook(
     forward_batch: ForwardBatch,
 ) -> None:
     """Shared eager + replay self-test perturb hook."""
-    active_indices, active_seq_lens = _extract_active_rows(forward_batch)
+    active_indices, active_seq_lens = extract_active_rows(forward_batch)
     maybe_perturb_req_to_token(
         runner=runner,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -60,12 +73,9 @@ def maybe_perturb_req_to_token(
     if prob <= 0.0:
         return
 
-    rng = _PERTURB_RNG_CACHE.get(rank)
-    if rng is None:
-        rng = random.Random(
-            _rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank)
-        )
-        _PERTURB_RNG_CACHE[rank] = rng
+    rng = _get_or_init_rng(
+        _PERTURB_RNG_CACHE, runner.config.perturb_req_to_token_seed, rank
+    )
     if rng.random() >= prob:
         return
     table = req_to_token_pool.req_to_token
@@ -105,19 +115,6 @@ def maybe_perturb_req_to_token(
     )
 
 
-def _extract_active_rows(
-    forward_batch: Optional[ForwardBatch],
-) -> Tuple[Optional[List[int]], Optional[List[int]]]:
-    """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb."""
-    if forward_batch is None:
-        return None, None
-    if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
-        return None, None
-    indices = forward_batch.req_pool_indices.detach().cpu().tolist()
-    seq_lens = forward_batch.seq_lens.detach().cpu().tolist()
-    return indices, seq_lens
-
-
 def _rng_seed_for_rank(base_seed: int, rank: int) -> int:
     return (
         (base_seed & 0xFFFFFFFF) * 0x9E3779B1 + rank * 0xBF58476D1CE4E5B9
@@ -130,18 +127,10 @@ def maybe_perturb_real_kv_bytes(
     req_to_token_pool: Optional[ReqToTokenPool],
     forward_batch: Optional[ForwardBatch],
 ) -> None:
-    """Self-test helper: probabilistically flip one byte of real KV at a slot
-    owned by an alive req in the current batch but NOT in this step's
-    per-step verify list.
+    """Self-test: flip one byte of real KV at an alive slot not in this step's
+    verify list, so only the periodic sweep can catch it.
 
-    Targeting alive-but-not-verified-this-step slots is what proves the
-    periodic sweep's independent detection value: the per-step path can't
-    observe the perturbation (those slots are outside its verify set) but
-    the next sweep should pick it up and emit a ``sweep_*`` violation.
-
-    Must be called AFTER the per-step head/tail freeze AND BEFORE
-    :meth:`CanaryRunner._run_sweep`, so the freeze captures clean state and
-    the sweep's next read sees the mutated bytes.
+    Must run AFTER the per-step head/tail freeze and BEFORE the sweep launch.
     """
     if runner is None or forward_batch is None or req_to_token_pool is None:
         return
@@ -150,12 +139,9 @@ def maybe_perturb_real_kv_bytes(
         return
 
     rank = runner.tp_rank
-    rng = _REAL_PERTURB_RNG_CACHE.get(rank)
-    if rng is None:
-        rng = random.Random(
-            _rng_seed_for_rank(runner.config.real_perturb_bytes_seed, rank)
-        )
-        _REAL_PERTURB_RNG_CACHE[rank] = rng
+    rng = _get_or_init_rng(
+        _REAL_PERTURB_RNG_CACHE, runner.config.real_perturb_bytes_seed, rank
+    )
     if rng.random() >= prob:
         return
 

@@ -365,9 +365,7 @@ class CanaryRunner:
         self._pull_latest_from_events()
         self._forward_step += 1
 
-        # Self-test perturb hook: runs after per-step head/tail freeze and
-        # before the periodic sweep so the sweep observes the mutation.
-        # Local import: test_utils imports CanaryRunner globally.
+        # Local import to break the test_utils ↔ runner module cycle.
         from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_real_kv_bytes
 
         maybe_perturb_real_kv_bytes(
@@ -405,7 +403,6 @@ class CanaryRunner:
             return
         plan = build_sweep_plan(
             canary_buf=self._buffer_group.k_head,
-            slot_stride_bytes=self._buffer_group.k_slot_stride_bytes,
             alive_slot_indices=alive_slots,
         )
         if plan.num_verify == 0:
@@ -455,39 +452,25 @@ class CanaryRunner:
                 event.record(stream=self._side_stream)
             self._poll_armed = True
             # Counter D2H is intentionally decoupled from the periodic print
-            # interval (``health_print_every_n_forwards``). Refreshing the
-            # cached counters every forward lets the warmup health check
-            # see fresh values by ``counter_zero_warmup_forwards`` (~64);
-            # tying the D2H to the 1024-forward print period would leave the
-            # host-side ``_latest_counters`` stuck at the step-0 snapshot and
-            # trip a spurious "kernel never ran" panic. The copies are four
-            # int64 non-blocking transfers on a side stream — negligible
-            # cost vs the verify workload.
+            # interval (``health_print_every_n_forwards``). Refreshing every
+            # forward lets the warmup health check see fresh values by
+            # ``counter_zero_warmup_forwards`` (~64); tying the D2H to the
+            # 1024-forward print period would leave ``_latest_counters`` stuck
+            # at the step-0 snapshot and trip a spurious "kernel never ran".
             if self._counters_event is not None:
-                self._counters_host[0].copy_(
-                    self._device_state.kernel_run_counter_head.flatten()[0],
-                    non_blocking=True,
-                )
-                self._counters_host[1].copy_(
-                    self._device_state.kernel_run_counter_tail.flatten()[0],
-                    non_blocking=True,
-                )
-                self._counters_host[2].copy_(
-                    self._device_state.slot_run_counter_head.flatten()[0],
-                    non_blocking=True,
-                )
-                self._counters_host[3].copy_(
-                    self._device_state.slot_run_counter_tail.flatten()[0],
-                    non_blocking=True,
-                )
-                self._counters_host[4].copy_(
-                    self._device_state.kernel_run_counter_sweep.flatten()[0],
-                    non_blocking=True,
-                )
-                self._counters_host[5].copy_(
-                    self._device_state.slot_run_counter_sweep.flatten()[0],
-                    non_blocking=True,
-                )
+                ds = self._device_state
+                for host_slot, device_counter in zip(
+                    self._counters_host,
+                    (
+                        ds.kernel_run_counter_head,
+                        ds.kernel_run_counter_tail,
+                        ds.slot_run_counter_head,
+                        ds.slot_run_counter_tail,
+                        ds.kernel_run_counter_sweep,
+                        ds.slot_run_counter_sweep,
+                    ),
+                ):
+                    host_slot.copy_(device_counter.flatten()[0], non_blocking=True)
                 self._counters_event.record(stream=self._side_stream)
 
     def prepare_for_replay(self, *, plan: BatchPlan) -> None:

@@ -139,7 +139,6 @@ class TestBuildSweepPlan(unittest.TestCase):
         canary_buf = self._build_canary_buf(num_slots=8)
         plan = build_sweep_plan(
             canary_buf=canary_buf,
-            slot_stride_bytes=CANARY_SLOT_BYTES,
             alive_slot_indices=torch.empty(0, dtype=torch.int64),
         )
         self.assertEqual(plan.num_verify, 0)
@@ -151,7 +150,6 @@ class TestBuildSweepPlan(unittest.TestCase):
         alive = torch.tensor([2, 5, 6], dtype=torch.int64)
         plan = build_sweep_plan(
             canary_buf=canary_buf,
-            slot_stride_bytes=CANARY_SLOT_BYTES,
             alive_slot_indices=alive,
         )
         self.assertEqual(plan.num_verify, 3)
