@@ -338,7 +338,10 @@ class CustomAllreduce:
         self.close()
 
 
-def dispatch_custom_allreduce(*args, **kwargs):
+def dispatch_custom_allreduce(
+    group: ProcessGroup,
+    device: torch.device,
+):
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
@@ -355,7 +358,7 @@ def dispatch_custom_allreduce(*args, **kwargs):
             can_use_custom_all_reduce_v2,
         )
 
-        if can_use_custom_all_reduce_v2(*args, **kwargs):
+        if can_use_custom_all_reduce_v2(group=group, device=device):
             logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
             return CustomAllReduceV2
 
