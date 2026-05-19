@@ -1004,7 +1004,12 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
-        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.video_processor, videos=videos, **video_processor_kwargs
+            ),
+        )
 
         # Get additional video metadata
         if (
@@ -1063,7 +1068,12 @@ class MMEncoder:
 
         audios = await self._flatten_and_load_audios(mm_items)
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.audio_processor.feature_extractor, audios, **audio_config
+            ),
+        )
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
@@ -1112,16 +1122,43 @@ class MMEncoder:
 
             try:
                 with torch.inference_mode():
-                    embeddings = []
-                    for mm_item, get_feature_fn in zip(mm_items_batch, get_feature_fns):
-                        emb = get_feature_fn([mm_item])
-                        emb = emb.cpu()
-                        if len(emb.shape) != 2:
-                            emb = emb.reshape(-1, emb.shape[-1])
-                        embeddings.append(emb)
-                for future, emb in zip(futures, embeddings):
-                    if not future.done():
-                        future.set_result(emb)
+                    # Group by function identity so each group is one batched ViT forward pass.
+                    # In the common case all items share the same get_feature_fn.
+                    fn_groups: dict = {}
+                    for mm_item, fn, fut in zip(
+                        mm_items_batch, get_feature_fns, futures
+                    ):
+                        gid = id(fn)
+                        if gid not in fn_groups:
+                            fn_groups[gid] = (fn, [], [])
+                        fn_groups[gid][1].append(mm_item)
+                        fn_groups[gid][2].append(fut)
+
+                    for fn, group_items, group_futures in fn_groups.values():
+                        combined = fn(group_items).cpu()
+                        if combined.ndim != 2:
+                            combined = combined.reshape(-1, combined.shape[-1])
+                        modality = group_items[0].modality
+                        offset = 0
+                        for mm_item, fut in zip(group_items, group_futures):
+                            grid = None
+                            for attr in _mm_grid_attrs[modality]:
+                                try:
+                                    grid = getattr(mm_item, attr)
+                                    break
+                                except AttributeError:
+                                    continue
+                            if grid is None:
+                                raise RuntimeError(
+                                    f"No grid dim found on mm_item for {modality}"
+                                )
+                            n_tokens = sum(
+                                self.get_num_tokens(g, modality) for g in grid
+                            )
+                            emb = combined[offset : offset + n_tokens]
+                            offset += n_tokens
+                            if not fut.done():
+                                fut.set_result(emb)
             except Exception as e:
                 for future in futures:
                     if not future.done():

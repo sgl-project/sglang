@@ -1,7 +1,7 @@
 """
 Unit tests for encode_server performance improvements:
-1. Async image preprocessing (preproc_executor + run_in_executor)
-2. Cross-request ViT batching (_vit_queue + _vit_batch_loop)
+1. Async preprocessing for image, video, and audio (preproc_executor + run_in_executor)
+2. Cross-request ViT batching (_vit_queue + _vit_batch_loop) with modality grouping
 """
 
 import asyncio
@@ -74,6 +74,54 @@ class TestAsyncPreprocessing(unittest.IsolatedAsyncioTestCase):
         executor.shutdown(wait=False)
         preproc_executor.shutdown(wait=False)
 
+    async def test_video_and_audio_preprocessing_does_not_block_event_loop(self):
+        """
+        Video and audio preprocessing (now using run_in_executor like images) should
+        run concurrently off the asyncio event loop, not serialize it.
+        """
+        import concurrent.futures
+        import functools
+
+        sleep_s = 0.05  # simulate 50ms video/audio feature extraction
+        n = 6  # 3 video + 3 audio concurrent requests
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=n)
+
+        def blocking_video_preproc(delay):
+            time.sleep(delay)
+            return {"pixel_values_videos": f"video_result_{delay}"}
+
+        def blocking_audio_preproc(delay):
+            time.sleep(delay)
+            return {"input_features": f"audio_result_{delay}"}
+
+        loop = asyncio.get_running_loop()
+        t_start = time.perf_counter()
+        results = await asyncio.gather(
+            *[
+                loop.run_in_executor(
+                    executor, functools.partial(blocking_video_preproc, sleep_s)
+                )
+                for _ in range(3)
+            ],
+            *[
+                loop.run_in_executor(
+                    executor, functools.partial(blocking_audio_preproc, sleep_s)
+                )
+                for _ in range(3)
+            ],
+        )
+        elapsed = time.perf_counter() - t_start
+
+        self.assertEqual(len(results), n)
+        # All 6 tasks ran concurrently — wall time should be ~1× sleep_s, not 6×
+        self.assertLess(
+            elapsed,
+            sleep_s * n * 0.5,
+            f"Expected ~{sleep_s:.2f}s wall time, got {elapsed:.2f}s — "
+            "video/audio preprocessing may be running serially",
+        )
+
 
 class TestViTBatchQueue(unittest.IsolatedAsyncioTestCase):
     """Verify the cross-request ViT batching queue behaviour."""
@@ -81,19 +129,21 @@ class TestViTBatchQueue(unittest.IsolatedAsyncioTestCase):
     async def _run_batch_loop(self, batch_size=4, timeout_ms=20, n_items=8):
         """
         Helper: enqueue n_items into a mock _vit_batch_loop and collect results.
-        Returns (embeddings, call_count) where call_count is how many times
-        get_feature_fn was called (ideally ceil(n_items / batch_size)).
+        Returns (embeddings, fn_call_count) where fn_call_count is how many times
+        get_feature_fn was invoked (ideally ceil(n_items / batch_size) with true
+        batching — one invocation per batch, not one per item).
         """
         import torch
 
+        TOKENS_PER_ITEM = 4  # each mock item produces this many embedding rows
         queue = asyncio.Queue()
-        call_count = 0
+        fn_call_count = 0  # number of get_feature_fn invocations (not total items)
 
         def get_feature_fn(items):
-            nonlocal call_count
-            call_count += len(items)
-            # Return a fake 2-D embedding tensor
-            return torch.zeros(len(items) * 4, 64)
+            nonlocal fn_call_count
+            fn_call_count += 1
+            # Return a single concatenated tensor for all items in this batch
+            return torch.zeros(len(items) * TOKENS_PER_ITEM, 64)
 
         async def batch_loop():
             while True:
@@ -111,22 +161,38 @@ class TestViTBatchQueue(unittest.IsolatedAsyncioTestCase):
 
                 import torch
 
+                mm_items_in_batch = [item for item, _, _ in batch]
+                fns_in_batch = [fn for _, fn, _ in batch]
+                futures_in_batch = [f for _, _, f in batch]
+
                 try:
                     with torch.inference_mode():
-                        embeddings = []
-                        for mm_item, fn, _ in batch:
-                            emb = fn([mm_item])
-                            emb = emb.cpu()
-                            if len(emb.shape) != 2:
-                                emb = emb.reshape(-1, emb.shape[-1])
-                            embeddings.append(emb)
-                    for (_, _, future), emb in zip(batch, embeddings):
-                        if not future.done():
-                            future.set_result(emb)
+                        # Group by function identity for one batched forward pass per group
+                        fn_groups: dict = {}
+                        for mm_item, fn, fut in zip(
+                            mm_items_in_batch, fns_in_batch, futures_in_batch
+                        ):
+                            gid = id(fn)
+                            if gid not in fn_groups:
+                                fn_groups[gid] = (fn, [], [])
+                            fn_groups[gid][1].append(mm_item)
+                            fn_groups[gid][2].append(fut)
+
+                        for fn, group_items, group_futures in fn_groups.values():
+                            combined = fn(group_items).cpu()
+                            if combined.ndim != 2:
+                                combined = combined.reshape(-1, combined.shape[-1])
+                            # Slice per item (mock: each item contributes TOKENS_PER_ITEM rows)
+                            offset = 0
+                            for fut in group_futures:
+                                emb = combined[offset : offset + TOKENS_PER_ITEM]
+                                offset += TOKENS_PER_ITEM
+                                if not fut.done():
+                                    fut.set_result(emb)
                 except Exception as e:
-                    for _, _, future in batch:
-                        if not future.done():
-                            future.set_exception(e)
+                    for fut in futures_in_batch:
+                        if not fut.done():
+                            fut.set_exception(e)
 
         task = asyncio.get_event_loop().create_task(batch_loop())
         loop = asyncio.get_running_loop()
@@ -139,7 +205,7 @@ class TestViTBatchQueue(unittest.IsolatedAsyncioTestCase):
 
         results = await asyncio.gather(*futures)
         task.cancel()
-        return results, call_count
+        return results, fn_call_count
 
     async def test_all_items_receive_embeddings(self):
         """Every queued item should receive an embedding result."""
@@ -153,16 +219,109 @@ class TestViTBatchQueue(unittest.IsolatedAsyncioTestCase):
     async def test_batching_reduces_vit_calls(self):
         """
         With batch_size=8 and 8 concurrent items, all items should be processed
-        in a single batch (call_count == 8 items in one pass, not 8 separate calls).
+        in a single batched forward pass — get_feature_fn called once with all 8
+        items, not 8 times with 1 item each.
         """
-        # Enqueue all 8 items at once, then let the loop drain them
-        results, call_count = await self._run_batch_loop(
+        results, fn_call_count = await self._run_batch_loop(
             batch_size=8, timeout_ms=50, n_items=8
         )
         self.assertEqual(len(results), 8)
-        # get_feature_fn is called once per item in _vit_batch_loop's inner loop,
-        # but all in a single batch drain — so call_count == n_items
-        self.assertEqual(call_count, 8)
+        # True GPU batching: one invocation of get_feature_fn for the whole batch
+        self.assertEqual(fn_call_count, 1)
+
+    async def test_mixed_modality_items_are_grouped_separately(self):
+        """
+        Items with different get_feature_fn (e.g. image vs video) should be
+        grouped separately and each function called once with only its own items.
+        Neither function should receive the other modality's items.
+        """
+        import torch
+
+        TOKENS_PER_ITEM = 4
+        queue = asyncio.Queue()
+
+        image_call_items = []
+        video_call_items = []
+
+        def get_image_feature(items):
+            image_call_items.append(len(items))
+            return torch.zeros(len(items) * TOKENS_PER_ITEM, 64)
+
+        def get_video_feature(items):
+            video_call_items.append(len(items))
+            return torch.zeros(len(items) * TOKENS_PER_ITEM, 64)
+
+        async def batch_loop():
+            while True:
+                first = await queue.get()
+                batch = [first]
+                if queue.empty():
+                    await asyncio.sleep(0.05)
+                else:
+                    await asyncio.sleep(0)
+                while len(batch) < 8:
+                    try:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                mm_items_in_batch = [item for item, _, _ in batch]
+                fns_in_batch = [fn for _, fn, _ in batch]
+                futures_in_batch = [f for _, _, f in batch]
+
+                try:
+                    with torch.inference_mode():
+                        fn_groups: dict = {}
+                        for mm_item, fn, fut in zip(
+                            mm_items_in_batch, fns_in_batch, futures_in_batch
+                        ):
+                            gid = id(fn)
+                            if gid not in fn_groups:
+                                fn_groups[gid] = (fn, [], [])
+                            fn_groups[gid][1].append(mm_item)
+                            fn_groups[gid][2].append(fut)
+
+                        for fn, group_items, group_futures in fn_groups.values():
+                            combined = fn(group_items).cpu()
+                            if combined.ndim != 2:
+                                combined = combined.reshape(-1, combined.shape[-1])
+                            offset = 0
+                            for fut in group_futures:
+                                emb = combined[offset : offset + TOKENS_PER_ITEM]
+                                offset += TOKENS_PER_ITEM
+                                if not fut.done():
+                                    fut.set_result(emb)
+                except Exception as e:
+                    for fut in futures_in_batch:
+                        if not fut.done():
+                            fut.set_exception(e)
+
+        task = asyncio.get_event_loop().create_task(batch_loop())
+        loop = asyncio.get_running_loop()
+
+        # Enqueue 4 image items and 3 video items in one batch
+        futures = []
+        for _ in range(4):
+            fut = loop.create_future()
+            await queue.put((MagicMock(), get_image_feature, fut))
+            futures.append(fut)
+        for _ in range(3):
+            fut = loop.create_future()
+            await queue.put((MagicMock(), get_video_feature, fut))
+            futures.append(fut)
+
+        results = await asyncio.gather(*futures)
+        task.cancel()
+
+        # All 7 items got embeddings
+        self.assertEqual(len(results), 7)
+        for emb in results:
+            self.assertIsInstance(emb, torch.Tensor)
+
+        # image function called once with exactly 4 items
+        self.assertEqual(image_call_items, [4])
+        # video function called once with exactly 3 items
+        self.assertEqual(video_call_items, [3])
 
     async def test_adaptive_sleep_skips_when_queue_nonempty(self):
         """
