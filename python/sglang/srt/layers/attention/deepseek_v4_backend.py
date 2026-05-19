@@ -667,7 +667,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
@@ -960,7 +960,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):

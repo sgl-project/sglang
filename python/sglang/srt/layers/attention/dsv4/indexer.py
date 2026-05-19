@@ -321,7 +321,7 @@ class C4IndexerBackendMixin:
         # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
         # before attn_backend.forward() would trigger the upgrade.
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -398,7 +398,7 @@ class C4IndexerBackendMixin:
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
-        hisparse_coordinator = forward_batch.hisparse_coordinator
+        hisparse_coordinator = self.hisparse_coordinator
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )

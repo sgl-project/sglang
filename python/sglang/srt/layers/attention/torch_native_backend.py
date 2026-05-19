@@ -209,7 +209,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -223,9 +223,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_extend(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
@@ -260,7 +260,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -270,9 +270,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_decode(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             scaling=layer.scaling,

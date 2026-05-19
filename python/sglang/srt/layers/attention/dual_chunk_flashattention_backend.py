@@ -184,7 +184,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         metadata.orig_seq_lens_tensor = forward_batch.orig_seq_lens
         metadata.orig_seq_lens = forward_batch.orig_seq_lens.tolist()
 
-        metadata.block_tables = forward_batch.req_to_token_pool.req_to_token[
+        metadata.block_tables = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len
         ]
         # Convert the block table to a strided format.
@@ -347,7 +347,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             assert current_end <= self.max_context_len
 
         # Do multi-head attention
-        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
         )
         key_cache = key_cache.view(
@@ -359,7 +359,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         if key is not None and value is not None:
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     key,
@@ -443,7 +443,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         key = k.view(-1, self.num_kv_heads, self.head_size)
         value = v.view(-1, self.num_kv_heads, self.head_size)
 
-        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
         )
         key_cache = key_cache.view(
@@ -455,7 +455,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         if key is not None and value is not None:
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     key,

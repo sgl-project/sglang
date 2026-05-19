@@ -425,7 +425,7 @@ class NativeSparseAttnBackend(
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
         # [b, max_seqlen_k]
-        page_table = forward_batch.req_to_token_pool.req_to_token[
+        page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
 
@@ -581,7 +581,7 @@ class NativeSparseAttnBackend(
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
                 self.use_mha
-                and forward_batch.token_to_kv_pool.dtype == torch.float8_e4m3fn
+                and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
@@ -606,8 +606,8 @@ class NativeSparseAttnBackend(
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
                 kv_cache_capacity = (
-                    forward_batch.token_to_kv_pool.size
-                    + forward_batch.token_to_kv_pool.page_size
+                    self.token_to_kv_pool.size
+                    + self.token_to_kv_pool.page_size
                 )
                 if forward_batch.seq_lens_sum > kv_cache_capacity:
                     max_idx = page_table_1_flattened.max().item()
@@ -1380,7 +1380,7 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
                     k,
@@ -1405,7 +1405,7 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1451,9 +1451,9 @@ class NativeSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if forward_batch.hisparse_coordinator is not None:
+        if self.hisparse_coordinator is not None:
             page_table_1 = (
-                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                self.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
                 )
             )
@@ -1580,7 +1580,7 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
                     k,
@@ -1588,7 +1588,7 @@ class NativeSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -1609,8 +1609,8 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if forward_batch.hisparse_coordinator is not None:
-            page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
+        if self.hisparse_coordinator is not None:
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
@@ -2105,11 +2105,11 @@ class NativeSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, cache_loc, k, k_rope
             )
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
 
         if merge_query:
@@ -2221,12 +2221,12 @@ class NativeSparseAttnBackend(
                 )  # SM90/SM100 only
                 and max_kv_len
                 <= envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
-                and forward_batch.token_to_kv_pool.dtype
+                and self.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
-                and (forward_batch.hisparse_coordinator is None)
+                and (self.hisparse_coordinator is None)
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
@@ -2272,7 +2272,7 @@ class NativeSparseAttnBackend(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
         force_unfused = (
-            forward_batch.hisparse_coordinator is not None
+            self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
         return NSAIndexerMetadata(

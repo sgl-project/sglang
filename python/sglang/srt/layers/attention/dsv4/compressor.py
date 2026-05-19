@@ -124,7 +124,7 @@ class CompressorBackendMixin:
         # attn_backend.forward(), so Raw -> DSV4Metadata must happen here too
         # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -155,7 +155,7 @@ class CompressorBackendMixin:
         assert is_overlap_compress(compressor.ratio)
         # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
