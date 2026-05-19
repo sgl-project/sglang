@@ -2299,6 +2299,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        self._deepseek_v4_mhc_prewarm()
+
+    def _deepseek_v4_mhc_prewarm(self):
+        if not self.is_hybrid_swa or not self.model_config.is_deepseek_v4_arch:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+
+        token_values = envs.SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS.get()
+        if not token_values:
+            return
+
+        token_counts = tuple(int(x) for x in token_values)
+        if any(x <= 0 for x in token_counts):
+            raise ValueError(
+                "SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS expects positive integers, "
+                f"got {token_values}"
+            )
+
+        self.model.prewarm_mhc_token_counts(token_counts, self.device)
+        self.tp_group.barrier()
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm completed for token-count shapes: %s",
+            token_counts,
+        )
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 

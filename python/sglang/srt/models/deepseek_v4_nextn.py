@@ -108,6 +108,11 @@ class DeepseekV4ModelNextN(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        self.decoder.prewarm_mhc_token_counts(token_counts, device)
+
     def forward(
         self,
         input_ids: torch.Tensor,
