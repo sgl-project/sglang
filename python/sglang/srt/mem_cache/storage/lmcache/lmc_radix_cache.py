@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -108,9 +107,7 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_global_server_args().lmcache_config_file
-        if cli_lmc_cfg:
-            os.environ["LMCACHE_CONFIG_FILE"] = cli_lmc_cfg
+        cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -140,7 +137,12 @@ class LMCRadixCache(RadixCache):
         # set ``self._mode = LMCacheMode.IP`` here.
         self._mode = LMCacheMode.MP
         if self._mode is LMCacheMode.MP:
-            lm_cfg = lmcache_get_config()
+            if not cli_lmc_cfg:
+                raise ValueError(
+                    "MP mode requires --lmcache-config-file (the YAML "
+                    "supplies mp_host / mp_port)."
+                )
+            lm_cfg = lmcache_get_config(cli_lmc_cfg)
             self.lmcache_connector = LMCacheMPConnector(
                 page_size=params.page_size,
                 host=lm_cfg.mp_host,
@@ -148,7 +150,9 @@ class LMCRadixCache(RadixCache):
                 **connector_kwargs,
             )
         elif self._mode is LMCacheMode.IP:
-            self.lmcache_connector = LMCacheLayerwiseConnector(**connector_kwargs)
+            self.lmcache_connector = LMCacheLayerwiseConnector(
+                config_file=cli_lmc_cfg, **connector_kwargs
+            )
             # Per-layer hook
             self.layer_done_executor = LayerTransferCounter(
                 num_layers=(
