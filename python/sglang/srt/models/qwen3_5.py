@@ -76,6 +76,12 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.utils import enable_fused_qk_norm_rope_set_kv_aiter
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -841,6 +847,154 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _fused_qk_norm_rope_cache_quant_aiter(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """AITER fused qk_norm + RoPE + set_kv (HIP only).
+        qkv: [batch, q_size + kv_size + kv_size]. Returns (q, k, v)."""
+        import aiter
+
+        from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+
+        num_tokens = qkv.shape[0]
+        head_size = self.head_dim
+        num_heads_q = self.num_heads
+        num_heads_k = self.num_kv_heads
+        num_heads_v = self.num_kv_heads
+        eps = self.q_norm.variance_epsilon
+
+        qw = 1.0 + self.q_norm.weight.data
+        kw = 1.0 + self.k_norm.weight.data
+        qkv = qkv.contiguous()
+
+        rotary_emb = self.rotary_emb
+        cos_sin = rotary_emb.cos_sin_cache
+        positions_1d = positions.flatten()
+
+        layer_id = self.attn.layer_id
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        k_cache = token_to_kv_pool.get_key_buffer(layer_id)
+        v_cache = token_to_kv_pool.get_value_buffer(layer_id)
+        slot_mapping = forward_batch.out_cache_loc
+
+        q_out = torch.empty(
+            num_tokens,
+            num_heads_q,
+            head_size,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        k_out = torch.empty(
+            num_tokens,
+            num_heads_k,
+            head_size,
+            dtype=k_cache.dtype,
+            device=k_cache.device,
+        )
+        v_out = torch.empty(
+            num_tokens,
+            num_heads_v,
+            head_size,
+            dtype=v_cache.dtype,
+            device=v_cache.device,
+        )
+
+        use_shuffle_layout = False
+        block_size = 0
+        x = 0
+        k_scale = (
+            self.attn.k_scale if self.attn.k_scale is not None else torch.tensor(1.0)
+        )
+        v_scale = (
+            self.attn.v_scale if self.attn.v_scale is not None else torch.tensor(1.0)
+        )
+
+        is_mrope = isinstance(rotary_emb, MRotaryEmbedding)
+        if is_mrope:
+            mrope_section = getattr(rotary_emb, "mrope_section", [head_size // 3] * 3)
+            is_interleaved = getattr(rotary_emb, "mrope_interleaved", False)
+            if positions.dim() == 1:
+                positions_3d = positions_1d.unsqueeze(0).expand(3, -1)
+            else:
+                positions_3d = positions
+            try:
+                aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+                    qkv=qkv,
+                    qw=qw,
+                    kw=kw,
+                    cos_sin=cos_sin,
+                    positions=positions_3d,
+                    num_tokens=num_tokens,
+                    num_heads_q=num_heads_q,
+                    num_heads_k=num_heads_k,
+                    num_heads_v=num_heads_v,
+                    head_size=head_size,
+                    is_neox_style=rotary_emb.is_neox_style,
+                    mrope_section_=mrope_section,
+                    is_interleaved=is_interleaved,
+                    eps=eps,
+                    q_out=q_out,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    slot_mapping=slot_mapping,
+                    per_tensor_k_scale=k_scale,
+                    per_tensor_v_scale=v_scale,
+                    k_out=k_out,
+                    v_out=v_out,
+                    return_kv=True,
+                    use_shuffle_layout=use_shuffle_layout,
+                    block_size=block_size,
+                    x=x,
+                    rotary_dim=getattr(rotary_emb, "rotary_dim", head_size),
+                )
+            except Exception as e:
+                logger.error(
+                    f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_mrope_3d_cache_pts_quant_shuffle: {e}"
+                )
+                raise e
+        else:
+            try:
+                aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+                    qkv=qkv,
+                    qw=qw,
+                    kw=kw,
+                    cos_sin=cos_sin,
+                    positions=positions_1d,
+                    num_tokens=num_tokens,
+                    num_heads_q=num_heads_q,
+                    num_heads_k=num_heads_k,
+                    num_heads_v=num_heads_v,
+                    head_size=head_size,
+                    is_neox_style=rotary_emb.is_neox_style,
+                    eps=eps,
+                    q_out=q_out,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    slot_mapping=slot_mapping,
+                    per_tensor_k_scale=k_scale,
+                    per_tensor_v_scale=v_scale,
+                    k_out=k_out,
+                    v_out=v_out,
+                    return_kv=True,
+                    use_shuffle_layout=use_shuffle_layout,
+                    block_size=block_size,
+                    x=x,
+                    rotary_dim=getattr(rotary_emb, "rotary_dim", head_size),
+                )
+            except Exception as e:
+                logger.error(
+                    f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_rope_cache_pts_quant_shuffle: {e}"
+                )
+                raise e
+
+        q_out = q_out.view(num_tokens, -1)
+        k_out = k_out.view(num_tokens, -1)
+        v_out = v_out.view(num_tokens, -1)
+        return q_out, k_out, v_out
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -862,9 +1016,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        save_kv_cache = True
+        if (
+            enable_fused_qk_norm_rope_set_kv_aiter(forward_batch)
+            and is_gfx95_supported()
+        ):
+            if self.attn_output_gate:
+                qkv = torch.cat([q, k, v], dim=-1)
+            q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
+                qkv,
+                positions,
+                forward_batch,
+            )
+            save_kv_cache = False
+        else:
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

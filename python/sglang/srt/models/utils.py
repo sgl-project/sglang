@@ -33,7 +33,12 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_current_device_stream_fast,
+    is_cuda,
+    is_hip,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -282,6 +287,31 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
+
+
+def enable_fused_set_kv_buffer_hip(forward_batch: ForwardBatch):
+    """Enable fused set_kv_buffer only on HIP with bf16 KV cache."""
+    return (
+        is_hip()
+        and hasattr(forward_batch.token_to_kv_pool, "dtype")
+        and forward_batch.token_to_kv_pool.dtype
+        in [torch.bfloat16, torch.float8_e4m3fn]
+        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+    )
+
+
+def enable_fused_qk_norm_rope_set_kv_aiter(forward_batch: ForwardBatch):
+    """Enable aiter fused qk_norm + RoPE/MRoPE + set_kv on HIP with bf16 KV cache."""
+    _use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+    from sglang.srt.server_args import get_global_server_args
+
+    return (
+        get_global_server_args().enable_fused_qk_norm_rope
+        and _use_aiter
+        and enable_fused_set_kv_buffer_hip(forward_batch)
+        and get_bool_env_var("SGLANG_FUSED_QK_NORM_ROPE_CACHE_PTS_QUANT_SHUFFLE")
+        # TODO: default to False if not set, and remove the default value from the env when aiter changes are included
+    )
 
 
 def create_fused_set_kv_buffer_arg(
