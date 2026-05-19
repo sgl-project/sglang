@@ -65,6 +65,8 @@ class TestNpuHierarchicalCacheMla(CustomTestCase):
                 "write_back",
             ],
         ]
+
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
         for common_arg in common_args:
             other_args = common_arg + (
                 [
