@@ -65,7 +65,7 @@ def install_on_model_runner(
         return
 
     pool = model_runner.token_to_kv_pool
-    if not _supports_canary(pool):
+    if not isinstance(pool, (BaseSWAKVPool, MLATokenToKVPool, MHATokenToKVPool)):
         logger.warning(
             "kv-canary: unsupported pool type %s; skipping install.",
             type(pool).__name__,
@@ -75,7 +75,7 @@ def install_on_model_runner(
     if getattr(model_runner, _FORWARD_PATCHED_ATTR, False):
         return
 
-    if _is_swa_pool(pool):
+    if isinstance(pool, BaseSWAKVPool):
         # SWA's req_to_token mapping only addresses the most recent
         # ``sliding_window_size`` slots; the verify range for the SWA
         # canary must be clipped accordingly. The FULL canary on the
@@ -93,16 +93,14 @@ def install_on_model_runner(
             config = dataclasses.replace(config, swa_window_size=int(window_size))
 
     device = torch.device(model_runner.device)
-    verify_capacity, write_capacity, write_req_capacity = _compute_launch_capacities(
-        model_runner=model_runner, config=config
-    )
+    capacities = _compute_launch_capacities(model_runner=model_runner, config=config)
     runners = attach(
         pool=pool,
         config=config,
         device=device,
-        verify_capacity=verify_capacity,
-        write_capacity=write_capacity,
-        write_req_capacity=write_req_capacity,
+        verify_capacity=capacities.verify_capacity,
+        write_capacity=capacities.write_capacity,
+        write_req_capacity=capacities.write_req_capacity,
     )
     if not runners:
         return
@@ -112,22 +110,19 @@ def install_on_model_runner(
     setattr(model_runner, _FORWARD_PATCHED_ATTR, True)
 
 
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class _LaunchCapacities:
+    """Fixed launch-buffer capacities sized for every plausible forward."""
+
+    verify_capacity: int
+    write_capacity: int
+    write_req_capacity: int
+
+
 def _compute_launch_capacities(
     *, model_runner: ModelRunner, config: CanaryConfig
-) -> Tuple[int, int, int]:
+) -> _LaunchCapacities:
     """Pick fixed launch-buffer capacities that cover every forward shape.
-
-    Returns ``(verify_capacity, write_capacity, write_req_capacity)``. Each
-    is sized off the largest plausible per-forward batch:
-
-    - ``write_capacity`` = max_bs * num_tokens_per_bs (extend tokens or
-      spec_num_draft_tokens).
-    - ``write_req_capacity`` = max_bs.
-    - ``verify_capacity`` = ``max_total_num_tokens`` — every forward
-      verifies the full per-req prefix, and the sum of all reqs' K_req
-      across one forward is bounded by the global slot pool size. This is
-      the only upper bound that is independent of the (now removed)
-      per-req verify cap.
 
     Padding rows past ``num_active_*`` carry ``*_active_mask == 0`` and the
     kernel short-circuits them with zero I/O, so oversizing is cheap.
@@ -149,19 +144,11 @@ def _compute_launch_capacities(
         max_extend_tokens_per_forward = max_prefill_tokens
     else:
         max_extend_tokens_per_forward = int(chunked_prefill_size)
-    write_capacity = max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
-    write_req_capacity = max_bs
-    verify_capacity = max(1, int(model_runner.max_total_num_tokens))
-    return verify_capacity, write_capacity, write_req_capacity
-
-
-def _supports_canary(pool: object) -> bool:
-    """Return True if ``pool`` matches any of the known canary dispatch shapes."""
-    return isinstance(pool, (BaseSWAKVPool, MLATokenToKVPool, MHATokenToKVPool))
-
-
-def _is_swa_pool(pool: object) -> bool:
-    return isinstance(pool, BaseSWAKVPool)
+    return _LaunchCapacities(
+        verify_capacity=max(1, int(model_runner.max_total_num_tokens)),
+        write_capacity=max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward),
+        write_req_capacity=max_bs,
+    )
 
 
 def _patch_model_forward(*, model_runner: ModelRunner) -> None:

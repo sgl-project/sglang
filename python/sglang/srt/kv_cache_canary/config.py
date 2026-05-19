@@ -86,12 +86,19 @@ class CanaryConfig:
         real_kv_hash_mode: str | RealKvHashMode | None = None,
     ) -> "CanaryConfig":
         parsed = CanaryMode.parse(mode)
-        perturb_prob = _read_perturb_prob()
-        perturb_seed = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get()
+        raw_prob = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get()
+        perturb_prob = max(0.0, min(1.0, raw_prob))
+        if perturb_prob != raw_prob:
+            logger.warning(
+                "kv-canary: SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB %f "
+                "out of [0,1]; clamped to %f",
+                raw_prob,
+                perturb_prob,
+            )
         return cls(
             mode=parsed,
             perturb_req_to_token_prob=perturb_prob,
-            perturb_req_to_token_seed=perturb_seed,
+            perturb_req_to_token_seed=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get(),
             real_kv_hash_mode=RealKvHashMode.parse(real_kv_hash_mode),
         )
 
@@ -133,17 +140,3 @@ def real_kv_hash_read_bytes(
     if mode is RealKvHashMode.ALL:
         return int(real_kv_slot_stride_bytes)
     raise ValueError(f"kv-canary: unknown RealKvHashMode {mode!r}")
-
-
-def _read_perturb_prob() -> float:
-    """Read perturb probability env var and clamp to [0, 1]."""
-    prob = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get()
-    if not (0.0 <= prob <= 1.0):
-        clamped = max(0.0, min(1.0, prob))
-        logger.warning(
-            "kv-canary: SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB %f out of [0,1]; clamped to %f",
-            prob,
-            clamped,
-        )
-        prob = clamped
-    return prob
