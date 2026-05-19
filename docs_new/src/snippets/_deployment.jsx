@@ -12,7 +12,57 @@
 // required. To improve the engine (new button, new UI feature, VRAM update),
 // edit this file once and every cookbook gets the upgrade.
 //
-// Mintlify caveats this file routes around:
+// AUTHORING — read _AUTHORING.md in this directory for the step-by-step
+// workflow on adding a new cookbook or extending the engine.
+//
+// CONFIG CONTRACT (what the engine reads from `config`)
+// -----------------------------------------------------
+//   supportedHardware  string[]                    — hw ids visible in the UI
+//                                                    catalog (subset of
+//                                                    HARDWARE_CATALOG below).
+//   variants           {id, label, subtitle?}[]    — 2nd-dim option list.
+//   quantizations      {id, label}[]               — 3rd-dim option list.
+//   strategies         {id, label}[]               — 4th-dim option list.
+//   nodesOptions       {id, label}[]               — 5th-dim option list. The
+//                                                    id must be either
+//                                                    `single` or `multi-N`
+//                                                    (engine extracts N from
+//                                                    the id for --nnodes).
+//   cells              {match, verified?, env,
+//                       flags}[]                   — one per supported
+//                                                    (hw × variant × quant ×
+//                                                    strategy × nodes) combo.
+//                                                    `match` keys MUST be the
+//                                                    five DIMENSIONS below.
+//                                                    env/flags are flat
+//                                                    literals consumed
+//                                                    verbatim (no
+//                                                    interpolation other than
+//                                                    {{PLACEHOLDER}} subst).
+//   modelNames         {`hw|variant|quant` |
+//                       `variant|quant`: string}   — HF slug lookup. Layered:
+//                                                    triple key wins, falls
+//                                                    back to pair.
+//   placeholders       {[key]: {target: 'command'
+//                       | 'curl', label, default?}}
+//                                                  — {{KEY}} interpolation
+//                                                    map for command + curl.
+//                                                    Editable via Env modal.
+//   curl               string                      — cURL template (uses
+//                                                    {{MODEL_NAME}} +
+//                                                    placeholders).
+//   multiNodeHints     {[hwId]: string[]}          — comment lines prepended
+//                                                    to multi-node commands.
+//                                                    Each string becomes one
+//                                                    `# ...` line.
+//   dockerImages       {[hwId]: string}            — per-hw image name for
+//                                                    `docker run` mode.
+//                                                    Falls back to
+//                                                    `lmsysorg/sglang:dev` if
+//                                                    a hw id is missing.
+//
+// MINTLIFY CAVEATS THIS FILE ROUTES AROUND
+// ----------------------------------------
 //   - Module-level statements inside a `.jsx` snippet are stripped — so every
 //     helper / hook / handler stays inside the wrapper function body below.
 //   - Capitalized JSX tags inside a snippet's function body get rebound via
@@ -20,9 +70,8 @@
 //     factor sub-regions into `renderButton()` / `renderFlatSection()` helper
 //     functions, not into sub-components).
 //   - Imports of plain-data exports from other `.jsx` files DO work when the
-//     import lives in an MDX file (validated by EXPERIMENT_RESULTS.md). So
-//     the per-model config is imported at MDX level and passed through here
-//     as the `config` prop.
+//     import lives in an MDX file. So the per-model config is imported at
+//     MDX level and passed through here as the `config` prop.
 
 export const Deployment = ({ config }) => {
   if (!config) {
@@ -31,11 +80,10 @@ export const Deployment = ({ config }) => {
 
   // ==========================================================================
   // 1. Hardware catalog (shared across cookbooks — single source of truth)
-  // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
   // ==========================================================================
-  // 1. Hardware catalog (shared across cookbooks — keep identical when copying)
   // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
-  // ==========================================================================
+  // Adding a new SKU here makes it eligible for any cookbook to list in
+  // `config.supportedHardware`. Removing one hides it everywhere.
   const HARDWARE_CATALOG = {
     nvidia: [
       { id: "h100",  label: "H100",  vram: "80GB"  },
@@ -54,7 +102,7 @@ export const Deployment = ({ config }) => {
   };
 
   // ==========================================================================
-  // 4. Style helper (dark-mode-aware)
+  // 2. Style helper (dark-mode-aware)
   // ==========================================================================
   const makeStyles = (isDark) => ({
     container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" },
@@ -220,7 +268,7 @@ export const Deployment = ({ config }) => {
   });
 
   // ==========================================================================
-  // 5. Pure helpers (no React state)
+  // 3. Pure helpers (no React state)
   // ==========================================================================
   // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
   // picks, never the other way around. Order is Hardware → Variant →
@@ -409,7 +457,7 @@ export const Deployment = ({ config }) => {
   };
 
   // ==========================================================================
-  // 6. State + effects
+  // 4. React state + effects
   // ==========================================================================
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -506,7 +554,7 @@ export const Deployment = ({ config }) => {
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // ==========================================================================
-  // 7. Derived
+  // 5. Derived values
   // ==========================================================================
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
@@ -542,7 +590,7 @@ export const Deployment = ({ config }) => {
   })();
 
   // ==========================================================================
-  // 8. JSX render
+  // 6. JSX render
   // ==========================================================================
   const renderButton = (item, dim, selectedId) => {
     const checked = selectedId === item.id;

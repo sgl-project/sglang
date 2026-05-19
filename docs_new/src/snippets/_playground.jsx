@@ -7,60 +7,79 @@
 //     import { config }    from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 //     <Playground config={config} />
 //
-// Like the deployment skeleton, this engine reads from `config`:
-//   - config.cells / modelNames / placeholders / curl / multiNodeHints /
-//     dockerImages — same fields the deployment engine uses (the playground
-//     reuses §3.1's base cell from the URL hash to seed its diff baseline).
-//   - config.playgroundFeatures — opt-in feature axes. Each known axis is
-//     rendered ONLY if its key is present in config. Six axes are recognised:
-//       attention   : knobs[] with TP/DP/CP/DP-Attention sub-controls
-//       moe         : backend.options[] + ep.values[]
-//       parsers     : items[] (each emits one toggle flag)
-//       speculative : options[] (single-select chip group)
-//       pdDisagg    : modes[] + ibDevices[]
-//       hicache     : backends[] + writePolicies[]
-//     Each axis's widget type and strip/insert behaviour is fixed here in the
-//     engine; config supplies labels, option values, and the actual flag
-//     strings to emit per option (so model-specific things like the parser
-//     slug or the MTP_314 numbers live in config, not here).
+// AUTHORING — read _AUTHORING.md in this directory for the step-by-step
+// workflow on adding a new cookbook or extending the engine with a new
+// playground axis.
 //
-// Mintlify caveats this file routes around are the same as `_deployment.jsx`:
-// module-level statements are stripped, custom JSX component imports are
-// silently rebound — so everything stays inside this wrapper function and
-// uses only lowercase HTML JSX tags.
+// CONTRACT WITH PER-MODEL CONFIG
+// ------------------------------
+// Same shape as `_deployment.jsx` consumes (cells / modelNames / placeholders
+// / curl / multiNodeHints / dockerImages). The playground reuses §3.1's base
+// cell from the URL hash to seed its diff baseline, then layers overrides on
+// top.
+//
+// Plus one playground-specific field:
+//   config.playgroundFeatures   — keyed map; presence of a key opts that axis
+//                                 in for this cookbook. Recognised keys
+//                                 (current set):
+//     attention   — knobs[] with TP/DP/CP/DP-Attention sub-controls
+//     moe         — backend.options[] + ep.values[]
+//     parsers     — items[] (each emits one toggle flag)
+//     speculative — options[] (single-select chip group)
+//     pdDisagg    — modes[] + ibDevices[] (engine handles role banner +
+//                   single-host bootstrap port internally)
+//     hicache     — backends[] + writePolicies[]
+//     megamoe     — requiresHw + excludesStrategy + stripEnv + options[]
+//                   (axis-level gating + env mutation)
+//
+// EXTENDING WITH A NEW AXIS
+// -------------------------
+// Adding a new sglang feature axis is a one-place change: add an entry to
+// `AXIS_HANDLERS` below. The state shape, hidden-revert effect, apply
+// pipeline, reset, and JSX render loop all derive from this table. No other
+// part of the engine should ever switch on an axis id.
+//
+// Each handler exposes a uniform 4-method interface:
+//   initState(featureConfig)              → initial delta value
+//   revertHidden(value, fc, base, helpers) → next value (same ref if unchanged)
+//   apply({flags, env, value, fc, sel, helpers}) → next {flags, env}
+//   render({axisId, value, setValue, fc, base, s, helpers, renderChip}) → JSX | null
+// Plus one optional method:
+//   getRenderHints(value, fc)             → {pdMode?, ...} hints for renderer
+//
+// MINTLIFY CAVEATS THIS FILE ROUTES AROUND
+// ----------------------------------------
+// Same as `_deployment.jsx`:
+//   - Module-level statements in `.jsx` snippets are stripped → every
+//     constant / helper / handler lives inside the wrapper function.
+//   - Capitalized JSX tags inside a snippet body get rebound, so we use
+//     only lowercase HTML JSX tags here.
+//   - Plain-data imports from other `.jsx` files DO work when the import
+//     lives in an MDX file — that's how `config` gets in.
+
 export const Playground = ({ config }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Playground: missing <code>config</code> prop</div>;
   }
 
   // ==========================================================================
-  // Playground feature axes — read from config (opt-in by presence).
+  // 1. Constants
   // ==========================================================================
-  // Each axis defaults to `undefined` if the per-model config doesn't supply
-  // it. The render section below uses these as render guards: missing axis →
-  // its card is omitted entirely (no empty placeholder).
-  const pgFeatures = config.playgroundFeatures || {};
-  const pgAttention   = pgFeatures.attention;
-  const pgMoe         = pgFeatures.moe;
-  const pgParsers     = pgFeatures.parsers;
-  const pgSpec        = pgFeatures.speculative;
-  const pgPdDisagg    = pgFeatures.pdDisagg;
-  const pgHicache     = pgFeatures.hicache;
-
-  // Convenience: a per-knob value list for the parallelism card. Look up by
-  // knob id; fall back to `[null]` (just "auto") if the knob isn't declared.
-  const attnValuesFor = (knobId) => {
-    const k = (pgAttention?.knobs || []).find((kk) => kk.id === knobId);
-    return k?.values || [null];
-  };
-
-  // ==========================================================================
-  // Pure helpers (shape-identical to §3 where they overlap)
-  // ==========================================================================
+  // Mirror §3's dimension priority. Used for cell lookup, hash hydration,
+  // and the hidden-revert effect's dependency array.
   const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
+  // Shared with `_deployment.jsx` (HOST/PORT/etc. unified across the page).
+  const STORAGE_KEY = "sglang-deploy-env";
+
+  const pgFeatures = config.playgroundFeatures || {};
+
+  // ==========================================================================
+  // 2. Pure data helpers
+  // ==========================================================================
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
+  // Layered lookup: hw|variant|quant → variant|quant → "".
   const resolveModelName = (sel) => {
     const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
     const pair = `${sel.variant}|${sel.quant}`;
@@ -77,16 +96,101 @@ export const Playground = ({ config }) => {
     return m ? parseInt(m[1], 10) : 1;
   };
 
-  // Strip any flag whose first whitespace-delimited token equals one of
-  // `prefixes`. Used to remove the base's values for an axis before re-emitting
-  // the playground's choice. We must match exactly the first token because
-  // values may contain hyphens / equals (e.g. `--moe-runner-backend marlin`).
+  const placeholderDefaults = (schema) => {
+    const out = {};
+    for (const [k, v] of Object.entries(schema || {})) out[k] = v.default ?? "";
+    return out;
+  };
+
+  // ==========================================================================
+  // 3. Per-chip constraint evaluation
+  // ==========================================================================
+  // Each chip entry in a playground axis can be either:
+  //   * a bare value           — `null`, `1`, `true`, `"auto"`, ...
+  //   * a wrapper object       — `{value, hide?, disable?, disableReason?, label?}`
+  //   * a rich option object   — `{id, label, flags?, env?, hide?, disable?, ...}`
+  //
+  // The optional `hide` / `disable` fields are constraint objects — each key
+  // is a base-cell field name (hw / variant / quant / strategy / nodes)
+  // mapped to an array of allowed values. The chip is hidden / disabled when
+  // EVERY key in the constraint matches the current base cell (AND across
+  // keys; OR within each key's value list). Empty constraints (or constraints
+  // with non-array values) never match — keeps malformed schemas from
+  // accidentally hiding everything.
+  //
+  // `disabled: true` / `disable: true` are static always-disabled forms
+  // (used by speculative's "Coming soon" chips). `disabled: false` /
+  // `disable: false` are no-ops.
+  const matchConstraint = (base, constraint) => {
+    if (!constraint || typeof constraint !== "object") return false;
+    const entries = Object.entries(constraint);
+    if (entries.length === 0) return false;
+    return entries.every(([k, vs]) =>
+      Array.isArray(vs) && vs.includes(base[k]));
+  };
+
+  // Normalize a chip entry into `{value, label?, hidden, disabled,
+  // disableReason, ...rest}`. For bare values, `value` is the entry itself
+  // and nothing is hidden/disabled. For object forms, `value` resolves to
+  // `entry.value` (bare-value wrapper form) or `entry.id` (rich option form
+  // — `id` doubles as the chip's identity in the delta state).
+  const evaluateChip = (entry, base) => {
+    if (entry === null || typeof entry !== "object") {
+      return {
+        value: entry, label: undefined,
+        hidden: false, disabled: false, disableReason: "",
+      };
+    }
+    const hidden = entry.hide ? matchConstraint(base, entry.hide) : false;
+    let disabled = entry.disabled === true || entry.disable === true;
+    if (!disabled && entry.disable && typeof entry.disable === "object") {
+      disabled = matchConstraint(base, entry.disable);
+    }
+    return {
+      ...entry,
+      value: "value" in entry ? entry.value : entry.id,
+      label: entry.label,
+      hidden,
+      disabled,
+      disableReason: entry.disableReason || "",
+    };
+  };
+
+  // Lookup helpers used by both render code and revertHidden handlers.
+  const findEntry = (entries, picked) => {
+    for (const e of (entries || [])) {
+      const v = (e === null || typeof e !== "object")
+        ? e : ("value" in e ? e.value : e.id);
+      if (v === picked) return e;
+    }
+    return null;
+  };
+  const isHidden = (entries, picked, base) => {
+    const e = findEntry(entries, picked);
+    if (e === null || e === undefined) return false;
+    return evaluateChip(e, base).hidden;
+  };
+
+  // ==========================================================================
+  // 4. Flag/env mutation primitives
+  // ==========================================================================
+  // Strip any flag whose first whitespace/equals-delimited token equals one
+  // of `prefixes`. Used to remove the base's values for an axis before
+  // re-emitting the playground's choice. Must match exactly the first token
+  // because values may contain hyphens / equals (e.g.
+  // `--moe-runner-backend marlin`).
   const stripFlagsByFirstToken = (flags, prefixes) => {
     const set = new Set(prefixes);
-    return flags.filter((f) => {
-      const head = f.split(/[\s=]/)[0];
-      return !set.has(head);
-    });
+    return flags.filter((f) => !set.has(f.split(/[\s=]/)[0]));
+  };
+
+  // Strip env entries whose name (the part before `=`) matches one of the
+  // given prefixes. Used by axes that need to remove the base cell's
+  // incompatible env vars before adding their own (currently only MegaMoE).
+  const stripEnvByPrefix = (envList, prefixes) => {
+    if (!prefixes || !prefixes.length) return envList;
+    const set = new Set(prefixes);
+    return envList.filter((e) => !set.has(e.split("=")[0]));
   };
 
   // Insert a list of new flags just before the trailing --host/--port pair so
@@ -99,11 +203,10 @@ export const Playground = ({ config }) => {
     return out;
   };
 
-  // Apply playground deltas on top of the base cell's flags.
   // Insert one or more new flags right after the FIRST flag whose first token
   // is in `afterAnyOf`. Falls back to right-after --model-path if none match.
-  // Used so the playground's overrides land near their conceptual siblings
-  // (e.g. --dp lands next to --tp).
+  // The order of `afterAnyOf` is irrelevant (set semantics); pass any subset
+  // of conceptual siblings so the override lands near them.
   const insertAfter = (flags, afterAnyOf, additions) => {
     const set = new Set(afterAnyOf);
     let idx = flags.findIndex((f) => set.has(f.split(/[\s=]/)[0]));
@@ -113,163 +216,617 @@ export const Playground = ({ config }) => {
     return out;
   };
 
-  const applyDeltas = (baseFlags, d, sel) => {
-    let flags = [...baseFlags];
+  // Insertion-anchor sets — declared once so axis handlers stay terse and
+  // the "what lives near what" intent is visible at the top of the file.
+  // Each anchor includes its sibling flags too, so insertion still works in
+  // partial cells where some sibling flags are absent.
+  const ANCHOR_NEAR_MODEL_PATH = ["--model-path"];
+  const ANCHOR_NEAR_TP         = ["--tp", "--model-path"];
+  const ANCHOR_NEAR_DP         = ["--dp", "--tp", "--model-path"];
+  const ANCHOR_NEAR_DPATTN     = ["--enable-dp-attention", "--dp", "--tp", "--model-path"];
+  const ANCHOR_NEAR_MOE        = ["--moe-a2a-backend", "--moe-runner-backend",
+                                  "--enable-dp-attention", "--dp", "--tp", "--model-path"];
 
-    // --- Attention parallelism overrides ---
-    // Per-knob: only strip + re-emit knobs the user actually set. A null
-    // override means "inherit from base" — so the base's flag for that knob
-    // stays untouched.
-    if (d.attn.tp !== null) {
-      flags = stripFlagsByFirstToken(flags, ["--tp"]);
-      flags = insertAfter(flags, ["--model-path"], [`--tp ${d.attn.tp}`]);
-    }
-    if (d.attn.dp !== null) {
-      flags = stripFlagsByFirstToken(flags, ["--dp"]);
-      if (d.attn.dp > 1) {
-        flags = insertAfter(flags, ["--tp", "--model-path"], [`--dp ${d.attn.dp}`]);
-      }
-    }
-    if (d.attn.dpAttn !== null) {
-      flags = stripFlagsByFirstToken(flags, ["--enable-dp-attention"]);
-      if (d.attn.dpAttn === true) {
-        flags = insertAfter(flags, ["--dp", "--tp", "--model-path"],
-          ["--enable-dp-attention"]);
-      }
-    }
-    if (d.attn.cp !== null) {
-      flags = stripFlagsByFirstToken(flags, [
-        "--enable-nsa-prefill-context-parallel", "--nsa-prefill-cp-mode",
-      ]);
-      if (d.attn.cp > 1) {
-        flags = insertAfter(flags,
-          ["--enable-dp-attention", "--dp", "--tp", "--model-path"],
-          ["--enable-nsa-prefill-context-parallel",
-           "--nsa-prefill-cp-mode round-robin-split"]);
-      }
-    }
-
-    // --- MoE backend (single-select) — config-driven option emit ---
-    // The option's `flags` array IS the source of truth for which `--moe-*`
-    // flag (and value) to insert. Engine just splices it after stripping the
-    // base's MoE flags.
-    if (d.moe.backend !== null) {
-      flags = stripFlagsByFirstToken(flags, [
-        "--moe-a2a-backend", "--moe-runner-backend",
-      ]);
-      const opt = (pgMoe?.backend?.options || []).find((o) => o.id === d.moe.backend);
-      if (opt && opt.flags && opt.flags.length) {
-        flags = insertAfter(flags,
-          ["--enable-dp-attention", "--dp", "--tp", "--model-path"],
-          opt.flags);
-      }
-    }
-    // --- MoE EP knob ---
-    if (d.moe.ep !== null) {
-      flags = stripFlagsByFirstToken(flags, ["--ep"]);
-      if (d.moe.ep > 1) {
-        flags = insertAfter(flags,
-          ["--moe-a2a-backend", "--moe-runner-backend", "--enable-dp-attention",
-           "--dp", "--tp", "--model-path"],
-          [`--ep ${d.moe.ep}`]);
-      }
-    }
-
-    // --- Speculative decoding — config-driven option emit ---
-    // Engine strips the 4 known --speculative-* prefixes and (if a non-current
-    // option is picked) splices the option's `flags` array. "current" leaves
-    // the base's spec flags untouched; "off" strips without re-adding.
-    if (d.spec !== "current") {
-      flags = stripFlagsByFirstToken(flags, [
-        "--speculative-algo", "--speculative-num-steps",
-        "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-      ]);
-      const preset = (pgSpec?.options || []).find((p) => p.id === d.spec);
-      if (preset && preset.flags && preset.flags.length) {
-        flags = insertBeforeTail(flags, preset.flags);
-      }
-    }
-
-    // --- Parsers (multi-toggle) — config-driven per-item flags ---
-    // Engine strips both --reasoning-parser and --tool-call-parser
-    // unconditionally (covers the case where the base cell already has
-    // either parser configured). Then iterates the config's parser items;
-    // for each item whose toggle is ON in `d.parsers`, splices `item.flag`.
-    flags = stripFlagsByFirstToken(flags, ["--reasoning-parser", "--tool-call-parser"]);
-    const parserAdds = [];
-    for (const item of (pgParsers?.items || [])) {
-      if (d.parsers && d.parsers[item.id]) parserAdds.push(item.flag);
-    }
-    if (parserAdds.length) flags = insertBeforeTail(flags, parserAdds);
-
-    // --- PD Disaggregation (role-specific flags for one of prefill/decode) ---
-    flags = stripFlagsByFirstToken(flags, [
-      "--disaggregation-mode", "--disaggregation-transfer-backend",
-      "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
-    ]);
-    if (d.pd.mode === "prefill" || d.pd.mode === "decode") {
-      const pdAdds = [
-        `--disaggregation-mode ${d.pd.mode}`,
-        "--disaggregation-transfer-backend mooncake",
-      ];
-      if (d.pd.ibDevice && d.pd.ibDevice !== "auto") {
-        pdAdds.push(`--disaggregation-ib-device ${d.pd.ibDevice}`);
-      }
-      // Single-host bootstrap port (only when base isn't already multi-node —
-      // the renderer adds NODE0_IP-based --dist-init-addr in that case and
-      // adding a second one here would collide).
-      if (sel.nodes === "single" && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-        const bootstrapPort = d.pd.mode === "prefill" ? 30335 : 30435;
-        pdAdds.push(`--dist-init-addr 127.0.0.1:${bootstrapPort}`);
-      }
-      flags = insertBeforeTail(flags, pdAdds);
-    }
-
-    // --- Hierarchical KV Cache ---
-    // Emission follows the canonical upstream form documented in
-    // docs/advanced_features/hicache_best_practices.mdx.
-    flags = stripFlagsByFirstToken(flags, [
-      "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
-      "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
-      "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
-    ]);
-    if (d.hicache.enable) {
-      const hcAdds = [
-        "--enable-hierarchical-cache",
-        "--hicache-ratio 2",
-        "--hicache-size 0",
-      ];
-      if (d.hicache.backend) {
-        hcAdds.push(
-          "--hicache-mem-layout page_first_direct",
-          "--hicache-io-backend direct",
-        );
-      }
-      const writePolicy = d.hicache.writePolicy && d.hicache.writePolicy !== "auto"
-        ? d.hicache.writePolicy
-        : "write_through";
-      hcAdds.push(`--hicache-write-policy ${writePolicy}`);
-      if (d.hicache.backend) {
-        hcAdds.push(
-          `--hicache-storage-backend ${d.hicache.backend}`,
-          "--hicache-storage-prefetch-policy wait_complete",
-        );
-      }
-      flags = insertBeforeTail(flags, hcAdds);
-    }
-
-    return flags;
+  // Helper bundle passed to every axis handler (render + apply + revertHidden).
+  // Adding a new primitive available to handlers = add a field here.
+  const helpers = {
+    matchConstraint, evaluateChip, findEntry, isHidden,
+    stripFlagsByFirstToken, stripEnvByPrefix, insertBeforeTail, insertAfter,
+    ANCHOR_NEAR_MODEL_PATH, ANCHOR_NEAR_TP, ANCHOR_NEAR_DP,
+    ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
 
-  // Renderer (same shape as §3 — multi-node prepending, env block, hints).
-  // `pdMode` is one of: null (skip banner), "prefill", "decode" — when present
-  // a banner is prepended explaining that the emitted command is only ONE of
-  // the three PD-Disagg roles (prefill + decode + router). The renderer
-  // intentionally only emits the role itself; the operator pairs it with the
-  // sibling role and a router invocation separately.
-  // `mode` is "python" (bare `sglang serve`) or "docker" (wrapped in `docker run`
-  // against the per-hardware image from config.dockerImages).
-  const renderCommandLines = (cell, flags, sel, envValues, pdMode = null, mode = "python") => {
+  // ==========================================================================
+  // 5. AXIS_HANDLERS — the built-in playground axis registry
+  // ==========================================================================
+  // Each entry implements `initState / revertHidden / apply / render` (plus
+  // optional `getRenderHints`). The engine iterates this map in insertion
+  // order for render and apply, and skips any axis whose key is absent from
+  // `config.playgroundFeatures`. Adding a new axis = adding one entry here.
+  //
+  // Conventions:
+  //   - `value` is whatever shape `initState` returns for that axis.
+  //   - `null` / "current" / "auto" / "off" / "disabled" / `false` are the
+  //     per-axis "inherit-from-base" sentinels — `apply` should be a no-op
+  //     for those (except for axes that always strip; see notes).
+  //   - `apply` is a pure function: it must not mutate its inputs.
+  //
+  // Strip-policy summary (for the reviewer):
+  //   - attention.tp/dp/dpAttn/cp : strip ONLY when value !== null
+  //                                  (so base's flag survives "inherit")
+  //   - moe.backend / moe.ep       : strip ONLY when value !== null
+  //   - speculative                : strip ONLY when value !== "current"
+  //                                  ("current" = inherit, "off" = strip
+  //                                  without re-emit)
+  //   - parsers                    : UNCONDITIONAL strip (engine owns parser
+  //                                  flags whenever the parsers axis is
+  //                                  declared)
+  //   - pdDisagg                   : UNCONDITIONAL strip
+  //   - hicache                    : UNCONDITIONAL strip
+  //   - megamoe                    : strip ONLY when value !== "disabled"
+  //                                  (also mutates env: stripEnvByPrefix +
+  //                                  appends option.env)
+  const AXIS_HANDLERS = {
+
+    // ---- Axis: Attention Parallelism ----------------------------------------
+    // Four sub-knobs (TP / DP / CP / DP-Attention). Per-knob state slot;
+    // `null` means inherit base. Each knob has its own strip prefix +
+    // insertion anchor so overrides land near their conceptual siblings.
+    attention: {
+      initState: () => ({ tp: null, dp: null, cp: null, dpAttn: null }),
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const knob of (fc.knobs || [])) {
+          const cur = next[knob.id];
+          if (cur !== null && cur !== undefined
+              && h.isHidden(knob.values, cur, base)) {
+            next[knob.id] = null; changed = true;
+          }
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, h }) => {
+        if (value.tp !== null) {
+          flags = h.stripFlagsByFirstToken(flags, ["--tp"]);
+          flags = h.insertAfter(flags, h.ANCHOR_NEAR_MODEL_PATH, [`--tp ${value.tp}`]);
+        }
+        if (value.dp !== null) {
+          flags = h.stripFlagsByFirstToken(flags, ["--dp"]);
+          if (value.dp > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [`--dp ${value.dp}`]);
+          }
+        }
+        if (value.dpAttn !== null) {
+          flags = h.stripFlagsByFirstToken(flags, ["--enable-dp-attention"]);
+          if (value.dpAttn === true) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DP, ["--enable-dp-attention"]);
+          }
+        }
+        if (value.cp !== null) {
+          flags = h.stripFlagsByFirstToken(flags, [
+            "--enable-nsa-prefill-context-parallel", "--nsa-prefill-cp-mode",
+          ]);
+          if (value.cp > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, [
+              "--enable-nsa-prefill-context-parallel",
+              "--nsa-prefill-cp-mode round-robin-split",
+            ]);
+          }
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        const knobs = fc.knobs || [];
+        if (!knobs.length) return null;
+        const setKnob = (k, v) => setValue({ ...value, [k]: v });
+        // DP-Attention chip labels are boolean-aware; others use plain numeric.
+        const labelFor = (knob, c) => {
+          if (c.label !== undefined) return c.label;
+          if (knob.id === "dpAttn") {
+            const labelMap = knob.labels || { "auto": "auto", "true": "on", "false": "off" };
+            const k = c.value === null ? "auto" : String(c.value);
+            return labelMap[k] || k;
+          }
+          return c.value === null ? "auto" : String(c.value);
+        };
+        return (
+          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
+            <div style={s.title}>Attention Parallelism</div>
+            {knobs.map((knob) => (
+              <div key={knob.id} style={s.subRow}>
+                <span style={s.subLabel}>{knob.label || knob.id.toUpperCase()}</span>
+                <div style={s.chipRow}>
+                  {(knob.values || [null]).map((entry) => {
+                    const c = h.evaluateChip(entry, base);
+                    if (c.hidden) return null;
+                    return renderChip(labelFor(knob, c), value[knob.id], c.value,
+                      (nv) => setKnob(knob.id, nv),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: MoE Parallelism ----------------------------------------------
+    // Backend (single-select; each option's `flags` is the source of truth)
+    // and EP (numeric knob). Either sub-axis is independently optional.
+    moe: {
+      initState: () => ({ backend: null, ep: null }),
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        if (next.backend !== null && fc.backend?.options
+            && h.isHidden(fc.backend.options, next.backend, base)) {
+          next.backend = null; changed = true;
+        }
+        if (next.ep !== null && fc.ep?.values
+            && h.isHidden(fc.ep.values, next.ep, base)) {
+          next.ep = null; changed = true;
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, h }) => {
+        if (value.backend !== null) {
+          flags = h.stripFlagsByFirstToken(flags, [
+            "--moe-a2a-backend", "--moe-runner-backend",
+          ]);
+          const opt = (fc.backend?.options || []).find((o) => o.id === value.backend);
+          if (opt?.flags?.length) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+          }
+        }
+        if (value.ep !== null) {
+          flags = h.stripFlagsByFirstToken(flags, ["--ep"]);
+          if (value.ep > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`--ep ${value.ep}`]);
+          }
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        if (!fc.backend && !fc.ep) return null;
+        const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        return (
+          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
+            <div style={s.title}>MoE Parallelism</div>
+            {fc.backend && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>Backend</span>
+                <div style={s.chipRow}>
+                  {(fc.backend.options || []).map((o) => {
+                    const c = h.evaluateChip(o, base);
+                    if (c.hidden) return null;
+                    return renderChip(c.label, value.backend, c.value,
+                      (v) => setSlot("backend", v),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+            {fc.ep && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>{fc.ep.label || "EP"}</span>
+                <div style={s.chipRow}>
+                  {(fc.ep.values || [null]).map((entry) => {
+                    const c = h.evaluateChip(entry, base);
+                    if (c.hidden) return null;
+                    const lbl = c.label ?? (c.value === null ? "auto" : String(c.value));
+                    return renderChip(lbl, value.ep, c.value,
+                      (nv) => setSlot("ep", nv),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: Parsers ------------------------------------------------------
+    // Multi-toggle: one boolean per item. Engine UNCONDITIONALLY strips
+    // `--reasoning-parser` and `--tool-call-parser` whenever the parsers axis
+    // is declared (so the playground takes ownership of these flags), then
+    // re-emits one item.flag per toggled-on item.
+    parsers: {
+      initState: (fc) => {
+        const out = {};
+        for (const item of (fc.items || [])) out[item.id] = false;
+        return out;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const item of (fc.items || [])) {
+          if (next[item.id] && h.evaluateChip(item, base).hidden) {
+            next[item.id] = false; changed = true;
+          }
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, h }) => {
+        flags = h.stripFlagsByFirstToken(flags, ["--reasoning-parser", "--tool-call-parser"]);
+        const adds = [];
+        for (const item of (fc.items || [])) {
+          if (value[item.id]) adds.push(item.flag);
+        }
+        if (adds.length) flags = h.insertBeforeTail(flags, adds);
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        const visible = (fc.items || [])
+          .map((item) => ({ item, c: h.evaluateChip(item, base) }))
+          .filter(({ c }) => !c.hidden);
+        if (visible.length === 0) return null;
+        return (
+          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
+            <div style={s.title}>Parsers</div>
+            {visible.map(({ item, c }) => (
+              <div key={item.id} style={s.subRow}>
+                <span style={s.subLabel}>{item.label}</span>
+                <div style={s.chipRow}>
+                  {renderChip(item.label, value[item.id], true,
+                    () => setValue({ ...value, [item.id]: !value[item.id] }),
+                    { disabled: c.disabled, disabledReason: c.disableReason })}
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: Speculative Decoding -----------------------------------------
+    // Single-select chip group. Sentinel values:
+    //   "current" — leave base cell's `--speculative-*` flags untouched
+    //   "off"     — strip them with no replacement (force greedy)
+    //   <other>   — strip + splice option.flags
+    speculative: {
+      initState: () => "current",
+
+      revertHidden: (value, fc, base, h) => {
+        if (value !== "current" && h.isHidden(fc.options || [], value, base)) {
+          return "current";
+        }
+        return value;
+      },
+
+      apply: ({ flags, env, value, fc, h }) => {
+        if (value === "current") return { flags, env };
+        flags = h.stripFlagsByFirstToken(flags, [
+          "--speculative-algo", "--speculative-num-steps",
+          "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+        ]);
+        const preset = (fc.options || []).find((p) => p.id === value);
+        if (preset?.flags?.length) flags = h.insertBeforeTail(flags, preset.flags);
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        const opts = fc.options || [];
+        if (!opts.length) return null;
+        return (
+          <div key={axisId} style={s.card}>
+            <div style={s.title}>Speculative Decoding</div>
+            <div style={s.rowFlex}>
+              {opts.map((p) => {
+                const c = h.evaluateChip(p, base);
+                if (c.hidden) return null;
+                return renderChip(c.label, value, c.value, setValue,
+                  { disabled: c.disabled, disabledReason: c.disableReason });
+              })}
+            </div>
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: PD Disaggregation --------------------------------------------
+    // Role select (off / prefill / decode) + optional IB device pick. Engine
+    // OWNS the `--disaggregation-*` flags (unconditional strip). When a role
+    // is picked, emits the role flag + transfer-backend + optional IB device
+    // + (single-host only) bootstrap port. `getRenderHints` reports the
+    // chosen role back to the renderer so it can prepend the role banner.
+    pdDisagg: {
+      initState: () => ({ mode: "off", ibDevice: "auto" }),
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        if (next.mode !== "off" && fc.modes
+            && h.isHidden(fc.modes, next.mode, base)) {
+          next.mode = "off"; changed = true;
+        }
+        if (next.ibDevice !== "auto" && fc.ibDevices
+            && h.isHidden(fc.ibDevices, next.ibDevice, base)) {
+          next.ibDevice = "auto"; changed = true;
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, sel, h }) => {
+        flags = h.stripFlagsByFirstToken(flags, [
+          "--disaggregation-mode", "--disaggregation-transfer-backend",
+          "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
+        ]);
+        if (value.mode === "prefill" || value.mode === "decode") {
+          const adds = [
+            `--disaggregation-mode ${value.mode}`,
+            "--disaggregation-transfer-backend mooncake",
+          ];
+          if (value.ibDevice && value.ibDevice !== "auto") {
+            adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
+          }
+          // Single-host bootstrap port only — multi-node cells already have
+          // a NODE0_IP-based --dist-init-addr from the renderer.
+          if (sel.nodes === "single"
+              && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
+            const bootstrapPort = value.mode === "prefill" ? 30335 : 30435;
+            adds.push(`--dist-init-addr 127.0.0.1:${bootstrapPort}`);
+          }
+          flags = h.insertBeforeTail(flags, adds);
+        }
+        return { flags, env };
+      },
+
+      getRenderHints: (value) => {
+        if (value.mode === "prefill" || value.mode === "decode") {
+          return { pdMode: value.mode };
+        }
+        return null;
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const showModes  = (fc.modes      || []).length > 0;
+        const showIb     = (fc.ibDevices  || []).length > 0;
+        if (!showModes && !showIb) return null;
+        return (
+          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
+            <div style={s.title}>PD Disaggregation</div>
+            {showModes && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>Mode</span>
+                <div style={s.chipRow}>
+                  {fc.modes.map((m) => {
+                    const c = h.evaluateChip(m, base);
+                    if (c.hidden) return null;
+                    return renderChip(c.label, value.mode, c.value,
+                      (v) => setSlot("mode", v),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+            {showIb && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>IB Device</span>
+                <div style={s.chipRow}>
+                  {fc.ibDevices.map((entry) => {
+                    const c = h.evaluateChip(entry, base);
+                    if (c.hidden) return null;
+                    const lbl = c.label ?? String(c.value);
+                    return renderChip(lbl, value.ibDevice, c.value,
+                      (nv) => setSlot("ibDevice", nv),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: Hierarchical KV Cache ----------------------------------------
+    // Enable toggle + optional backend + optional write policy. Engine OWNS
+    // the `--hicache-*` family of flags (unconditional strip). Emission
+    // follows the canonical upstream form documented in
+    // docs/advanced_features/hicache_best_practices.mdx.
+    hicache: {
+      initState: () => ({ enable: false, backend: null, writePolicy: "auto" }),
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        if (next.backend !== null && fc.backends
+            && h.isHidden(fc.backends, next.backend, base)) {
+          next.backend = null; changed = true;
+        }
+        if (next.writePolicy !== "auto" && fc.writePolicies
+            && h.isHidden(fc.writePolicies, next.writePolicy, base)) {
+          next.writePolicy = "auto"; changed = true;
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, h }) => {
+        flags = h.stripFlagsByFirstToken(flags, [
+          "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
+          "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
+          "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
+        ]);
+        if (value.enable) {
+          const adds = [
+            "--enable-hierarchical-cache",
+            "--hicache-ratio 2",
+            "--hicache-size 0",
+          ];
+          if (value.backend) {
+            adds.push("--hicache-mem-layout page_first_direct",
+                      "--hicache-io-backend direct");
+          }
+          const writePolicy = (value.writePolicy && value.writePolicy !== "auto")
+            ? value.writePolicy : "write_through";
+          adds.push(`--hicache-write-policy ${writePolicy}`);
+          if (value.backend) {
+            adds.push(`--hicache-storage-backend ${value.backend}`,
+                      "--hicache-storage-prefetch-policy wait_complete");
+          }
+          flags = h.insertBeforeTail(flags, adds);
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        return (
+          <div key={axisId} style={{ ...s.card, ...s.cardStack }}>
+            <div style={s.title}>Hierarchical KV Cache (HiCache)</div>
+            <div style={s.subRow}>
+              <span style={s.subLabel}>Enable</span>
+              <div style={s.chipRow}>
+                {renderChip("HiCache", value.enable, true,
+                  () => setSlot("enable", !value.enable))}
+              </div>
+            </div>
+            {(fc.backends || []).length > 0 && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>Storage</span>
+                <div style={s.chipRow}>
+                  {fc.backends.map((o) => {
+                    const c = h.evaluateChip(o, base);
+                    if (c.hidden) return null;
+                    return renderChip(c.label, value.backend, c.value,
+                      (v) => setSlot("backend", v),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+            {(fc.writePolicies || []).length > 0 && (
+              <div style={s.subRow}>
+                <span style={s.subLabel}>Write Policy</span>
+                <div style={s.chipRow}>
+                  {fc.writePolicies.map((entry) => {
+                    const c = h.evaluateChip(entry, base);
+                    if (c.hidden) return null;
+                    const lbl = c.label ?? String(c.value);
+                    return renderChip(lbl, value.writePolicy, c.value,
+                      (v) => setSlot("writePolicy", v),
+                      { disabled: c.disabled, disabledReason: c.disableReason });
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: MegaMoE ------------------------------------------------------
+    // Single-select. Has BOTH axis-level gating (requiresHw / excludesStrategy
+    // — entire card hidden) AND per-option `hide` constraints, plus env
+    // mutation (stripEnv + option.env). The axis-level gates are enforced in
+    // `render` (returns null) and in `revertHidden` (auto-reset to "disabled"
+    // when base moves into a gated cell).
+    megamoe: {
+      initState: () => "disabled",
+
+      // Centralised gate check — used by both render and revertHidden.
+      _gateOpen: (fc, base) => {
+        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
+        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
+        return hwGate && stratGate;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        if (!AXIS_HANDLERS.megamoe._gateOpen(fc, base)) {
+          return value === "disabled" ? value : "disabled";
+        }
+        if (value !== "disabled" && h.isHidden(fc.options || [], value, base)) {
+          return "disabled";
+        }
+        return value;
+      },
+
+      apply: ({ flags, env, value, fc, h }) => {
+        if (!value || value === "disabled") return { flags, env };
+        const opt = (fc.options || []).find((o) => o.id === value);
+        if (!opt) return { flags, env };
+        // The axis-level gate isn't re-checked here — revertHidden keeps the
+        // state in sync with the base, so by the time apply runs, a non-
+        // "disabled" value implies the card is visible and the user opted in.
+        flags = h.stripFlagsByFirstToken(flags, [
+          "--moe-a2a-backend", "--moe-runner-backend",
+        ]);
+        if (opt.flags?.length) {
+          flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+        }
+        env = h.stripEnvByPrefix(env, fc.stripEnv || []);
+        if (opt.env?.length) env = [...env, ...opt.env];
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+        if (!AXIS_HANDLERS.megamoe._gateOpen(fc, base)) return null;
+        return (
+          <div key={axisId} style={s.card}>
+            <div style={s.title}>MegaMoE</div>
+            <div style={s.rowFlex}>
+              {(fc.options || []).map((o) => {
+                const c = h.evaluateChip(o, base);
+                if (c.hidden) return null;
+                return renderChip(c.label, value, c.value, setValue,
+                  { disabled: c.disabled, disabledReason: c.disableReason });
+              })}
+            </div>
+          </div>
+        );
+      },
+    },
+
+  };
+
+  // ==========================================================================
+  // 6. Apply pipeline + render command
+  // ==========================================================================
+  // Thread the base cell's (flags, env) through every declared axis's apply
+  // method, in AXIS_HANDLERS declaration order. Also collects render hints
+  // from any axis that emits them (currently only pdDisagg's role banner).
+  const applyAllDeltas = (baseFlags, baseEnv, allDeltas, sel) => {
+    let flags = [...baseFlags];
+    let env = [...(baseEnv || [])];
+    let pdMode = null;
+    for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
+      const fc = pgFeatures[axisId];
+      if (!fc) continue;
+      const value = allDeltas[axisId];
+      if (value === undefined) continue;
+      ({ flags, env } = handler.apply({ flags, env, value, fc, sel, h: helpers }));
+      if (handler.getRenderHints) {
+        const hints = handler.getRenderHints(value, fc) || {};
+        if (hints.pdMode) pdMode = hints.pdMode;
+      }
+    }
+    return { flags, env, pdMode };
+  };
+
+  // Renderer (same shape as _deployment.jsx — multi-node prepending, env
+  // block, hints, docker framing).
+  //   pdMode — null | "prefill" | "decode": when present, prepends a banner
+  //     explaining that the emitted command is only one of the PD-Disagg
+  //     roles. The renderer doesn't generate prefill+decode+router pairs;
+  //     the operator pairs the sibling role and router separately.
+  //   mode   — "python" | "docker": shell-style invocation vs `docker run`
+  //     wrapping. Image comes from `config.dockerImages[sel.hw]`.
+  //   cellEnv is decoupled from `cell` so callers can pass a modified env
+  //     (e.g. after MegaMoE's stripEnv + env append).
+  const renderCommandLines = (cell, flags, cellEnv, sel, envValues, pdMode = null, mode = "python") => {
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
@@ -290,7 +847,7 @@ export const Playground = ({ config }) => {
         "  -p {{PORT}}:{{PORT}}",
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
-        ...cell.env.map((e) => `  --env ${e}`),
+        ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
         "  sglang serve",
@@ -299,7 +856,7 @@ export const Playground = ({ config }) => {
       cmd = dockerLines.join(" \\\n");
     } else {
       const flagBlock = f.map((x) => "  " + x).join(" \\\n");
-      const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+      const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
       cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
     }
     if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
@@ -328,10 +885,12 @@ export const Playground = ({ config }) => {
     return cmd;
   };
 
-  // Line-level diff. Returns array of {line, kind: 'unchanged'|'added'|'removed'}.
-  // Greedy LCS-like: walk both sides, emit `unchanged` when they agree,
-  // `added` for playground-only, `removed` for base-only. This isn't optimal
-  // but produces readable output when the two share most lines (the common case).
+  // ==========================================================================
+  // 7. Diff (line-level, greedy LCS-like)
+  // ==========================================================================
+  // Walk both sides, emit `unchanged` when they agree, `added` for
+  // playground-only, `removed` for base-only. Not optimal but produces
+  // readable output when the two share most lines (the common case).
   const computeDiff = (baseStr, pgStr) => {
     const a = baseStr.split("\n");
     const b = pgStr.split("\n");
@@ -358,22 +917,8 @@ export const Playground = ({ config }) => {
     return out;
   };
 
-  const placeholderDefaults = (schema) => {
-    const out = {};
-    for (const [k, v] of Object.entries(schema || {})) out[k] = v.default ?? "";
-    return out;
-  };
-
-  // Initial parser-toggle state derived from config: each item's id starts at
-  // `false`. If the parsers axis is absent, the parsers state is just `{}`.
-  const initialParsers = () => {
-    const out = {};
-    for (const item of (pgParsers?.items || [])) out[item.id] = false;
-    return out;
-  };
-
   // ==========================================================================
-  // Style helper (mostly shared with §3 — adds diff-line colors)
+  // 8. Style helper (dark-mode-aware)
   // ==========================================================================
   const makeStyles = (isDark) => ({
     container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "8px" },
@@ -384,14 +929,7 @@ export const Playground = ({ config }) => {
       borderRadius: "4px",
       background: isDark ? "#1f2937" : "#fff",
     },
-    cardRow: {
-      padding: "8px 12px",
-      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
-      borderLeft: `3px solid ${isDark ? "#A78BFA" : "#8B5CF6"}`,
-      borderRadius: "4px",
-      background: isDark ? "#1f2937" : "#fff",
-      display: "flex", alignItems: "center", gap: "12px",
-    },
+    cardStack: { display: "flex", flexDirection: "column", gap: "6px" },
     baseStrip: {
       padding: "8px 12px",
       borderRadius: "4px",
@@ -401,16 +939,12 @@ export const Playground = ({ config }) => {
       display: "flex", alignItems: "center", gap: "10px",
     },
     title: { fontSize: "13px", fontWeight: "600", color: isDark ? "#e5e7eb" : "inherit", marginBottom: "8px" },
-    titleInline: { fontSize: "13px", fontWeight: "600", minWidth: "180px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
     rowFlex: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", flex: 1 },
-    cardStack: { display: "flex", flexDirection: "column", gap: "6px" },
     subRow: { display: "flex", alignItems: "center", gap: "10px" },
     subLabel: {
-      fontSize: "11px",
-      fontWeight: 600,
+      fontSize: "11px", fontWeight: 600,
       color: isDark ? "#9ca3af" : "#6b7280",
-      minWidth: "96px",
-      flexShrink: 0,
+      minWidth: "96px", flexShrink: 0,
       letterSpacing: "0.02em",
     },
     chipRow: { display: "flex", flexWrap: "wrap", gap: "6px", flex: 1 },
@@ -428,7 +962,6 @@ export const Playground = ({ config }) => {
     },
     chipChecked: { background: "#8B5CF6", color: "white", borderColor: "#8B5CF6" },
     chipDisabled: { cursor: "not-allowed", opacity: 0.4 },
-    axisLabel: { fontSize: "11px", color: isDark ? "#9ca3af" : "#6b7280", marginRight: "6px" },
     commandWrap: {
       position: "relative",
       background: isDark ? "#111827" : "#f5f5f5",
@@ -473,9 +1006,7 @@ export const Playground = ({ config }) => {
       color: isDark ? "#fde68a" : "#92400e",
       fontSize: "11px", fontWeight: 600,
     },
-    badgeDot: {
-      width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b",
-    },
+    badgeDot: { width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b" },
     iconButton: {
       padding: "4px 10px",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -491,20 +1022,17 @@ export const Playground = ({ config }) => {
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
       borderRadius: "10px",
       overflow: "hidden",
-      fontSize: "11px",
-      fontWeight: 600,
+      fontSize: "11px", fontWeight: 600,
       userSelect: "none",
     },
     runModeChip: (active) => ({
-      padding: "2px 10px",
-      cursor: "pointer",
+      padding: "2px 10px", cursor: "pointer",
       background: active ? (isDark ? "#1f2937" : "#fff") : "transparent",
       color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
       borderRight: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
     }),
     runModeChipLast: (active) => ({
-      padding: "2px 10px",
-      cursor: "pointer",
+      padding: "2px 10px", cursor: "pointer",
       background: active ? (isDark ? "#1f2937" : "#fff") : "transparent",
       color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
     }),
@@ -551,9 +1079,7 @@ export const Playground = ({ config }) => {
       fontSize: "13px", fontWeight: 500,
     },
     resetBtn: {
-      marginLeft: "auto",
-      padding: "2px 8px",
-      fontSize: "11px",
+      marginLeft: "auto", padding: "2px 8px", fontSize: "11px",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
       borderRadius: "3px",
       background: "transparent",
@@ -563,7 +1089,7 @@ export const Playground = ({ config }) => {
   });
 
   // ==========================================================================
-  // State + effects
+  // 9. React state + effects
   // ==========================================================================
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -584,9 +1110,8 @@ export const Playground = ({ config }) => {
     return () => observer.disconnect();
   }, []);
 
-  // Shared env store with §3 (same localStorage key) so HOST/PORT/etc. are
-  // unified across the page.
-  const STORAGE_KEY = "sglang-deploy-env";
+  // Env / placeholder values, shared with _deployment.jsx (same localStorage
+  // key) so HOST/PORT/etc. are unified across the page.
   const [env, setEnv] = useState(() => placeholderDefaults(config.placeholders));
   useEffect(() => {
     try {
@@ -602,7 +1127,7 @@ export const Playground = ({ config }) => {
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
   };
 
-  // Base selection: live-link to §3 via custom event + URL hash fallback.
+  // Base selection — live-link to §3 via URL hash + custom event.
   const initialBaseFromHash = () => {
     const fallback = config.cells[0].match;
     if (typeof window === "undefined") return { ...fallback };
@@ -633,20 +1158,42 @@ export const Playground = ({ config }) => {
     };
   }, []);
 
-  // Playground deltas. `null` = inherit from base for that knob.
-  // Parser keys come from config.playgroundFeatures.parsers.items (each item's
-  // id maps to a boolean toggle). Other axes have fixed shapes that mirror
-  // the engine's strip/insert logic.
-  const [deltas, setDeltas] = useState({
-    attn: { tp: null, dp: null, cp: null, dpAttn: null },
-    moe:  { backend: null, ep: null },
-    spec: "current",
-    parsers: initialParsers(),
-    pd: { mode: "off", ibDevice: "auto" },
-    hicache: { enable: false, backend: null, writePolicy: "auto" },
-  });
+  // Deltas: one slot per declared axis. Shape is derived from AXIS_HANDLERS
+  // crossed with `pgFeatures` — adding a new axis adds one slot here for
+  // free.
+  const initialDeltas = () => {
+    const out = {};
+    for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
+      const fc = pgFeatures[axisId];
+      if (fc) out[axisId] = handler.initState(fc);
+    }
+    return out;
+  };
+  const [deltas, setDeltas] = useState(initialDeltas);
 
-  const [modal, setModal] = useState(null);
+  // When base cell changes, any picked override whose chip is now hidden
+  // would silently linger as a ghost override. Walk every axis and revert
+  // hidden picks back to that axis's inherit default. Disabled picks are
+  // intentionally NOT reverted — `disable` is a soft warning, the user can
+  // keep that override across base changes if they explicitly opted in.
+  useEffect(() => {
+    setDeltas((d) => {
+      let next = d;
+      let mutated = false;
+      for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
+        const fc = pgFeatures[axisId];
+        if (!fc || !(axisId in d)) continue;
+        const nv = handler.revertHidden(d[axisId], fc, base, helpers);
+        if (nv !== d[axisId]) {
+          if (!mutated) { next = { ...d }; mutated = true; }
+          next[axisId] = nv;
+        }
+      }
+      return mutated ? next : d;
+    });
+  }, [base.hw, base.variant, base.quant, base.strategy, base.nodes]);
+
+  const [modal, setModal] = useState(null); // 'curl' | 'env' | null
   useEffect(() => {
     if (modal === null) return;
     const onKey = (e) => { if (e.key === "Escape") setModal(null); };
@@ -666,7 +1213,7 @@ export const Playground = ({ config }) => {
   const [runMode, setRunMode] = useState("python");
 
   // ==========================================================================
-  // Derived
+  // 10. Derived values
   // ==========================================================================
   const s = makeStyles(isDark);
   const baseCell = findCell(config.cells, base);
@@ -676,22 +1223,15 @@ export const Playground = ({ config }) => {
   let playgroundCommand = "";
   let diffLines = [];
   if (baseCell) {
-    baseCommand = renderCommandLines(baseCell, baseCell.flags, base, env, null, runMode);
-    const pgFlags = applyDeltas(baseCell.flags, deltas, base);
-    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env, deltas.pd.mode, runMode);
+    baseCommand = renderCommandLines(baseCell, baseCell.flags, baseCell.env, base, env, null, runMode);
+    const { flags: pgFlags, env: pgEnv, pdMode } = applyAllDeltas(baseCell.flags, baseCell.env, deltas, base);
+    playgroundCommand = renderCommandLines(baseCell, pgFlags, pgEnv, base, env, pdMode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
 
   const curlText = interpolate(config.curl || "", env, modelName);
 
-  const resetAll = () => setDeltas({
-    attn: { tp: null, dp: null, cp: null, dpAttn: null },
-    moe:  { backend: null, ep: null },
-    spec: "current",
-    parsers: initialParsers(),
-    pd: { mode: "off", ibDevice: "auto" },
-    hicache: { enable: false, backend: null, writePolicy: "auto" },
-  });
+  const resetAll = () => setDeltas(initialDeltas());
 
   const placeholderGroups = (() => {
     const out = { command: [], curl: [] };
@@ -712,12 +1252,18 @@ export const Playground = ({ config }) => {
     setTimeout(() => setCurlCopied(false), 1200);
   };
 
+  // Inherited-base summary line (top strip).
+  const baseSummary = baseCell
+    ? `${base.hw.toUpperCase()} · ${base.variant} · ${base.quant.toUpperCase()} · ${base.strategy} · ${base.nodes}`
+    : "(no verified cell at current §3 selection — showing playground only)";
+
   // ==========================================================================
-  // JSX render
+  // 11. Render helpers
   // ==========================================================================
-  // A row of chip selectors. `current` is the value bound to the chip group;
-  // `onPick(v)` is called when the user clicks a chip. Disabled chips are
-  // unclickable (used for placeholder spec algorithms).
+  // Chip selector. `current` is the value bound to the chip group; `onPick(v)`
+  // is called when the user clicks a chip. Disabled chips are unclickable
+  // (used for static "Coming soon" entries and for chips whose `disable`
+  // constraint matches the current base).
   const renderChip = (label, current, value, onPick, opts = {}) => {
     const checked = current === value;
     const disabled = !!opts.disabled;
@@ -737,26 +1283,9 @@ export const Playground = ({ config }) => {
     );
   };
 
-  const setAttn   = (k, v) => setDeltas((d) => ({ ...d, attn: { ...d.attn, [k]: v } }));
-  const setMoe    = (k, v) => setDeltas((d) => ({ ...d, moe:  { ...d.moe,  [k]: v } }));
-  const setParser = (k, v) => setDeltas((d) => ({ ...d, parsers: { ...d.parsers, [k]: v } }));
-  const setPd     = (k, v) => setDeltas((d) => ({ ...d, pd: { ...d.pd, [k]: v } }));
-  const setHiCache = (k, v) => setDeltas((d) => ({ ...d, hicache: { ...d.hicache, [k]: v } }));
-
-  // Format a hash-suffixed badge of the inherited base.
-  const baseSummary = baseCell
-    ? `${base.hw.toUpperCase()} · ${base.variant} · ${base.quant.toUpperCase()} · ${base.strategy} · ${base.nodes}`
-    : "(no verified cell at current §3 selection — showing playground only)";
-
-  // Look up a knob's value range. Used by Attention's TP/DP/CP/DP-Attention
-  // chip rows. DP-Attention's chips are rendered manually below because the
-  // values include booleans (need custom labels), not just numbers.
-  const tpValues = attnValuesFor("tp");
-  const dpValues = attnValuesFor("dp");
-  const cpValues = attnValuesFor("cp");
-  const dpAttnKnob = (pgAttention?.knobs || []).find((k) => k.id === "dpAttn");
-  const epValues = pgMoe?.ep?.values || [null];
-
+  // ==========================================================================
+  // 12. JSX render
+  // ==========================================================================
   return (
     <div style={s.container} className="not-prose">
       {/* Inherited base summary */}
@@ -766,171 +1295,21 @@ export const Playground = ({ config }) => {
         <button style={s.resetBtn} onClick={resetAll}>Reset all overrides</button>
       </div>
 
-      {/* Axis 1: Attention Parallelism — only renders if config declares it */}
-      {pgAttention && (
-        <div style={{ ...s.card, ...s.cardStack }}>
-          <div style={s.title}>Attention Parallelism</div>
-          {(pgAttention.knobs || []).some((k) => k.id === "tp") && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>TP</span>
-              <div style={s.chipRow}>
-                {tpValues.map((v) =>
-                  renderChip(v === null ? "auto" : String(v), deltas.attn.tp, v,
-                    (nv) => setAttn("tp", nv)))}
-              </div>
-            </div>
-          )}
-          {(pgAttention.knobs || []).some((k) => k.id === "dp") && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>DP</span>
-              <div style={s.chipRow}>
-                {dpValues.map((v) =>
-                  renderChip(v === null ? "auto" : String(v), deltas.attn.dp, v,
-                    (nv) => setAttn("dp", nv)))}
-              </div>
-            </div>
-          )}
-          {(pgAttention.knobs || []).some((k) => k.id === "cp") && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>CP</span>
-              <div style={s.chipRow}>
-                {cpValues.map((v) =>
-                  renderChip(v === null ? "auto" : String(v), deltas.attn.cp, v,
-                    (nv) => setAttn("cp", nv)))}
-              </div>
-            </div>
-          )}
-          {dpAttnKnob && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>{dpAttnKnob.label || "DP-Attention"}</span>
-              <div style={s.chipRow}>
-                {(dpAttnKnob.values || [null, true, false]).map((v) => {
-                  const labelMap = dpAttnKnob.labels || { "auto": "auto", "true": "on", "false": "off" };
-                  const k = v === null ? "auto" : String(v);
-                  return renderChip(labelMap[k] || k, deltas.attn.dpAttn, v,
-                    (nv) => setAttn("dpAttn", nv));
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {/* Axes — one card per declared axis, in AXIS_HANDLERS declaration order.
+          Axes whose key is missing from pgFeatures are skipped entirely. Each
+          handler's render() may also return null for axis-level gating (e.g.
+          MegaMoE hidden on Hopper / low-latency). */}
+      {Object.entries(AXIS_HANDLERS).map(([axisId, handler]) => {
+        const fc = pgFeatures[axisId];
+        if (!fc) return null;
+        const setValue = (next) => setDeltas((d) => ({ ...d, [axisId]: next }));
+        return handler.render({
+          axisId, value: deltas[axisId], setValue,
+          fc, base, s, h: helpers, renderChip,
+        });
+      })}
 
-      {/* Axis 2: MoE Parallelism — Backend row + EP row */}
-      {pgMoe && (
-        <div style={{ ...s.card, ...s.cardStack }}>
-          <div style={s.title}>MoE Parallelism</div>
-          {pgMoe.backend && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>Backend</span>
-              <div style={s.chipRow}>
-                {(pgMoe.backend.options || []).map((o) =>
-                  renderChip(o.label, deltas.moe.backend, o.id, (v) => setMoe("backend", v)))}
-              </div>
-            </div>
-          )}
-          {pgMoe.ep && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>{pgMoe.ep.label || "EP"}</span>
-              <div style={s.chipRow}>
-                {epValues.map((v) =>
-                  renderChip(v === null ? "auto" : String(v), deltas.moe.ep, v,
-                    (nv) => setMoe("ep", nv)))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Axis 3: Parsers — one toggle row per config-supplied item */}
-      {pgParsers && (pgParsers.items || []).length > 0 && (
-        <div style={{ ...s.card, ...s.cardStack }}>
-          <div style={s.title}>Parsers</div>
-          {(pgParsers.items || []).map((item) => (
-            <div key={item.id} style={s.subRow}>
-              <span style={s.subLabel}>{item.label}</span>
-              <div style={s.chipRow}>
-                {renderChip(item.label, deltas.parsers[item.id], true,
-                  () => setParser(item.id, !deltas.parsers[item.id]))}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Axis 4: Speculative Decoding — single-select chip group */}
-      {pgSpec && (pgSpec.options || []).length > 0 && (
-        <div style={s.card}>
-          <div style={s.title}>Speculative Decoding</div>
-          <div style={s.rowFlex}>
-            {(pgSpec.options || []).map((p) =>
-              renderChip(p.label, deltas.spec, p.id,
-                (v) => setDeltas((d) => ({ ...d, spec: v })),
-                { disabled: p.disabled, disabledReason: p.disabledReason }))}
-          </div>
-        </div>
-      )}
-
-      {/* Axis 5: PD Disaggregation — Mode row + IB Device row */}
-      {pgPdDisagg && (
-        <div style={{ ...s.card, ...s.cardStack }}>
-          <div style={s.title}>PD Disaggregation</div>
-          {(pgPdDisagg.modes || []).length > 0 && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>Mode</span>
-              <div style={s.chipRow}>
-                {pgPdDisagg.modes.map((m) =>
-                  renderChip(m.label, deltas.pd.mode, m.id, (v) => setPd("mode", v)))}
-              </div>
-            </div>
-          )}
-          {(pgPdDisagg.ibDevices || []).length > 0 && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>IB Device</span>
-              <div style={s.chipRow}>
-                {pgPdDisagg.ibDevices.map((v) =>
-                  renderChip(v, deltas.pd.ibDevice, v, (nv) => setPd("ibDevice", nv)))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Axis 6: Hierarchical KV Cache — Enable row + Storage row + Write Policy row */}
-      {pgHicache && (
-        <div style={{ ...s.card, ...s.cardStack }}>
-          <div style={s.title}>Hierarchical KV Cache (HiCache)</div>
-          <div style={s.subRow}>
-            <span style={s.subLabel}>Enable</span>
-            <div style={s.chipRow}>
-              {renderChip("HiCache", deltas.hicache.enable, true,
-                () => setHiCache("enable", !deltas.hicache.enable))}
-            </div>
-          </div>
-          {(pgHicache.backends || []).length > 0 && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>Storage</span>
-              <div style={s.chipRow}>
-                {pgHicache.backends.map((o) =>
-                  renderChip(o.label, deltas.hicache.backend, o.id,
-                    (v) => setHiCache("backend", v)))}
-              </div>
-            </div>
-          )}
-          {(pgHicache.writePolicies || []).length > 0 && (
-            <div style={s.subRow}>
-              <span style={s.subLabel}>Write Policy</span>
-              <div style={s.chipRow}>
-                {pgHicache.writePolicies.map((p) =>
-                  renderChip(p, deltas.hicache.writePolicy, p,
-                    (v) => setHiCache("writePolicy", v)))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Command box */}
+      {/* Command box (diff vs verified base) */}
       <div style={s.card}>
         <div style={s.title}>Playground Command (diff vs verified base)</div>
         <div style={s.commandWrap}>
