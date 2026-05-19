@@ -659,6 +659,14 @@ class ServerArgs:
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
 
+    # Double Sparsity
+    enable_double_sparsity: bool = False
+    ds_channel_config_path: Optional[str] = None
+    ds_heavy_channel_num: int = 32
+    ds_heavy_token_num: int = 256
+    ds_heavy_channel_type: str = "qk"
+    ds_sparse_decode_threshold: int = 4096
+
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -1338,6 +1346,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
+        # 19. Double Sparsity (triton DS backend does not support torch.compile)
+        if self.enable_double_sparsity:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
@@ -5995,6 +6006,43 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
 
         # Offloading

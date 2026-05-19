@@ -177,6 +177,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
 
+            if mr.server_args.enable_double_sparsity:
+                # DoubleSparseTokenToKVPool also allocates a label_buffer of shape
+                # [size, head_num, heavy_channel_num] per layer alongside K/V.
+                cell_size += (
+                    model_config.get_num_kv_heads(tp_size)
+                    * mr.server_args.ds_heavy_channel_num
+                    * num_layers
+                    * kv_size
+                )
+
         return cell_size
 
     def calculate_pool_sizes(
