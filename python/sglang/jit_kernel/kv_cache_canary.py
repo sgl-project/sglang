@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import torch
 
@@ -90,8 +90,60 @@ def _jit_canary_module() -> "Module":
     return load_jit(
         "kv_cache_canary",
         cuda_files=["kv_cache_canary/canary.cuh"],
-        cuda_wrappers=[("canary_step", "canary_step")],
+        cuda_wrappers=[
+            ("canary_step", "canary_step"),
+            ("canary_get_constants", "canary_get_constants"),
+        ],
     )
+
+
+# Names ordered exactly as ``canary_get_constants`` writes them in
+# canary.cuh. Changing one side without the other is caught by
+# ``test_unit_const_sync.py`` (the kernel-side fill is the source of
+# truth; this list just labels the slots).
+_CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
+    "kCanaryFieldsPerSlot",
+    "kCanaryFieldReqId",
+    "kCanaryFieldTokenId",
+    "kCanaryFieldPosition",
+    "kCanaryFieldPrevHash",
+    "kCanaryFieldRealKvHash",
+    "kViolationFields",
+    "kViolationFieldKernelKind",
+    "kViolationFieldFailReason",
+    "kViolationFieldSlotIdx",
+    "kViolationFieldReqId",
+    "kViolationFieldTokenId",
+    "kViolationFieldPosition",
+    "kViolationFieldExpectedHash",
+    "kViolationFieldActualHash",
+    "kViolationFieldExpectedReqId",
+    "kViolationFieldExpectedPosition",
+    "kFailReasonReqId",
+    "kFailReasonTokenId",
+    "kFailReasonPosition",
+    "kFailReasonHash",
+    "kFailReasonPositionMonotonic",
+    "kFailReasonRealKvHash",
+    "kRealKvHashModeOff",
+    "kRealKvHashModeBit",
+    "kRealKvHashModeAll",
+)
+
+
+def get_cpp_constants() -> Dict[str, int]:
+    """Read the canonical canary constants directly from the C++ kernel.
+
+    Allocates a small CPU int64 tensor, invokes the kernel module's
+    ``canary_get_constants`` host function (which fills the tensor with
+    every shared ``constexpr int k...`` value), and returns a dict keyed
+    by the C++ identifier. Use this as the ground truth in tests that
+    want to assert Python's mirror integers have not drifted.
+    """
+    module = _jit_canary_module()
+    out = torch.zeros(len(_CANARY_CONSTANT_LAYOUT), dtype=torch.int64, device="cpu")
+    module.canary_get_constants(out)
+    return dict(zip(_CANARY_CONSTANT_LAYOUT, (int(x) for x in out.tolist())))
 
 
 def canary_step(

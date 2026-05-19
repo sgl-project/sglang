@@ -1,20 +1,21 @@
 """Python <-> C++ constant sync check for the canary kernel.
 
-Scheme A from the design doc: rather than hand-maintaining two copies
-of the same integers (slot field offsets, violation field offsets,
-fail reasons, real-KV hash modes), this test parses the C++ ``constexpr
-int kXxx = N;`` declarations out of ``canary.cuh`` and asserts each one
-matches the Python module's exported value.
+Scheme A: the C++ kernel exposes a host-side ``canary_get_constants``
+function (registered as a tvm-ffi wrapper). Calling it from Python
+fills a CPU int64 tensor with every shared ``constexpr int k... = N;``
+value in canary.cuh, in the exact order declared by
+:data:`_CANARY_CONSTANT_LAYOUT`. This test asserts each kernel-reported
+value matches the Python mirror integer of the same role.
 
-Drift between the two sides is caught at test time, before it can
-silently corrupt a chain hash or a violation row.
+Drift between the two sides is caught at test time — and because we
+pull from the *running* kernel module, not from parsed source text, we
+also catch the case where the .cuh declarations move around or get
+overridden in a build configuration.
 """
 
 from __future__ import annotations
 
-import re
 import unittest
-from pathlib import Path
 from typing import Dict
 
 from sglang.jit_kernel.kv_cache_canary import (
@@ -42,33 +43,14 @@ from sglang.jit_kernel.kv_cache_canary import (
     REAL_KV_HASH_MODE_OFF,
     VIOLATION_FIELDS,
     FailReason,
+    get_cpp_constants,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 
-_CANARY_CUH = (
-    Path(__file__).resolve().parents[3]
-    / "python"
-    / "sglang"
-    / "jit_kernel"
-    / "csrc"
-    / "kv_cache_canary"
-    / "canary.cuh"
-)
 
-_CONSTEXPR_INT_PATTERN = re.compile(
-    r"^\s*constexpr\s+int\s+(k[A-Za-z0-9_]+)\s*=\s*(-?\d+)\s*;",
-    re.MULTILINE,
-)
-
-
-def _parse_cpp_constants() -> Dict[str, int]:
-    text = _CANARY_CUH.read_text()
-    return {name: int(value) for name, value in _CONSTEXPR_INT_PATTERN.findall(text)}
-
-
-# Mapping: C++ identifier -> Python value the test asserts against.
+# C++ identifier -> Python value that the test asserts against.
 _EXPECTED_PAIRS: Dict[str, int] = {
     "kCanaryFieldsPerSlot": CANARY_FIELDS_PER_SLOT,
     "kCanaryFieldReqId": _CANARY_FIELD_REQ_ID,
@@ -102,17 +84,8 @@ _EXPECTED_PAIRS: Dict[str, int] = {
 class TestPythonCppConstantSync(unittest.TestCase):
     """Every shared integer constant in canary.cuh must match Python."""
 
-    def test_canary_cuh_constexpr_int_values_match_python_module(self) -> None:
-        self.assertTrue(_CANARY_CUH.exists(), f"missing source: {_CANARY_CUH}")
-        cpp_constants = _parse_cpp_constants()
-
-        self.assertGreater(
-            len(cpp_constants),
-            0,
-            f"no `constexpr int k... = N;` declarations found in {_CANARY_CUH}; "
-            "parser regex needs updating",
-        )
-
+    def test_kernel_module_constants_match_python_mirrors(self) -> None:
+        cpp_constants = get_cpp_constants()
         mismatches: Dict[str, str] = {}
         missing_in_cpp: list[str] = []
         for cpp_name, py_value in _EXPECTED_PAIRS.items():
@@ -123,10 +96,9 @@ class TestPythonCppConstantSync(unittest.TestCase):
                 mismatches[cpp_name] = (
                     f"cpp={cpp_constants[cpp_name]} python={py_value}"
                 )
-
         self.assertFalse(
             missing_in_cpp,
-            f"expected constants missing from canary.cuh: {missing_in_cpp}",
+            f"expected constants missing from kernel module: {missing_in_cpp}",
         )
         self.assertFalse(
             mismatches,
@@ -135,10 +107,10 @@ class TestPythonCppConstantSync(unittest.TestCase):
         )
 
     def test_kernel_kind_constants_have_expected_layout(self) -> None:
-        # KERNEL_KIND_HEAD / TAIL aren't ``constexpr int`` in canary.cuh
-        # (they're plumbed through as the kernel_kind kwarg), so the
-        # regex above wouldn't catch them; assert the documented values
-        # here as a separate guard.
+        # KERNEL_KIND_HEAD / TAIL are kernel-launch kwargs (not constexpr
+        # int in canary.cuh), so the kernel-reported layout cannot
+        # cover them; assert the documented values here as a separate
+        # guard against accidental flips.
         self.assertEqual(KERNEL_KIND_HEAD, 0)
         self.assertEqual(KERNEL_KIND_TAIL, 1)
         self.assertNotEqual(KERNEL_KIND_HEAD, KERNEL_KIND_TAIL)

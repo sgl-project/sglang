@@ -518,4 +518,45 @@ void canary_step(
   LaunchKernel(grid, kBlockSize, device)(canary_kernel, p);
 }
 
+// Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
+// jit_kernel/kv_cache_canary.py. Adding a new constant requires
+// appending it here AND there; the const-sync test catches drift.
+constexpr int kConstantsCount = 26;
+
+void canary_get_constants(tvm::ffi::TensorView out) {
+  using namespace host;
+  TensorMatcher({static_cast<int64_t>(kConstantsCount)})
+      .with_dtype<int64_t>()
+      .with_device<kDLCPU>()
+      .verify(out);
+  int64_t* dst = static_cast<int64_t*>(out.data_ptr());
+  int i = 0;
+  dst[i++] = kCanaryFieldsPerSlot;
+  dst[i++] = kCanaryFieldReqId;
+  dst[i++] = kCanaryFieldTokenId;
+  dst[i++] = kCanaryFieldPosition;
+  dst[i++] = kCanaryFieldPrevHash;
+  dst[i++] = kCanaryFieldRealKvHash;
+  dst[i++] = kViolationFields;
+  dst[i++] = kViolationFieldKernelKind;
+  dst[i++] = kViolationFieldFailReason;
+  dst[i++] = kViolationFieldSlotIdx;
+  dst[i++] = kViolationFieldReqId;
+  dst[i++] = kViolationFieldTokenId;
+  dst[i++] = kViolationFieldPosition;
+  dst[i++] = kViolationFieldExpectedHash;
+  dst[i++] = kViolationFieldActualHash;
+  dst[i++] = kViolationFieldExpectedReqId;
+  dst[i++] = kViolationFieldExpectedPosition;
+  dst[i++] = kFailReasonReqId;
+  dst[i++] = kFailReasonTokenId;
+  dst[i++] = kFailReasonPosition;
+  dst[i++] = kFailReasonHash;
+  dst[i++] = kFailReasonPositionMonotonic;
+  dst[i++] = kFailReasonRealKvHash;
+  dst[i++] = kRealKvHashModeOff;
+  dst[i++] = kRealKvHashModeBit;
+  dst[i++] = kRealKvHashModeAll;
+}
+
 }  // namespace
