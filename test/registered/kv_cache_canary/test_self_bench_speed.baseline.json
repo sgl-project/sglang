@@ -1,0 +1,16 @@
+{
+  "1-gpu-large": {
+    "qwen3-0.6b/prefill_bs32_isl16384_osl1": {
+      "samples": [],
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null
+    },
+    "qwen3-0.6b/decode_bs256_isl4096_osl1024": {
+      "samples": [],
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null
+    }
+  }
+}
