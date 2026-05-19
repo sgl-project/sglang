@@ -111,8 +111,6 @@ class CanaryConfig:
         mode: str | CanaryMode | None,
         real_kv_hash_mode: str | RealKvHashMode | None = None,
         real_data_sweep_every_n_steps: int = 0,
-        real_perturb_bytes_prob: float = 0.0,
-        real_perturb_bytes_seed: int = 0,
     ) -> "CanaryConfig":
         parsed = CanaryMode.parse(mode)
         raw_prob = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get()
@@ -124,14 +122,25 @@ class CanaryConfig:
                 raw_prob,
                 perturb_prob,
             )
+        raw_real_prob = envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get()
+        real_perturb_prob = max(0.0, min(1.0, raw_real_prob))
+        if real_perturb_prob != raw_real_prob:
+            logger.warning(
+                "kv-canary: SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB %f "
+                "out of [0,1]; clamped to %f",
+                raw_real_prob,
+                real_perturb_prob,
+            )
         return cls(
             mode=parsed,
             perturb_req_to_token_prob=perturb_prob,
             perturb_req_to_token_seed=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get(),
             real_kv_hash_mode=RealKvHashMode.parse(real_kv_hash_mode),
             real_data_sweep_every_n_steps=int(real_data_sweep_every_n_steps),
-            real_perturb_bytes_prob=float(real_perturb_bytes_prob),
-            real_perturb_bytes_seed=int(real_perturb_bytes_seed),
+            real_perturb_bytes_prob=real_perturb_prob,
+            real_perturb_bytes_seed=int(
+                envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED.get()
+            ),
         )
 
     @property

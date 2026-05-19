@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
+from sglang.srt.kv_cache_canary.sweep import compute_alive_owned_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -14,6 +15,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 logger = logging.getLogger(__name__)
 
 _PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
+_REAL_PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
 
 
 def maybe_perturb_hook(
@@ -120,3 +122,73 @@ def _rng_seed_for_rank(base_seed: int, rank: int) -> int:
     return (
         (base_seed & 0xFFFFFFFF) * 0x9E3779B1 + rank * 0xBF58476D1CE4E5B9
     ) & 0xFFFFFFFFFFFFFFFF
+
+
+def maybe_perturb_real_kv_bytes(
+    *,
+    runner: Optional[CanaryRunner],
+    req_to_token_pool: Optional[ReqToTokenPool],
+    forward_batch: Optional[ForwardBatch],
+) -> None:
+    """Self-test helper: probabilistically flip one byte of real KV at a slot
+    owned by an alive req in the current batch but NOT in this step's
+    per-step verify list.
+
+    Targeting alive-but-not-verified-this-step slots is what proves the
+    periodic sweep's independent detection value: the per-step path can't
+    observe the perturbation (those slots are outside its verify set) but
+    the next sweep should pick it up and emit a ``sweep_*`` violation.
+
+    Must be called AFTER the per-step head/tail freeze AND BEFORE
+    :meth:`CanaryRunner._run_sweep`, so the freeze captures clean state and
+    the sweep's next read sees the mutated bytes.
+    """
+    if runner is None or forward_batch is None or req_to_token_pool is None:
+        return
+    prob = runner.config.real_perturb_bytes_prob
+    if prob <= 0.0:
+        return
+
+    rank = runner.tp_rank
+    rng = _REAL_PERTURB_RNG_CACHE.get(rank)
+    if rng is None:
+        rng = random.Random(
+            _rng_seed_for_rank(runner.config.real_perturb_bytes_seed, rank)
+        )
+        _REAL_PERTURB_RNG_CACHE[rank] = rng
+    if rng.random() >= prob:
+        return
+
+    group = runner.buffer_group
+    if group.real_kv_source is None or group.real_kv_slot_stride_bytes <= 0:
+        return
+
+    alive = compute_alive_owned_slots(
+        req_to_token_pool=req_to_token_pool, forward_batch=forward_batch
+    )
+    if alive.numel() == 0:
+        return
+
+    last_plan = runner.last_plan
+    verify_this_step = (
+        set(last_plan.verify_slot_indices) if last_plan is not None else set()
+    )
+    alive_list = alive.detach().cpu().tolist()
+    idle_alive: List[int] = [
+        int(s) for s in alive_list if int(s) not in verify_this_step
+    ]
+    if not idle_alive:
+        return
+
+    slot_idx = idle_alive[rng.randrange(len(idle_alive))]
+    stride = int(group.real_kv_slot_stride_bytes)
+    byte_offset = rng.randrange(stride)
+    flat = group.real_kv_source.view(torch.uint8).flatten()
+    base = slot_idx * stride
+    flat[base + byte_offset] ^= 0xFF
+    logger.warning(
+        "kv-canary self-test: perturbed real KV bytes at slot=%d offset=%d (rank=%d)",
+        slot_idx,
+        byte_offset,
+        rank,
+    )

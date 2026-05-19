@@ -751,6 +751,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_runner=self,
             mode=server_args.kv_cache_canary,
             real_kv_hash_mode=server_args.kv_cache_canary_real_data,
+            real_data_sweep_every_n_steps=server_args.kv_cache_canary_real_data_sweep_every_n_steps,
         )
 
         if server_args.enable_pseudo_mode:

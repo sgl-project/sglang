@@ -154,12 +154,14 @@ class CanaryRunner:
         write_capacity: int,
         write_req_capacity: int,
         req_to_token_pool: Optional["ReqToTokenPool"] = None,
+        tp_rank: int = 0,
     ) -> None:
         self._config = config
         self._device = device
         self._pool_kind = buffer_group.kind
         self._has_v_half: bool = buffer_group.has_v_half
         self._buffer_group = buffer_group
+        self._tp_rank: int = int(tp_rank)
 
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
@@ -307,6 +309,14 @@ class CanaryRunner:
     def pool_kind(self) -> PoolKind:
         return self._pool_kind
 
+    @property
+    def tp_rank(self) -> int:
+        return self._tp_rank
+
+    @property
+    def buffer_group(self) -> CanaryBufferGroup:
+        return self._buffer_group
+
     def run_head(self, *, plan: BatchPlan) -> None:
         self._last_plan = plan
         self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_HEAD)
@@ -355,9 +365,16 @@ class CanaryRunner:
         self._pull_latest_from_events()
         self._forward_step += 1
 
-        # Phase 3 self-test perturb hook is inserted here, after the
-        # per-step head/tail freeze and before the periodic sweep so the
-        # sweep observes the perturbation immediately.
+        # Self-test perturb hook: runs after per-step head/tail freeze and
+        # before the periodic sweep so the sweep observes the mutation.
+        # Local import: test_utils imports CanaryRunner globally.
+        from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_real_kv_bytes
+
+        maybe_perturb_real_kv_bytes(
+            runner=self,
+            req_to_token_pool=self._req_to_token_pool,
+            forward_batch=self._last_forward_batch,
+        )
 
         if self._sweep_every_n > 0 and self._forward_step % self._sweep_every_n == 0:
             self._run_sweep()

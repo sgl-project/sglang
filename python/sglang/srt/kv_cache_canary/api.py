@@ -36,6 +36,7 @@ def attach(
     write_capacity: int,
     write_req_capacity: int,
     req_to_token_pool: Optional["ReqToTokenPool"] = None,
+    tp_rank: int = 0,
 ) -> Optional[List[CanaryRunner]]:
     """Attach canaries to ``pool`` and create one runner per canary buffer group.
 
@@ -70,6 +71,7 @@ def attach(
                 write_capacity=write_capacity,
                 write_req_capacity=write_req_capacity,
                 req_to_token_pool=req_to_token_pool,
+                tp_rank=tp_rank,
             )
         )
     setattr(pool, _GLOBAL_RUNNERS_KEY, runners)
