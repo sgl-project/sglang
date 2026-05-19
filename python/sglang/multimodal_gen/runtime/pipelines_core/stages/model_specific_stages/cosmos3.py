@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -400,17 +401,14 @@ class Cosmos3DenoisingStage(PipelineStage):
         Only ``gen_layers`` are compiled — they are the per-step hot path and
         all share the same module class, so a single compilation amortizes
         across them. The UND ``language_model`` runs once per prompt and is
-        cached, so compiling it would only pay warmup cost. Keeping the
-        ``sdpa_kernel`` context manager outside the compiled region also
-        avoids fighting Inductor's attention rewrites.
+        cached, so compiling it would only pay warmup cost.
 
-        Caveat for Ulysses (``sp_size > 1``): the cross-attention's
-        Ulysses all-to-all (``_usp_input_all_to_all`` /
-        ``_usp_output_all_to_all``) calls into ``torch.distributed.all_to_all_single``
-        through a Python wrapper that fetches the process group at call time,
-        which graph-breaks Dynamo. Compile still works but loses some speedup
-        on that path. The headline 2-GPU CFG-parallel recipe (``sp_size == 1``)
-        skips the SP branch entirely and compiles cleanly.
+        Caveat for Ulysses (``sp_size > 1``): the cross-attention's all-to-all
+        calls into ``torch.distributed.all_to_all_single`` through a Python
+        wrapper that fetches the process group at call time, which graph-breaks
+        Dynamo. Compile still works but loses some speedup on that path. The
+        headline 2-GPU CFG-parallel recipe (``sp_size == 1``) skips the SP
+        branch entirely and compiles cleanly.
         """
         if not server_args.enable_torch_compile or not isinstance(
             transformer, nn.Module
@@ -486,16 +484,20 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and "uncond" for unconditional to enable cache reuse across steps.
             noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
         """
-        return self.transformer(
-            hidden_states=latents,
-            encoder_hidden_states=None,  # Not used by Cosmos3
-            timestep=timestep,
-            text_ids=text_ids,
-            text_mask=text_mask,
-            fps=fps,
-            cache_key=cache_key,
-            noisy_frame_mask=noisy_frame_mask,
-        )
+        with set_forward_context(
+            current_timestep=int(timestep.flatten()[0].item()),
+            attn_metadata=None,
+        ):
+            return self.transformer(
+                hidden_states=latents,
+                encoder_hidden_states=None,  # Not used by Cosmos3
+                timestep=timestep,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                fps=fps,
+                cache_key=cache_key,
+                noisy_frame_mask=noisy_frame_mask,
+            )
 
     def _manage_device_placement(self, server_args: ServerArgs):
         """Move transformer to GPU if CPU offload is enabled."""
@@ -782,7 +784,7 @@ class Cosmos3DecodingStage(PipelineStage):
         vae_scale_factor = getattr(vae.config, "scale_factor_spatial", 16)
         self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
         if guardrails:
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 _init_guardrails,
             )
 
@@ -864,7 +866,7 @@ class Cosmos3DecodingStage(PipelineStage):
             self.log_info(f"Postprocessed video shape: {output.shape}")
 
         if self._guardrails:
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 check_video_safety,
             )
 

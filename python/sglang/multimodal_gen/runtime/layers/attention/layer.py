@@ -418,6 +418,7 @@ class USPAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         """
@@ -432,6 +433,12 @@ class USPAttention(nn.Module):
             num_replicated_suffix: number of trailing tokens in q/k/v that are
                 replicated across all SP ranks, e.g. caption tokens appended
                 after image tokens in Z-Image joint attention.
+            num_replicated_kv_prefix: number of leading tokens in k/v only
+                (not q) that are replicated across all SP ranks. Used for
+                cross-attention where the keys/values include a fully-replicated
+                conditioning prefix (e.g. cached text K/V) followed by a
+                sequence-sharded suffix (image tokens). Q has no replicated
+                portion and is fully sequence-sharded.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -537,9 +544,19 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
-        if num_replicated_prefix > 0 and num_replicated_suffix > 0:
+        if (
+            sum(
+                bool(n)
+                for n in (
+                    num_replicated_prefix,
+                    num_replicated_suffix,
+                    num_replicated_kv_prefix,
+                )
+            )
+            > 1
+        ):
             raise ValueError(
-                "USPAttention does not support replicated prefix and suffix at the same time."
+                "USPAttention supports at most one replicated-token mode per call."
             )
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
@@ -548,6 +565,10 @@ class USPAttention(nn.Module):
         if sp_size > 1 and num_replicated_suffix > 0:
             return self._forward_with_replicated_suffix(
                 q, k, v, ctx_attn_metadata, num_replicated_suffix
+            )
+        if sp_size > 1 and num_replicated_kv_prefix > 0:
+            return self._forward_with_replicated_kv_prefix(
+                q, k, v, ctx_attn_metadata, num_replicated_kv_prefix
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -635,6 +656,48 @@ class USPAttention(nn.Module):
         out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    def _forward_with_replicated_kv_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        num_rep: int,
+    ) -> torch.Tensor:
+        """Ulysses cross-attention where only K/V have a replicated prefix.
+
+        Q is sequence-sharded across SP ranks with no replicated portion. K/V
+        carry a fully-replicated prefix (``[:num_rep]``, same on every rank,
+        e.g. cached text K/V) followed by a sequence-sharded suffix (e.g.
+        image tokens) that aligns with Q's sharding.
+
+        Strategy:
+        1. All-to-all Q and the sharded K/V suffix (seq → head shard).
+        2. Locally slice the replicated K/V prefix to the same head shard.
+        3. Concatenate prefix + suffix on the sequence dim and attend.
+        4. All-to-all the output back (head shard → seq shard).
+        """
+        sp_rank = get_sp_parallel_rank()
+
+        k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
+        v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+
+        q = _usp_input_all_to_all(q, head_dim=2)
+        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+
+        h_kv_local = k_shard.shape[2]
+        h_start = sp_rank * h_kv_local
+        h_end = h_start + h_kv_local
+        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
+        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+
+        k = torch.cat([k_rep, k_shard], dim=1)
+        v = torch.cat([v_rep, v_shard], dim=1)
+
+        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        return _usp_output_all_to_all(out, head_dim=2)
 
     def _forward_with_replicated_suffix(
         self,
