@@ -1,156 +1,124 @@
-"""CanaryConfig. Schema retained from the legacy module minus the ``seed`` field (anchor is hardcoded in
-jit_kernel; see kernels.md §6.1) plus a ``pseudo_mode`` toggle for caller-driven write-time expectation checks
-(kernels.md §2.6, §2.8).
-"""
-
 from __future__ import annotations
 
-import enum
-import logging
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple
-
-import torch
+from typing import TYPE_CHECKING, Literal
 
 from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
-from sglang.jit_kernel.kv_cache_canary_write import CanaryPseudoMode
-from sglang.srt.environ import envs
+from sglang.jit_kernel.kv_cache_canary_write import (
+    CanaryPseudoMode as CanaryInputCheckMode,
+)
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-logger = logging.getLogger(__name__)
-
-
-class CanaryMode(str, enum.Enum):
-    OFF = "off"
-    LOG = "log"
-    RAISE = "raise"
-
-    @classmethod
-    def parse(cls, value: "str | CanaryMode | None") -> "CanaryMode":
-        if value is None:
-            return cls.OFF
-        if isinstance(value, cls):
-            return value
-        return cls(value)
-
-
-def parse_real_kv_hash_mode(value: "str | RealKvHashMode | None") -> RealKvHashMode:
-    """Parse a server-arg value into the jit_kernel :class:`RealKvHashMode` IntEnum.
-
-    Accepts the new BIT / ALL / OFF names, plus the legacy ``portion`` alias that the existing CLI flag still
-    uses (mapped to BIT — both are "cheap fingerprint of a leading prefix").
-    """
-    if value is None:
-        return RealKvHashMode.OFF
-    if isinstance(value, RealKvHashMode):
-        return value
-    lowered = str(value).lower()
-    if lowered in ("off", "0"):
-        return RealKvHashMode.OFF
-    if lowered in ("bit", "portion"):
-        return RealKvHashMode.BIT
-    if lowered in ("all", "full"):
-        return RealKvHashMode.ALL
-    raise ValueError(f"kv-canary: unknown RealKvHashMode value {value!r}")
-
-
-PseudoOracleCallback = Callable[["ForwardBatch"], Tuple[torch.Tensor, torch.Tensor]]
+    from sglang.srt.server_args import ServerArgs
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryConfig:
-    """Configuration for one canary runner.
+    """Top-level canary configuration. All knobs live here; nothing reads env vars deeper in the stack.
 
-    Schema is retained from the legacy module with two exceptions:
+    Constructed once at server startup from CLI flags / env vars, then frozen and passed into
+    install_canary(server_args, model_runner) once. Subsequent runtime never mutates it.
 
-    - ``seed`` is dropped — the chain anchor is now the hardcoded :data:`CANARY_CHAIN_ANCHOR` constant in
-      ``jit_kernel.kv_cache_canary_verify`` (kernels.md §6.1).
-    - ``pseudo_mode`` and ``pseudo_oracle`` are added — when ``pseudo_mode == ON`` the runner invokes the
-      oracle once per forward to produce ``(pseudo_expected_tokens, pseudo_expected_positions)`` for
-      ``canary_write_step`` (kernels.md §2.6).
+    Fields:
+        mode: "off" | "on" | "raise". off = no canary installed; on = canary runs, violations are logged
+            but do NOT raise (used for production observability + canary self-test perturb); raise =
+            violations propagate to host as RuntimeError after the next D2H pump.
+        ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously
+            (default 1024); overflow only drops detail beyond row N, the monotonic counter still grows.
+        sweep_every_n_steps: 0 disables sweep entirely; positive N means every N-th forward step the runner
+            additionally walks all alive slots (running ∪ radix-orphan) and verifies them.
+        real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Uniform across head/tail/sweep launches; if a
+            workload wants per-launch granularity it bumps mode globally (BIT is cheap enough this is fine).
+        input_check_mode: CanaryInputCheckMode (OFF / ON). ON = canary_write_step additionally compares
+            forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
+            expected_input_positions[i]; mismatch records a violation. ON is only useful when something
+            else (e.g. mock_model.sampler.fill_expected_inputs) is feeding the expected_* placeholders
+            per forward — canary itself knows no oracle.
+        perturb_req_to_token_prob: For canary self-test only. 0 = disabled; positive (e.g. 1e-4) = each
+            forward step has this probability of trampling a random req_to_token entry to drive a violation.
+            Reads from SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN env var if not set explicitly.
+        perturb_real_kv_prob: Same as above but trampling real KV bytes (only meaningful when
+            real_kv_hash_mode != OFF). Reads from SGLANG_KV_CANARY_PERTURB_REAL_KV if not set.
+        stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
+            "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
+        allreduce_violation_signal: True = end-of-step pump performs cross-rank allreduce on the local
+            is_errored byte so all ranks raise in lockstep; False = each rank raises independently (faster
+            but produces partial-failure logs across TP groups). Default True.
     """
 
-    mode: CanaryMode
-    violation_ring_capacity: int = 1024
-    health_print_every_n_forwards: int = 1024
-    counter_zero_warmup_forwards: int = 64
+    mode: Literal["off", "on", "raise"]
+    ring_capacity: int = 1024
+    sweep_every_n_steps: int = 64
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.BIT
+    input_check_mode: CanaryInputCheckMode = CanaryInputCheckMode.OFF
     perturb_req_to_token_prob: float = 0.0
-    perturb_req_to_token_seed: int = 0
-    swa_window_size: Optional[int] = None
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
-    real_kv_read_bytes: int = 16
-    real_data_sweep_every_n_steps: int = 0
-    real_perturb_bytes_prob: float = 0.0
-    real_perturb_bytes_seed: int = 0
-    pseudo_mode: CanaryPseudoMode = CanaryPseudoMode.OFF
-    pseudo_oracle: Optional[PseudoOracleCallback] = None
-
-    def __post_init__(self) -> None:
-        if self.real_data_sweep_every_n_steps < 0:
-            raise ValueError(
-                "kv-canary: real_data_sweep_every_n_steps must be >= 0, "
-                f"got {self.real_data_sweep_every_n_steps}"
-            )
-        if self.real_perturb_bytes_prob < 0.0:
-            raise ValueError(
-                "kv-canary: real_perturb_bytes_prob must be >= 0.0, "
-                f"got {self.real_perturb_bytes_prob}"
-            )
-        if self.real_perturb_bytes_seed < 0:
-            raise ValueError(
-                "kv-canary: real_perturb_bytes_seed must be >= 0, "
-                f"got {self.real_perturb_bytes_seed}"
-            )
-        if self.real_kv_read_bytes < 0:
-            raise ValueError(
-                "kv-canary: real_kv_read_bytes must be >= 0, "
-                f"got {self.real_kv_read_bytes}"
-            )
-        if self.pseudo_mode is CanaryPseudoMode.ON and self.pseudo_oracle is None:
-            raise ValueError(
-                "kv-canary: pseudo_mode == ON requires a pseudo_oracle callback"
-            )
+    perturb_real_kv_prob: float = 0.0
+    stats_print_every_n_steps: int = 0
+    allreduce_violation_signal: bool = True
 
     @classmethod
-    def from_server_args(
-        cls,
-        mode: "str | CanaryMode | None",
-        real_kv_hash_mode: "str | RealKvHashMode | None" = None,
-        real_data_sweep_every_n_steps: int = 0,
-    ) -> "CanaryConfig":
-        parsed = CanaryMode.parse(mode)
-        raw_prob = envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get()
-        perturb_prob = max(0.0, min(1.0, raw_prob))
-        if perturb_prob != raw_prob:
-            logger.warning(
-                "kv-canary: SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB %f "
-                "out of [0,1]; clamped to %f",
-                raw_prob,
-                perturb_prob,
-            )
-        raw_real_prob = envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get()
-        real_perturb_prob = max(0.0, min(1.0, raw_real_prob))
-        if real_perturb_prob != raw_real_prob:
-            logger.warning(
-                "kv-canary: SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB %f "
-                "out of [0,1]; clamped to %f",
-                raw_real_prob,
-                real_perturb_prob,
-            )
+    def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
         return cls(
-            mode=parsed,
-            perturb_req_to_token_prob=perturb_prob,
-            perturb_req_to_token_seed=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED.get(),
-            real_kv_hash_mode=parse_real_kv_hash_mode(real_kv_hash_mode),
-            real_data_sweep_every_n_steps=int(real_data_sweep_every_n_steps),
-            real_perturb_bytes_prob=real_perturb_prob,
-            real_perturb_bytes_seed=int(
-                envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED.get()
+            mode=_parse_mode(os.getenv("SGLANG_KV_CANARY_MODE", "off")),
+            ring_capacity=int(os.getenv("SGLANG_KV_CANARY_RING_CAPACITY", "1024")),
+            sweep_every_n_steps=int(
+                os.getenv("SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS", "64")
+            ),
+            real_kv_hash_mode=_parse_real_kv_hash_mode(
+                os.getenv("SGLANG_KV_CANARY_REAL_KV_HASH_MODE", "BIT")
+            ),
+            input_check_mode=_parse_input_check_mode(
+                os.getenv("SGLANG_KV_CANARY_INPUT_CHECK_MODE", "OFF")
+            ),
+            perturb_req_to_token_prob=float(
+                os.getenv("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN", "0.0")
+            ),
+            perturb_real_kv_prob=float(
+                os.getenv("SGLANG_KV_CANARY_PERTURB_REAL_KV", "0.0")
+            ),
+            stats_print_every_n_steps=int(
+                os.getenv("SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS", "0")
+            ),
+            allreduce_violation_signal=_parse_bool(
+                os.getenv("SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL", "1")
             ),
         )
 
-    @property
-    def enabled(self) -> bool:
-        return self.mode is not CanaryMode.OFF
+
+def _parse_mode(value: str) -> Literal["off", "on", "raise"]:
+    lowered = value.strip().lower()
+    if lowered not in ("off", "on", "raise"):
+        raise ValueError(
+            f"kv-canary: SGLANG_KV_CANARY_MODE must be one of off/on/raise, got {value!r}"
+        )
+    return lowered  # type: ignore[return-value]
+
+
+def _parse_real_kv_hash_mode(value: str) -> RealKvHashMode:
+    upper = value.strip().upper()
+    if upper not in RealKvHashMode.__members__:
+        raise ValueError(
+            f"kv-canary: SGLANG_KV_CANARY_REAL_KV_HASH_MODE must be one of "
+            f"{list(RealKvHashMode.__members__)}, got {value!r}"
+        )
+    return RealKvHashMode[upper]
+
+
+def _parse_input_check_mode(value: str) -> CanaryInputCheckMode:
+    upper = value.strip().upper()
+    if upper not in CanaryInputCheckMode.__members__:
+        raise ValueError(
+            f"kv-canary: SGLANG_KV_CANARY_INPUT_CHECK_MODE must be one of "
+            f"{list(CanaryInputCheckMode.__members__)}, got {value!r}"
+        )
+    return CanaryInputCheckMode[upper]
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in ("1", "true", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(f"kv-canary: cannot parse boolean from {value!r}")
