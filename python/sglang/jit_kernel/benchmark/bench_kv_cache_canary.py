@@ -118,6 +118,8 @@ def _launch(
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
         write_req_active_mask=_i32([1] * n_write_reqs if n_write_reqs else [0]),
+        expected_write_token_ids=_i64([-1] * n_write if n_write else [-1]),
+        expected_write_positions=_i64([-1] * n_write if n_write else [-1]),
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],

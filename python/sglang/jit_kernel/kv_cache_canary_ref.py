@@ -101,6 +101,8 @@ def canary_step_torch_reference(
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
     write_req_active_mask: torch.Tensor,
+    expected_write_token_ids: torch.Tensor,
+    expected_write_positions: torch.Tensor,
     seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
@@ -175,6 +177,8 @@ def canary_step_torch_reference(
         write_req_entry_starts=write_req_entry_starts,
         write_req_entry_counts=write_req_entry_counts,
         write_req_active_mask=write_req_active_mask,
+        expected_write_token_ids=expected_write_token_ids,
+        expected_write_positions=expected_write_positions,
     )
     sink = _RefViolationSink(
         violation_ring=violation_ring,
@@ -198,6 +202,7 @@ def canary_step_torch_reference(
         int_views=int_views,
         real_kv_view=real_kv_view,
         seed=seed,
+        sink=sink,
     )
 
     # Commit any updated slot rows back to the destination buffer.
@@ -319,6 +324,8 @@ class _RefPlan:
         write_req_entry_starts: list,
         write_req_entry_counts: list,
         write_req_active_mask: list,
+        expected_write_token_ids: list,
+        expected_write_positions: list,
     ) -> None:
         self.verify_slot_indices = verify_slot_indices
         self.verify_positions = verify_positions
@@ -331,6 +338,8 @@ class _RefPlan:
         self.write_req_entry_starts = write_req_entry_starts
         self.write_req_entry_counts = write_req_entry_counts
         self.write_req_active_mask = write_req_active_mask
+        self.expected_write_token_ids = expected_write_token_ids
+        self.expected_write_positions = expected_write_positions
 
     @classmethod
     def from_tensors(cls, **tensors: torch.Tensor) -> "_RefPlan":
@@ -503,6 +512,7 @@ def _run_write_chains(
     int_views: _IntViewBundle,
     real_kv_view: _RealKvView,
     seed: int,
+    sink: _RefViolationSink,
 ) -> int:
     """Walk active write-req chains, mutating slots. Returns total slot count."""
     active_slots = 0
@@ -540,6 +550,34 @@ def _run_write_chains(
             slot_idx = int(plan.write_slot_indices[i])
             token_id = int(plan.write_token_ids[i])
             position = int(plan.write_positions[i])
+
+            expected_token = int(plan.expected_write_token_ids[i])
+            if expected_token != -1 and expected_token != token_id:
+                sink.record(
+                    fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
+                    slot_idx=slot_idx,
+                    req_id=req_id,
+                    token_id=token_id,
+                    position=position,
+                    expected_hash=expected_token & _U64_MASK,
+                    actual_hash=token_id & _U64_MASK,
+                    expected_req_id=0,
+                    expected_position=0,
+                )
+            expected_pos = int(plan.expected_write_positions[i])
+            if expected_pos != -1 and expected_pos != position:
+                sink.record(
+                    fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
+                    slot_idx=slot_idx,
+                    req_id=req_id,
+                    token_id=token_id,
+                    position=position,
+                    expected_hash=0,
+                    actual_hash=0,
+                    expected_req_id=0,
+                    expected_position=expected_pos,
+                )
+
             real_kv_hash = real_kv_view.hash_slot(slot_idx)
 
             int_views.store_field(slot_idx, _CANARY_FIELD_TOKEN_ID, token_id)

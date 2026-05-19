@@ -158,6 +158,8 @@ def canary_step(
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
     write_req_active_mask: torch.Tensor,
+    expected_write_token_ids: torch.Tensor,
+    expected_write_positions: torch.Tensor,
     seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
@@ -223,6 +225,11 @@ def canary_step(
         write_req_entry_starts,
         write_req_entry_counts:      ``int64 [N_write_reqs]`` — slice of the per-slot arrays owned by each write-req.
         write_req_active_mask:       ``int32 [N_write_reqs]`` — 1 = process, 0 = skip.
+        expected_write_token_ids,
+        expected_write_positions:    ``int64 [N_write]`` — per-write-entry oracle predictions for the input token and
+                                     position. A value of ``-1`` is the skip-sentinel: the kernel skips that entry's
+                                     input-mismatch check. Non-pseudo callers fill both buffers with ``-1`` and pay
+                                     no per-entry cost beyond two loads and two compares.
         seed:                        Chain anchor used wherever a slot has no predecessor (``CanaryConfig.seed``).
         violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — append-only sink. Each populated
                                      row is fill-once: never overwritten.
@@ -282,6 +289,8 @@ def canary_step(
         write_req_entry_starts,
         write_req_entry_counts,
         write_req_active_mask,
+        expected_write_token_ids,
+        expected_write_positions,
         to_signed_int64(int(seed)),
         violation_ring,
         violation_ring_valid,
