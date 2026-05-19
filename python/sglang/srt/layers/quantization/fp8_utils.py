@@ -105,10 +105,14 @@ if _is_cuda:
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
-    def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+    def _fp8_scaled_mm_abstract(
+        mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None, out=None
+    ):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
+        if out is not None:
+            return out
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
     @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")

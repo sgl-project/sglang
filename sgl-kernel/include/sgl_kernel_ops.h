@@ -191,7 +191,8 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& out_opt);
 torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,

@@ -13,6 +13,7 @@ from sglang.srt.compilation.inductor_pass import (
     SGLangInductorPass,
     get_pass_context,
 )
+from sglang.srt.compilation.replace_scaled_mm import ReplaceScaledMMWithCutlassPass
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class PostGradPassManager(CustomGraphPass):
             if pass_.is_applicable_for_shape(shape):
                 pass_(graph)
 
+        self.replace_scaled_mm(graph)
+
         # always run fix_functionalization last
         self.fix_functionalization(graph)
 
@@ -48,6 +51,7 @@ class PostGradPassManager(CustomGraphPass):
         self,
     ):
         self.pass_config = dict()
+        self.replace_scaled_mm = ReplaceScaledMMWithCutlassPass()
         self.fix_functionalization = FixFunctionalizationPass()
 
     def add(self, pass_: InductorPass):
@@ -64,5 +68,6 @@ class PostGradPassManager(CustomGraphPass):
         state = {"pass_config": pass_manager_uuid, "passes": []}
         for pass_ in self.passes:
             state["passes"].append(pass_.uuid())
+        state["passes"].append(self.replace_scaled_mm.uuid())
         state["passes"].append(self.fix_functionalization.uuid())
         return InductorPass.hash_dict(state)
