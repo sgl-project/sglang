@@ -486,6 +486,7 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    enable_thinking: Optional[bool] = None
     strip_thinking_cache: bool = False
     enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
@@ -4135,6 +4136,12 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+        if self.enable_thinking is not None and self.reasoning_parser is None:
+            logger.warning(
+                "--enable-thinking/--disable-thinking has no effect without "
+                "--reasoning-parser."
+            )
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -5101,6 +5108,24 @@ class ServerArgs:
             help=f"Specify the parser for reasoning models. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
+        )
+        thinking_default_group = parser.add_mutually_exclusive_group()
+        thinking_default_group.add_argument(
+            "--enable-thinking",
+            action="store_true",
+            default=None,
+            dest="enable_thinking",
+            help="Enable the chat-template thinking toggle by default for "
+            "reasoning models (Qwen3, GLM-4.5, DeepSeek-V3, etc.). "
+            "Per-request chat_template_kwargs takes precedence. Requires "
+            "--reasoning-parser.",
+        )
+        thinking_default_group.add_argument(
+            "--disable-thinking",
+            action="store_false",
+            dest="enable_thinking",
+            help="Disable the chat-template thinking toggle by default. "
+            "See --enable-thinking.",
         )
         parser.add_argument(
             "--strip-thinking-cache",

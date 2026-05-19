@@ -44,6 +44,7 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            enable_thinking=None,
             stream_response_default_include_usage=False,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
@@ -1442,6 +1443,96 @@ class ServingChatTestCase(unittest.TestCase):
             conv_mock.return_value = conv_ins
             result = self.chat._apply_conversation_template(req, is_multimodal=False)
         self.assertEqual(result.prompt, "BASE_PROMPT")
+
+    # ------------- server-level --enable-thinking / --disable-thinking -------------
+    def _make_chat_with_thinking_default(
+        self, parser: Optional[str], enable_thinking: Optional[bool]
+    ):
+        """Rebuild OpenAIServingChat with the given parser + server-level
+        --enable-thinking default, then stub `reasoning_default` on the
+        detector so we don't depend on real ReasoningParser construction."""
+        self.tm.server_args.reasoning_parser = parser
+        self.tm.server_args.enable_thinking = enable_thinking
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        if self.chat._reasoning_detector is not None:
+            # `_server_thinking_toggle_key` reads `reasoning_default` only.
+            self.chat._reasoning_detector = Mock(
+                reasoning_default={
+                    "qwen3": "enable_thinking",
+                    "deepseek-v3": "explicit_thinking",
+                    "deepseek-r1": "always",
+                    "mistral": "mistral",
+                }.get(parser, "always")
+            )
+        return self.chat
+
+    def test_thinking_default_sets_toggle_per_parser(self):
+        # (parser, flag) -> expected chat_template_kwargs after apply.
+        cases = [
+            ("qwen3", True, {"enable_thinking": True}),
+            ("qwen3", False, {"enable_thinking": False}),
+            ("deepseek-v3", True, {"thinking": True}),
+        ]
+        for parser, flag, expected in cases:
+            with self.subTest(parser=parser, flag=flag):
+                chat = self._make_chat_with_thinking_default(parser, flag)
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}]
+                )
+                chat._apply_server_thinking_default(req)
+                self.assertEqual(req.chat_template_kwargs, expected)
+
+    def test_thinking_default_per_request_override_wins(self):
+        chat = self._make_chat_with_thinking_default("qwen3", False)
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        chat._apply_server_thinking_default(req)
+        self.assertEqual(req.chat_template_kwargs, {"enable_thinking": True})
+
+    def test_thinking_default_skipped_when_reasoning_effort_none(self):
+        # reasoning_effort="none" is an explicit opt-out; server default
+        # must not flip the toggle back on.
+        chat = self._make_chat_with_thinking_default("qwen3", True)
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            reasoning_effort="none",
+        )
+        chat._apply_server_thinking_default(req)
+        self.assertFalse(req.chat_template_kwargs.get("enable_thinking"))
+
+    def test_thinking_default_uses_template_manager_for_auto_parser(self):
+        # --reasoning-parser=auto leaves _reasoning_detector unset; toggle
+        # key must come from TemplateManager.reasoning_config instead.
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        chat = self._make_chat_with_thinking_default(None, False)
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        chat._apply_server_thinking_default(req)
+        self.assertEqual(req.chat_template_kwargs, {"enable_thinking": False})
+
+    def test_thinking_default_noop_cases(self):
+        # Each early-return guard in _apply_server_thinking_default:
+        # flag unset, no reasoning parser, parser without binary toggle.
+        cases = [
+            ("flag_unset", "qwen3", None),
+            ("no_parser", None, True),
+            ("non_toggleable_parser", "deepseek-r1", True),
+        ]
+        for label, parser, flag in cases:
+            with self.subTest(case=label):
+                chat = self._make_chat_with_thinking_default(parser, flag)
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}]
+                )
+                chat._apply_server_thinking_default(req)
+                self.assertIsNone(req.chat_template_kwargs)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

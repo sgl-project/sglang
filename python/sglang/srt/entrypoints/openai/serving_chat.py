@@ -194,6 +194,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.enable_thinking = self.tokenizer_manager.server_args.enable_thinking
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -364,6 +365,36 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _server_thinking_toggle_key(self) -> Optional[str]:
+        # template_manager.reasoning_config is set when --reasoning-parser=auto
+        # picks the parser at template-load time; prefer it over the
+        # parser-level fallback.
+        config = getattr(self.template_manager, "reasoning_config", None)
+        if config is not None:
+            return getattr(config, "toggle_param", None)
+        if self._reasoning_detector is None:
+            return None
+        mode = getattr(self._reasoning_detector, "reasoning_default", None)
+        if mode in ("enable_thinking", "explicit_enable_thinking"):
+            return "enable_thinking"
+        if mode in ("thinking", "explicit_thinking"):
+            return "thinking"
+        return None
+
+    def _apply_server_thinking_default(self, request: ChatCompletionRequest) -> None:
+        if self.enable_thinking is None:
+            return
+        if request.reasoning_effort == "none":
+            return
+        key = self._server_thinking_toggle_key()
+        if key is None:
+            return
+        ctk = request.chat_template_kwargs
+        if ctk is None:
+            ctk = {}
+            request.chat_template_kwargs = ctk
+        ctk.setdefault(key, self.enable_thinking)
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -381,6 +412,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
+
+        self._apply_server_thinking_default(request)
 
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
