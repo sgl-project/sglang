@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     TextConditioningOutput,
     pad_text_embeddings_with_mask,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
 )
@@ -64,6 +67,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    vae_precision: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3TextConfig(),)
@@ -79,6 +83,9 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     SEQ_LEN_MULTIPLE: int = 32
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         rendered_prompts = [
