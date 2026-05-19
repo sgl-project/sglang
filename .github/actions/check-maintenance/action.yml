@@ -1,5 +1,5 @@
 name: Check Maintenance Mode
-description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
+description: Blocks CI in two independent modes driven by issue #21065. (1) Full-pause: when the issue is open. (2) Rebase-required: whenever the issue body contains a `MIN_BASE_SHA: <sha>` directive — enforced regardless of whether the issue is open or closed, so maintainers can require all PRs to rebase past a specific commit without having to open the maintenance issue. Both modes are bypassed by the `bypass-maintenance` label on the PR, or by env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during full-pause; in severe cases, merge permissions may be revoked.
 
 inputs:
   github-token:
@@ -18,6 +18,7 @@ runs:
         MAINTENANCE_ISSUE=21065
         REPO="${{ github.repository }}"
         PR_NUMBER="${{ github.event.pull_request.number }}"
+        PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
         # PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
         if [[ "${PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
@@ -25,39 +26,143 @@ runs:
           exit 0
         fi
 
-        # Check if maintenance issue is open (fail-open: if API errors, allow CI to proceed)
-        ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+        # Use curl + jq instead of `gh` because self-hosted GPU runners
+        # don't have the gh CLI installed. Without this, the action
+        # silently fell through to "Proceeding with CI" on every GPU
+        # job — the rebase gate only fired on ubuntu-latest jobs that
+        # had gh pre-installed. curl+jq are reliably available on every
+        # Linux runner.
+        gh_api() {
+          local path="$1"
+          local err_file="$2"
+          curl --silent --show-error --fail \
+            --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/$path" 2>"$err_file"
+        }
 
-        if [[ "$ISSUE_STATE" != "OPEN" ]]; then
-          echo "✅ Maintenance mode is OFF. Proceeding with CI."
+        # Fetch issue state and body. Fail-open: if we can't read the issue
+        # (network blip, missing token scope), CI proceeds.
+        ERR_FILE=$(mktemp)
+        ISSUE_JSON=$(gh_api "repos/$REPO/issues/$MAINTENANCE_ISSUE" "$ERR_FILE" || true)
+        if [[ -z "$ISSUE_JSON" ]]; then
+          echo "⚠️  Issue fetch returned empty. curl stderr was:"
+          cat "$ERR_FILE" || true
+        fi
+        rm -f "$ERR_FILE"
+        ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+        # Issues API returns state in lowercase ("open"/"closed"); normalize
+        # to uppercase so existing comparisons against "OPEN" still work.
+        ISSUE_STATE=$(printf '%s' "$ISSUE_STATE" | tr '[:lower:]' '[:upper:]')
+        ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // ""' 2>/dev/null || echo "")
+        echo "DEBUG: ISSUE_STATE=$ISSUE_STATE  body_length=${#ISSUE_BODY}"
+
+        # Parse optional `MIN_BASE_SHA: <sha>` directive from the issue body
+        # (first occurrence wins). Whenever this directive is present, the
+        # rebase check is enforced regardless of whether the issue is open
+        # or closed — so maintainers can require all PRs to rebase past a
+        # specific commit without having to open the maintenance issue.
+        # `grep` exits 1 on no-match, which under `set -eo pipefail` (the
+        # default for `shell: bash` composite steps) would abort the whole
+        # script — silently failing every PR whose issue body has no
+        # MIN_BASE_SHA line. Wrap grep in a brace group with `|| true` so
+        # an empty match falls through cleanly to "no directive set".
+        MIN_BASE_SHA=$(
+          { printf '%s' "$ISSUE_BODY" | tr -d '\r' | grep -iE '^[[:space:]]*`?MIN_BASE_SHA`?[[:space:]]*[:=]' || true; } \
+            | head -n1 | sed -E 's/.*[:=][[:space:]]*//; s/`//g' | awk '{print $1}'
+        )
+        if [[ -n "$MIN_BASE_SHA" ]] && ! [[ "$MIN_BASE_SHA" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+          WARN="⚠️  Ignoring malformed MIN_BASE_SHA directive in issue #$MAINTENANCE_ISSUE: '$MIN_BASE_SHA' (must be 7-40 hex chars)"
+          echo "$WARN"
+          echo "$WARN" >> "$GITHUB_STEP_SUMMARY"
+          MIN_BASE_SHA=""
+        fi
+
+        # If neither gate is active (no MIN_BASE_SHA, issue not open), nothing to do.
+        if [[ -z "$MIN_BASE_SHA" && "$ISSUE_STATE" != "OPEN" ]]; then
+          echo "✅ Maintenance mode is OFF and no MIN_BASE_SHA directive. Proceeding with CI."
           exit 0
         fi
 
-        # For PRs, check if bypass-maintenance label is present
+        # bypass-maintenance label bypasses both gates. PR labels live on
+        # the issue resource (PRs are issues with extra metadata in the
+        # GH API), so we hit the same /issues/{n} endpoint.
         if [[ -n "$PR_NUMBER" ]]; then
-          HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
-          if [[ "$HAS_BYPASS" -gt 0 ]]; then
-            echo "✅ PR #$PR_NUMBER has 'bypass-maintenance' label. Bypassing maintenance mode."
+          ERR_FILE=$(mktemp)
+          PR_JSON=$(gh_api "repos/$REPO/issues/$PR_NUMBER" "$ERR_FILE" || true)
+          rm -f "$ERR_FILE"
+          HAS_BYPASS=$(printf '%s' "$PR_JSON" | jq -r '[.labels[]?.name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
+          if [[ "${HAS_BYPASS:-0}" -gt 0 ]]; then
+            echo "✅ PR #$PR_NUMBER has 'bypass-maintenance' label. Bypassing maintenance + rebase checks."
             exit 0
           fi
         fi
 
-        MSG=$(printf "%s\n" \
-          "## ⚠️ CI Maintenance Mode is Active" \
-          "The CI infrastructure is currently under maintenance." \
-          "All PR CI runs are paused until maintenance is complete." \
-          "**Merging non-CI-fix PRs is prohibited during maintenance mode.** In severe cases, merge permissions may be revoked." \
-          "You might also experience unexpected failures during this period." \
-          "The team is working on the issue and will update the status as soon as possible." \
-          "" \
-          "What should you do?" \
-          "- **Do NOT merge non-CI-fix PRs** until maintenance mode is lifted" \
-          "- Check back later (~12 hours)" \
-          "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+        # Rebase-required gate (independent of issue open/closed state).
+        if [[ -n "$MIN_BASE_SHA" ]]; then
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo "✅ Not a PR context; skipping rebase check."
+          else
+            # Use GitHub compare API: status is "ahead"/"identical" when MIN_BASE_SHA is reachable from PR head.
+            ERR_FILE=$(mktemp)
+            COMPARE_JSON=$(gh_api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" "$ERR_FILE" || true)
+            if [[ -z "$COMPARE_JSON" ]]; then
+              echo "⚠️  Compare API failed. curl stderr was:"
+              cat "$ERR_FILE" || true
+            fi
+            rm -f "$ERR_FILE"
+            COMPARE_STATUS=$(printf '%s' "$COMPARE_JSON" | jq -r '.status // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+            COMPARE_STATUS="${COMPARE_STATUS:-UNKNOWN}"
 
-        echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
-        while IFS= read -r line; do
-          echo "::error::$line"
-        done <<< "$MSG"
+            case "$COMPARE_STATUS" in
+              ahead|identical)
+                echo "✅ PR #$PR_NUMBER contains required base ${MIN_BASE_SHA:0:12} ($COMPARE_STATUS)."
+                ;;
+              UNKNOWN)
+                echo "⚠️  Could not determine rebase status via GitHub API; fail-open, allowing rebase check to pass."
+                ;;
+              *)
+                MSG=$(printf "%s\n" \
+                  "## ⚠️ Rebase Required Before CI Can Run" \
+                  "A major update has landed on \`main\`. All PRs must rebase onto the latest \`main\` before CI will run." \
+                  "Required base commit: \`${MIN_BASE_SHA:0:12}\` (your PR is \`$COMPARE_STATUS\` relative to this commit)." \
+                  "" \
+                  "What should you do?" \
+                  "- Rebase your branch onto the latest \`main\` and push again" \
+                  "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for context" \
+                  "- CI-fix PRs may request the \`bypass-maintenance\` label to skip this check")
+                echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+                while IFS= read -r line; do
+                  echo "::error::$line"
+                done <<< "$MSG"
+                exit 1
+                ;;
+            esac
+          fi
+        fi
 
-        exit 1
+        # Full-pause maintenance gate (only when issue is open).
+        if [[ "$ISSUE_STATE" == "OPEN" ]]; then
+          MSG=$(printf "%s\n" \
+            "## ⚠️ CI Maintenance Mode is Active" \
+            "The CI infrastructure is currently under maintenance." \
+            "All PR CI runs are paused until maintenance is complete." \
+            "**Merging non-CI-fix PRs is prohibited during maintenance mode.** In severe cases, merge permissions may be revoked." \
+            "You might also experience unexpected failures during this period." \
+            "The team is working on the issue and will update the status as soon as possible." \
+            "" \
+            "What should you do?" \
+            "- **Do NOT merge non-CI-fix PRs** until maintenance mode is lifted" \
+            "- Check back later (~12 hours)" \
+            "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done <<< "$MSG"
+          exit 1
+        fi
+
+        echo "✅ Rebase check passed; full-pause not active. Proceeding with CI."
