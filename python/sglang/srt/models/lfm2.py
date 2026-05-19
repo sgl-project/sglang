@@ -302,11 +302,13 @@ class Lfm2ShortConv(nn.Module):
                     ]
                 )
                 cache_indices = mamba_indices.to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens > 0
             else:
                 query_start_loc = torch.tensor(
                     [0, T], dtype=torch.int32, device=hidden_states.device
                 )
                 cache_indices = mamba_indices[:1].to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens[:1] > 0
 
             conv_out = causal_conv1d_fn(
                 Bx_t,
@@ -314,7 +316,7 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_bias,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                has_initial_state=None,
+                has_initial_state=has_initial_state,
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
