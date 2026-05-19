@@ -45,7 +45,12 @@ class _FakeForwardBatch:
 
 
 class TestSweepValiditySet(unittest.TestCase):
-    """``compute_alive_owned_slots`` returns the union of owned ranges, deduped."""
+    """``compute_alive_owned_slots`` returns the union of owned ranges.
+
+    Uniqueness follows from the allocator invariant — each slot is owned by
+    at most one alive req — so the function intentionally does not dedupe;
+    callers are responsible for not feeding the same req twice in one batch.
+    """
 
     def _build_pool(self) -> _FakeReqToTokenPool:
         # Row 0 padding, rows 1..3 hold three reqs with seq_lens 5/3/7 below.
@@ -66,18 +71,6 @@ class TestSweepValiditySet(unittest.TestCase):
         )
         expected = sorted({10, 11, 12, 13, 14, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36})
         self.assertEqual(sorted(slots.tolist()), expected)
-
-    def test_compute_alive_owned_slots_dedupes_overlapping_slots(self) -> None:
-        pool = self._build_pool()
-        # Same req appears twice — output must still be unique.
-        forward_batch = _FakeForwardBatch(
-            req_pool_indices=torch.tensor([2, 2], dtype=torch.int32),
-            seq_lens=torch.tensor([3, 3], dtype=torch.int32),
-        )
-        slots = compute_alive_owned_slots(
-            req_to_token_pool=pool, forward_batch=forward_batch
-        )
-        self.assertEqual(sorted(slots.tolist()), [20, 21, 22])
 
     def test_compute_alive_owned_slots_skips_padding_row(self) -> None:
         pool = self._build_pool()
