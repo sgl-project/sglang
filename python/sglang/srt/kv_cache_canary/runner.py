@@ -17,7 +17,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_TAIL,
     FailReason,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import (
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import (
     BatchPlan,
     BatchPlanGpu,
     allocate_batch_plan_gpu,
@@ -343,9 +343,9 @@ class CanaryRunner:
         no-op kernel.
         """
         # Local import to avoid a runtime cycle:
-        # ``kv_cache_canary_plan`` -> ``kv_cache_canary_plan_ref``
+        # ``kv_cache_canary_plan_legacy`` -> ``kv_cache_canary_plan_ref_legacy``
         # -> (when patched) pseudo_mode -> runner.
-        from sglang.jit_kernel.kv_cache_canary_plan import (
+        from sglang.jit_kernel.kv_cache_canary_plan_legacy import (
             plan_batch_from_forward_batch_triton,
         )
 

@@ -8,7 +8,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _CANARY_FIELD_POSITION,
     SKIP_CHAIN_SENTINEL,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlan
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool

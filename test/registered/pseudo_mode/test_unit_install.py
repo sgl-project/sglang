@@ -146,7 +146,7 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
     """After install, the canary plan_batch fn returns expected_* populated."""
 
     def test_plan_patch_populates_expected(self) -> None:
-        from sglang.jit_kernel import kv_cache_canary_plan_ref as _canary_plan_ref
+        from sglang.jit_kernel import kv_cache_canary_plan_ref_legacy as _canary_plan_ref
         from sglang.srt.kv_cache_canary import api as _canary_api
         from sglang.srt.pseudo_mode import install as install_mod
 

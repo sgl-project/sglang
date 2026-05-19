@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import canary_step
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlanGpu
 from sglang.srt.kv_cache_canary.host_state import (
     CanaryViolationSlot,
 )

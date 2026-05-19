@@ -23,7 +23,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     canary_step,
     to_signed_int64,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlanGpu
 from sglang.jit_kernel.kv_cache_canary_ref import (
     canary_step_torch_reference,
     splitmix64_mix,

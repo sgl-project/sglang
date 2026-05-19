@@ -1,8 +1,8 @@
 """Differential test for the canary plan Triton kernel.
 
 For each scenario, the Python reference (``plan_batch_from_forward_batch``
-in ``kv_cache_canary_plan_ref``) and the Triton wrapper
-(``plan_batch_from_forward_batch_triton`` in ``kv_cache_canary_plan``)
+in ``kv_cache_canary_plan_ref_legacy``) and the Triton wrapper
+(``plan_batch_from_forward_batch_triton`` in ``kv_cache_canary_plan_legacy``)
 are both driven against the same synthetic ``ForwardBatch``. The ref's
 host-side ``BatchPlan`` is projected into a ``BatchPlanGpu`` via the
 shared ``fill_batch_plan_gpu_from_plan`` helper so the two outputs are
@@ -18,10 +18,10 @@ from typing import List, Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_cache_canary_plan import (
+from sglang.jit_kernel.kv_cache_canary_plan_legacy import (
     plan_batch_from_forward_batch_triton,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import (
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import (
     BatchPlanGpu,
     allocate_batch_plan_gpu,
     fill_batch_plan_gpu_from_plan,

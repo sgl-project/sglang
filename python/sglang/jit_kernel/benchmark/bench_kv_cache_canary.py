@@ -34,7 +34,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
     canary_step,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlanGpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="base-b-kernel-benchmark-1-gpu-large")

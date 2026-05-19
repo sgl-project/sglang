@@ -32,7 +32,7 @@ import torch
 from sglang.jit_kernel.kv_cache_canary_ref import splitmix64
 
 if TYPE_CHECKING:
-    from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
+    from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlan
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)

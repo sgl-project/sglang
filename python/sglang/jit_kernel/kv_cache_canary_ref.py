@@ -36,7 +36,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     FailReason,
     to_signed_int64,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlanGpu
 
 _U64_MASK = (1 << 64) - 1
 

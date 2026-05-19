@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, Final, Tuple
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlanGpu
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -212,7 +212,7 @@ def canary_step(
         buf:                         ``uint8 [num_slots, slot_bytes]`` — canary tensor that both verify reads from
                                      and write writes into (each endpoint is self-verifying). Bytes per slot are
                                      taken from ``buf.shape[1]``.
-        plan:                        :class:`~sglang.jit_kernel.kv_cache_canary_plan_ref.BatchPlanGpu` bundling the
+        plan:                        :class:`~sglang.jit_kernel.kv_cache_canary_plan_ref_legacy.BatchPlanGpu` bundling the
                                      13 per-verify-entry / per-write-entry / per-write-req plan tensors plus the
                                      ``verify_num_valid`` and ``write_req_num_valid`` active-count scalars. See the
                                      ``BatchPlanGpu`` docstring for the per-field layout, sentinel encodings, and the

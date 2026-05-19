@@ -21,7 +21,7 @@ import unittest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import SKIP_CHAIN_SENTINEL
-from sglang.jit_kernel.kv_cache_canary_plan_ref import (
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import (
     BatchPlan,
     _build_plan,
     _translate_plan_slot_indices,

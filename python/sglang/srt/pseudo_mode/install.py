@@ -33,12 +33,12 @@ import pickle
 import types
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
-from sglang.jit_kernel import kv_cache_canary_plan_ref as _canary_plan_ref
+from sglang.jit_kernel import kv_cache_canary_plan_ref_legacy as _canary_plan_ref
 from sglang.srt.kv_cache_canary.api import get_runners
 from sglang.srt.pseudo_mode.sampler_override import install_sampler_override
 
 if TYPE_CHECKING:
-    from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
+    from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import BatchPlan
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -96,7 +96,7 @@ def install_on_model_runner(
 
 
 def _install_plan_patch(*, oracle: "PseudoOracle") -> None:
-    """Wrap ``kv_cache_canary_plan_ref.plan_batch_from_forward_batch`` to fill expected_*.
+    """Wrap ``kv_cache_canary_plan_ref_legacy.plan_batch_from_forward_batch`` to fill expected_*.
 
     The canary api module imports ``plan_batch_from_forward_batch`` by
     name at module load, so we rebind on **both** modules to ensure
@@ -136,7 +136,7 @@ def _install_plan_patch(*, oracle: "PseudoOracle") -> None:
 
     _canary_plan_ref.plan_batch_from_forward_batch = patched_plan
     # Refresh the name binding inside canary.api too — it did
-    # ``from .kv_cache_canary_plan_ref import plan_batch_from_forward_batch``
+    # ``from .kv_cache_canary_plan_ref_legacy import plan_batch_from_forward_batch``
     # at load time, so its local binding is the original function object.
     from sglang.srt.kv_cache_canary import api as _canary_api
 

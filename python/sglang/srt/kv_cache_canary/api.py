@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.jit_kernel import kv_cache_canary_plan_ref as _canary_plan_ref
-from sglang.jit_kernel.kv_cache_canary_plan_ref import (
+from sglang.jit_kernel import kv_cache_canary_plan_ref_legacy as _canary_plan_ref
+from sglang.jit_kernel.kv_cache_canary_plan_ref_legacy import (
     BatchPlan,
     plan_batch_from_forward_batch,
 )
@@ -40,7 +40,7 @@ def _triton_plan_enabled() -> bool:
 
     - ``SGLANG_KV_CANARY_PLAN_USE_TRITON=0`` env var (debug escape hatch).
     - pseudo-mode install has monkey-patched
-      ``kv_cache_canary_plan_ref.plan_batch_from_forward_batch`` (it wraps
+      ``kv_cache_canary_plan_ref_legacy.plan_batch_from_forward_batch`` (it wraps
       the ref to inject ``expected_write_*`` and the Triton kernel does
       not yet implement that oracle). The patch sets a sentinel attr
       on the ref module that we detect here.
