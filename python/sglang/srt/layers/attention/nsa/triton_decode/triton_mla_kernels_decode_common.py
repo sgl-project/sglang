@@ -73,81 +73,28 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
 # ============================================================================
 @triton.autotune(
     configs=[
-        # CDNA4-optimized configurations for MI355X (256 CUs, 8TB/s BW)
-        # Best for h_q=128, large topk: maximize parallelism across CUs
+        # Selected based on CDNA4 architecture analysis:
+        # - BLOCK_D=128 is fixed (matches KV tile structure for d_qk=512).
+        # - BLOCK_N=256: best for amortizing memory access over topk dimension.
+        #   (decode attention is memory-bound; larger BLOCK_N = fewer iterations)
+        # - num_warps=8: memory-bound decode benefits from more warps for latency hiding.
+        # - BLOCK_H varies to cover different batch sizes:
+        #   * BLOCK_H=16: cdiv(128,16)=8 H-blocks, best for small batches (bs=1-8)
+        #   * BLOCK_H=32: cdiv(128,32)=4 H-blocks, good for medium batches (bs=8-32)
+        #   * BLOCK_H=64: cdiv(128,64)=2 H-blocks, best for large batches (bs=32+)
+        #     (original comment: "Best for h_q=128, large topk")
+        #   * BLOCK_H=128: cdiv(128,128)=1 H-block, for very large batches (bs=128+)
         triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 128, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
         ),
         triton.Config(
             {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
         ),
         triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        # Additional configs with num_stages=2 for better pipelining
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
         ),
         triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        # Original configurations
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 8, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 8, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
         ),
     ],
     key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
