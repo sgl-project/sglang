@@ -28,7 +28,7 @@ class TestNPULogRequestLevel0(TestNPULoggingBase):
             "2": r".*Finish: obj=GenerateReqInput\(.*text=.*, sampling_params=.*\).*",
             "3": r".*Finish: obj=GenerateReqInput\(.*text=.*, sampling_params=.*\).*",
         }
-        cls.finish_message = (r".*Finish: obj=GenerateReqInput\(.*\).*")
+        cls.finish_message = r".*Finish: obj=GenerateReqInput\(.*\).*"
         cls.keyword_output_id_start = (
             "'output_ids': ["  # Start delimiter for token ID array
         )
