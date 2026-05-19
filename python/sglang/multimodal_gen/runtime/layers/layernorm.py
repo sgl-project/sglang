@@ -296,10 +296,13 @@ class RMSNorm(CustomOp):
 
 @CustomOp.register("rms_norm_no_weight")
 class RMSNormNoWeight(CustomOp):
-    def forward_native(x: torch.Tensor, eps: float) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor, eps: float) -> torch.Tensor:
         return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
-    def forward_npu(x: torch.Tensor, eps: float) -> torch.Tensor:
+    def forward_cuda(self, x: torch.Tensor, eps: float) -> torch.Tensor:
+        return self.forward_native(x, normalized_shape=(x.shape[-1],), eps=eps)
+
+    def forward_npu(self, x: torch.Tensor, eps: float) -> torch.Tensor:
         return fused_rmsnorm_without_weight(x, eps)
 
 
