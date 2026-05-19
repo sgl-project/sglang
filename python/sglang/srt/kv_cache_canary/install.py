@@ -28,7 +28,6 @@ from sglang.srt.kv_cache_canary.api import (
     run_tail,
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
-from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_hook
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -206,9 +205,6 @@ def _patch_model_forward(*, model_runner: ModelRunner) -> None:
         if _is_inside_replay():
             return original_forward(*args, **kwargs)
 
-        maybe_perturb_hook(
-            runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
-        )
         run_head(runners=runners, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
         run_tail(runners=runners, forward_batch=forward_batch)
@@ -283,9 +279,6 @@ def _patch_graph_runner_class_replay(cls: type) -> None:
         if not runners or not runners[0].config.enabled:
             return original_replay(self, forward_batch, *args, **kwargs)
 
-        maybe_perturb_hook(
-            runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
-        )
         run_head(runners=runners, forward_batch=forward_batch)
         _replay_in_flight.active = True
         try:
