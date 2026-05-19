@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 _CANARY_ATTACHED_ATTR = "_kv_cache_canary_attached"
+_CANARY_BUFFER_GROUPS_ATTR = "_kv_cache_canary_buffer_groups"
 _DEFAULT_REAL_KV_READ_BYTES = 32
 
 _BufInfoTriple = Tuple[List[int], List[int], List[int]]
@@ -85,7 +86,25 @@ def attach_canary_buffers(
         groups.append(swa_group)
 
     setattr(pool, _CANARY_ATTACHED_ATTR, True)
-    return tuple(groups)
+    groups_tuple = tuple(groups)
+    setattr(
+        pool,
+        _CANARY_BUFFER_GROUPS_ATTR,
+        {group.kind: group for group in groups_tuple},
+    )
+    return groups_tuple
+
+
+def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]:
+    """Return the ``{PoolKind: CanaryBufferGroup}`` mapping stashed on ``pool`` by a prior
+    :func:`attach_canary_buffers` call. Raises ``RuntimeError`` if canary has not been attached.
+    """
+    groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
+    if groups is None:
+        raise RuntimeError(
+            f"kv-canary: pool {type(pool).__name__} has no canary buffers attached"
+        )
+    return groups
 
 
 class CanaryPoolAdapter(Protocol):

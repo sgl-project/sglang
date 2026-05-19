@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import pytest
 import torch
@@ -16,6 +16,11 @@ from sglang.jit_kernel.kv_cache_canary_verify import (
 )
 from sglang.srt.kv_cache_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_cache_canary.pool_patch import (
+    _make_row_source,
+    _patch_buf_info_method,
+    register_canary_adapter,
+)
 
 
 @pytest.fixture
@@ -333,3 +338,175 @@ def make_radix_cache(device):
         return cache
 
     return _make
+
+
+@register_canary_adapter(FakeMHAPool)
+class _FakeMHAAdapter:
+    def is_swa(self, pool: FakeMHAPool) -> bool:
+        return False
+
+    def has_v_half(self, pool: FakeMHAPool) -> bool:
+        return True
+
+    def build_real_kv_sources(
+        self,
+        pool: FakeMHAPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        buf = pool.k_buffer[0] if half == "K" else pool.v_buffer[0]
+        return _make_row_source(layer_buffer=buf, read_bytes=read_bytes)
+
+    def install_full_group(self, pool: FakeMHAPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_contiguous_buf_infos",
+            group=group,
+            has_v_half=True,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(self, pool: FakeMHAPool, group: CanaryBufferGroup) -> None:
+        raise NotImplementedError
+
+
+@register_canary_adapter(FakeMLAPool)
+class _FakeMLAAdapter:
+    def is_swa(self, pool: FakeMLAPool) -> bool:
+        return False
+
+    def has_v_half(self, pool: FakeMLAPool) -> bool:
+        return False
+
+    def build_real_kv_sources(
+        self,
+        pool: FakeMLAPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        if half == "V":
+            return ()
+        return _make_row_source(layer_buffer=pool.kv_buffer[0], read_bytes=read_bytes)
+
+    def install_full_group(self, pool: FakeMLAPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_contiguous_buf_infos",
+            group=group,
+            has_v_half=False,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(self, pool: FakeMLAPool, group: CanaryBufferGroup) -> None:
+        raise NotImplementedError
+
+
+@register_canary_adapter(FakeSWAPool)
+class _FakeSWAAdapter:
+    def is_swa(self, pool: FakeSWAPool) -> bool:
+        return True
+
+    def has_v_half(self, pool: FakeSWAPool) -> bool:
+        return True
+
+    def build_real_kv_sources(
+        self,
+        pool: FakeSWAPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+        buf = sub_pool.k_buffer[0] if half == "K" else sub_pool.v_buffer[0]
+        return _make_row_source(layer_buffer=buf, read_bytes=read_bytes)
+
+    def install_full_group(self, pool: FakeSWAPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_state_buf_infos",
+            group=group,
+            has_v_half=True,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(self, pool: FakeSWAPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_state_buf_infos",
+            group=group,
+            has_v_half=True,
+            page_size=pool.page_size,
+        )
+
+
+@register_canary_adapter(FakeDsv4Pool)
+class _FakeDsv4Adapter:
+    def is_swa(self, pool: FakeDsv4Pool) -> bool:
+        return True
+
+    def has_v_half(self, pool: FakeDsv4Pool) -> bool:
+        return False
+
+    def build_real_kv_sources(
+        self,
+        pool: FakeDsv4Pool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        if half == "V":
+            return ()
+        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+        return _make_row_source(
+            layer_buffer=sub_pool.kv_buffer[0], read_bytes=read_bytes
+        )
+
+    def install_full_group(self, pool: FakeDsv4Pool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_state_buf_infos",
+            group=group,
+            has_v_half=False,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(self, pool: FakeDsv4Pool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_state_buf_infos",
+            group=group,
+            has_v_half=False,
+            page_size=pool.page_size,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _patch_fake_pool_helpers(monkeypatch):
+    """Patch _slot_count / _swa_index_lut helpers in pool_patch to recognize Fake pools."""
+    from sglang.srt.kv_cache_canary import pool_patch as pp
+
+    original_slot_count = pp._slot_count
+    original_swa_lut = pp._swa_index_lut
+
+    def patched_slot_count(pool, kind):
+        if isinstance(pool, FakeMHAPool):
+            return int(pool.k_buffer[0].shape[0])
+        if isinstance(pool, FakeMLAPool):
+            return int(pool.kv_buffer[0].shape[0])
+        if isinstance(pool, FakeSWAPool):
+            sub = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+            return int(sub.k_buffer[0].shape[0])
+        if isinstance(pool, FakeDsv4Pool):
+            sub = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+            return int(sub.kv_buffer[0].shape[0])
+        return original_slot_count(pool, kind)
+
+    def patched_swa_lut(pool):
+        if isinstance(pool, (FakeSWAPool, FakeDsv4Pool)):
+            return pool.full_to_swa_index_mapping
+        return original_swa_lut(pool)
+
+    monkeypatch.setattr(pp, "_slot_count", patched_slot_count)
+    monkeypatch.setattr(pp, "_swa_index_lut", patched_swa_lut)
