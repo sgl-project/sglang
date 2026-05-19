@@ -12,6 +12,11 @@ name: PR Test Extra
 on:
   pull_request:
     branches: [main]
+    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
+    # is added after the latest push — otherwise GHA leaves the stale
+    # skipped run in place and there's no way to enable extra without
+    # another push. See check-changes.if below for the matching guard.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -70,10 +75,17 @@ jobs:
   # (workflow_dispatch / workflow_call) always run. When this job is
   # skipped by the gate, every downstream caller stub naturally skips
   # because its needs do not resolve.
+  #
+  # For `labeled` events we additionally require the just-added label to be
+  # one of the two gating labels — otherwise every unrelated label addition
+  # would dispatch a full CI run.
   check-changes:
     if: |
       github.event_name != 'pull_request' ||
       (
+        (github.event.action != 'labeled' ||
+         github.event.label.name == 'run-ci' ||
+         github.event.label.name == 'run-ci-extra') &&
         contains(github.event.pull_request.labels.*.name, 'run-ci') &&
         contains(github.event.pull_request.labels.*.name, 'run-ci-extra')
       )
