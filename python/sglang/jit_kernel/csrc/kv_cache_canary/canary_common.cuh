@@ -84,7 +84,7 @@ struct RealKvSourceHandle {
 
 // Standard splitmix64 finalizer. Bit-equivalent to the Python _splitmix64_python in
 // kv_cache_canary_verify_ref.py.
-SGL_DEVICE inline uint64_t splitmix64(uint64_t x) {
+SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
   return x ^ (x >> 31);
@@ -92,7 +92,7 @@ SGL_DEVICE inline uint64_t splitmix64(uint64_t x) {
 
 // 4-arg chain step: XOR all four uint64 inputs, then splitmix64-finalize. Matches the Python helper
 // _splitmix64_mix4_vec in kv_cache_canary_verify_ref.py.
-SGL_DEVICE inline uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   return splitmix64(a ^ b ^ c ^ d);
 }
 
@@ -104,7 +104,7 @@ SGL_DEVICE inline uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, u
 //
 // row_stride_bytes is the dim-1 size of the underlying tensor in bytes (which may exceed
 // page_size * num_bytes_per_token; trailing bytes are skipped).
-SGL_DEVICE inline uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset) {
+SGL_DEVICE uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset) {
   const int64_t row = slot_idx / src.page_size;
   const int64_t col_within_page = slot_idx % src.page_size;
   const int64_t col = col_within_page * src.num_bytes_per_token + byte_offset;
@@ -117,8 +117,7 @@ SGL_DEVICE inline uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64
 // BIT mode: XOR-fold the low bit of every byte into a single bit, returned as 0 or 1 in a uint64.
 // ALL mode: pack bytes little-endian into 8-byte words (zero-padded if read_bytes is not a multiple of 8)
 // and splitmix64-fold them iteratively.
-SGL_DEVICE inline uint64_t
-real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
+SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   if (src.read_bytes <= 0) {
     return 0ULL;
   }
@@ -158,7 +157,7 @@ real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvH
 // in kv_cache_canary_verify_ref.py: `if source.read_bytes <= 0: continue`). To stay byte-equal, this
 // helper must skip the splitmix64 step entirely for read_bytes == 0 sources rather than treating them as
 // "fold 0".
-SGL_DEVICE inline uint64_t
+SGL_DEVICE uint64_t
 fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t slot_idx, RealKvHashMode mode) {
   if (mode == RealKvHashMode::kOff || num_sources <= 0) {
     return 0ULL;
@@ -183,7 +182,7 @@ fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
 // atomicAdd on violation_write_index serializes arrivals; only writers with idx < ring_capacity store a
 // row. The __threadfence_system after the store guarantees any host observer that reads the post-increment
 // counter also sees the committed row.
-SGL_DEVICE inline void record_violation(
+SGL_DEVICE void record_violation(
     int64_t* __restrict__ violation_ring,
     int32_t* __restrict__ violation_write_index,
     int32_t ring_capacity,
@@ -210,13 +209,12 @@ SGL_DEVICE inline void record_violation(
   }
 }
 
-SGL_DEVICE inline int64_t
-canary_load_field(const uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, int field) {
+SGL_DEVICE int64_t canary_load_field(const uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, int field) {
   const int64_t* p = reinterpret_cast<const int64_t*>(buf + slot_idx * slot_stride_bytes);
   return p[field];
 }
 
-SGL_DEVICE inline void
+SGL_DEVICE void
 canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, int field, int64_t value) {
   int64_t* p = reinterpret_cast<int64_t*>(buf + slot_idx * slot_stride_bytes);
   p[field] = value;

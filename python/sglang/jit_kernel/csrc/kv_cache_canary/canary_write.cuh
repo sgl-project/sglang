@@ -68,8 +68,7 @@ struct WriteKernelParams {
 
 // SWA translation matching _swa_translate in kv_cache_canary_write_ref.py. Negative slot_full passes
 // through unchanged; out-of-bounds indices clamp to lut_len - 1 (the trailing sentinel row).
-SGL_DEVICE inline int64_t
-swa_translate_one(int64_t slot_full, const int32_t* lut, int32_t lut_len, int32_t mapping_present) {
+SGL_DEVICE int64_t swa_translate_one(int64_t slot_full, const int32_t* lut, int32_t lut_len, int32_t mapping_present) {
   if (mapping_present == kSwaMappingAbsent) {
     return slot_full;
   }
