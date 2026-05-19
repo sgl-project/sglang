@@ -697,6 +697,7 @@ class ServerArgs:
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
     disable_overlap_schedule: bool = False
+    mlx_enable_sampling: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
@@ -6154,6 +6155,11 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--mlx-enable-sampling",
+            action="store_true",
+            help="MLX backend only: route decode-step token selection through sglang's sampler (temperature / top-k / top-p / penalties) instead of greedy argmax. Currently applies to the pure-decode forward path only; prefill and extend remain greedy.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",

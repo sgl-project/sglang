@@ -54,6 +54,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            enable_sampling=self.server_args.mlx_enable_sampling,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -123,6 +124,40 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
+
+    def _decode_with_sampling(
+        self, batch: ScheduleBatch, req_ids: list[str]
+    ) -> list[int]:
+        """Run a pure-decode forward pass and route the logits through
+        sglang's sampler (temperature / top-k / top-p / penalties) instead
+        of MLX-side greedy argmax.
+
+        Only used in the ``forward_mode.is_decode()`` branch — prefill /
+        extend remain greedy in this phase. Returns the next token ids in
+        ``req_ids`` order, matching the contract of
+        ``MlxModelRunner.decode_batch``.
+        """
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        pending, lazy_logits = self._mlx_runner.decode_batch_logits(req_ids)
+        logits_cpu = mlx_to_torch(lazy_logits, device="cpu")
+
+        positions = batch.seq_lens
+        if positions is None:
+            positions = torch.zeros(len(req_ids), dtype=torch.long)
+
+        logits_output = LogitsProcessorOutput(next_token_logits=logits_cpu)
+        next_token_ids = self._model_runner.sampler(
+            logits_output,
+            batch.sampling_info,
+            batch.return_logprob,
+            batch.top_logprobs_nums or [0] * len(req_ids),
+            batch.token_ids_logprobs or [None] * len(req_ids),
+            positions,
+        )
+        sampled = [int(t) for t in next_token_ids.tolist()]
+        return self._mlx_runner.decode_batch_commit(pending, sampled)
 
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
@@ -208,7 +243,14 @@ class MlxTpModelWorker(TpModelWorker):
 
         elif forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
-            next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
+            if (
+                self.server_args.mlx_enable_sampling
+                and batch.sampling_info is not None
+                and getattr(self._model_runner, "sampler", None) is not None
+            ):
+                next_token_ids_list = self._decode_with_sampling(batch, req_ids)
+            else:
+                next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
 
         else:
             raise ValueError(
