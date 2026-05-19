@@ -75,7 +75,7 @@ class CanaryConfig:
             )
 
         real_kv_cli = (server_args.kv_cache_canary_real_data or "").strip().upper()
-        if real_kv_cli and real_kv_cli != "OFF":
+        if real_kv_cli:
             real_kv_raw = real_kv_cli
         else:
             real_kv_raw = envs.SGLANG_KV_CANARY_REAL_KV_HASH_MODE.get().strip().upper()
