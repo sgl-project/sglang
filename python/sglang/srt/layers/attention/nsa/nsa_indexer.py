@@ -70,6 +70,7 @@ if is_npu():
 from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
     get_attn_context_model_parallel_world_size,
+    get_attn_tp_group,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
@@ -88,6 +89,30 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
+
+def _broadcast_indexer_topk_from_rank0(
+    topk_indices: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    # Sync only the finalized indexer output. Internal topk_transform calls can
+    # be chunked differently across ranks, which would make collectives diverge.
+    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        return topk_indices
+
+    group = get_attn_tp_group()
+    if group.world_size == 1:
+        return topk_indices
+
+    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        if group.pynccl_comm is None:
+            raise RuntimeError(
+                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
+            )
+        with group.pynccl_comm.change_state(enable=True):
+            group.pynccl_comm.broadcast(topk_indices, src=0)
+    else:
+        group.broadcast(topk_indices, src=0)
+    return topk_indices
 
 
 class BaseIndexerMetadata(ABC):
@@ -1162,19 +1187,18 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return maybe_capture_indexer_topk(
+            topk_result = self._forward_cuda_k_only(
+                x,
+                positions,
+                forward_batch,
                 layer_id,
-                self._forward_cuda_k_only(
-                    x,
-                    positions,
-                    forward_batch,
-                    layer_id,
-                    act_quant,
-                    enable_dual_stream,
-                    metadata,
-                    return_indices,
-                ),
+                act_quant,
+                enable_dual_stream,
+                metadata,
+                return_indices,
             )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
@@ -1271,15 +1295,14 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return maybe_capture_indexer_topk(
-                    layer_id,
-                    torch.full(
-                        (x_meta.shape[0], self.index_topk),
-                        -1,
-                        dtype=torch.int,
-                        device=x_meta.device,
-                    ),
+                topk_result = torch.full(
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int,
+                    device=x_meta.device,
                 )
+                topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                return maybe_capture_indexer_topk(layer_id, topk_result)
 
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -1328,10 +1351,9 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return maybe_capture_indexer_topk(
-                        layer_id,
-                        torch.cat([topk_result_prev, topk_result_next], dim=0),
-                    )
+                    topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                    return maybe_capture_indexer_topk(layer_id, topk_result)
                 else:
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
@@ -1349,6 +1371,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(
