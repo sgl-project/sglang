@@ -543,6 +543,7 @@ class TargetActor:
         rank: int | None = None,
         deterministic: bool = False,
         decoupled_spec_trace_dir: str | None = None,
+        log_level: str | None = None,
     ):
         """Pin GPUs and initialize the target engine for one node rank."""
         self.mode = mode
@@ -560,6 +561,8 @@ class TargetActor:
             enable_deterministic_inference=deterministic,
             decoupled_spec_trace_dir=decoupled_spec_trace_dir,
         )
+        if log_level is not None:
+            engine_kwargs["log_level"] = log_level
         if ep_size is not None:
             engine_kwargs["ep_size"] = ep_size
         if moe_a2a_backend is not None:
@@ -612,4 +615,3 @@ class TargetActor:
         """Shutdown the target engine owned by this actor."""
         self.engine.shutdown()
         return True
-

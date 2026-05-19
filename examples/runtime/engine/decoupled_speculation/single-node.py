@@ -635,6 +635,7 @@ def create_verifier_engine(
         disable_radix_cache=True,
         enable_deterministic_inference=args.deterministic,
         decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+        log_level="info",
     )
     _add_decoupled_endpoint_kwargs(
         engine_kwargs,
@@ -667,6 +668,7 @@ def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
         enable_deterministic_inference=args.deterministic,
         disable_overlap_schedule=True,
         decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+        log_level="info",
     )
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size

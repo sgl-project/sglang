@@ -667,6 +667,7 @@ def launch_target_actors(
             rank=rank,
             deterministic=args.deterministic,
             decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+            log_level="info",
         )
         actors.append(actor)
 
