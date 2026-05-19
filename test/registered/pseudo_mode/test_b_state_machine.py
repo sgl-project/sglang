@@ -75,36 +75,17 @@ except ImportError as exc:
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
-# Bound per-example operation count well below the Hypothesis default
-# (~100) so each example finishes in seconds and CI stays under the
-# stage-a wall-clock budget. ``max_examples`` is also lowered: the
-# space we explore is small enough that 20 examples cover the
-# interesting branches without trading too much shrinking quality.
-_MAX_EXAMPLES: int = 20
+# Per-example budget kept tight so the CI wall-clock stays predictable.
+# Each example pays one PseudoEngine.launch (~5s subprocess boot) plus
+# ~30 stateful operations (~50ms each via the IPC), so 5 examples
+# realistic upper bound ~60s. Developers can override locally with
+# HYPOTHESIS_PROFILE=dev or by editing _MAX_EXAMPLES directly.
+_MAX_EXAMPLES: int = 5
 _STATEFUL_STEPS: int = 30
 _PROMPT_LEN_MIN: int = 8
 _PROMPT_LEN_MAX: int = 64
 _MAX_NEW_MIN: int = 1
 _MAX_NEW_MAX: int = 8
-
-
-@requires_cuda
-@unittest.skipUnless(_HYPOTHESIS_AVAILABLE, "hypothesis is not installed")
-class TestSchedulerContractMachine(unittest.TestCase):
-    """Wraps the Hypothesis state machine into the unittest discovery path."""
-
-    def test_scheduler_contract(self) -> None:
-        """Run the state machine. Hypothesis handles example generation."""
-        SchedulerContractMachine.TestCase.settings = settings(
-            max_examples=_MAX_EXAMPLES,
-            stateful_step_count=_STATEFUL_STEPS,
-            deadline=None,
-            suppress_health_check=[
-                HealthCheck.too_slow,
-                HealthCheck.data_too_large,
-            ],
-        )
-        SchedulerContractMachine.TestCase().runTest()
 
 
 if _HYPOTHESIS_AVAILABLE:
@@ -227,6 +208,14 @@ if _HYPOTHESIS_AVAILABLE:
         def _retire_handle(self, handle: PseudoReqHandle) -> None:
             self._retired_rids.add(handle.rid)
             self._handles = [h for h in self._handles if h.rid != handle.rid]
+
+    SchedulerContractMachine.TestCase.settings = settings(
+        max_examples=_MAX_EXAMPLES,
+        stateful_step_count=_STATEFUL_STEPS,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+    TestSchedulerContract = requires_cuda(SchedulerContractMachine.TestCase)
 
 
 if __name__ == "__main__":
