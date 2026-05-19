@@ -712,8 +712,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids.
-    # TODO(Jialin): migrate to `array.array('q')` to drop the wraps at
-    # scheduler.py:1786/1874/2157, encode_receiver.py:1007, session_controller.py:218.
+    # TODO(Jialin): Migrate to python array.
     input_ids: List[int]
     # The multimodal inputs
     mm_inputs: object
@@ -1029,8 +1028,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids.
-    # TODO(Jialin): see TokenizedGenerateReqInput.input_ids — same migration
-    # opportunity for embedding requests.
+    # TODO(Jialin): Migrate to python array.
     input_ids: List[int]
     # The image inputs
     image_inputs: dict
