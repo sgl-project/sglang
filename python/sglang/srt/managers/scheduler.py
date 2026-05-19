@@ -2278,7 +2278,7 @@ class Scheduler(
         delay them by 1 mb step for no correctness gain, so we skip them
         here and only return rids of reqs that genuinely need protection.
         """
-        if self.pp_size <= 1 or not hasattr(self, "mbs"):
+        if self.ps.pp_size <= 1 or not hasattr(self, "mbs"):
             return set()
         rids = set()
         for mb in self.mbs:
@@ -3469,7 +3469,7 @@ class Scheduler(
         # output processor would crash on a None req_pool_idx (or, with
         # pending_middle_outputs cleared to 0, mistake the middle-chunk
         # result for a full output and append garbage tokens).
-        if self.pp_size > 1 and hasattr(self, "mbs"):
+        if self.ps.pp_size > 1 and hasattr(self, "mbs"):
             for mb_list in (self.mbs, self.last_mbs, self.running_mbs):
                 for mb in mb_list:
                     if mb is not None and not mb.is_empty():
