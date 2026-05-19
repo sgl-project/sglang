@@ -244,6 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
+           python3 -m pip install --force-reinstall "flashinfer_python[cu12]==${FLASHINFER_VERSION}"; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
