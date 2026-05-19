@@ -3,21 +3,29 @@ name: PR States
 # pull_request_target (not pull_request) for fork-PR write access; safe
 # because we never check out PR head code, only API-read and PATCH the body.
 #
-# Trigger sources:
-#   - pull_request_target: covers fresh push / open / label changes.
+# Three trigger sources, each covering a distinct gap:
+#   - pull_request_target: covers fresh push / open / label changes (all
+#     PRs including forks, since pull_request_target runs in base-repo
+#     context with full permissions).
+#   - workflow_run (pr-test* completion): covers the INITIAL completion of
+#     each pr-test / pr-test-extra run, including fork PRs. The notify-job
+#     below cannot fire for fork PRs (their `pull_request` GITHUB_TOKEN is
+#     read-only), so fork PRs rely on this path to update on completion.
+#     workflow_run does NOT re-fire for rerun attempts (GitHub reuses the
+#     workflow_run record across attempts), which is why we need the
+#     notify-job path too.
 #   - workflow_dispatch: explicit refresh fired by pr-test.yml /
-#     pr-test-extra.yml's notify-pr-states final job after every run
-#     (initial + every rerun attempt). This is the only way to catch a
-#     post-rerun status change, because GitHub does NOT re-fire
-#     `workflow_run.completed` for rerun attempts (the workflow_run record
-#     is reused across attempts, so subscribers see the initial completion
-#     once and never again). `workflow_dispatch` is also the only event
-#     that GITHUB_TOKEN can cascade-create, which lets the notify job fire
-#     this workflow regardless of who initiated the rerun.
+#     pr-test-extra.yml's notify-pr-states final job after every attempt
+#     completion. This catches rerun completions (initial + rerun) for
+#     non-fork PRs. `workflow_dispatch` is the only event GITHUB_TOKEN can
+#     cascade-create, so it works regardless of who initiated the rerun.
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_run:
+    workflows: ["PR Test Base", "PR Test Extra"]
+    types: [requested, completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -30,9 +38,11 @@ permissions:
   actions: read
 
 concurrency:
-  # Dedupe per PR so a flurry of notify-pr-states dispatches (e.g. one
-  # per stage completion) doesn't race on the body PATCH.
-  group: pr-states-${{ github.event.pull_request.number || inputs.pr_number }}
+  # Dedupe per commit SHA when available, fall back to PR number for the
+  # workflow_dispatch path. Concurrent fires from pull_request_target +
+  # workflow_run + notify-job on the same push will queue rather than
+  # race on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -51,10 +61,39 @@ jobs:
 
             // Event-agnostic PR lookup.
             // - pull_request_target: PR is in the payload.
+            // - workflow_run: pull_requests[] is populated for same-repo
+            //   PRs; fork PRs need a head-ref reverse lookup
+            //   ("forkOwner:branch") because
+            //   listPullRequestsAssociatedWithCommit requires the commit to
+            //   be in the default branch. Bail when no open PR matches.
             // - workflow_dispatch: pr_number is an explicit input.
             let prNumber;
             if (context.payload.pull_request) {
               prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (wr.pull_requests && wr.pull_requests.length > 0) {
+                prNumber = wr.pull_requests[0].number;
+              } else if (wr.head_repository && wr.head_branch) {
+                const headSpec = `${wr.head_repository.owner.login}:${wr.head_branch}`;
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: headSpec,
+                });
+                // Multiple PRs could share a head ref if a branch was reused;
+                // match by head_sha to pick the right one.
+                const match = prs.find(p => p.head.sha === wr.head_sha) || prs[0];
+                if (!match) {
+                  core.info(`No open PR for head=${headSpec}; skipping.`);
+                  return;
+                }
+                prNumber = match.number;
+              } else {
+                core.info(`workflow_run has no PR linkage; skipping.`);
+                return;
+              }
             } else if (context.eventName === 'workflow_dispatch') {
               // workflow_dispatch inputs are arbitrary strings; reject
               // anything that isn't a pure digit sequence so trailing
