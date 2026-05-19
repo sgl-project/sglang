@@ -151,9 +151,11 @@ class DecodeReqToTokenPool:
         assert (
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
-        # Relayer cpu_value channel resolve when kv_committed ctx is set.
+        # ``req.kv_committed_len`` is updated in place by
+        # _resolve_spec_overlap_tokens (main-style); attribute is the
+        # post-iter value, no channel resolve needed.
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].relayer_resolve_kv_committed_len() > 0
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
@@ -1463,17 +1465,21 @@ class DecodeTransferQueue:
             decode_req.req.hidden_states_tensor = output_hidden_states
 
         if decode_req.req.return_logprob:
-            decode_req.req.output_token_logprobs_val.append(
+            decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
-            decode_req.req.output_token_logprobs_idx.append(
+            decode_req.req.logprob.output_token_logprobs_idx.append(
                 output_token_logprobs_idx[0].item()
             )
-            decode_req.req.output_top_logprobs_val.append(
-                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_val.append(
+                output_top_logprobs_val[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
-            decode_req.req.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
 
         decode_req.kv_receiver.clear()

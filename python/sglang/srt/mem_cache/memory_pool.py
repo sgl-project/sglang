@@ -165,13 +165,13 @@ class ReqToTokenPool:
         # https://github.com/sgl-project/sglang/pull/20476
         # if not any(r.is_dllm() for r in reqs):
         #     assert (
-        #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+        #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
-        # Read kv_committed_len via the Relayer cpu_value channel when each
-        # req has a kv_committed ctx attached (set by process_batch_result);
-        # falls back to the attribute when not.
+        # ``req.kv_committed_len`` is updated in place by
+        # _resolve_spec_overlap_tokens (main-style), so the attribute is
+        # already the post-iter value; no channel resolve needed.
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].relayer_resolve_kv_committed_len() > 0
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
