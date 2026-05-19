@@ -39,13 +39,7 @@ def _alloc_state(ring_capacity: int = 32) -> dict:
         violation_ring=torch.zeros(
             ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device="cuda"
         ),
-        violation_ring_valid=torch.zeros(
-            ring_capacity, dtype=torch.int32, device="cuda"
-        ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device="cuda"),
-        first_violation_set=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        is_errored=torch.zeros(1, dtype=torch.int32, device="cuda"),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device="cuda"),
         kernel_run_counter=torch.zeros(1, dtype=torch.int64, device="cuda"),
     )
@@ -92,11 +86,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         plan=plan,
         seed=_SEED,
         violation_ring=state["violation_ring"],
-        violation_ring_valid=state["violation_ring_valid"],
         violation_write_index=state["violation_write_index"],
-        first_violation=state["first_violation"],
-        first_violation_set=state["first_violation_set"],
-        is_errored=state["is_errored"],
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=KERNEL_KIND_HEAD,
@@ -121,7 +111,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
 
     # Counters reflect work done.
     assert int(state["slot_run_counter"].item()) == n
-    assert int(state["is_errored"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
 
 
 def test_python_splitmix64_mix_zero_inputs_are_zero():

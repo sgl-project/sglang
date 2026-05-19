@@ -39,13 +39,7 @@ def _alloc_state(ring_capacity: int = 64) -> dict:
         violation_ring=torch.zeros(
             ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device="cuda"
         ),
-        violation_ring_valid=torch.zeros(
-            ring_capacity, dtype=torch.int32, device="cuda"
-        ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device="cuda"),
-        first_violation_set=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        is_errored=torch.zeros(1, dtype=torch.int32, device="cuda"),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device="cuda"),
         kernel_run_counter=torch.zeros(1, dtype=torch.int64, device="cuda"),
     )
@@ -121,11 +115,7 @@ def _run(
         plan=plan,
         seed=seed,
         violation_ring=state["violation_ring"],
-        violation_ring_valid=state["violation_ring_valid"],
         violation_write_index=state["violation_write_index"],
-        first_violation=state["first_violation"],
-        first_violation_set=state["first_violation_set"],
-        is_errored=state["is_errored"],
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=kernel_kind,
@@ -171,7 +161,7 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    assert int(state["is_errored"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
     assert int(state["slot_run_counter"].item()) == 3
     # Recompute the expected chain in Python and bit-wise-match the stored prev_hash.
     expected_prev = _SEED
@@ -231,8 +221,7 @@ def test_verify_clean_round_trip_no_violation():
         state=state,
         kernel_kind=KERNEL_KIND_TAIL,
     )
-    assert int(state["is_errored"].item()) == 0
-    assert int(state["first_violation_set"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
 
 
 def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
@@ -276,8 +265,8 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
         kernel_kind=KERNEL_KIND_TAIL,
     )
 
-    assert int(state["is_errored"].item()) == 1
-    first = state["first_violation"].cpu().tolist()
+    assert int(state["violation_write_index"].item()) >= 1
+    first = state["violation_ring"][0].cpu().tolist()
     assert int(first[1]) == FailReason.POSITION_MONOTONIC.value
 
 
@@ -327,8 +316,8 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         kernel_kind=KERNEL_KIND_TAIL,
     )
 
-    assert int(state["is_errored"].item()) == 1
-    first = state["first_violation"].cpu().tolist()
+    assert int(state["violation_write_index"].item()) >= 1
+    first = state["violation_ring"][0].cpu().tolist()
     assert int(first[1]) == FailReason.HASH.value
 
 
@@ -384,8 +373,7 @@ def test_verify_skips_chain_check_on_sentinel():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    assert int(state["is_errored"].item()) == 0
-    assert int(state["first_violation_set"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
 
     # Also corrupt slot[0].real_kv_hash (field index 3). With real_kv mode
     # OFF the expected real_kv_hash is 0; a non-zero stored value must
@@ -415,8 +403,8 @@ def test_verify_skips_chain_check_on_sentinel():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    assert int(state["is_errored"].item()) == 1
-    first = state["first_violation"].cpu().tolist()
+    assert int(state["violation_write_index"].item()) >= 1
+    first = state["violation_ring"][0].cpu().tolist()
     assert int(first[1]) == FailReason.REAL_KV_HASH.value
 
 
@@ -444,7 +432,7 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
     )
 
     # Every active mask is 0: kernel must be a no-op on slot I/O and counters.
-    assert int(state["is_errored"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
     assert int(state["slot_run_counter"].item()) == 0
     # But the kernel_run_counter still increments — that's what the
     # host-side health monitor uses to detect "kernel actually launched".
@@ -493,7 +481,7 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
         kernel_kind=KERNEL_KIND_HEAD,
     )
 
-    assert int(state["is_errored"].item()) == 0
+    assert int(state["violation_write_index"].item()) == 0
     assert int(state["slot_run_counter"].item()) == 0
     assert int(state["kernel_run_counter"].item()) >= 1
 
@@ -537,7 +525,7 @@ def test_first_violation_preserved_across_cascading_mismatches():
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
-    first_after_initial = state["first_violation"].cpu().tolist()
+    first_after_initial = state["violation_ring"][0].cpu().tolist()
 
     # Cascade: 20 more verify launches with wrong positions on slots 1..3.
     for _ in range(20):
@@ -558,8 +546,9 @@ def test_first_violation_preserved_across_cascading_mismatches():
             kernel_kind=KERNEL_KIND_HEAD,
         )
 
-    # first_violation row must be byte-identical to the first observed one.
-    first_after_cascade = state["first_violation"].cpu().tolist()
+    # violation_ring[0] must be byte-identical to the first observed row —
+    # the atomicAdd ``seq == 0`` winner owns it permanently.
+    first_after_cascade = state["violation_ring"][0].cpu().tolist()
     assert first_after_initial == first_after_cascade
     # The write_index has advanced past ring capacity.
     assert int(state["violation_write_index"].item()) > 4
@@ -577,11 +566,7 @@ def test_first_violation_preserved_across_cascading_mismatches():
 _DIFFERENTIAL_OUTPUT_FIELDS = (
     "dst_buf",
     "violation_ring",
-    "violation_ring_valid",
     "violation_write_index",
-    "first_violation",
-    "first_violation_set",
-    "is_errored",
     "slot_run_counter",
     "kernel_run_counter",
 )
@@ -600,13 +585,7 @@ def _alloc_diff_state(
         violation_ring=torch.zeros(
             ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
         ),
-        violation_ring_valid=torch.zeros(
-            ring_capacity, dtype=torch.int32, device=device
-        ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
-        first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device=device),
-        first_violation_set=torch.zeros(1, dtype=torch.int32, device=device),
-        is_errored=torch.zeros(1, dtype=torch.int32, device=device),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
         kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
     )
@@ -735,11 +714,7 @@ def _run_differential(
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_cuda["violation_ring"],
-        violation_ring_valid=state_cuda["violation_ring_valid"],
         violation_write_index=state_cuda["violation_write_index"],
-        first_violation=state_cuda["first_violation"],
-        first_violation_set=state_cuda["first_violation_set"],
-        is_errored=state_cuda["is_errored"],
         slot_run_counter=state_cuda["slot_run_counter"],
         kernel_run_counter=state_cuda["kernel_run_counter"],
         real_kv_buf=real_kv_buf_cuda,
@@ -754,11 +729,7 @@ def _run_differential(
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_ref["violation_ring"],
-        violation_ring_valid=state_ref["violation_ring_valid"],
         violation_write_index=state_ref["violation_write_index"],
-        first_violation=state_ref["first_violation"],
-        first_violation_set=state_ref["first_violation_set"],
-        is_errored=state_ref["is_errored"],
         slot_run_counter=state_ref["slot_run_counter"],
         kernel_run_counter=state_ref["kernel_run_counter"],
         real_kv_buf=real_kv_buf_ref,
@@ -938,8 +909,8 @@ def _scenario_mixed_write_and_verify() -> dict:
 
 def _scenario_first_violation_latch_preserved() -> dict:
     # Two verify entries on the same req, both hit POSITION mismatch (stored
-    # positions are 0/1, expected are 888/999). The first-violation latch
-    # must preserve entry 0's row across the cascade.
+    # positions are 0/1, expected are 888/999). violation_ring[0] (the
+    # atomicAdd ``seq == 0`` winner) must preserve entry 0's row across the cascade.
     plan = _empty_plan_lists()
     plan.update(
         verify_slot_indices=[0, 1],
@@ -1014,8 +985,8 @@ def _scenario_large_k_req_1w() -> dict:
 
 
 def _scenario_ring_buffer_small_capacity() -> dict:
-    # Exactly one mismatch is enough to populate first_violation + one
-    # ring row; keeps us in the single-producer-per-row regime where the
+    # Exactly one mismatch is enough to populate one ring row;
+    # keeps us in the single-producer-per-row regime where the
     # torch reference and the CUDA kernel agree bit-wise.
     plan = _empty_plan_lists()
     plan.update(
@@ -1223,11 +1194,7 @@ def _prefill_buffer_with_chain(
         seed=_SEED,
         kernel_kind=KERNEL_KIND_HEAD,
         violation_ring=state["violation_ring"],
-        violation_ring_valid=state["violation_ring_valid"],
         violation_write_index=state["violation_write_index"],
-        first_violation=state["first_violation"],
-        first_violation_set=state["first_violation_set"],
-        is_errored=state["is_errored"],
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         real_kv_buf=real_kv_buf,
@@ -1343,5 +1310,7 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
 
     expected_fail_reason = scenario.get("expected_fail_reason")
     if expected_fail_reason is not None:
-        assert int(state_cuda["is_errored"].item()) == 1
-        assert int(state_cuda["first_violation"][1].item()) == int(expected_fail_reason)
+        assert int(state_cuda["violation_write_index"].item()) >= 1
+        assert int(state_cuda["violation_ring"][0, 1].item()) == int(
+            expected_fail_reason
+        )

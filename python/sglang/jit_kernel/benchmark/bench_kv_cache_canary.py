@@ -65,15 +65,7 @@ def _build_state(*, num_slots: int, ring_capacity: int = 256) -> dict:
         violation_ring=torch.zeros(
             ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=DEFAULT_DEVICE
         ),
-        violation_ring_valid=torch.zeros(
-            ring_capacity, dtype=torch.int32, device=DEFAULT_DEVICE
-        ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device=DEFAULT_DEVICE),
-        first_violation=torch.zeros(
-            VIOLATION_FIELDS, dtype=torch.int64, device=DEFAULT_DEVICE
-        ),
-        first_violation_set=torch.zeros(1, dtype=torch.int32, device=DEFAULT_DEVICE),
-        is_errored=torch.zeros(1, dtype=torch.int32, device=DEFAULT_DEVICE),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device=DEFAULT_DEVICE),
         kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=DEFAULT_DEVICE),
     )
@@ -128,11 +120,7 @@ def _launch(
         plan=plan,
         seed=_SEED,
         violation_ring=state["violation_ring"],
-        violation_ring_valid=state["violation_ring_valid"],
         violation_write_index=state["violation_write_index"],
-        first_violation=state["first_violation"],
-        first_violation_set=state["first_violation_set"],
-        is_errored=state["is_errored"],
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=KERNEL_KIND_HEAD,
