@@ -13,7 +13,7 @@ normal ``GenerationBatchResult``.
 """
 
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import mlx.core as mx
 import torch
@@ -27,6 +27,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 logger = logging.getLogger(__name__)
 
@@ -127,27 +130,52 @@ class MlxTpModelWorker(TpModelWorker):
 
     def _decode_with_sampling(
         self, batch: ScheduleBatch, req_ids: list[str]
-    ) -> list[int]:
+    ) -> tuple[list[int], "LogitsProcessorOutput"]:
         """Run a pure-decode forward pass and route the logits through
         sglang's sampler (temperature / top-k / top-p / penalties) instead
         of MLX-side greedy argmax.
 
-        Only used in the ``forward_mode.is_decode()`` branch — prefill /
-        extend remain greedy in this phase. Returns the next token ids in
-        ``req_ids`` order, matching the contract of
-        ``MlxModelRunner.decode_batch``.
+        Mirrors the CUDA path's ModelRunner.sample(): calls
+        ``_preprocess_logits`` (which applies vocab_mask, penalties via
+        ``penalizer_orchestrator``, and ``logit_bias``) before the sampler,
+        and uses ``clamp_position(seq_lens)`` so seeded sampling matches
+        the standard contract.
+
+        Returns ``(next_token_ids, logits_output)`` — the populated
+        ``LogitsProcessorOutput`` so logprob / top_logprob requests can
+        be served downstream.
         """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import clamp_position
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
 
         pending, lazy_logits = self._mlx_runner.decode_batch_logits(req_ids)
         logits_cpu = mlx_to_torch(lazy_logits, device="cpu")
 
-        positions = batch.seq_lens
-        if positions is None:
+        if batch.seq_lens is not None:
+            positions = clamp_position(batch.seq_lens)
+        else:
             positions = torch.zeros(len(req_ids), dtype=torch.long)
 
         logits_output = LogitsProcessorOutput(next_token_logits=logits_cpu)
+
+        # CUDA-side equivalent: ModelRunner._preprocess_logits ->
+        # sampling_info.apply_logits_bias. We hand-roll the same effect here
+        # but skip penalizer_orchestrator.apply: the penalty kernels are wrapped
+        # in torch.compile, which dispatches to Triton — unsupported on Apple
+        # Silicon. Repetition / frequency / presence penalties therefore remain
+        # in-scope only when the Triton-free path lands (planned follow-up).
+        sinfo = batch.sampling_info
+        sinfo.update_regex_vocab_mask()
+        if sinfo.vocab_mask is not None:
+            sinfo.apply_mask_func(
+                logits=logits_output.next_token_logits,
+                vocab_mask=sinfo.vocab_mask,
+            )
+        if sinfo.logit_bias is not None:
+            logits_output.next_token_logits.add_(sinfo.logit_bias)
+        sinfo.vocab_mask = None  # release like _preprocess_logits does
+
         next_token_ids = self._model_runner.sampler(
             logits_output,
             batch.sampling_info,
@@ -157,7 +185,8 @@ class MlxTpModelWorker(TpModelWorker):
             positions,
         )
         sampled = [int(t) for t in next_token_ids.tolist()]
-        return self._mlx_runner.decode_batch_commit(pending, sampled)
+        committed = self._mlx_runner.decode_batch_commit(pending, sampled)
+        return committed, logits_output
 
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
@@ -177,6 +206,11 @@ class MlxTpModelWorker(TpModelWorker):
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         next_token_ids_list: list[int] = []
+        # Populated only on the --mlx-enable-sampling decode path. When set,
+        # carries the sampler's annotated next-token logprobs / top-logprobs so
+        # the scheduler can serve return_logprob=True requests without crashing
+        # on a None next_token_logprobs.tolist().
+        sampled_logits_output: Optional["LogitsProcessorOutput"] = None
 
         if forward_mode.is_extend():
             # Ensure pool is up-to-date before PoolBackedCache reads it
@@ -248,7 +282,9 @@ class MlxTpModelWorker(TpModelWorker):
                 and batch.sampling_info is not None
                 and getattr(self._model_runner, "sampler", None) is not None
             ):
-                next_token_ids_list = self._decode_with_sampling(batch, req_ids)
+                next_token_ids_list, sampled_logits_output = self._decode_with_sampling(
+                    batch, req_ids
+                )
             else:
                 next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
 
@@ -262,7 +298,11 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=(
+                sampled_logits_output
+                if sampled_logits_output is not None
+                else LogitsProcessorOutput(next_token_logits=None)
+            ),
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )
