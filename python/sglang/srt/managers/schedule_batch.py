@@ -2446,10 +2446,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
+        # Use event.wait() (stream-level wait) instead of .synchronize()
+        # (CPU block). Schedule-stream prep ops following this call get
+        # ordered after the forward-stream verify via the wait; CPU is not
+        # blocked. Subsequent .cpu()/.item() naturally sync the stream.
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+                draft_input.verify_done.wait()
 
     def filter_batch(
         self,
