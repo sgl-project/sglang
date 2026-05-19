@@ -134,8 +134,12 @@ def canary_write_step(
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
     - Advance ``running_prev_hash = splitmix64(prev XOR token XOR position XOR real_kv_hash)``.
 
-    Initial ``running_prev_hash``: from ``canary_buf[plan.write_seed_slot_indices[r]]``'s stored prev_hash field
-    when ``seed_slot_idx >= 0``, else ``splitmix64(CANARY_CHAIN_ANCHOR)``. ``write_seed_slot_indices`` is already
+    Initial ``running_prev_hash`` when ``seed_slot_idx >= 0``: load the 4 int64 fields from
+    ``canary_buf[plan.write_seed_slot_indices[r]]`` and set
+    ``running_prev_hash = splitmix64(seed.prev_hash XOR seed.token XOR seed.position XOR seed.real_kv_hash)``
+    (i.e. apply the same advance step that produced ``seed``'s successor — this keeps slot[0]'s stored
+    ``prev_hash`` consistent with §6.1's chain link). Else
+    ``running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)``. ``write_seed_slot_indices`` is already
     SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (§6.1, no runtime seed).
 
     Pseudo-mode (caller-driven, kernel is oracle-agnostic): when ``pseudo_mode == ON`` the kernel additionally
@@ -187,8 +191,9 @@ def canary_write_step(
         - Per block, early-exit on r >= plan.write_num_valid_reqs[0]. Else load entry_start = plan.write_offsets[r],
           entry_count = plan.write_offsets[r+1] - entry_start, seed_slot_idx = plan.write_seed_slot_indices[r] into
           registers.
-        - Initialize running_prev_hash: if seed_slot_idx >= 0, load 4 int64 fields from canary_buf[seed_slot_idx]
-          and use the stored prev_hash field; else running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR).
+        - Initialize running_prev_hash: if seed_slot_idx >= 0, load the 4 int64 fields from
+          canary_buf[seed_slot_idx] and set running_prev_hash = splitmix64(prev_hash XOR token XOR position XOR
+          real_kv_hash); else running_prev_hash = splitmix64(kCanaryChainAnchor).
         - Serial chain loop `for j in range(entry_count)`:
               i = entry_start + j;
               slot_full = fb_out_cache_loc[i];
