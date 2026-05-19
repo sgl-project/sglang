@@ -44,6 +44,19 @@ def _reshape_kv_for_fia_nz(
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
 
+def _restore_kv_from_fia_nz(
+    tensor: torch.Tensor, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Restore NZ-laid MLA cache to token-major [num_page, page, 1, head_dim]."""
+    num_pages = tensor.shape[0]
+    return (
+        tensor.view(num_pages, head_dim // 16, page_size, 16)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(num_pages, page_size, 1, head_dim)
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1227,6 +1240,13 @@ class AscendAttnBackend(AttentionBackend):
                 v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
                     layer.layer_id
                 )
+                if is_fia_nz():
+                    k_buffer = _restore_kv_from_fia_nz(
+                        k_buffer, self.kv_lora_rank, self.page_size
+                    )
+                    v_buffer = _restore_kv_from_fia_nz(
+                        v_buffer, self.qk_rope_head_dim, self.page_size
+                    )
                 kv_cached = torch.index_select(
                     k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
                 )
@@ -1339,6 +1359,13 @@ class AscendAttnBackend(AttentionBackend):
                 v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
                     layer.layer_id
                 )
+                if is_fia_nz():
+                    k_buffer = _restore_kv_from_fia_nz(
+                        k_buffer, self.kv_lora_rank, self.page_size
+                    )
+                    v_buffer = _restore_kv_from_fia_nz(
+                        v_buffer, self.qk_rope_head_dim, self.page_size
+                    )
                 kv_cached = torch.index_select(
                     k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
                 )
