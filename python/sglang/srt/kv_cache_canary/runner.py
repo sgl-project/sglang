@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 
 _LOG_RATE_LIMIT_SECONDS: float = 5.0
 
+_FAIL_REASON_DESCRIPTIONS: Dict[int, str] = {
+    int(FailReason.NONE): "no failure",
+    int(FailReason.REQ_ID): "slot's stored req_id does not match the verifying req",
+    int(FailReason.TOKEN_ID): "slot's stored token_id does not match the write entry",
+    int(FailReason.POSITION): "slot's stored position does not match the write entry",
+    int(FailReason.HASH): "slot's chain hash diverged from splitmix64 recomputation",
+    int(
+        FailReason.POSITION_MONOTONIC
+    ): "verify-time position does not match what was written",
+    int(FailReason.REAL_KV_HASH): "real-KV slot bytes changed underneath the canary",
+}
+
+
+def _fail_reason_description(reason: int) -> str:
+    return _FAIL_REASON_DESCRIPTIONS.get(reason, "unknown")
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _RealKvKernelArgs:
@@ -537,6 +553,19 @@ class CanaryRunner:
     def _format_violation(
         kind: str, first_violation: List[int], write_index: int
     ) -> str:
+        """Format a violation row as a labelled, multi-line error message.
+
+        The kernel records the *actual* req_id / token_id / position read
+        from the slot at the moment the canary detected the mismatch.
+        ``expected_hash`` / ``actual_hash`` carry the expected vs actual
+        ``prev_hash`` for HASH-class violations and the expected vs actual
+        ``real_kv_hash`` for REAL_KV_HASH. For REQ_ID and
+        POSITION_MONOTONIC the canary knows the expected value at
+        kernel-side but it is not currently recorded in the violation
+        row; the reported ``req_id`` / ``position`` are still the *actual*
+        slot contents, which is what an investigator needs to chase the
+        miswritten slot.
+        """
         (
             kernel_kind,
             fail_reason,
@@ -552,11 +581,26 @@ class CanaryRunner:
             reason_name = FailReason(int(fail_reason)).name
         except ValueError:
             reason_name = f"unknown({int(fail_reason)})"
-        return (
-            f"kv-canary violation: kind={kind} kernel_kind={int(kernel_kind)} "
-            f"fail_reason={reason_name} slot_idx={int(slot_idx)} "
-            f"req_id={int(req_id)} token_id={int(token_id)} position={int(position)} "
-            f"expected_hash={int(expected_hash) & u64_mask:#x} "
-            f"actual_hash={int(actual_hash) & u64_mask:#x} "
-            f"(total violations recorded: {write_index})"
-        )
+        kernel_label = {0: "HEAD", 1: "TAIL"}.get(int(kernel_kind), str(kernel_kind))
+
+        lines = [
+            "kv-canary violation:",
+            f"  shadow_kind:       {kind} (one of head_k/head_v/tail_k/tail_v)",
+            f"  kernel_kind:       {kernel_label}",
+            f"  fail_reason:       {reason_name} ({_fail_reason_description(int(fail_reason))})",
+            f"  slot_idx:          {int(slot_idx)}",
+            f"  actual req_id:     {int(req_id)}",
+            f"  actual token_id:   {int(token_id)}",
+            f"  actual position:   {int(position)}",
+        ]
+        if int(fail_reason) in (
+            int(FailReason.HASH),
+            int(FailReason.REAL_KV_HASH),
+        ):
+            lines += [
+                f"  expected_hash:     {int(expected_hash) & u64_mask:#018x}",
+                f"  actual_hash:       {int(actual_hash) & u64_mask:#018x}",
+                f"  hash_xor_diff:     {(int(expected_hash) ^ int(actual_hash)) & u64_mask:#018x}",
+            ]
+        lines.append(f"  total_violations:  {write_index} (since last reset)")
+        return "\n".join(lines)
