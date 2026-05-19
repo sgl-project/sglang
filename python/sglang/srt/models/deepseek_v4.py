@@ -1227,7 +1227,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
+        if _FP8_WO_A_GEMM and not is_sm120_supported():
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
