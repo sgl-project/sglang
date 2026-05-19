@@ -152,7 +152,8 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
@@ -1450,17 +1451,21 @@ class DecodeTransferQueue:
             decode_req.req.hidden_states_tensor = output_hidden_states
 
         if decode_req.req.return_logprob:
-            decode_req.req.output_token_logprobs_val.append(
+            decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
-            decode_req.req.output_token_logprobs_idx.append(
+            decode_req.req.logprob.output_token_logprobs_idx.append(
                 output_token_logprobs_idx[0].item()
             )
-            decode_req.req.output_top_logprobs_val.append(
-                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_val.append(
+                output_top_logprobs_val[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
-            decode_req.req.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
 
         decode_req.kv_receiver.clear()
