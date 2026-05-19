@@ -36,8 +36,8 @@ on:
         required: false
         type: boolean
         default: false
-      skip_stage_health_check:
-        description: "Skip stage health check fast-fail (e.g. for release branch cuts)"
+      skip_pr_test_health_check:
+        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
@@ -50,7 +50,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ (inputs.skip_stage_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -96,7 +96,7 @@ jobs:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
   # =============================================== extra-a (1-/2-gpu) ===============================================
