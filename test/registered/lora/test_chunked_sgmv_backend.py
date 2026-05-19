@@ -37,6 +37,7 @@ def reset_kernel_cache():
     _chunked_lora_expand_kernel._clear_cache()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class BatchComposition(Enum):
     UNIFORM = "uniform"
     MIXED = "mixed"
