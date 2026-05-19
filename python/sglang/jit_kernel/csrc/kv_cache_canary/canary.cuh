@@ -17,7 +17,7 @@ constexpr int kCanaryFieldPosition = 2;
 constexpr int kCanaryFieldPrevHash = 3;
 constexpr int kCanaryFieldRealKvHash = 4;
 
-constexpr int kViolationFields = 8;
+constexpr int kViolationFields = 10;
 constexpr int kViolationFieldKernelKind = 0;
 constexpr int kViolationFieldFailReason = 1;
 constexpr int kViolationFieldSlotIdx = 2;
@@ -26,6 +26,8 @@ constexpr int kViolationFieldTokenId = 4;
 constexpr int kViolationFieldPosition = 5;
 constexpr int kViolationFieldExpectedHash = 6;
 constexpr int kViolationFieldActualHash = 7;
+constexpr int kViolationFieldExpectedReqId = 8;
+constexpr int kViolationFieldExpectedPosition = 9;
 
 constexpr int kFailReasonReqId = 1;
 constexpr int kFailReasonTokenId = 2;
@@ -176,7 +178,9 @@ SGL_DEVICE void record_violation(
     int64_t token_id,
     int64_t position,
     uint64_t expected_hash,
-    uint64_t actual_hash) {
+    uint64_t actual_hash,
+    int64_t expected_req_id,
+    int64_t expected_position) {
   int64_t entry[kViolationFields];
   entry[kViolationFieldKernelKind] = static_cast<int64_t>(p.kernel_kind);
   entry[kViolationFieldFailReason] = static_cast<int64_t>(fail_reason);
@@ -186,6 +190,8 @@ SGL_DEVICE void record_violation(
   entry[kViolationFieldPosition] = position;
   entry[kViolationFieldExpectedHash] = static_cast<int64_t>(expected_hash);
   entry[kViolationFieldActualHash] = static_cast<int64_t>(actual_hash);
+  entry[kViolationFieldExpectedReqId] = expected_req_id;
+  entry[kViolationFieldExpectedPosition] = expected_position;
 
   // First-violation latch: only the first writer wins; ensures the very first
   // mismatch is preserved verbatim even if subsequent cascades overrun the ring.
@@ -284,7 +290,16 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   }
   if (fail_reason != 0) {
     record_violation(
-        p, fail_reason, slot_idx, actual_req_id, actual_token_id, actual_position, reported_expected, reported_actual);
+        p,
+        fail_reason,
+        slot_idx,
+        actual_req_id,
+        actual_token_id,
+        actual_position,
+        reported_expected,
+        reported_actual,
+        expected_req_id,
+        expected_position);
   }
   atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
 }

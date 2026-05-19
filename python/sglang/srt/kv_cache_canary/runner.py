@@ -548,16 +548,10 @@ class CanaryRunner:
     ) -> str:
         """Format a violation row as a labelled, multi-line error message.
 
-        The kernel records the *actual* req_id / token_id / position read
-        from the slot at the moment the canary detected the mismatch.
-        ``expected_hash`` / ``actual_hash`` carry the expected vs actual
-        ``prev_hash`` for HASH-class violations and the expected vs actual
-        ``real_kv_hash`` for REAL_KV_HASH. For REQ_ID and
-        POSITION_MONOTONIC the canary knows the expected value at
-        kernel-side but it is not currently recorded in the violation
-        row; the reported ``req_id`` / ``position`` are still the *actual*
-        slot contents, which is what an investigator needs to chase the
-        miswritten slot.
+        Violation row carries both actual fields (read from the slot at
+        violation time) and expected fields (computed by the canary from
+        the live verify plan), so every fail_reason can print a full
+        expected vs actual diff.
         """
         (
             kernel_kind,
@@ -568,6 +562,8 @@ class CanaryRunner:
             position,
             expected_hash,
             actual_hash,
+            expected_req_id,
+            expected_position,
         ) = first_violation
         u64_mask = (1 << 64) - 1
         try:
@@ -582,9 +578,9 @@ class CanaryRunner:
             f"  kernel_kind:       {kernel_label}",
             f"  fail_reason:       {reason_name} ({_fail_reason_description(int(fail_reason))})",
             f"  slot_idx:          {int(slot_idx)}",
-            f"  actual req_id:     {int(req_id)}",
+            f"  req_id:            expected={int(expected_req_id)} actual={int(req_id)}",
+            f"  position:          expected={int(expected_position)} actual={int(position)}",
             f"  actual token_id:   {int(token_id)}",
-            f"  actual position:   {int(position)}",
         ]
         if int(fail_reason) in (
             int(FailReason.HASH),

@@ -365,6 +365,8 @@ class _RefViolationSink:
         position: int,
         expected_hash: int,
         actual_hash: int,
+        expected_req_id: int,
+        expected_position: int,
     ) -> None:
         entry = [
             self._kernel_kind,
@@ -375,6 +377,8 @@ class _RefViolationSink:
             int(position),
             to_signed_int64(expected_hash & _U64_MASK),
             to_signed_int64(actual_hash & _U64_MASK),
+            int(expected_req_id),
+            int(expected_position),
         ]
 
         if self._first_violation_set_host == 0:
@@ -474,6 +478,8 @@ def _run_verify_entries(
                 position=actual_position,
                 expected_hash=expected_hash_field,
                 actual_hash=actual_hash_field,
+                expected_req_id=expected_req_id,
+                expected_position=expected_position,
             )
 
     return active
