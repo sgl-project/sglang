@@ -15,6 +15,8 @@
 import multiprocessing as mp
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.lora_utils import (
     LORA_MODELS_QWEN3,
@@ -29,6 +31,7 @@ register_amd_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3(CustomTestCase):
     def test_ci_lora_models(self):
         run_lora_multiple_batch_on_model_cases(LORA_MODELS_QWEN3)
