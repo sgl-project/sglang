@@ -1,180 +1,88 @@
-"""End-to-end tests for the KV cache canary.
+"""End-to-end canary tests on Qwen3-0.6B.
 
-Covers v1 acceptance items #1 (kernel really runs), #4 (self-test triggers
-violation), and #7 (no TP deadlock on raise — implicit at TP=1 here; the
-unconditional allreduce path is exercised by the host runner regardless).
+Two paired scenarios:
+
+- ``TestKvCacheCanaryCleanRaise``: ``--kv-cache-canary=raise`` with no
+  fault injection. Server must come up and stay healthy under a parallel
+  request burst — any false positive would abort the server.
+- ``TestKvCacheCanaryPerturbRaise``: same config but with
+  ``SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB=0.01``. The canary must
+  fire (either at warmup or under live traffic).
 """
 
 from __future__ import annotations
 
-import os
 import time
 import unittest
+from typing import List
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from test.registered.canary.e2e_base import CanaryE2EBase
 
 _MODEL = "Qwen/Qwen3-0.6B"
 
 register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-small")
 
 
-class TestKvCacheCanaryCleanRaiseMode(CustomTestCase):
-    """Clean run with ``--kv-cache-canary=raise``: no violation expected.
+class TestKvCacheCanaryCleanRaise(CanaryE2EBase):
+    """Clean run with ``--kv-cache-canary=raise``: no violation expected."""
 
-    Using ``raise`` (not ``log``) on the clean path is strictly stronger:
-    any unexpected canary fire will abort the server instead of being
-    silently logged, so the test fails loudly if the canary mis-reports.
-    """
+    model = _MODEL
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = _MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        env = os.environ.copy()
-        # Ensure no perturbation is configured.
-        env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB", None)
-        env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED", None)
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--kv-cache-canary",
-                "raise",
-                # Shadow K/V tensors add ~4× layer-size to the pool; leave
-                # headroom so the canary tensors fit.
-                "--mem-fraction-static",
-                "0.65",
-            ],
-            env=env,
-        )
+    def test_clean_raise_run_stays_healthy(self) -> None:
+        results = self.send_parallel_requests(n=64)
+        bad = [r for r in results if r.get("status_code") != 200]
+        self.assertFalse(bad, f"non-200 responses on clean run: {bad[:3]}")
 
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-    def test_clean_raise_run_stays_healthy(self):
-        # Step 1: send a small batch of generate requests.
-        for i in range(20):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "text": f"hello world {i}",
-                    "sampling_params": {"max_new_tokens": 16, "temperature": 0.0},
-                },
-                timeout=60,
-            )
-            self.assertEqual(response.status_code, 200, response.text)
-
-        # Step 2: allow the side-stream event pump a beat to refresh counters.
+        # Allow the side-stream event pump a beat to refresh counters.
         time.sleep(2.0)
 
-        # Step 3: the server should still be healthy (no raise/abort).
-        health = requests.get(self.base_url + "/health", timeout=10)
-        self.assertEqual(health.status_code, 200)
+        self.assert_health_ok()
 
 
-class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
+class TestKvCacheCanaryPerturbRaise(CanaryE2EBase):
     """Perturb + raise: server must either fail to come up (canary raised
     during warmup) OR die under live traffic. Both outcomes prove the
     raise path is wired.
 
-    Hit-rate note: perturb is active-row-aware (swap is restricted to
-    the in-use ``[0, seq_len)`` range of an active req), so it lands on a
-    column the canary actually verifies. Probability kept at 0.01 so per-
-    forward mismatches stay sparse; over ~20 generate requests this still
-    triggers on a real wiring bug while leaving room for a clean baseline.
+    Perturb is active-row-aware (swap is restricted to the in-use
+    ``[0, seq_len)`` range of an active req), so it lands on a column
+    the canary actually verifies. Probability is 0.01 — sparse enough
+    to keep per-forward mismatches rare, but over ~50 parallel requests
+    we expect a hit.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = _MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        env = os.environ.copy()
-        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB"] = "0.01"
-        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED"] = "42"
-        cls.process = None
-        cls.launch_failed_due_to_raise = False
-        try:
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--kv-cache-canary",
-                    "raise",
-                    "--mem-fraction-static",
-                    "0.65",
-                ],
-                env=env,
-            )
-        except Exception as exc:
-            # popen_launch_server raises when the server doesn't pass
-            # health check. With perturb+raise that's the expected canary
-            # signal (warmup forward tripped the kernel).
-            cls.launch_failed_due_to_raise = True
-            cls.launch_exception = exc
+    model = _MODEL
+    perturb_prob = 0.01
+    perturb_seed = 42
+    allow_launch_failure = True
 
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+    def test_perturbation_triggers_canary_violation(self) -> None:
+        if self.launch_failed:
+            return  # canary raised during warmup; expected signal.
 
-    def test_perturbation_triggers_canary_violation(self):
-        if self.launch_failed_due_to_raise:
-            # The canary raised during warmup before the server could
-            # answer /health. That's a successful raise.
-            return
+        results: List[dict] = self.send_parallel_requests(
+            n=128, max_new_tokens=32, timeout=30.0
+        )
+        triggered = any(
+            "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
+        )
 
-        # Server is up despite perturb; drive traffic until canary fires.
-        triggered = False
-        last_status = None
-        for i in range(50):
-            try:
-                response = requests.post(
-                    self.base_url + "/generate",
-                    json={
-                        "text": (
-                            f"The quick brown fox jumps over the lazy dog {i}. "
-                            "Tell me a story about the fox and the dog."
-                        ),
-                        "sampling_params": {
-                            "max_new_tokens": 32,
-                            "temperature": 0.0,
-                        },
-                    },
-                    timeout=30,
-                )
-                last_status = response.status_code
-            except requests.exceptions.RequestException:
-                triggered = True
-                break
-
-            if response.status_code >= 500:
-                triggered = True
-                break
-
+        # Give the server a moment, then probe /health.
         time.sleep(1.5)
         try:
-            health = requests.get(self.base_url + "/health", timeout=5)
-            health_ok = health.status_code == 200
+            health_ok = (
+                requests.get(self.base_url + "/health", timeout=5).status_code == 200
+            )
         except requests.exceptions.RequestException:
             health_ok = False
 
         self.assertTrue(
             triggered or not health_ok,
             f"Expected canary to fire under perturb+raise, but server still "
-            f"healthy and last request status={last_status}",
+            f"healthy and no failed requests; first 3 responses: {results[:3]}",
         )
 
 
