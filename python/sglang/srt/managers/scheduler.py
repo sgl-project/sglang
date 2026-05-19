@@ -1538,12 +1538,22 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        batch = None
+        
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # Process the last batch
+            if self.last_batch:
+                if not disable_overlap_for_batch:
+                    pop_and_process()
+            elif batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.on_idle()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1561,14 +1571,6 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
-
-            # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
