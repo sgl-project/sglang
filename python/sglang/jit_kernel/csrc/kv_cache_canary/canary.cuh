@@ -84,9 +84,9 @@ struct CanaryParams {
   // kSeed". The kernel reads (prev_token, prev_position, prev_prev_hash) from
   // that slot and recomputes splitmix64_mix on-device.
   const int64_t* __restrict__ verify_prev_slot_indices;
-  // 1 = active verify entry, 0 = skip-sentinel padding (cuda graph fixed
-  // buffer capacity exceeds plan size).
-  const int32_t* __restrict__ verify_active_mask;
+  // Number of leading verify entries that are valid; remaining entries are
+  // skip-sentinel padding from cuda graph fixed-capacity buffers.
+  const int32_t* __restrict__ verify_num_valid;
   uint32_t num_verify;
 
   // Per-write-entry arrays, length == num_write. Pure data; read by the
@@ -106,7 +106,7 @@ struct CanaryParams {
   const int64_t* __restrict__ write_req_seed_slot_indices;  // -1 = kSeed
   const int64_t* __restrict__ write_req_entry_starts;
   const int64_t* __restrict__ write_req_entry_counts;
-  const int32_t* __restrict__ write_req_active_mask;
+  const int32_t* __restrict__ write_req_num_valid;
   uint32_t num_write_reqs;
 
   // splitmix64 chain seed (== CanaryConfig.seed).
@@ -262,7 +262,7 @@ SGL_DEVICE void record_violation(
 }
 
 SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
-  if (p.verify_active_mask[tid] == 0) {
+  if (tid >= static_cast<uint32_t>(*p.verify_num_valid)) {
     return;
   }
   const int64_t slot_idx = p.verify_slot_indices[tid];
@@ -338,7 +338,7 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
 }
 
 SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
-  if (p.write_req_active_mask[req_tid] == 0) {
+  if (req_tid >= static_cast<uint32_t>(*p.write_req_num_valid)) {
     return;
   }
   const int64_t entry_start = p.write_req_entry_starts[req_tid];
@@ -451,14 +451,14 @@ void canary_step(
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
-    tvm::ffi::TensorView verify_active_mask,
+    tvm::ffi::TensorView verify_num_valid,
     tvm::ffi::TensorView write_slot_indices,
     tvm::ffi::TensorView write_token_ids,
     tvm::ffi::TensorView write_positions,
     tvm::ffi::TensorView write_req_seed_slot_indices,
     tvm::ffi::TensorView write_req_entry_starts,
     tvm::ffi::TensorView write_req_entry_counts,
-    tvm::ffi::TensorView write_req_active_mask,
+    tvm::ffi::TensorView write_req_num_valid,
     tvm::ffi::TensorView expected_write_token_ids,
     tvm::ffi::TensorView expected_write_positions,
     int64_t seed,
@@ -489,7 +489,7 @@ void canary_step(
       .verify(verify_slot_indices)
       .verify(verify_positions)
       .verify(verify_prev_slot_indices);
-  TensorMatcher({N_verify}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_active_mask);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
 
   TensorMatcher({N_write})
       .with_dtype<int64_t>()
@@ -506,7 +506,7 @@ void canary_step(
       .verify(write_req_seed_slot_indices)
       .verify(write_req_entry_starts)
       .verify(write_req_entry_counts);
-  TensorMatcher({N_write_reqs}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_req_active_mask);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_req_num_valid);
 
   const uint32_t num_verify = static_cast<uint32_t>(N_verify.unwrap());
   const uint32_t num_write_reqs = static_cast<uint32_t>(N_write_reqs.unwrap());
@@ -543,7 +543,7 @@ void canary_step(
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
   p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
-  p.verify_active_mask = static_cast<const int32_t*>(verify_active_mask.data_ptr());
+  p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
   p.num_verify = num_verify;
   p.write_slot_indices = static_cast<const int64_t*>(write_slot_indices.data_ptr());
   p.write_token_ids = static_cast<const int64_t*>(write_token_ids.data_ptr());
@@ -553,7 +553,7 @@ void canary_step(
   p.write_req_seed_slot_indices = static_cast<const int64_t*>(write_req_seed_slot_indices.data_ptr());
   p.write_req_entry_starts = static_cast<const int64_t*>(write_req_entry_starts.data_ptr());
   p.write_req_entry_counts = static_cast<const int64_t*>(write_req_entry_counts.data_ptr());
-  p.write_req_active_mask = static_cast<const int32_t*>(write_req_active_mask.data_ptr());
+  p.write_req_num_valid = static_cast<const int32_t*>(write_req_num_valid.data_ptr());
   p.num_write_reqs = num_write_reqs;
   p.seed = static_cast<uint64_t>(seed);
   p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());

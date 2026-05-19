@@ -103,6 +103,7 @@ def _launch(
     state: dict,
 ) -> None:
     n_verify = len(verify_slot_indices)
+    n_write = len(write_slot_indices)
     n_write_reqs = len(write_req_seed_slot_indices)
     canary_step(
         src_buf=src.flatten(),
@@ -111,14 +112,14 @@ def _launch(
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
-        verify_active_mask=_i32([1] * n_verify if n_verify else [0]),
+        verify_num_valid=_i32([n_verify]),
         write_slot_indices=_i64(write_slot_indices or [0]),
         write_token_ids=_i64(write_token_ids or [0]),
         write_positions=_i64(write_positions or [0]),
         write_req_seed_slot_indices=_i64(write_req_seed_slot_indices or [-1]),
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
-        write_req_active_mask=_i32([1] * n_write_reqs if n_write_reqs else [0]),
+        write_req_num_valid=_i32([n_write_reqs]),
         expected_write_token_ids=_i64(
             [CANARY_EXPECTED_SKIP_SENTINEL] * max(n_write, 1)
         ),

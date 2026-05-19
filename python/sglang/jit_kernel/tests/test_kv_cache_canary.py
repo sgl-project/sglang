@@ -62,6 +62,10 @@ def _i32(values: list[int]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
+def _num_valid(values: list[int]) -> torch.Tensor:
+    return _i32([sum(1 for value in values if value)])
+
+
 def _empty_real_kv() -> torch.Tensor:
     return torch.zeros(1, dtype=torch.uint8, device="cuda")
 
@@ -74,14 +78,14 @@ def _run(
     verify_slot_indices: list[int],
     verify_positions: list[int],
     verify_prev_slot_indices: list[int],
-    verify_active_mask: list[int],
+    verify_num_valid: list[int],
     write_slot_indices: list[int],
     write_token_ids: list[int],
     write_positions: list[int],
     write_req_seed_slot_indices: list[int],
     write_req_entry_starts: list[int],
     write_req_entry_counts: list[int],
-    write_req_active_mask: list[int],
+    write_req_num_valid: list[int],
     state: dict,
     kernel_kind: int,
     seed: int = _SEED,
@@ -106,14 +110,14 @@ def _run(
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
-        verify_active_mask=_i32(verify_active_mask or [0]),
+        verify_num_valid=_num_valid(verify_num_valid),
         write_slot_indices=_i64(write_slot_indices or [0]),
         write_token_ids=_i64(write_token_ids or [0]),
         write_positions=_i64(write_positions or [0]),
         write_req_seed_slot_indices=_i64(write_req_seed_slot_indices or [-1]),
         write_req_entry_starts=_i64(write_req_entry_starts or [0]),
         write_req_entry_counts=_i64(write_req_entry_counts or [0]),
-        write_req_active_mask=_i32(write_req_active_mask or [0]),
+        write_req_num_valid=_num_valid(write_req_num_valid),
         expected_write_token_ids=_i64(expected_write_token_ids),
         expected_write_positions=_i64(expected_write_positions),
         seed=seed,
@@ -159,14 +163,14 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=slot_indices,
         write_token_ids=tokens,
         write_positions=positions,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -203,14 +207,14 @@ def test_verify_clean_round_trip_no_violation():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=slot_indices,
         write_token_ids=tokens,
         write_positions=positions,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -224,14 +228,14 @@ def test_verify_clean_round_trip_no_violation():
         verify_slot_indices=slot_indices,
         verify_positions=positions,
         verify_prev_slot_indices=[-1, slot_indices[0], slot_indices[1]],
-        verify_active_mask=[1, 1, 1],
+        verify_num_valid=[1, 1, 1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_TAIL,
     )
@@ -251,14 +255,14 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=[0],
         write_token_ids=[42],
         write_positions=[0],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -272,14 +276,14 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
         verify_slot_indices=[0],
         verify_positions=[5],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_TAIL,
     )
@@ -302,14 +306,14 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=[0],
         write_token_ids=[42],
         write_positions=[0],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -327,14 +331,14 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_TAIL,
     )
@@ -362,14 +366,14 @@ def test_verify_skips_chain_check_on_sentinel():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=[0],
         write_token_ids=[42],
         write_positions=[0],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -388,14 +392,14 @@ def test_verify_skips_chain_check_on_sentinel():
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -421,14 +425,14 @@ def test_verify_skips_chain_check_on_sentinel():
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -451,14 +455,14 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
         verify_prev_slot_indices=[-1, 0],
-        verify_active_mask=[0, 0],
+        verify_num_valid=[0, 0],
         write_slot_indices=[0, 1, 2],
         write_token_ids=[10, 20, 30],
         write_positions=[0, 1, 2],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
-        write_req_active_mask=[0],
+        write_req_num_valid=[0],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -503,14 +507,14 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[0],
+        verify_num_valid=[0],
         write_slot_indices=[0],
         write_token_ids=[0],
         write_positions=[0],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[0],
-        write_req_active_mask=[0],
+        write_req_num_valid=[0],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -532,14 +536,14 @@ def test_first_violation_preserved_across_cascading_mismatches():
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=[0, 1, 2, 3],
         write_token_ids=[10, 20, 30, 40],
         write_positions=[0, 1, 2, 3],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[4],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -552,14 +556,14 @@ def test_first_violation_preserved_across_cascading_mismatches():
         verify_slot_indices=[0],
         verify_positions=[7],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
         state=state,
         kernel_kind=KERNEL_KIND_HEAD,
     )
@@ -574,14 +578,14 @@ def test_first_violation_preserved_across_cascading_mismatches():
             verify_slot_indices=[1, 2, 3],
             verify_positions=[99, 98, 97],
             verify_prev_slot_indices=[0, 1, 2],
-            verify_active_mask=[1, 1, 1],
+            verify_num_valid=[1, 1, 1],
             write_slot_indices=[],
             write_token_ids=[],
             write_positions=[],
             write_req_seed_slot_indices=[],
             write_req_entry_starts=[],
             write_req_entry_counts=[],
-            write_req_active_mask=[],
+            write_req_num_valid=[],
             state=state,
             kernel_kind=KERNEL_KIND_HEAD,
         )
@@ -653,6 +657,10 @@ def _i32_on(values: list[int], device: str) -> torch.Tensor:
     return torch.tensor(values or [0], dtype=torch.int32, device=device)
 
 
+def _num_valid_on(values: list[int], device: str) -> torch.Tensor:
+    return _i32_on([sum(1 for value in values if value)], device)
+
+
 def _build_inputs_on(device: str, **plan_lists) -> dict:
     n_write = max(len(plan_lists["write_slot_indices"]), 1)
     expected_write_token_ids = plan_lists.get("expected_write_token_ids") or (
@@ -667,7 +675,7 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
         verify_prev_slot_indices=_i64_on(
             plan_lists["verify_prev_slot_indices"], device
         ),
-        verify_active_mask=_i32_on(plan_lists["verify_active_mask"], device),
+        verify_num_valid=_num_valid_on(plan_lists["verify_num_valid"], device),
         write_slot_indices=_i64_on(plan_lists["write_slot_indices"], device),
         write_token_ids=_i64_on(plan_lists["write_token_ids"], device),
         write_positions=_i64_on(plan_lists["write_positions"], device),
@@ -676,7 +684,7 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
         ),
         write_req_entry_starts=_i64_on(plan_lists["write_req_entry_starts"], device),
         write_req_entry_counts=_i64_on(plan_lists["write_req_entry_counts"], device),
-        write_req_active_mask=_i32_on(plan_lists["write_req_active_mask"], device),
+        write_req_num_valid=_num_valid_on(plan_lists["write_req_num_valid"], device),
         expected_write_token_ids=_i64_on(expected_write_token_ids, device),
         expected_write_positions=_i64_on(expected_write_positions, device),
     )
@@ -783,14 +791,14 @@ def _empty_plan_lists() -> dict:
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=[],
         write_token_ids=[],
         write_positions=[],
         write_req_seed_slot_indices=[],
         write_req_entry_starts=[],
         write_req_entry_counts=[],
-        write_req_active_mask=[],
+        write_req_num_valid=[],
     )
 
 
@@ -803,7 +811,7 @@ def _scenario_write_only_single_req() -> dict:
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -826,7 +834,7 @@ def _scenario_write_only_multi_req() -> dict:
         write_req_seed_slot_indices=[-1, -1],
         write_req_entry_starts=[0, 2],
         write_req_entry_counts=[2, 2],
-        write_req_active_mask=[1, 1],
+        write_req_num_valid=[1, 1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -844,7 +852,7 @@ def _scenario_verify_only_clean_chain() -> dict:
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
         verify_prev_slot_indices=[-1, 0, 1],
-        verify_active_mask=[1, 1, 1],
+        verify_num_valid=[1, 1, 1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -866,7 +874,7 @@ def _scenario_verify_only_position_mismatch() -> dict:
         verify_slot_indices=[0],
         verify_positions=[5],  # mismatch: slot stored position=0
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -889,7 +897,7 @@ def _scenario_verify_only_hash_mismatch() -> dict:
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -916,14 +924,14 @@ def _scenario_mixed_write_and_verify() -> dict:
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
         verify_prev_slot_indices=[-1, 0],
-        verify_active_mask=[1, 1],
+        verify_num_valid=[1, 1],
         write_slot_indices=[2, 3],
         write_token_ids=[81, 82],
         write_positions=[2, 3],
         write_req_seed_slot_indices=[1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[2],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -948,7 +956,7 @@ def _scenario_first_violation_latch_preserved() -> dict:
         verify_slot_indices=[0, 1],
         verify_positions=[888, 999],
         verify_prev_slot_indices=[-1, 0],
-        verify_active_mask=[1, 1],
+        verify_num_valid=[1, 1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -973,7 +981,7 @@ def _scenario_small_k_req() -> dict:
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[1],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1000,7 +1008,7 @@ def _scenario_large_k_req_1w() -> dict:
         verify_slot_indices=verify_slots,
         verify_positions=positions,
         verify_prev_slot_indices=verify_prev,
-        verify_active_mask=[1] * n,
+        verify_num_valid=[1] * n,
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1025,7 +1033,7 @@ def _scenario_ring_buffer_small_capacity() -> dict:
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
-        verify_active_mask=[1],
+        verify_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1055,14 +1063,14 @@ def _scenario_real_kv_hash_clean_chain(*, mode_int: int, read_bytes: int) -> dic
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
         verify_prev_slot_indices=[-1, 0, 1],
-        verify_active_mask=[1, 1, 1],
+        verify_num_valid=[1, 1, 1],
         write_slot_indices=[0, 1, 2],
         write_token_ids=[101, 202, 303],
         write_positions=[0, 1, 2],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[3],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1106,7 +1114,7 @@ def _scenario_real_kv_hash_corruption_caught() -> dict:
         verify_slot_indices=[0, 1, 2],
         verify_positions=[0, 1, 2],
         verify_prev_slot_indices=[-1, 0, 1],
-        verify_active_mask=[1, 1, 1],
+        verify_num_valid=[1, 1, 1],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1142,14 +1150,14 @@ def _scenario_inactive_mask_skipped() -> dict:
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
         verify_prev_slot_indices=[-1, 0],
-        verify_active_mask=[0, 0],
+        verify_num_valid=[0, 0],
         write_slot_indices=[0, 1],
         write_token_ids=[10, 20],
         write_positions=[0, 1],
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[2],
-        write_req_active_mask=[0],
+        write_req_num_valid=[0],
     )
     return dict(
         slot_stride=CANARY_SLOT_BYTES,
@@ -1209,14 +1217,14 @@ def _prefill_buffer_with_chain(
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
-        verify_active_mask=[],
+        verify_num_valid=[],
         write_slot_indices=slots,
         write_token_ids=tokens,
         write_positions=positions,
         write_req_seed_slot_indices=[-1],
         write_req_entry_starts=[0],
         write_req_entry_counts=[n],
-        write_req_active_mask=[1],
+        write_req_num_valid=[1],
     )
     # Use canary_step itself; result lives in state["dst_buf"], copy to buf.
     if real_kv_buf is None:

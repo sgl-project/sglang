@@ -165,14 +165,14 @@ def canary_step(
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
-    verify_active_mask: torch.Tensor,
+    verify_num_valid: torch.Tensor,
     write_slot_indices: torch.Tensor,
     write_token_ids: torch.Tensor,
     write_positions: torch.Tensor,
     write_req_seed_slot_indices: torch.Tensor,
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
-    write_req_active_mask: torch.Tensor,
+    write_req_num_valid: torch.Tensor,
     expected_write_token_ids: torch.Tensor,
     expected_write_positions: torch.Tensor,
     seed: int,
@@ -229,8 +229,8 @@ def canary_step(
         verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor
                                      the chain on ``seed`` (no predecessor available, e.g. position 0 or an SWA
                                      window head).
-        verify_active_mask:          ``int32 [N_verify]`` — 1 = process, 0 = skip. Lets cuda-graph padding be traced
-                                     without taking effect at replay.
+        verify_num_valid:            ``int32 [1]`` — number of leading verify entries to process. Remaining entries
+                                     are cuda-graph padding and are skipped.
         write_slot_indices,
         write_token_ids,
         write_positions:             ``int64 [N_write]`` — per-slot payload to install, flattened across all
@@ -239,7 +239,7 @@ def canary_step(
                                      or ``-1`` to anchor on ``seed``.
         write_req_entry_starts,
         write_req_entry_counts:      ``int64 [N_write_reqs]`` — slice of the per-slot arrays owned by each write-req.
-        write_req_active_mask:       ``int32 [N_write_reqs]`` — 1 = process, 0 = skip.
+        write_req_num_valid:         ``int32 [1]`` — number of leading write-req rows to process.
         expected_write_token_ids,
         expected_write_positions:    ``int64 [N_write]`` — per-write-entry oracle predictions for the input token and
                                      position. A value of ``-1`` is the skip-sentinel: the kernel skips that entry's
@@ -296,14 +296,14 @@ def canary_step(
         verify_slot_indices,
         verify_positions,
         verify_prev_slot_indices,
-        verify_active_mask,
+        verify_num_valid,
         write_slot_indices,
         write_token_ids,
         write_positions,
         write_req_seed_slot_indices,
         write_req_entry_starts,
         write_req_entry_counts,
-        write_req_active_mask,
+        write_req_num_valid,
         expected_write_token_ids,
         expected_write_positions,
         to_signed_int64(int(seed)),

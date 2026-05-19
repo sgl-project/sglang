@@ -96,14 +96,14 @@ def canary_step_torch_reference(
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
-    verify_active_mask: torch.Tensor,
+    verify_num_valid: torch.Tensor,
     write_slot_indices: torch.Tensor,
     write_token_ids: torch.Tensor,
     write_positions: torch.Tensor,
     write_req_seed_slot_indices: torch.Tensor,
     write_req_entry_starts: torch.Tensor,
     write_req_entry_counts: torch.Tensor,
-    write_req_active_mask: torch.Tensor,
+    write_req_num_valid: torch.Tensor,
     expected_write_token_ids: torch.Tensor,
     expected_write_positions: torch.Tensor,
     seed: int,
@@ -172,14 +172,14 @@ def canary_step_torch_reference(
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
         verify_prev_slot_indices=verify_prev_slot_indices,
-        verify_active_mask=verify_active_mask,
+        verify_num_valid=verify_num_valid,
         write_slot_indices=write_slot_indices,
         write_token_ids=write_token_ids,
         write_positions=write_positions,
         write_req_seed_slot_indices=write_req_seed_slot_indices,
         write_req_entry_starts=write_req_entry_starts,
         write_req_entry_counts=write_req_entry_counts,
-        write_req_active_mask=write_req_active_mask,
+        write_req_num_valid=write_req_num_valid,
         expected_write_token_ids=expected_write_token_ids,
         expected_write_positions=expected_write_positions,
     )
@@ -320,38 +320,43 @@ class _RefPlan:
     def __init__(
         self,
         *,
-        verify_slot_indices: list,
-        verify_positions: list,
-        verify_prev_slot_indices: list,
-        verify_active_mask: list,
-        write_slot_indices: list,
-        write_token_ids: list,
-        write_positions: list,
-        write_req_seed_slot_indices: list,
-        write_req_entry_starts: list,
-        write_req_entry_counts: list,
-        write_req_active_mask: list,
-        expected_write_token_ids: list,
-        expected_write_positions: list,
+        verify_slot_indices: list[int],
+        verify_positions: list[int],
+        verify_prev_slot_indices: list[int],
+        verify_num_valid: int,
+        write_slot_indices: list[int],
+        write_token_ids: list[int],
+        write_positions: list[int],
+        write_req_seed_slot_indices: list[int],
+        write_req_entry_starts: list[int],
+        write_req_entry_counts: list[int],
+        write_req_num_valid: int,
+        expected_write_token_ids: list[int],
+        expected_write_positions: list[int],
     ) -> None:
         self.verify_slot_indices = verify_slot_indices
         self.verify_positions = verify_positions
         self.verify_prev_slot_indices = verify_prev_slot_indices
-        self.verify_active_mask = verify_active_mask
+        self.verify_num_valid = verify_num_valid
         self.write_slot_indices = write_slot_indices
         self.write_token_ids = write_token_ids
         self.write_positions = write_positions
         self.write_req_seed_slot_indices = write_req_seed_slot_indices
         self.write_req_entry_starts = write_req_entry_starts
         self.write_req_entry_counts = write_req_entry_counts
-        self.write_req_active_mask = write_req_active_mask
+        self.write_req_num_valid = write_req_num_valid
         self.expected_write_token_ids = expected_write_token_ids
         self.expected_write_positions = expected_write_positions
 
     @classmethod
     def from_tensors(cls, **tensors: torch.Tensor) -> "_RefPlan":
-        as_list = {k: v.detach().to("cpu").tolist() for k, v in tensors.items()}
-        return cls(**as_list)
+        values: dict[str, int | list[int]] = {}
+        for key, value in tensors.items():
+            if key in {"verify_num_valid", "write_req_num_valid"}:
+                values[key] = int(value.detach().to("cpu").item())
+            else:
+                values[key] = value.detach().to("cpu").tolist()
+        return cls(**values)
 
 
 class _RefViolationSink:
@@ -447,9 +452,9 @@ def _run_verify_entries(
 ) -> int:
     """Walk active verify entries, updating ``sink``. Returns active count."""
     active = 0
-    n = len(plan.verify_active_mask)
+    n = len(plan.verify_slot_indices)
     for tid in range(n):
-        if int(plan.verify_active_mask[tid]) == 0:
+        if tid >= plan.verify_num_valid:
             continue
         active += 1
         slot_idx = int(plan.verify_slot_indices[tid])
@@ -532,9 +537,9 @@ def _run_write_chains(
 ) -> int:
     """Walk active write-req chains, mutating slots. Returns total slot count."""
     active_slots = 0
-    n_reqs = len(plan.write_req_active_mask)
+    n_reqs = len(plan.write_req_seed_slot_indices)
     for req_tid in range(n_reqs):
-        if int(plan.write_req_active_mask[req_tid]) == 0:
+        if req_tid >= plan.write_req_num_valid:
             continue
         entry_start = int(plan.write_req_entry_starts[req_tid])
         entry_count = int(plan.write_req_entry_counts[req_tid])

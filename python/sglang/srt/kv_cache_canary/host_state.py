@@ -594,12 +594,12 @@ class CanaryLaunchBuffers:
 
     1. **Per-verify-entry** (capacity ``verify_capacity``):
        ``verify_slot_indices`` / ``verify_positions`` /
-       ``verify_prev_slot_indices`` / ``verify_active_mask``.
+       ``verify_prev_slot_indices`` / ``verify_num_valid``.
     2. **Per-write-entry** (capacity ``write_capacity``):
        ``write_slot_indices`` / ``write_token_ids`` / ``write_positions``.
     3. **Per-write-req** (capacity ``write_req_capacity``):
        ``write_req_seed_slot_indices`` / ``write_req_entry_starts`` /
-       ``write_req_entry_counts`` / ``write_req_active_mask``.
+       ``write_req_entry_counts`` / ``write_req_num_valid``.
 
     Per-write-entry rows are pure data driven by the write-req chains; the
     grid is sized by ``verify_capacity + write_req_capacity``.
@@ -611,7 +611,7 @@ class CanaryLaunchBuffers:
     verify_slot_indices: torch.Tensor
     verify_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
-    verify_active_mask: torch.Tensor
+    verify_num_valid: torch.Tensor
     write_slot_indices: torch.Tensor
     write_token_ids: torch.Tensor
     write_positions: torch.Tensor
@@ -620,7 +620,7 @@ class CanaryLaunchBuffers:
     write_req_seed_slot_indices: torch.Tensor
     write_req_entry_starts: torch.Tensor
     write_req_entry_counts: torch.Tensor
-    write_req_active_mask: torch.Tensor
+    write_req_num_valid: torch.Tensor
 
     @classmethod
     def allocate(
@@ -657,7 +657,7 @@ class CanaryLaunchBuffers:
             verify_slot_indices=zeros_i64(verify_capacity),
             verify_positions=zeros_i64(verify_capacity),
             verify_prev_slot_indices=zeros_i64(verify_capacity),
-            verify_active_mask=zeros_i32(verify_capacity),
+            verify_num_valid=zeros_i32(1),
             write_slot_indices=zeros_i64(write_capacity),
             write_token_ids=zeros_i64(write_capacity),
             write_positions=zeros_i64(write_capacity),
@@ -666,15 +666,14 @@ class CanaryLaunchBuffers:
             write_req_seed_slot_indices=zeros_i64(write_req_capacity),
             write_req_entry_starts=zeros_i64(write_req_capacity),
             write_req_entry_counts=zeros_i64(write_req_capacity),
-            write_req_active_mask=zeros_i32(write_req_capacity),
+            write_req_num_valid=zeros_i32(1),
         )
 
     def fill_from_plan(self, plan: "BatchPlan") -> Tuple[int, int]:
         """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
 
         Returns ``(num_active_verify, num_active_write_reqs)``. Rows past
-        the active count are reset to inactive (mask = 0) so the kernel
-        skips them. The write-entry tile is also reset past
+        the active count are skipped by the kernel. The write-entry tile is also reset past
         ``plan.num_write`` so a write-req driver that reads
         ``write_*[entry_start + j]`` cannot pick up stale data.
 
@@ -723,9 +722,7 @@ class CanaryLaunchBuffers:
             self.verify_prev_slot_indices[:num_active_verify].copy_(
                 to_i64(plan.verify_prev_slot_indices, v)
             )
-            self.verify_active_mask[:num_active_verify].fill_(1)
-        if num_active_verify < self.verify_capacity:
-            self.verify_active_mask[num_active_verify:].fill_(0)
+        self.verify_num_valid.fill_(num_active_verify)
 
         nw = plan.num_write
         if nw > 0:
@@ -742,9 +739,9 @@ class CanaryLaunchBuffers:
         # Oracle-off callers leave these buffers in their canonical
         # all-sentinel state from allocate(); pseudo-mode rewrites [:nw]
         # and restores the tail. The kernel skips entries where
-        # write_req_active_mask is zero, so the tail being stale doesn't
+        # write_req_num_valid excludes the row, so the tail being stale doesn't
         # produce false violations — but keeping it at the sentinel value
-        # keeps reset_to_skip_sentinel a mask-only no-op (see below).
+        # keeps reset_to_skip_sentinel from touching these buffers (see below).
         if plan.expected_write_token_ids is not None:
             if nw > 0:
                 self.expected_write_token_ids[:nw].copy_(
@@ -768,19 +765,17 @@ class CanaryLaunchBuffers:
             self.write_req_entry_counts[:nwr].copy_(
                 to_i64(plan.write_req_entry_counts, slice(0, nwr))
             )
-            self.write_req_active_mask[:nwr].fill_(1)
-        if nwr < self.write_req_capacity:
-            self.write_req_active_mask[nwr:].fill_(0)
+        self.write_req_num_valid.fill_(nwr)
 
         return num_active_verify, nwr
 
     def reset_to_skip_sentinel(self) -> None:
-        """Reset all active masks so the recorded kernel becomes a no-op.
+        """Reset all active counts so the recorded kernel becomes a no-op.
 
         Used at capture time and at replay-time when no valid plan exists.
         The expected_write_* buffers do not need touching here: the
-        kernel early-exits on a zero write_req_active_mask before reading
+        kernel early-exits on a zero write_req_num_valid before reading
         them.
         """
-        self.verify_active_mask.zero_()
-        self.write_req_active_mask.zero_()
+        self.verify_num_valid.zero_()
+        self.write_req_num_valid.zero_()

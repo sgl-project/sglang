@@ -72,7 +72,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         verify_slot_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_prev_slot_indices=torch.full((1,), -1, dtype=torch.int64, device="cuda"),
-        verify_active_mask=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        verify_num_valid=torch.zeros(1, dtype=torch.int32, device="cuda"),
         write_slot_indices=torch.tensor(slot_indices, dtype=torch.int64, device="cuda"),
         write_token_ids=torch.tensor(tokens, dtype=torch.int64, device="cuda"),
         write_positions=torch.tensor(positions, dtype=torch.int64, device="cuda"),
@@ -81,7 +81,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         ),
         write_req_entry_starts=torch.zeros(1, dtype=torch.int64, device="cuda"),
         write_req_entry_counts=torch.full((1,), n, dtype=torch.int64, device="cuda"),
-        write_req_active_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
+        write_req_num_valid=torch.ones(1, dtype=torch.int32, device="cuda"),
         expected_write_token_ids=torch.full(
             (n,), CANARY_EXPECTED_SKIP_SENTINEL, dtype=torch.int64, device="cuda"
         ),
