@@ -29,6 +29,7 @@ CONVS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestInternlm2(CustomTestCase):
     """Testcase: This test case verifies that the Shanghai_AI_Laboratory/internlm2-7b-reward model can successfully generate reward
     scores for different conversational responses using the SGLang framework, without comparing to a reference implementation.

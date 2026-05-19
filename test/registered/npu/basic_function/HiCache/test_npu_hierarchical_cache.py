@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -15,6 +16,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNPUHierarchicalCache(CustomTestCase):
     """Testcase: HierarchicalCache Test on Ascend NPU.
     Cover scenarios:

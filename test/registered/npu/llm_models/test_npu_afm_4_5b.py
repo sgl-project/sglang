@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import AFM_4_5B_BASE_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -8,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAFM(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the arcee-ai/AFM-4.5B-Base model on the GSM8K dataset is no less than 0.375.
 
