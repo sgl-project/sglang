@@ -62,12 +62,10 @@ constexpr int kRealKvHashModeBit = 1;
 constexpr int kRealKvHashModeAll = 2;
 
 struct CanaryParams {
-  // Source buffer: read prior canary slots from here (verification target,
-  // and the prev-slot read source for chain hash recomputation).
-  const uint8_t* __restrict__ src_buf;
-  // Destination buffer: write the new canary slots here.
-  uint8_t* __restrict__ dst_buf;
-  // Bytes per slot in both src and dst (= per-slot stride of the underlying real-layer-shaped tensor).
+  // Canary buffer: verify reads prior slots from here and write writes new slots here.
+  // Each endpoint is self-verifying — verify and write operate on the same buffer.
+  uint8_t* __restrict__ buf;
+  // Bytes per slot (= per-slot stride of the underlying real-layer-shaped tensor).
   int64_t slot_stride_bytes;
 
   // Per-verify-entry arrays, length == num_verify. NOTE: we do NOT carry
@@ -269,10 +267,10 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   const int64_t expected_position = p.verify_positions[tid];
   const int64_t prev_slot_idx = p.verify_prev_slot_indices[tid];
 
-  const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
-  const int64_t actual_position = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+  const int64_t actual_token_id = load_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+  const int64_t actual_position = load_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
   const uint64_t actual_prev_hash =
-      static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+      static_cast<uint64_t>(load_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
 
   uint64_t expected_prev_hash;
   const bool skip_chain_check = (prev_slot_idx == kSkipChainSentinel);
@@ -282,11 +280,11 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
     expected_prev_hash = p.seed;
   } else {
     const uint64_t prev_prev_hash =
-        static_cast<uint64_t>(load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
-    const int64_t prev_token = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
-    const int64_t prev_position = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+        static_cast<uint64_t>(load_field(p.buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const int64_t prev_token = load_field(p.buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+    const int64_t prev_position = load_field(p.buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
     const uint64_t prev_real_kv_hash =
-        static_cast<uint64_t>(load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+        static_cast<uint64_t>(load_field(p.buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
     expected_prev_hash = splitmix64_mix4(
         prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position), prev_real_kv_hash);
   }
@@ -299,15 +297,15 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   // caught at the next position's verify.
   //
   // The external real-KV fingerprint check (actual vs recomputed) is only
-  // valid when the peer shadow's stored real_kv_hash reflects post-model-
+  // valid when the canary buffer's stored real_kv_hash reflects post-model-
   // write KV bytes. Head writes pre-model-forward (real_kv_hash = hash of
-  // pre-write bytes — garbage for new write positions), so the tail kernel,
-  // whose src is head_shadow, must skip this check; otherwise every alive
-  // slot whose KV was last written by an earlier forward would false-
-  // positive. Head's verify (src=tail_shadow) and sweep (src=tail_shadow)
-  // both read post-write hashes and run the check normally.
+  // pre-write bytes — garbage for new write positions), so the tail kernel
+  // must skip this check on its own (head-written) buffer; otherwise every
+  // alive slot whose KV was last written by an earlier forward would
+  // false-positive. Head's verify and sweep both read post-write hashes and
+  // run the check normally.
   const uint64_t actual_real_kv_hash =
-      static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+      static_cast<uint64_t>(load_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
   const uint64_t expected_real_kv_hash = compute_real_kv_hash(p, slot_idx);
   const bool real_kv_check_enabled = (p.kernel_kind != kKernelKindTail);
 
@@ -357,22 +355,15 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
   if (seed_slot_idx < 0) {
     prev_hash = p.seed;
   } else {
-    // Read seed from OWN dst (this kernel's prior writes), not peer src:
-    // head's real_kv_hash sequence is pre-model-write and tail's is post-
-    // model-write; if either kernel seeded its chain from the peer, that
-    // chain would store one shadow's prev_hash field computed from the
-    // other shadow's real_kv_hash lineage, and the next forward's verify
-    // (which compares an actual loaded from peer against an expected
-    // recomputed from peer) would diverge by exactly that real_kv_hash
-    // delta — a guaranteed HASH false positive on every clean decode.
-    // Each shadow stays internally consistent (head=pre, tail=post) and
-    // the cross-shadow integrity check still runs at verify time.
+    // Each endpoint's chain is self-contained: read the seed slot from
+    // the same buffer we will write into below, so the new entry's
+    // prev_hash is consistent with the on-disk predecessor.
     const uint64_t seed_prev_hash =
-        static_cast<uint64_t>(load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
-    const int64_t seed_token = load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
-    const int64_t seed_position = load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+        static_cast<uint64_t>(load_field(p.buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const int64_t seed_token = load_field(p.buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+    const int64_t seed_position = load_field(p.buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
     const uint64_t seed_real_kv_hash =
-        static_cast<uint64_t>(load_field(p.dst_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+        static_cast<uint64_t>(load_field(p.buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
     prev_hash = splitmix64_mix4(
         seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position), seed_real_kv_hash);
   }
@@ -404,10 +395,10 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
     }
 
     const uint64_t real_kv_hash = compute_real_kv_hash(p, slot_idx);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, token_id);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, position);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(prev_hash));
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash, static_cast<int64_t>(real_kv_hash));
+    store_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, token_id);
+    store_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, position);
+    store_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(prev_hash));
+    store_field(p.buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash, static_cast<int64_t>(real_kv_hash));
 
     prev_hash =
         splitmix64_mix4(prev_hash, static_cast<uint64_t>(token_id), static_cast<uint64_t>(position), real_kv_hash);
@@ -445,8 +436,7 @@ __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
 
 // API source of truth: docstring of canary_step in python/sglang/jit_kernel/kv_cache_canary.py
 void canary_step(
-    tvm::ffi::TensorView src_buf,
-    tvm::ffi::TensorView dst_buf,
+    tvm::ffi::TensorView buf,
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
@@ -483,11 +473,7 @@ void canary_step(
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({N_canary_slots, N_slot_stride})
-      .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(src_buf)
-      .verify(dst_buf);
+  TensorMatcher({N_canary_slots, N_slot_stride}).with_dtype<uint8_t>().with_device<kDLCUDA>(device_).verify(buf);
 
   SymbolicSize N_real_kv_slots = {"num_real_kv_slots"};
   SymbolicSize N_real_kv_stride = {"real_kv_slot_stride_bytes"};
@@ -556,8 +542,7 @@ void canary_step(
   // across warmup / no-work forwards.
 
   CanaryParams p{};
-  p.src_buf = static_cast<const uint8_t*>(src_buf.data_ptr());
-  p.dst_buf = static_cast<uint8_t*>(dst_buf.data_ptr());
+  p.buf = static_cast<uint8_t*>(buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
   p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());

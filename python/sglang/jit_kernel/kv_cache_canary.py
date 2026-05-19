@@ -159,8 +159,7 @@ def get_cpp_constants() -> Dict[str, int]:
 
 def canary_step(
     *,
-    src_buf: torch.Tensor,
-    dst_buf: torch.Tensor,
+    buf: torch.Tensor,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
@@ -191,7 +190,7 @@ def canary_step(
     """One step of the KV-cache canary protocol against the canary buffer.
 
     Shadow slot layout — each logical token tracked by the canary occupies one slot of ``slot_bytes`` bytes
-    in ``src_buf`` / ``dst_buf`` (the second dim of the 2D buffer), holding 4 ``int64`` fields
+    in ``buf`` (the second dim of the 2D buffer), holding 4 ``int64`` fields
     (see ``_CANARY_FIELD_*`` for offsets):
 
     - ``token_id``     — vocab id of the token this slot represents.
@@ -219,10 +218,9 @@ def canary_step(
     in-place mutation of the output tensors listed below.
 
     Args:
-        src_buf:                     ``uint8 [num_slots, slot_bytes]`` — canary tensor that verify reads from. Bytes
-                                     per slot are taken from ``src_buf.shape[1]``.
-        dst_buf:                     ``uint8 [num_slots, slot_bytes]`` — canary tensor that writes land in. Same
-                                     shape as ``src_buf``. Aliasing ``src_buf`` is allowed.
+        buf:                         ``uint8 [num_slots, slot_bytes]`` — canary tensor that both verify reads from
+                                     and write writes into (each endpoint is self-verifying). Bytes per slot are
+                                     taken from ``buf.shape[1]``.
         verify_slot_indices:         ``int64 [N_verify]`` — slot of each verify entry.
         verify_positions:            ``int64 [N_verify]`` — position the caller expects that slot to carry.
         verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor
@@ -290,8 +288,7 @@ def canary_step(
     """
     module = _jit_canary_module()
     module.canary_step(
-        src_buf,
-        dst_buf,
+        buf,
         verify_slot_indices,
         verify_positions,
         verify_prev_slot_indices,

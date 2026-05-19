@@ -88,8 +88,7 @@ def _i32(values: list[int]) -> torch.Tensor:
 
 def _launch(
     *,
-    src: torch.Tensor,
-    dst: torch.Tensor,
+    buf: torch.Tensor,
     verify_slot_indices: list[int],
     verify_positions: list[int],
     verify_prev_slot_indices: list[int],
@@ -105,8 +104,7 @@ def _launch(
     n_write = len(write_slot_indices)
     n_write_reqs = len(write_req_seed_slot_indices)
     canary_step(
-        src_buf=src,
-        dst_buf=dst,
+        buf=buf,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -156,8 +154,7 @@ def _context_len_step(context_len: int) -> None:
     verify_positions = list(range(context_len))
     verify_prev_slot_indices = [-1] + list(range(context_len - 1))
     _launch(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
         verify_prev_slot_indices=verify_prev_slot_indices,
@@ -180,8 +177,7 @@ def _extend_chunk_step(chunk_size: int) -> None:
     state = _build_state(num_slots=num_slots)
 
     _launch(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -229,8 +225,7 @@ def _decode_bs_step(batch_size: int) -> None:
         write_positions.append(history)
 
     _launch(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=verify_slot_indices,
         verify_positions=verify_positions,
         verify_prev_slot_indices=verify_prev_slot_indices,

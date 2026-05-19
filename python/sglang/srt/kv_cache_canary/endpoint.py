@@ -27,10 +27,11 @@ def _empty_real_kv_buf(device: torch.device) -> torch.Tensor:
 class CanaryEndpoint:
     """One end (head OR tail) of the head/tail canary pair.
 
-    Owns the destination canary tensors that this endpoint writes into, the
-    violation buckets the launches feed into, and the per-endpoint counters.
-    The peer endpoint supplies the source buffers via :meth:`launch` — head
-    reads tail's canary buffers, tail reads head's canary buffers.
+    Owns the canary tensors that this endpoint both writes into and verifies
+    against, the violation buckets the launches feed into, and the per-endpoint
+    counters. Each endpoint is self-verifying — the splitmix64 chain over the
+    endpoint's own buffer is enough to detect any corruption of the slots this
+    endpoint has touched, so there is no cross-shadow read.
 
     One pair (``head_endpoint``, ``tail_endpoint``) lives on each
     ``CanaryRunner`` instance. The dataclass is frozen so the runner cannot
@@ -56,44 +57,30 @@ class CanaryEndpoint:
     def launch(
         self,
         *,
-        src: "CanaryEndpoint",
         launch_buffers: CanaryLaunchBuffers,
         seed: int,
     ) -> None:
-        """Launch the head|tail kernel pair reading from ``src``.
+        """Launch the head|tail kernel pair against this endpoint's own buffers.
 
         Iterates over (K-half) and (V-half, if present); each half launches
         an independent ``canary_step`` against its own
         ``CanaryViolationSlot`` so K-half and V-half mismatches never
         cross-latch into one another's first-violation row.
         """
-        buf_specs: List[Tuple[torch.Tensor, torch.Tensor, CanaryViolationSlot]] = [
-            (
-                src.k_canary_buf,
-                self.k_canary_buf,
-                self.k_violation,
-            )
+        buf_specs: List[Tuple[torch.Tensor, CanaryViolationSlot]] = [
+            (self.k_canary_buf, self.k_violation),
         ]
         if (
             self.has_v_half
-            and src.has_v_half
             and self.v_violation is not None
             and self.v_canary_buf is not None
-            and src.v_canary_buf is not None
         ):
-            buf_specs.append(
-                (
-                    src.v_canary_buf,
-                    self.v_canary_buf,
-                    self.v_violation,
-                )
-            )
+            buf_specs.append((self.v_canary_buf, self.v_violation))
 
-        for src_buf, dst_buf, violation_slot in buf_specs:
+        for buf, violation_slot in buf_specs:
             # API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
             canary_step(
-                src_buf=src_buf,
-                dst_buf=dst_buf,
+                buf=buf,
                 verify_slot_indices=launch_buffers.verify_slot_indices,
                 verify_positions=launch_buffers.verify_positions,
                 verify_prev_slot_indices=launch_buffers.verify_prev_slot_indices,

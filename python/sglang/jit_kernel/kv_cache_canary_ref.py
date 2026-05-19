@@ -90,8 +90,7 @@ def splitmix64_mix4(
 # API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
 def canary_step_torch_reference(
     *,
-    src_buf: torch.Tensor,
-    dst_buf: torch.Tensor,
+    buf: torch.Tensor,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
@@ -155,10 +154,7 @@ def canary_step_torch_reference(
     on any device (CPU, CUDA, …); the reference does its work in Python
     after pulling the few small index tensors to host.
     """
-    int_views = _IntViewBundle(
-        src_buf=src_buf,
-        dst_buf=dst_buf,
-    )
+    int_views = _IntViewBundle(buf=buf)
     real_kv_view = _RealKvView(
         real_kv_buf=real_kv_buf,
         read_bytes=int(real_kv_read_bytes),
@@ -213,56 +209,38 @@ def canary_step_torch_reference(
 
 
 class _IntViewBundle:
-    """Host-side int64 view of src/dst slot byte buffers.
+    """Host-side int64 view of the canary slot byte buffer.
 
-    The CUDA kernel reads/writes 64-bit fields directly out of byte
-    buffers. We mirror that by pulling both buffers to host once,
-    reshaping them as ``(num_slots, slot_stride_bytes // 8)`` int64
+    The CUDA kernel reads/writes 64-bit fields directly out of the byte
+    buffer. We mirror that by pulling the buffer to host once,
+    reshaping it as ``(num_slots, slot_stride_bytes // 8)`` int64
     arrays, and writing changes back on commit. The per-slot byte
-    stride is taken from ``src_buf.shape[1]``.
+    stride is taken from ``buf.shape[1]``.
     """
 
-    def __init__(
-        self,
-        *,
-        src_buf: torch.Tensor,
-        dst_buf: torch.Tensor,
-    ) -> None:
-        self._src_buf = src_buf
-        self._dst_buf = dst_buf
-        self._slot_stride_bytes = int(src_buf.shape[1])
+    def __init__(self, *, buf: torch.Tensor) -> None:
+        self._buf = buf
+        self._slot_stride_bytes = int(buf.shape[1])
         self._slot_stride_i64 = self._slot_stride_bytes // 8
-        self._src_i64 = src_buf.detach().to("cpu").view(torch.int64).flatten().clone()
-        if dst_buf.data_ptr() == src_buf.data_ptr():
-            self._dst_i64 = self._src_i64
-        else:
-            self._dst_i64 = (
-                dst_buf.detach().to("cpu").view(torch.int64).flatten().clone()
-            )
+        self._buf_i64 = buf.detach().to("cpu").view(torch.int64).flatten().clone()
 
     def load_field(self, slot_idx: int, field: int) -> int:
         row_start = slot_idx * self._slot_stride_i64
-        return int(self._src_i64[row_start + field].item())
+        return int(self._buf_i64[row_start + field].item())
 
     def load_field_dst(self, slot_idx: int, field: int) -> int:
-        row_start = slot_idx * self._slot_stride_i64
-        return int(self._dst_i64[row_start + field].item())
+        # Single-buffer endpoint: dst and src are the same buffer.
+        return self.load_field(slot_idx, field)
 
     def store_field(self, slot_idx: int, field: int, value: int) -> None:
         row_start = slot_idx * self._slot_stride_i64
-        self._dst_i64[row_start + field] = to_signed_int64(value & _U64_MASK)
+        self._buf_i64[row_start + field] = to_signed_int64(value & _U64_MASK)
 
     def commit(self) -> None:
-        """Write the (possibly modified) dst buffer back into the user tensor.
-
-        The kernel only mutates ``dst_buf``; ``src_buf`` is read-only, so
-        the non-aliased case leaves ``src_buf`` untouched on the device.
-        When ``src_buf is dst_buf`` (aliased), the two host canary buffers share
-        storage and the single copy below updates both.
-        """
-        dst_dev_i64 = self._dst_i64.to(self._dst_buf.device)
-        self._dst_buf.view(torch.int64).copy_(
-            dst_dev_i64.view(self._dst_buf.shape[0], self._slot_stride_i64)
+        """Write the (possibly modified) host buffer back into the user tensor."""
+        dst_dev_i64 = self._buf_i64.to(self._buf.device)
+        self._buf.view(torch.int64).copy_(
+            dst_dev_i64.view(self._buf.shape[0], self._slot_stride_i64)
         )
 
 

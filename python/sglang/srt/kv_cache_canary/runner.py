@@ -188,10 +188,11 @@ class CanaryRunner:
             use_head=False,
             real_kv=real_kv,
         )
-        # Sweep reads the latest head freeze; it never writes (sweep plans
-        # have num_write == 0), so dst_buf is harmless but must be a valid
-        # tensor — reuse head's canary buffers. K-half / V-half each gets
-        # its own sweep violation slot for the same reason head/tail do.
+        # Sweep verifies post-model-write real_kv_hash for every alive slot,
+        # so it must read the tail buffer (which stores post-write hashes).
+        # Sweep plans have num_write == 0 so the buffer is never written.
+        # K-half / V-half each gets its own sweep violation slot for the
+        # same reason head/tail do.
         self._sweep_endpoint = self._make_endpoint(
             kernel_kind=KERNEL_KIND_SWEEP,
             buffer_group=buffer_group,
@@ -199,7 +200,7 @@ class CanaryRunner:
             violation_kind_v=VIOLATION_KIND_SWEEP_V,
             slot_run_counter=self._device_state.slot_run_counter_sweep,
             kernel_run_counter=self._device_state.kernel_run_counter_sweep,
-            use_head=True,
+            use_head=False,
             real_kv=real_kv,
         )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
@@ -520,29 +521,27 @@ class CanaryRunner:
         replay-graph re-launch (real contents after pre-fill). K-half and
         V-half each get their own ``CanaryViolationSlot`` so the
         first-violation latch / ring / is_errored never cross-pollinate;
-        head/tail symmetry is captured by :class:`CanaryEndpoint` (each
-        endpoint owns the destination canary buffers + violation buckets; the peer
-        supplies the source).
+        head/tail symmetry is captured by :class:`CanaryEndpoint`. Each
+        endpoint is self-verifying — it reads and writes its own canary
+        buffer, no cross-shadow link.
 
         ``kernel_kind == KERNEL_KIND_SWEEP`` runs the verify-only sweep
         endpoint. Sweep fires at ``end_of_forward`` (post-model-write) and
         verifies real_kv_hash for every alive slot, including the new write
-        positions of this forward. It must read from ``tail_endpoint`` (which
-        captures post-model-write real_kv_hash) — reading head_endpoint would
-        compare current (post-write) KV bytes against head's pre-write hash
-        for any slot the model just wrote to, producing a guaranteed false
-        positive on every new-position slot.
+        positions of this forward. The sweep endpoint is wired to the
+        tail buffers (which capture post-model-write real_kv_hash) so the
+        check sees consistent post-write bytes for every alive slot.
         """
         if kernel_kind == KERNEL_KIND_HEAD:
-            dst, src = self._head_endpoint, self._tail_endpoint
+            endpoint = self._head_endpoint
         elif kernel_kind == KERNEL_KIND_TAIL:
-            dst, src = self._tail_endpoint, self._head_endpoint
+            endpoint = self._tail_endpoint
         elif kernel_kind == KERNEL_KIND_SWEEP:
-            dst, src = self._sweep_endpoint, self._tail_endpoint
+            endpoint = self._sweep_endpoint
         else:
             raise ValueError(f"kv-canary: unknown kernel_kind {kernel_kind}")
         buffers = launch_buffers if launch_buffers is not None else self._launch
-        dst.launch(src=src, launch_buffers=buffers, seed=int(self._config.seed))
+        endpoint.launch(launch_buffers=buffers, seed=int(self._config.seed))
 
     def _run_kernel_pair(
         self,

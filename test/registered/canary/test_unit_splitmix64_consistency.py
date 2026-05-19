@@ -66,8 +66,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
     state = _alloc_state()
 
     canary_step(
-        src_buf=buf,
-        dst_buf=buf,
+        buf=buf,
         verify_slot_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_prev_slot_indices=torch.full((1,), -1, dtype=torch.int64, device="cuda"),

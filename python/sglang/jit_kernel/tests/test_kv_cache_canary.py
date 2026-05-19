@@ -72,8 +72,7 @@ def _empty_real_kv() -> torch.Tensor:
 
 def _run(
     *,
-    src: torch.Tensor,
-    dst: torch.Tensor,
+    buf: torch.Tensor,
     verify_slot_indices: list[int],
     verify_positions: list[int],
     verify_prev_slot_indices: list[int],
@@ -102,8 +101,7 @@ def _run(
         [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
     )
     canary_step(
-        src_buf=src,
-        dst_buf=dst,
+        buf=buf,
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -153,8 +151,7 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
     slot_indices = [4, 5, 6]
 
     _run(
-        src=dst,
-        dst=dst,
+        buf=dst,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -196,8 +193,7 @@ def test_verify_clean_round_trip_no_violation():
 
     # Phase 1: write the chain.
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -216,8 +212,7 @@ def test_verify_clean_round_trip_no_violation():
     # Phase 2: verify every position. prev_slot_indices: -1 for pos 0, the
     # actual previous slot for the rest.
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=slot_indices,
         verify_positions=positions,
         verify_prev_slot_indices=[-1, slot_indices[0], slot_indices[1]],
@@ -242,8 +237,7 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
     state = _alloc_state()
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -262,8 +256,7 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
     # Verify with an expected position that doesn't match the slot's stored
     # position field -> kFailReasonPositionMonotonic.
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[5],
         verify_prev_slot_indices=[-1],
@@ -291,8 +284,7 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     state = _alloc_state()
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -315,8 +307,7 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
     )
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
@@ -349,8 +340,7 @@ def test_verify_skips_chain_check_on_sentinel():
     state = _alloc_state()
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -374,8 +364,7 @@ def test_verify_skips_chain_check_on_sentinel():
     )
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
@@ -406,8 +395,7 @@ def test_verify_skips_chain_check_on_sentinel():
     )
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[SKIP_CHAIN_SENTINEL],
@@ -435,8 +423,7 @@ def test_inactive_mask_rows_are_skipped_no_io_no_counter():
     state = _alloc_state()
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0, 1],
         verify_positions=[0, 1],
         verify_prev_slot_indices=[-1, 0],
@@ -486,8 +473,7 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
     # (verify_capacity / write_req_capacity must be >= 1 but the masks
     # default to 0 = skip-sentinel).
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[0],
         verify_prev_slot_indices=[-1],
@@ -514,8 +500,7 @@ def test_first_violation_preserved_across_cascading_mismatches():
     state = _alloc_state(ring_capacity=4)
 
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[],
         verify_positions=[],
         verify_prev_slot_indices=[],
@@ -533,8 +518,7 @@ def test_first_violation_preserved_across_cascading_mismatches():
 
     # First mismatch: position mismatch at slot 0 (stored=0, expected=7).
     _run(
-        src=buf,
-        dst=buf,
+        buf=buf,
         verify_slot_indices=[0],
         verify_positions=[7],
         verify_prev_slot_indices=[-1],
@@ -554,8 +538,7 @@ def test_first_violation_preserved_across_cascading_mismatches():
     # Cascade: 20 more verify launches with wrong positions on slots 1..3.
     for _ in range(20):
         _run(
-            src=buf,
-            dst=buf,
+            buf=buf,
             verify_slot_indices=[1, 2, 3],
             verify_positions=[99, 98, 97],
             verify_prev_slot_indices=[0, 1, 2],
@@ -713,9 +696,11 @@ def _run_differential(
             1, 1, dtype=torch.uint8, device=state_ref["dst_buf"].device
         )
 
+    state_cuda["dst_buf"].copy_(src_cuda)
+    state_ref["dst_buf"].copy_(src_ref)
+
     canary_step(
-        src_buf=src_cuda,
-        dst_buf=state_cuda["dst_buf"],
+        buf=state_cuda["dst_buf"],
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_cuda["violation_ring"],
@@ -734,8 +719,7 @@ def _run_differential(
     torch.cuda.synchronize()
 
     canary_step_torch_reference(
-        src_buf=src_ref,
-        dst_buf=state_ref["dst_buf"],
+        buf=state_ref["dst_buf"],
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_ref["violation_ring"],
@@ -1204,8 +1188,7 @@ def _prefill_buffer_with_chain(
     if real_kv_buf is None:
         real_kv_buf = torch.zeros(1, 1, dtype=torch.uint8, device=buf.device)
     canary_step(
-        src_buf=state["dst_buf"],
-        dst_buf=state["dst_buf"],
+        buf=state["dst_buf"],
         seed=_SEED,
         kernel_kind=KERNEL_KIND_HEAD,
         violation_ring=state["violation_ring"],
