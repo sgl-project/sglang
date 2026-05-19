@@ -55,9 +55,9 @@ class CanaryBufferGroup:
     k_tail: torch.Tensor
     v_head: Optional[torch.Tensor]
     v_tail: Optional[torch.Tensor]
-    real_kv_sources_k: tuple[RealKvSource, ...] = ()
-    real_kv_sources_v: tuple[RealKvSource, ...] = ()
-    swa_index_lut: Optional[torch.Tensor] = None
+    real_kv_sources_k: tuple[RealKvSource, ...]
+    real_kv_sources_v: tuple[RealKvSource, ...]
+    swa_index_lut: Optional[torch.Tensor]
 
     @property
     def has_v_half(self) -> bool:
