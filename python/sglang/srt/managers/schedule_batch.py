@@ -2394,9 +2394,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.input_ids
                 )
 
-        # input_ids was set at the end of the previous run_batch (overlap:
-        # -future_indices.indices placeholder; non-overlap: next_token_ids
-        # cast to int64). resolve_future / forward consumes it directly.
+        # input_ids is set at end of previous run_batch (placeholder for
+        # overlap; next_token_ids cast for non-overlap).
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()

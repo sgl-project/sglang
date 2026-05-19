@@ -2862,9 +2862,8 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # input_ids is the cross-iter bridge: overlap path stores
-                # the future-indices placeholder; resolve_future at next
-                # forward rewrites it in-place via token_ids_buf lookup.
+                # Placeholder for next iter's resolve_future to look up the
+                # real token from token_ids_buf via the negated indices.
                 batch.input_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
