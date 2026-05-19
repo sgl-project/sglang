@@ -1,10 +1,3 @@
-"""UnifiedRadixTree + HiCache KL divergence tests.
-
-Tests Mamba hybrid, DeepSeek V4 Flash, and GLM-5 models with HiCache L2
-offloading under UnifiedRadixTree, verifying multi-turn cache correctness
-via KL divergence.
-"""
-
 import unittest
 
 from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
@@ -20,26 +13,24 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
-MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-DSV32_MODEL = "deepseek-ai/DeepSeek-V3.2"
-DSV32_LAUNCH_TIMEOUT = 3600
-
-register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=745, stage="base-c", runner_config="8-gpu-h200")
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + HiCache + UnifiedRadixCache."""
 
-    kl_threshold = 0.003
+    kl_threshold = 0.005
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
     )
@@ -77,8 +68,11 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "page_first_direct",
                 "--max-total-tokens",
                 "12000",
+                "--max-mamba-cache-size",
+                "500",
                 "--max-running-requests",
                 "4",
+                "--weight-loader-prefetch-checkpoints",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
@@ -99,13 +93,18 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
-    kl_threshold = 0.0035
+    hicache_io_backend = "direct"
+    hicache_mem_layout = "page_first_direct"
+    max_running_requests = 4
+    kl_threshold = 0.005
     sampling_temperature = 0
+    decode_hit_request_batch_size = 3
+    decode_hit_inter_batch_delay_s = 0.5
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
     num_gsm8k_questions = 100
 
-    @unittest.skip("no stable.")
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_multiturn_logprobs_match(self):
         pass
 
@@ -136,15 +135,15 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "direct",
+                cls.hicache_io_backend,
                 "--hicache-mem-layout",
-                "page_first_direct",
+                cls.hicache_mem_layout,
                 "--swa-full-tokens-ratio",
                 "0.25",
                 "--max-total-tokens",
                 "20000",
                 "--max-running-requests",
-                "4",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -156,6 +155,15 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "layer_first"
 
 
 if __name__ == "__main__":

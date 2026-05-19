@@ -32,7 +32,50 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+    from triton_kernels.topk import topk as triton_kernels_topk
+
+    def routing(
+        logits,
+        n_expts_act,
+        sm_first=False,
+        expt_indx=None,
+        simulated_ep=1,
+        n_rows=None,
+    ):
+        if simulated_ep != 1:
+            raise NotImplementedError(
+                "simulated_ep routing is not supported with triton_kernels 3.6.0"
+            )
+
+        if sm_first:
+            logits = torch.softmax(logits, dim=-1)
+
+        sparse_logits = triton_kernels_topk(
+            logits,
+            n_expts_act,
+            apply_softmax=not sm_first,
+            y_indx=expt_indx,
+            n_rows=n_rows,
+        )
+        dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
+        combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+        ragged_metadata = make_ragged_tensor_metadata(
+            sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
+        )
+        gate_scal = sparse_logits.vals.flatten()[combine_indx]
+        routing_data = RoutingData(
+            gate_scal,
+            ragged_metadata.slice_sizes,
+            logits.shape[-1],
+            n_expts_act,
+            ragged_metadata,
+        )
+        gather_indx = GatherIndx(combine_indx, dispatch_indx)
+        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
+        return routing_data, gather_indx, scatter_indx
+
 except ImportError:
     pass
 
@@ -817,8 +860,6 @@ def biased_topk_impl(
             topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -850,8 +891,6 @@ def biased_topk_jit_kernel_impl(
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -1368,7 +1407,9 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        if scoring_func != "sqrtsoftplus":
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+
         if scoring_func == "sqrtsoftplus":
             _biased_topk = (
                 biased_topk_jit_kernel_impl
@@ -1423,6 +1464,18 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
+        # Benchmark-only: override gating with uniform round-robin expert assignment
+        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
+        num_tokens, k = topk_ids.shape
+        num_experts = router_logits.shape[1]
+        offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
+        steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
+        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
+            topk_ids.dtype
+        )
+        topk_weights = torch.ones_like(topk_weights) / k
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
