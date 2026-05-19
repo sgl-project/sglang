@@ -17,9 +17,11 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
+    get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -29,10 +31,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
-)
-from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all,
-    _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
@@ -44,27 +42,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
-
-
-def _get_sp_world_size_safe() -> int:
-    """Sequence-parallel world size, or 1 when SP isn't initialized.
-
-    ``get_sp_group()`` raises ``AssertionError`` when called before the SP
-    group is initialized (single-GPU runs, tests, etc.); we fall back to
-    a degenerate size-1 group rather than forcing every caller to guard.
-    """
-    try:
-        return get_sp_group().world_size
-    except AssertionError:
-        return 1
-
-
-def _get_sp_group_safe():
-    """Sequence-parallel group, or None when SP isn't initialized."""
-    try:
-        return get_sp_group()
-    except AssertionError:
-        return None
 
 
 # -----------------------------------------------------------------------------
@@ -501,6 +478,7 @@ class Cosmos3CrossAttention(nn.Module):
         head_dim: int,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        supported_attention_backends: set | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -518,8 +496,6 @@ class Cosmos3CrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("to_qkv", prefix),
         )
-        # Output projection - ReplicatedLinear for quantization support
-        # Input is not parallel (gather_output=True on QKV)
         self.to_out = ReplicatedLinear(
             num_attention_heads * head_dim,
             hidden_size,
@@ -528,9 +504,17 @@ class Cosmos3CrossAttention(nn.Module):
             prefix=add_prefix("to_out", prefix),
         )
 
-        # Per-head QK norm. Modules hold the weights; F.rms_norm in forward.
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
+
+        self.attn = USPAttention(
+            num_heads=num_attention_heads,
+            head_size=head_dim,
+            num_kv_heads=num_key_value_heads,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+            prefix=add_prefix("attn", prefix),
+        )
 
     def forward(
         self,
@@ -539,7 +523,6 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        sp_group=None,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -549,17 +532,10 @@ class Cosmos3CrossAttention(nn.Module):
             v_und: [B, S_und, H_kv, D] pre-computed UND values (always full/replicated)
             freqs_cos: [B, S_gen_local, 1, D] cosine part of RoPE (for local shard)
             freqs_sin: [B, S_gen_local, 1, D] sine part of RoPE (for local shard)
-            sp_group: Sequence parallel group; None or sp_size==1 short-circuits
-                to the local-attention path.
-
-        Returns:
-            [B, S_gen_local, hidden_size] cross-attention output
         """
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        # split returns strided views into qkv; .contiguous() before .view()
-        # because the per-head reshape needs row-major memory.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.contiguous().view(
             batch_size, seq_len_gen, self.num_attention_heads, self.head_dim
@@ -579,64 +555,14 @@ class Cosmos3CrossAttention(nn.Module):
         )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if sp_group is not None:
-            # Ulysses-style head-parallel attention. Each rank holds 1/sp of
-            # the sequence on entry; we all-to-all swap to 1/sp of the heads
-            # over the full sequence, run attention locally, then swap back.
-            #
-            # Q, K, V each go through their own a2a — same pattern as
-            # USPAttention (runtime/layers/attention/layer.py). Cannot fuse
-            # K and V into one a2a because the head-dim chunking would
-            # cross the K/V boundary (the previous attempt at cat-then-a2a
-            # silently swapped K and V at sp_size>1 due to GQA's asymmetric
-            # head counts).
-            #
-            # UND K/V is already replicated full per rank — head-slice it
-            # locally to match the post-a2a head shard, no extra collective
-            # needed. Q comes from the image stream and K/V from text+image,
-            # so the head-shard alignment must hold across both sources.
-            #
-            # Use the Ulysses sub-group sizes (not the full SP group) so the
-            # math stays correct even if a Ring sub-group is layered in later.
-            sp_size = sp_group.ulysses_world_size
-            sp_rank = sp_group.ulysses_rank
-            h_q_local = self.num_attention_heads // sp_size
-            h_kv_local = self.num_key_value_heads // sp_size
-
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k_gen = _usp_input_all_to_all(k, head_dim=2)
-            v_gen = _usp_input_all_to_all(v, head_dim=2)
-
-            h_kv_start = sp_rank * h_kv_local
-            h_kv_end = h_kv_start + h_kv_local
-            k_und_local = k_und[:, :, h_kv_start:h_kv_end, :].contiguous()
-            v_und_local = v_und[:, :, h_kv_start:h_kv_end, :].contiguous()
-
-            k_all = torch.cat([k_und_local, k_gen], dim=1)
-            v_all = torch.cat([v_und_local, v_gen], dim=1)
-
-            out = F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k_all.transpose(1, 2),
-                v_all.transpose(1, 2),
-                is_causal=False,
-                enable_gqa=True,
-            )
-            out = out.transpose(1, 2)  # [B, S_gen_full, h_q_local, head_dim]
-            out = _usp_output_all_to_all(out, head_dim=2)
-            out = out.reshape(batch_size, seq_len_gen, -1)
-        else:
-            k_all = torch.cat([k_und, k], dim=1)
-            v_all = torch.cat([v_und, v], dim=1)
-            out = F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k_all.transpose(1, 2),
-                v_all.transpose(1, 2),
-                is_causal=False,
-                enable_gqa=True,
-            )
-            out = out.transpose(1, 2).reshape(batch_size, seq_len_gen, -1)
-
+        # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
+        # USPAttention routes through the registered attention backend (FA, sage,
+        # …) and handles the Ulysses all-to-all when SP > 1.
+        num_und = k_und.shape[1]
+        k = torch.cat([k_und, k], dim=1)
+        v = torch.cat([v_und, v], dim=1)
+        out = self.attn(q, k, v, num_replicated_kv_prefix=num_und)
+        out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
 
@@ -724,6 +650,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         layer_idx: int,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        supported_attention_backends: set | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -735,6 +662,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             head_dim=head_dim,
             prefix=add_prefix("cross_attention", prefix),
             quant_config=quant_config,
+            supported_attention_backends=supported_attention_backends,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -753,7 +681,6 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         residual: torch.Tensor | None = None,
-        sp_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -766,7 +693,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und, v_und, freqs_cos, freqs_sin, sp_group=sp_group
+            hidden_states, k_und, v_und, freqs_cos, freqs_sin
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -912,8 +839,8 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Ulysses sequence parallelism. When CFG-parallel is also enabled
         # the SP group only spans ranks that share a CFG context (cond or
         # uncond), so ``sp_size`` here is the per-context shard count.
-        self.sp_size = _get_sp_world_size_safe()
-        self.sp_group = _get_sp_group_safe() if self.sp_size > 1 else None
+        self.sp_size = get_sp_world_size()
+        self.sp_group = get_sp_group() if self.sp_size > 1 else None
         self.sp_rank = self.sp_group.rank_in_group if self.sp_group else 0
         if self.sp_size > 1:
             logger.info(
@@ -973,6 +900,7 @@ class Cosmos3OmniTransformer(CachableDiT):
                     layer_idx=i,
                     prefix=f"gen_layers.{i}",
                     quant_config=quant_config,
+                    supported_attention_backends=arch._supported_attention_backends,
                 )
                 for i in range(arch.num_hidden_layers)
             ]
@@ -981,10 +909,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Output norm
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
 
-        # SDPA backend selection for optimal attention performance
-        # Build list dynamically since CUDNN_ATTENTION requires PyTorch 2.2+
-        self.sdpa_backends = self._build_sdpa_backends()
-
         # Cached K/V from UND pathway - dict keyed by cache_key for CFG support
         # This allows maintaining separate caches for conditional and unconditional
         # prompts, avoiding recomputation on every denoising step
@@ -992,30 +916,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         self.cached_freqs_gen: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.__post_init__()
-
-    def _build_sdpa_backends(self) -> list:
-        """Build list of available SDPA backends.
-
-        CUDNN_ATTENTION requires PyTorch 2.2+, so we check availability dynamically.
-        Priority order: CUDNN > FlashAttention > EfficientAttention > Math
-        """
-        backends = []
-        SDPBackend = torch.nn.attention.SDPBackend
-
-        # CUDNN_ATTENTION added in PyTorch 2.2
-        if hasattr(SDPBackend, "CUDNN_ATTENTION"):
-            backends.append(SDPBackend.CUDNN_ATTENTION)
-
-        # These are available in all PyTorch 2.x versions
-        backends.extend(
-            [
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ]
-        )
-
-        return backends
 
     def _pad_to_patch_size(self, H: int, W: int) -> tuple[int, int, int, int]:
         """Compute padded spatial dims aligned to patch_size."""
@@ -1237,65 +1137,56 @@ class Cosmos3OmniTransformer(CachableDiT):
         else:
             hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
-        # Ensure cache dicts exist (for backwards compatibility)
         self._ensure_cache_dicts()
 
-        # Use optimized SDPA backend (FlashAttention when available)
-        with torch.nn.attention.sdpa_kernel(self.sdpa_backends, set_priority=True):
-            # Compute UND K/V cache for this cache_key if not already cached
-            # This allows reusing the cache across denoising steps for the same text
-            if cache_key not in self.cached_kv:
-                freqs_und, freqs_gen = self._compute_rope_freqs(
-                    text_mask, T, Hp, Wp, fps, hidden_states.device, hidden_states.dtype
-                )
-                # UND K/V cache is kept FULL on all ranks (not sharded)
-                # Text sequence is short, so memory impact is minimal
-                # This is required for correct cross-attention with Ulysses
-                self.cached_kv[cache_key] = self.language_model(
-                    text_ids, text_mask, freqs_und[0], freqs_und[1]
-                )
-                self.cached_freqs_gen[cache_key] = freqs_gen
+        # Compute UND K/V cache for this cache_key if not already cached
+        # This allows reusing the cache across denoising steps for the same text
+        if cache_key not in self.cached_kv:
+            freqs_und, freqs_gen = self._compute_rope_freqs(
+                text_mask, T, Hp, Wp, fps, hidden_states.device, hidden_states.dtype
+            )
+            # UND K/V cache is kept FULL on all ranks (not sharded). Text
+            # sequence is short, so memory impact is minimal, and the GEN
+            # cross-attention needs the full K/V on every SP rank.
+            self.cached_kv[cache_key] = self.language_model(
+                text_ids, text_mask, freqs_und[0], freqs_und[1]
+            )
+            self.cached_freqs_gen[cache_key] = freqs_gen
 
-            freqs_gen = self.cached_freqs_gen[cache_key]
-            cos_gen, sin_gen = freqs_gen
+        freqs_gen = self.cached_freqs_gen[cache_key]
+        cos_gen, sin_gen = freqs_gen
 
-            # Shard RoPE frequencies if SP enabled
-            if sequence_shard_enabled:
-                full_seq_len = cos_gen.shape[1]
-                if seq_shard_pad > 0:
-                    # Pad freqs to match padded sequence
-                    pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                    pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                    cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
-                    sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
-                # Shard frequencies
-                cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-                sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-                cos_gen = cos_gen[:, self.sp_rank, :, :]
-                sin_gen = sin_gen[:, self.sp_rank, :, :]
+        if sequence_shard_enabled:
+            if seq_shard_pad > 0:
+                pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
+                sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
+            cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+            sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+            cos_gen = cos_gen[:, self.sp_rank, :, :]
+            sin_gen = sin_gen[:, self.sp_rank, :, :]
 
-            cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
-            sin_gen = sin_gen.unsqueeze(2)
+        cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
+        sin_gen = sin_gen.unsqueeze(2)
 
-            # Run GEN layers. `residual` is threaded so each layer's
-            # input_layernorm and post_attention_layernorm can use the
-            # fused add+rmsnorm path instead of separate add + norm kernels.
-            cached_kv_for_key = self.cached_kv[cache_key]
-            residual: torch.Tensor | None = None
-            for i, layer in enumerate(self.gen_layers):
-                k_und, v_und = cached_kv_for_key[i]
-                # UND K/V is always full (not sharded) - slice to max_real_len to avoid padding
-                k_und = k_und[:, :max_real_len]
-                v_und = v_und[:, :max_real_len]
-                hidden_gen, residual = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    cos_gen,
-                    sin_gen,
-                    residual=residual,
-                    sp_group=self.sp_group if sequence_shard_enabled else None,
-                )
+        # Run GEN layers. `residual` is threaded so each layer's
+        # input_layernorm and post_attention_layernorm can use the
+        # fused add+rmsnorm path instead of separate add + norm kernels.
+        cached_kv_for_key = self.cached_kv[cache_key]
+        residual: torch.Tensor | None = None
+        for i, layer in enumerate(self.gen_layers):
+            k_und, v_und = cached_kv_for_key[i]
+            k_und = k_und[:, :max_real_len]
+            v_und = v_und[:, :max_real_len]
+            hidden_gen, residual = layer(
+                hidden_gen,
+                k_und,
+                v_und,
+                cos_gen,
+                sin_gen,
+                residual=residual,
+            )
 
         # Collapse the trailing residual carry. RMSNorm and the linear
         # projection that follow are per-token, so we run them on the

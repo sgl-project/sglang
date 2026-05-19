@@ -11,7 +11,7 @@ import os
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
     Cosmos3ImagePreprocessStage,
@@ -65,7 +65,7 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         self.add_stage(Cosmos3ImagePreprocessStage())
         self.add_stage(Cosmos3TokenizationStage(tokenizer=text_tokenizer))
         if guardrails_on:
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 Cosmos3TextGuardrailStage,
             )
 
