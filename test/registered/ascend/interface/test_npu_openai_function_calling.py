@@ -792,6 +792,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     """Testcase：Verify the functionality of Python-style list-format function calling with pythonic parser for Llama-3.2-1B-Instruct model on Ascend NPU backend.
     Cover: Explicit format prompt verification, streaming call index integrity, and return validity of parallel tool calls.
