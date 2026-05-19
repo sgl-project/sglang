@@ -53,3 +53,19 @@ Resolve the pod's service account name.
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Resolve the Service's `spec.ports[0].port`. Defaults to
+`config.server.port` so a `service.port: ""` (the chart default) keeps
+the LB-facing port in sync with the container port. An operator that
+needs a different externally-visible port (e.g. an L4 LB that rewrites
+80 → 8090) sets `service.port: 80` explicitly.
+*/}}
+{{- define "sgl-router.servicePort" -}}
+{{- $svcPort := .Values.service.port -}}
+{{- if or (eq (printf "%v" $svcPort) "") (kindIs "invalid" $svcPort) -}}
+{{- .Values.config.server.port -}}
+{{- else -}}
+{{- $svcPort -}}
+{{- end -}}
+{{- end -}}

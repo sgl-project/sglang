@@ -11,7 +11,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   ports:
-    - port: {{ .Values.service.port }}
+    - port: {{ include "sgl-router.servicePort" . }}
       targetPort: http
       protocol: TCP
       name: http
