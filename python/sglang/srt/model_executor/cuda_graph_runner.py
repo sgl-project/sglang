@@ -1379,7 +1379,7 @@ class CudaGraphRunner:
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.speculative_num_draft_tokens,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

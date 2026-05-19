@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DFLASH are supported)"
         )
     if server_args.speculative_eagle_topk != 1:
         return (
@@ -89,10 +89,14 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         config: dict[str, object] | None = None,
+        is_dflash: bool = False,
     ):
         cfg = config or {}
         # TODO: Wider range of candidate_steps (once lazy init is supported).
-        candidates = set(cfg.get("candidate_steps", [1, 3, 7]))
+        # DFlash uses drafted-token counts [3,7,11,15] → verify query-lens [4,8,12,16].
+        # EAGLE/EAGLE3 uses [1, 3, 7] draft steps by default.
+        _default_candidates = [3, 7, 11, 15] if is_dflash else [1, 3, 7]
+        candidates = set(cfg.get("candidate_steps", _default_candidates))
 
         # Ensure the worker's initial speculative_num_steps is itself a candidate.
         # Otherwise AdaptiveController.register() would store the worker's pre-built

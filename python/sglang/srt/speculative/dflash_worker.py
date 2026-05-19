@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from copy import deepcopy
 from typing import Optional
 
@@ -20,6 +21,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController, SpecRuntimeState
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -29,7 +31,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +233,32 @@ class DFlashWorker:
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
+        # Adaptive speculative: the single piece of mutable state is the effective verify
+        # length. When adaptive is disabled this equals block_size (no truncation).
+        self._effective_verify_len: int = self.block_size
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self._init_adaptive_controller(server_args)
+
+    def _init_adaptive_controller(self, server_args: ServerArgs) -> None:
+        """Register the max-step state (already captured), build remaining buckets, activate."""
+        self.adaptive_controller = AdaptiveController(
+            self, config_path=server_args.speculative_adaptive_config
+        )
+        self.adaptive_controller.register(
+            SpecRuntimeState(
+                speculative_num_steps=self.block_size - 1,
+                speculative_num_draft_tokens=self.block_size,
+                draft_attn_backend=self.draft_model_runner.attn_backend,
+                cuda_graph_runner=None,
+                target_attn_backend=self.target_worker.model_runner.attn_backend,
+                target_graph_runner=self.target_worker.model_runner.graph_runner,
+                draft_extend_attn_backend=None,
+                cuda_graph_runner_for_draft_extend=None,
+            )
+        )
+        self.adaptive_controller.init_states()
+
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
         try:
@@ -309,6 +337,88 @@ class DFlashWorker:
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> SpecRuntimeState:
+        """Build a verify-only SpecRuntimeState for one effective_verify_len bucket.
+
+        Draft side is always shared (block_size fixed by training). Only the target
+        attention backend and CUDA graph are rebuilt per bucket.
+        """
+        effective_verify_len = speculative_num_draft_tokens
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            "DFLASH adaptive: building runtime state for effective_verify_len=%d",
+            effective_verify_len,
+        )
+
+        target_model_runner = self.target_worker.model_runner
+        sa = self.server_args
+
+        # Attention backends read server_args.speculative_num_draft_tokens in __init__ to
+        # size verify-metadata buffers that get baked into the CUDA graph, so we must
+        # temporarily point server_args at this bucket's verify length.
+        saved_num_draft_tokens = sa.speculative_num_draft_tokens
+        sa.speculative_num_draft_tokens = effective_verify_len
+        try:
+            target_attn_backend = target_model_runner._get_attention_backend(
+                init_new_workspace=True
+            )
+
+            target_graph_runner = None
+            if not sa.disable_cuda_graph:
+                from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+                target_graph_runner = CudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=effective_verify_len,
+                )
+        finally:
+            sa.speculative_num_draft_tokens = saved_num_draft_tokens
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            "DFLASH adaptive: built runtime state steps=%d effective_verify_len=%d: elapsed=%.2fs, mem=%.2fGB",
+            speculative_num_steps,
+            effective_verify_len,
+            time.perf_counter() - tic,
+            before_mem - after_mem,
+        )
+
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=effective_verify_len,
+            # Draft side: shared pointer, draft always runs at block_size.
+            draft_attn_backend=self.draft_model_runner.attn_backend,
+            cuda_graph_runner=None,
+            # Verify side: effective_verify_len-specific.
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+            # Extend stage: not used by DFlash.
+            draft_extend_attn_backend=None,
+            cuda_graph_runner_for_draft_extend=None,
+        )
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Switch to a different effective verify length.
+
+        Only three host-side fields are updated; no GPU ops, no memory release.
+        All candidate graph runners are permanently held by AdaptiveController._states.
+        """
+        effective_verify_len = state.speculative_num_draft_tokens
+        if self._effective_verify_len == effective_verify_len:
+            return
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"verify_len {self._effective_verify_len} -> {effective_verify_len}"
+        )
+        self._effective_verify_len = effective_verify_len
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -667,19 +777,33 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        # Only sample effective_verify_len-1 candidates to avoid wasted LM head compute.
+        effective_verify_len = self._effective_verify_len
         draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            hidden_states=draft_hidden[:, 1:effective_verify_len, :].reshape(
+                -1, draft_hidden.shape[-1]
+            ),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        ).view(bs, effective_verify_len - 1)
+        draft_tokens_full = self._draft_block_tokens_buf[:bs]  # [bs, block_size]
+        draft_tokens_full[:, 0].copy_(block_ids[:, 0])
+        draft_tokens_full[:, 1:effective_verify_len].copy_(draft_next)
+
+        # Adaptive truncation: send only the first effective_verify_len tokens to the target verify.
+        # When adaptive is disabled, effective_verify_len == block_size (no truncation).
+        if effective_verify_len < self.block_size:
+            # Contiguous copies are small (bs × effective_verify_len × ~8 bytes) and negligible
+            # compared to the attention cost saved at the target verify side.
+            draft_tokens_eff = draft_tokens_full[:, :effective_verify_len].contiguous()
+            positions_eff_2d = positions_2d[:, :effective_verify_len].contiguous()
+        else:
+            draft_tokens_eff = draft_tokens_full
+            positions_eff_2d = positions_2d
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=draft_tokens_eff.reshape(-1),
+            positions=positions_eff_2d.reshape(-1),
+            draft_token_num=effective_verify_len,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
@@ -1229,6 +1353,10 @@ class DFlashWorker:
                 num_correct_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
+
+        # Feed acceptance signal to adaptive controller (no-op when adaptive is disabled).
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(num_accepted_drafts_per_req_cpu)
 
         return GenerationBatchResult(
             logits_output=logits_output,
