@@ -99,6 +99,17 @@ _FAIL_REASON_BIT_POSITION: Final[int] = 1 << 1
 _FAIL_REASON_BIT_REAL_KV_HASH: Final[int] = 1 << 2
 
 
+def _assert_contiguous(tensor: torch.Tensor, name: str) -> None:
+    """Fail loud when a tensor whose data_ptr() flows into the canary CUDA ABI is non-contiguous.
+
+    The CUDA kernels treat every input tensor as a raw byte/word buffer indexed by element offsets, so a
+    non-contiguous input would silently corrupt the read/write. We refuse rather than silently call
+    ``.contiguous()`` so the caller fixes the upstream allocation.
+    """
+    if not tensor.is_contiguous():
+        raise ValueError(f"kv-canary: {name} must be contiguous")
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RealKvSource:
     """One piece of real KV the canary folds into its fingerprint.
@@ -276,6 +287,16 @@ def canary_verify_step(
             f"got {len(real_kv_sources)}"
         )
 
+    _assert_contiguous(canary_buf, "canary_buf")
+    _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
+    _assert_contiguous(plan.verify_positions, "plan.verify_positions")
+    _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
+    _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
+    _assert_contiguous(violation_ring, "violation_ring")
+    _assert_contiguous(violation_write_index, "violation_write_index")
+    _assert_contiguous(slot_run_counter, "slot_run_counter")
+    _assert_contiguous(kernel_run_counter, "kernel_run_counter")
+
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
     )
@@ -332,6 +353,7 @@ def _build_real_kv_source_abi(
     params = torch.zeros((_MAX_REAL_KV_SOURCES, 3), dtype=torch.int32, device="cpu")
 
     for i, source in enumerate(real_kv_sources):
+        _assert_contiguous(source.tensor, f"real_kv_sources[{i}].tensor")
         source_u8 = source.tensor.view(torch.uint8)
         if source_u8.dim() != 2:
             raise ValueError(

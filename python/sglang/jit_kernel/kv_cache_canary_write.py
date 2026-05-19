@@ -23,6 +23,7 @@ from sglang.jit_kernel.kv_cache_canary_verify import (
     CanaryLaunchTag,
     RealKvHashMode,
     RealKvSource,
+    _assert_contiguous,
     _build_real_kv_source_abi,
 )
 from sglang.jit_kernel.utils import cache_once, load_jit
@@ -234,6 +235,22 @@ def canary_write_step(
             f"kv-canary: at most {_MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
+
+    _assert_contiguous(canary_buf, "canary_buf")
+    _assert_contiguous(plan.write_offsets, "plan.write_offsets")
+    _assert_contiguous(plan.write_seed_slot_indices, "plan.write_seed_slot_indices")
+    _assert_contiguous(plan.write_num_valid_reqs, "plan.write_num_valid_reqs")
+    _assert_contiguous(fb_input_ids, "fb_input_ids")
+    _assert_contiguous(fb_positions, "fb_positions")
+    _assert_contiguous(fb_out_cache_loc, "fb_out_cache_loc")
+    _assert_contiguous(pseudo_expected_tokens, "pseudo_expected_tokens")
+    _assert_contiguous(pseudo_expected_positions, "pseudo_expected_positions")
+    _assert_contiguous(violation_ring, "violation_ring")
+    _assert_contiguous(violation_write_index, "violation_write_index")
+    _assert_contiguous(slot_run_counter, "slot_run_counter")
+    _assert_contiguous(kernel_run_counter, "kernel_run_counter")
+    if full_to_swa_index_mapping is not None:
+        _assert_contiguous(full_to_swa_index_mapping, "full_to_swa_index_mapping")
 
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
