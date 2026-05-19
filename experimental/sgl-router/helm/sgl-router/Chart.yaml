@@ -1,0 +1,22 @@
+apiVersion: v2
+name: sgl-router
+description: |
+  Slim KV-aware OpenAI-compatible router for SGLang workers. Pairs with
+  a fleet of SGLang inference servers (configured via static-file or k8s
+  discovery) and routes /v1/chat/completions, /v1/completions,
+  /v1/embeddings, /v1/tokenize requests by KV-cache locality.
+type: application
+version: 0.1.0
+# `appVersion` tracks the binary's release tag; values.yaml's
+# `image.tag` overrides this at deploy time.
+appVersion: "0.1.0"
+maintainers:
+  - name: SGLang authors
+home: https://github.com/sgl-project/sglang
+sources:
+  - https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router
+keywords:
+  - sglang
+  - llm
+  - router
+  - prometheus
