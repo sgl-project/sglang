@@ -433,6 +433,7 @@ The port you use depends on your deployment mode:
 | Scenario | Where to send requests |
 |---|---|
 | Non-PD (single server) | The server's `--port` (e.g., `8000` in the examples above) |
+| Non-PD (multi-node) | The primary node's (`--node-rank 0`) `--port`; do **not** send requests to worker nodes |
 | PD disaggregation | The router's `--port` (e.g., `6688` in the examples above); do **not** send requests directly to prefill or decode servers |
 
 <Tip>
@@ -455,10 +456,12 @@ A successful response returns HTTP 200 with an empty body.
 curl http://127.0.0.1:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "Hello, who are you?",
+    "text": "What is the capital of France?",
     "sampling_params": {"temperature": 0, "max_new_tokens": 128}
   }'
 ```
+
+The expected output should contain "Paris".
 
 ### Chat Completions (OpenAI-Compatible)
 
@@ -467,9 +470,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3.1-8B-Instruct",
-    "messages": [{"role": "user", "content": "Hello, who are you?"}]
+    "messages": [{"role": "user", "content": "What is the capital of France?"}]
   }'
 ```
+
+The expected output should contain "Paris".
 
 ### Multimodal Chat Completions
 
