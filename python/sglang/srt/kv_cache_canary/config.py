@@ -66,28 +66,48 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
-        mode_raw = envs.SGLANG_KV_CANARY_MODE.get().strip().lower()
+        mode_raw = (server_args.kv_cache_canary or "").strip().lower()
+        if mode_raw in ("", "off"):
+            mode_raw = envs.SGLANG_KV_CANARY_MODE.get().strip().lower()
         if mode_raw not in ("off", "on", "raise"):
             raise ValueError(
-                f"kv-canary: SGLANG_KV_CANARY_MODE must be one of off/on/raise, got {mode_raw!r}"
+                f"kv-canary: kv_cache_canary must be one of off/on/raise, got {mode_raw!r}"
             )
-        real_kv_raw = envs.SGLANG_KV_CANARY_REAL_KV_HASH_MODE.get().strip().upper()
+
+        real_kv_cli = (server_args.kv_cache_canary_real_data or "").strip().upper()
+        if real_kv_cli and real_kv_cli != "OFF":
+            real_kv_raw = real_kv_cli
+        else:
+            real_kv_raw = envs.SGLANG_KV_CANARY_REAL_KV_HASH_MODE.get().strip().upper()
         if real_kv_raw not in RealKvHashMode.__members__:
             raise ValueError(
-                f"kv-canary: SGLANG_KV_CANARY_REAL_KV_HASH_MODE must be one of "
+                f"kv-canary: kv_cache_canary_real_data must be one of "
                 f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
             )
-        input_check_raw = envs.SGLANG_KV_CANARY_INPUT_CHECK_MODE.get().strip().upper()
+
+        input_check_cli = server_args.kv_cache_canary_input_check_mode
+        if input_check_cli:
+            input_check_raw = input_check_cli.strip().upper()
+        else:
+            input_check_raw = (
+                envs.SGLANG_KV_CANARY_INPUT_CHECK_MODE.get().strip().upper()
+            )
         if input_check_raw not in CanaryInputCheckMode.__members__:
             raise ValueError(
-                f"kv-canary: SGLANG_KV_CANARY_INPUT_CHECK_MODE must be one of "
+                f"kv-canary: kv_cache_canary_input_check_mode must be one of "
                 f"{list(CanaryInputCheckMode.__members__)}, got {input_check_raw!r}"
             )
+
+        sweep_cli = int(server_args.kv_cache_canary_real_data_sweep_every_n_steps or 0)
+        if sweep_cli > 0:
+            sweep_every_n_steps = sweep_cli
+        else:
+            sweep_every_n_steps = envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get()
 
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
-            sweep_every_n_steps=envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get(),
+            sweep_every_n_steps=sweep_every_n_steps,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             input_check_mode=CanaryInputCheckMode[input_check_raw],
             perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
