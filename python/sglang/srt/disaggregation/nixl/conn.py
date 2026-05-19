@@ -703,7 +703,9 @@ class NixlKVManager(CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                             )
-                            handles.extend(h for h in state_xfer_handles if h is not None)
+                            handles.extend(
+                                h for h in state_xfer_handles if h is not None
+                            )
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
@@ -1976,9 +1978,9 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
 
         # Mark that we expect state data if state_indices was provided.
-        # Match the prefill-side truthy check (line ~697): an empty list
-        # means the model has no state types (e.g. dense LLaMA/Qwen), and
-        # prefill won't send state notifs, so we must not expect them.
+        # Match the prefill-side truthy check: an empty list means the
+        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
+        # won't send state notifs, so we must not expect them.
         if state_indices:
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
