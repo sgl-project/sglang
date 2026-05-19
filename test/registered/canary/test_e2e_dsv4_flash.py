@@ -24,8 +24,12 @@ Single-GPU constraint:
 
 from __future__ import annotations
 
+import os
 import time
 import unittest
+from typing import ClassVar, Dict, List, Optional
+
+import requests
 
 from sglang.test.canary_e2e_base import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -65,6 +69,81 @@ class TestKvCacheCanaryDSV4Flash(CanaryE2EBase):
         time.sleep(2.0)
 
         self.assert_health_ok()
+
+
+class TestKvCacheCanaryDSV4FlashPerturbed(TestKvCacheCanaryDSV4Flash):
+    """DSV4-Flash + real-KV byte perturb: per-step head/tail must raise.
+
+    Inherits model + extra_server_args from the clean sibling. The perturb
+    hook flips one real-KV byte; with no sweep configured here, the
+    per-step ``head`` and ``tail`` kernels are what observe the
+    corruption. Either the warmup forward trips canary (server fails to
+    come up) or the live burst returns errors / /health flips.
+    """
+
+    server_env: ClassVar[Dict[str, str]] = {
+        "SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB": "0.01",
+        "SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED": "42",
+    }
+    allow_launch_failure = True
+
+    _saved_env: ClassVar[Optional[Dict[str, Optional[str]]]] = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._saved_env = {k: os.environ.get(k) for k in cls.server_env}
+        for k, v in cls.server_env.items():
+            os.environ[k] = v
+        try:
+            super().setUpClass()
+        except Exception:
+            cls._restore_env()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            super().tearDownClass()
+        finally:
+            cls._restore_env()
+
+    @classmethod
+    def _restore_env(cls) -> None:
+        if cls._saved_env is None:
+            return
+        for k, old in cls._saved_env.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+        cls._saved_env = None
+
+    def test_perturbed_burst_triggers_canary_raise(self) -> None:
+        if not self.launch_failed:
+            results: List[Dict[str, object]] = self.send_parallel_requests(
+                n=200, max_new_tokens=32, timeout=30.0
+            )
+            triggered = any(
+                "error" in r or int(r.get("status_code", 0)) >= 500 for r in results
+            )
+
+            time.sleep(1.5)
+            try:
+                health_ok = (
+                    requests.get(self.base_url + "/health", timeout=5).status_code
+                    == 200
+                )
+            except requests.exceptions.RequestException:
+                health_ok = False
+
+            self.assertTrue(
+                triggered or not health_ok,
+                f"Expected canary to fire under perturb+raise, but server still "
+                f"healthy and no failed requests; first 3 responses: {results[:3]}",
+            )
+        # Without sweep enabled, the per-step head/tail kernels are the
+        # only observers of the byte flip on DSV4 Flash.
+        self.assert_violation_kind_logged(["head_k", "head_v", "tail_k", "tail_v"])
 
 
 if __name__ == "__main__":
