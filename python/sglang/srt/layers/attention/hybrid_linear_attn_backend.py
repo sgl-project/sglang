@@ -936,7 +936,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        accepted_steps: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
@@ -950,7 +950,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = accepted_steps.shape[0]
+        request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -973,13 +973,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             ssm_states,
             intermediate_state_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
 
         # Track indices used for tracking mamba states for prefix cache
