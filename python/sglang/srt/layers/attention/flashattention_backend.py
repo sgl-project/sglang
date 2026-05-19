@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -190,10 +191,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
+            // get_attention_tp_size()
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            get_attention_tp_size()
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
