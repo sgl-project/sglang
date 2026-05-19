@@ -453,6 +453,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                hf_config=self.model_config.hf_config,
             )
 
     def init_metric_collector_watchdog(self):
@@ -1491,7 +1492,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        if not abort_all and rid not in self.rid_to_state:
+        # Empty rid would startswith-match every request on the scheduler.
+        if not abort_all and not rid:
+            logger.warning("Ignore abort_request with empty rid and abort_all=False")
+            return
+        if (
+            not abort_all
+            and self.server_args.tokenizer_worker_num == 1
+            and rid not in self.rid_to_state
+        ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
@@ -2210,6 +2219,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 cached_tokens_details = recv_obj.cached_tokens_details[i]
 
+            spec_verify_ct = (
+                recv_obj.spec_verify_ct[i]
+                if hasattr(recv_obj, "spec_verify_ct")
+                and recv_obj.spec_verify_ct
+                and len(recv_obj.spec_verify_ct) > i
+                else 0
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -2218,6 +2235,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
                 cached_tokens_details,
+                spec_verify_ct=spec_verify_ct,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

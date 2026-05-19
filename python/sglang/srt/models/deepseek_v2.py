@@ -575,6 +575,11 @@ class DeepseekV2MoE(nn.Module):
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+                    apply_routed_scaling_factor_on_output=(
+                        True
+                        if _use_aiter
+                        else self.experts.should_fuse_routed_scaling_factor_in_topk
+                    ),
                 )
             self.topk = TopK(**topk_kwargs)
 
@@ -2559,9 +2564,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # TODO (Qiaolin-Yu): check if other draft models need similar layer id
+            # adjustment
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
