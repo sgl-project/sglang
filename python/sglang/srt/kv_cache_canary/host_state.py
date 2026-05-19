@@ -12,6 +12,7 @@ from sglang.jit_kernel.kv_cache_canary import (
 from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 
 if TYPE_CHECKING:
@@ -586,17 +587,23 @@ class CanaryDeviceState:
             slot.reset()
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CanaryLaunchBuffers:
-    """Fixed-address per-launch tensors for cuda-graph-safe kernel launches.
+def allocate_batch_plan_gpu(
+    *,
+    device: torch.device,
+    verify_capacity: int,
+    write_capacity: int,
+    write_req_capacity: int,
+) -> BatchPlanGpu:
+    """Allocate the fixed-address per-launch :class:`BatchPlanGpu` tensors.
 
-    Holds three tile sets:
+    Three tile sets:
 
     1. **Per-verify-entry** (capacity ``verify_capacity``):
        ``verify_slot_indices`` / ``verify_positions`` /
        ``verify_prev_slot_indices`` / ``verify_num_valid``.
     2. **Per-write-entry** (capacity ``write_capacity``):
-       ``write_slot_indices`` / ``write_token_ids`` / ``write_positions``.
+       ``write_slot_indices`` / ``write_token_ids`` / ``write_positions`` /
+       ``expected_write_token_ids`` / ``expected_write_positions``.
     3. **Per-write-req** (capacity ``write_req_capacity``):
        ``write_req_seed_slot_indices`` / ``write_req_entry_starts`` /
        ``write_req_entry_counts`` / ``write_req_num_valid``.
@@ -604,178 +611,158 @@ class CanaryLaunchBuffers:
     Per-write-entry rows are pure data driven by the write-req chains; the
     grid is sized by ``verify_capacity + write_req_capacity``.
     """
+    for name, cap in [
+        ("verify_capacity", verify_capacity),
+        ("write_capacity", write_capacity),
+        ("write_req_capacity", write_req_capacity),
+    ]:
+        if cap <= 0:
+            raise RuntimeError(
+                f"kv-canary: BatchPlanGpu {name} must be positive, got {cap}"
+            )
 
-    verify_capacity: int
-    write_capacity: int
-    write_req_capacity: int
-    verify_slot_indices: torch.Tensor
-    verify_positions: torch.Tensor
-    verify_prev_slot_indices: torch.Tensor
-    verify_num_valid: torch.Tensor
-    write_slot_indices: torch.Tensor
-    write_token_ids: torch.Tensor
-    write_positions: torch.Tensor
-    expected_write_token_ids: torch.Tensor
-    expected_write_positions: torch.Tensor
-    write_req_seed_slot_indices: torch.Tensor
-    write_req_entry_starts: torch.Tensor
-    write_req_entry_counts: torch.Tensor
-    write_req_num_valid: torch.Tensor
+    def zeros_i64(n: int) -> torch.Tensor:
+        return torch.zeros(n, dtype=torch.int64, device=device)
 
-    @classmethod
-    def allocate(
-        cls,
-        *,
-        device: torch.device,
-        verify_capacity: int,
-        write_capacity: int,
-        write_req_capacity: int,
-    ) -> "CanaryLaunchBuffers":
-        for name, cap in [
-            ("verify_capacity", verify_capacity),
-            ("write_capacity", write_capacity),
-            ("write_req_capacity", write_req_capacity),
-        ]:
-            if cap <= 0:
-                raise RuntimeError(
-                    f"kv-canary: CanaryLaunchBuffers {name} must be positive, got {cap}"
-                )
+    def zeros_i32(n: int) -> torch.Tensor:
+        return torch.zeros(n, dtype=torch.int32, device=device)
 
-        def zeros_i64(n: int) -> torch.Tensor:
-            return torch.zeros(n, dtype=torch.int64, device=device)
+    def full_i64(n: int, value: int) -> torch.Tensor:
+        return torch.full((n,), value, dtype=torch.int64, device=device)
 
-        def zeros_i32(n: int) -> torch.Tensor:
-            return torch.zeros(n, dtype=torch.int32, device=device)
+    return BatchPlanGpu(
+        verify_slot_indices=zeros_i64(verify_capacity),
+        verify_positions=zeros_i64(verify_capacity),
+        verify_prev_slot_indices=zeros_i64(verify_capacity),
+        verify_num_valid=zeros_i32(1),
+        write_slot_indices=zeros_i64(write_capacity),
+        write_token_ids=zeros_i64(write_capacity),
+        write_positions=zeros_i64(write_capacity),
+        expected_write_token_ids=full_i64(write_capacity, _SKIP_SENTINEL),
+        expected_write_positions=full_i64(write_capacity, _SKIP_SENTINEL),
+        write_req_seed_slot_indices=zeros_i64(write_req_capacity),
+        write_req_entry_starts=zeros_i64(write_req_capacity),
+        write_req_entry_counts=zeros_i64(write_req_capacity),
+        write_req_num_valid=zeros_i32(1),
+    )
 
-        def full_i64(n: int, value: int) -> torch.Tensor:
-            return torch.full((n,), value, dtype=torch.int64, device=device)
 
-        return cls(
-            verify_capacity=int(verify_capacity),
-            write_capacity=int(write_capacity),
-            write_req_capacity=int(write_req_capacity),
-            verify_slot_indices=zeros_i64(verify_capacity),
-            verify_positions=zeros_i64(verify_capacity),
-            verify_prev_slot_indices=zeros_i64(verify_capacity),
-            verify_num_valid=zeros_i32(1),
-            write_slot_indices=zeros_i64(write_capacity),
-            write_token_ids=zeros_i64(write_capacity),
-            write_positions=zeros_i64(write_capacity),
-            expected_write_token_ids=full_i64(write_capacity, _SKIP_SENTINEL),
-            expected_write_positions=full_i64(write_capacity, _SKIP_SENTINEL),
-            write_req_seed_slot_indices=zeros_i64(write_req_capacity),
-            write_req_entry_starts=zeros_i64(write_req_capacity),
-            write_req_entry_counts=zeros_i64(write_req_capacity),
-            write_req_num_valid=zeros_i32(1),
+def fill_batch_plan_gpu_from_plan(
+    *,
+    launch: BatchPlanGpu,
+    plan: BatchPlan,
+) -> Tuple[int, int]:
+    """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
+
+    Returns ``(num_active_verify, num_active_write_reqs)``. Rows past
+    the active count are skipped by the kernel. The write-entry tile is also reset past
+    ``plan.num_write`` so a write-req driver that reads
+    ``write_*[entry_start + j]`` cannot pick up stale data.
+
+    The verify range now covers the full ``[0, K_req)`` of every req
+    (SWA pools clip to ``[K_req - window_size, K_req)`` at plan time),
+    and ``verify_capacity`` is sized off ``max_total_num_tokens`` so
+    the buffer can hold every slot in the pool simultaneously. An
+    overflow here means the plan computed more verify entries than the
+    canary's slot pool — a logic bug, not a budget choice — so we
+    raise instead of silently truncating.
+    """
+    verify_capacity = int(launch.verify_slot_indices.shape[0])
+    write_capacity = int(launch.write_slot_indices.shape[0])
+    write_req_capacity = int(launch.write_req_seed_slot_indices.shape[0])
+
+    if plan.num_verify > verify_capacity:
+        raise RuntimeError(
+            f"kv-canary: verify entry count {plan.num_verify} exceeds "
+            f"verify_capacity {verify_capacity}. This should be "
+            "unreachable when verify_capacity == max_total_num_tokens; "
+            "indicates a planner bug or undersized capacity."
+        )
+    if plan.num_write > write_capacity:
+        raise RuntimeError(
+            f"kv-canary: write entry count {plan.num_write} exceeds "
+            f"write_capacity {write_capacity}. Raise canary launch "
+            "capacity or disable the canary for this deployment."
+        )
+    if plan.num_write_reqs > write_req_capacity:
+        raise RuntimeError(
+            f"kv-canary: write req count {plan.num_write_reqs} exceeds "
+            f"write_req_capacity {write_req_capacity}."
         )
 
-    def fill_from_plan(self, plan: "BatchPlan") -> Tuple[int, int]:
-        """Copy a host-side ``BatchPlan`` into the fixed GPU tensors in place.
+    num_active_verify = plan.num_verify
+    v = slice(0, num_active_verify)
 
-        Returns ``(num_active_verify, num_active_write_reqs)``. Rows past
-        the active count are skipped by the kernel. The write-entry tile is also reset past
-        ``plan.num_write`` so a write-req driver that reads
-        ``write_*[entry_start + j]`` cannot pick up stale data.
+    device = launch.verify_slot_indices.device
 
-        The verify range now covers the full ``[0, K_req)`` of every req
-        (SWA pools clip to ``[K_req - window_size, K_req)`` at plan time),
-        and ``verify_capacity`` is sized off ``max_total_num_tokens`` so
-        the buffer can hold every slot in the pool simultaneously. An
-        overflow here means the plan computed more verify entries than the
-        canary's slot pool — a logic bug, not a budget choice — so we
-        raise instead of silently truncating.
-        """
-        if plan.num_verify > self.verify_capacity:
-            raise RuntimeError(
-                f"kv-canary: verify entry count {plan.num_verify} exceeds "
-                f"verify_capacity {self.verify_capacity}. This should be "
-                "unreachable when verify_capacity == max_total_num_tokens; "
-                "indicates a planner bug or undersized capacity."
-            )
-        if plan.num_write > self.write_capacity:
-            raise RuntimeError(
-                f"kv-canary: write entry count {plan.num_write} exceeds "
-                f"write_capacity {self.write_capacity}. Raise canary launch "
-                "capacity or disable the canary for this deployment."
-            )
-        if plan.num_write_reqs > self.write_req_capacity:
-            raise RuntimeError(
-                f"kv-canary: write req count {plan.num_write_reqs} exceeds "
-                f"write_req_capacity {self.write_req_capacity}."
-            )
+    def to_i64(values: List[int], sl: slice) -> torch.Tensor:
+        return torch.tensor(values[sl], dtype=torch.int64, device=device)
 
-        num_active_verify = plan.num_verify
-        v = slice(0, num_active_verify)
+    if num_active_verify > 0:
+        launch.verify_slot_indices[:num_active_verify].copy_(
+            to_i64(plan.verify_slot_indices, v)
+        )
+        launch.verify_positions[:num_active_verify].copy_(
+            to_i64(plan.verify_positions, v)
+        )
+        launch.verify_prev_slot_indices[:num_active_verify].copy_(
+            to_i64(plan.verify_prev_slot_indices, v)
+        )
+    launch.verify_num_valid.fill_(num_active_verify)
 
-        device = self.verify_slot_indices.device
+    nw = plan.num_write
+    if nw > 0:
+        launch.write_slot_indices[:nw].copy_(
+            to_i64(plan.write_slot_indices, slice(0, nw))
+        )
+        launch.write_token_ids[:nw].copy_(to_i64(plan.write_token_ids, slice(0, nw)))
+        launch.write_positions[:nw].copy_(to_i64(plan.write_positions, slice(0, nw)))
+    if nw < write_capacity:
+        launch.write_slot_indices[nw:].zero_()
+        launch.write_token_ids[nw:].zero_()
+        launch.write_positions[nw:].zero_()
 
-        def to_i64(values: List[int], sl: slice) -> torch.Tensor:
-            return torch.tensor(values[sl], dtype=torch.int64, device=device)
-
-        if num_active_verify > 0:
-            self.verify_slot_indices[:num_active_verify].copy_(
-                to_i64(plan.verify_slot_indices, v)
-            )
-            self.verify_positions[:num_active_verify].copy_(
-                to_i64(plan.verify_positions, v)
-            )
-            self.verify_prev_slot_indices[:num_active_verify].copy_(
-                to_i64(plan.verify_prev_slot_indices, v)
-            )
-        self.verify_num_valid.fill_(num_active_verify)
-
-        nw = plan.num_write
+    # Oracle-off callers leave these buffers in their canonical
+    # all-sentinel state from allocate_batch_plan_gpu(); pseudo-mode rewrites
+    # [:nw] and restores the tail. The kernel skips entries where
+    # write_req_num_valid excludes the row, so the tail being stale doesn't
+    # produce false violations — but keeping it at the sentinel value
+    # keeps reset_batch_plan_gpu_to_skip_sentinel from touching these buffers.
+    if plan.expected_write_token_ids is not None:
         if nw > 0:
-            self.write_slot_indices[:nw].copy_(
-                to_i64(plan.write_slot_indices, slice(0, nw))
+            launch.expected_write_token_ids[:nw].copy_(
+                to_i64(plan.expected_write_token_ids, slice(0, nw))
             )
-            self.write_token_ids[:nw].copy_(to_i64(plan.write_token_ids, slice(0, nw)))
-            self.write_positions[:nw].copy_(to_i64(plan.write_positions, slice(0, nw)))
-        if nw < self.write_capacity:
-            self.write_slot_indices[nw:].zero_()
-            self.write_token_ids[nw:].zero_()
-            self.write_positions[nw:].zero_()
-
-        # Oracle-off callers leave these buffers in their canonical
-        # all-sentinel state from allocate(); pseudo-mode rewrites [:nw]
-        # and restores the tail. The kernel skips entries where
-        # write_req_num_valid excludes the row, so the tail being stale doesn't
-        # produce false violations — but keeping it at the sentinel value
-        # keeps reset_to_skip_sentinel from touching these buffers (see below).
-        if plan.expected_write_token_ids is not None:
-            if nw > 0:
-                self.expected_write_token_ids[:nw].copy_(
-                    to_i64(plan.expected_write_token_ids, slice(0, nw))
-                )
-                self.expected_write_positions[:nw].copy_(
-                    to_i64(plan.expected_write_positions, slice(0, nw))
-                )
-            if nw < self.write_capacity:
-                self.expected_write_token_ids[nw:].fill_(_SKIP_SENTINEL)
-                self.expected_write_positions[nw:].fill_(_SKIP_SENTINEL)
-
-        nwr = plan.num_write_reqs
-        if nwr > 0:
-            self.write_req_seed_slot_indices[:nwr].copy_(
-                to_i64(plan.write_req_seed_slot_indices, slice(0, nwr))
+            launch.expected_write_positions[:nw].copy_(
+                to_i64(plan.expected_write_positions, slice(0, nw))
             )
-            self.write_req_entry_starts[:nwr].copy_(
-                to_i64(plan.write_req_entry_starts, slice(0, nwr))
-            )
-            self.write_req_entry_counts[:nwr].copy_(
-                to_i64(plan.write_req_entry_counts, slice(0, nwr))
-            )
-        self.write_req_num_valid.fill_(nwr)
+        if nw < write_capacity:
+            launch.expected_write_token_ids[nw:].fill_(_SKIP_SENTINEL)
+            launch.expected_write_positions[nw:].fill_(_SKIP_SENTINEL)
 
-        return num_active_verify, nwr
+    nwr = plan.num_write_reqs
+    if nwr > 0:
+        launch.write_req_seed_slot_indices[:nwr].copy_(
+            to_i64(plan.write_req_seed_slot_indices, slice(0, nwr))
+        )
+        launch.write_req_entry_starts[:nwr].copy_(
+            to_i64(plan.write_req_entry_starts, slice(0, nwr))
+        )
+        launch.write_req_entry_counts[:nwr].copy_(
+            to_i64(plan.write_req_entry_counts, slice(0, nwr))
+        )
+    launch.write_req_num_valid.fill_(nwr)
 
-    def reset_to_skip_sentinel(self) -> None:
-        """Reset all active counts so the recorded kernel becomes a no-op.
+    return num_active_verify, nwr
 
-        Used at capture time and at replay-time when no valid plan exists.
-        The expected_write_* buffers do not need touching here: the
-        kernel early-exits on a zero write_req_num_valid before reading
-        them.
-        """
-        self.verify_num_valid.zero_()
-        self.write_req_num_valid.zero_()
+
+def reset_batch_plan_gpu_to_skip_sentinel(launch: BatchPlanGpu) -> None:
+    """Reset all active counts so the recorded kernel becomes a no-op.
+
+    Used at capture time and at replay-time when no valid plan exists.
+    The expected_write_* buffers do not need touching here: the
+    kernel early-exits on a zero write_req_num_valid before reading
+    them.
+    """
+    launch.verify_num_valid.zero_()
+    launch.write_req_num_valid.zero_()

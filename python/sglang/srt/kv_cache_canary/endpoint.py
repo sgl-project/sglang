@@ -6,8 +6,8 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import canary_step
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.srt.kv_cache_canary.host_state import (
-    CanaryLaunchBuffers,
     CanaryViolationSlot,
 )
 
@@ -57,7 +57,7 @@ class CanaryEndpoint:
     def launch(
         self,
         *,
-        launch_buffers: CanaryLaunchBuffers,
+        plan: BatchPlanGpu,
         seed: int,
     ) -> None:
         """Launch the head|tail kernel pair against this endpoint's own buffers.
@@ -81,19 +81,7 @@ class CanaryEndpoint:
             # API source of truth: docstring of canary_step in sglang.jit_kernel.kv_cache_canary
             canary_step(
                 buf=buf,
-                verify_slot_indices=launch_buffers.verify_slot_indices,
-                verify_positions=launch_buffers.verify_positions,
-                verify_prev_slot_indices=launch_buffers.verify_prev_slot_indices,
-                verify_num_valid=launch_buffers.verify_num_valid,
-                write_slot_indices=launch_buffers.write_slot_indices,
-                write_token_ids=launch_buffers.write_token_ids,
-                write_positions=launch_buffers.write_positions,
-                write_req_seed_slot_indices=launch_buffers.write_req_seed_slot_indices,
-                write_req_entry_starts=launch_buffers.write_req_entry_starts,
-                write_req_entry_counts=launch_buffers.write_req_entry_counts,
-                write_req_num_valid=launch_buffers.write_req_num_valid,
-                expected_write_token_ids=launch_buffers.expected_write_token_ids,
-                expected_write_positions=launch_buffers.expected_write_positions,
+                plan=plan,
                 seed=int(seed),
                 violation_ring=violation_slot.violation_ring,
                 violation_ring_valid=violation_slot.violation_ring_valid,

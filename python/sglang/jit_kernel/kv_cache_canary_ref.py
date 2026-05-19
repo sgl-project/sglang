@@ -35,6 +35,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     FailReason,
     to_signed_int64,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 
 _U64_MASK = (1 << 64) - 1
 
@@ -91,19 +92,7 @@ def splitmix64_mix4(
 def canary_step_torch_reference(
     *,
     buf: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
-    verify_num_valid: torch.Tensor,
-    write_slot_indices: torch.Tensor,
-    write_token_ids: torch.Tensor,
-    write_positions: torch.Tensor,
-    write_req_seed_slot_indices: torch.Tensor,
-    write_req_entry_starts: torch.Tensor,
-    write_req_entry_counts: torch.Tensor,
-    write_req_num_valid: torch.Tensor,
-    expected_write_token_ids: torch.Tensor,
-    expected_write_positions: torch.Tensor,
+    plan: BatchPlanGpu,
     seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
@@ -160,21 +149,7 @@ def canary_step_torch_reference(
         read_bytes=int(real_kv_read_bytes),
         mode=int(real_kv_hash_mode),
     )
-    plan = _RefPlan.from_tensors(
-        verify_slot_indices=verify_slot_indices,
-        verify_positions=verify_positions,
-        verify_prev_slot_indices=verify_prev_slot_indices,
-        verify_num_valid=verify_num_valid,
-        write_slot_indices=write_slot_indices,
-        write_token_ids=write_token_ids,
-        write_positions=write_positions,
-        write_req_seed_slot_indices=write_req_seed_slot_indices,
-        write_req_entry_starts=write_req_entry_starts,
-        write_req_entry_counts=write_req_entry_counts,
-        write_req_num_valid=write_req_num_valid,
-        expected_write_token_ids=expected_write_token_ids,
-        expected_write_positions=expected_write_positions,
-    )
+    ref_plan = _RefPlan.from_batch_plan_gpu(plan)
     sink = _RefViolationSink(
         violation_ring=violation_ring,
         violation_ring_valid=violation_ring_valid,
@@ -186,14 +161,14 @@ def canary_step_torch_reference(
     )
 
     active_verify = _run_verify_entries(
-        plan=plan,
+        plan=ref_plan,
         int_views=int_views,
         real_kv_view=real_kv_view,
         seed=seed,
         sink=sink,
     )
     active_write = _run_write_chains(
-        plan=plan,
+        plan=ref_plan,
         int_views=int_views,
         real_kv_view=real_kv_view,
         seed=seed,
@@ -328,14 +303,34 @@ class _RefPlan:
         self.expected_write_positions = expected_write_positions
 
     @classmethod
-    def from_tensors(cls, **tensors: torch.Tensor) -> "_RefPlan":
-        values: dict[str, int | list[int]] = {}
-        for key, value in tensors.items():
-            if key in {"verify_num_valid", "write_req_num_valid"}:
-                values[key] = int(value.detach().to("cpu").item())
-            else:
-                values[key] = value.detach().to("cpu").tolist()
-        return cls(**values)
+    def from_batch_plan_gpu(cls, plan: BatchPlanGpu) -> "_RefPlan":
+        return cls(
+            verify_slot_indices=plan.verify_slot_indices.detach().to("cpu").tolist(),
+            verify_positions=plan.verify_positions.detach().to("cpu").tolist(),
+            verify_prev_slot_indices=plan.verify_prev_slot_indices.detach()
+            .to("cpu")
+            .tolist(),
+            verify_num_valid=int(plan.verify_num_valid.detach().to("cpu").item()),
+            write_slot_indices=plan.write_slot_indices.detach().to("cpu").tolist(),
+            write_token_ids=plan.write_token_ids.detach().to("cpu").tolist(),
+            write_positions=plan.write_positions.detach().to("cpu").tolist(),
+            write_req_seed_slot_indices=plan.write_req_seed_slot_indices.detach()
+            .to("cpu")
+            .tolist(),
+            write_req_entry_starts=plan.write_req_entry_starts.detach()
+            .to("cpu")
+            .tolist(),
+            write_req_entry_counts=plan.write_req_entry_counts.detach()
+            .to("cpu")
+            .tolist(),
+            write_req_num_valid=int(plan.write_req_num_valid.detach().to("cpu").item()),
+            expected_write_token_ids=plan.expected_write_token_ids.detach()
+            .to("cpu")
+            .tolist(),
+            expected_write_positions=plan.expected_write_positions.detach()
+            .to("cpu")
+            .tolist(),
+        )
 
 
 class _RefViolationSink:

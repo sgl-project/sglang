@@ -34,6 +34,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
     canary_step,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="base-b-kernel-benchmark-1-gpu-large")
@@ -103,8 +104,7 @@ def _launch(
     n_verify = len(verify_slot_indices)
     n_write = len(write_slot_indices)
     n_write_reqs = len(write_req_seed_slot_indices)
-    canary_step(
-        buf=buf,
+    plan = BatchPlanGpu(
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -122,6 +122,10 @@ def _launch(
         expected_write_positions=_i64(
             [CANARY_EXPECTED_SKIP_SENTINEL] * max(n_write, 1)
         ),
+    )
+    canary_step(
+        buf=buf,
+        plan=plan,
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],

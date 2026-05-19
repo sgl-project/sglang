@@ -17,6 +17,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_TAIL,
     FailReason,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.srt.kv_cache_canary.config import (
     CanaryConfig,
     CanaryMode,
@@ -37,7 +38,9 @@ from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KINDS,
     BatchPlan,
     CanaryDeviceState,
-    CanaryLaunchBuffers,
+    allocate_batch_plan_gpu,
+    fill_batch_plan_gpu_from_plan,
+    reset_batch_plan_gpu_to_skip_sentinel,
     translate_alive_slots_for_swa,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
@@ -207,7 +210,7 @@ class CanaryRunner:
         # records these specific addresses; replay-side host code refills
         # them in-place before ``graph.replay()`` so the recorded kernel
         # launches see the correct expected_* / slot_indices for the batch.
-        self._launch = CanaryLaunchBuffers.allocate(
+        self._launch = allocate_batch_plan_gpu(
             device=device,
             verify_capacity=verify_capacity,
             write_capacity=write_capacity,
@@ -218,8 +221,8 @@ class CanaryRunner:
         # instances so they cannot conflict with the per-step buffers that
         # are baked into cuda-graph capture.
         sweep_verify_capacity = int(buffer_group.k_head.shape[0])
-        self._sweep_launch: Optional[CanaryLaunchBuffers] = (
-            CanaryLaunchBuffers.allocate(
+        self._sweep_launch: Optional[BatchPlanGpu] = (
+            allocate_batch_plan_gpu(
                 device=device,
                 verify_capacity=sweep_verify_capacity,
                 write_capacity=1,
@@ -411,7 +414,7 @@ class CanaryRunner:
         )
         if plan.num_verify == 0:
             return
-        self._sweep_launch.fill_from_plan(plan)
+        fill_batch_plan_gpu_from_plan(launch=self._sweep_launch, plan=plan)
         self._launch_kernel_only(
             kernel_kind=KERNEL_KIND_SWEEP,
             launch_buffers=self._sweep_launch,
@@ -479,11 +482,11 @@ class CanaryRunner:
 
     def prepare_for_replay(self, *, plan: BatchPlan) -> None:
         """Refill the fixed launch buffers in-place for a replay forward."""
-        self._launch.fill_from_plan(plan)
+        fill_batch_plan_gpu_from_plan(launch=self._launch, plan=plan)
 
     def reset_launch_buffers_to_skip_sentinel(self) -> None:
         """Reset the launch buffers to skip-sentinel state (kernel no-op)."""
-        self._launch.reset_to_skip_sentinel()
+        reset_batch_plan_gpu_to_skip_sentinel(self._launch)
 
     def launch_for_capture(self, *, kernel_kind: int) -> None:
         """Capture-only: record one kernel launch as a no-op (skip-sentinel).
@@ -498,7 +501,7 @@ class CanaryRunner:
         canary never actually verifies anything).
 
         The buffers are guaranteed to already be all zero at capture time:
-        :class:`CanaryLaunchBuffers` is allocated with ``torch.zeros`` and
+        :class:`BatchPlanGpu` is allocated with ``torch.zeros`` and
         nothing writes a non-skip-sentinel value to it before
         ``init_device_graphs`` runs (the canary attaches BEFORE graph
         init, and no eager forward with a real plan can fire before then).
@@ -513,7 +516,7 @@ class CanaryRunner:
         self,
         *,
         kernel_kind: int,
-        launch_buffers: Optional[CanaryLaunchBuffers] = None,
+        launch_buffers: Optional[BatchPlanGpu] = None,
     ) -> None:
         """Launch one kernel pair from the current fixed-buffer contents.
 
@@ -541,7 +544,7 @@ class CanaryRunner:
         else:
             raise ValueError(f"kv-canary: unknown kernel_kind {kernel_kind}")
         buffers = launch_buffers if launch_buffers is not None else self._launch
-        endpoint.launch(launch_buffers=buffers, seed=int(self._config.seed))
+        endpoint.launch(plan=buffers, seed=int(self._config.seed))
 
     def _run_kernel_pair(
         self,
@@ -561,7 +564,7 @@ class CanaryRunner:
         """
         if not self._config.enabled:
             return
-        self._launch.fill_from_plan(plan)
+        fill_batch_plan_gpu_from_plan(launch=self._launch, plan=plan)
         self._launch_kernel_only(kernel_kind=kernel_kind)
 
     def _cross_rank_max(self, local_flag: int) -> int:

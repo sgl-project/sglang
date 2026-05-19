@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, Tuple
 
 import torch
 
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -160,19 +161,7 @@ def get_cpp_constants() -> Dict[str, int]:
 def canary_step(
     *,
     buf: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
-    verify_num_valid: torch.Tensor,
-    write_slot_indices: torch.Tensor,
-    write_token_ids: torch.Tensor,
-    write_positions: torch.Tensor,
-    write_req_seed_slot_indices: torch.Tensor,
-    write_req_entry_starts: torch.Tensor,
-    write_req_entry_counts: torch.Tensor,
-    write_req_num_valid: torch.Tensor,
-    expected_write_token_ids: torch.Tensor,
-    expected_write_positions: torch.Tensor,
+    plan: BatchPlanGpu,
     seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
@@ -221,27 +210,11 @@ def canary_step(
         buf:                         ``uint8 [num_slots, slot_bytes]`` — canary tensor that both verify reads from
                                      and write writes into (each endpoint is self-verifying). Bytes per slot are
                                      taken from ``buf.shape[1]``.
-        verify_slot_indices:         ``int64 [N_verify]`` — slot of each verify entry.
-        verify_positions:            ``int64 [N_verify]`` — position the caller expects that slot to carry.
-        verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor
-                                     the chain on ``seed`` (no predecessor available, e.g. position 0 or an SWA
-                                     window head).
-        verify_num_valid:            ``int32 [1]`` — number of leading verify entries to process. Remaining entries
-                                     are cuda-graph padding and are skipped.
-        write_slot_indices,
-        write_token_ids,
-        write_positions:             ``int64 [N_write]`` — per-slot payload to install, flattened across all
-                                     write-reqs.
-        write_req_seed_slot_indices: ``int64 [N_write_reqs]`` — for each write-req, the slot to anchor its chain on,
-                                     or ``-1`` to anchor on ``seed``.
-        write_req_entry_starts,
-        write_req_entry_counts:      ``int64 [N_write_reqs]`` — slice of the per-slot arrays owned by each write-req.
-        write_req_num_valid:         ``int32 [1]`` — number of leading write-req rows to process.
-        expected_write_token_ids,
-        expected_write_positions:    ``int64 [N_write]`` — per-write-entry oracle predictions for the input token and
-                                     position. A value of ``-1`` is the skip-sentinel: the kernel skips that entry's
-                                     input-mismatch check. Non-pseudo callers fill both buffers with ``-1`` and pay
-                                     no per-entry cost beyond two loads and two compares.
+        plan:                        :class:`~sglang.jit_kernel.kv_cache_canary_plan_ref.BatchPlanGpu` bundling the
+                                     13 per-verify-entry / per-write-entry / per-write-req plan tensors plus the
+                                     ``verify_num_valid`` and ``write_req_num_valid`` active-count scalars. See the
+                                     ``BatchPlanGpu`` docstring for the per-field layout, sentinel encodings, and the
+                                     cuda-graph fixed-capacity lifecycle.
         seed:                        Chain anchor used wherever a slot has no predecessor (``CanaryConfig.seed``).
         violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — append-only sink. Each populated
                                      row is fill-once: never overwritten.
@@ -289,19 +262,19 @@ def canary_step(
     module = _jit_canary_module()
     module.canary_step(
         buf,
-        verify_slot_indices,
-        verify_positions,
-        verify_prev_slot_indices,
-        verify_num_valid,
-        write_slot_indices,
-        write_token_ids,
-        write_positions,
-        write_req_seed_slot_indices,
-        write_req_entry_starts,
-        write_req_entry_counts,
-        write_req_num_valid,
-        expected_write_token_ids,
-        expected_write_positions,
+        plan.verify_slot_indices,
+        plan.verify_positions,
+        plan.verify_prev_slot_indices,
+        plan.verify_num_valid,
+        plan.write_slot_indices,
+        plan.write_token_ids,
+        plan.write_positions,
+        plan.write_req_seed_slot_indices,
+        plan.write_req_entry_starts,
+        plan.write_req_entry_counts,
+        plan.write_req_num_valid,
+        plan.expected_write_token_ids,
+        plan.expected_write_positions,
         to_signed_int64(int(seed)),
         violation_ring,
         violation_ring_valid,

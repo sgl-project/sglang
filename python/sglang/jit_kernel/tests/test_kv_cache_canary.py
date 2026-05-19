@@ -22,6 +22,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     canary_step,
     to_signed_int64,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.jit_kernel.kv_cache_canary_ref import (
     canary_step_torch_reference,
     splitmix64_mix,
@@ -100,8 +101,7 @@ def _run(
     expected_write_positions = expected_write_positions or (
         [CANARY_EXPECTED_SKIP_SENTINEL] * n_write_padded
     )
-    canary_step(
-        buf=buf,
+    plan = BatchPlanGpu(
         verify_slot_indices=_i64(verify_slot_indices or [0]),
         verify_positions=_i64(verify_positions or [0]),
         verify_prev_slot_indices=_i64(verify_prev_slot_indices or [-1]),
@@ -115,6 +115,10 @@ def _run(
         write_req_num_valid=_num_valid(write_req_num_valid),
         expected_write_token_ids=_i64(expected_write_token_ids),
         expected_write_positions=_i64(expected_write_positions),
+    )
+    canary_step(
+        buf=buf,
+        plan=plan,
         seed=seed,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],
@@ -469,7 +473,7 @@ def test_kernel_run_counter_increments_even_with_zero_threads():
     state = _alloc_state()
 
     # Length-1 placeholder arrays for every plan field with the active
-    # masks zeroed — this mimics ``CanaryLaunchBuffers`` at capture time
+    # masks zeroed — this mimics ``BatchPlanGpu`` at capture time
     # (verify_capacity / write_req_capacity must be >= 1 but the masks
     # default to 0 = skip-sentinel).
     _run(
@@ -625,7 +629,33 @@ def _num_valid_on(values: list[int], device: str) -> torch.Tensor:
     return _i32_on([sum(1 for value in values if value)], device)
 
 
-def _build_inputs_on(device: str, **plan_lists) -> dict:
+def _clone_batch_plan_gpu(plan: BatchPlanGpu, *, device: str) -> BatchPlanGpu:
+    return BatchPlanGpu(
+        verify_slot_indices=plan.verify_slot_indices.detach().clone().to(device),
+        verify_positions=plan.verify_positions.detach().clone().to(device),
+        verify_prev_slot_indices=plan.verify_prev_slot_indices.detach()
+        .clone()
+        .to(device),
+        verify_num_valid=plan.verify_num_valid.detach().clone().to(device),
+        write_slot_indices=plan.write_slot_indices.detach().clone().to(device),
+        write_token_ids=plan.write_token_ids.detach().clone().to(device),
+        write_positions=plan.write_positions.detach().clone().to(device),
+        write_req_seed_slot_indices=plan.write_req_seed_slot_indices.detach()
+        .clone()
+        .to(device),
+        write_req_entry_starts=plan.write_req_entry_starts.detach().clone().to(device),
+        write_req_entry_counts=plan.write_req_entry_counts.detach().clone().to(device),
+        write_req_num_valid=plan.write_req_num_valid.detach().clone().to(device),
+        expected_write_token_ids=plan.expected_write_token_ids.detach()
+        .clone()
+        .to(device),
+        expected_write_positions=plan.expected_write_positions.detach()
+        .clone()
+        .to(device),
+    )
+
+
+def _build_inputs_on(device: str, **plan_lists) -> BatchPlanGpu:
     n_write = max(len(plan_lists["write_slot_indices"]), 1)
     expected_write_token_ids = plan_lists.get("expected_write_token_ids") or (
         [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
@@ -633,7 +663,7 @@ def _build_inputs_on(device: str, **plan_lists) -> dict:
     expected_write_positions = plan_lists.get("expected_write_positions") or (
         [CANARY_EXPECTED_SKIP_SENTINEL] * n_write
     )
-    return dict(
+    return BatchPlanGpu(
         verify_slot_indices=_i64_on(plan_lists["verify_slot_indices"], device),
         verify_positions=_i64_on(plan_lists["verify_positions"], device),
         verify_prev_slot_indices=_i64_on(
@@ -674,8 +704,8 @@ def _run_differential(
     src_initial: torch.Tensor,
     state_cuda: dict,
     state_ref: dict,
-    inputs_cuda: dict,
-    inputs_ref: dict,
+    inputs_cuda: BatchPlanGpu,
+    inputs_ref: BatchPlanGpu,
     kernel_kind: int,
     seed: int = _SEED,
     real_kv_buf_cuda: torch.Tensor | None = None,
@@ -701,6 +731,7 @@ def _run_differential(
 
     canary_step(
         buf=state_cuda["dst_buf"],
+        plan=inputs_cuda,
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_cuda["violation_ring"],
@@ -714,12 +745,12 @@ def _run_differential(
         real_kv_buf=real_kv_buf_cuda,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
-        **inputs_cuda,
     )
     torch.cuda.synchronize()
 
     canary_step_torch_reference(
         buf=state_ref["dst_buf"],
+        plan=inputs_ref,
         seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_ref["violation_ring"],
@@ -733,7 +764,6 @@ def _run_differential(
         real_kv_buf=real_kv_buf_ref,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
-        **inputs_ref,
     )
 
     _assert_states_match(cuda_state=state_cuda, ref_state=state_ref, scenario=scenario)
@@ -1189,6 +1219,7 @@ def _prefill_buffer_with_chain(
         real_kv_buf = torch.zeros(1, 1, dtype=torch.uint8, device=buf.device)
     canary_step(
         buf=state["dst_buf"],
+        plan=inputs,
         seed=_SEED,
         kernel_kind=KERNEL_KIND_HEAD,
         violation_ring=state["violation_ring"],
@@ -1202,7 +1233,6 @@ def _prefill_buffer_with_chain(
         real_kv_buf=real_kv_buf,
         real_kv_read_bytes=real_kv_read_bytes,
         real_kv_hash_mode=real_kv_hash_mode,
-        **inputs,
     )
     torch.cuda.synchronize()
     buf.copy_(state["dst_buf"])
@@ -1274,7 +1304,7 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
     state_ref = _clone_state_for_reference(state_cuda, device="cuda")
 
     inputs_cuda = _build_inputs_on("cuda", **plan_lists)
-    inputs_ref = {k: v.detach().clone().to("cuda") for k, v in inputs_cuda.items()}
+    inputs_ref = _clone_batch_plan_gpu(inputs_cuda, device="cuda")
 
     if real_kv_buf_cuda is not None:
         real_kv_buf_ref = real_kv_buf_cuda.detach().clone()

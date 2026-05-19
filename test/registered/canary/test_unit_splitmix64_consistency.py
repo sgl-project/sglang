@@ -24,6 +24,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     canary_step,
     to_signed_int64,
 )
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
 from sglang.jit_kernel.kv_cache_canary_ref import splitmix64_mix
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -65,8 +66,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
     buf = torch.zeros(n, slot_stride, dtype=torch.uint8, device="cuda")
     state = _alloc_state()
 
-    canary_step(
-        buf=buf,
+    plan = BatchPlanGpu(
         verify_slot_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_prev_slot_indices=torch.full((1,), -1, dtype=torch.int64, device="cuda"),
@@ -86,6 +86,10 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         expected_write_positions=torch.full(
             (n,), CANARY_EXPECTED_SKIP_SENTINEL, dtype=torch.int64, device="cuda"
         ),
+    )
+    canary_step(
+        buf=buf,
+        plan=plan,
         seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_ring_valid=state["violation_ring_valid"],
