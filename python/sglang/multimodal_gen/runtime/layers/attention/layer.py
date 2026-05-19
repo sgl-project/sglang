@@ -663,7 +663,7 @@ class USPAttention(nn.Module):
         """Convert replicated prefix/suffix into sharded tokens, run the
         standard USPAttention path (ulysses + ring), then reconstruct.
 
-        Called when ring > 1 and replicated tokens are present.
+        Called when both ulysses > 1 and ring > 1 with replicated tokens.
         """
         sp_group = get_sp_group()
         total_sp_size = get_sp_world_size()
