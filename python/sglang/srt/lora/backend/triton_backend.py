@@ -259,6 +259,40 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
+            # SILENT-BUG FIX (PCG/BCG + LoRA + EXTEND): previously the
+            # cuda_graph path left seg_lens / seg_indptr / max_len at their
+            # init defaults ([num_tokens_per_bs]*max_bs, cumsum-of-defaults,
+            # num_tokens_per_bs). For DECODE that is correct (1 token per
+            # seq). For EXTEND (PCG/BCG replay), it meant the sgemm_lora
+            # kernel applied LoRA to only num_tokens_per_bs (==1) tokens
+            # per sequence — silently truncating the per-prompt LoRA work
+            # to a single token regardless of actual prompt length. Update
+            # those fields here to reflect the live batch.
+            if forward_batch.forward_mode.is_extend():
+                extend_lens_cpu = list(forward_batch.extend_seq_lens_cpu)
+                seg_lens_tensor = torch.tensor(
+                    extend_lens_cpu[:bs],
+                    dtype=torch.int32,
+                    pin_memory=True,
+                    device="cpu",
+                )
+                batch_info.seg_lens[:bs].copy_(seg_lens_tensor, non_blocking=True)
+                batch_info.seg_indptr[0:1].zero_()
+                torch.cumsum(
+                    batch_info.seg_lens[:bs],
+                    dim=0,
+                    out=batch_info.seg_indptr[1 : bs + 1],
+                )
+                # NOTE: do NOT update batch_info.max_len here. max_len is a
+                # Python int used in the sgemm kernel grid (cdiv(max_len, BLOCK_S))
+                # so under Inductor / Dynamo it is a specialization guard.
+                # Changing it between capture (max_len = bucket size) and live
+                # (max_len = actual max seq len, often smaller after bisect-up
+                # to a bigger bucket) triggers a runtime recompile that hits
+                # `PCG capture stream is not set`. Leave max_len at its init
+                # value (covers the largest bucket); the kernel internally
+                # early-returns via `if pid_s * BLOCK_S >= seg_len: return`,
+                # so the extra grid_0 blocks beyond actual seg_len are no-ops.
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.

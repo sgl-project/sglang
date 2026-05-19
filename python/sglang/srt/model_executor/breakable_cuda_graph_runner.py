@@ -366,6 +366,15 @@ class BreakableCudaGraphRunner:
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        # Mirror PCG's bs>1 LoRA gate: BCG also captures at bs=1, so live
+        # bs>1 LoRA would only apply LoRA kernels to the first sequence
+        # (kernel grid baked-in at capture-time bs=1). Refuse so the engine
+        # falls back to eager prefill (correct, no silent truncation).
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.batch_size > 1
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -401,10 +410,16 @@ class BreakableCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        # Note: prepare_lora_batch is NOT called here anymore. When PCG (or
-        # BCG) is enabled, lora_manager._cuda_graph_supports_extend is True
-        # so the upstream init_new call already routes EXTEND through the
-        # pinned cuda_graph_batch_info. Calling again duplicated CPU work.
+        # Re-run prepare_lora_batch with force_cuda_graph=True so the LoRA
+        # backend writes batch metadata into the pinned cuda_graph_batch_info
+        # baked into the captured BreakableCUDAGraph (mirrors PCG.replay).
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
 
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
