@@ -1,9 +1,9 @@
 import time
 import unittest
-from unittest.mock import patch, MagicMock
 from multiprocessing import Process
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.utils.watchdog import Watchdog, SubprocessWatchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, Watchdog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -95,6 +95,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         wd.stop()
         self._watchdog = None  # already stopped
         self.assertIsNone(wd._thread)
+
 
 if __name__ == "__main__":
     unittest.main()

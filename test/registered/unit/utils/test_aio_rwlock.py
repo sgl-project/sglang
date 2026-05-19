@@ -18,6 +18,7 @@ class TestAIORWLock(CustomTestCase):
 
     def test_init_state(self):
         """Test the initial state of the RWLock."""
+
         async def main():
             rwlock = RWLock()
             self.assertEqual(rwlock._readers, 0)
@@ -29,6 +30,7 @@ class TestAIORWLock(CustomTestCase):
 
     def test_multiple_readers_concurrently(self):
         """Multiple readers should be able to acquire the lock concurrently."""
+
         async def main():
             rwlock = RWLock()
             active_readers = 0
@@ -53,6 +55,7 @@ class TestAIORWLock(CustomTestCase):
 
     def test_writer_exclusivity(self):
         """A writer has exclusive access, blocking readers and other writers."""
+
         async def main():
             rwlock = RWLock()
             events = []
@@ -106,6 +109,7 @@ class TestAIORWLock(CustomTestCase):
 
     def test_writer_priority_over_new_readers(self):
         """When a writer is waiting, new readers wait behind it."""
+
         async def main():
             rwlock = RWLock()
             events = []
@@ -146,13 +150,21 @@ class TestAIORWLock(CustomTestCase):
             r1_release.set()
             await asyncio.gather(r1, w1, r2)
 
-            expected = ["r1_start", "r1_end", "w1_start", "w1_end", "r2_start", "r2_end"]
+            expected = [
+                "r1_start",
+                "r1_end",
+                "w1_start",
+                "w1_end",
+                "r2_start",
+                "r2_end",
+            ]
             self.assertEqual(events, expected)
 
         asyncio.run(main())
 
     def test_is_locked(self):
         """is_locked reflects the current state correctly."""
+
         async def main():
             rwlock = RWLock()
             self.assertFalse(await rwlock.is_locked())

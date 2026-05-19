@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import Tool, Function
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -12,7 +12,10 @@ class TestJsonArrayParser(CustomTestCase):
     def setUp(self):
         self.parser = JsonArrayParser()
         self.tools = [
-            Tool(type="function", function=Function(name="test_tool", description="", parameters={}))
+            Tool(
+                type="function",
+                function=Function(name="test_tool", description="", parameters={}),
+            )
         ]
 
     def test_initialization(self):
@@ -31,7 +34,9 @@ class TestJsonArrayParser(CustomTestCase):
 
     def test_has_tool_call_plain_text(self):
         """Test has_tool_call returns False for plain text."""
-        self.assertFalse(self.parser.has_tool_call("This is regular text without brackets."))
+        self.assertFalse(
+            self.parser.has_tool_call("This is regular text without brackets.")
+        )
 
     def test_detect_and_parse_not_implemented(self):
         """Test detect_and_parse raises NotImplementedError."""
