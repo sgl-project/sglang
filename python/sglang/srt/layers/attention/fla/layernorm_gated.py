@@ -172,6 +172,9 @@ def _layer_norm_fwd_1pass_kernel(
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
     """Get and cache the SM count for a given device."""
+    if device.type == "xpu":
+        assert torch.xpu.is_available(), "XPU device is not available"
+        return torch.xpu.get_device_properties(device).gpu_subslice_count
     props = torch.cuda.get_device_properties(device)
     return props.multi_processor_count
 

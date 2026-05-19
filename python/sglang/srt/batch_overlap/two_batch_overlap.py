@@ -1054,6 +1054,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
+    @property
+    def expert_mask_gpu(self):
+        return self._inners[0].expert_mask_gpu
+
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 

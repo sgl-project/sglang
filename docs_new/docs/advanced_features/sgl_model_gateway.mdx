@@ -944,9 +944,9 @@ Response:
 ***
 ## Reliability and Flow Control
 
-### HTTP Client Pool
+### HTTP Client
 
-Configure the idle timeout for pooled upstream HTTP connections:
+Configure upstream HTTP client connection settings:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -966,6 +966,21 @@ Configure the idle timeout for pooled upstream HTTP connections:
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--pool-idle-timeout-secs`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Idle timeout in seconds for pooled upstream HTTP connections. Can also be set with `SMG_POOL_IDLE_TIMEOUT_SECS`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--connect-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>10</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Timeout in seconds for new upstream HTTP connections. Can also be set with `SMG_CONNECT_TIMEOUT_SECS`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--pool-max-idle-per-host`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>500</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum idle upstream HTTP connections to keep per host. Can also be set with `SMG_POOL_MAX_IDLE_PER_HOST`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tcp-keepalive-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>TCP keepalive idle time in seconds for upstream HTTP connections. Can also be set with `SMG_TCP_KEEPALIVE_SECS`.</td>
     </tr>
   </tbody>
 </table>

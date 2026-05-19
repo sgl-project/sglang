@@ -186,8 +186,8 @@ uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
     # - flashinfer-jit-cache: 1.2+ GB
-    FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_python==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 'flashinfer_cubin(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
     FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
@@ -277,7 +277,20 @@ install_sglang_kernel() {
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
     TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
     echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+    REINSTALL_TORCH=false
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
+        REINSTALL_TORCH=true
+    else
+        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
+            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
+                REINSTALL_TORCH=true
+                break
+            fi
+        done
+    fi
+    if [ "${REINSTALL_TORCH}" = true ]; then
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
@@ -318,6 +331,22 @@ download_flashinfer_cache() {
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+purge_cutlass_libs_base() {
+    # nvidia-cutlass-dsl[cu13] extras are additive on PyPI: requires_dist always
+    # pulls -libs-base AND -libs-cu13 when [cu13] is requested. Both wheels write
+    # to the same site-packages paths with different content, leaving the wrapper
+    # (cutlass.py, cu13 style) mismatched with the binding (_gpu_ops_gen.py, base
+    # style) -> GPUModuleOp signature TypeError. See vllm-project/vllm#40082.
+    # Uninstall -libs-base, then force-reinstall -libs-cu13 so its files win.
+    $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    if [ -n "$CUTLASS_DSL_VERSION" ]; then
+        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -475,6 +504,7 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
+    purge_cutlass_libs_base
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
