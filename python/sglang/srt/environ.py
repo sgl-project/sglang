@@ -106,12 +106,39 @@ class EnvField:
         )
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
+class EnvStr(EnvField):
+    def parse(self, value: str) -> str:
+        return value
+
+
+class EnvBool(EnvField):
+    def parse(self, value: str) -> bool:
+        value = value.lower()
+        if value in ["true", "1", "yes", "y"]:
+            return True
+        if value in ["false", "0", "no", "n"]:
+            return False
+        raise ValueError(f'"{value}" is not a valid boolean value')
+
+
+class EnvInt(EnvField):
+    def parse(self, value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f'"{value}" is not a valid integer value')
+
+
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
     check *deprecated_name* and emit DeprecationWarning before reading it.
 
     Usage:
-        class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool): pass
         SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
     """
 
@@ -140,34 +167,6 @@ class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
 
 class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
     pass
-
-
-class EnvTuple(EnvField):
-    def parse(self, value: str) -> tuple[str, ...]:
-        return tuple(s.strip() for s in value.split(",") if s.strip())
-
-
-class EnvStr(EnvField):
-    def parse(self, value: str) -> str:
-        return value
-
-
-class EnvBool(EnvField):
-    def parse(self, value: str) -> bool:
-        value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
-            return True
-        if value in ["false", "0", "no", "n"]:
-            return False
-        raise ValueError(f'"{value}" is not a valid boolean value')
-
-
-class EnvInt(EnvField):
-    def parse(self, value: str) -> int:
-        try:
-            return int(value)
-        except ValueError:
-            raise ValueError(f'"{value}" is not a valid integer value')
 
 
 class EnvFloat(EnvField):
