@@ -825,7 +825,16 @@ class Scheduler(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
 
-        if hasattr(config_to_check, "num_experts_per_tok"):
+        # Different MoE architectures expose the per-token expert count under
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
+        # Detect any of the known variants so that the MoE backend config is
+        # initialized for every MoE model.
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.

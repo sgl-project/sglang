@@ -508,19 +508,26 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.intermediate_size_per_partition = intermediate_size
 
 
-def get_activation_type(activation: str) -> int:
+def get_activation_type(activation: str, is_gated: bool = True) -> int:
     """Map SGLang activation string to FlashInfer ActivationType int value."""
     from flashinfer.fused_moe.core import ActivationType
 
-    _ACTIVATION_STR_TO_TYPE = {
-        "silu": ActivationType.Swiglu,
-        "relu2": ActivationType.Relu2,
-        "gelu": ActivationType.Gelu,
-    }
+    if is_gated:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Swiglu,
+            "gelu": ActivationType.Geglu,
+        }
+    else:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Silu,
+            "gelu": ActivationType.Gelu,
+            "relu2": ActivationType.Relu2,
+        }
     act = _ACTIVATION_STR_TO_TYPE.get(activation)
     if act is None:
         raise ValueError(
-            f"Unsupported activation '{activation}' for TRTLLM MoE. "
+            f"Unsupported activation '{activation}' for TRTLLM MoE "
+            f"(is_gated={is_gated}). "
             f"Expected one of {list(_ACTIVATION_STR_TO_TYPE.keys())}."
         )
     return act.value
@@ -879,7 +886,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
 
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
@@ -1051,7 +1060,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     assert (
         runner_config.num_fused_shared_experts == 0
     ), "Fused shared experts are not supported for flashinfer trtllm moe"
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
