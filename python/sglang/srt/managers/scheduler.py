@@ -812,9 +812,20 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if len(think_end_ids) == 1:
+                self.model_config.think_end_id = think_end_ids[0]
+            else:
+                logger.warning(
+                    "think_end_token '%s' encodes to %d tokens (expected 1). "
+                    "Constrained reasoning grammar and reasoning token counting "
+                    "will be disabled for this model. The reasoning parser will "
+                    "still function for output parsing.",
+                    reasoning_parser.detector.think_end_token,
+                    len(think_end_ids),
+                )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
