@@ -1,214 +1,243 @@
-"""Facade for the canary API used by other srt modules.
-
-External surface:
-
-- :func:`attach` — install canary buffers + create a :class:`CanaryRunner` per attached
-  :class:`CanaryBufferGroup`.
-- :func:`get_runners` — fetch the runners attached to a pool.
-- :func:`attach_radix_cache_to_pool` — late-binding helper invoked once the scheduler has built its
-  ``tree_cache`` (the canary's :func:`attach` runs at ``ModelRunner`` init, before the radix cache exists).
-- :func:`run_head` / :func:`run_tail` — per-forward driver delegating to each runner.
-- :func:`launch_canary_for_capture` — capture-only no-op recording.
-- :func:`prepare_replay` / :func:`finalize_replay` — replay-side hooks for cuda-graph runners.
-"""
-
 from __future__ import annotations
 
-import dataclasses
+import contextvars
+import functools
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.kv_cache_canary.buffer_group import PoolKind
 from sglang.srt.kv_cache_canary.config import CanaryConfig
-from sglang.srt.kv_cache_canary.pool_patch import (
-    attach_canary_buffers,
-    get_canary_buffer_groups,
-)
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_RUNNERS_KEY = "_kv_cache_canary_runners"
+_INSIDE_REPLAY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kv_cache_canary_inside_replay", default=False
+)
+_REPLAY_CLASS_PATCHED_ATTR = "_kv_cache_canary_replay_class_patched"
+_OPTIONAL_GRAPH_RUNNER_CLASSES: tuple[tuple[str, str], ...] = (
+    (
+        "sglang.srt.speculative.eagle_draft_cuda_graph_runner",
+        "EAGLEDraftCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner",
+        "EAGLEDraftExtendCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.model_executor.piecewise_cuda_graph_runner",
+        "PiecewiseCudaGraphRunner",
+    ),
+)
 
 
-def attach(
+def install_canary(
     *,
-    pool: "KVCache",
-    config: CanaryConfig,
-    device: torch.device,
-    per_forward_verify_capacity: int,
-    per_forward_write_req_capacity: int,
-    running_sweep_verify_capacity: int,
-    radix_sweep_verify_capacity: int,
-    radix_sweep_extras_capacity: int,
-    per_forward_extras_capacity: int = 1,
-    running_sweep_extras_capacity: int = 1,
-    pseudo_token_capacity: int = 1,
-    req_to_token_pool: Optional["ReqToTokenPool"] = None,
-    radix_cache: Optional["BasePrefixCache"] = None,
-    tp_rank: int = 0,
-) -> Optional[List[CanaryRunner]]:
-    """Attach canaries to ``pool`` and create one runner per attached canary buffer group.
+    server_args: "ServerArgs",
+    model_runner: "ModelRunner",
+) -> Optional[CanaryRunner]:
+    """Install canary on a ModelRunner. Returns None if config.mode == "off". Otherwise:
 
-    For SWA-style pools this returns **two** runners (one ``FULL`` + one ``SWA``); for plain MHA / MLA
-    pools it returns a single ``FULL`` runner.
+    1. Build CanaryConfig from server_args + env vars.
+    2. For each KV pool on model_runner (token_to_kv_pool + any aux pools): attach_canary_buffers.
+    3. Build CanaryEndpoint tuples per pool.
+    4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
+    5. Construct CanaryRunner and stash on model_runner.canary_runner.
+    6. Monkeypatch ModelRunner.forward to call runner.forward_step(forward_batch) wrapping the original.
 
-    Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs`` so every canary kernel is
-    captured into the CUDA graph and the canary buffer tensors are baked into the graph's pointer table.
+    Idempotent: second call on the same model_runner is an error.
     """
-    if not config.enabled:
-        return None
-    if hasattr(pool, _GLOBAL_RUNNERS_KEY):
-        logger.warning("kv-canary: pool already has runners attached; reusing them")
-        return get_runners(pool)
-
-    attach_canary_buffers(pool, real_kv_read_bytes=config.real_kv_read_bytes)
-    buffer_groups = get_canary_buffer_groups(pool)
-    if not buffer_groups:
-        return None
-
-    runners: List[CanaryRunner] = []
-    for kind, group in buffer_groups.items():
-        runner_config = _per_kind_config(config, kind=kind)
-        runners.append(
-            CanaryRunner(
-                config=runner_config,
-                buffer_group=group,
-                device=device,
-                per_forward_verify_capacity=per_forward_verify_capacity,
-                per_forward_write_req_capacity=per_forward_write_req_capacity,
-                running_sweep_verify_capacity=running_sweep_verify_capacity,
-                radix_sweep_verify_capacity=radix_sweep_verify_capacity,
-                radix_sweep_extras_capacity=radix_sweep_extras_capacity,
-                per_forward_extras_capacity=per_forward_extras_capacity,
-                running_sweep_extras_capacity=running_sweep_extras_capacity,
-                pseudo_token_capacity=pseudo_token_capacity,
-                req_to_token_pool=req_to_token_pool,
-                radix_cache=radix_cache,
-                tp_rank=tp_rank,
-            )
+    if get_canary_runner(model_runner) is not None:
+        raise RuntimeError(
+            "kv-canary: install_canary called twice on the same ModelRunner"
         )
-    setattr(pool, _GLOBAL_RUNNERS_KEY, runners)
-    logger.info(
-        "kv-canary: attached %d runner(s) in mode=%s kinds=%s",
-        len(runners),
-        config.mode.value,
-        [r.pool_kind.name for r in runners],
-    )
-    return runners
 
+    config = CanaryConfig.from_env(server_args)
+    if config.mode == "off":
+        return None
 
-def _per_kind_config(config: CanaryConfig, *, kind: PoolKind) -> CanaryConfig:
-    """Specialise the shared :class:`CanaryConfig` for one attention regime.
+    pools = _collect_pools(model_runner)
+    device = torch.device(model_runner.device)
+    tp_group = _resolve_tp_group()
+    capacities = _compute_launch_capacities(model_runner=model_runner, config=config)
+    swa_window_size = _resolve_swa_window_size(model_runner)
 
-    The ``swa_window_size`` field gates verify-range clipping in the plan kernel. Only the SWA canary
-    clips; the FULL canary always covers the full prefix even when the parent pool is an SWA system, so we
-    null out the window for it.
-    """
-    if kind is PoolKind.SWA:
-        return config
-    if config.swa_window_size is None:
-        return config
-    return dataclasses.replace(config, swa_window_size=None)
-
-
-def get_runners(pool: "KVCache") -> Optional[List[CanaryRunner]]:
-    """Return the list of runners attached to the pool, or ``None``."""
-    return getattr(pool, _GLOBAL_RUNNERS_KEY, None)
-
-
-def attach_radix_cache_to_pool(pool: "KVCache", radix_cache: "BasePrefixCache") -> None:
-    """Bind ``radix_cache`` to every canary runner attached to ``pool``.
-
-    No-op when canary is disabled or runners are not attached — keeps the scheduler call site cheap to
-    invoke unconditionally. Required for radix-orphan sweep coverage (SOT §6.2): the radix cache is built
-    by the scheduler after :func:`attach` already ran at ``ModelRunner`` init, so the runner needs a
-    late-binding hook.
-    """
-    runners = get_runners(pool)
-    if not runners:
-        return
-    for runner in runners:
-        runner.attach_radix_cache(radix_cache)
-    logger.info(
-        "kv-canary: bound radix cache %s to %d runner(s)",
-        type(radix_cache).__name__,
-        len(runners),
+    runner = CanaryRunner(
+        config=config,
+        pools=pools,
+        device=device,
+        tp_group=tp_group,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        radix_cache=None,
+        per_forward_verify_capacity=capacities.per_forward_verify_capacity,
+        per_forward_write_req_capacity=capacities.per_forward_write_req_capacity,
+        per_forward_write_entry_capacity=capacities.per_forward_write_entry_capacity,
+        sweep_verify_capacity=capacities.sweep_verify_capacity,
+        swa_window_size=swa_window_size,
     )
 
+    model_runner.canary_runner = runner
 
-def run_head(
-    *,
-    runners: Optional[List[CanaryRunner]],
-    forward_batch: "ForwardBatch",
-) -> None:
-    """Drive each runner's per-forward HEAD launch."""
-    if not runners:
+    _patch_model_forward(model_runner=model_runner, runner=runner)
+    _patch_cuda_graph_runner_replay_class_method()
+
+    logger.info(
+        "install_canary: mode=%s tags=%d sweep_cadence=%d",
+        config.mode,
+        len(runner._active_tags),
+        config.sweep_every_n_steps,
+    )
+    return runner
+
+
+def get_canary_runner(model_runner: "ModelRunner") -> Optional[CanaryRunner]:
+    """Return the runner attached to this ModelRunner, or None if canary was not installed."""
+    return getattr(model_runner, "canary_runner", None)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _LaunchCapacities:
+    per_forward_verify_capacity: int
+    per_forward_write_req_capacity: int
+    per_forward_write_entry_capacity: int
+    sweep_verify_capacity: int
+
+
+def _collect_pools(model_runner: "ModelRunner") -> list:
+    pools = [model_runner.token_to_kv_pool]
+    return pools
+
+
+def _resolve_tp_group():
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    try:
+        return get_tp_group()
+    except (AssertionError, RuntimeError, AttributeError):
+        return None
+
+
+def _resolve_swa_window_size(model_runner: "ModelRunner") -> int:
+    window = model_runner.sliding_window_size
+    if window is None:
+        return 0
+    return int(window) if int(window) > 0 else 0
+
+
+def _compute_launch_capacities(
+    *, model_runner: "ModelRunner", config: CanaryConfig
+) -> _LaunchCapacities:
+    server_args = model_runner.server_args
+    cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+    spec_num_draft_tokens = server_args.speculative_num_draft_tokens
+    num_tokens_per_bs = 1
+    if spec_num_draft_tokens:
+        num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
+    max_running_requests = int(model_runner.req_to_token_pool.size)
+    max_bs = max(int(cuda_graph_max_bs), max_running_requests)
+    chunked_prefill_size = server_args.chunked_prefill_size
+    max_prefill_tokens = int(server_args.max_prefill_tokens)
+    if chunked_prefill_size is None or chunked_prefill_size < 0:
+        max_extend_tokens_per_forward = max_prefill_tokens
+    else:
+        max_extend_tokens_per_forward = int(chunked_prefill_size)
+    pool_slot_count = int(model_runner.max_total_num_tokens)
+    write_entry_capacity = max(
+        1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
+    )
+
+    _ = config
+    return _LaunchCapacities(
+        per_forward_verify_capacity=max(1, pool_slot_count),
+        per_forward_write_req_capacity=max(1, max_bs),
+        per_forward_write_entry_capacity=write_entry_capacity,
+        sweep_verify_capacity=max(1, pool_slot_count),
+    )
+
+
+def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -> None:
+    model = model_runner.model
+    original_forward = model.forward
+
+    @functools.wraps(original_forward)
+    def patched_model_forward(*args, **kwargs):
+        forward_batch = _extract_forward_batch(args, kwargs)
+        if forward_batch is None:
+            return original_forward(*args, **kwargs)
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return original_forward(*args, **kwargs)
+
+        if _INSIDE_REPLAY.get():
+            return original_forward(*args, **kwargs)
+
+        runner.forward_step_before_model(forward_batch)
+        output = original_forward(*args, **kwargs)
+        runner.forward_step_after_model()
+        runner.end_of_step()
+        return output
+
+    model.forward = patched_model_forward
+
+
+def _patch_cuda_graph_runner_replay_class_method() -> None:
+    classes_to_patch: list[type] = [CudaGraphRunner]
+    for module_path, class_name in _OPTIONAL_GRAPH_RUNNER_CLASSES:
+        optional_cls = _try_import_class(module_path, class_name)
+        if optional_cls is not None:
+            classes_to_patch.append(optional_cls)
+
+    for cls in classes_to_patch:
+        _patch_graph_runner_class_replay(cls)
+
+
+def _try_import_class(module_path: str, class_name: str) -> Optional[type]:
+    try:
+        module = __import__(module_path, fromlist=[class_name])
+    except ImportError:
+        logger.debug("kv-canary: %s not available; skipping", class_name)
+        return None
+    return getattr(module, class_name, None)
+
+
+def _patch_graph_runner_class_replay(cls: type) -> None:
+    if getattr(cls, _REPLAY_CLASS_PATCHED_ATTR, False):
         return
-    for runner in runners:
-        runner.set_last_forward_batch(forward_batch)
-        runner.run_head(forward_batch=forward_batch)
+
+    original_replay = cls.replay
+
+    @functools.wraps(original_replay)
+    def patched_replay(self, forward_batch, *args, **kwargs):
+        runner = get_canary_runner(self.model_runner)
+        if runner is None or runner.config.mode == "off":
+            return original_replay(self, forward_batch, *args, **kwargs)
+
+        runner.forward_step_before_model(forward_batch)
+        token = _INSIDE_REPLAY.set(True)
+        try:
+            output = original_replay(self, forward_batch, *args, **kwargs)
+        finally:
+            _INSIDE_REPLAY.reset(token)
+        runner.forward_step_after_model()
+        runner.end_of_step()
+        return output
+
+    cls.replay = patched_replay
+    setattr(cls, _REPLAY_CLASS_PATCHED_ATTR, True)
 
 
-def run_tail(
-    *,
-    runners: Optional[List[CanaryRunner]],
-    forward_batch: "ForwardBatch",
-) -> None:
-    """Drive each runner's per-forward TAIL launch + end-of-forward bookkeeping."""
-    if not runners:
-        return
-    for runner in runners:
-        runner.run_tail(forward_batch=forward_batch)
-        runner.end_of_forward()
-
-
-def launch_canary_for_capture(
-    runners: Optional[List[CanaryRunner]], *, kernel_kind: str
-) -> None:
-    """Capture-only no-op recording hook.
-
-    The kernel pair is intentionally NOT baked into cuda-graph capture (see :mod:`install`); this stays in
-    place as the public symbol for any callers that still drive it. ``kernel_kind`` is accepted for
-    backward-compat and ignored.
-    """
-    if not runners:
-        return
-    _ = kernel_kind
-
-
-def prepare_replay(
-    *,
-    runners: Optional[List[CanaryRunner]],
-    forward_batch: "ForwardBatch",
-) -> None:
-    """Replay-side hook: drive head launch + plan refill before the captured replay runs."""
-    if not runners:
-        return
-    for runner in runners:
-        if not runner.config.enabled:
-            continue
-        runner.set_last_forward_batch(forward_batch)
-        runner.run_head(forward_batch=forward_batch)
-
-
-def finalize_replay(
-    *,
-    runners: Optional[List[CanaryRunner]],
-    forward_batch: "ForwardBatch",
-) -> None:
-    """Replay-side hook: drive tail launch + end-of-forward after the captured replay returns."""
-    if not runners:
-        return
-    for runner in runners:
-        if not runner.config.enabled:
-            continue
-        runner.run_tail(forward_batch=forward_batch)
-        runner.end_of_forward()
+def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:
+    if "forward_batch" in kwargs and isinstance(kwargs["forward_batch"], ForwardBatch):
+        return kwargs["forward_batch"]
+    for arg in args:
+        if isinstance(arg, ForwardBatch):
+            return arg
+    return None

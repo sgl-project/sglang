@@ -743,16 +743,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
-        # Local import: kv_cache_canary.install imports ModelRunner globally, so
+        # Local import: kv_cache_canary.api imports ModelRunner globally, so
         # importing it at module top here would form a cycle.
-        from sglang.srt.kv_cache_canary.install import install_on_model_runner
+        from sglang.srt.kv_cache_canary.api import install_canary
 
-        install_on_model_runner(
-            model_runner=self,
-            mode=server_args.kv_cache_canary,
-            real_kv_hash_mode=server_args.kv_cache_canary_real_data,
-            real_data_sweep_every_n_steps=server_args.kv_cache_canary_real_data_sweep_every_n_steps,
-        )
+        install_canary(server_args=server_args, model_runner=self)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
