@@ -864,7 +864,8 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
+            if self.rem_chunk_tokens is None or self.rem_chunk_tokens <= 0:
+                return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
@@ -892,7 +893,8 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                return AddReqResult.OTHER
+                if self.rem_chunk_tokens is None or self.rem_chunk_tokens <= 0:
+                    return AddReqResult.OTHER
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
