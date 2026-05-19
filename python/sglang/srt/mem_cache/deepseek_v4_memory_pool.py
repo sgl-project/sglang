@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
-    DeepSeekV4CompressState,
+    CompressStateSeparate,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
@@ -488,9 +488,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if _is_hip:
             self._init_paged_compress_states(False)
         elif _is_cpu and _cpu_amx:
-            self._init_compress_states(enable_memory_saver)
-            self.compress_state_pools: List[CompressStatePool] = []
-            self.indexer_compress_state_pools: List[CompressStatePool] = []
+            self._init_non_paged_compress_states(enable_memory_saver)
         else:
             self._init_paged_compress_states(enable_memory_saver)
 
@@ -603,22 +601,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     swa_page_size=self.swa_page_size,
                 )
 
-    def _init_compress_states(self, enable_memory_saver: bool):
-        """Allocate non-paged DeepSeekV4CompressState buffers used by the
-        old-compressor fallback.
+    def _init_non_paged_compress_states(self, enable_memory_saver: bool):
+        """Allocate non-paged CompressStateSeparate buffers
 
         Layout per layer: ``(max_num_reqs, ratio*coff, 2*head_dim*coff)``.
         The buffers are small relative to the paged ring pools and only
         materialised when the radix path is off.
         """
-        self.compress_states: List[Optional[DeepSeekV4CompressState]] = []
-        self.indexer_compress_states: List[Optional[DeepSeekV4CompressState]] = []
+        self.compress_states: List[Optional[CompressStateSeparate]] = []
+        self.indexer_compress_states: List[Optional[CompressStateSeparate]] = []
         attn_kv_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         for ratio in self.compression_ratios:
             overlap = ratio == 4
             compress_state = indexer_compress_state = None
             if ratio != 0:
-                compress_state = DeepSeekV4CompressState(
+                compress_state = CompressStateSeparate(
                     max_num_reqs=self.max_num_reqs,
                     ratio=ratio,
                     overlap=overlap,
@@ -628,7 +625,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     enable_memory_saver=enable_memory_saver,
                 )
             if ratio == 4:
-                indexer_compress_state = DeepSeekV4CompressState(
+                indexer_compress_state = CompressStateSeparate(
                     max_num_reqs=self.max_num_reqs,
                     ratio=ratio,
                     overlap=overlap,
