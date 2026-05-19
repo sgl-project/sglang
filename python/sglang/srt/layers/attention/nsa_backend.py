@@ -334,9 +334,9 @@ class NativeSparseAttnBackend(
 
         self.use_mha: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (
-            model_runner.server_args.nsa_prefill_backend
+            model_runner.server_args.dsa_prefill_backend
         )
-        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.dsa_decode_backend
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:

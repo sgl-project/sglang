@@ -36,12 +36,12 @@ def apply_hisparse_nsa_backend_defaults(
 
     backend = _hisparse_default_backend(kv_cache_dtype)
     if not user_set_prefill:
-        server_args.nsa_prefill_backend = backend
+        server_args.dsa_prefill_backend = backend
     if not user_set_decode:
-        server_args.nsa_decode_backend = backend
+        server_args.dsa_decode_backend = backend
     logger.warning(
         f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
-        f"prefill={server_args.nsa_prefill_backend}, decode={server_args.nsa_decode_backend}."
+        f"prefill={server_args.dsa_prefill_backend}, decode={server_args.dsa_decode_backend}."
     )
     return True
 
@@ -83,8 +83,8 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         server_args.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
     )
     for attr, label in [
-        ("nsa_prefill_backend", "prefill"),
-        ("nsa_decode_backend", "decode"),
+        ("dsa_prefill_backend", "prefill"),
+        ("dsa_decode_backend", "decode"),
     ]:
         backend = getattr(server_args, attr)
         if backend is not None and backend not in allowed_backends:

@@ -685,8 +685,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend == "nsa":
             return (
-                get_global_server_args().nsa_decode_backend == "trtllm"
-                or get_global_server_args().nsa_prefill_backend == "trtllm"
+                get_global_server_args().dsa_decode_backend == "trtllm"
+                or get_global_server_args().dsa_prefill_backend == "trtllm"
             ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -707,8 +707,8 @@ class DeepseekMLAForwardMixin:
             _use_aiter_gfx95
             and self.current_attention_backend == "nsa"
             and (
-                server_args.nsa_decode_backend == "tilelang"
-                or server_args.nsa_prefill_backend == "tilelang"
+                server_args.dsa_decode_backend == "tilelang"
+                or server_args.dsa_prefill_backend == "tilelang"
             )
         )
 

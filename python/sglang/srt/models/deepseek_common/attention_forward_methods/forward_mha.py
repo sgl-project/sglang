@@ -233,8 +233,8 @@ class DeepseekMHAForwardMixin:
                 self.use_nsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().nsa_decode_backend == "trtllm"
-                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
+                    not get_global_server_args().dsa_decode_backend == "trtllm"
+                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
