@@ -2522,9 +2522,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # rows so the GPU worker can sync its GPU tensor before the forward pass.
         # Pure decode steps don't need this: the GPU req_to_token already holds
         # the correct rows from the previous step's _allocate_kv_deferred write,
-        # and the decode fast path reuses the cached GPU batch.  Cloning the
-        # snapshot here would be [batch_size * max_context_len * 4] bytes of
-        # unused memcpy per decode step.
+        # and the decode fast path reuses the cached GPU batch.
+        # For extend, only need to ship rows for reqs that have cached prefix
+        # (extend_prefix_lens > 0). All-fresh prefill batches don't need any
+        # snapshot. Cloning the full [batch_size, max_context_len] slice would
+        # be megabytes of unused memcpy per prefill batch.
+        req_to_token_cpu = None
         if (
             self.req_to_token_pool is not None
             and self.req_to_token_pool.device == "cpu"
@@ -2532,11 +2535,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             and len(self.req_pool_indices) > 0
             and not self.forward_mode.is_decode()
         ):
-            req_to_token_cpu = self.req_to_token_pool.req_to_token[
-                self.req_pool_indices.long()
-            ].clone()
-        else:
-            req_to_token_cpu = None
+            # Check if any req has a non-zero prefix that needs syncing.
+            need_snapshot = False
+            if self.forward_mode.is_extend() and extend_prefix_lens is not None:
+                if isinstance(extend_prefix_lens, list):
+                    need_snapshot = any(p > 0 for p in extend_prefix_lens)
+                else:
+                    need_snapshot = bool(int(extend_prefix_lens.max())) if extend_prefix_lens.numel() > 0 else False
+            else:
+                # Other non-decode modes (idle, mixed, etc.) — keep old behavior.
+                need_snapshot = True
+            if need_snapshot:
+                req_to_token_cpu = self.req_to_token_pool.req_to_token[
+                    self.req_pool_indices.long()
+                ].clone()
 
         # Drain any KV slot indices queued for freeing on the GPU worker.
         _allocator = getattr(self.tree_cache, "token_to_kv_pool_allocator", None)
@@ -2602,7 +2614,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_pooled_hidden_states=self.return_pooled_hidden_states,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
-            reqs=self.reqs,
+            # Pass full Req objects only when the worker actually needs them
+            # (grammar paths consult req.grammar). Otherwise ship just rids,
+            # saving multi-MB of Req-object pickling on every forward.
+            reqs=self.reqs if self.has_grammar else None,
+            rids=[req.rid for req in self.reqs],
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2812,6 +2828,12 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # Cheap alternative to ``reqs`` for the worker side — only the rids are
+    # consumed there (forward_batch_info passes them through to tracing).
+    # Setting this lets the CPU-scheduler path drop ``reqs`` from the cross-
+    # process payload (the Req object graph is multi-MB at batch=32).
+    rids: Optional[List[str]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

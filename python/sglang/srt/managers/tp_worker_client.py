@@ -533,9 +533,9 @@ class TpWorkerClientGroup(BaseTpWorker):
         return self._last_req_pool_fp is not None and fp == self._last_req_pool_fp
 
     def _maybe_rehydrate_decode_reply(self, slim):
-        """Rehydrate the worker's slim M_DECODE_STEP dict reply into a
+        """Rehydrate the worker's slim reply dict (decode OR prefill) into a
         ``GenerationBatchResult``.  Returns *slim* unchanged if it's already
-        a full result object (back-compat with the M_FORWARD_GENERATION path).
+        a full result object.
         """
         if isinstance(slim, dict) and slim.get("_slim_decode"):
             from sglang.srt.managers.utils import GenerationBatchResult
@@ -545,9 +545,11 @@ class TpWorkerClientGroup(BaseTpWorker):
                 accept_lens=slim.get("accept_lens"),
                 can_run_cuda_graph=slim.get("can_run_cuda_graph", False),
                 num_accepted_drafts=slim.get("num_accepted_drafts", 0),
+                num_accepted_drafts_per_req_cpu=slim.get("num_accepted_drafts_per_req_cpu"),
                 logits_output=slim.get("logits_output"),
                 routed_experts_output=slim.get("routed_experts_output"),
                 expert_distribution_metrics=slim.get("expert_distribution_metrics"),
+                next_draft_input=slim.get("next_draft_input"),
             )
         return slim
 
@@ -623,7 +625,7 @@ class TpWorkerClientGroup(BaseTpWorker):
             )
             self._decode_fast_valid = True
             self._last_req_pool_fp = fp
-            return result
+            return self._maybe_rehydrate_decode_reply(result)
 
         # Non-decode forward (extend / idle / mixed): full path.
         self._decode_full_calls += 1
@@ -637,7 +639,7 @@ class TpWorkerClientGroup(BaseTpWorker):
         # Non-decode (extend / idle) invalidates the GPU decode cache.
         self._decode_fast_valid = False
         self._last_req_pool_fp = None
-        return result
+        return self._maybe_rehydrate_decode_reply(result)
 
     def forward_batch_embedding(self, model_worker_batch: "ModelWorkerBatch"):
         return self._fanout_forward(b"forward_batch_embedding", batch=model_worker_batch)
@@ -693,17 +695,15 @@ class TpWorkerClientGroup(BaseTpWorker):
         if kind == "fast":
             self._decode_fast_hits += 1
             self._last_req_pool_fp = fp
-            return self._maybe_rehydrate_decode_reply(result)
-        if kind == "miss":
+        elif kind == "miss":
             self._decode_fast_misses += 1
             self._decode_fast_valid = True
             self._last_req_pool_fp = fp
-            return result
-        # kind == "full" — non-decode forward
-        self._decode_full_calls += 1
-        self._decode_fast_valid = False
-        self._last_req_pool_fp = None
-        return result
+        else:  # kind == "full" — non-decode forward
+            self._decode_full_calls += 1
+            self._decode_fast_valid = False
+            self._last_req_pool_fp = None
+        return self._maybe_rehydrate_decode_reply(result)
 
     def forward_batch_split_prefill(self, batch: "ScheduleBatch") -> "GenerationBatchResult":
         return self._fanout_forward(b"forward_batch_split_prefill", batch=batch)

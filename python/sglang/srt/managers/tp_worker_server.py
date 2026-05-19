@@ -184,13 +184,12 @@ class TpWorkerServer:
 
         # Phase 0 instrumentation: aggregate run_loop sub-step times for the
         # decode-step path so we can see where the per-step time actually goes.
-        _loop_count = 0
-        _loop_recv_sum = 0.0      # time waiting on recv_multipart (incl. idle)
-        _loop_unpickle_sum = 0.0  # pickle.loads of payload
-        _loop_dispatch_sum = 0.0  # actual work (delegates to existing aggregator inside)
-        _loop_repickle_sum = 0.0  # pickle.dumps of result
-        _loop_send_sum = 0.0      # socket.send_multipart
-        _loop_window = 100
+        # Separate counters for decode (M_DECODE_STEP) and full (M_FORWARD_GENERATION)
+        # so prefill regressions don't get hidden behind decode aggregates.
+        _agg = {
+            M_DECODE_STEP: {"count": 0, "recv": 0.0, "unpkl": 0.0, "disp": 0.0, "repkl": 0.0, "send": 0.0, "win": 100},
+            M_FORWARD_GENERATION: {"count": 0, "recv": 0.0, "unpkl": 0.0, "disp": 0.0, "repkl": 0.0, "send": 0.0, "win": 5},
+        }
 
         while True:
             try:
@@ -223,30 +222,35 @@ class TpWorkerServer:
                 self.socket.send_multipart([STATUS_ERROR, pickle.dumps(str(exc))])
                 continue
 
-            # Aggregate per-step
-            if method == M_DECODE_STEP or method == M_FORWARD_GENERATION:
-                _loop_count += 1
-                _loop_recv_sum += _t1 - _t0
-                _loop_unpickle_sum += _t2 - _t1
-                _loop_dispatch_sum += _t3 - _t2
-                _loop_repickle_sum += _t4 - _t3
-                _loop_send_sum += _t5 - _t4
-                if _loop_count >= _loop_window:
+            # Aggregate per-step per-method
+            if method in _agg:
+                a = _agg[method]
+                a["count"] += 1
+                a["recv"] += _t1 - _t0
+                a["unpkl"] += _t2 - _t1
+                a["disp"] += _t3 - _t2
+                a["repkl"] += _t4 - _t3
+                a["send"] += _t5 - _t4
+                if a["count"] >= a["win"]:
+                    n = a["count"]
+                    label = "decode" if method == M_DECODE_STEP else "full"
                     logger.info(
-                        "TpWorkerServer run_loop[%d steps] avg ms: recv_wait=%.2f "
+                        "TpWorkerServer run_loop[%s %d steps] avg ms: recv_wait=%.2f "
                         "unpickle=%.2f dispatch=%.2f repickle=%.2f send=%.2f total=%.2f",
-                        _loop_count,
-                        _loop_recv_sum / _loop_count * 1000,
-                        _loop_unpickle_sum / _loop_count * 1000,
-                        _loop_dispatch_sum / _loop_count * 1000,
-                        _loop_repickle_sum / _loop_count * 1000,
-                        _loop_send_sum / _loop_count * 1000,
-                        (_loop_recv_sum + _loop_unpickle_sum + _loop_dispatch_sum
-                         + _loop_repickle_sum + _loop_send_sum) / _loop_count * 1000,
+                        label, n,
+                        a["recv"] / n * 1000,
+                        a["unpkl"] / n * 1000,
+                        a["disp"] / n * 1000,
+                        a["repkl"] / n * 1000,
+                        a["send"] / n * 1000,
+                        (a["recv"] + a["unpkl"] + a["disp"] + a["repkl"] + a["send"]) / n * 1000,
                     )
-                    _loop_count = 0
-                    _loop_recv_sum = _loop_unpickle_sum = _loop_dispatch_sum = 0.0
-                    _loop_repickle_sum = _loop_send_sum = 0.0
+                    win = a["win"]
+                    for k in a:
+                        if k == "win":
+                            continue
+                        a[k] = 0 if k == "count" else 0.0
+                    a["win"] = win
 
     def run_in_thread(self) -> threading.Thread:
         """Start the event loop in a background daemon thread and return it."""
@@ -359,15 +363,38 @@ class TpWorkerServer:
                     "Try lowering --max-running-requests."
                 )
 
-            # Write new extend slots into GPU req_to_token
-            pt = 0
-            for i in range(len(prefix_lens_list)):
-                pre = prefix_lens_list[i]
-                ext = extend_lens_cpu[i].item()
+            # Write new extend slots into GPU req_to_token.
+            # Vectorized: build (row, col) index pairs once and do a single
+            # fancy-indexed scatter instead of a per-request Python loop with
+            # GPU sync points. Significant at prefill batches > a few reqs.
+            bs = len(prefix_lens_list)
+            if bs == 1:
+                pre = prefix_lens_list[0]
+                ext = int(extend_lens_cpu[0])
                 req_to_token_gpu[
-                    req_pool_indices_gpu[i], pre : pre + ext
-                ] = out_cache_loc[pt : pt + ext].to(torch.int32)
-                pt += ext
+                    req_pool_indices_gpu[0], pre : pre + ext
+                ] = out_cache_loc[:ext].to(torch.int32)
+            else:
+                extend_lens_gpu = extend_lens_cpu.to(device)
+                # Row index per scattered token: repeat each req's pool index by
+                # its extend length.
+                row_idx = torch.repeat_interleave(req_pool_indices_gpu, extend_lens_gpu)
+                # Column index per scattered token:
+                #   prefix_lens[req] + (offset within that req's extend range)
+                # offset = global_index - cumulative_extend_start_of_that_req.
+                cumulative_extend = torch.cumsum(extend_lens_gpu, dim=0)
+                slice_starts = torch.cat(
+                    [torch.zeros(1, dtype=torch.int64, device=device), cumulative_extend[:-1]]
+                )
+                total_tokens = int(cumulative_extend[-1])
+                token_indices = torch.arange(total_tokens, device=device, dtype=torch.int64)
+                slice_start_per_token = torch.repeat_interleave(slice_starts, extend_lens_gpu)
+                token_offset = token_indices - slice_start_per_token
+                col_idx = (
+                    torch.repeat_interleave(prefix_lens_gpu, extend_lens_gpu)
+                    + token_offset
+                )
+                req_to_token_gpu[row_idx, col_idx] = out_cache_loc.to(torch.int32)
 
             batch.out_cache_loc = out_cache_loc
 
@@ -509,34 +536,9 @@ class TpWorkerServer:
             result = w.forward_batch_generation(batch)
             forward_batch_time = time.perf_counter()
             result.deferred_alloc = batch._deferred_alloc
-            # CRITICAL: drop next_token_logits — a [batch, vocab_size] GPU tensor
-            # (~155 MB at batch=200 / vocab=152k) that the scheduler never reads.
-            # If it pickles, it sends 155 MB per decode step over ZMQ.
-            if result.logits_output is not None:
-                result.logits_output.next_token_logits = None
+            _drop_ipc_unsafe_logits(result.logits_output, batch)
             _move_generation_result_to_cpu(result)
-            # Slim reply for M_DECODE_STEP: include only what the scheduler reads.
-            # Pickling a full GenerationBatchResult walks 15+ Optional dataclass
-            # fields and historically dragged in the huge next_token_logits.
-            slim_result = {
-                "_slim_decode": True,
-                "next_token_ids": result.next_token_ids,
-                "deferred_alloc": result.deferred_alloc,
-                "accept_lens": result.accept_lens,
-                "can_run_cuda_graph": result.can_run_cuda_graph,
-                "num_accepted_drafts": result.num_accepted_drafts,
-            }
-            # logits_output only carries useful logprob arrays when return_logprob
-            # is set on the batch; otherwise the whole thing is dead weight.
-            if (
-                result.logits_output is not None
-                and getattr(batch, "return_logprob", False)
-            ):
-                slim_result["logits_output"] = result.logits_output
-            if result.routed_experts_output is not None:
-                slim_result["routed_experts_output"] = result.routed_experts_output
-            if result.expert_distribution_metrics is not None:
-                slim_result["expert_distribution_metrics"] = result.expert_distribution_metrics
+            slim_result = _build_slim_reply(result, batch)
             move_result_to_cpu_time = time.perf_counter()
             # Aggregate timings every N steps so we can see worker-side breakdown
             # without flooding the log.
@@ -582,11 +584,9 @@ class TpWorkerServer:
                 self._decode_cache = batch
             else:
                 self._decode_cache = None
-            # Drop the [batch, vocab_size] next_token_logits — never read by the
-            # scheduler, would pickle as 100+ MB per step.
-            if result.logits_output is not None:
-                result.logits_output.next_token_logits = None
+            _drop_ipc_unsafe_logits(result.logits_output, batch)
             _move_generation_result_to_cpu(result)
+            slim = _build_slim_reply(result, batch)
             move_result_to_cpu_time = time.perf_counter()
             logger.debug(
                 "TpWorkerServer forward_batch_generation times: "
@@ -595,7 +595,7 @@ class TpWorkerServer:
                 forward_batch_time - prepare_time,
                 move_result_to_cpu_time - forward_batch_time,
             )
-            return result
+            return slim
 
         if method == M_FORWARD_EMBEDDING:
             batch = payload["batch"]
@@ -662,6 +662,69 @@ class TpWorkerServer:
             return None
 
         raise ValueError(f"TpWorkerServer: unknown RPC method {method!r}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers: prepare a GenerationBatchResult for IPC return to the scheduler.
+# ---------------------------------------------------------------------------
+
+def _drop_ipc_unsafe_logits(lo, batch) -> None:
+    """Null out fields on LogitsProcessorOutput the scheduler never reads.
+
+    Each of these is a potentially large GPU tensor that the worker has
+    finished consuming (sampling, etc.). Leaving them non-None forces them
+    to ride pickle/ZMQ to the scheduler for no purpose — at batch=200,
+    vocab=152k, that's ~155 MB *per step*.
+
+    - next_token_logits: [batch, vocab_size], from sampling — never read.
+    - full_logits: [batch, seq_len, vocab_size], dLLM only — never read.
+    - mm_input_embeds: multimodal patches — never read in this path.
+    - hidden_states: only used by spec / return_hidden_states; drop otherwise.
+    """
+    if lo is None:
+        return
+    lo.next_token_logits = None
+    lo.full_logits = None
+    lo.mm_input_embeds = None
+    if not (
+        getattr(batch, "is_spec_v2", False)
+        or getattr(batch, "return_hidden_states", False)
+    ):
+        lo.hidden_states = None
+
+
+def _build_slim_reply(result, batch) -> dict:
+    """Pack only the fields the scheduler consumes downstream.
+
+    The scheduler's process_batch_result_decode / _prefill / overlap-handlers
+    read: next_token_ids, deferred_alloc, accept_lens, can_run_cuda_graph,
+    num_accepted_drafts, num_accepted_drafts_per_req_cpu, next_draft_input
+    (spec), logits_output (return_logprob), routed_experts_output (MoE),
+    expert_distribution_metrics. The remaining ~10 Optional dataclass fields
+    on GenerationBatchResult are dead weight for the wire.
+    """
+    slim = {
+        "_slim_decode": True,
+        "next_token_ids": result.next_token_ids,
+        "deferred_alloc": result.deferred_alloc,
+        "accept_lens": result.accept_lens,
+        "can_run_cuda_graph": result.can_run_cuda_graph,
+        "num_accepted_drafts": result.num_accepted_drafts,
+    }
+    if getattr(result, "num_accepted_drafts_per_req_cpu", None) is not None:
+        slim["num_accepted_drafts_per_req_cpu"] = result.num_accepted_drafts_per_req_cpu
+    if (
+        result.logits_output is not None
+        and getattr(batch, "return_logprob", False)
+    ):
+        slim["logits_output"] = result.logits_output
+    if result.routed_experts_output is not None:
+        slim["routed_experts_output"] = result.routed_experts_output
+    if result.expert_distribution_metrics is not None:
+        slim["expert_distribution_metrics"] = result.expert_distribution_metrics
+    if getattr(result, "next_draft_input", None) is not None:
+        slim["next_draft_input"] = result.next_draft_input
+    return slim
 
 
 # ---------------------------------------------------------------------------
