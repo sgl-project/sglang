@@ -339,22 +339,14 @@ class LoRAManager:
 
         # force_cuda_graph=True lets PCG (extend) drive in-place batch info updates
         # even though ForwardMode.EXTEND is not in ForwardMode.is_cuda_graph().
-        # Additionally, when the pinned cuda_graph_batch_info was sized for PCG
-        # (max_num_tokens_pcg supplied), route EXTEND through it directly so the
-        # upstream init_new call writes into the pinned buffer once, instead of
-        # doing the throwaway fresh-alloc path followed by a second pass in
-        # PCG.replay (which was the source of long-prompt regression).
+        # The auto-route via _cuda_graph_supports_extend was reverted because it
+        # caused eager EXTEND fallbacks (e.g. PCG can_run==False for batched LoRA)
+        # to read stale max_len from the pinned buffer, ballooning kernel grids.
+        # Now only PCG/BCG.replay opt in explicitly via force_cuda_graph=True.
         use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
-            and (
-                forward_batch.forward_mode.is_cuda_graph()
-                or force_cuda_graph
-                or (
-                    getattr(self, "_cuda_graph_supports_extend", False)
-                    and forward_batch.forward_mode.is_extend()
-                )
-            )
+            and (forward_batch.forward_mode.is_cuda_graph() or force_cuda_graph)
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)

@@ -492,6 +492,23 @@ class PiecewiseCudaGraphRunner:
         # lm_head_batch_info.use_cuda_graph=False in the backend (see
         # triton/chunked_backend._build_lm_head_batch_info). No need to
         # blacklist whole batches here.
+        #
+        # PCG capture is performed with batch_size=1 (one logical sequence
+        # carrying all num_tokens tokens). LoRA triton kernels launch with a
+        # grid of `(_, batch_info.bs)` (sgemm_lora_a/b at lines 150-155), so
+        # a live batch_size != 1 changes the kernel grid shape — Dynamo's
+        # specialization guard fails, a runtime recompile fires, and the
+        # captured PCG stream is no longer in scope, hitting the
+        # `AssertionError: PCG capture stream is not set` in
+        # cuda_piecewise_backend.py. Refuse PCG for batched LoRA requests so
+        # the engine falls back to eager prefill (still correct, no crash).
+        # BCG (BreakableCudaGraphRunner) does not have this limitation
+        # because it does not go through Inductor / Dynamo.
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.batch_size > 1
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -839,13 +856,18 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        # Note: prepare_lora_batch is NOT called here anymore. The upstream
-        # call in forward_batch_info.init_new already routed EXTEND through
-        # the pinned cuda_graph_batch_info path because
-        # lora_manager._cuda_graph_supports_extend is True when PCG was
-        # initialized (max_num_tokens_pcg was supplied). Calling again here
-        # would duplicate the CPU permutation/segments build + async copies
-        # and was the source of the long-prompt PCG regression.
+        # Re-run prepare_lora_batch with force_cuda_graph=True so the backend
+        # writes batch metadata into the pinned cuda_graph_batch_info baked
+        # into the captured graph. The upstream init_new call wrote into a
+        # fresh allocation under use_cuda_graph=False (because EXTEND is not
+        # in is_cuda_graph()); we overwrite that here.
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
 
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
