@@ -33,12 +33,12 @@ import pickle
 import types
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
-from sglang.srt.kv_cache_canary import host_state as _canary_host_state
+from sglang.jit_kernel import kv_cache_canary_plan_ref as _canary_plan_ref
 from sglang.srt.kv_cache_canary.api import get_runners
 from sglang.srt.pseudo_mode.sampler_override import install_sampler_override
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_cache_canary.host_state import BatchPlan
+    from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -96,16 +96,16 @@ def install_on_model_runner(
 
 
 def _install_plan_patch(*, oracle: "PseudoOracle") -> None:
-    """Wrap ``host_state.plan_batch_from_forward_batch`` to fill expected_*.
+    """Wrap ``kv_cache_canary_plan_ref.plan_batch_from_forward_batch`` to fill expected_*.
 
     The canary api module imports ``plan_batch_from_forward_batch`` by
     name at module load, so we rebind on **both** modules to ensure
     ``run_head`` / ``prepare_replay`` pick up the wrapper.
     """
-    if getattr(_canary_host_state, _PLAN_PATCHED_ATTR, False):
+    if getattr(_canary_plan_ref, _PLAN_PATCHED_ATTR, False):
         return
 
-    original_plan = _canary_host_state.plan_batch_from_forward_batch
+    original_plan = _canary_plan_ref.plan_batch_from_forward_batch
 
     @functools.wraps(original_plan)
     def patched_plan(
@@ -134,14 +134,14 @@ def _install_plan_patch(*, oracle: "PseudoOracle") -> None:
             expected_write_positions=expected_positions,
         )
 
-    _canary_host_state.plan_batch_from_forward_batch = patched_plan
+    _canary_plan_ref.plan_batch_from_forward_batch = patched_plan
     # Refresh the name binding inside canary.api too — it did
-    # ``from .host_state import plan_batch_from_forward_batch`` at load
-    # time, so its local binding is the original function object.
+    # ``from .kv_cache_canary_plan_ref import plan_batch_from_forward_batch``
+    # at load time, so its local binding is the original function object.
     from sglang.srt.kv_cache_canary import api as _canary_api
 
     _canary_api.plan_batch_from_forward_batch = patched_plan
-    setattr(_canary_host_state, _PLAN_PATCHED_ATTR, True)
+    setattr(_canary_plan_ref, _PLAN_PATCHED_ATTR, True)
 
 
 def _install_scheduler_hooks(

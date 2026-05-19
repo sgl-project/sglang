@@ -32,7 +32,7 @@ import torch
 from sglang.jit_kernel.kv_cache_canary_ref import splitmix64
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_cache_canary.host_state import BatchPlan
+    from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -84,9 +84,7 @@ class PseudoOracle:
                 f"pseudo-oracle: vocab_size must be positive, got {vocab_size}"
             )
         if not 0 <= eos_id < vocab_size:
-            raise ValueError(
-                f"pseudo-oracle: eos_id {eos_id} out of [0, {vocab_size})"
-            )
+            raise ValueError(f"pseudo-oracle: eos_id {eos_id} out of [0, {vocab_size})")
         self._seed: int = seed & _U64_MASK
         self._vocab_size: int = vocab_size
         self._eos_id: int = eos_id
@@ -162,7 +160,9 @@ class PseudoOracle:
     def predict_input_token(self, *, req_id: str, position: int) -> int:
         state = self._reqs.get(req_id)
         if state is None:
-            raise KeyError(f"pseudo-oracle: predict_input_token unknown req_id {req_id!r}")
+            raise KeyError(
+                f"pseudo-oracle: predict_input_token unknown req_id {req_id!r}"
+            )
         prefill_len = len(state.origin_input_ids)
         if position < 0:
             raise ValueError(
@@ -182,7 +182,9 @@ class PseudoOracle:
     def predict_output_token(self, *, req_id: str, step: int) -> int:
         state = self._reqs.get(req_id)
         if state is None:
-            raise KeyError(f"pseudo-oracle: predict_output_token unknown req_id {req_id!r}")
+            raise KeyError(
+                f"pseudo-oracle: predict_output_token unknown req_id {req_id!r}"
+            )
         if step < 0:
             raise ValueError(
                 f"pseudo-oracle: predict_output_token {req_id!r} step {step} < 0"

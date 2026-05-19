@@ -21,12 +21,12 @@ import unittest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import SKIP_CHAIN_SENTINEL
-from sglang.srt.kv_cache_canary.host_state import (
+from sglang.jit_kernel.kv_cache_canary_plan_ref import (
     BatchPlan,
     _build_plan,
     _translate_plan_slot_indices,
-    translate_alive_slots_for_swa,
 )
+from sglang.srt.kv_cache_canary.host_state import translate_alive_slots_for_swa
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
     attach_canary_buffers,

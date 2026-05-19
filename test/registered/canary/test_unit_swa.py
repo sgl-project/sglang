@@ -16,8 +16,8 @@ import unittest
 
 import torch
 
+from sglang.jit_kernel.kv_cache_canary_plan_ref import _build_plan
 from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_cache_canary.host_state import _build_plan
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
     attach_canary_buffers,

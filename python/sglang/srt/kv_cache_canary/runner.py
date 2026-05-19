@@ -17,7 +17,13 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_TAIL,
     FailReason,
 )
-from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlanGpu
+from sglang.jit_kernel.kv_cache_canary_plan_ref import (
+    BatchPlan,
+    BatchPlanGpu,
+    allocate_batch_plan_gpu,
+    fill_batch_plan_gpu_from_plan,
+    reset_batch_plan_gpu_to_skip_sentinel,
+)
 from sglang.srt.kv_cache_canary.config import (
     CanaryConfig,
     CanaryMode,
@@ -36,11 +42,7 @@ from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KIND_TAIL_K,
     VIOLATION_KIND_TAIL_V,
     VIOLATION_KINDS,
-    BatchPlan,
     CanaryDeviceState,
-    allocate_batch_plan_gpu,
-    fill_batch_plan_gpu_from_plan,
-    reset_batch_plan_gpu_to_skip_sentinel,
     translate_alive_slots_for_swa,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (

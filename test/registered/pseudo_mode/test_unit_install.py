@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 from unittest import mock
 
 import torch
@@ -96,15 +96,11 @@ class _StubScheduler:
         self.queued: List[_StubReq] = []
         self.processed_results: List[Any] = []
 
-    def _add_request_to_queue(
-        self, req: _StubReq, is_retracted: bool = False
-    ) -> None:
+    def _add_request_to_queue(self, req: _StubReq, is_retracted: bool = False) -> None:
         if not is_retracted:
             self.queued.append(req)
 
-    def process_batch_result(
-        self, batch: _StubScheduleBatch, result: Any
-    ) -> None:
+    def process_batch_result(self, batch: _StubScheduleBatch, result: Any) -> None:
         self.processed_results.append((batch, result))
 
 
@@ -150,24 +146,22 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
     """After install, the canary plan_batch fn returns expected_* populated."""
 
     def test_plan_patch_populates_expected(self) -> None:
+        from sglang.jit_kernel import kv_cache_canary_plan_ref as _canary_plan_ref
         from sglang.srt.kv_cache_canary import api as _canary_api
-        from sglang.srt.kv_cache_canary import host_state as _canary_host_state
         from sglang.srt.pseudo_mode import install as install_mod
 
         oracle = _fresh_oracle()
-        oracle.admit(
-            req_id="r0", origin_input_ids=[10, 20, 30], max_new_tokens=4
-        )
+        oracle.admit(req_id="r0", origin_input_ids=[10, 20, 30], max_new_tokens=4)
         oracle.register_chunk_commit(req_id="r0", chunk_size=3)
         oracle.register_req_pool_mapping(req_pool_idx=0, req_id="r0")
         oracle.commit_step(req_id="r0", output_token=42)
 
         # Reset patched-attr flags so re-running tests does not skip install.
         for attr in ("_pseudo_mode_plan_patched",):
-            if hasattr(_canary_host_state, attr):
-                delattr(_canary_host_state, attr)
+            if hasattr(_canary_plan_ref, attr):
+                delattr(_canary_plan_ref, attr)
 
-        original_plan_fn = _canary_host_state.plan_batch_from_forward_batch
+        original_plan_fn = _canary_plan_ref.plan_batch_from_forward_batch
         try:
             stub_plan = _StubBatchPlan(
                 write_req_pool_indices=[0],
@@ -181,7 +175,7 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
             def stub_plan_fn(*, forward_batch, config):
                 return stub_plan
 
-            _canary_host_state.plan_batch_from_forward_batch = stub_plan_fn
+            _canary_plan_ref.plan_batch_from_forward_batch = stub_plan_fn
             _canary_api.plan_batch_from_forward_batch = stub_plan_fn
             install_mod._install_plan_patch(oracle=oracle)
 
@@ -201,10 +195,8 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
                     expected_write_positions=kw.get("expected_write_positions"),
                 ),
             ):
-                patched = _canary_host_state.plan_batch_from_forward_batch
-                result = patched(
-                    forward_batch=fb, config=_StubCanaryConfig()
-                )
+                patched = _canary_plan_ref.plan_batch_from_forward_batch
+                result = patched(forward_batch=fb, config=_StubCanaryConfig())
 
             self.assertIsNotNone(result.expected_write_token_ids)
             self.assertIsNotNone(result.expected_write_positions)
@@ -213,11 +205,11 @@ class TestPlanPatchFillsExpectedFields(unittest.TestCase):
             # decode-step input = first committed output_token (42)
             self.assertEqual(result.expected_write_token_ids, [42])
         finally:
-            _canary_host_state.plan_batch_from_forward_batch = original_plan_fn
+            _canary_plan_ref.plan_batch_from_forward_batch = original_plan_fn
             _canary_api.plan_batch_from_forward_batch = original_plan_fn
             for attr in ("_pseudo_mode_plan_patched",):
-                if hasattr(_canary_host_state, attr):
-                    delattr(_canary_host_state, attr)
+                if hasattr(_canary_plan_ref, attr):
+                    delattr(_canary_plan_ref, attr)
 
 
 class TestSchedulerAdmitHook(unittest.TestCase):

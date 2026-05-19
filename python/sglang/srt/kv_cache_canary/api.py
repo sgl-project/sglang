@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.srt.kv_cache_canary.config import CanaryConfig
-from sglang.srt.kv_cache_canary.host_state import (
+from sglang.jit_kernel.kv_cache_canary_plan_ref import (
     BatchPlan,
     plan_batch_from_forward_batch,
 )
+from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
     attach_canary_buffers,

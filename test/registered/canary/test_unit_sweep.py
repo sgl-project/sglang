@@ -19,7 +19,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     CANARY_SLOT_BYTES,
     SKIP_CHAIN_SENTINEL,
 )
-from sglang.srt.kv_cache_canary.host_state import BatchPlan
+from sglang.jit_kernel.kv_cache_canary_plan_ref import BatchPlan
 from sglang.srt.kv_cache_canary.sweep import (
     build_sweep_plan,
     compute_alive_owned_slots,
