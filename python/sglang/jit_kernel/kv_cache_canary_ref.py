@@ -578,12 +578,10 @@ def _run_write_chains(
                 sink.record(
                     fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
                     slot_idx=slot_idx,
-                    req_id=req_id,
                     token_id=token_id,
                     position=position,
                     expected_hash=expected_token & _U64_MASK,
                     actual_hash=token_id & _U64_MASK,
-                    expected_req_id=0,
                     expected_position=0,
                 )
             expected_pos = int(plan.expected_write_positions[i])
@@ -594,12 +592,10 @@ def _run_write_chains(
                 sink.record(
                     fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
                     slot_idx=slot_idx,
-                    req_id=req_id,
                     token_id=token_id,
                     position=position,
                     expected_hash=0,
                     actual_hash=0,
-                    expected_req_id=0,
                     expected_position=expected_pos,
                 )
 
