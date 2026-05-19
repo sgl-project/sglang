@@ -520,7 +520,8 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         # The PP all-gather optimization (send 1/TP slice, then all-gather on recv)
         # requires all TP ranks to hold identical (replicated) hidden states.
         # Disable when:
@@ -528,8 +529,6 @@ class SchedulerPPMixin:
         # - Scatter-based MoE a2a backends (deepep, etc.): hidden states are
         #   scattered (each TP rank holds different tokens), so all-gather
         #   would mix non-identical data and produce incorrect results.
-        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
             and self.server_args.moe_a2a_backend == "none"
