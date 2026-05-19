@@ -133,6 +133,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens_tensor = torch.tensor(
             last_tokens, dtype=torch.int64, device=self.device
         )
+        # No forward in _run_batch_prebuilt consumes input_ids. The next
+        # decode iter's verify (V1: prepare_for_verify; V2: prepare_for_v2_verify)
+        # overwrites batch.input_ids before any kernel reads it. Set the
+        # [bs] last-token layout here for cleaner filter / merge semantics.
+        self.input_ids = last_tokens_tensor
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -175,9 +180,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=self.seq_lens,
             )
-            # prepare_for_extend shifts batch.input_ids in place — keep it
-            # as the prefill prompt, not the [bs] last-token tensor.
-            spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 spec_info.future_indices = future_map.alloc_future_indices(
@@ -187,6 +189,3 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
-        else:
-            # Non-spec: input_ids feeds the next decode forward directly.
-            self.input_ids = last_tokens_tensor
