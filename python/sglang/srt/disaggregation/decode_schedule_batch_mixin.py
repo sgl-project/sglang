@@ -130,7 +130,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        bonus_tokens = torch.tensor(last_tokens, dtype=torch.int64, device=self.device)
+        last_tokens_tensor = torch.tensor(
+            last_tokens, dtype=torch.int64, device=self.device
+        )
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -170,12 +172,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
-                bonus_tokens=bonus_tokens,
+                bonus_tokens=last_tokens_tensor,
                 new_seq_lens=self.seq_lens,
             )
             # prepare_for_extend modifies batch.input_ids (the prefill prompt
             # carried over from the prefill node) in place; do NOT overwrite
-            # batch.input_ids with bonus_tokens before this call.
+            # batch.input_ids with last_tokens_tensor before this call.
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
@@ -187,7 +189,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 )
             self.spec_info = spec_info
         else:
-            # Non-spec disagg decode: input_ids = bonus_tokens is the input for
+            # Non-spec disagg decode: input_ids = last_tokens_tensor is the input for
             # the next decode forward. prepare_for_decode no longer swaps in
             # this PR, so set it here.
-            self.input_ids = bonus_tokens
+            self.input_ids = last_tokens_tensor
