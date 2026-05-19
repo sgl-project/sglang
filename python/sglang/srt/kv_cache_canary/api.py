@@ -33,8 +33,20 @@ _OPTIONAL_GRAPH_RUNNER_CLASSES: tuple[tuple[str, str], ...] = (
         "EAGLEDraftExtendCudaGraphRunner",
     ),
     (
+        "sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner",
+        "MultiLayerEagleDraftExtendCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner",
+        "FrozenKVMTPCudaGraphRunner",
+    ),
+    (
         "sglang.srt.model_executor.piecewise_cuda_graph_runner",
         "PiecewiseCudaGraphRunner",
+    ),
+    (
+        "sglang.srt.model_executor.breakable_cuda_graph_runner",
+        "BreakableCudaGraphRunner",
     ),
 )
 
