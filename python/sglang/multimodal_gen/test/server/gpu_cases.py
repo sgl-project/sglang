@@ -405,11 +405,14 @@ if not current_platform.is_hip():
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
-# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
+# Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
+# quantization coverage in the B200 suite.
 if current_platform.is_hip():
-    ONE_GPU_MODELOPT_CASES = []
+    ONE_GPU_MODELOPT_FP8_CASES = []
+    ONE_GPU_MODELOPT_NVFP4_CASES = []
 else:
-    ONE_GPU_MODELOPT_CASES = [
+    ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_fp8_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -457,6 +460,8 @@ else:
             sampling_params=MODELOPT_TI2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
+    ]
+    ONE_GPU_MODELOPT_NVFP4_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -482,6 +487,8 @@ else:
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
         ),
     ]
+
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
@@ -601,8 +608,7 @@ TWO_GPU_CASES = [
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
+            cfg_parallel=True,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
@@ -613,7 +619,7 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
             extras=[
-                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
+                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
             ],
         ),
         TI2V_sampling_params,
@@ -634,10 +640,10 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--ltx2-two-stage-device-mode original",
+                "--component-attention-backends transformer=fa",
             ],
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -708,7 +714,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
         ),
         TI2V_sampling_params,
         run_component_accuracy_check=False,
@@ -728,5 +734,5 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)

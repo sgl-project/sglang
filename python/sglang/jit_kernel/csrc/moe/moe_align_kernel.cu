@@ -478,10 +478,10 @@ struct MoeAlignBlockSizeKernel {
     int64_t max_num_tokens_padded = sorted_token_ids.size(0);
 
     // num_experts from Python is actual_num_experts + 1 (for EP offset convention).
-    // The v2 kernel (>1024 experts) uses 1024 threads with EXPERTS_PER_THREAD=4,
-    // covering at most 4096 expert indices, so num_experts (including the +1
-    // offset bucket) must be <= 4096. This means up to 4095 real experts.
-    RuntimeCheck(num_experts <= 4096, "moe_align_block_size: num_experts must be <= 4096, got ", num_experts);
+    // The v2 kernel (>1024 experts) uses 1024 threads with EXPERTS_PER_THREAD up
+    // to 8, covering at most 8192 expert indices. This supports up to 8191 real
+    // experts, sufficient for LoRA virtual experts (num_moe_experts * max_loras).
+    RuntimeCheck(num_experts <= 8192, "moe_align_block_size: num_experts must be <= 8192, got ", num_experts);
 
     const scalar_t* topk_ids_ptr = static_cast<const scalar_t*>(topk_ids.data_ptr());
     int32_t* sorted_token_ids_ptr = static_cast<int32_t*>(sorted_token_ids.data_ptr());
@@ -561,8 +561,10 @@ struct MoeAlignBlockSizeKernel {
 
       if (padded_num_experts <= 2048) {
         launch_v2(std::integral_constant<int, 2>{});
-      } else {
+      } else if (padded_num_experts <= 4096) {
         launch_v2(std::integral_constant<int, 4>{});
+      } else {
+        launch_v2(std::integral_constant<int, 8>{});
       }
 
       const int block_threads = std::min(256, threads);
