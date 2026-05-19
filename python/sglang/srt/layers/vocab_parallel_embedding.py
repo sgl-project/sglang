@@ -473,6 +473,16 @@ class VocabParallelEmbedding(torch.nn.Module):
     def forward(self, input_):
         if self.tp_size > 1:
             # Build the mask.
+
+            # Avoid _base guard recompiles: .data shares storage but sets _base=None,
+            # which prevents Dynamo from generating a guard on input_._base.size()[0].
+            # Must be applied BEFORE calling the @torch.compile decorated function.
+            input_ = input_.data
+            # Avoid 0/1 specialization guard: mark dim-0 as dynamic so Dynamo does not
+            # specialize on batch-size-1 during the first CUDA-graph capture step.
+            # Must be called BEFORE entering the @torch.compile decorated function.
+            torch._dynamo.mark_dynamic(input_, 0)
+
             masked_input, input_mask = get_masked_input_and_mask(
                 input_,
                 self.shard_indices.org_vocab_start_index,
