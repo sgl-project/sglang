@@ -264,6 +264,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reserved-ports",
+        default=None,
+        help=(
+            "Comma- or whitespace-separated list of pre-reserved ports, e.g. "
+            "Merlin PORT1..PORT15. Ports do not need to be contiguous. They are "
+            "consumed in order: spec dist-init ports, optional baseline dist-init "
+            "ports, verifier result endpoints, then drafter control endpoints. "
+            "This cannot be combined with --dist-init-addr or --dist-init-port."
+        ),
+    )
+    parser.add_argument(
         "--num-draft-replicas",
         dest="num_draft_replicas",
         type=int,
@@ -344,12 +355,75 @@ def _pick_free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
+    if raw_ports is None:
+        return []
+    ports: list[int] = []
+    for raw_port in raw_ports.replace(",", " ").split():
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError(f"invalid reserved port: {raw_port!r}") from exc
+        if port <= 0 or port > 65535:
+            raise ValueError(f"reserved port out of range: {port}")
+        ports.append(port)
+    if len(set(ports)) != len(ports):
+        raise ValueError(f"reserved ports must be unique: {ports}")
+    return ports
+
+
+def _split_reserved_ports(
+    args: argparse.Namespace,
+) -> tuple[list[int], list[int] | None, list[int], list[int], list[int] | None]:
+    reserved_ports = _parse_reserved_ports(args.reserved_ports)
+    if not reserved_ports:
+        return [], None, [], [], None
+
+    if args.dist_init_addr is not None or args.dist_init_port is not None:
+        raise ValueError(
+            "--reserved-ports cannot be combined with --dist-init-addr or "
+            "--dist-init-port"
+        )
+
+    num_verifiers = args.num_verifier_replicas
+    num_drafters = args.num_draft_replicas
+    required_ports = (
+        num_verifiers
+        + (num_verifiers if args.baseline != "none" else 0)
+        + num_verifiers
+        + num_drafters
+    )
+    if len(reserved_ports) < required_ports:
+        raise ValueError(
+            f"--reserved-ports provides {len(reserved_ports)} ports, but this "
+            f"run needs {required_ports}: {num_verifiers} spec dist-init, "
+            f"{num_verifiers if args.baseline != 'none' else 0} baseline "
+            f"dist-init, {num_verifiers} result endpoint, and {num_drafters} "
+            "drafter control ports"
+        )
+
+    cursor = 0
+    spec_ports = reserved_ports[cursor : cursor + num_verifiers]
+    cursor += num_verifiers
+    baseline_ports = None
+    if args.baseline != "none":
+        baseline_ports = reserved_ports[cursor : cursor + num_verifiers]
+        cursor += num_verifiers
+    result_ports = reserved_ports[cursor : cursor + num_verifiers]
+    cursor += num_verifiers
+    control_ports = reserved_ports[cursor : cursor + num_drafters]
+    return spec_ports, baseline_ports, result_ports, control_ports, reserved_ports
+
+
 def derive_dist_init_addr(
     args: argparse.Namespace,
     *,
     port_offset: int = 0,
+    preferred_port: int | None = None,
 ) -> str | None:
     if args.nnodes == 1 and args.dist_init_addr is None:
+        if preferred_port is not None:
+            return f"127.0.0.1:{preferred_port}"
         if args.dist_init_port is not None:
             return f"127.0.0.1:{args.dist_init_port + port_offset}"
         return f"127.0.0.1:{_pick_free_local_port()}"
@@ -372,9 +446,12 @@ def derive_dist_init_addr_from_pg(
     pg,
     *,
     port_offset: int = 0,
+    preferred_port: int | None = None,
 ) -> str | None:
     if args.dist_init_addr is not None or args.nnodes == 1:
-        return derive_dist_init_addr(args, port_offset=port_offset)
+        return derive_dist_init_addr(
+            args, port_offset=port_offset, preferred_port=preferred_port
+        )
 
     scheduling_strategy = PlacementGroupSchedulingStrategy(
         placement_group=pg,
@@ -385,12 +462,13 @@ def derive_dist_init_addr_from_pg(
         scheduling_strategy=scheduling_strategy,
     ).remote()
     try:
-        preferred_port = (
-            args.dist_init_port + port_offset
-            if args.dist_init_port is not None
-            else None
-        )
-        reservation = ray.get(actor.reserve_port.remote(preferred_port))
+        if preferred_port is not None:
+            selected_port = preferred_port
+        elif args.dist_init_port is not None:
+            selected_port = args.dist_init_port + port_offset
+        else:
+            selected_port = None
+        reservation = ray.get(actor.reserve_port.remote(selected_port))
         host = reservation["host"]
         port = int(reservation["port"])
         ray.get(actor.release_port.remote())
@@ -841,8 +919,26 @@ def main() -> None:
             target_nnodes,
             target_gpus_per_node,
         )
+        (
+            spec_reserved_ports,
+            baseline_reserved_ports,
+            result_reserved_ports,
+            control_reserved_ports,
+            reserved_ports,
+        ) = _split_reserved_ports(args)
+        if reserved_ports is not None:
+            print(f"reserved_ports: {reserved_ports}", flush=True)
         spec_dist_init_addrs = [
-            derive_dist_init_addr_from_pg(args, pg, port_offset=replica_index)
+            derive_dist_init_addr_from_pg(
+                args,
+                pg,
+                port_offset=replica_index,
+                preferred_port=(
+                    spec_reserved_ports[replica_index]
+                    if spec_reserved_ports
+                    else None
+                ),
+            )
             for replica_index, pg in enumerate(spec_pgs)
         ]
         spec_dist_init_ports = {
@@ -855,7 +951,9 @@ def main() -> None:
         num_verifiers = args.num_verifier_replicas
         reserved_dist_init_ports = set(spec_dist_init_ports)
         if args.baseline != "none":
-            if args.dist_init_port is not None:
+            if baseline_reserved_ports is not None:
+                reserved_dist_init_ports.update(baseline_reserved_ports)
+            elif args.dist_init_port is not None:
                 reserved_dist_init_ports.update(
                     args.dist_init_port + num_verifiers + replica_index
                     for replica_index in range(num_verifiers)
@@ -868,17 +966,28 @@ def main() -> None:
                         for replica_index in range(num_verifiers)
                     )
         preferred_result_ports = (
-            [args.dist_init_port + 2 * num_verifiers + i for i in range(num_verifiers)]
-            if args.dist_init_port is not None
-            else None
+            result_reserved_ports
+            if result_reserved_ports
+            else (
+                [
+                    args.dist_init_port + 2 * num_verifiers + i
+                    for i in range(num_verifiers)
+                ]
+                if args.dist_init_port is not None
+                else None
+            )
         )
         preferred_control_ports = (
-            [
-                args.dist_init_port + 3 * num_verifiers + i
-                for i in range(args.num_draft_replicas)
-            ]
-            if args.dist_init_port is not None
-            else None
+            control_reserved_ports
+            if control_reserved_ports
+            else (
+                [
+                    args.dist_init_port + 3 * num_verifiers + i
+                    for i in range(args.num_draft_replicas)
+                ]
+                if args.dist_init_port is not None
+                else None
+            )
         )
         topology = create_remote_decoupled_spec_topology(
             args,
@@ -918,6 +1027,11 @@ def main() -> None:
                     args,
                     pg,
                     port_offset=args.num_verifier_replicas + replica_index,
+                    preferred_port=(
+                        baseline_reserved_ports[replica_index]
+                        if baseline_reserved_ports is not None
+                        else None
+                    ),
                 )
                 for replica_index, pg in enumerate(spec_pgs)
             ]
@@ -944,6 +1058,13 @@ def main() -> None:
             spec_metrics=spec_metrics,
             baseline_metrics=baseline_metrics,
         )
+        if reserved_ports is not None:
+            result["config"]["reserved_ports"] = reserved_ports
+            result["config"]["spec_dist_init_addrs"] = spec_dist_init_addrs
+            if args.baseline != "none":
+                result["config"]["baseline_dist_init_addrs"] = (
+                    baseline_dist_init_addrs
+                )
         print_summary(result)
         if args.output_dir:
             print("output_files:")

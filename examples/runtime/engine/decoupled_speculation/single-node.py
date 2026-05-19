@@ -215,6 +215,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reserved-ports",
+        default=None,
+        help=(
+            "Comma- or whitespace-separated list of pre-reserved local ports. "
+            "When set, ports do not need to be contiguous. They are consumed in "
+            "order: spec dist-init, optional baseline dist-init, verifier result, "
+            "then drafter control endpoints. This cannot be combined with "
+            "--dist-init-addr or --dist-init-port."
+        ),
+    )
+    parser.add_argument(
         "--num-draft-replicas",
         dest="num_draft_replicas",
         type=int,
@@ -295,9 +306,8 @@ def _child_env_for_gpus(gpus: list[str]) -> dict[str, str]:
 
 def _port_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((LOCAL_HOST, port))
+            sock.bind(("0.0.0.0", port))
         except OSError:
             return False
     return True
@@ -332,6 +342,97 @@ def _port_from_dist_init_addr(addr: str | None) -> int | None:
 
 def _format_tcp_endpoint(port: int) -> str:
     return f"tcp://{LOCAL_HOST}:{port}"
+
+
+def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
+    if raw_ports is None:
+        return []
+    ports: list[int] = []
+    for raw_port in raw_ports.replace(",", " ").split():
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError(f"invalid reserved port: {raw_port!r}") from exc
+        if port <= 0 or port > 65535:
+            raise ValueError(f"reserved port out of range: {port}")
+        ports.append(port)
+    if len(set(ports)) != len(ports):
+        raise ValueError(f"reserved ports must be unique: {ports}")
+    return ports
+
+
+def _allocate_local_ports(
+    args: argparse.Namespace,
+    *,
+    num_verifiers: int,
+    num_drafters: int,
+) -> tuple[str, str | None, str, list[str], list[int] | None]:
+    reserved_ports = _parse_reserved_ports(args.reserved_ports)
+    if reserved_ports:
+        if args.dist_init_addr is not None or args.dist_init_port is not None:
+            raise ValueError(
+                "--reserved-ports cannot be combined with --dist-init-addr or "
+                "--dist-init-port"
+            )
+        required_ports = 1 + (1 if args.baseline != "none" else 0) + 1 + num_drafters
+        if len(reserved_ports) < required_ports:
+            raise ValueError(
+                f"--reserved-ports provides {len(reserved_ports)} ports, but this "
+                f"run needs {required_ports}: spec dist-init, "
+                f"{'baseline dist-init, ' if args.baseline != 'none' else ''}"
+                "verifier result, and drafter control endpoints"
+            )
+        usable_ports = [port for port in reserved_ports if _port_available(port)]
+        skipped_ports = [port for port in reserved_ports if port not in usable_ports]
+        if len(usable_ports) < required_ports:
+            raise ValueError(
+                f"--reserved-ports has only {len(usable_ports)} currently "
+                f"available ports after skipping in-use ports {skipped_ports}, "
+                f"but this run needs {required_ports}"
+            )
+        if skipped_ports:
+            print(
+                f"skipping_in_use_reserved_ports: {skipped_ports}",
+                flush=True,
+            )
+        port_iter = iter(usable_ports)
+        spec_dist_init_addr = f"{LOCAL_HOST}:{next(port_iter)}"
+        baseline_dist_init_addr = (
+            f"{LOCAL_HOST}:{next(port_iter)}" if args.baseline != "none" else None
+        )
+        result_endpoint = _format_tcp_endpoint(next(port_iter))
+        control_endpoints = [
+            _format_tcp_endpoint(next(port_iter)) for _ in range(num_drafters)
+        ]
+        return (
+            spec_dist_init_addr,
+            baseline_dist_init_addr,
+            result_endpoint,
+            control_endpoints,
+            reserved_ports,
+        )
+
+    explicit_dist_init_port = _port_from_dist_init_addr(args.dist_init_addr)
+    base_port = args.dist_init_port or _pick_free_port_block(
+        3 + num_drafters,
+        avoid_ports=(
+            {explicit_dist_init_port} if explicit_dist_init_port is not None else None
+        ),
+    )
+    spec_dist_init_addr = args.dist_init_addr or f"{LOCAL_HOST}:{base_port}"
+    baseline_dist_init_addr = f"{LOCAL_HOST}:{base_port + num_verifiers}"
+    result_endpoint = _format_tcp_endpoint(base_port + 2 * num_verifiers)
+    control_endpoints = [
+        _format_tcp_endpoint(base_port + 3 * num_verifiers + index)
+        for index in range(num_drafters)
+    ]
+    return (
+        spec_dist_init_addr,
+        baseline_dist_init_addr,
+        result_endpoint,
+        control_endpoints,
+        None,
+    )
 
 
 def _uses_bind_connect_endpoint_args() -> bool:
@@ -759,24 +860,23 @@ def main() -> None:
 
     num_verifiers = args.num_verifier_replicas
     num_drafters = args.num_draft_replicas
-    explicit_dist_init_port = _port_from_dist_init_addr(args.dist_init_addr)
-    base_port = args.dist_init_port or _pick_free_port_block(
-        3 + num_drafters,
-        avoid_ports=(
-            {explicit_dist_init_port} if explicit_dist_init_port is not None else None
-        ),
+    (
+        spec_dist_init_addr,
+        baseline_dist_init_addr,
+        result_endpoint,
+        control_endpoints,
+        reserved_ports,
+    ) = _allocate_local_ports(
+        args,
+        num_verifiers=num_verifiers,
+        num_drafters=num_drafters,
     )
-    spec_dist_init_addr = args.dist_init_addr or f"{LOCAL_HOST}:{base_port}"
-    baseline_dist_init_addr = f"{LOCAL_HOST}:{base_port + num_verifiers}"
-    result_endpoint = _format_tcp_endpoint(base_port + 2 * num_verifiers)
-    control_endpoints = [
-        _format_tcp_endpoint(base_port + 3 * num_verifiers + index)
-        for index in range(num_drafters)
-    ]
 
     print("local_decoupled_spec_topology:", flush=True)
     print(f"  target_gpus: {args.target_gpus}", flush=True)
     print(f"  draft_gpus: {args.draft_gpus}", flush=True)
+    if reserved_ports is not None:
+        print(f"  reserved_ports: {reserved_ports}", flush=True)
     print(f"  verifier_result_endpoint: {result_endpoint}", flush=True)
     print(f"  draft_control_endpoints: {control_endpoints}", flush=True)
     print(f"  verifier_dist_init_addr: {spec_dist_init_addr}", flush=True)
@@ -820,6 +920,7 @@ def main() -> None:
         baseline_metrics = None
         if args.baseline != "none":
             print(f"creating_{args.baseline}_engine...", flush=True)
+            assert baseline_dist_init_addr is not None
             if args.baseline == "decode":
                 baseline_engine = create_decode_engine(
                     args,
@@ -861,6 +962,10 @@ def main() -> None:
         result["config"]["verifier_result_endpoint"] = result_endpoint
         result["config"]["draft_control_endpoints"] = control_endpoints
         result["config"]["verifier_dist_init_addr"] = spec_dist_init_addr
+        if baseline_dist_init_addr is not None:
+            result["config"]["baseline_dist_init_addr"] = baseline_dist_init_addr
+        if reserved_ports is not None:
+            result["config"]["reserved_ports"] = reserved_ports
 
         common.print_summary(result)
         if args.output_dir:
