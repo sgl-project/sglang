@@ -71,7 +71,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -174,7 +174,9 @@ def stop_profile(
     if save_trace:
         if profiler is not None:
             if trace_filename:
-                _save_profile_trace_results(profiler, trace_filename)
+                _save_profile_trace_results(
+                    profiler, profile_activities, trace_filename
+                )
                 stage_desc = f"for {stage}" if stage else ""
                 rank_print(
                     f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
@@ -597,15 +599,17 @@ def _create_torch_profiler_filename(
     return os.path.join(output_dir, filename)
 
 
-def _save_profile_trace_results(profiler, filename):
+def _save_profile_trace_results(profiler, profile_activities, filename):
     parent_dir = os.path.dirname(os.path.abspath(filename))
     os.makedirs(parent_dir, exist_ok=True)
     profiler.export_chrome_trace(filename)
-    print(
-        profiler.key_averages(group_by_input_shape=True).table(
-            sort_by="self_cpu_time_total"
-        )
-    )
+    if "GPU" in profile_activities:
+        sort_by = "self_cuda_time_total"
+    elif "XPU" in profile_activities:
+        sort_by = "self_xpu_time_total"
+    else:
+        sort_by = "self_cpu_time_total"
+    print(profiler.key_averages(group_by_input_shape=True).table(sort_by=sort_by))
 
 
 def correctness_test(
