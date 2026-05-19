@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from sglang.srt.kv_cache_canary.mock_model import sampler as oracle_sampler_module
 from sglang.srt.kv_cache_canary.mock_model.oracle import HashOracle, ScriptedOracle
@@ -11,10 +12,20 @@ from sglang.srt.kv_cache_canary.mock_model.sampler import (
     install_oracle_sampler,
 )
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES, Sampler
-from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+from sglang.srt.server_args import (
+    SAMPLING_BACKEND_CHOICES,
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
+
+
+@pytest.fixture(autouse=True)
+def _global_server_args() -> None:
+    """Sampler.__init__ reads get_global_server_args().enable_nan_detection. Provide a dummy one."""
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
 def test_install_oracle_sampler_registers_oracle_backend() -> None:
@@ -78,6 +89,4 @@ class _DummyLogitsOutput:
     """Stand-in for LogitsProcessorOutput; only next_token_logits is accessed in the error path."""
 
     def __init__(self) -> None:
-        import torch
-
         self.next_token_logits = torch.zeros((1, 2), dtype=torch.float32)
