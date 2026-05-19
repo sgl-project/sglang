@@ -14,15 +14,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.jit_kernel.kv_cache_canary_verify import (
+    _MAX_REAL_KV_SOURCES,
     CanaryLaunchTag,
     RealKvHashMode,
     RealKvSource,
+    _build_real_kv_source_abi,
 )
+from sglang.jit_kernel.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 
 class CanaryPseudoMode(IntEnum):
@@ -223,6 +229,61 @@ def canary_write_step(
     :func:`sglang.jit_kernel.kv_cache_canary_write_ref.canary_write_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
-    raise NotImplementedError(
-        "Use canary_write_step_torch_reference until CUDA kernel lands"
+    if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:
+        raise ValueError(
+            f"kv-canary: at most {_MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
+            f"got {len(real_kv_sources)}"
+        )
+
+    padded_bufs, source_params = _build_real_kv_source_abi(
+        real_kv_sources=real_kv_sources, device=canary_buf.device
+    )
+
+    # The SWA LUT is presence-flagged via a separate int. When None, pass a tiny dummy tensor that the
+    # kernel never dereferences (kSwaMappingAbsent disables the indexing path).
+    if full_to_swa_index_mapping is None:
+        swa_lut = torch.zeros(1, dtype=torch.int32, device=canary_buf.device)
+        swa_present = 0
+    else:
+        swa_lut = full_to_swa_index_mapping
+        swa_present = 1
+
+    module = _jit_canary_write_module()
+    module.canary_write_step_cuda(
+        canary_buf,
+        plan.write_offsets,
+        plan.write_seed_slot_indices,
+        plan.write_num_valid_reqs,
+        fb_input_ids,
+        fb_positions,
+        fb_out_cache_loc,
+        swa_lut,
+        swa_present,
+        int(kernel_kind),
+        int(pseudo_mode),
+        pseudo_expected_tokens,
+        pseudo_expected_positions,
+        violation_ring,
+        violation_write_index,
+        slot_run_counter,
+        kernel_run_counter,
+        padded_bufs[0],
+        padded_bufs[1],
+        padded_bufs[2],
+        padded_bufs[3],
+        source_params,
+        len(real_kv_sources),
+        int(real_kv_hash_mode),
+    )
+
+
+@cache_once
+def _jit_canary_write_module() -> "Module":
+    """Lazy-load the CUDA write module via tvm-ffi. Same JIT plumbing as the verify loader."""
+    return load_jit(
+        "kv_cache_canary_write",
+        cuda_files=["kv_cache_canary/canary_write.cuh"],
+        cuda_wrappers=[
+            ("canary_write_step_cuda", "canary::canary_write_step_cuda"),
+        ],
     )
