@@ -2194,7 +2194,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch == "Gemma4ForConditionalGeneration":
+        elif model_arch in (
+            "Gemma4ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+        ):
             default_attention_backend = (
                 "trtllm_mha" if is_sm100_supported() else "triton"
             )
@@ -2428,7 +2431,7 @@ class ServerArgs:
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
+        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2445,6 +2448,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
@@ -6841,6 +6845,25 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
+
+    def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count runtime speculative decoding may use."""
+        if self.speculative_num_draft_tokens is None:
+            return None
+        if not self.speculative_adaptive:
+            return self.speculative_num_draft_tokens
+
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidate_steps = resolve_candidate_steps_from_config(
+            initial_steps=self.speculative_num_steps,
+            cfg_path=self.speculative_adaptive_config,
+        )
+        # TODO: adaptive spec currently requires topk=1, so each runtime state
+        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+        return max(candidate_steps) + 1
 
     @property
     def mamba_cache_chunk_size(self) -> int:
