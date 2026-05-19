@@ -18,8 +18,8 @@ from typing import List
 
 import requests
 
+from sglang.test.canary_e2e_base import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
-from test.registered.canary.e2e_base import CanaryE2EBase
 
 _MODEL = "Qwen/Qwen3-0.6B"
 

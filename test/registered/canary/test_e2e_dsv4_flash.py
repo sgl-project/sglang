@@ -27,8 +27,8 @@ from __future__ import annotations
 import time
 import unittest
 
+from sglang.test.canary_e2e_base import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
-from test.registered.canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=420, stage="extra-b", runner_config="8-gpu-h200")
 
@@ -56,9 +56,7 @@ class TestKvCacheCanaryDSV4Flash(CanaryE2EBase):
     ]
 
     def test_clean_run_no_canary_violation(self) -> None:
-        results = self.send_parallel_requests(
-            n=16, max_new_tokens=16, timeout=120.0
-        )
+        results = self.send_parallel_requests(n=16, max_new_tokens=16, timeout=120.0)
         bad = [r for r in results if r.get("status_code") != 200]
         self.assertFalse(bad, f"non-200 responses on DSV4 clean run: {bad[:3]}")
 
