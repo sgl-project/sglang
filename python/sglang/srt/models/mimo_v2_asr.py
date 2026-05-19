@@ -1,82 +1,59 @@
-"""MiMo-V2-ASR model"""
+"""MiMo-V2-ASR model.
+
+Reuses the LM scaffold of ``MiMoForCausalLM`` and adds audio encoder
+components via ``AudioEncoderMixin``. The encoder modules are attached as
+top-level attributes (no ``audio_encoder.`` prefix) so the checkpoint
+state_dict aligns 1:1 with ``self.named_parameters()``.
+"""
 
 import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
-from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfig
-from sglang.srt.utils import add_prefix
-from torch import nn
-
-from python.sglang.srt.models.mimo import MiMoModel
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mimo import MiMoForCausalLM
+from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 
 logger = logging.getLogger(__name__)
 
 MiMoV2ASRConfig = None
 
+# Top-level audio sub-module name prefixes (after AUDIO_WEIGHT_REMAP). Loaded
+# directly by default_weight_loader because the LM branch's qkv/gate-up fused
+# stacked-params mapping doesn't apply to the vanilla HF Qwen2Model used
+# inside the audio encoder.
+_AUDIO_NAME_PREFIXES: Tuple[str, ...] = (
+    "projection.",
+    "input_local_transformer.",
+    "speech_embeddings.",
+)
 
-class MiMoV2ASRForCausalLM(nn.Module):
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+# Training-only weights present in checkpoint but not used at inference.
+# Checked AFTER the audio-prefix load path so substring matching here is
+# safe: legitimate audio weights (``input_local_transformer.*``) are
+# already consumed by ``_AUDIO_NAME_PREFIXES`` above.
+_SKIP_NAME_SUBSTRINGS: Tuple[str, ...] = (
+    "hidden_states_downcast",
+    "local_transformer",
+)
 
+
+class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
     def __init__(
         self,
         config: MiMoV2ASRConfig,  # type: ignore
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config=None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
-        self.config = config
-        self.quant_config = quant_config
-        self.audio_config = MiMoAudioEncoderConfig(**config.audio_config)
-        self.audio_encoder = MiMoAudioEncoder(self.audio_config)
-        self.model = MiMoModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        features = self.audio_encoder.get_audio_feature(items)
-        return features
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        self.build_audio_encoder(MiMoAudioEncoderConfig(**config.audio_config))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -114,93 +91,39 @@ class MiMoV2ASRForCausalLM(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
-        else:
-            return self.pooler(hidden_states, forward_batch)
+        return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters())
+        deferred: List[Tuple[str, torch.Tensor]] = []
 
         for name, loaded_weight in weights:
-            audio_modules_map: List[Tuple[str, Optional[str]]] = [
-                ("input_local_transformer", None),
-                ("speech_embeddings", None),
-                ("speech_group_downcast", "projection"),
-            ]
-            for audio_module, target_name in audio_modules_map:
-                target_module = f"audio_encoder.{target_name or audio_module}"
-                if audio_module in name and target_module not in name:
-                    name = name.replace(audio_module, target_module)
-                    if name in params_dict:
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    break
+            if name.startswith("audio_encoder."):
+                name = name[len("audio_encoder.") :]
+            name = self.remap_audio_weight_name(name)
 
-            if (
-                "rotary_emb.inv_freq" in name
-                or "projector" in name
-                or "mtp_layers" in name
-                or "local_transformer" in name
-                or "hidden_states_downcast" in name
-            ):
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+            if name.startswith(_AUDIO_NAME_PREFIXES):
+                if name not in params_dict:
+                    logger.warning(
+                        f"Audio param {name} not found in params_dict, skipping"
+                    )
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name.startswith("speech_embeddings."):
+                    weight_loader(param, loaded_weight[: param.shape[0], :])
+                else:
+                    weight_loader(param, loaded_weight)
+                continue
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+            if any(s in name for s in _SKIP_NAME_SUBSTRINGS):
+                continue
 
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+            deferred.append((name, loaded_weight))
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
+        super().load_weights(iter(deferred))
 
 
 EntryClass = MiMoV2ASRForCausalLM

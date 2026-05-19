@@ -78,7 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -987,7 +987,7 @@ class MiMoV2Model(nn.Module):
                 )
 
 
-class MiMoV2ForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -1064,8 +1064,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 quant_config=None,
                 prefix=add_prefix("visual", prefix),
             )
-            self.audio_config = MiMoAudioEncoderConfig(**audio_config)
-            self.audio_encoder = MiMoAudioEncoder(self.audio_config)
+            self.build_audio_encoder(MiMoAudioEncoderConfig(**audio_config))
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (
@@ -1119,9 +1118,6 @@ class MiMoV2ForCausalLM(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         return self.visual(pixel_values, grid_thw=video_grid_thw)
-
-    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        return self.audio_encoder.get_audio_feature(items)
 
     @torch.inference_mode()
     def encode_video_audio(self, mm_inputs: Dict) -> Optional[torch.Tensor]:
@@ -1275,9 +1271,17 @@ class MiMoV2ForCausalLM(nn.Module):
                 name.startswith(self._VISION_AUDIO_WEIGHT_PREFIXES)
                 or self._VISION_AUDIO_WEIGHT_SUBSTRING in name
             )
+            
 
         for name, loaded_weight in weights:
-            if not self._is_multimodal and _is_vision_audio_weight(name):
+            is_audio_weight = (
+                name.startswith(("audio_encoder.", "audio_"))
+                or "speech_embeddings" in name
+            )
+
+            if not self._is_multimodal and (
+                name.startswith(("visual.", "vision_model.")) or is_audio_weight
+            ):
                 continue
 
             if self.config.encoder_only and name.startswith(
@@ -1285,61 +1289,21 @@ class MiMoV2ForCausalLM(nn.Module):
             ):
                 continue
 
-            if self._is_multimodal and "audio" in name:
-                if "projection" in name:
-                    if (
-                        "audio_encoder.audio_projection" in name
-                        and "audio_encoder.projection" not in name
-                    ):
-                        name = name.replace(
-                            "audio_encoder.audio_projection", "audio_encoder.projection"
-                        )
-                    elif (
-                        "audio_projection" in name
-                        and "audio_encoder.projection" not in name
-                    ):
-                        name = name.replace(
-                            "audio_projection", "audio_encoder.projection"
-                        )
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+            if self._is_multimodal and is_audio_weight:
+                if name.startswith("audio_encoder."):
+                    name = name[len("audio_encoder.") :]
+                name = self.remap_audio_weight_name(name)
+                if name not in params_dict:
+                    logger.warning(
+                        f"Audio param {name} not found in params_dict, skipping"
                     )
-                    weight_loader(param, loaded_weight)
                     continue
-
-                if "input_local_transformer" in name:
-                    if (
-                        "audio_input_local_transformer" in name
-                        and "audio_encoder.input_local_transformer" not in name
-                    ):
-                        name = name.replace(
-                            "audio_input_local_transformer",
-                            "audio_encoder.input_local_transformer",
-                        )
-                    if name not in params_dict:
-                        logger.warning(
-                            f"Parameter {name} not found in params_dict, skipping"
-                        )
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    continue
-
-            if self._is_multimodal and "speech_embeddings" in name:
-                if (
-                    "speech_embeddings" in name
-                    and "audio_encoder.speech_embeddings" not in name
-                ):
-                    name = name.replace(
-                        "speech_embeddings", "audio_encoder.speech_embeddings"
-                    )
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight[: param.shape[0], :])
+                if "speech_embeddings" in name:
+                    weight_loader(param, loaded_weight[: param.shape[0], :])
+                else:
+                    weight_loader(param, loaded_weight)
                 continue
 
             if self._is_multimodal and "visual" in name:
