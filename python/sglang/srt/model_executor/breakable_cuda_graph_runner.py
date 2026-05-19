@@ -249,6 +249,16 @@ class BreakableCudaGraphRunner:
             req_pool_indices = torch.arange(bs, dtype=torch.int64)
             orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
 
+        # Mirror PCG's LoRA-aware capture: empty lora_ids drives the kernels to
+        # launch but early-return, so the captured graph records the kernel
+        # presence. Replay overwrites the pinned cuda_graph_batch_info with
+        # live lora ids.
+        capture_lora_ids = (
+            [None] * bs
+            if self.model_runner.server_args.enable_lora
+            else None
+        )
+
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=bs,
@@ -296,13 +306,24 @@ class BreakableCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=None,
             global_forward_mode=ForwardMode.EXTEND,
-            lora_ids=None,
+            lora_ids=capture_lora_ids,
         )
+
+    def _maybe_prepare_lora(self, forward_batch):
+        """Mirror PCG: populate pinned LoRABatchInfo for the capture/replay batch."""
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
 
     def _warmup(self):
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
+        self._maybe_prepare_lora(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         self._run_forward(forward_batch, num_tokens)
 
@@ -358,6 +379,7 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
+        self._maybe_prepare_lora(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -379,6 +401,17 @@ class BreakableCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # Re-run prepare_lora_batch with force_cuda_graph=True so the LoRA
+        # backend writes batch metadata into the pinned cuda_graph_batch_info
+        # whose address was baked into the captured graph (mirrors PCG.replay).
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True
+            )
+
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
