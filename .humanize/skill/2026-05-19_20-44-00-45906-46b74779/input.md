@@ -1,3 +1,82 @@
+# Ask Codex Input
+
+## Question
+
+# Task: Review Linus-style Critiques on an SGLang Implementation Plan
+
+Below is the full text of `/sgl-workspace/sglang/development/refined_plan.md`. The file is an implementation plan for adding **Double Sparsity** (offline-calibrated channel-importance + runtime top-K page selection) to **SGLang** for **DeepSeek-V3.2 (FP8)**. It already contains **12 critique comments** wrapped in `<comment>[Linus] ...</comment>` blocks, each targeting a specific code smell or architectural issue.
+
+## Context You May Need
+
+- SGLang is a high-performance LLM serving engine; the project lives at `sgl-project/sglang`. The branch is `dev/double-sparsity-standalone` off `main` (commit `2a35707`).
+- DeepSeek-V3.2 is a sparse-attention MoE model with a built-in NSA (Native Sparse Attention) indexer in `python/sglang/srt/layers/attention/nsa/`. The plan proposes that DS replaces NSA's per-step token selector while keeping NSA's quant_k_cache, dequant_k_cache, tilelang/Triton kernels, and FlashMLA backend intact.
+- HiSparse (`python/sglang/srt/mem_cache/sparsity/`, `python/sglang/srt/managers/hisparse_coordinator.py`, `python/sglang/srt/arg_groups/hisparse_hook.py`) is an existing sparsity feature that today only runs on PD-disaggregated decode instances; this constrained the architectural choice (CMT-1 redirect from the user).
+- PR #25304 (`dev/double-sparsity-v2`, +22552/-8) is a WIP rewrite by the same author using FA3 + native sparse-decode kernels on Llama-style attention. The plan cites its commits as cherry-pick targets.
+- PR #22992 is a Llama-only, page=1, Triton-attention re-introduction of the legacy DS backend that the plan rejects as a base.
+- FlashMLA backends: `flashmla_kv` (FP8), `flashmla_sparse` (BF16). Validators pair these with `kv_cache_dtype`.
+- Project-level engineering maxims live in `.pensieve/maxims/`:
+  - `eliminate-special-cases-by-redesigning-data-flow`
+  - `prefer-pragmatic-solutions-over-theoretical-completeness`
+  - `preserve-user-visible-behavior-as-a-hard-rule`
+  - `reduce-complexity-before-adding-branches`
+
+## Your Job
+
+Two-part response.
+
+### Part 1 — Verdict on each of the 12 Linus comments
+
+For each of CRITIQUE-1 through CRITIQUE-12 in document order, return a one-line verdict using EXACTLY these tags:
+
+- `AGREE` — critique stands as written; add a one-sentence reason
+- `PARTIALLY_AGREE` — mixed; add a one-sentence delta
+- `DISAGREE` — Linus is wrong; add a one-sentence counterargument
+
+Format:
+
+```
+CRITIQUE-1 (Goal Description — bureaucratic plan thinking): AGREE — <reason>
+CRITIQUE-2 (Two Different Labels — names are wrong): ...
+...
+CRITIQUE-12 (Implementation Notes — copy-don't-import is a layering smell): ...
+```
+
+Be honest. If Linus overshot, say so; if he undershot, say where.
+
+### Part 2 — New critiques Linus missed
+
+Linus caught 12 things. What else is wrong with this plan? Look for additional issues including but not limited to:
+
+- Concrete technical mistakes (kernel design, memory layout, page-table semantics, FP8 numerics, CUDA-graph capture pitfalls, MoE/TP interactions, paged attention contract violations, scheduler / radix-cache invalidation gaps)
+- Code smells the Linus pass missed
+- Architecture decisions that will need to be undone later
+- Hidden assumptions that will break in production (multi-TP rank divergence, sharded label cache, batch packing under sparsity, idle batches, retracted requests, MTP / speculative decoding interaction, expert routing inside MoE layers)
+- Process / scope problems (premature optimization, ungrounded benchmark, missing rollback story, etc.)
+
+For each new critique, output EXACTLY this delimited block:
+
+```
+NEW_CRITIQUE_<N>:
+LOCATION: <anchor — quote the closest existing heading or AC/task/DEC label so a reader can find it; e.g. "AC-6 (CUDA-graph)", "After Milestone 1 Phase C", "Implementation Notes — Symbol-name boundary">
+COMMENT_TEXT:
+<comment>
+[Codex] <your critique, Linus-style: concrete, technical, actionable, no hedging>
+</comment>
+END_NEW_CRITIQUE
+```
+
+`N` is sequential starting at 1. Aim for **3–8 new critiques** — quality over quantity. Each must:
+
+1. Point at a concrete location in the plan.
+2. Name a specific failure mode or smell, not a vague concern.
+3. Either propose an alternative or pose a question that forces a decision.
+4. Match the existing Linus voice. No "consider whether..." hedging. Be direct.
+
+Do not duplicate or rephrase Linus's existing critiques.
+
+## The Plan
+
+```
 # Plan: Deliver Standalone Double Sparsity for DeepSeek-V3.2 (FP8)
 
 ## Goal Description
@@ -63,10 +142,6 @@ Following TDD philosophy, each criterion includes positive and negative tests fo
 Also: "bit-for-bit identical attention output" on FP8 is a fantasy. FP8 GEMM is not deterministic across launch orderings. State a tolerance or pick a different correctness check.
 </comment>
 
-<comment>
-[Codex] `selected_indices` is not a contract. FlashMLA needs physical block-table entries with causal lengths, not a bag of ranked logical page ids. Decide now: selector returns logical positions and an adapter maps/sorts them into the backend block table, or selector returns physical page ids already ordered for the kernel. Passing top-k score order into a paged attention backend that expects sequence order is how you get silent wrong attention.
-</comment>
-
 - AC-3: Page size 64 works on DeepSeek-V3.2 (FP8) and at least one alternate page size is exercised in tests. The implementation does not hard-code page=64. Backend / dtype pairing follows the V3.2 MLA backend rule: `fp8_e4m3` ↔ FlashMLA FP8 path, `bfloat16` ↔ FlashMLA BF16 path.
   - Positive Tests:
     - End-to-end smoke run with `kv_cache_dtype=fp8_e4m3`, `page_size=64`, V3.2 FP8 MLA backend succeeds for one warm prefill + one decode batch.
@@ -88,10 +163,6 @@ Also: "bit-for-bit identical attention output" on FP8 is a fantasy. FP8 GEMM is 
 [Linus] Validating `model_revision_sha + head_dim + tp_world_size + dtype + page_size + label_dim` is paranoid bookkeeping that will not catch the actual bug class. Calibration done on a different LoRA fine-tune of the same revision passes every one of those checks and produces garbage. Either ship a content hash of the channel mask plus an end-to-end NIAH sanity probe on startup (which catches the real bugs), or trust the user and delete the validator. `head_dim` and `tp_world_size` are derivable from the running config; embedding them in the artifact metadata is an excuse to fail-fast on a non-bug.
 </comment>
 
-<comment>
-[Codex] `tp_world_size` in the artifact is not enough for tensor parallel correctness. If each TP rank computes page scores from its local shard, ranks can choose different page tables for the same request, which breaks backend metadata assumptions and makes output rank-dependent. Specify whether page selection is per-rank by design or globally synchronized; if it is global, define the reduction/all-gather path and test rank agreement.
-</comment>
-
 - AC-5: A calibration script produces a calibration artifact for DeepSeek-V3.2 (FP8) and is invocable as a standalone command. CI uses a tiny NSA-shaped fixture; the production recipe runs on the agreed hardware (DEC-1) and is documented but not committed.
   - Positive Tests:
     - `python -m sglang.srt.layers.attention.double_sparsity.calibrate --model <tiny-NSA-fixture> --dtype fp8_e4m3 --tp 1 --output /tmp/labels.safetensors` runs to completion in CI under a minute and writes a non-empty artifact with the documented schema.
@@ -108,10 +179,6 @@ Also: "bit-for-bit identical attention output" on FP8 is a fantasy. FP8 GEMM is 
   - Negative Tests:
     - Setting `max_top_k` smaller than `top_k` fails at startup, not at capture.
     - Removing CUDA-graph capture (per-step eager) does not regress correctness — golden output is unchanged.
-
-<comment>
-[Codex] Static output buffers do not make CUDA graph capture safe. Grid sizes, scratch buffers, page-table writes, valid page counts, dense sentinel branching, and radix-cache hit shapes also have to be replay-stable. Define the captured decode ABI as fixed input/output tensors plus device-side masking, and ban CPU-side allocation or metadata rebuilding inside the captured region.
-</comment>
 
 - AC-7: A native-NSA baseline (DS off — DeepSeek-V3.2 running with its built-in NSA selection on a single-instance server) is recorded on the same hardware, same model revision, same workload, same radix-cache setting, and same concurrency as the DS run. **No HiSparse baseline is required for the initial deliverable**; it is documented as an optional follow-up benchmark under the future-work section.
   - Positive Tests:
@@ -205,15 +272,6 @@ The implementation adds `--enable-double-sparsity` and `--double-sparsity-config
    Plus argparse entries with `--enable-double-sparsity` and `--double-sparsity-config`. The mutual-exclusion check with `--enable-hisparse` (AC-1 negative test) lives near the existing `_handle_hisparse` / `_handle_pd_disaggregation` code in `server_args.py`.
 4. Calibration artifact format (`safetensors`): top-level tensors `channel_selection[L, H, label_dim]` (int32 indices) and `channel_weights[L, H, label_dim]` (fp32) where `L = num_layers`, `H = num_heads`; metadata block with `model_revision_sha`, `head_dim`, `tp_world_size`, `dtype`, `page_size`, `label_dim`, `created_at`, `schema_version`. Schema reviewed against GLM-5 (per-rank metadata), 128K ISL (no length-dependent fields), and FP4 weights (dtype-agnostic) before merging — see task 6.
 5. Runtime label cache: allocated when DS is enabled with shape `[num_layers, max_pages, num_heads, label_dim]`; populated by an MLA-adapted port of PR #25304 commit `567eff67b`'s `K_label` write kernel during prefill, and incrementally during decode for new pages. Cache-hit pages reuse prior labels; a page-stability fixture (M3-B) verifies this.
-
-<comment>
-[Codex] The page signature table is keyed by `max_pages`, but the plan never ties entries to the KV page allocator lifecycle. Paged KV blocks are freed, reused, evicted from radix cache, and invalidated by aborted requests; without an owner/epoch check, stale signatures will select pages from a previous request. Make page signatures allocator-owned metadata, overwrite them on every page assignment, and invalidate them on free/eviction/retract.
-</comment>
-
-<comment>
-[Codex] `[num_layers, max_pages, num_heads, label_dim]` has no memory budget. On V3.2 with long contexts and high concurrency, this can consume enough HBM to reduce KV capacity and invalidate the benchmark before any kernel runs. Pick the dtype, TP shard dimensions, allocation owner, and worst-case bytes in the plan; if the table is too large, compress it or allocate only for resident pages in the existing KV pool.
-</comment>
-
 6. Radix cache: DS does not inherit HiSparse's `assert server_args.disable_radix_cache`. The DS validator must instead validate (via M3-B) that the runtime label cache is page-stable under cache hits, then permit radix cache by default for DS. If the fixture fails, the validator refuses radix cache for DS until the failure is resolved.
 7. Observability hooks: add Prometheus gauges / counters under `sglang_double_sparsity_*`; thread per-request fields `sparsity_rate`, `selected_pages`, `dense_fallback` through `ScheduleBatch` → `meta_info`.
 8. Tests: `test/manual/test_double_sparsity_v32.py` (NIAH 4K / 16K / 64K + MMLU 5-shot on V3.2-FP8); `test/srt/test_double_sparsity_unit.py` (selector kernel, calibration loader, runtime label cache, ABI shape, fault-injection). CI smoke under `test/run_suite.py` using the tiny NSA fixture.
@@ -253,7 +311,7 @@ The implementation adds `--enable-double-sparsity` and `--double-sparsity-config
 
 ### Milestones
 
-1. **Milestone 0 — Decision artifact & branch setup**
+1. **Milestone 0 — Decision artifact $(REFINED_PLAN_TEXT) branch setup**
    - Phase A: Land this refined plan. Close PR #22992. Mark PR #25304 as reference.
    - Phase B: Cut a feature branch off current `main`: `dev/double-sparsity-standalone`.
    - Phase C: Resolve `## Pending User Decisions` (DEC-1..DEC-7). Encode the resolutions into the test plan.
@@ -273,18 +331,13 @@ The implementation adds `--enable-double-sparsity` and `--double-sparsity-config
 4. **Milestone 3 — Selection kernels (real DS math) and ABI shape lock-in** (targets AC-2 real, AC-6, AC-11, DEC-2 page-stability)
    - Phase A: Port the M3 / v1.1-4 / v1.1-5 / v1.1-6 selection kernels from PR #25304 to MLA-shaped `K_label` / page layout. Cover stage-1 block-topk, stage-2 merge, score-aware union, capture-safe dispatch. Ship `selection_mode` parameter from this milestone (the ABI shape) with `TOPK` enabled.
    - Phase B: Wire the `K_label` write kernel from commit `567eff67b` to the runtime label cache built in M2-C; populate on prefill, incrementally extend on decode. **Land the DEC-2 page-stability fixture here**: a deterministic prefix is run cold (cache miss) and warm (cache hit) and the test asserts identical `retrieve_topk` output across both runs. Passing this fixture is the precondition for the DS validator to permit radix cache.
-
-<comment>
-[Codex] "Incrementally extend on decode for new pages" misses the hot page. During decode, the current KV page changes every token until it fills; if the signature is only written when a new page appears, the freshest tokens are invisible to selection for up to 63 steps at page size 64. Either update the active page signature every decode step or force the active/local window into the selected page table unconditionally.
-</comment>
-
    - Phase C: CUDA-graph piecewise capture for the DS decode path at conc 16 / 32 / 64.
 
 5. **Milestone 4 — Calibration tooling** (targets AC-5)
    - Phase A: Port the calibration script (commits `a8efc6068`, `e8824f86a`) to `calibrate.py`. Default dataset: NIAH-shaped synthetic (`3dca4be73`); `--dataset` accepts external corpora.
    - Phase B: Produce + version an external label artifact for `deepseek-ai/DeepSeek-V3.2` (FP8) **outside** the repo; commit only the documented recipe under `docs/advanced_features/double_sparsity_calibration.md`.
 
-6. **Milestone 5 — Quality & SLO gates** (targets AC-7, AC-8, AC-9, AC-10)
+6. **Milestone 5 — Quality $(REFINED_PLAN_TEXT) SLO gates** (targets AC-7, AC-8, AC-9, AC-10)
    - Phase A: Update `development/benchmark.sh` to consume the baseline harness from M1-D and emit the two-column report (`DS off` / `DS on`).
    - Phase B: `test/manual/test_double_sparsity_v32.py` for NIAH (4K / 16K / 64K) and MMLU. CI smoke `test/srt/test_double_sparsity_unit.py`.
    - Phase C: Prometheus metrics + per-request `meta_info` fields.
@@ -333,10 +386,6 @@ The implementation adds `--enable-double-sparsity` and `--double-sparsity-config
 | task18 | Add `selection_mode=TOPP` unit-test path; gate the end-to-end server path behind a "Twilight" feature flag (default off); AC-11 negative test passes | AC-11 | coding | task11 |
 | task19 | Independent reasonability audit of the cherry-picked selection kernels vs the Double Sparsity paper and Twilight repo; verify channel-sparsity math matches the published algorithm; document deltas | AC-9 | analyze | task11 |
 | task20 | Branch hygiene + ship-gate: rewrite history if needed, write the PR description (must explicitly call out "standalone, no HiSparse"), add the pre-commit hook that blocks `HANDOFF*.md` / `SESSION_REPORT*.md` / pensieve installs, run CI green, prepare reviewer guide. Include a "Future-Work" section in the PR description that scopes the downstream HiSparse + PD-Disagg integration path. | AC-12 | coding | task15, task16, task17, task18 |
-
-<comment>
-[Codex] The FP8 path is underspecified (task 12). A `K_label` kernel reading FP8 cache bytes without the exact quantization scales used by `quant_k_cache` is computing scores in the wrong numeric space. The page signature writer must consume the same scale metadata as the NSA dequant path, or it must explicitly dequantize before projection; otherwise the offline channel weights are calibrated against values the runtime never reconstructs.
-</comment>
 
 <comment>
 [Linus] PR #25304 commits `0b776ca05`, `1b5e52863`, `7fe8002a3` are cited ten times as "cherry-pick targets". They were on a FA3 + Llama path. "Adapt for MLA `K_label` layout" is not cherry-pick — it is rewrite the kernel with the old one open in a side window. Call it what it is: "study PR #25304, reimplement for MLA". The cherry-pick framing makes the work sound smaller than it is and will bite during execution when M3 kernels take three times the budgeted effort.
@@ -469,3 +518,12 @@ I am deciding between whether I should
 
 Help me first decide whether I should resume or restart from scratch on Sglang.
 --- Original Design Draft End ---
+```
+
+## Configuration
+
+- Model: gpt-5.5
+- Effort: high
+- Timeout: 3600s
+- Timestamp: 2026-05-19_20-44-00
+- Tool: codex
