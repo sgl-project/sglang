@@ -186,8 +186,8 @@ export const config = {
       // EP=16 is similarly bounded by total ranks — disable on single-node.
       ep: { label: "EP", values: [
         null,
-        1,
-        2,
+        { value: 1, hide: { variant: ["pro"] } },
+        { value: 2, hide: { variant: ["pro"] } },
         4,
         8,
         { value: 16, disable: { nodes: ["single"] },

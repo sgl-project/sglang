@@ -12,7 +12,7 @@
 // required. To improve the engine (new button, new UI feature, VRAM update),
 // edit this file once and every cookbook gets the upgrade.
 //
-// AUTHORING — read _AUTHORING.md in this directory for the step-by-step
+// AUTHORING — read .claude/rules/cookbook-authoring.md for the step-by-step
 // workflow on adding a new cookbook or extending the engine.
 //
 // CONFIG CONTRACT (what the engine reads from `config`)
