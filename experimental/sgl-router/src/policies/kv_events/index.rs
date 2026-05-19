@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, WorkerEvent};
 use super::tree::{HashTree, KvWorkerId};
@@ -81,6 +82,12 @@ pub struct KvEventIndex {
     /// may legitimately have a fresh publisher whose sequence numbers
     /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+    /// Worker-sourced `page_size` shared with the cache-aware-zmq policy.
+    /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
+    /// establishes the value; subsequent workers that disagree are
+    /// rejected (logged + not subscribed). The policy reads it at routing
+    /// time to size its `compute_block_hashes` call.
+    block_size_oracle: Arc<BlockSizeOracle>,
 }
 
 impl KvEventIndex {
@@ -96,6 +103,18 @@ impl KvEventIndex {
 
     /// Constructor used by tests so they can supply a custom timeout.
     pub fn new_with_http(http: reqwest::Client) -> Arc<Self> {
+        Self::new_with_http_and_oracle(http, BlockSizeOracle::new())
+    }
+
+    /// Constructor that lets the caller supply a pre-shared
+    /// [`BlockSizeOracle`]. Production wires this from `AppContext` so
+    /// the same oracle the index seeds is the one the cache-aware-zmq
+    /// policy reads at routing time. Tests use this to pre-populate the
+    /// oracle and exercise the mismatch-rejection path.
+    pub fn new_with_http_and_oracle(
+        http: reqwest::Client,
+        block_size_oracle: Arc<BlockSizeOracle>,
+    ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
@@ -118,7 +137,16 @@ impl KvEventIndex {
             http,
             live_workers,
             cursors,
+            block_size_oracle,
         })
+    }
+
+    /// Shared accessor for the per-process block-size oracle. The
+    /// `CacheAwareZmqPolicy` (via [`crate::policies::factory`]) holds the
+    /// same `Arc` so the value the index seeds is the value the policy
+    /// hashes against.
+    pub fn block_size_oracle(&self) -> Arc<BlockSizeOracle> {
+        Arc::clone(&self.block_size_oracle)
     }
 
     /// Clone the underlying tree handle for cache-aware selection and
@@ -159,10 +187,28 @@ impl KvEventIndex {
                 }
             },
         };
+        // Reconcile this worker's `page_size` with the oracle BEFORE
+        // any subscriber state is created. The first worker establishes
+        // the value; later workers must agree. A mismatch means the
+        // router and at least one engine would compute different block
+        // hashes for the same prompt, silently destroying cache-aware
+        // routing quality — reject loudly instead.
+        if let Err(err) = self.block_size_oracle.try_set(cfg.block_size) {
+            warn!(
+                worker_url = %worker_url,
+                established_block_size = err.established,
+                worker_block_size = err.candidate,
+                "kv-events: worker page_size disagrees with established block_size; \
+                 skipping worker — cache-aware routing requires every worker to publish \
+                 at the same block size",
+            );
+            return;
+        }
         info!(
             worker_url = %worker_url,
             dp_size = cfg.dp_size,
             port_base = cfg.port_base,
+            block_size = cfg.block_size,
             "kv-events: subscribing",
         );
         // Compute the DP ranks that will actually be subscribed (skip
@@ -581,5 +627,56 @@ mod tests {
 
         assert_eq!(tree.match_prefix(None, &[42]).matched_blocks, 0);
         assert_eq!(tree.match_prefix(None, &[99]).matched_blocks, 1);
+    }
+
+    /// `add_worker` must reject a worker whose `EventConfig.block_size`
+    /// disagrees with the previously-established oracle value. The
+    /// router cannot hash prompts simultaneously at two block sizes;
+    /// silently accepting the mismatched worker would destroy
+    /// cache-aware routing quality for every request.
+    #[tokio::test]
+    async fn add_worker_rejects_block_size_mismatch() {
+        let index = KvEventIndex::new();
+        // First worker establishes block_size=64 via the oracle.
+        index.block_size_oracle().try_set(64).unwrap();
+
+        let bad_cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 30100,
+            topic: String::new(),
+            block_size: 128,
+            dp_size: 1,
+        };
+        index
+            .add_worker("http://127.0.0.1:30100", Some(bad_cfg))
+            .await;
+        assert_eq!(
+            index.known_worker_count(),
+            0,
+            "mismatched worker must not be registered"
+        );
+        index.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn add_worker_seeds_oracle_with_first_block_size() {
+        // Without any prior priming, the first worker through `add_worker`
+        // should publish its `EventConfig.block_size` into the oracle so
+        // subsequent matching workers reconcile and mismatched ones fail.
+        let index = KvEventIndex::new();
+        assert_eq!(index.block_size_oracle().get(), None);
+
+        // A dp_size=0 cfg short-circuits before the subscriber spawn but
+        // still runs through the block-size validation.
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 30200,
+            topic: String::new(),
+            block_size: 64,
+            dp_size: 0,
+        };
+        index.add_worker("http://127.0.0.1:30200", Some(cfg)).await;
+        assert_eq!(index.block_size_oracle().get(), Some(64));
+        index.shutdown().await;
     }
 }

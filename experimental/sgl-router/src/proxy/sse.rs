@@ -4,6 +4,7 @@
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -44,7 +45,21 @@ use tokio_stream::wrappers::ReceiverStream;
 /// pack arbitrary cleanup state in. Pass `None` for callers that manage the
 /// guard externally (e.g. non-streaming paths where the handler itself is the
 /// guard scope).
-pub fn bytes_stream_to_body<S, E>(stream: S, stream_guards: Option<Box<dyn Send + 'static>>) -> Body
+///
+/// # Completion hook
+/// When `on_complete` is `Some`, the closure runs exactly once when the
+/// pump task finishes. The bool argument is `true` on clean stream end
+/// (including a clean client disconnect after at least the headers
+/// landed cleanly), `false` on upstream stream error or pump panic.
+/// `forward_streaming_to` passes a closure that records the worker's
+/// circuit-breaker outcome — without this hook, a worker that returns
+/// 2xx headers and then drops the stream mid-flight would stay credited
+/// as healthy.
+pub fn bytes_stream_to_body<S, E>(
+    stream: S,
+    stream_guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
@@ -52,6 +67,11 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let tx_for_panic = tx.clone();
+        // Capture the pump's outcome so we can report it through `on_complete`
+        // AFTER `pump.catch_unwind()` settles. The closure inside owns
+        // `outcome_setter`; the outer scope reads `outcome_holder` once.
+        let outcome_holder = Arc::new(parking_lot::Mutex::new(true));
+        let outcome_setter = Arc::clone(&outcome_holder);
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -66,6 +86,9 @@ where
                     std::io::Error::other(msg)
                 });
                 let is_err_chunk = item.is_err();
+                if is_err_chunk {
+                    *outcome_setter.lock() = false;
+                }
                 if tx.send(item).await.is_err() {
                     // Receiver dropped. If we were about to ship an upstream
                     // error there's nothing left to report; otherwise this is
@@ -82,7 +105,9 @@ where
                 }
             }
         });
-        if let Err(panic_payload) = pump.catch_unwind().await {
+        let pump_result = pump.catch_unwind().await;
+        let panicked = pump_result.is_err();
+        if let Err(panic_payload) = pump_result {
             let msg = panic_payload
                 .downcast_ref::<&'static str>()
                 .map(|s| (*s).to_string())
@@ -94,6 +119,10 @@ where
                     "SSE pump panicked: {msg}"
                 ))))
                 .await;
+        }
+        if let Some(hook) = on_complete {
+            let ok = !panicked && *outcome_holder.lock();
+            hook(ok);
         }
     });
     Body::from_stream(ReceiverStream::new(rx))
@@ -113,7 +142,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None);
+        let body = bytes_stream_to_body(s, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -125,7 +154,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None);
+        let body = bytes_stream_to_body(s, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -187,7 +216,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None);
+        let body = bytes_stream_to_body(s, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -210,7 +239,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None);
+        let body = bytes_stream_to_body(s, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -269,7 +298,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None);
+        let body = bytes_stream_to_body(stream, None, None);
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();

@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
@@ -118,11 +119,12 @@ impl Proxy {
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
-        if status.is_server_error() {
-            breaker.record_failure();
-        } else {
-            breaker.record_success();
-        }
+        // Defer breaker recording until after the body completes — a
+        // worker that returns 2xx headers and then drops mid-body is
+        // still failing the request, and crediting it as healthy lets
+        // a misbehaving worker stay eligible. For 5xx the early bail is
+        // safe (no body to consume meaningfully), but we still wait
+        // until after the read attempt to record exactly once.
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
@@ -132,9 +134,15 @@ impl Proxy {
                     error = ?e,
                     "upstream dropped connection mid-body",
                 );
+                breaker.record_failure();
                 return Err(ApiError::UpstreamStatus { status });
             }
         };
+        if status.is_server_error() {
+            breaker.record_failure();
+        } else {
+            breaker.record_success();
+        }
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -159,7 +167,7 @@ impl Proxy {
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
-        breaker: &CircuitBreaker,
+        breaker: &Arc<CircuitBreaker>,
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
@@ -188,11 +196,6 @@ impl Proxy {
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
-        if status.is_server_error() {
-            breaker.record_failure();
-        } else {
-            breaker.record_success();
-        }
         let upstream_ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -204,7 +207,26 @@ impl Proxy {
         } else {
             upstream_ct
         };
-        let body = sse::bytes_stream_to_body(resp.bytes_stream(), stream_guards);
+        // Breaker recording is deferred to the pump's completion hook so
+        // an upstream that returns 2xx headers and then drops mid-stream
+        // is recorded as a failure. For 5xx headers we record_failure
+        // up front and skip the pump hook (the body we surface is the
+        // error response — its stream completing is not a worker win).
+        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+            if status.is_server_error() {
+                breaker.record_failure();
+                None
+            } else {
+                let breaker_for_hook = Arc::clone(breaker);
+                Some(Box::new(move |ok| {
+                    if ok {
+                        breaker_for_hook.record_success();
+                    } else {
+                        breaker_for_hook.record_failure();
+                    }
+                }))
+            };
+        let body = sse::bytes_stream_to_body(resp.bytes_stream(), stream_guards, on_complete);
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(

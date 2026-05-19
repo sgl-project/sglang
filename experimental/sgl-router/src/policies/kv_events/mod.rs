@@ -14,6 +14,7 @@
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
 
+pub mod block_size_oracle;
 pub mod discovery;
 pub mod hash;
 pub mod index;
@@ -21,6 +22,7 @@ pub mod subscriber;
 pub mod tree;
 pub mod wire;
 
+pub use block_size_oracle::BlockSizeOracle;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, sha256_to_i64};
 pub use index::KvEventIndex;

@@ -36,7 +36,7 @@
 use crate::config::CacheAwareConfig;
 
 use crate::discovery::ModelId;
-use crate::policies::kv_events::{compute_block_hashes, HashTree};
+use crate::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
 use crate::policies::{Policy, SelectionContext};
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -53,6 +53,12 @@ pub struct CacheAwareZmqPolicy {
     /// Tokenizer registry — selection reads `model_id` from the context
     /// and looks up the per-model tokenizer.
     tokenizers: Arc<TokenizerRegistry>,
+    /// Worker-sourced block size, shared with the `KvEventIndex` that
+    /// seeds it on worker registration. Read once per request; if
+    /// `None` (no worker has reported a `page_size` yet) the policy
+    /// degrades to min-load — the router cannot hash a prompt without
+    /// a block size that matches what the worker publishes.
+    block_size_oracle: Arc<BlockSizeOracle>,
 }
 
 impl std::fmt::Debug for CacheAwareZmqPolicy {
@@ -69,11 +75,13 @@ impl CacheAwareZmqPolicy {
         config: CacheAwareConfig,
         tree: Arc<HashTree>,
         tokenizers: Arc<TokenizerRegistry>,
+        block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Self {
         Self {
             config,
             tree,
             tokenizers,
+            block_size_oracle,
         }
     }
 
@@ -205,8 +213,14 @@ impl Policy for CacheAwareZmqPolicy {
         let Some(tokens) = self.tokenize(ctx.model(), &text) else {
             return Self::pick_min_load(workers);
         };
-        let block_size = self.config.block_size.max(1) as usize;
-        let block_hashes = compute_block_hashes(&tokens, block_size);
+        // Source block_size from the worker — the router can only hash
+        // prompts at the block size the workers publish at. If no worker
+        // has registered yet (oracle empty), cache-aware routing has no
+        // ground truth to score against; fall back to min-load.
+        let Some(block_size) = self.block_size_oracle.get() else {
+            return Self::pick_min_load(workers);
+        };
+        let block_hashes = compute_block_hashes(&tokens, block_size as usize);
         if block_hashes.is_empty() {
             return Self::pick_min_load(workers);
         }
@@ -248,8 +262,16 @@ mod tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
-            block_size: 4,
         }
+    }
+
+    /// Helper: build a `BlockSizeOracle` already primed to the test's
+    /// canonical block size (4). Mirrors what `KvEventIndex::add_worker`
+    /// would do when the first real worker registers.
+    fn oracle_for_tests(block_size: u32) -> Arc<crate::policies::kv_events::BlockSizeOracle> {
+        let o = crate::policies::kv_events::BlockSizeOracle::new();
+        o.try_set(block_size).expect("fresh oracle accepts first set");
+        o
     }
 
     fn worker(url: &str, model_id: &str) -> Arc<Worker> {
@@ -294,7 +316,7 @@ mod tests {
     #[test]
     fn empty_workers_returns_none() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny());
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, Some(b"{\"prompt\":\"hi\"}"));
         assert!(policy.select(&[], &ctx).is_none());
@@ -304,7 +326,7 @@ mod tests {
     #[test]
     fn empty_tree_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny());
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         // Bump w0's load so min-load picks w1 deterministically.
@@ -340,16 +362,13 @@ mod tests {
         );
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
+        let policy = CacheAwareZmqPolicy::new(CacheAwareConfig {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                block_size,
             },
             tree,
-            registry,
-        );
+            registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
@@ -375,16 +394,13 @@ mod tests {
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
         tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
+        let policy = CacheAwareZmqPolicy::new(CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                block_size,
             },
             tree,
-            registry,
-        );
+            registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         // Bump w0 to load=1; w1 is at 0 — tiebreak picks w1.
@@ -410,16 +426,13 @@ mod tests {
         let hashes = compute_block_hashes(&ids, block_size as usize);
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
+        let policy = CacheAwareZmqPolicy::new(CacheAwareConfig {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
-                block_size,
             },
             tree,
-            registry,
-        );
+            registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         // Bump w0 well above the imbalance threshold.
@@ -441,7 +454,7 @@ mod tests {
     fn missing_tokenizer_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
         let empty_registry = Arc::new(TokenizerRegistry::default());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, empty_registry);
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, empty_registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -458,7 +471,7 @@ mod tests {
     #[test]
     fn missing_request_body_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny());
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -474,7 +487,7 @@ mod tests {
     #[test]
     fn body_without_prompt_field_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny());
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -493,7 +506,7 @@ mod tests {
     #[test]
     fn empty_text_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny());
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -519,16 +532,13 @@ mod tests {
             &[999, 998, 997],
         );
 
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
+        let policy = CacheAwareZmqPolicy::new(CacheAwareConfig {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                block_size: 4,
             },
             tree,
-            tokenizer_registry_with_tiny(),
-        );
+            tokenizer_registry_with_tiny(), oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -595,16 +605,13 @@ mod tests {
         let kw0 = KvWorkerId::new("http://w0:30000".into(), 0);
         tree.insert(&kw0, None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
+        let policy = CacheAwareZmqPolicy::new(CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
-                block_size,
             },
             tree.clone(),
-            registry,
-        );
+            registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];

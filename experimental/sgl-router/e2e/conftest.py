@@ -129,32 +129,77 @@ def _find_tokenizer_path(model: str) -> str:
     return model
 
 
+def build_smoke_router_config(
+    *,
+    host: str,
+    port: int,
+    model: str,
+    tokenizer_path: str,
+    sglang_url: str,
+    workers_path: Path,
+) -> tuple[str, str]:
+    """Build the TOML pair the smoke `router` fixture writes to disk.
+
+    Returns ``(main_config_text, workers_text)`` where:
+
+    * ``main_config_text`` carries ``[server]``, ``[[models]]``, and
+      ``[discovery] backend = "static_file"`` pointing at ``workers_path``.
+      The Rust ``Config`` struct requires a ``[discovery]`` section
+      (``DiscoveryConfig`` has no ``#[serde(default)]``) and has no
+      top-level ``workers`` field — earlier versions of this fixture
+      emitted ``[[workers]]`` inline, which made the router fail to
+      start.
+    * ``workers_text`` is the side-car ``[[workers]]`` list the
+      static-file discovery backend polls.
+
+    Pure string builder so unit tests can validate the shape against
+    ``tomllib`` without launching the binary.
+    """
+    main = f"""\
+[server]
+host = "{host}"
+port = {port}
+
+[[models]]
+id = "{model}"
+tokenizer_path = "{tokenizer_path}"
+
+[discovery]
+backend = "static_file"
+
+[discovery.static_file]
+path = "{workers_path}"
+poll_interval_ms = 200
+"""
+    workers = f"""\
+[[workers]]
+url = "{sglang_url}"
+"""
+    return main, workers
+
+
 @pytest.fixture(scope="session")
 def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
     """Launch sgl-router on port 8090 pointed at the SGLang worker."""
     tok_path = _find_tokenizer_path(MODEL)
-    config_content = f"""\
-[server]
-host = "0.0.0.0"
-port = {ROUTER_PORT}
-
-[[models]]
-id = "{MODEL}"
-tokenizer_path = "{tok_path}"
-
-[[workers]]
-url = "http://localhost:{SGLANG_PORT}"
-"""
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".toml", delete=False
-    ) as cfg_file:
-        cfg_file.write(config_content)
-        cfg_path = cfg_file.name
+    cfg_handle = tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False)
+    cfg_path = Path(cfg_handle.name)
+    workers_path = cfg_path.with_suffix(".workers.toml")
+    main_text, workers_text = build_smoke_router_config(
+        host="0.0.0.0",
+        port=ROUTER_PORT,
+        model=MODEL,
+        tokenizer_path=tok_path,
+        sglang_url=f"http://localhost:{SGLANG_PORT}",
+        workers_path=workers_path,
+    )
+    cfg_handle.write(main_text)
+    cfg_handle.close()
+    workers_path.write_text(workers_text, encoding="utf-8")
 
     try:
         proc = subprocess.Popen(
-            [str(_BINARY), "--config", cfg_path],
+            [str(_BINARY), "--config", str(cfg_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -175,7 +220,8 @@ url = "http://localhost:{SGLANG_PORT}"
             proc.kill()
             proc.wait()
     finally:
-        Path(cfg_path).unlink(missing_ok=True)
+        cfg_path.unlink(missing_ok=True)
+        workers_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

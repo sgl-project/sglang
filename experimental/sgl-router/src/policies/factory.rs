@@ -4,8 +4,11 @@
 use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
-    cache_aware_zmq::CacheAwareZmqPolicy, kv_events::HashTree,
-    power_of_two::PowerOfTwoChoicesPolicy, random::RandomPolicy, round_robin::RoundRobinPolicy,
+    cache_aware_zmq::CacheAwareZmqPolicy,
+    kv_events::{BlockSizeOracle, HashTree},
+    power_of_two::PowerOfTwoChoicesPolicy,
+    random::RandomPolicy,
+    round_robin::RoundRobinPolicy,
     Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
@@ -13,15 +16,17 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Construct a policy for a single model from its [`ModelConfig`] and the
-/// process-shared `HashTree` + `TokenizerRegistry`.
+/// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle`.
 ///
-/// The tree and tokenizer registry are only consulted by the cache-aware-zmq
-/// variant; other policies ignore them. Callers building all policies for
-/// the same process pass the same `tree` and `tokenizers` to every model.
+/// The tree, tokenizer registry, and oracle are only consulted by the
+/// cache-aware-zmq variant; other policies ignore them. Callers building
+/// all policies for the same process pass the same instances to every
+/// model.
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
+    block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Arc<dyn Policy> {
     match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -29,7 +34,12 @@ pub fn build_policy(
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
-            Arc::new(CacheAwareZmqPolicy::new(cache_cfg, tree, tokenizers))
+            Arc::new(CacheAwareZmqPolicy::new(
+                cache_cfg,
+                tree,
+                tokenizers,
+                block_size_oracle,
+            ))
         }
     }
 }
@@ -45,13 +55,15 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::CacheAwareZmq => {
-            // Provide an empty tree + empty tokenizer registry so the test
-            // policy is constructible. Production callers go through
-            // `build_policy` with the real shared instances.
+            // Provide an empty tree + empty tokenizer registry + fresh
+            // oracle so the test policy is constructible. Production
+            // callers go through `build_policy` with the real
+            // process-shared instances.
             Arc::new(CacheAwareZmqPolicy::new(
                 crate::config::CacheAwareConfig::default(),
                 Arc::new(HashTree::new()),
                 Arc::new(TokenizerRegistry::default()),
+                BlockSizeOracle::new(),
             ))
         }
     }
@@ -61,12 +73,18 @@ pub fn build_registry(
     cfg: &Config,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
+    block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     for m in &cfg.models {
         reg.insert(
             ModelId(m.id.clone()),
-            build_policy(m, Arc::clone(&tree), Arc::clone(&tokenizers)),
+            build_policy(
+                m,
+                Arc::clone(&tree),
+                Arc::clone(&tokenizers),
+                Arc::clone(&block_size_oracle),
+            ),
         );
     }
     Ok(reg)
@@ -74,8 +92,9 @@ pub fn build_registry(
 
 /// Convenience for tests + non-cache-aware callers: builds a registry with
 /// a fresh, empty `HashTree` and an empty `TokenizerRegistry`. The
-/// cache-aware-zmq policy will then degrade to min-load (no tokenizer →
-/// fallback) — which is exactly what the legacy tests assume.
+/// cache-aware-zmq policy will then degrade to min-load (no tokenizer +
+/// no worker-published block size → fallback) — which is exactly what
+/// the legacy tests assume.
 ///
 /// Production callers go through [`build_registry`] with the real
 /// process-shared instances.
@@ -84,6 +103,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
         cfg,
         Arc::new(HashTree::new()),
         Arc::new(TokenizerRegistry::default()),
+        BlockSizeOracle::new(),
     )
 }
 
@@ -142,7 +162,7 @@ mod tests {
         ]);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers).unwrap();
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("deepseek".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
@@ -153,7 +173,7 @@ mod tests {
         let cfg = cfg_with_models(&[("modelA", PolicyKind::CacheAwareZmq)]);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers).unwrap();
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         // Down-cast probe via Debug — cheaper than carrying a type-tag
         // on the trait. Pinning the debug repr is fine because the field

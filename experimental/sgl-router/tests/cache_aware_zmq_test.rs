@@ -171,15 +171,21 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     //    Arc<HashTree> that the index also owns; events the index
     //    receives mutate the same tree the policy reads.
     let kv_index = KvEventIndex::new();
+    // Mirror what `KvEventIndex::add_worker` would do in production: seed
+    // the oracle with the worker-reported page_size before any cache
+    // lookup happens. The integration path calls `add_worker` further
+    // down, but here we want the policy to know `block_size` immediately.
+    let block_size_oracle = kv_index.block_size_oracle();
+    block_size_oracle.try_set(block_size).unwrap();
     let policy = CacheAwareZmqPolicy::new(
         CacheAwareConfig {
             cache_threshold: 0.0,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
-            block_size,
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),
+        block_size_oracle,
     );
 
     // 5. Register two workers. They share `127.0.0.1` so both
