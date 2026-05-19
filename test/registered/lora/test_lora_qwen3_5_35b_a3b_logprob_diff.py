@@ -53,6 +53,7 @@ DISABLE_SHARED_EXPERTS_FUSION = True
 KL_THRESHOLD = 1e-3
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3_5_35B_A3B_LogprobDiff(CustomTestCase):
     def test_lora_qwen3_5_35b_a3b_logprob_accuracy(self):
         adapter_path = snapshot_download(

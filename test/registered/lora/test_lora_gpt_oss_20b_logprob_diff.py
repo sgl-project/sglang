@@ -52,6 +52,7 @@ DECODE_ATTENTION_BACKEND = "triton" if is_hip() else "fa4"
 KL_THRESHOLD = 5e-3
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
     def test_lora_gpt_oss_20b_logprob_accuracy(self):
         adapter_path = snapshot_download(
