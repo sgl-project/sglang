@@ -494,15 +494,16 @@ class DeepseekV2MoE(nn.Module):
                 top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
+                use_grouped_topk=False if self.is_deepseek_v4 else True,
                 num_expert_group=config.n_group,
                 num_fused_shared_experts=self.num_fused_shared_experts,
                 topk_group=config.topk_group,
                 correction_bias=self.gate.e_score_correction_bias,
                 quant_config=quant_config,
                 routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                apply_routed_scaling_factor_on_output=True if self.is_deepseek_v4 else self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                scoring_func=config.scoring_func,
                 output_format=(
                     TopKOutputFormat.STANDARD
                     if (quant_config is None)

@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -1208,8 +1209,31 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        if (
+        if scoring_func != "sqrtsoftplus":
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+
+        if scoring_func == "sqrtsoftplus":
+            from sglang.srt.layers.moe.deepseek_v4_topk import biased_topk_jit_kernel_impl, biased_topk_impl
+            _biased_topk = (
+                biased_topk_jit_kernel_impl
+                if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+                else biased_topk_impl
+            )
+
+            topk_weights, topk_ids = _biased_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                correction_bias=correction_bias,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
