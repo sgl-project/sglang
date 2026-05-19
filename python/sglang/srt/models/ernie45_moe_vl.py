@@ -194,12 +194,13 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             layer_id >= text_moe_layer_start_index
             and layer_id <= text_moe_layer_end_index
         ):
+            # gate uses float32 input, so disable FP8 quantization to avoid error
             self.text_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[0],
                 bias=False,
                 params_dtype=torch.float32,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=add_prefix("text_experts_gate", prefix),
             )
 
@@ -225,13 +226,13 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             layer_id >= vision_moe_layer_start_index
             and layer_id <= vision_moe_layer_end_index
         ):
-
+            # gate uses float32 input, so disable FP8 quantization to avoid error
             self.vision_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[1],
                 bias=False,
                 params_dtype=torch.float32,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=add_prefix("vision_experts_gate", prefix),
             )
 
