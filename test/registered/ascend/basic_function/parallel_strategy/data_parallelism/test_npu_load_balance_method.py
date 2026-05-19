@@ -63,7 +63,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             other_args=other_args,
             env={
                 "TRANSFORMERS_VERBOSITY": "error",
-            }
+            },
         )
 
     @classmethod

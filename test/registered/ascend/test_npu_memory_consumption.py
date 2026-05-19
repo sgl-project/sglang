@@ -65,7 +65,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
             ],
             env={
                 "TRANSFORMERS_VERBOSITY": "error",
-            }
+            },
         )
 
         ### Calculate initial used memory

@@ -94,7 +94,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             other_args=prefill_args,
             env={
                 "TRANSFORMERS_VERBOSITY": "error",
-            }
+            },
         )
 
     @classmethod
