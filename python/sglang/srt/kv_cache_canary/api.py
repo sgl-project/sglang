@@ -13,8 +13,8 @@ from sglang.srt.kv_cache_canary.host_state import (
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
-    attach_shadow_buffers,
-    get_shadow_groups,
+    attach_canary_buffers,
+    get_canary_buffer_groups,
 )
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
 
@@ -36,14 +36,14 @@ def attach(
     write_capacity: int,
     write_req_capacity: int,
 ) -> Optional[List[CanaryRunner]]:
-    """Attach canaries to ``pool`` and create one runner per shadow group.
+    """Attach canaries to ``pool`` and create one runner per canary buffer group.
 
     For SWA-style pools this returns **two** runners (one ``FULL`` + one
     ``SWA``); for plain MHA / MLA pools it returns a single ``FULL``
     runner.
 
     Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs``
-    so that every canary kernel is captured into the CUDA graph and the shadow
+    so that every canary kernel is captured into the CUDA graph and the canary buffer
     tensors are baked into the graph's pointer table.
     """
     if not config.enabled:
@@ -52,18 +52,18 @@ def attach(
         logger.warning("kv-canary: pool already has runners attached; reusing them")
         return get_runners(pool)
 
-    attach_shadow_buffers(pool)
-    shadow_groups = get_shadow_groups(pool)
-    if not shadow_groups:
+    attach_canary_buffers(pool)
+    buffer_groups = get_canary_buffer_groups(pool)
+    if not buffer_groups:
         return None
 
     runners: List[CanaryRunner] = []
-    for kind, group in shadow_groups.items():
+    for kind, group in buffer_groups.items():
         runner_config = _per_kind_config(config, kind=kind)
         runners.append(
             CanaryRunner(
                 config=runner_config,
-                shadow_group=group,
+                buffer_group=group,
                 device=device,
                 verify_capacity=verify_capacity,
                 write_capacity=write_capacity,

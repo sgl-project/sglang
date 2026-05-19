@@ -1,6 +1,6 @@
 """Pool-patch tests for KV cache canary on SWA pools.
 
-Covers ``BaseSWAKVPool``-style dispatch in ``pool_patch.attach_shadow_buffers``
+Covers ``BaseSWAKVPool``-style dispatch in ``pool_patch.attach_canary_buffers``
 plus the ``get_state_buf_infos`` patching path (PD main route for SWA).
 
 The stateless redesign dropped SWA window-slide eviction hooks: the canary
@@ -20,8 +20,8 @@ from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_cache_canary.host_state import _build_plan
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
-    attach_shadow_buffers,
-    get_shadow_groups,
+    attach_canary_buffers,
+    get_canary_buffer_groups,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -86,22 +86,22 @@ class _FakeSWAPool:
 
 
 class TestSWAShadowAttach(unittest.TestCase):
-    def test_attach_creates_both_full_and_swa_shadow_groups(self) -> None:
+    def test_attach_creates_both_full_and_swa_canary_buffer_groups(self) -> None:
         pool = _FakeSWAPool(layer_num=3, slot_count=24, head_num=1, head_dim=8)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
 
         # SWA-system pools always get TWO independent canaries: FULL + SWA.
-        groups = get_shadow_groups(pool)
+        groups = get_canary_buffer_groups(pool)
         self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
 
-        # Both shadows are sized off the SWA sub-pool's slot count when the
+        # Both canary buffers are sized off the SWA sub-pool's slot count when the
         # fake pool has no separate full_kv_pool (DSV4-style fallback).
         self.assertEqual(groups[PoolKind.FULL].k_head.shape[0], 24)
         self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 24)
         self.assertTrue(groups[PoolKind.SWA].has_v_half)
         self.assertTrue(groups[PoolKind.FULL].has_v_half)
 
-        # The shadow groups are independent allocations (different storage).
+        # The canary buffer groups are independent allocations (different storage).
         self.assertNotEqual(
             groups[PoolKind.FULL].k_head.data_ptr(),
             groups[PoolKind.SWA].k_head.data_ptr(),
@@ -109,19 +109,19 @@ class TestSWAShadowAttach(unittest.TestCase):
 
     def test_attach_is_idempotent_on_swa_pool(self) -> None:
         pool = _FakeSWAPool(layer_num=2, slot_count=16, head_num=1, head_dim=8)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         first_ptr = pool.canary_k_head.data_ptr()
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         self.assertEqual(pool.canary_k_head.data_ptr(), first_ptr)
 
 
 class TestSWAStateBufInfosPatch(unittest.TestCase):
     def test_patched_get_state_buf_infos_preserves_kv_midpoint(self) -> None:
         pool = _FakeSWAPool(layer_num=4, slot_count=32, head_num=2, head_dim=16)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         ptrs, lens, item_lens = pool.get_state_buf_infos()
 
-        # Original [K*4, V*4] = 8 entries -> with TWO shadow groups
+        # Original [K*4, V*4] = 8 entries -> with TWO canary buffer groups
         # (FULL + SWA), each contributing K_head + K_tail in the K block
         # and V_head + V_tail in the V block, total becomes
         # [K*4, K_full_head, K_full_tail, K_swa_head, K_swa_tail,
@@ -133,7 +133,7 @@ class TestSWAStateBufInfosPatch(unittest.TestCase):
         mid = len(ptrs) // 2
         self.assertEqual(mid, 8)
 
-        groups = get_shadow_groups(pool)
+        groups = get_canary_buffer_groups(pool)
         full_group = groups[PoolKind.FULL]
         swa_group = groups[PoolKind.SWA]
         # K block tail: full first (dict order), then swa.

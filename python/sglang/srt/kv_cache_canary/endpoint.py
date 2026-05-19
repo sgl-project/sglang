@@ -27,20 +27,20 @@ def _empty_real_kv_buf(device: torch.device) -> torch.Tensor:
 class CanaryEndpoint:
     """One end (head OR tail) of the head/tail canary pair.
 
-    Owns the destination shadow tensors that this endpoint writes into, the
+    Owns the destination canary tensors that this endpoint writes into, the
     violation buckets the launches feed into, and the per-endpoint counters.
     The peer endpoint supplies the source buffers via :meth:`launch` — head
-    reads tail's shadows, tail reads head's shadows.
+    reads tail's canary buffers, tail reads head's canary buffers.
 
     One pair (``head_endpoint``, ``tail_endpoint``) lives on each
     ``CanaryRunner`` instance. The dataclass is frozen so the runner cannot
-    silently swap shadow handles between forwards; per-launch mutable state
+    silently swap canary buffer handles between forwards; per-launch mutable state
     (violation buffer + counters) is held by the GPU tensor handles.
     """
 
     kernel_kind: int
-    k_shadow: torch.Tensor
-    v_shadow: Optional[torch.Tensor]
+    k_canary_buf: torch.Tensor
+    v_canary_buf: Optional[torch.Tensor]
     k_violation: CanaryViolationSlot
     v_violation: Optional[CanaryViolationSlot]
     slot_run_counter: torch.Tensor
@@ -54,7 +54,7 @@ class CanaryEndpoint:
 
     @property
     def has_v_half(self) -> bool:
-        return self.v_shadow is not None
+        return self.v_canary_buf is not None
 
     def launch(
         self,
@@ -71,19 +71,19 @@ class CanaryEndpoint:
         cross-latch into one another's first-violation row.
         """
         buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int, CanaryViolationSlot]] = [
-            (src.k_shadow, self.k_shadow, self.k_slot_stride_bytes, self.k_violation)
+            (src.k_canary_buf, self.k_canary_buf, self.k_slot_stride_bytes, self.k_violation)
         ]
         if (
             self.has_v_half
             and src.has_v_half
             and self.v_violation is not None
-            and self.v_shadow is not None
-            and src.v_shadow is not None
+            and self.v_canary_buf is not None
+            and src.v_canary_buf is not None
         ):
             buf_specs.append(
                 (
-                    src.v_shadow,
-                    self.v_shadow,
+                    src.v_canary_buf,
+                    self.v_canary_buf,
                     self.v_slot_stride_bytes,
                     self.v_violation,
                 )

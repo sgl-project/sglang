@@ -35,7 +35,7 @@ class CanaryE2EBase(CustomTestCase):
     Subclasses set ``model`` and (optionally) ``extra_server_args``,
     ``perturb_prob``, ``perturb_seed``. ``setUpClass`` launches the server
     with ``--kv-cache-canary=raise`` and ``--mem-fraction-static=0.65``
-    (shadow K/V tensors need headroom); subclasses can layer more args on
+    (canary K/V tensors need headroom); subclasses can layer more args on
     via ``extra_server_args``.
 
     Use :meth:`send_parallel_requests` to fan out N concurrent

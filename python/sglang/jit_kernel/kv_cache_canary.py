@@ -169,7 +169,7 @@ def canary_step(
     real_kv_read_bytes: int,
     real_kv_hash_mode: int,
 ) -> None:
-    """One step of the KV-cache canary protocol against the shadow buffer.
+    """One step of the KV-cache canary protocol against the canary buffer.
 
     Shadow slot layout — each logical token tracked by the canary occupies one slot of ``slot_stride_bytes`` bytes
     in ``src_buf`` / ``dst_buf``, holding 4 ``int64`` fields (see ``_CANARY_FIELD_*`` for offsets):
@@ -186,7 +186,7 @@ def canary_step(
                          at write time and re-checked at verify time. Zero when the real-KV mixin is disabled
                          (in which case the chain collapses to a token/position-only fingerprint).
 
-    A call does two independent operations on the shadow:
+    A call does two independent operations on the canary buffer:
 
     1. **Verify** — for each active verify entry, recompute the expected ``prev_hash`` from the slot's predecessor
        and check it against the slot's stored fields (plus ``position`` and, if enabled, the live ``real_kv_hash``).
@@ -199,10 +199,10 @@ def canary_step(
     in-place mutation of the output tensors listed below.
 
     Args:
-        src_buf:                     Flat ``uint8`` view of the canary shadow tensor that verify reads from.
-        dst_buf:                     Flat ``uint8`` view of the canary shadow tensor that writes land in. Aliasing
+        src_buf:                     Flat ``uint8`` view of the canary canary tensor that verify reads from.
+        dst_buf:                     Flat ``uint8`` view of the canary canary tensor that writes land in. Aliasing
                                      ``src_buf`` is allowed.
-        slot_stride_bytes:           Bytes per logical slot in the shadow.
+        slot_stride_bytes:           Bytes per logical slot in the canary buffer.
         verify_slot_indices:         ``int64 [N_verify]`` — slot of each verify entry.
         verify_positions:            ``int64 [N_verify]`` — position the caller expects that slot to carry.
         verify_prev_slot_indices:    ``int64 [N_verify]`` — slot of the predecessor in the chain, or ``-1`` to anchor

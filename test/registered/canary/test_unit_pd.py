@@ -2,7 +2,7 @@
 
 After the stateless redesign:
 
-- The K/V shadow tensors ride the regular KV transfer via the layer-shaped
+- The K/V canary tensors ride the regular KV transfer via the layer-shaped
   ``get_contiguous_buf_infos`` patch — PD's transport sees them as two
   extra layers. No ``MetadataBuffers`` extension, no canary-aware PD field.
 - The decode side has no canary host state to transport. The first decode

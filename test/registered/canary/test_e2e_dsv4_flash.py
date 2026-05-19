@@ -3,7 +3,7 @@
 DSV4-Flash is the most complex hybrid pool sglang supports (43 layers,
 compress_ratios mixing full/4x/128x, 5 internal sub-pools). The point
 of this test is to prove the canary handles it out-of-the-box by always
-attaching a standard full + a standard swa shadow on the top-level
+attaching a standard full + a standard swa canary buffer on the top-level
 ``DeepSeekV4TokenToKVPool`` without diving into c4 / c128 / indexer /
 compress_state internals.
 

@@ -33,7 +33,7 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryLaunchBuffers,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
-    CanaryShadowGroup,
+    CanaryBufferGroup,
     PoolKind,
 )
 
@@ -70,24 +70,24 @@ class _RealKvKernelArgs:
 
 def _resolve_real_kv_kernel_args(
     *,
-    shadow_group: CanaryShadowGroup,
+    buffer_group: CanaryBufferGroup,
     config: CanaryConfig,
     device: torch.device,
 ) -> _RealKvKernelArgs:
-    """Resolve the real-KV kernel arguments for this shadow group + config.
+    """Resolve the real-KV kernel arguments for this canary buffer group + config.
 
-    When the real-KV-hash feature is disabled (or the shadow group has no
+    When the real-KV-hash feature is disabled (or the canary buffer group has no
     real KV source) the kernel receives a 1-byte placeholder tensor and
     zero stride/read_bytes so it short-circuits on the OFF early-out.
     """
     hash_mode_int = real_kv_hash_mode_to_int(config.real_kv_hash_mode)
     if (
-        shadow_group.real_kv_source is not None
+        buffer_group.real_kv_source is not None
         and hash_mode_int != 0
-        and shadow_group.real_kv_slot_stride_bytes > 0
+        and buffer_group.real_kv_slot_stride_bytes > 0
     ):
-        buf = shadow_group.real_kv_source.view(torch.uint8).contiguous().flatten()
-        slot_stride_bytes = shadow_group.real_kv_slot_stride_bytes
+        buf = buffer_group.real_kv_source.view(torch.uint8).contiguous().flatten()
+        slot_stride_bytes = buffer_group.real_kv_slot_stride_bytes
         read_bytes = real_kv_hash_read_bytes(
             config.real_kv_hash_mode, slot_stride_bytes
         )
@@ -131,7 +131,7 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        shadow_group: CanaryShadowGroup,
+        buffer_group: CanaryBufferGroup,
         device: torch.device,
         verify_capacity: int,
         write_capacity: int,
@@ -139,18 +139,18 @@ class CanaryRunner:
     ) -> None:
         self._config = config
         self._device = device
-        self._pool_kind = shadow_group.kind
-        self._has_v_half: bool = shadow_group.has_v_half
+        self._pool_kind = buffer_group.kind
+        self._has_v_half: bool = buffer_group.has_v_half
 
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
         )
         real_kv = _resolve_real_kv_kernel_args(
-            shadow_group=shadow_group, config=config, device=device
+            buffer_group=buffer_group, config=config, device=device
         )
         self._head_endpoint = self._make_endpoint(
             kernel_kind=KERNEL_KIND_HEAD,
-            shadow_group=shadow_group,
+            buffer_group=buffer_group,
             violation_kind_k=VIOLATION_KIND_HEAD_K,
             violation_kind_v=VIOLATION_KIND_HEAD_V,
             slot_run_counter=self._device_state.slot_run_counter_head,
@@ -160,7 +160,7 @@ class CanaryRunner:
         )
         self._tail_endpoint = self._make_endpoint(
             kernel_kind=KERNEL_KIND_TAIL,
-            shadow_group=shadow_group,
+            buffer_group=buffer_group,
             violation_kind_k=VIOLATION_KIND_TAIL_K,
             violation_kind_v=VIOLATION_KIND_TAIL_V,
             slot_run_counter=self._device_state.slot_run_counter_tail,
@@ -212,7 +212,7 @@ class CanaryRunner:
         self,
         *,
         kernel_kind: int,
-        shadow_group: CanaryShadowGroup,
+        buffer_group: CanaryBufferGroup,
         violation_kind_k: str,
         violation_kind_v: str,
         slot_run_counter: torch.Tensor,
@@ -222,8 +222,8 @@ class CanaryRunner:
     ) -> CanaryEndpoint:
         return CanaryEndpoint(
             kernel_kind=kernel_kind,
-            k_shadow=shadow_group.k_head if use_head else shadow_group.k_tail,
-            v_shadow=shadow_group.v_head if use_head else shadow_group.v_tail,
+            k_canary_buf=buffer_group.k_head if use_head else buffer_group.k_tail,
+            v_canary_buf=buffer_group.v_head if use_head else buffer_group.v_tail,
             k_violation=self._device_state.get_violation_slot(violation_kind_k),
             v_violation=(
                 self._device_state.get_violation_slot(violation_kind_v)
@@ -232,8 +232,8 @@ class CanaryRunner:
             ),
             slot_run_counter=slot_run_counter,
             kernel_run_counter=kernel_run_counter,
-            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
-            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
+            k_slot_stride_bytes=buffer_group.k_slot_stride_bytes,
+            v_slot_stride_bytes=buffer_group.v_slot_stride_bytes,
             real_kv_buf=real_kv.buf,
             real_kv_slot_stride_bytes=real_kv.slot_stride_bytes,
             real_kv_read_bytes=real_kv.read_bytes,
@@ -385,7 +385,7 @@ class CanaryRunner:
         V-half each get their own ``CanaryViolationSlot`` so the
         first-violation latch / ring / is_errored never cross-pollinate;
         head/tail symmetry is captured by :class:`CanaryEndpoint` (each
-        endpoint owns the destination shadows + violation buckets; the peer
+        endpoint owns the destination canary buffers + violation buckets; the peer
         supplies the source).
         """
         if kernel_kind == KERNEL_KIND_HEAD:
@@ -571,7 +571,7 @@ class CanaryRunner:
 
         lines = [
             "kv-canary violation:",
-            f"  shadow_kind:       {kind} (one of head_k/head_v/tail_k/tail_v)",
+            f"  canary_kind:       {kind} (one of head_k/head_v/tail_k/tail_v)",
             f"  kernel_kind:       {kernel_label}",
             f"  fail_reason:       {reason_name} ({_fail_reason_description(int(fail_reason))})",
             f"  slot_idx:          {int(slot_idx)}",

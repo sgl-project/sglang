@@ -1,9 +1,9 @@
 """Host-side unit tests for KV cache canary on MLA pools (Phase 2.2).
 
 Covers ``MLATokenToKVPool`` / ``MLATokenToKVPoolFP4`` / ``NSATokenToKVPool``
-dispatch in ``pool_patch.attach_shadow_buffers``. MLA has a single latent
+dispatch in ``pool_patch.attach_canary_buffers``. MLA has a single latent
 ``kv_buffer`` per layer (no separate V half), so we only allocate a K-half
-shadow and ``canary_has_v_half`` is False.
+canary buffer and ``canary_has_v_half`` is False.
 
 Depends on Phase 1 fix (C1/C2/C3 cuda-graph + host plan) for end-to-end
 mismatch detection; only the host-side bookkeeping is exercised here.
@@ -18,8 +18,8 @@ import torch
 from sglang.jit_kernel.kv_cache_canary import CANARY_SLOT_BYTES
 from sglang.srt.kv_cache_canary.pool_patch import (
     PoolKind,
-    attach_shadow_buffers,
-    get_shadow_groups,
+    attach_canary_buffers,
+    get_canary_buffer_groups,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -30,7 +30,7 @@ class _FakeMLAPool:
     """Stand-in for ``MLATokenToKVPool`` exposing the bits the canary touches.
 
     MLA pools have a single ``kv_buffer`` (latent rep) per layer; the canary
-    only allocates a K-half shadow (no V half).
+    only allocates a K-half canary buffer (no V half).
     """
 
     def __init__(
@@ -58,9 +58,9 @@ class _FakeMLAPool:
 class TestMLAShadowAttach(unittest.TestCase):
     def test_mla_attach_allocates_only_k_half(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
 
-        groups = get_shadow_groups(pool)
+        groups = get_canary_buffer_groups(pool)
         # MLA-style pools get exactly one FULL group.
         self.assertEqual(list(groups.keys()), [PoolKind.FULL])
         group = groups[PoolKind.FULL]
@@ -77,16 +77,16 @@ class TestMLAShadowAttach(unittest.TestCase):
 
     def test_mla_attach_is_idempotent(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=16, kv_cache_dim=128)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         first_ptr = pool.canary_k_head.data_ptr()
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         self.assertEqual(pool.canary_k_head.data_ptr(), first_ptr)
 
 
 class TestMLAContiguousBufInfosPatch(unittest.TestCase):
     def test_patched_appends_k_head_and_k_tail(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
 
         # Original 4 entries (one per layer), +2 canary entries = 6 total.
@@ -100,7 +100,7 @@ class TestMLAContiguousBufInfosPatch(unittest.TestCase):
 
     def test_slot_stride_bytes_matches_canary_slot_bytes(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=8, kv_cache_dim=512)
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
         self.assertEqual(pool.canary_slot_stride_bytes, CANARY_SLOT_BYTES)
 
 
@@ -109,7 +109,7 @@ class TestMLADispatchFallthroughForNSAAndFP4(unittest.TestCase):
 
     They expose the same ``kv_buffer`` attribute (no ``k_buffer``/``v_buffer``)
     and same ``get_contiguous_buf_infos`` shape — the duck-typed dispatch in
-    ``attach_shadow_buffers`` routes them through ``_attach_mla`` exactly like
+    ``attach_canary_buffers`` routes them through ``_attach_mla`` exactly like
     the base MLA pool. This test mimics the NSA case by also exposing an
     auxiliary buffer that the canary should ignore.
     """
@@ -120,7 +120,7 @@ class TestMLADispatchFallthroughForNSAAndFP4(unittest.TestCase):
         pool.index_k_with_scale_buffer = [
             torch.zeros(4, 256, dtype=torch.uint8) for _ in range(3)
         ]
-        attach_shadow_buffers(pool)
+        attach_canary_buffers(pool)
 
         self.assertFalse(pool.canary_has_v_half)
         # Index buffer is unchanged; canary doesn't touch it.

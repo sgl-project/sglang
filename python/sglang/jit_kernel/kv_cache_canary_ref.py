@@ -247,7 +247,7 @@ class _IntViewBundle:
 
         The kernel only mutates ``dst_buf``; ``src_buf`` is read-only, so
         the non-aliased case leaves ``src_buf`` untouched on the device.
-        When ``src_buf is dst_buf`` (aliased), the two host shadows share
+        When ``src_buf is dst_buf`` (aliased), the two host canary buffers share
         storage and the single copy below updates both.
         """
         dst_dev_i64 = self._dst_i64.to(self._dst_buf.device)

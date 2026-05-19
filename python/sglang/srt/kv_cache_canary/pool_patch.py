@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CANARY_POOL_ATTR = "_kv_cache_canary_attached"
-_CANARY_SHADOW_GROUPS_ATTR = "_kv_cache_canary_shadow_groups"
+_CANARY_BUFFER_GROUPS_ATTR = "_kv_cache_canary_buffer_groups"
 
 
 class PoolKind(str, enum.Enum):
@@ -39,8 +39,8 @@ class PoolKind(str, enum.Enum):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class CanaryShadowGroup:
-    """One canary's worth of shadow tensors on a pool.
+class CanaryBufferGroup:
+    """One canary's worth of canary tensors on a pool.
 
     K/V split lives here; head/tail symmetry lives in :class:`CanaryEndpoint`.
     ``v_head`` / ``v_tail`` are ``None`` for single-buffer pools (MLA / DSV4).
@@ -64,8 +64,8 @@ class CanaryShadowGroup:
         return self.v_head is not None
 
 
-def attach_shadow_buffers(pool: "KVCache") -> None:
-    """Attach canary shadow buffers + monkey-patch buf_info methods on the pool.
+def attach_canary_buffers(pool: "KVCache") -> None:
+    """Attach canary canary buffers + monkey-patch buf_info methods on the pool.
 
     Dispatches on the pool type:
 
@@ -75,44 +75,44 @@ def attach_shadow_buffers(pool: "KVCache") -> None:
       attach 1 ``FULL`` group with K-half only (single ``kv_buffer``).
     - ``BaseSWAKVPool`` (incl. ``SWAKVPool`` and ``DeepSeekV4TokenToKVPool``)
       — attach **two** groups: 1 ``FULL`` + 1 ``SWA``, each with its own
-      independent shadow tensors. The ``FULL`` group's shadow sits on the
+      independent canary tensors. The ``FULL`` group's canary buffer sits on the
       full sub-pool's slot index space (or the swa sub-pool's slot index
       space when no full sub-pool exists — DSV4 case); the ``SWA`` group's
-      shadow always sits on the swa sub-pool's slot index space. Patches
+      canary buffer always sits on the swa sub-pool's slot index space. Patches
       BOTH ``get_contiguous_buf_infos`` and ``get_state_buf_infos`` because
       PD takes SWA via the latter, and each patch splices in all attached
-      groups' shadows.
+      groups' canary buffers.
 
     Idempotent: a second call on the same pool is a no-op.
     """
     if getattr(pool, _CANARY_POOL_ATTR, False):
         return
 
-    shadow_groups: Dict[PoolKind, CanaryShadowGroup] = {}
+    buffer_groups: Dict[PoolKind, CanaryBufferGroup] = {}
 
     # Dispatch by structural attribute, not just isinstance, so duck-typed
     # fake pools (used by host-side unit tests) also work without depending
     # on the real pool class hierarchy.
     if hasattr(pool, "swa_kv_pool"):
-        _attach_swa(pool, shadow_groups=shadow_groups)
+        _attach_swa(pool, buffer_groups=buffer_groups)
     elif hasattr(pool, "kv_buffer") and not hasattr(pool, "k_buffer"):
-        _attach_mla(pool, shadow_groups=shadow_groups)
+        _attach_mla(pool, buffer_groups=buffer_groups)
     elif hasattr(pool, "k_buffer") and hasattr(pool, "v_buffer"):
-        _attach_mha(pool, shadow_groups=shadow_groups)
+        _attach_mha(pool, buffer_groups=buffer_groups)
     else:
         raise RuntimeError(
             f"kv-canary: unsupported pool type {type(pool).__name__}; "
             "extend pool_patch.py with a dispatch branch"
         )
 
-    setattr(pool, _CANARY_SHADOW_GROUPS_ATTR, shadow_groups)
+    setattr(pool, _CANARY_BUFFER_GROUPS_ATTR, buffer_groups)
     setattr(pool, _CANARY_POOL_ATTR, True)
 
     # Legacy single-canary attribute aliases (used by host-side unit tests
     # and a few inspection helpers). They alias to the FIRST attached
     # group — i.e., the FULL group on every pool. SWA-aware tests should
-    # query ``get_shadow_group(pool, PoolKind.SWA)`` instead.
-    first_group = next(iter(shadow_groups.values()))
+    # query ``get_buffer_group(pool, PoolKind.SWA)`` instead.
+    first_group = next(iter(buffer_groups.values()))
     pool.canary_k_head = first_group.k_head
     pool.canary_k_tail = first_group.k_tail
     pool.canary_v_head = first_group.v_head
@@ -123,16 +123,16 @@ def attach_shadow_buffers(pool: "KVCache") -> None:
     pool.canary_slot_stride_bytes = first_group.k_slot_stride_bytes
 
 
-def _allocate_shadow_group(
+def _allocate_buffer_group(
     *,
     kind: PoolKind,
     k_template: torch.Tensor,
     v_template: Optional[torch.Tensor],
     real_kv_source: Optional[torch.Tensor] = None,
-) -> CanaryShadowGroup:
-    """Allocate a fresh shadow group sized off the provided slot templates.
+) -> CanaryBufferGroup:
+    """Allocate a fresh canary buffer group sized off the provided slot templates.
 
-    Each shadow has shape ``[num_slots, CANARY_SLOT_BYTES]`` uint8 — only
+    Each canary buffer has shape ``[num_slots, CANARY_SLOT_BYTES]`` uint8 — only
     the slot count is borrowed from the template; the per-slot footprint
     is the canary's tiny fingerprint rather than the real KV's per-slot
     size, so canary memory and PD transfer stay bounded.
@@ -168,7 +168,7 @@ def _allocate_shadow_group(
     if real_kv_source is not None and num_slots > 0:
         real_kv_slot_stride_bytes = int(real_kv_source[0].nbytes)
 
-    return CanaryShadowGroup(
+    return CanaryBufferGroup(
         kind=kind,
         k_head=k_head,
         k_tail=k_tail,
@@ -182,43 +182,43 @@ def _allocate_shadow_group(
 
 
 def _attach_mha(
-    pool: "MHATokenToKVPool", *, shadow_groups: Dict[PoolKind, CanaryShadowGroup]
+    pool: "MHATokenToKVPool", *, buffer_groups: Dict[PoolKind, CanaryBufferGroup]
 ) -> None:
     if pool.layer_num <= 0:
         raise RuntimeError(f"kv-canary: pool has invalid layer_num={pool.layer_num}")
-    group = _allocate_shadow_group(
+    group = _allocate_buffer_group(
         kind=PoolKind.FULL,
         k_template=pool.k_buffer[0],
         v_template=pool.v_buffer[0],
         real_kv_source=pool.k_buffer[0],
     )
-    shadow_groups[PoolKind.FULL] = group
-    _patch_get_contiguous_buf_infos(pool, shadow_groups=shadow_groups, has_v_half=True)
+    buffer_groups[PoolKind.FULL] = group
+    _patch_get_contiguous_buf_infos(pool, buffer_groups=buffer_groups, has_v_half=True)
     logger.info(
-        "kv-canary: attached MHA shadow (FULL, dtype=%s, slot_stride_bytes=%d)",
+        "kv-canary: attached MHA canary buffer (FULL, dtype=%s, slot_stride_bytes=%d)",
         group.k_head.dtype,
         group.k_slot_stride_bytes,
     )
 
 
 def _attach_mla(
-    pool: "MLATokenToKVPool", *, shadow_groups: Dict[PoolKind, CanaryShadowGroup]
+    pool: "MLATokenToKVPool", *, buffer_groups: Dict[PoolKind, CanaryBufferGroup]
 ) -> None:
     """Attach to MLA / NSA / FP4 — single latent ``kv_buffer`` (no V half)."""
     if pool.layer_num <= 0:
         raise RuntimeError(
             f"kv-canary: MLA pool has invalid layer_num={pool.layer_num}"
         )
-    group = _allocate_shadow_group(
+    group = _allocate_buffer_group(
         kind=PoolKind.FULL,
         k_template=pool.kv_buffer[0],
         v_template=None,
         real_kv_source=pool.kv_buffer[0],
     )
-    shadow_groups[PoolKind.FULL] = group
-    _patch_get_contiguous_buf_infos(pool, shadow_groups=shadow_groups, has_v_half=False)
+    buffer_groups[PoolKind.FULL] = group
+    _patch_get_contiguous_buf_infos(pool, buffer_groups=buffer_groups, has_v_half=False)
     logger.info(
-        "kv-canary: attached MLA-style shadow on %s (FULL, dtype=%s, slot_stride_bytes=%d)",
+        "kv-canary: attached MLA-style canary buffer on %s (FULL, dtype=%s, slot_stride_bytes=%d)",
         type(pool).__name__,
         group.k_head.dtype,
         group.k_slot_stride_bytes,
@@ -226,13 +226,13 @@ def _attach_mla(
 
 
 def _attach_swa(
-    pool: "BaseSWAKVPool", *, shadow_groups: Dict[PoolKind, CanaryShadowGroup]
+    pool: "BaseSWAKVPool", *, buffer_groups: Dict[PoolKind, CanaryBufferGroup]
 ) -> None:
     """Attach BOTH a FULL and a SWA canary to an SWA system.
 
     A normal SWA system always runs both — a FULL canary that covers the
     entire prefix and a SWA canary that only covers the window. Two
-    independent shadow groups live on the pool:
+    independent canary buffer groups live on the pool:
 
     - ``FULL``: sized off the full sub-pool (``pool.full_kv_pool``) when
       it exists (sglang ``SWAKVPool``), otherwise off the SWA sub-pool
@@ -246,7 +246,7 @@ def _attach_swa(
 
     Both ``get_contiguous_buf_infos`` and ``get_state_buf_infos`` (PD's
     main route for SWA) get patched to splice in each attached group's
-    K-shadow entries at the K-block tail and V-shadow entries at the
+    K-canary entries at the K-block tail and V-canary entries at the
     V-block tail.
     """
     swa_sub_pool = pool.swa_kv_pool
@@ -261,36 +261,36 @@ def _attach_swa(
         )
     else:
         # DSV4 case: no separate full_kv_pool. Fall back to swa templates;
-        # the resulting FULL group's shadow lives in the swa-sub-pool slot
+        # the resulting FULL group's canary buffer lives in the swa-sub-pool slot
         # index space (verify range covers the entire prefix).
         full_k_template = swa_k_template
         full_v_template = swa_v_template
 
-    full_group = _allocate_shadow_group(
+    full_group = _allocate_buffer_group(
         kind=PoolKind.FULL,
         k_template=full_k_template,
         v_template=full_v_template,
         real_kv_source=full_k_template,
     )
-    swa_group = _allocate_shadow_group(
+    swa_group = _allocate_buffer_group(
         kind=PoolKind.SWA,
         k_template=swa_k_template,
         v_template=swa_v_template,
         real_kv_source=swa_k_template,
     )
-    shadow_groups[PoolKind.FULL] = full_group
-    shadow_groups[PoolKind.SWA] = swa_group
+    buffer_groups[PoolKind.FULL] = full_group
+    buffer_groups[PoolKind.SWA] = swa_group
 
     _patch_get_state_buf_infos(
         pool,
-        shadow_groups=shadow_groups,
+        buffer_groups=buffer_groups,
         has_v_half=swa_group.has_v_half,
     )
     logger.info(
-        "kv-canary: attached dual SWA shadows on %s (kinds=%s, v_half=%s, "
+        "kv-canary: attached dual SWA canary buffers on %s (kinds=%s, v_half=%s, "
         "full_slots=%d, swa_slots=%d)",
         type(pool).__name__,
-        [k.value for k in shadow_groups.keys()],
+        [k.value for k in buffer_groups.keys()],
         swa_group.has_v_half,
         int(full_group.k_head.shape[0]),
         int(swa_group.k_head.shape[0]),
@@ -311,7 +311,7 @@ def _pull_kv_templates(
         return sub_pool.kv_buffer[0], None
     raise RuntimeError(
         f"kv-canary: {label} {type(sub_pool).__name__} has neither "
-        "k_buffer/v_buffer nor kv_buffer; cannot attach shadow"
+        "k_buffer/v_buffer nor kv_buffer; cannot attach canary buffer"
     )
 
 
@@ -320,13 +320,13 @@ def _compose_buf_infos_with_canaries(
     data_ptrs: List[int],
     data_lens: List[int],
     item_lens: List[int],
-    shadow_groups: Dict[PoolKind, CanaryShadowGroup],
+    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
     page_size: int,
     has_v_half: bool,
 ) -> Tuple[List[int], List[int], List[int]]:
     """Splice every attached group's canary entries into the buf-info triple.
 
-    For each ``CanaryShadowGroup`` in ``shadow_groups`` we contribute
+    For each ``CanaryBufferGroup`` in ``buffer_groups`` we contribute
     ``[k_head, k_tail]`` at the K-block tail and (when ``has_v_half`` is
     True for the pool) ``[v_head, v_tail]`` at the V-block tail. So a
     single-attach pool yields 2 entries (or 4 with V); a SWA dual-attach
@@ -343,7 +343,7 @@ def _compose_buf_infos_with_canaries(
     extra_v_lens: List[int] = []
     extra_v_item_lens: List[int] = []
 
-    for group in shadow_groups.values():
+    for group in buffer_groups.values():
         extra_k_ptrs.extend([group.k_head.data_ptr(), group.k_tail.data_ptr()])
         extra_k_lens.extend([group.k_head.nbytes, group.k_tail.nbytes])
         extra_k_item_lens.extend(
@@ -384,7 +384,7 @@ def _compose_buf_infos_with_canaries(
 def _patch_get_contiguous_buf_infos(
     pool: "KVCache",
     *,
-    shadow_groups: Dict[PoolKind, CanaryShadowGroup],
+    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
     has_v_half: bool,
 ) -> None:
     original = pool.get_contiguous_buf_infos
@@ -395,7 +395,7 @@ def _patch_get_contiguous_buf_infos(
             data_ptrs=ptrs,
             data_lens=lens,
             item_lens=item_lens,
-            shadow_groups=shadow_groups,
+            buffer_groups=buffer_groups,
             page_size=pool.page_size,
             has_v_half=has_v_half,
         )
@@ -406,7 +406,7 @@ def _patch_get_contiguous_buf_infos(
 def _patch_get_state_buf_infos(
     pool: "BaseSWAKVPool",
     *,
-    shadow_groups: Dict[PoolKind, CanaryShadowGroup],
+    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
     has_v_half: bool,
 ) -> None:
     """SWA + PD: ``get_state_buf_infos`` is the main path."""
@@ -418,7 +418,7 @@ def _patch_get_state_buf_infos(
             data_ptrs=ptrs,
             data_lens=lens,
             item_lens=item_lens,
-            shadow_groups=shadow_groups,
+            buffer_groups=buffer_groups,
             page_size=pool.page_size,
             has_v_half=has_v_half,
         )
@@ -426,13 +426,13 @@ def _patch_get_state_buf_infos(
     pool.get_state_buf_infos = patched
 
 
-def get_shadow_groups(pool: "KVCache") -> Dict[PoolKind, CanaryShadowGroup]:
-    """Return the dict of attached shadow groups keyed by :class:`PoolKind`.
+def get_canary_buffer_groups(pool: "KVCache") -> Dict[PoolKind, CanaryBufferGroup]:
+    """Return the dict of attached canary buffer groups keyed by :class:`PoolKind`.
 
     Empty dict if the pool has not been attached yet (caller responsibility
-    to invoke :func:`attach_shadow_buffers` first).
+    to invoke :func:`attach_canary_buffers` first).
     """
-    groups = getattr(pool, _CANARY_SHADOW_GROUPS_ATTR, None)
+    groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
     if groups is None:
         return {}
     return groups

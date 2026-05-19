@@ -131,7 +131,7 @@ def _build_plan(
         req_pool_idx_int = int(req_pool_idx)
         # Padding row in ReqToTokenPool lives at index 0 (cuda-graph padded
         # batches set padding rows' req_pool_indices to 0). Skipping avoids
-        # writing synthetic data into the padding slot's shadow.
+        # writing synthetic data into the padding slot's canary buffer.
         if req_pool_idx_int == 0:
             cursor = next_cursor
             continue
