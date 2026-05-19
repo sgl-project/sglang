@@ -48,9 +48,13 @@ class _PlanScratch:
     Fields:
         verify_offsets: Exclusive prefix sum of per-req verify counts, shape [_PLAN_BS_BLOCK_SIZE + 1], int32.
             Slot ``[bs]`` carries the total verify entry count (= base index for extras append).
+        swa_lut_sentinel: One-element int32 zero tensor used as a stable LUT pointer when the caller passes
+            ``full_to_swa_index_mapping=None``. Cached so the wrapper never allocates per call; its data_ptr()
+            is pinned into any cuda-graph capture and the kernel never dereferences it (HAS_SWA_LUT is False).
     """
 
     verify_offsets: torch.Tensor
+    swa_lut_sentinel: torch.Tensor
 
 
 _PLAN_SCRATCH_CACHE: dict[torch.device, _PlanScratch] = {}
@@ -211,8 +215,8 @@ def canary_plan_step(
         lut_len = int(full_to_swa_index_mapping.shape[0])
     else:
         # Sentinel one-element tensor keeps the pointer well-defined; kernel never dereferences it when
-        # HAS_SWA_LUT is False.
-        lut_tensor = scratch.verify_offsets.new_zeros(1)
+        # HAS_SWA_LUT is False. Cached on the scratch so we never allocate per call.
+        lut_tensor = scratch.swa_lut_sentinel
         lut_len = 0
 
     req_to_token_stride0 = int(req_to_token.stride(0))
@@ -306,6 +310,7 @@ def _get_plan_scratch(*, device: torch.device) -> _PlanScratch:
         verify_offsets=torch.zeros(
             _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
         ),
+        swa_lut_sentinel=torch.zeros(1, dtype=torch.int32, device=device),
     )
     _PLAN_SCRATCH_CACHE[device] = scratch
     return scratch
