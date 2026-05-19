@@ -1,18 +1,4 @@
-"""Differential test: CUDA canary_verify_step vs the torch reference, byte-equal.
-
-Each test invokes both ``canary_verify_step`` and ``canary_verify_step_torch_reference`` on identical
-inputs and asserts byte-equality on the three globals (violation_ring, violation_write_index, both
-counters). The hardcoded ``test_chain_link_byte_equal_5_step_hardcoded`` subset additionally pins the
-chain advance against Python-side ``splitmix64`` to defend against a co-regression where ref + CUDA
-both drift from kernels.md §6.1.
-
-Notes:
-- API names (``CanaryPseudoMode`` / ``pseudo_mode`` / ``pseudo_expected_*``) match the sglang-dev-d
-  jit_kernel implementation. The kernel SOT (kernels.md) has renamed the surface to
-  ``CanaryMockMode`` / ``mock_mode`` / ``mock_expected_*``; that rename is pending on the kernel side.
-- The verify wrapper raises if ``len(real_kv_sources) > 4``; we exercise that path via the
-  ``test_real_kv_source_above_4_raises`` case (no CUDA launch).
-"""
+"""Differential test: CUDA canary_verify_step vs the torch reference, byte-equal."""
 
 from __future__ import annotations
 
@@ -1246,10 +1232,8 @@ def test_violation_ring_overflow_counter_still_increments() -> None:
 
     assert int(cuda_log.write_index[0].item()) == n_violations
     assert int(ref_log.write_index[0].item()) == n_violations
-    # CUDA's atomic-order may differ from ref's deterministic order but the *post-image counter* and ring
-    # size are byte-equal targets; we only assert state equality on the counters since atomic-order ring
-    # contents may permute under overflow. Per kernels.md §6.5 differential testing: when the ring is
-    # under-capacity, only counters are guaranteed byte-equal — we relax the ring-contents check here.
+    # Atomic-order may permute ring contents under overflow; only the write_index counter is
+    # byte-equal — we relax the ring-contents check here.
     assert torch.equal(cuda_log.write_index, ref_log.write_index)
 
 
@@ -1325,15 +1309,7 @@ def test_empty_plan_no_op() -> None:
 
 @pytest.mark.parametrize("hardcoded", [True])
 def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
-    """5-step chain with hand-computed splitmix64 expected sequence; defends against ref + CUDA co-drift.
-
-    The expected stored prev_hash sequence is computed via Python's ``splitmix64`` (per kernels.md §6.1):
-
-        prev_0 = splitmix64(CANARY_CHAIN_ANCHOR)
-        prev_{k+1} = splitmix64(prev_k XOR token_k XOR position_k XOR real_kv_hash_k)
-
-    Hardcoded fixture: tokens=[101, 202, 303, 404, 505], positions=[0..4], real_kv_hash=0 (RealKvHashMode.OFF).
-    """
+    """5-step chain with hand-computed splitmix64 expected sequence; defends against ref + CUDA co-drift."""
     assert hardcoded
     tokens = [101, 202, 303, 404, 505]
     positions = [0, 1, 2, 3, 4]
@@ -1403,11 +1379,7 @@ def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
 
 
 def test_chain_advance_formula_matches_spec() -> None:
-    """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula.
-
-    Defends ref + CUDA co-drift away from kernels.md §6.1 chain advance — purely a property check on the
-    ref via hardcoded 4-tuples; CUDA kernel itself is not invoked.
-    """
+    """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
     # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
     cases = [
         (CANARY_CHAIN_ANCHOR, 0, 0, 0),

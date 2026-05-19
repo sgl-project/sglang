@@ -1,12 +1,12 @@
 """Sweep-matrix benchmark for canary_plan_step.
 
-Cartesian product over (bs, prefix_len, mode, pool_kind) per testing.md §2.4.1, plus a separate
-``total_tokens`` axis per §2.4.2 to expose how the plan kernel scales with (bs, total_tokens) rather than
-chunk_size. Fast subset runs by default; full slow subset gated behind ``--runslow`` / ``--bench-full``.
+Cartesian product over (bs, prefix_len, mode, pool_kind), plus a separate ``total_tokens`` axis to
+expose how the plan kernel scales with (bs, total_tokens) rather than chunk_size. Fast subset runs by
+default; full slow subset gated behind ``--runslow`` / ``--bench-full``.
 
 Per case the bench reports: name, microseconds per call, nanoseconds per verify entry, and the ratio
 against a naive ``torch.cumsum`` baseline of the same per-req count array (cumsum is the closest "naive
-plan baseline" because exclusive prefix-sum dominates the plan kernel's phase 2).
+plan baseline" because exclusive prefix-sum dominates the plan kernel's second pass).
 """
 
 from __future__ import annotations

@@ -1,12 +1,10 @@
 """Sweep-matrix benchmark for canary_write_step.
 
-Cartesian product over (bs, prefix_len, mode, pool_kind) per testing.md §2.4.1. Fast subset
-runs by default; full slow subset gated behind ``--runslow`` / ``--bench-full`` via this
-directory's ``conftest.py``.
+Cartesian product over (bs, prefix_len, mode, pool_kind). Fast subset runs by default; full slow
+subset gated behind ``--runslow`` / ``--bench-full`` via this directory's ``conftest.py``.
 
-Per case the bench reports: name, microseconds per call, nanoseconds per processed write
-slot, and the ratio against a naive ``kv_buf[slot] = payload`` baseline of the same total
-slot count.
+Per case the bench reports: name, microseconds per call, nanoseconds per processed write slot, and
+the ratio against a naive ``kv_buf[slot] = payload`` baseline of the same total slot count.
 """
 
 from __future__ import annotations

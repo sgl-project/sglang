@@ -1,29 +1,51 @@
-"""Scripted-PR regression: #22819 (scenario TBD).
-
-Phase-06 SOT pointer: testing.md §4.2 type-a, file `test_self_e2e_scripted_pr_22819.py`. The SOT
-records `TBD scenario name` for this PR. Per the dispatcher instructions we use the literal
-`placeholder` token in case names so the TBD is visibly unresolved — phase-2 implementers rename
-both cases (and the matching CUDA-graph-parity parametrize label) once the scenario is read off the
-upstream PR description.
-
-This file is shipped as a phase-2 skeleton: the module-level pytestmark below skips it until the
-mock_mode subsystem (MockEngine + oracle + sampler hook) lands on this branch.
-"""
+"""Scripted-PR regression self-e2e for #22819."""
 
 from __future__ import annotations
 
 import pytest
 
+try:
+    from sglang.srt.mock_mode import MockEngine
+except ImportError:
+    MockEngine = None
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
-pytestmark = pytest.mark.skip(reason="phase-2; awaits mock_mode subsystem")
+pytestmark = pytest.mark.skip(
+    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+)
+
+
+def _fake_prompt(length: int) -> list[int]:
+    return list(range(1, length + 1))
 
 
 def test_pr_22819_regression_placeholder() -> None:
-    pass
+    engine = MockEngine.launch(
+        model="Qwen/Qwen3-0.6B",
+        num_hidden_layers=1,
+        apply_pr_22819_fix=False,
+    )
+    req = engine.admit(prompt=_fake_prompt(32), max_new_tokens=4)
+
+    engine.step_until(req, n=4)
+    violations = engine.canary_violations()
+
+    assert len(violations) > 0
+    engine.shutdown()
 
 
 def test_pr_22819_with_fix_placeholder() -> None:
-    pass
+    engine = MockEngine.launch(
+        model="Qwen/Qwen3-0.6B",
+        num_hidden_layers=1,
+        apply_pr_22819_fix=True,
+    )
+    req = engine.admit(prompt=_fake_prompt(32), max_new_tokens=4)
+
+    engine.step_until(req, n=4)
+    engine.assert_no_canary_violations()
+
+    engine.shutdown()

@@ -69,7 +69,7 @@ def test_ring_fill_once_overflow_drops_row_keeps_counter(device):
 @pytest.mark.xfail(
     strict=False,
     reason="runner._raise_with_first_violation builds a string message; "
-    "structured-dict raise (exc.args[0] is dict) is a phase-2 jit_kernel rewrite item",
+    "structured-dict raise (exc.args[0] is dict) not yet implemented",
 )
 def test_raise_message_includes_idx_expected_actual(device):
     from sglang.srt.kv_cache_canary.buffer_group import CanaryBufferGroup, PoolKind
