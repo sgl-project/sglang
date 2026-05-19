@@ -326,6 +326,52 @@ class CanaryRunner:
     def run_tail(self, *, plan: BatchPlan) -> None:
         self._run_kernel_pair(plan=plan, kernel_kind=KERNEL_KIND_TAIL)
 
+    def fill_launch_from_forward_batch_triton(
+        self, *, forward_batch: "ForwardBatch"
+    ) -> bool:
+        """Triton path: populate :data:`self._launch` from ``forward_batch`` on device.
+
+        Returns ``True`` on success, ``False`` when the batch was rejected by
+        the wrapper (unsupported forward mode, missing extend lens, etc.). On
+        a ``False`` return ``self._launch``'s active counters are zero, so
+        a subsequent ``launch_head_only`` / ``launch_tail_only`` records a
+        no-op kernel.
+        """
+        # Local import to avoid a runtime cycle:
+        # ``kv_cache_canary_plan`` -> ``kv_cache_canary_plan_ref``
+        # -> (when patched) pseudo_mode -> runner.
+        from sglang.jit_kernel.kv_cache_canary_plan import (
+            plan_batch_from_forward_batch_triton,
+        )
+
+        return plan_batch_from_forward_batch_triton(
+            forward_batch=forward_batch,
+            config=self._config,
+            plan_out=self._launch,
+            swa_index_lut=self._buffer_group.swa_index_lut,
+        )
+
+    def launch_head_only(self) -> None:
+        """Launch the HEAD kernel pair against the current :data:`self._launch`.
+
+        Assumes ``self._launch`` has already been populated either by
+        :meth:`fill_launch_from_forward_batch_triton` (Triton path) or by
+        :func:`fill_batch_plan_gpu_from_plan` (ref path).
+        """
+        if not self._config.enabled:
+            return
+        self._launch_kernel_only(kernel_kind=KERNEL_KIND_HEAD)
+
+    def launch_tail_only(self) -> None:
+        """Launch the TAIL kernel pair without refilling :data:`self._launch`.
+
+        The launch buffer must still hold the active forward's plan from the
+        matching :meth:`launch_head_only` call.
+        """
+        if not self._config.enabled:
+            return
+        self._launch_kernel_only(kernel_kind=KERNEL_KIND_TAIL)
+
     def set_last_forward_batch(self, forward_batch: "ForwardBatch") -> None:
         """Stash the current forward batch for sweep / perturb hooks.
 
