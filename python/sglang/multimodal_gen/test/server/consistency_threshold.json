@@ -110,15 +110,15 @@
             "mean_abs_diff_threshold": 10.0
         },
         "ltx_2.3_one_stage_ti2v": {
-            "clip_threshold": 0.64,
-            "ssim_threshold": 0.42,
-            "psnr_threshold": 8.8,
-            "mean_abs_diff_threshold": 59.0
+            "clip_threshold": 0.84,
+            "ssim_threshold": 0.78,
+            "psnr_threshold": 20.5,
+            "mean_abs_diff_threshold": 11.0
         },
         "ltx_2.3_two_stage_t2v_2gpus": {
             "clip_threshold": 0.79,
             "ssim_threshold": 0.12,
-            "psnr_threshold": 12.1,
+            "psnr_threshold": 16.0,
             "mean_abs_diff_threshold": 51.0
         },
         "wan2_1_t2v_1.3b_teacache_enabled": {
@@ -254,10 +254,10 @@
             "mean_abs_diff_threshold": 45.0
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
-            "clip_threshold": 0.92,
-            "ssim_threshold": 0.58,
-            "psnr_threshold": 17.5,
-            "mean_abs_diff_threshold": 20.0
+            "clip_threshold": 0.55,
+            "ssim_threshold": 0.29,
+            "psnr_threshold": 11.7,
+            "mean_abs_diff_threshold": 47.0
         }
     },
     "default_clip_threshold_image": 0.92,

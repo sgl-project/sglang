@@ -85,8 +85,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
-            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -124,7 +124,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
-                    # handles the release via check_finished -> release_kv_cache in one place.
+                    # handles the release via update_finish_state -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     req.to_finish = FINISH_ABORT(
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
@@ -170,7 +170,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
-                verified_id=self.output_ids,
+                bonus_tokens=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )
             spec_info.prepare_for_extend(self)
