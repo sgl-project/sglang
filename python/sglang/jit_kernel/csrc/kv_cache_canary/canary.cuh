@@ -526,10 +526,7 @@ constexpr int kConstantsCount = 26;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
-  TensorMatcher({static_cast<int64_t>(kConstantsCount)})
-      .with_dtype<int64_t>()
-      .with_device<kDLCPU>()
-      .verify(out);
+  TensorMatcher({static_cast<int64_t>(kConstantsCount)}).with_dtype<int64_t>().with_device<kDLCPU>().verify(out);
   int64_t* dst = static_cast<int64_t*>(out.data_ptr());
   int i = 0;
   dst[i++] = kCanaryFieldsPerSlot;
