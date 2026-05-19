@@ -83,6 +83,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.forward_mode = None
+        self.if_use_v2 = model_runner.model_config.hf_config.architectures[0] in ["MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"]
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -125,12 +126,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if self.forward_mode is not None and self.forward_mode.is_target_verify():
+        if self.forward_mode is not None and self.forward_mode.is_target_verify() and self.if_use_v2:
             return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if self.forward_mode is not None and self.forward_mode.is_target_verify():
+        if self.forward_mode is not None and self.forward_mode.is_target_verify() and self.if_use_v2:
             return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
