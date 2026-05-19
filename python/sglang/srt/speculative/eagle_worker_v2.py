@@ -693,7 +693,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
+                preset=server_args.speculative_adaptive_preset,
             )
 
         # Some dummy tensors

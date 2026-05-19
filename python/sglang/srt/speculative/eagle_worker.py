@@ -121,6 +121,7 @@ class EAGLEWorker(TpModelWorker):
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
+                preset=server_args.speculative_adaptive_preset,
             )
 
         # Override the context length of the draft model to be the same as the target model.

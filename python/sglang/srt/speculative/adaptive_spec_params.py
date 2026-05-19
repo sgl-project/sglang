@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default per-BS hysteresis for Route 1 (accept_len + hysteresis)
+# Default per-BS config (used when no preset or config file is specified)
 # Keys are lower bounds of BS ranges: 1 covers [1,64), 64 covers [64,128), etc.
 # ---------------------------------------------------------------------------
 DEFAULT_BS_HYSTERESIS: Dict[int, Dict[str, float]] = {
@@ -33,6 +33,92 @@ DEFAULT_BS_STEPS: Dict[int, list] = {
     64: [1, 2, 5],
     128: [1, 2, 6],
 }
+
+# ---------------------------------------------------------------------------
+# Universal presets: conservative / balanced / aggressive
+# Users pick one based on draft model quality. Per-model config files
+# override these when --speculative-adaptive-config is provided.
+# ---------------------------------------------------------------------------
+PRESET_CONFIGS: Dict[str, dict] = {
+    # TODO: add step=0 (nospec fallback) for BS>=64 once supported —
+    # on hard workloads, even step=1 loses to nospec at high batch sizes.
+    "conservative": {
+        "1": {
+            "steps": [1, 3, 7],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -0.25,
+            "ceiling_coeff": 0,
+        },
+        "8": {
+            "steps": [1],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": 0.0,
+            "ceiling_coeff": 0,
+        },
+    },
+    "balanced": {
+        "1": {
+            "steps": [1, 3, 6],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -1.0,
+            "ceiling_coeff": 0,
+        },
+        "16": {
+            "steps": [1, 3, 5],
+            "up_hysteresis": -1.0,
+            "down_hysteresis": -1.0,
+            "ceiling_coeff": 0,
+        },
+        "64": {
+            "steps": [1, 2, 6],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -1.0,
+            "ceiling_coeff": 3.0,
+        },
+        "128": {
+            "steps": [1, 2, 5],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -1.0,
+            "ceiling_coeff": 3.0,
+        },
+    },
+    "aggressive": {
+        "1": {
+            "steps": [1, 3, 7],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -0.25,
+            "ceiling_coeff": 0,
+        },
+        "8": {
+            "steps": [1, 3, 7],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -0.25,
+            "ceiling_coeff": 3.0,
+        },
+        "64": {
+            "steps": [1, 3],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -0.25,
+            "ceiling_coeff": 1.67,
+        },
+        "128": {
+            "steps": [1, 3],
+            "up_hysteresis": 0.0,
+            "down_hysteresis": -0.25,
+            "ceiling_coeff": 1.2,
+        },
+    },
+}
+
+
+def get_preset_config(preset_name: str) -> dict:
+    """Return the built-in preset config dict, or raise ValueError."""
+    if preset_name not in PRESET_CONFIGS:
+        raise ValueError(
+            f"Unknown adaptive preset '{preset_name}'. "
+            f"Available: {list(PRESET_CONFIGS.keys())}"
+        )
+    return PRESET_CONFIGS[preset_name]
 
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:

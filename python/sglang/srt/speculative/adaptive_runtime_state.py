@@ -8,9 +8,11 @@ from sglang.srt.speculative.adaptive_spec_params import (
     DEFAULT_BS_STEPS,
     AdaptiveSpeculativeParams,
     get_default_hysteresis,
+    get_preset_config,
     load_adaptive_config,
     load_bs_config,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -87,9 +89,21 @@ class AdaptiveController:
         self,
         worker: AdaptiveSpecWorker,
         config_path: Optional[str] = None,
+        preset: Optional[str] = None,
     ):
         self.worker = worker
-        cfg = load_adaptive_config(config_path)
+
+        if config_path is not None:
+            cfg = load_adaptive_config(config_path)
+        elif preset is not None:
+            cfg = get_preset_config(preset)
+            log_info_on_rank0(
+                logger,
+                f"Using adaptive preset '{preset}'",
+            )
+        else:
+            cfg = {}
+
         bs_config = load_bs_config(cfg)
 
         if bs_config is None:
@@ -217,7 +231,9 @@ class AdaptiveController:
                 When ``None``, all batch sizes are captured for every step
                 (original behaviour).
         """
-        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs is not None else None
+        self._cuda_graph_bs = (
+            sorted(cuda_graph_bs) if cuda_graph_bs is not None else None
+        )
 
         # All steps share the same init_max_bs so that each draft attention
         # backend allocates _sched_meta_buf with a consistent shape.
