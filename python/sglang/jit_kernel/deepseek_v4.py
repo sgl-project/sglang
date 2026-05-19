@@ -13,7 +13,13 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
@@ -659,14 +665,31 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    if _is_cpu and _cpu_amx:
+    """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
+
+    Args:
+        q: [batch_size, num_q_heads, rope_dim] bfloat16
+        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
+        freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
+        positions: [batch_size] int32 or int64, indices into freqs_cis
+        inverse: if True, apply inverse rotation (conjugate freqs)
+    """
+    if _is_hip:
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+        return
+    elif _is_cpu and _cpu_amx:
         torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
             q, freqs_cis, inverse, positions, k
         )
-    else:
-        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-        module = _jit_fused_rope_module()
-        module.forward(q, k, freqs_real, positions, inverse)
+        return
+
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    module = _jit_fused_rope_module()
+    module.forward(q, k, freqs_real, positions, inverse)
 
 
 # Alias for V2 code paths
@@ -1105,6 +1128,8 @@ def _dispatch_bf16_fp32_backend(
         return torch.ops.sgl_kernel.weight_packed_linear(
             x, y, None, True, torch.float32
         )
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=torch.float32)
     else:
         return torch.nn.functional.linear(x.float(), y.float())
 

@@ -21,13 +21,13 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import ceil_div, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import ceil_div, cpu_has_amx_support, is_cpu, is_hip
 
 logger = logging.getLogger(__name__)
-
+_is_hip = is_hip()
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
-ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_compress_state_ring_size(
@@ -149,6 +149,9 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+
         return self.kv_buffer[layer_id]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
@@ -471,7 +474,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            self.c4_logical_size,
+            self.c4_logical_size if not _is_hip else c4_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -482,15 +485,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        # Mutually exclusive: paged ring pools (radix path) vs. non-paged
-        if not (_is_cpu and _cpu_amx):
-            self._init_paged_compress_states(enable_memory_saver)
-            self.compress_states: List[Optional[DeepSeekV4CompressState]] = []
-            self.indexer_compress_states: List[Optional[DeepSeekV4CompressState]] = []
-        else:
+        if _is_hip:
+            self._init_paged_compress_states(False)
+        elif _is_cpu and _cpu_amx:
+            self._init_compress_states(enable_memory_saver)
             self.compress_state_pools: List[CompressStatePool] = []
             self.indexer_compress_state_pools: List[CompressStatePool] = []
-            self._init_compress_states(enable_memory_saver)
+        else:
+            self._init_paged_compress_states(enable_memory_saver)
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
@@ -598,6 +600,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     dtype=self.state_dtype,
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
+                    swa_page_size=self.swa_page_size,
                 )
 
     def _init_compress_states(self, enable_memory_saver: bool):

@@ -88,7 +88,7 @@ def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
         (64, "RMSNormWarpKernel"),
         (128, "RMSNormWarpKernel"),
         (256, "RMSNormWarpKernel"),
-        (512, "RMSNormKernel"),
+        (512, "RMSNormHalfKernel"),
         (1536, "RMSNormKernel"),
         (2048, "RMSNormHalfKernel"),
         (2304, "RMSNormKernel"),  # NOTE: not 512 aligned
