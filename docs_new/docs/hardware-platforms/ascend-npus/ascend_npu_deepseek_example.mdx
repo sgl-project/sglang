@@ -6,6 +6,10 @@ metatags:
 
 ## Running DeepSeek-V3
 
+<Warning>
+If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 ### Running DeepSeek in PD mixed mode on 1 x Atlas 800I A3.
 
 W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
@@ -271,7 +275,11 @@ python -m sglang_router.launch_router \
     --mini-lb
 ```
 
-### test gsm8k
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+### Test GSM8K
 
 ```python Test GSM8K
 from types import SimpleNamespace
