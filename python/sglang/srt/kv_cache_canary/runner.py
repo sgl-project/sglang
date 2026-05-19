@@ -523,6 +523,8 @@ class CanaryRunner:
         orphan_slots = self._collect_radix_orphan_slots(excluded=excluded)
         if orphan_slots:
             return orphan_slots
+        if self.config.perturb_real_kv_require_orphan:
+            return []
         return self._collect_running_req_slots(
             forward_batch=forward_batch, excluded=excluded
         )

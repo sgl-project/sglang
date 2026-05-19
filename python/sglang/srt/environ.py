@@ -673,6 +673,7 @@ class Envs:
     # Requires --kv-cache-canary-real-data-sweep-every-n-steps > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
 
     # Pseudo-mode sampler-override perturbation (testing only).
     # When >0, the pseudo-mode sampler override writes the WRONG token

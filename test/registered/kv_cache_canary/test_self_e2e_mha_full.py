@@ -172,6 +172,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
 
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "2"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN"] = "1"
         super().setUpClass()
 
     @classmethod
@@ -180,6 +181,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
 
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB", None)
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED", None)
+        os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN", None)
         super().tearDownClass()
 
     def test_sweep_orphan_radix_detects_violation(self) -> None:
