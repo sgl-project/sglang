@@ -18,11 +18,13 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import ceil_div
+from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
 
-ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+_is_hip = is_hip()
+
+ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_compress_state_ring_size(
@@ -144,6 +146,9 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+
         return self.kv_buffer[layer_id]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
@@ -466,7 +471,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            self.c4_logical_size,
+            self.c4_logical_size if not _is_hip else c4_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -477,7 +482,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        self._init_paged_compress_states(enable_memory_saver)
+        if _is_hip:
+            self._init_paged_compress_states(False)
+        else:
+            self._init_paged_compress_states(enable_memory_saver)
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
@@ -585,6 +593,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     dtype=self.state_dtype,
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
+                    swa_page_size=self.swa_page_size,
                 )
 
     def _init_compressed_layer_mapping(self):

@@ -5,6 +5,10 @@ metatags:
 ---
 ## Qwen3 examples
 
+<Warning>
+If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 ### Running Qwen3
 
 #### Running Qwen3-32B on 1 x Atlas 800I A3.
@@ -66,7 +70,6 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --device npu \
@@ -87,7 +90,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
@@ -119,7 +121,6 @@ MODEL_PATH=/root/.cache/modelscope/hub/models/zcgy26/Qwen3-235B-A22B-Instruct-25
 
 ```bash Command
 export ASCEND_LAUNCH_BLOCKING=1
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1500
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
@@ -132,7 +133,6 @@ python3 -m sglang.launch_server \
    --disaggregation-bootstrap-port 8995 \
    --attention-backend ascend \
    --disable-radix-cache \
-   --quantization modelslim \
    --chunked-prefill-size -1 \
    --skip-server-warmup \
    --device npu \
@@ -151,7 +151,6 @@ python3 -m sglang.launch_server \
 **Decode node:**
 
 ```bash Command
-export SGLANG_DEEPEP_BF16_DISPATCH=0
 export HCCL_BUFFSIZE=4000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
@@ -165,7 +164,6 @@ python3 -m sglang.launch_server \
    --disable-cuda-graph \
    --device npu \
    --disable-radix-cache \
-   --quantization modelslim \
    --chunked-prefill-size 8192 \
    --skip-server-warmup \
    --tp-size 16 \
@@ -210,3 +208,7 @@ python -m sglang.launch_server \
    --model-path Qwen/Qwen3-VL-8B-Instruct \
    --mem-fraction-static 0.8
 ```
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
