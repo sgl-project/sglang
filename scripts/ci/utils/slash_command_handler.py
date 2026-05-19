@@ -294,6 +294,16 @@ def handle_tag_run_ci(
     we always add `run-ci` alongside `run-ci-extra`. Reuses the same
     `can_tag_run_ci_label` permission.
 
+    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
+    include `labeled` in `on.pull_request.types`, so adding a label fires a
+    new `pull_request.labeled` event with the up-to-date label set in its
+    payload, which spawns a fresh workflow run that satisfies the
+    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
+    label-gated run — `run.rerun()` on a previously-skipped pull_request run
+    reuses the original event payload (frozen labels), so it would skip
+    again. handle_rerun_failed_ci can't recover label-skipped runs; the
+    labeled event is the recovery mechanism.
+
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_tag_run_ci_label", False):
@@ -379,6 +389,14 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   core.setFailed(...) so their conclusion is "failure" and are covered.
     # - skipped: the entire run was skipped (no jobs ran), so there are no
     #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    #
+    #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
+    #   reruns of `pull_request`-event runs that were skipped because their
+    #   `if` evaluated to false (e.g. missing label) will skip again — the
+    #   label set in the frozen payload doesn't update. To un-skip a
+    #   label-gated workflow, add the missing label (the `labeled` event
+    #   dispatches a fresh run with the current label set); this function
+    #   cannot recover those by rerun alone.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
