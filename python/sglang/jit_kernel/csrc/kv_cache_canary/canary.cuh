@@ -40,9 +40,10 @@ constexpr int kFailReasonInputPositionMismatch = 7;
 constexpr int64_t kCanaryExpectedSkipSentinel = -1;
 
 // Sentinel for verify_prev_slot_indices: skip the chain hash check on
-// this entry. Distinct from -1 ("chain head, expected_prev_hash = seed")
-// so sweep-mode plans can verify an alive slot's real_kv_hash without
-// requiring the full chain to be reconstructible across the sweep set.
+// this entry. Distinct from -1 ("chain head, expected_prev_hash =
+// kCanaryChainAnchor") so sweep-mode plans can verify an alive slot's
+// real_kv_hash without requiring the full chain to be reconstructible
+// across the sweep set.
 constexpr int64_t kSkipChainSentinel = -2;
 
 // Mirror of the Python KERNEL_KIND_* constants. Stamped into every
@@ -60,6 +61,11 @@ constexpr int kKernelKindSweep = 2;
 constexpr int kRealKvHashModeOff = 0;
 constexpr int kRealKvHashModePortion = 1;
 constexpr int kRealKvHashModeAll = 2;
+
+// Frozen chain anchor used wherever a slot has no predecessor. Mirror
+// of the Python ``CANARY_CHAIN_ANCHOR`` in jit_kernel/kv_cache_canary.py;
+// the const-sync test pins them together.
+constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 
 struct CanaryParams {
   // Canary buffer: verify reads prior slots from here and write writes new slots here.
@@ -79,8 +85,8 @@ struct CanaryParams {
   const int64_t* __restrict__ verify_positions;
   // For verify entry i, the slot index of position (verify_positions[i] - 1)
   // for the same req. -1 means "this is position 0; expected prev_hash =
-  // kSeed". The kernel reads (prev_token, prev_position, prev_prev_hash) from
-  // that slot and recomputes splitmix64_mix on-device.
+  // kCanaryChainAnchor". The kernel reads (prev_token, prev_position,
+  // prev_prev_hash) from that slot and recomputes splitmix64_mix on-device.
   const int64_t* __restrict__ verify_prev_slot_indices;
   // Number of leading verify entries that are valid; remaining entries are
   // skip-sentinel padding from cuda graph fixed-capacity buffers.
@@ -101,14 +107,11 @@ struct CanaryParams {
 
   // Per-write-req arrays, length == num_write_reqs. One driver thread per row
   // walks the splitmix64 chain across this req's writes in sequence.
-  const int64_t* __restrict__ write_req_seed_slot_indices;  // -1 = kSeed
+  const int64_t* __restrict__ write_req_seed_slot_indices;  // -1 = kCanaryChainAnchor
   const int64_t* __restrict__ write_req_entry_starts;
   const int64_t* __restrict__ write_req_entry_counts;
   const int32_t* __restrict__ write_req_num_valid;
   uint32_t num_write_reqs;
-
-  // splitmix64 chain seed (== CanaryConfig.seed).
-  uint64_t seed;
 
   // Violation ring. ``violation_write_index`` is the monotonic atomic counter
   // for total violation arrivals; ``violation_ring`` is fill-once for the
@@ -251,7 +254,7 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
   if (skip_chain_check) {
     expected_prev_hash = 0;
   } else if (prev_slot_idx < 0) {
-    expected_prev_hash = p.seed;
+    expected_prev_hash = kCanaryChainAnchor;
   } else {
     const uint64_t prev_prev_hash =
         static_cast<uint64_t>(load_field(p.buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
@@ -321,13 +324,13 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
   const int64_t seed_slot_idx = p.write_req_seed_slot_indices[req_tid];
 
   // Seed of the chain at the first write entry's position. If seed_slot < 0,
-  // K_req_old == 0 so we start from kSeed; otherwise read the canary slot at
-  // (K_req_old - 1) and recompute splitmix64_mix from its stored
-  // (prev_hash, token_id, position) to derive the prev_hash field for the
-  // first new write.
+  // K_req_old == 0 so we start from kCanaryChainAnchor; otherwise read the
+  // canary slot at (K_req_old - 1) and recompute splitmix64_mix from its
+  // stored (prev_hash, token_id, position) to derive the prev_hash field
+  // for the first new write.
   uint64_t prev_hash;
   if (seed_slot_idx < 0) {
-    prev_hash = p.seed;
+    prev_hash = kCanaryChainAnchor;
   } else {
     // Each endpoint's chain is self-contained: read the seed slot from
     // the same buffer we will write into below, so the new entry's
@@ -424,7 +427,6 @@ void canary_step(
     tvm::ffi::TensorView write_req_num_valid,
     tvm::ffi::TensorView expected_write_token_ids,
     tvm::ffi::TensorView expected_write_positions,
-    int64_t seed,
     tvm::ffi::TensorView violation_ring,
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
@@ -526,7 +528,6 @@ void canary_step(
   p.write_req_entry_counts = static_cast<const int64_t*>(write_req_entry_counts.data_ptr());
   p.write_req_num_valid = static_cast<const int32_t*>(write_req_num_valid.data_ptr());
   p.num_write_reqs = num_write_reqs;
-  p.seed = static_cast<uint64_t>(seed);
   p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_write_index = static_cast<uint32_t*>(violation_write_index.data_ptr());
   p.slot_run_counter = static_cast<uint64_t*>(slot_run_counter.data_ptr());
@@ -554,7 +555,7 @@ void canary_step(
 // Layout: keep in lockstep with Python's _CANARY_CONSTANT_LAYOUT in
 // jit_kernel/kv_cache_canary.py. Adding a new constant requires
 // appending it here AND there; the const-sync test catches drift.
-constexpr int kConstantsCount = 29;
+constexpr int kConstantsCount = 30;
 
 void canary_get_constants(tvm::ffi::TensorView out) {
   using namespace host;
@@ -590,6 +591,7 @@ void canary_get_constants(tvm::ffi::TensorView out) {
   dst[i++] = kKernelKindHead;
   dst[i++] = kKernelKindTail;
   dst[i++] = kKernelKindSweep;
+  dst[i++] = static_cast<int64_t>(kCanaryChainAnchor);
 }
 
 }  // namespace

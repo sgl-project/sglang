@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_CHAIN_ANCHOR,
     CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
@@ -31,7 +32,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 
-_SEED = 0xC0FFEE1234567890
+_SEED = CANARY_CHAIN_ANCHOR
 
 
 def _alloc_state(ring_capacity: int = 64) -> dict:
@@ -81,7 +82,6 @@ def _run(
     write_req_num_valid: list[int],
     state: dict,
     kernel_kind: int,
-    seed: int = _SEED,
     real_kv_buf: torch.Tensor | None = None,
     real_kv_read_bytes: int = 0,
     real_kv_hash_mode: int = 0,
@@ -113,7 +113,6 @@ def _run(
     canary_step(
         buf=buf,
         plan=plan,
-        seed=seed,
         violation_ring=state["violation_ring"],
         violation_write_index=state["violation_write_index"],
         slot_run_counter=state["slot_run_counter"],
@@ -686,7 +685,6 @@ def _run_differential(
     inputs_cuda: BatchPlanGpu,
     inputs_ref: BatchPlanGpu,
     kernel_kind: int,
-    seed: int = _SEED,
     real_kv_buf_cuda: torch.Tensor | None = None,
     real_kv_buf_ref: torch.Tensor | None = None,
     real_kv_read_bytes: int = 0,
@@ -711,7 +709,6 @@ def _run_differential(
     canary_step(
         buf=state_cuda["dst_buf"],
         plan=inputs_cuda,
-        seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_cuda["violation_ring"],
         violation_write_index=state_cuda["violation_write_index"],
@@ -726,7 +723,6 @@ def _run_differential(
     canary_step_torch_reference(
         buf=state_ref["dst_buf"],
         plan=inputs_ref,
-        seed=seed,
         kernel_kind=kernel_kind,
         violation_ring=state_ref["violation_ring"],
         violation_write_index=state_ref["violation_write_index"],
@@ -1191,7 +1187,6 @@ def _prefill_buffer_with_chain(
     canary_step(
         buf=state["dst_buf"],
         plan=inputs,
-        seed=_SEED,
         kernel_kind=KERNEL_KIND_HEAD,
         violation_ring=state["violation_ring"],
         violation_write_index=state["violation_write_index"],

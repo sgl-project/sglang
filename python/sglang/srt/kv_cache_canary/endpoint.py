@@ -58,7 +58,6 @@ class CanaryEndpoint:
         self,
         *,
         plan: BatchPlanGpu,
-        seed: int,
     ) -> None:
         """Launch the head|tail kernel pair against this endpoint's own buffers.
 
@@ -82,7 +81,6 @@ class CanaryEndpoint:
             canary_step(
                 buf=buf,
                 plan=plan,
-                seed=int(seed),
                 violation_ring=violation_slot.violation_ring,
                 violation_write_index=violation_slot.violation_write_index,
                 slot_run_counter=self.slot_run_counter,

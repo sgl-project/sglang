@@ -7,7 +7,7 @@ After the stateless redesign:
   extra layers. No ``MetadataBuffers`` extension, no canary-aware PD field.
 - The decode side has no canary host state to transport. The first decode
   forward reads (req_id, K_req) from the sglang ``ForwardBatch`` itself
-  and the splitmix64 chain restarts from ``CanaryConfig.seed`` until the
+  and the splitmix64 chain restarts from ``CANARY_CHAIN_ANCHOR`` until the
   decode side's writes start advancing it.
 
 These tests pin the contract so future PD changes can't silently re-add

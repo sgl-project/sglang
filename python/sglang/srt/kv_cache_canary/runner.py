@@ -603,7 +603,7 @@ class CanaryRunner:
         else:
             raise ValueError(f"kv-canary: unknown kernel_kind {kernel_kind}")
         buffers = launch_buffers if launch_buffers is not None else self._launch
-        endpoint.launch(plan=buffers, seed=int(self._config.seed))
+        endpoint.launch(plan=buffers)
 
     def _run_kernel_pair(
         self,

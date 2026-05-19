@@ -17,6 +17,7 @@ import random
 import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
+    CANARY_CHAIN_ANCHOR,
     CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_SLOT_BYTES,
     KERNEL_KIND_HEAD,
@@ -30,7 +31,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-large")
 
-_SEED = 0xC0FFEE1234567890
+_SEED = CANARY_CHAIN_ANCHOR
 _U64_MASK = (1 << 64) - 1
 
 
@@ -84,7 +85,6 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
     canary_step(
         buf=buf,
         plan=plan,
-        seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_write_index=state["violation_write_index"],
         slot_run_counter=state["slot_run_counter"],

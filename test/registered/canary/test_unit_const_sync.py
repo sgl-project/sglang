@@ -31,6 +31,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_POSITION,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
+    CANARY_CHAIN_ANCHOR,
     CANARY_EXPECTED_SKIP_SENTINEL,
     CANARY_FIELDS_PER_SLOT,
     KERNEL_KIND_HEAD,
@@ -44,6 +45,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
     FailReason,
     get_cpp_constants,
+    to_signed_int64,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -81,6 +83,7 @@ _EXPECTED_PAIRS: Dict[str, int] = {
     "kKernelKindHead": KERNEL_KIND_HEAD,
     "kKernelKindTail": KERNEL_KIND_TAIL,
     "kKernelKindSweep": KERNEL_KIND_SWEEP,
+    "kCanaryChainAnchor": to_signed_int64(CANARY_CHAIN_ANCHOR),
 }
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Final, Tuple
 
 import torch
 
@@ -11,6 +11,11 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+
+# Frozen chain anchor used wherever a slot has no predecessor. Mirrored
+# in C++ as ``kCanaryChainAnchor`` in ``canary.cuh``; the const-sync test
+# pins them together.
+CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
 
 VIOLATION_FIELDS: int = 8
 CANARY_FIELDS_PER_SLOT: int = 4
@@ -42,8 +47,8 @@ REAL_KV_HASH_PORTION_BYTES: int = 16
 CANARY_EXPECTED_SKIP_SENTINEL: int = -1
 
 # Sentinel for verify_prev_slot_indices: skip the chain hash check on
-# this entry. Distinct from -1 (chain head, expected_prev_hash = seed).
-# Mirrored as ``kSkipChainSentinel`` in canary.cuh.
+# this entry. Distinct from -1 (chain head, expected_prev_hash =
+# CANARY_CHAIN_ANCHOR). Mirrored as ``kSkipChainSentinel`` in canary.cuh.
 SKIP_CHAIN_SENTINEL: int = -2
 
 # Violation-row field offsets. Mirrors the kViolationField* constants.
@@ -69,8 +74,8 @@ def to_signed_int64(value: int) -> int:
     Python ints are arbitrary-precision, so a uint64 value above 2^63 - 1
     overflows ``torch.tensor(..., dtype=torch.int64)`` with
     ``OverflowError: Python int too large to convert to C long``. Used at
-    every uint64 -> int64 boundary (e.g. passing ``CanaryConfig.seed`` into
-    the C++ kernel).
+    every uint64 -> int64 boundary (e.g. mirroring
+    :data:`CANARY_CHAIN_ANCHOR` into a tensor).
     """
     value &= _U64_MASK
     if value >= (1 << 63):
@@ -140,6 +145,7 @@ _CANARY_CONSTANT_LAYOUT: Tuple[str, ...] = (
     "kKernelKindHead",
     "kKernelKindTail",
     "kKernelKindSweep",
+    "kCanaryChainAnchor",
 )
 
 
@@ -162,7 +168,6 @@ def canary_step(
     *,
     buf: torch.Tensor,
     plan: BatchPlanGpu,
-    seed: int,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -181,7 +186,8 @@ def canary_step(
     - ``token_id``     — vocab id of the token this slot represents.
     - ``position``     — sequence position of the token within its request.
     - ``prev_hash``    — running fingerprint over the entire 4-field tuple of every chain element *strictly before*
-                         this slot. Anchored on ``seed`` for the chain head. Successive slots are linked by
+                         this slot. Anchored on :data:`CANARY_CHAIN_ANCHOR` for the chain head. Successive slots are
+                         linked by
                          ``next.prev_hash == hash(this.prev_hash, this.token_id, this.position, this.real_kv_hash)``;
                          that link is exactly what Verify recomputes and asserts on. Folding ``real_kv_hash`` into
                          the chain means any tampering with a slot's *full* contents (not just token/position)
@@ -196,8 +202,8 @@ def canary_step(
        and check it against the slot's stored fields (plus ``position`` and, if enabled, the live ``real_kv_hash``).
        Mismatches are *recorded* (not raised) into the violation sink; verification never throws.
     2. **Write** — for each active write-req, populate a contiguous run of slots, walking the chain forward from
-       either a designated predecessor slot (carrying chain state forward from a prior step) or the global ``seed``
-       (chain start), and stamping each slot's 4 fields.
+       either a designated predecessor slot (carrying chain state forward from a prior step) or
+       :data:`CANARY_CHAIN_ANCHOR` (chain start), and stamping each slot's 4 fields.
 
     The two are independent: a call may verify only, write only, or do both. Returns ``None``; all effects are
     in-place mutation of the output tensors listed below.
@@ -211,7 +217,6 @@ def canary_step(
                                      ``verify_num_valid`` and ``write_req_num_valid`` active-count scalars. See the
                                      ``BatchPlanGpu`` docstring for the per-field layout, sentinel encodings, and the
                                      cuda-graph fixed-capacity lifecycle.
-        seed:                        Chain anchor used wherever a slot has no predecessor (``CanaryConfig.seed``).
         violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — fill-once append sink. Row ``0`` is
                                      the first violation (atomic ``seq == 0`` writer wins and never gets overwritten).
                                      Rows ``1..ring_capacity-1`` hold subsequent arrivals; once the ring fills,
@@ -272,7 +277,6 @@ def canary_step(
         plan.write_req_num_valid,
         plan.expected_write_token_ids,
         plan.expected_write_positions,
-        to_signed_int64(int(seed)),
         violation_ring,
         violation_write_index,
         slot_run_counter,

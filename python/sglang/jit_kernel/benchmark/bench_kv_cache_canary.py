@@ -39,8 +39,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="base-b-kernel-benchmark-1-gpu-large")
 
-_SEED = 0xC0FFEE1234567890
-
 CONTEXT_LEN_LIST = get_benchmark_range(
     full_range=[128, 512, 1024, 4096, 10240],
     ci_range=[128, 1024],
@@ -118,7 +116,6 @@ def _launch(
     canary_step(
         buf=buf,
         plan=plan,
-        seed=_SEED,
         violation_ring=state["violation_ring"],
         violation_write_index=state["violation_write_index"],
         slot_run_counter=state["slot_run_counter"],

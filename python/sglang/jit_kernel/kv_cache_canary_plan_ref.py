@@ -50,8 +50,9 @@ class BatchPlanGpu:
     - **Per-verify-entry** (active length ``verify_num_valid[0]``; capacity =
       ``verify_slot_indices.shape[0]``): ``(slot_idx, position, prev_slot_idx)`` for each slot
       the kernel verifies. ``prev_slot_idx == -1`` flags a chain-seed entry (position 0 of a
-      req, or the head of an SWA window — anchor on ``CanaryConfig.seed`` instead of a
-      predecessor slot).
+      req, or the head of an SWA window — anchor on
+      :data:`sglang.jit_kernel.kv_cache_canary.CANARY_CHAIN_ANCHOR` instead of a predecessor
+      slot).
     - **Per-write-entry** (active length implied by per-write-req ``entry_start`` /
       ``entry_count``; capacity = ``write_slot_indices.shape[0]``): ``(slot_idx, token_id,
       position)`` for each slot the kernel fingerprints, flattened across reqs in the order
@@ -62,8 +63,9 @@ class BatchPlanGpu:
     - **Per-write-req** (active length ``write_req_num_valid[0]``; capacity =
       ``write_req_seed_slot_indices.shape[0]``): ``(seed_slot_idx, entry_start, entry_count)``
       per req that has at least one write entry. ``seed_slot_idx == -1`` flags
-      ``K_req_old == 0`` (chain anchors on ``seed``). ``entry_start`` is the exclusive
-      prefix-sum offset into the per-write-entry arrays.
+      ``K_req_old == 0`` (chain anchors on
+      :data:`sglang.jit_kernel.kv_cache_canary.CANARY_CHAIN_ANCHOR`). ``entry_start`` is the
+      exclusive prefix-sum offset into the per-write-entry arrays.
 
     Every per-entry tensor is sized to a **cuda-graph-captured fixed maximum**; the active
     prefix is reported via the ``verify_num_valid`` / ``write_req_num_valid`` scalars. Padding
@@ -148,8 +150,8 @@ class BatchPlan:
     thread per entry plus one driver thread per write-req).
 
     ``verify_prev_slot_indices[i] == -1`` flags position 0 of a req
-    (chain seed = kSeed). ``write_req_seed_slot_indices[i] == -1``
-    flags ``K_req_old == 0`` for the same reason.
+    (chain seed = :data:`sglang.jit_kernel.kv_cache_canary.CANARY_CHAIN_ANCHOR`).
+    ``write_req_seed_slot_indices[i] == -1`` flags ``K_req_old == 0`` for the same reason.
     """
 
     verify_positions: List[int]

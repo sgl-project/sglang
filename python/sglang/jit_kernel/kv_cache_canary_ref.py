@@ -28,6 +28,7 @@ from sglang.jit_kernel.kv_cache_canary import (
     _CANARY_FIELD_PREV_HASH,
     _CANARY_FIELD_REAL_KV_HASH,
     _CANARY_FIELD_TOKEN_ID,
+    CANARY_CHAIN_ANCHOR,
     CANARY_EXPECTED_SKIP_SENTINEL,
     KERNEL_KIND_TAIL,
     REAL_KV_HASH_MODE_OFF,
@@ -93,7 +94,6 @@ def canary_step_torch_reference(
     *,
     buf: torch.Tensor,
     plan: BatchPlanGpu,
-    seed: int,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -116,8 +116,8 @@ def canary_step_torch_reference(
     - **Write path**: for every active write-req row, walk the splitmix64
       chain over ``[entry_starts, entry_starts + entry_counts)`` and
       store ``(token_id, position, prev_hash, real_kv_hash)`` per slot.
-      Chain head is either ``seed`` (when ``seed_slot < 0``) or
-      ``splitmix64_mix4`` of the seed slot's stored
+      Chain head is either :data:`CANARY_CHAIN_ANCHOR` (when
+      ``seed_slot < 0``) or ``splitmix64_mix4`` of the seed slot's stored
       ``(prev_hash, token, position, real_kv_hash)``.
     - **Verify path**: for every active verify entry, load the slot's
       stored fields plus the previous slot's fields, recompute
@@ -159,14 +159,12 @@ def canary_step_torch_reference(
         plan=ref_plan,
         int_views=int_views,
         real_kv_view=real_kv_view,
-        seed=seed,
         sink=sink,
     )
     active_write = _run_write_chains(
         plan=ref_plan,
         int_views=int_views,
         real_kv_view=real_kv_view,
-        seed=seed,
         sink=sink,
     )
 
@@ -384,7 +382,6 @@ def _run_verify_entries(
     plan: _RefPlan,
     int_views: _IntViewBundle,
     real_kv_view: _RealKvView,
-    seed: int,
     sink: _RefViolationSink,
 ) -> int:
     """Walk active verify entries, updating ``sink``. Returns active count."""
@@ -411,7 +408,7 @@ def _run_verify_entries(
         if skip_chain_check:
             expected_prev_hash = 0
         elif prev_slot_idx < 0:
-            expected_prev_hash = seed & _U64_MASK
+            expected_prev_hash = CANARY_CHAIN_ANCHOR & _U64_MASK
         else:
             prev_prev_hash = (
                 int_views.load_field(prev_slot_idx, _CANARY_FIELD_PREV_HASH) & _U64_MASK
@@ -469,7 +466,6 @@ def _run_write_chains(
     plan: _RefPlan,
     int_views: _IntViewBundle,
     real_kv_view: _RealKvView,
-    seed: int,
     sink: _RefViolationSink,
 ) -> int:
     """Walk active write-req chains, mutating slots. Returns total slot count."""
@@ -485,7 +481,7 @@ def _run_write_chains(
         seed_slot_idx = int(plan.write_req_seed_slot_indices[req_tid])
 
         if seed_slot_idx < 0:
-            prev_hash = seed & _U64_MASK
+            prev_hash = CANARY_CHAIN_ANCHOR & _U64_MASK
         else:
             seed_prev_hash = (
                 int_views.load_field_dst(seed_slot_idx, _CANARY_FIELD_PREV_HASH)

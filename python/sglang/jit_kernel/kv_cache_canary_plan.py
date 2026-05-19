@@ -326,15 +326,17 @@ def plan_batch_from_forward_batch(
 
     - **Per-verify-entry** (length ``num_verify``): ``(slot_idx, position, prev_slot_idx)``
       for each slot to check. ``prev_slot_idx == -1`` flags the chain-seed entry (position 0
-      of a req, or the head of an SWA window — anchor on ``CanaryConfig.seed`` instead of a
-      predecessor). Padding tail entries (``i >= num_verify``) are unspecified; ``canary_step``
-      early-exits via its own ``verify_num_valid``.
+      of a req, or the head of an SWA window — anchor on
+      :data:`sglang.jit_kernel.kv_cache_canary.CANARY_CHAIN_ANCHOR` instead of a predecessor).
+      Padding tail entries (``i >= num_verify``) are unspecified; ``canary_step`` early-exits
+      via its own ``verify_num_valid``.
     - **Per-write-entry** (length ``num_write``): ``(slot_idx, token_id, position)`` for each
       slot to fingerprint this step, flattened across reqs in the same order the reqs appear in
       ``req_pool_indices``.
     - **Per-write-req** (length ``num_write_reqs``): ``(seed_slot_idx, entry_start,
       entry_count, req_pool_idx)`` per req that has at least one write entry. ``seed_slot_idx
-      == -1`` flags ``K_req_old == 0`` (chain anchors on ``seed``). ``entry_start`` is the
+      == -1`` flags ``K_req_old == 0`` (chain anchors on
+      :data:`sglang.jit_kernel.kv_cache_canary.CANARY_CHAIN_ANCHOR`). ``entry_start`` is the
       exclusive prefix-sum offset into the per-write-entry arrays.
 
     A call performs five fused operations against ``plan_out`` in a single kernel invocation:

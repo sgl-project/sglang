@@ -63,7 +63,6 @@ class RealKvHashMode(str, enum.Enum):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryConfig:
     mode: CanaryMode
-    seed: int = 0xC0FFEE1234567890
     violation_ring_capacity: int = 256
     health_print_every_n_forwards: int = 1024
     counter_zero_warmup_forwards: int = 64
