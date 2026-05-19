@@ -598,6 +598,9 @@ class ServerArgs:
     ] = None
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
+        "auto"
+    )
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -2107,7 +2110,7 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
-            if model_arch == "MiMoV2ForCausalLM":
+            if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
                 )
@@ -2207,9 +2210,30 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif model_arch == "Gemma4ForConditionalGeneration":
+            default_attention_backend = (
+                "trtllm_mha" if is_sm100_supported() else "triton"
+            )
             if self.is_attention_backend_not_set():
-                self.attention_backend = "triton"
-                logger.info("Use triton as default attention backend for Gemma4")
+                self.attention_backend = default_attention_backend
+                logger.info(
+                    f"Use {self.attention_backend} as default attention backend for Gemma4"
+                )
+            else:
+                # If only one split backend is set, keep the other side on a
+                # Gemma4-compatible fallback instead of letting generic backend
+                # selection choose an unsupported backend later.
+                if self.attention_backend is None:
+                    self.attention_backend = default_attention_backend
+
+            prefill_backend, decode_backend = self.get_attention_backends()
+            accepted_backends = ("trtllm_mha", "triton")
+            assert (
+                prefill_backend in accepted_backends
+                and decode_backend in accepted_backends
+            ), (
+                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                f"got prefill={prefill_backend}, decode={decode_backend}"
+            )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
@@ -2419,7 +2443,7 @@ class ServerArgs:
 
         # FlashInfer's TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families).
+        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # mnnvl: single-node and multi-node (SM100). auto: picks backend from topology.
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
@@ -2437,6 +2461,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
@@ -3555,19 +3580,7 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.load_format == "remote_instance":
-            if self.remote_instance_weight_loader_backend == "modelexpress":
-                # ModelExpress backend: requires url in --modelexpress-config
-                if self.modelexpress_url is None:
-                    logger.warning(
-                        "Fallback load_format to 'auto' due to missing 'url' in --modelexpress-config."
-                    )
-                    self.load_format = "auto"
-                elif not self.validate_transfer_engine():
-                    logger.warning(
-                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by modelexpress) not being supported."
-                    )
-                    self.load_format = "auto"
-            elif (
+            if self.remote_instance_weight_loader_backend != "modelexpress" and (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
@@ -3742,7 +3755,7 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-        # Validate model type: only support Qwen models for now
+        # Validate model type for encoder disaggregation
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if (self.encoder_only or self.language_only) and model_arch not in [
@@ -3758,9 +3771,11 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "MiMoV2ForCausalLM",
         ]:
             raise ValueError(
-                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+                f"Model type {model_arch} is not supported for encoder disaggregation. "
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:
@@ -5680,6 +5695,13 @@ class ServerArgs:
             help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
+            "--deepep-dispatcher-output-dtype",
+            type=str,
+            choices=["auto", "bf16", "fp8", "int8", "nvfp4"],
+            default="auto",
+            help="Select DeepEP dispatcher output dtype",
+        )
+        parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
@@ -6660,7 +6682,7 @@ class ServerArgs:
             "--modelexpress-config",
             type=str,
             default=ServerArgs.modelexpress_config,
-            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
         )
 
         # For PD-Multiplexing
@@ -7305,34 +7327,21 @@ class ServerArgs:
         return self._parsed_modelexpress_config.get("url")
 
     @property
-    def modelexpress_model_name(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("model_name")
-
-    @property
-    def modelexpress_source(self) -> bool:
-        return self._parsed_modelexpress_config.get("source", False)
-
-    @property
     def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress: 'transfer_engine' (default) or 'nixl'."""
-        return self._parsed_modelexpress_config.get("transport", "transfer_engine")
+        """Transport backend for modelexpress."""
+        return self._parsed_modelexpress_config.get("transport", "nixl")
 
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
-        # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
-        if (
-            self.modelexpress_source
-            and self.modelexpress_transport == "transfer_engine"
-        ):
-            return True
         # Use TransferEngine as client backend.
-        elif (
-            self.load_format == "remote_instance"
-            and self.remote_instance_weight_loader_backend
-            in ("transfer_engine", "modelexpress")
-            and self.modelexpress_transport == "transfer_engine"
+        if self.load_format == "remote_instance" and (
+            self.remote_instance_weight_loader_backend == "transfer_engine"
+            or (
+                self.remote_instance_weight_loader_backend == "modelexpress"
+                and self.modelexpress_transport == "transfer_engine"
+            )
         ):
             return True
         else:

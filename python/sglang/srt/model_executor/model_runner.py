@@ -25,7 +25,6 @@ import os
 import socket
 import threading
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -655,6 +654,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            # ModelExpress owns TransferEngine memory registration and metadata
+            # publishing for backend=modelexpress. Re-registering here would
+            # overlap the same weight buffers.
+            and self.server_args.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
@@ -963,155 +967,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
 
-    def _publish_modelexpress_metadata(self):
-        """Publish metadata to ModelExpress server (seed mode).
-
-        Supports two transport backends:
-        - transfer_engine: publishes TransferEngine session_id (Mooncake)
-        - nixl: creates NIXL agent, registers tensors, publishes nixl_metadata
-        """
-        try:
-            from modelexpress import p2p_pb2
-            from modelexpress.client import MxClient
-        except ImportError as exc:
-            raise ImportError(
-                "ModelExpress support requires the 'modelexpress' package. "
-                "Install it with: pip install modelexpress"
-            ) from exc
-
-        model_name = (
-            self.server_args.modelexpress_model_name or self.server_args.model_path
-        )
-        mx_url = self.server_args.modelexpress_url
-        transport = self.server_args.modelexpress_transport
-
-        # Build SourceIdentity for this instance
-        identity = p2p_pb2.SourceIdentity(
-            model_name=model_name,
-            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-            tensor_parallel_size=self.server_args.tp_size,
-            pipeline_parallel_size=self.server_args.pp_size,
-            expert_parallel_size=self.server_args.ep_size,
-            dtype=self.server_args.dtype or "",
-            quantization=self.server_args.quantization or "",
-        )
-
-        if transport == "nixl":
-            worker, tensor_count = self._build_nixl_worker_metadata(p2p_pb2)
-        else:
-            worker, tensor_count = self._build_transfer_engine_worker_metadata(p2p_pb2)
-            if worker is None:
-                return
-
-        # Generate a unique worker_id for this running instance
-        worker_id = str(uuid.uuid4())
-
-        mx_client = MxClient(server_url=mx_url)
-        try:
-            logger.info(
-                "ModelExpress source [%s]: publishing metadata for model=%s, "
-                "tp_rank=%d, %d tensors, worker_id=%s",
-                transport,
-                model_name,
-                self.tp_rank,
-                tensor_count,
-                worker_id,
-            )
-            mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
-            mx_client.update_status(
-                mx_source_id=mx_source_id,
-                worker_id=worker_id,
-                worker_rank=self.tp_rank,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-            )
-            logger.info(
-                "ModelExpress source: published ready for model=%s, "
-                "tp_rank=%d, mx_source_id=%s",
-                model_name,
-                self.tp_rank,
-                mx_source_id,
-            )
-        finally:
-            mx_client.close()
-
-    def _build_transfer_engine_worker_metadata(self, p2p_pb2):
-        """Build WorkerMetadata using TransferEngine session_id."""
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
-
-        if not session_id or weight_info is None:
-            logger.warning(
-                "ModelExpress source: skipping publish -- "
-                "TransferEngine not initialized or no weight info"
-            )
-            return None, 0
-
-        tensors = []
-        for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=numel * element_size,
-                    device_id=self.gpu_id,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
-        return worker, len(tensors)
-
-    def _build_nixl_worker_metadata(self, p2p_pb2):
-        """Build WorkerMetadata using NIXL agent for RDMA transfers."""
-        from modelexpress.nixl_transfer import NixlTransferManager
-
-        agent_name = f"sglang-seed-rank{self.tp_rank}-{uuid.uuid4().hex[:8]}"
-        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
-        nixl_mgr.initialize()
-
-        # Collect model tensors for NIXL registration
-        model_tensors = {}
-        for name, param in self.model.named_parameters():
-            t = param.data
-            if t.is_contiguous():
-                model_tensors[name] = t
-            else:
-                # Non-contiguous tensors: register underlying storage as byte view
-                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                    t.untyped_storage()
-                )
-                if sv.data_ptr() not in {v.data_ptr() for v in model_tensors.values()}:
-                    model_tensors[f"{name}.__storage"] = sv
-
-        nixl_metadata = nixl_mgr.register_tensors(model_tensors)
-
-        # Build tensor descriptors from registered tensors
-        tensors = []
-        for td in nixl_mgr.tensor_descriptors:
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=td.name,
-                    addr=td.addr,
-                    size=td.size,
-                    device_id=td.device_id,
-                    dtype=td.dtype,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            nixl_metadata=nixl_metadata,
-            tensors=tensors,
-        )
-
-        # Keep reference alive so NIXL agent isn't garbage collected
-        self._nixl_manager = nixl_mgr
-
-        return worker, len(tensors)
-
     def model_specific_adjustment(self):
         server_args = self.server_args
 
@@ -1399,14 +1254,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_transfer_engine_session_id,
             modelexpress_url=self.server_args.modelexpress_url,
-            modelexpress_model_name=self.server_args.modelexpress_model_name
-            or self.server_args.model_path,
-            modelexpress_tp_size=self.server_args.tp_size,
-            modelexpress_pp_size=self.server_args.pp_size,
-            modelexpress_ep_size=self.server_args.ep_size,
-            modelexpress_dtype=self.server_args.dtype,
-            modelexpress_quantization=self.server_args.quantization or "",
             modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
@@ -1463,25 +1312,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
-
-        # Publish metadata to ModelExpress if running as seed source
-        if self.server_args.modelexpress_source:
-            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
-            # call register_memory_region(). Do it here so weight_info is populated.
-            if (
-                self.remote_instance_transfer_engine_weight_info is None
-                and self.remote_instance_transfer_engine is not None
-            ):
-                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-                    register_memory_region,
-                )
-
-                self.remote_instance_transfer_engine_weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_transfer_engine
-                    )
-                )
-            self._publish_modelexpress_metadata()
 
         if not self.is_draft_worker:
             get_offloader().post_init()

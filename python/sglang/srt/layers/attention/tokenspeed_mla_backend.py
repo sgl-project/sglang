@@ -92,7 +92,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
-            skip_init_workspace_buffer=True,
         )
 
         if self.data_type != torch.float8_e4m3fn:
@@ -107,10 +106,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
-
-        # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2 min;
-        # without warm-up the first request trips the 300 s scheduler watchdog.
         if is_tokenspeed_mla_available():
+            self._tokenspeed_workspace = _get_tokenspeed_workspace(
+                self.device, self.num_q_heads, self.kv_lora_rank
+            )
+
+            # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
+            # min; without warm-up the first request trips the 300 s scheduler
+            # watchdog.
             _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
             _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
             head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -143,16 +146,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
 
-    def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
-        if (
-            self._tokenspeed_workspace is None
-            or self._tokenspeed_workspace.device != device
-        ):
-            self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                device, self.num_q_heads, self.kv_lora_rank
-            )
-        return self._tokenspeed_workspace
-
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -174,7 +167,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=self._ensure_workspace(query.device),
+            workspace_buffer=self._tokenspeed_workspace,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
