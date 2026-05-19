@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -14,7 +14,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -304,28 +307,49 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
 
 @dataclass
 class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels."""
+    """Quantization payload for FlashInfer CuteDSL FP4 MoE kernels.
 
-    # Lazily-created CuteDslMoEWrapper (stashed on layer)
-    wrapper: Any
+    Shared by the two CuteDSL runner entries:
 
-    # Weights (uint8 FP4 packed)
+    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
+      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
+      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
+      interleaved with MMA-layout blockscales. ``wrapper`` is set;
+      ``w*_scale`` are scalarized.
+
+    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
+      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
+      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
+      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
+      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
+    """
+
+    # FP4 packed weights (uint8)
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
 
-    # Block-scale factors
+    # Block-scale factors (MMA layout for v2, swizzled for v1)
     w13_weight_sf: torch.Tensor
     w2_weight_sf: torch.Tensor
 
-    # Per-expert GEMM scales
+    # Per-expert GEMM dequant alphas (scalarized for v2, per-expert for v1)
     w1_alpha: torch.Tensor
     w2_alpha: torch.Tensor
 
-    # Intermediate quantization scale (fc2 input)
-    fc2_input_scale: torch.Tensor
+    # Activation quant scales (1 / raw_input_scale).
+    #   - a1_scale: quantizes hidden_states before GEMM1
+    #   - a2_scale: quantizes GEMM1 output before GEMM2 (a.k.a. fc2 input)
+    a1_scale: torch.Tensor
+    a2_scale: torch.Tensor
 
-    # Activation quantization scale (scalarized)
-    input_scale: torch.Tensor
+    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
+    wrapper: Optional[Any] = None
+
+    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
+    use_nvfp4_dispatch: bool = False
+
+    # v1 only: SBO down-GEMM overlap args.
+    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")
@@ -339,6 +363,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -351,7 +376,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     x_fp4, x_sf = fp4_quantize(
         hidden_states,
-        quant_info.input_scale,
+        quant_info.a1_scale,
         sf_vec_size=_FP4_SF_VEC_SIZE,
         is_sf_swizzled_layout=False,
     )
@@ -364,7 +389,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.fc2_input_scale,
+        fc2_input_scale=quant_info.a2_scale,
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -385,14 +410,14 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
     - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
     """
-    from flashinfer import fp4_quantize
-
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
     x_sf = dispatch_output.hidden_states_scale
@@ -410,7 +435,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
-            quant_info.input_scale,
+            quant_info.a1_scale,
             sf_vec_size=_FP4_SF_VEC_SIZE,
             is_sf_swizzled_layout=False,
         )
@@ -423,7 +448,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.fc2_input_scale,
+        fc2_input_scale=quant_info.a2_scale,
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -437,3 +462,68 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         output = dispatch_output.moe_output
 
     return FlashinferCombineInput(hidden_states=output)
+
+
+@register_fused_func("deepep", "flashinfer_cutedsl")
+def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
+    dispatch_output: DeepEPLLDispatchOutput,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert (
+        not runner_config.apply_router_weight_on_input
+    ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+
+    # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
+    # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
+    # UE8M0) need stride(-1)==1.
+    if (
+        quant_info.use_nvfp4_dispatch
+        and hidden_states_scale is not None
+        and hidden_states_scale.element_size() != 1
+        and hidden_states_scale.stride(-1) != 1
+    ):
+        raise AssertionError(
+            f"NVFP4 dispatch scale has stride(-1)={hidden_states_scale.stride(-1)}, "
+            f"dtype={hidden_states_scale.dtype}; .view(float8_e4m3fn) requires stride(-1)==1. "
+            "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+        )
+
+    overlap = quant_info.down_gemm_overlap_args
+    output = flashinfer_cutedsl_moe_masked(
+        hidden_states=(hidden_states, hidden_states_scale),
+        input_global_scale=(
+            None if quant_info.use_nvfp4_dispatch else quant_info.a1_scale
+        ),
+        w1=quant_info.w13_weight,
+        w1_blockscale=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        w2=quant_info.w2_weight,
+        a2_global_scale=quant_info.a2_scale,
+        w2_blockscale=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+        masked_m=masked_m,
+        **(
+            dict(
+                down_sm_count=overlap.num_sms,
+                down_signals=overlap.signal,
+                down_start_event=overlap.start_event,
+            )
+            if overlap is not None
+            else {}
+        ),
+    )
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )

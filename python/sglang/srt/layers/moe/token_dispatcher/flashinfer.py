@@ -192,12 +192,16 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        dp_global_num_tokens = get_dp_global_num_tokens()
-        self.runtime_max_tokens_per_rank = (
-            max(dp_global_num_tokens)
-            if dp_global_num_tokens is not None
-            else x.shape[0]
-        )
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is not None and len(dp_global) > 1:
+            # DP attention: multiple DP ranks with different token counts.
+            # Use the max across ranks so the A2A workspace fits the fattest.
+            self.runtime_max_tokens_per_rank = max(dp_global)
+        else:
+            # dp_size=1 or SP: use the actual input tensor size (post-scatter
+            # in SP mode, full batch otherwise).  Avoids the pre-scatter
+            # scheduler count which can exceed the workspace cap.
+            self.runtime_max_tokens_per_rank = x.shape[0]
         if self.has_dummy_token:
             self.runtime_max_tokens_per_rank = max(self.runtime_max_tokens_per_rank, 1)
 
