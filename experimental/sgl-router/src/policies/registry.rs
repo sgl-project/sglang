@@ -94,14 +94,33 @@ impl PdPoolResolver {
     /// workers. Workers whose circuit breaker is open are filtered out
     /// at this layer so the policy never has to re-check.
     ///
-    /// Returns `Err(NoHealthyWorkers)` only when the entire model has
-    /// zero healthy workers; PD-mode partial failures (one pool empty,
-    /// the other non-empty) succeed here — the handler decides whether
-    /// the empty pool matters for the request it is dispatching.
+    /// Returns `Err(NoHealthyWorkers)` only when the model has zero
+    /// **registered** workers (healthy or not). When the model is
+    /// registered as PD but every breaker is currently open, returns
+    /// `Ok(Pd { prefill: [], decode: [] })` so `prefill_candidates` /
+    /// `decode_candidates` can surface the more specific
+    /// `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable` code —
+    /// operators alerting on partial-pool failures see the same code
+    /// whether the empty pool is empty by registration or by breaker.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
         let all = self.workers.healthy_workers_for(model);
         if all.is_empty() {
-            return Err(PdResolveError::NoHealthyWorkers);
+            // No healthy workers — distinguish "model never registered"
+            // (true 404-ish, operator misconfiguration) from "PD model
+            // with all breakers currently open" (transient health
+            // issue, deserves the per-pool code).
+            let registered = self.workers.workers_for(model);
+            let pd_intent = registered
+                .iter()
+                .any(|w| matches!(w.mode(), WorkerMode::Prefill | WorkerMode::Decode));
+            return if pd_intent {
+                Ok(PdPools::Pd {
+                    prefill: Vec::new(),
+                    decode: Vec::new(),
+                })
+            } else {
+                Err(PdResolveError::NoHealthyWorkers)
+            };
         }
         let mut prefill = Vec::new();
         let mut decode = Vec::new();
@@ -366,6 +385,47 @@ mod tests {
         assert_eq!(decode.len(), 2);
     }
 
+    /// PD mode where every breaker is open (e.g. the upstream pool went
+    /// hard down) must NOT collapse to the generic `NoHealthyWorkers`
+    /// code. Both `prefill_candidates` and `decode_candidates` should
+    /// still surface the per-pool variant so operators can alert on
+    /// "prefill tier degraded" independently from "model misconfigured".
+    #[test]
+    fn pd_mode_all_breakers_open_keeps_per_pool_codes() {
+        let r = registry(&[
+            spec("p1", WorkerMode::Prefill, "m"),
+            spec("d1", WorkerMode::Decode, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(r);
+        let model = ModelId("m".into());
+        // Trip both breakers (threshold = 3 in the default config).
+        for w in resolver.workers.workers_for(&model) {
+            for _ in 0..3 {
+                w.breaker.record_failure();
+            }
+            assert!(!w.breaker.allow());
+        }
+        // resolve() still returns a PD shape (both pools empty) — the
+        // PD intent is preserved across the breaker-open state.
+        match resolver.resolve(&model).unwrap() {
+            PdPools::Pd { prefill, decode } => {
+                assert!(prefill.is_empty());
+                assert!(decode.is_empty());
+            }
+            other => panic!("expected Pd, got {other:?}"),
+        }
+        // prefill dispatch → NoPrefillWorkersAvailable (not NoHealthyWorkers).
+        assert_eq!(
+            resolver.prefill_candidates(&model).unwrap_err(),
+            PdResolveError::NoPrefillWorkersAvailable,
+        );
+        // decode dispatch → NoDecodeWorkersAvailable (not NoHealthyWorkers).
+        assert_eq!(
+            resolver.decode_candidates(&model).unwrap_err(),
+            PdResolveError::NoDecodeWorkersAvailable,
+        );
+    }
+
     /// Symmetric: PD mode with no decode workers → decode dispatch
     /// errors.
     #[test]
@@ -616,11 +676,12 @@ mod tests {
         );
     }
 
-    /// All decode peers' breakers are open → resolver returns
-    /// `NoHealthyWorkers` (the resolver's filter at
-    /// `healthy_workers_for` rejects every candidate before pool
-    /// classification). Pin: the public path stays loud — the chat
-    /// handler maps to 503 instead of routing into a known-bad pool.
+    /// All decode peers' breakers are open → `decode_with_affinity`
+    /// surfaces `NoDecodeWorkersAvailable` (the per-pool variant), not
+    /// the generic `NoHealthyWorkers`. The PD intent is preserved
+    /// through `resolve` so operators alerting on "decode tier down"
+    /// see the same code regardless of whether the pool is empty by
+    /// registration or by breaker state.
     ///
     /// The lower-level helper [`select_decode_with_affinity`] is total
     /// even when every candidate's breaker is open (rule 3 in the
@@ -645,12 +706,14 @@ mod tests {
             }
             assert!(!w.breaker.allow());
         }
-        // resolver path: healthy_workers_for returns empty, so
-        // resolve() errors at the entry — handler maps to 503.
+        // resolver path: healthy_workers_for returns empty, but the
+        // model is registered as PD (decode peers exist), so resolve()
+        // preserves PD shape and decode_with_affinity surfaces the
+        // per-pool code.
         let err = resolver
             .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
             .unwrap_err();
-        assert_eq!(err, PdResolveError::NoHealthyWorkers);
+        assert_eq!(err, PdResolveError::NoDecodeWorkersAvailable);
 
         // helper path with a non-empty (but all-breaker-open) slice
         // returns Some via the last-resort branch — selection function
