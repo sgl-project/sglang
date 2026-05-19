@@ -443,6 +443,7 @@ class WaitingImageRequest:
         encoder_urls,
         host_name,
         receive_count,
+        model_type: Optional[str] = None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -453,6 +454,7 @@ class WaitingImageRequest:
         self.encoder_urls = encoder_urls
         self.host_name = host_name
         self.receive_count = receive_count
+        self.model_type = model_type
         self.num_items_assigned = recv_req.num_items_assigned
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
             zmq.Context(), zmq.PULL, host=host_name
@@ -668,9 +670,16 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         embeddings_engine,
         dtype,
         gpu_id=0,
+        model_type: Optional[str] = None,
     ):
         super().__init__(
-            rid, recv_req, mm_processor, encoder_urls, host_name, receive_count
+            rid,
+            recv_req,
+            mm_processor,
+            encoder_urls,
+            host_name,
+            receive_count,
+            model_type=model_type,
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
@@ -1253,6 +1262,7 @@ class MMReceiverBase(ABC):
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    model_type=self.model_type,
                     **extra_kwargs,
                 )
                 waiting_req.send_encode_request()
