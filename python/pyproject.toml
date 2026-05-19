@@ -25,6 +25,7 @@ dependencies = [
   "cuda-python==12.9",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
+  "distro",
   "einops",
   "fastapi",
   "flashinfer_python==0.6.4", # keep it aligned with jit-cache version in Dockerfile
