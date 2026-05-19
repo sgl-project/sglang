@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.overlap_utils import Relayer
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -78,6 +79,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: "SchedulerLogprobResultProcessor"
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
+    relayer: Optional["Relayer"]
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -503,6 +505,9 @@ class SchedulerBatchResultProcessor:
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
+        kv_committed_deltas: List[int] = []
+        finished_status: List[bool] = []
+
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -510,20 +515,44 @@ class SchedulerBatchResultProcessor:
 
             if req.is_retracted:
                 # reset_for_retract() already zeroes committed/allocated KV.
+                kv_committed_deltas.append(0)
+                finished_status.append(False)
                 continue
 
             if req.finished():
                 # -1 because prepare_for_decode pre-claimed the bonus slot.
                 req.kv_committed_len -= 1
+                kv_committed_deltas.append(-1)
+                finished_status.append(True)
                 continue
 
             # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
+            req.kv_committed_len += accept_lens[i] - 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.spec_num_correct_drafts += num_correct_drafts
             req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+            kv_committed_deltas.append(accept_lens[i] - 1)
+            finished_status.append(False)
+
+        # Relayer cpu_value channel owns kv_committed_delta + finished status.
+        # Channel is the sole source: req.kv_committed_len stays at its
+        # iter-start baseline; consumers read post-iter value via
+        # Req.relayer_resolve_kv_committed_len. Promotion (baseline += delta)
+        # happens once at next bind_relayer_for_iter before the slot wraps.
+        relayer = self.relayer
+        assert (
+            relayer is not None and result.cpu_future_indices is not None
+        ), "spec V2 overlap path requires relayer + cpu_future_indices"
+        relayer.store_kv_committed_delta(result.cpu_future_indices, kv_committed_deltas)
+        relayer.store_finished_status(result.cpu_future_indices, finished_status)
+        # ``req.kv_committed_len`` is updated in-place above (the same way
+        # main does it), so no ctx rebind is needed: same-iter attribute
+        # readers (e.g. filter_batch, retract path, mamba track) see the
+        # post-iter value immediately. The channel slot remains the source
+        # for the finished_status read in filter_batch.
 
         return predict_tokens
 

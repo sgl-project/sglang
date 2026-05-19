@@ -167,6 +167,9 @@ class ReqToTokenPool:
         #     assert (
         #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
+        # ``req.kv_committed_len`` is updated in place by
+        # _resolve_spec_overlap_tokens (main-style), so the attribute is
+        # already the post-iter value; no channel resolve needed.
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing

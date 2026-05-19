@@ -224,7 +224,7 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         scheduler.server_args = SimpleNamespace(
             disaggregation_decode_enable_radix_cache=False
         )
-        scheduler.future_map = MagicMock()
+        scheduler.relayer = MagicMock()
         scheduler.policy = MagicMock()
         scheduler.policy.calc_priority.side_effect = (
             lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)

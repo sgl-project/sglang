@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -695,6 +695,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            relayer=self.relayer,
         )
 
         self.is_initializing = False
@@ -1258,8 +1259,8 @@ class Scheduler(
 
         if use_mlx():
             # MLX overlap scheduling uses mx.async_eval / mx.eval for
-            # synchronisation so no CUDA/MPS streams or FutureMap needed.
-            self.future_map = None
+            # synchronisation so no CUDA/MPS streams or Relayer needed.
+            self.relayer = None
             # Empty result_queue is needed because idle-check references it
             # when enable_overlap is True.
             self.result_queue: Deque = deque()
@@ -1274,17 +1275,25 @@ class Scheduler(
         )
 
         if not self.enable_overlap:
-            self.future_map = None
+            self.relayer = None
             return
 
-        self.future_map = self.spec_algorithm.create_future_map(
+        self.relayer = self.spec_algorithm.create_relayer(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
         )
-        self.batch_record_buf = [None] * 2
-        self.batch_record_ct = 0
+
+    @property
+    def batch_record_buf(self):
+        # Alias of the Relayer iter-pin ring. None in non-overlap / MLX
+        # paths where ref retention is not driven by the ring.
+        return self.relayer._iter_pin_ring if self.relayer is not None else None
+
+    @property
+    def batch_record_ct(self):
+        return self.relayer._iter_pin_ct if self.relayer is not None else 0
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -2632,6 +2641,7 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
+                self.running_batch.bind_relayer_for_iter(self.relayer)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
@@ -2753,65 +2763,42 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Update batch tensors
+        # Bind Relayer slots before prepare_for_decode so its explicit
+        # store of seq_lens family lands on this iter's slot; run_batch
+        # and process_batch_result reuse the same slots.
+        batch.bind_relayer_for_iter(self.relayer)
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, batch: ScheduleBatch):
-        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
-        # NOTE: More Reliable: record all tensors into the forward stream
-        # NOTE: - for all future tensors, we shall always read from future map
-        #       - for all non-future tensors (produced only by schedule stream),
-        #       we shall keep its reference not being release during all the forwarding pass
-        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
+    def record_batch_in_overlap(self, batch: ScheduleBatch):  # noqa: D401
+        # Pin batch + SB attr snapshot for 2 iters via Relayer iter-pin ring
+        # so cross-stream tensor refs survive the schedule-side return.
+        self.relayer.begin_iter_pin()
+        self.relayer.add_iter_pin(batch)
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        # List (not tuple) so that workers can register additional refs via
-        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
-        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+        self.relayer.add_iter_pin(attr_snapshot)
 
-    @contextmanager
-    def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Make SB transactional across one overlap forward.
+    def _apply_spec_v2_relay_outputs(
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        future_indices,
+    ):
+        """Hand off spec V2 forward outputs to SB via the gpu_scalar channel.
 
-        1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
-           input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
-           only need sampling_info restored - V1 carries spec_info forward as
-           next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
-           shares the pre-accumulated penalty buffer) so V2's multiple init_new
-           calls don't double-accumulate penalties.
-        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
-           tensors in the snapshot survive the caching allocator past the
-           forward stream. Must run AFTER the sampling_info swap so the
-           forward-only copy gets pinned.
+        next_draft_input is rebound on SB.spec_info; its tensor fields
+        (topk_p / topk_index / bonus_tokens / new_seq_lens / hidden_states)
+        are then rebound to channel slot views so any subsequent SB-side
+        read carries the per-buffer cross-stream event.wait inline.
         """
-        # 1. snapshot
-        snapshot_v2_full = batch.is_spec_v2
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
-        sched_sampling_info = batch.sampling_info
-
-        # 2. sampling_info substitute
-        if sched_sampling_info is not None:
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
-
-        # 3. pin for 2-iter tensor lifetime
-        self.record_batch_in_overlap(batch)
-
-        try:
-            yield
-        finally:
-            if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
-            else:
-                batch.sampling_info = sched_sampling_info
+        batch.spec_info = batch_result.next_draft_input
+        batch.spec_info.future_indices = future_indices
+        self.relayer.resolve_draft_input_from_channel(batch.spec_info)
+        # batch.seq_lens is sourced from the resolved channel view so
+        # SB.seq_lens does not alias a worker-stream-produced raw tensor.
+        batch.seq_lens = batch.spec_info.new_seq_lens
 
     def run_batch(
         self,
@@ -2835,46 +2822,68 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                with self._overlap_forward_isolation(batch):
-                    bs = len(batch.seq_lens)
-                    future_indices = self.future_map.alloc_future_indices(bs)
+                # Pin batch + attr snapshot for 2 iters so cross-stream
+                # tensor refs survive the schedule-side return.
+                self.record_batch_in_overlap(batch)
 
-                    with self.forward_stream_ctx:
-                        self.forward_stream.wait_stream(self.schedule_stream)
-                        self.future_map.resolve_future(batch)
-                        # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
-                        # Park any refs the worker wants kept alive 2 iters
-                        # (cross-stream tensor lifetime; pinned in the same
-                        # ring slot as the SB attr snapshot).
-                        if batch_result.extra_keep_alive_refs:
-                            self.batch_record_buf[self.batch_record_ct].extend(
-                                batch_result.extra_keep_alive_refs
-                            )
-                        # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
-                        if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
-                            batch_result.copy_to_cpu(
-                                return_logprob=batch.return_logprob,
-                                return_hidden_states=batch.return_hidden_states,
-                            )
-                        else:
-                            batch_result.future_indices = future_indices
+                # Schedule-side same-iter read; SB attribute is the right
+                # source. Channel resolve is reserved for cross-stream /
+                # cross-iter consumers (cuda_graph_runner / ForwardBatch.init_new).
+                bs = len(batch.seq_lens)
+                # Reuse SB-bound iter slots (from bind_relayer_for_iter
+                # in the schedule pass); fall back to fresh alloc for
+                # batches that bypassed it (e.g. disagg prefill).
+                future_indices = getattr(
+                    batch, "_relayer_iter_gpu_fi", None
+                ) or self.relayer.alloc_future_indices(bs)
+                cpu_future_indices = getattr(
+                    batch, "_relayer_iter_cpu_fi", None
+                ) or self.relayer.cpu_value.alloc(bs)
+
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self.relayer.resolve_future(batch)
+                    # FD snapshot is the ownership boundary: from here
+                    # forward consumes FD, not the live SB. to_forward_data
+                    # also derives a forward-view of sampling_info so worker
+                    # writes do not touch SB.sampling_info's orchestrator.
+                    forward_data = batch.to_forward_data()
+                    # FIXME: pp is not compatible with overlap
+                    batch_result = self.model_worker.forward_batch_generation(
+                        forward_data
+                    )
+                    # Pin FD for 2 iters: worker may bind mid-forward tensors
+                    # (verify_input, draft kernels' scratch) into FD fields;
+                    # FD must outlive the schedule-side return for the
+                    # forward_stream-queued reads to be safe.
+                    self.relayer.add_iter_pin(forward_data)
+                    if batch_result.extra_keep_alive_refs:
+                        self.relayer.add_iter_pin(*batch_result.extra_keep_alive_refs)
+                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.delay_sample_func is None:
+                        self.relayer.store_to_map(future_indices, batch_result)
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
+                    else:
+                        batch_result.future_indices = future_indices
+                    batch_result.cpu_future_indices = cpu_future_indices
+                    batch.set_relayer_ctx(self.relayer, cpu_future_indices)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                # Spec V2 relay rebind requires the gpu_scalar buffers to
+                # have been populated by store_to_map first; only invoke it
+                # in the non-delay branch here. The delay-sample branch
+                # routes through launch_batch_sample_if_needed, which runs
+                # store_to_map and then applies the relay outputs.
+                if batch.is_spec_v2 and batch_result.delay_sample_func is None:
+                    self._apply_spec_v2_relay_outputs(
+                        batch, batch_result, future_indices
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -2884,6 +2893,9 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                # Non-overlap path: spec V1 / dflash / frozen_kv_mtp / non-spec
+                # all mutate SB directly inside the worker; no FD boundary
+                # since there is no cross-iter race window here.
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -2894,7 +2906,21 @@ class Scheduler(
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
+            # Spec V1 decode returns verify_output.accept_tokens (flat
+            # shape (sum_accept,) > bs); SB.output_ids must hold (bs,)
+            # for merge_batch / filter_batch / assert_lockstep to stay
+            # consistent. Spec V1 doesn't consume SB.output_ids
+            # downstream (worker's spec_info carries the state and
+            # process_batch_result_decode reads batch_result.next_token_ids),
+            # so skip the assignment.
+            if (
+                not self.spec_algorithm.is_none()
+                and not batch.is_spec_v2
+                and batch.forward_mode.is_decode()
+            ):
+                batch.output_ids = None
+            else:
+                batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2960,18 +2986,25 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            self.relayer.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
 
-        # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
-        # iteration, causing a steady VRAM leak with structured output.
+        # Spec V2 relay rebind deferred from run_batch: store_to_map just
+        # populated the gpu_scalar buffers, so it is now safe to rebind
+        # SB.spec_info / SB.seq_lens to the channel views before the next
+        # iter's prepare_for_decode reads them.
+        if self.cur_batch is not None and self.cur_batch.is_spec_v2:
+            self._apply_spec_v2_relay_outputs(
+                self.cur_batch, batch_result, batch_result.future_indices
+            )
+
+        # Release the delay_sample_func closure (captures forward_batch +
+        # logits_output): without this the closure stays alive via
+        # batch_result in result_queue and the iter-pin ring, causing a
+        # steady VRAM leak with structured output.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None

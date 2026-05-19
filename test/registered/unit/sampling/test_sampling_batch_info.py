@@ -404,14 +404,14 @@ class TestMergeBatch(CustomTestCase):
         self.assertEqual(info1.sampling_seed[2].item(), 30)
 
 
-# copy_for_forward
-class TestCopyForForward(CustomTestCase):
+# derive_forward_view
+class TestDeriveForwardView(CustomTestCase):
 
     def test_returns_copy_without_orchestrator(self):
-        """Test that copy_for_forward returns a copy with orchestrator set to None."""
+        """derive_forward_view returns a copy with orchestrator set to None."""
         orch = MagicMock(is_required=False)
         info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        copied = info.copy_for_forward()
+        copied = info.derive_forward_view()
         self.assertIsNone(copied.penalizer_orchestrator)
         # Original should still have orchestrator
         self.assertIsNotNone(info.penalizer_orchestrator)

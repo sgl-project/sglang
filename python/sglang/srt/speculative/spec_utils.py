@@ -57,6 +57,11 @@ def record_stream_each(tensors, stream):
     non-tensor / non-cuda entries. Tells the caching allocator that the
     tensors are also used on `stream`, so memory is not recycled while
     queued work is still in flight after Python refs drop.
+
+    Temporary tool: kept until PR-7/8 routes input_ids / out_cache_loc /
+    verify_input tensors through Relayer handles (handle.switch instead of
+    SB / FD attribute rebind), at which point cross-stream lifetime is
+    owned by the Relayer ring buffer and record_stream becomes redundant.
     """
     for t in tensors:
         if isinstance(t, torch.Tensor) and t.is_cuda:
@@ -75,6 +80,13 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
     Covers pre-prepare tensors only; caller must also `record_stream_each`
     the post-prepare rebinds (new `batch.input_ids` / `out_cache_loc`).
+
+    Temporary: Relayer.add_iter_pin(forward_data) preserves the FD object's
+    Python ref for 2 iters, but worker mid-forward rebinds (FD.input_ids
+    = predict; FD.input_ids = draft_token; ...) drop FD's ref to the
+    original tensor while fwd_stream still reads it. PR-7/8 will route
+    these through Relayer handles so SB/FD never hold raw refs; then this
+    helper can go.
     """
     candidates = [
         batch.seq_lens,
@@ -104,7 +116,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # multi_layer_eagle handles hidden_states internally, not via Relayer.
     # TODO(lsyin): also skip when step == 1.
     if server_args.speculative_algorithm == "STANDALONE":
         return False

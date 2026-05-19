@@ -669,7 +669,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -719,6 +719,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     ):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        # See comment in EAGLEWorkerV2.verify; remove once PR-7/8 lands.
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         bs = len(batch.seq_lens)
@@ -775,8 +776,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -798,11 +797,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
         )
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
-        # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
+        # via extra_keep_alive_refs through Relayer.add_iter_pin.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,

@@ -549,6 +549,10 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
+        # Worker-internal pass state: store the freshly built draft input on
+        # FD.spec_info so the next draft step reads it. SB.spec_info is not
+        # touched; the iter-boundary handoff is via gpu_scalar channel in
+        # store_to_map_for_new_batch.
         batch.spec_info = next_draft_input
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -752,7 +756,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -967,6 +971,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        # Temporary: until PR-7/8 routes input_ids / out_cache_loc /
+        # verify_input fields through Relayer handles, mid-forward rebind
+        # in prepare_for_v2_verify / _draft_extend_for_decode drops FD's
+        # Python ref to the original tensor while fwd_stream still reads
+        # it. record_stream tells the caching allocator to defer reclaim
+        # until fwd_stream syncs.
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
@@ -1077,9 +1087,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, verify_input, accept_lens, accept_index, bs
             )
 
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
-
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -1100,14 +1107,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
         )
 
-        # verify_forward_batch transitively holds verify-time GPU tensors
-        # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache,
-        # until the next iter's verify_done.synchronize() in filter_batch.
-        # Scheduler pins it in batch_record_buf for the 2-iter window.
+        # verify_forward_batch holds verify-time GPU tensors that must
+        # outlive the imminent batch.input_ids rebind in
+        # prepare_for_extend_to_fill_draft_kvcache. extra_keep_alive_refs
+        # routes the ref through Scheduler -> Relayer.add_iter_pin.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,

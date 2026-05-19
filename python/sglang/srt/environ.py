@@ -218,6 +218,14 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_RELAYER_LOCKSTEP_ASSERT = EnvBool(True)
+    # Strict mode: raise on any ScheduleBatch cross-iter volatile attribute
+    # read from a worker-stream entry frame. Worker reads must go through
+    # ForwardData snapshot or Relayer channel resolve. Default-on so the
+    # "worker never touches live SB" invariant is locked in CI without
+    # contributors having to remember to flip it; set 0 to opt out if the
+    # stack-walk cost shows up in profiling.
+    SGLANG_RELAYER_DEBUG_STRICT = EnvBool(True)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)

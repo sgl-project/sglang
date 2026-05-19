@@ -17,7 +17,7 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.overlap_utils import Relayer
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
@@ -115,16 +115,16 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
-    def create_future_map(
+    def create_relayer(
         self,
         max_running_requests: int,
         chunked_prefill_size: int,
         context_len: int,
         device: torch.device,
-    ) -> FutureMap:
-        from sglang.srt.managers.overlap_utils import FutureMap
+    ) -> Relayer:
+        from sglang.srt.managers.overlap_utils import Relayer
 
-        return FutureMap(
+        return Relayer(
             max_running_requests,
             chunked_prefill_size,
             context_len,

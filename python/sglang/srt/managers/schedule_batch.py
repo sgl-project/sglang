@@ -952,8 +952,60 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
+            return min(
+                self.relayer_resolve_kv_committed_len(), len(self.origin_input_ids)
+            )
+        return self.relayer_resolve_kv_committed_len()
+
+    def relayer_resolve_kv_committed_len(self) -> int:
+        """Read the per-req committed-KV length with the Relayer cpu_value
+        channel as source of truth when a (relayer, cpu_future_indices,
+        slot_offset) tuple has been attached via
+        ``Req.set_relayer_kv_committed_ctx``. The fallback returns the legacy
+        attribute, so call sites do not need to know whether the channel is
+        populated.
+        """
+        ctx = self.__dict__.get("_relayer_kv_committed_ctx")
+        if ctx is not None:
+            relayer, cpu_fi, slot_offset, baseline = ctx
+            if relayer is not None and cpu_fi is not None and slot_offset is not None:
+                deltas = relayer.resolve_kv_committed_delta(cpu_fi)
+                d = deltas[slot_offset] if slot_offset < len(deltas) else 0
+                if d is not None:
+                    return baseline + d
         return self.kv_committed_len
+
+    def set_relayer_kv_committed_ctx(self, relayer, cpu_future_indices, slot_offset):
+        """Attach the Relayer + cpu_value slot key + this iter's baseline
+        kv_committed_len so subsequent ``relayer_resolve_kv_committed_len``
+        calls return ``baseline + delta`` from the channel rather than the
+        in-place mutated attribute.
+        """
+        self._relayer_kv_committed_ctx = (
+            relayer,
+            cpu_future_indices,
+            slot_offset,
+            self.kv_committed_len,
+        )
+
+    def clear_relayer_kv_committed_ctx(self):
+        self._relayer_kv_committed_ctx = None
+
+    def promote_relayer_kv_committed_delta(self):
+        """Move the channel-resident delta into ``kv_committed_len`` and
+        clear ctx. Called before the cpu_value slot is reused so the
+        post-iter committed length is captured before the slot wraps.
+        """
+        ctx = self.__dict__.get("_relayer_kv_committed_ctx")
+        if ctx is None:
+            return
+        relayer, cpu_fi, slot_offset, baseline = ctx
+        if relayer is not None and cpu_fi is not None and slot_offset is not None:
+            deltas = relayer.resolve_kv_committed_delta(cpu_fi)
+            d = deltas[slot_offset] if slot_offset < len(deltas) else None
+            if d is not None:
+                self.kv_committed_len = baseline + d
+        self._relayer_kv_committed_ctx = None
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
@@ -1285,6 +1337,9 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
+        # Drop any stale channel ctx so post-retract resolve returns the
+        # zeroed baseline rather than baseline+stale_delta.
+        self.clear_relayer_kv_committed_ctx()
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
@@ -1390,6 +1445,35 @@ class Req(ReqDllmMixin):
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
+
+
+# Strict mode: SB attributes whose value is volatile across iters and whose
+# worker-side read must instead come from ForwardData snapshot or Relayer
+# channel resolve. Reading these from a worker entry frame indicates a
+# regression of the "worker never touches live SB" invariant.
+_SB_CROSS_ITER_VOLATILE_ATTRS = frozenset(
+    {
+        "seq_lens",
+        "seq_lens_cpu",
+        "orig_seq_lens",
+        "input_ids",
+        "out_cache_loc",
+        "req_pool_indices",
+        "output_ids",
+        "spec_info",
+        "sampling_info",
+    }
+)
+_SB_STRICT_WORKER_FRAMES = frozenset(
+    {
+        # Only the generation worker entry consumes ForwardData under
+        # overlap mode (FD boundary established by Scheduler.run_batch).
+        # Embedding / split-prefill workers still legitimately receive SB
+        # directly because they have not been migrated to FD, so excluding
+        # them prevents the strict shim from raising on legitimate reads.
+        "forward_batch_generation",
+    }
+)
 
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
@@ -1594,6 +1678,239 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def __getattribute__(self, name):
+        # Fast path: dunder / private / non-volatile attrs bypass entirely.
+        if name.startswith("_") or name not in _SB_CROSS_ITER_VOLATILE_ATTRS:
+            return object.__getattribute__(self, name)
+        # Strict guard runs only when env flag + overlap mode are on. Stack
+        # walk pays its cost only on volatile-attr reads in this regime.
+        if not envs.SGLANG_RELAYER_DEBUG_STRICT.get():
+            return object.__getattribute__(self, name)
+        if not object.__getattribute__(self, "enable_overlap"):
+            return object.__getattribute__(self, name)
+        import sys
+
+        f = sys._getframe(1)
+        for _ in range(40):
+            if f is None:
+                break
+            if f.f_code.co_name in _SB_STRICT_WORKER_FRAMES:
+                raise AssertionError(
+                    f"strict: ScheduleBatch.{name} read from worker stack "
+                    f"frame {f.f_code.co_name} "
+                    f"({f.f_code.co_filename}:{f.f_lineno}). Use ForwardData "
+                    f"snapshot or Relayer channel resolve "
+                    f"(forward_batch.relayer_resolve_*) instead."
+                )
+            f = f.f_back
+        return object.__getattribute__(self, name)
+
+    def set_relayer_ctx(self, relayer, cpu_future_indices):
+        self._relayer_ctx = (relayer, cpu_future_indices)
+
+    def set_relayer_seq_lens_ctx(self, relayer, future_indices):
+        self._relayer_seq_lens_ctx = (relayer, future_indices)
+
+    def clear_relayer_seq_lens_ctx(self):
+        self._relayer_seq_lens_ctx = (None, None)
+
+    def _relayer_buffer_ready(self, name: str) -> bool:
+        """``True`` when the bound slot for ``name`` has been written this
+        iter. Buffer-level existence is not sufficient — a fresh alloc
+        after wrap may target an index where stale data sits until the
+        producer stores. Slot-level check ensures resolve returns
+        current-iter data.
+        """
+        ctx = self.__dict__.get("_relayer_seq_lens_ctx")
+        if ctx is None:
+            return False
+        relayer, fi = ctx
+        if relayer is None or fi is None:
+            return False
+        return relayer.gpu_scalar.slot_ready(name, fi.interval)
+
+    def relayer_resolve_seq_lens(self):
+        """Resolve seq_lens via channel (cross-stream-safe) when the slot has
+        been written; fall back to the direct attribute otherwise.
+
+        Schedule-side callers (alloc_for_decode, prepare_for_decode early
+        phase) read seq_lens before prepare_for_decode stores the post-iter
+        value to the channel; for them the channel buffer may not exist
+        yet on the first decode iter, so fall back to attribute.
+        """
+        if self._relayer_buffer_ready("seq_lens"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_seq_lens(fi.indices)
+        return self.seq_lens
+
+    def relayer_resolve_seq_lens_cpu(self):
+        if self._relayer_buffer_ready("seq_lens_cpu"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_seq_lens_cpu(fi.indices)
+        return self.seq_lens_cpu
+
+    def relayer_resolve_orig_seq_lens(self):
+        if self._relayer_buffer_ready("orig_seq_lens"):
+            relayer, fi = self._relayer_seq_lens_ctx
+            return relayer.resolve_orig_seq_lens(fi.indices)
+        return self.orig_seq_lens
+
+    def to_forward_data(self):
+        """Build a ForwardData snapshot of all fields ForwardBatch.init_new reads.
+
+        Forward-only sampling view: when the sampling_info carries a penalizer
+        orchestrator, the snapshot uses ``derive_forward_view`` so worker-side
+        sampling kernels read/write the forward view and the orchestrator state
+        on SB.sampling_info stays untouched across forward.
+        """
+        # Local import to avoid circular import at module load time.
+        from sglang.srt.model_executor.forward_batch_info import ForwardData
+
+        fd_sampling_info = self.sampling_info
+        if (
+            fd_sampling_info is not None
+            and getattr(fd_sampling_info, "penalizer_orchestrator", None) is not None
+        ):
+            fd_sampling_info = fd_sampling_info.derive_forward_view()
+
+        return ForwardData(
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            seq_lens_sum=self.seq_lens_sum,
+            out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=self.seq_lens_cpu,
+            orig_seq_lens=self.orig_seq_lens,
+            extend_seq_lens=getattr(self, "extend_lens", None),
+            extend_prefix_lens=getattr(self, "prefix_lens", None),
+            extend_num_tokens=getattr(self, "extend_num_tokens", None),
+            extend_logprob_start_lens=getattr(self, "extend_logprob_start_lens", None),
+            extend_input_logprob_token_ids=getattr(
+                self, "extend_input_logprob_token_ids", None
+            ),
+            sampling_info=fd_sampling_info,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            has_grammar=self.has_grammar,
+            # Aggregate per-req grammar refs here so the FD path's
+            # init_new_from_forward_data can mirror the SB path's
+            # ``[req.grammar for req in batch.reqs]`` install onto
+            # sampling_info without needing batch.reqs at the worker side.
+            grammars=([req.grammar for req in self.reqs] if self.has_grammar else None),
+            input_embeds=getattr(self, "input_embeds", None),
+            replace_embeds=getattr(self, "replace_embeds", None),
+            replace_positions=getattr(self, "replace_positions", None),
+            token_type_ids=getattr(self, "token_type_ids", None),
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            global_forward_mode=getattr(self, "global_forward_mode", None),
+            multimodal_inputs=getattr(self, "multimodal_inputs", None),
+            multi_item_delimiter_indices=getattr(
+                self, "multi_item_delimiter_indices", None
+            ),
+            encoder_cached=getattr(self, "encoder_cached", None),
+            encoder_lens=getattr(self, "encoder_lens", None),
+            encoder_lens_cpu=getattr(self, "encoder_lens_cpu", None),
+            encoder_out_cache_loc=getattr(self, "encoder_out_cache_loc", None),
+            mamba_track_indices=getattr(self, "mamba_track_indices", None),
+            mamba_track_mask=getattr(self, "mamba_track_mask", None),
+            mamba_track_seqlens=getattr(self, "mamba_track_seqlens", None),
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            dllm_config=getattr(self, "dllm_config", None),
+            dllm_block_offsets=getattr(self, "dllm_block_offsets", None),
+            ne_token_table=getattr(self, "ne_token_table", None),
+            tbo_split_seq_index=getattr(self, "tbo_split_seq_index", None),
+            is_prefill_only=self.is_prefill_only,
+            return_hidden_states=getattr(self, "return_hidden_states", False),
+            return_pooled_hidden_states=getattr(
+                self, "return_pooled_hidden_states", False
+            ),
+            dimensions=getattr(self, "dimensions", None),
+            lora_ids=[req.lora_id for req in self.reqs],
+            rids=[req.rid for req in self.reqs],
+            # Transitional pass-through for spec V2 worker / eagle_info_v2
+            # which still read schedule-side objects (read-only).
+            reqs=self.reqs,
+            device=self.device,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+    def bind_relayer_for_iter(self, relayer):
+        """Allocate this iter's relay slots (gpu_scalar for seq_lens family,
+        cpu_value for kv_committed_delta / finished_status). Promotes
+        each req's previous-iter channel delta into req.kv_committed_len
+        before clearing ctx, so the new baseline reflects the prior iter's
+        committed lengths once the old slot is about to be reused.
+        """
+        for req in self.reqs:
+            req.promote_relayer_kv_committed_delta()
+        # Drop stale ctx so this iter's stores / reads target fresh slots.
+        self.clear_relayer_ctx()
+        if relayer is None:
+            return
+        bs = len(self.reqs)
+        if bs == 0:
+            return
+        gpu_fi = relayer.alloc_future_indices(bs)
+        cpu_fi = relayer.cpu_value.alloc(bs)
+        self._relayer_iter_gpu_fi = gpu_fi
+        self._relayer_iter_cpu_fi = cpu_fi
+        self.set_relayer_seq_lens_ctx(relayer, gpu_fi)
+        self.set_relayer_ctx(relayer, cpu_fi)
+
+    def clear_relayer_ctx(self):
+        self._relayer_ctx = (None, None)
+        self._relayer_seq_lens_ctx = (None, None)
+        self._relayer_iter_gpu_fi = None
+        self._relayer_iter_cpu_fi = None
+
+    def assert_lockstep(self):
+        """Per-req containers all have the same length as ``self.reqs``.
+
+        Producer / consumer contract: filter_batch / merge_batch /
+        prepare_for_decode / prepare_for_extend keep all per-req slices
+        aligned. Cheap to call (Python lengths + 1-D tensor shapes).
+        """
+        bs = len(self.reqs)
+        if self.seq_lens is not None:
+            assert (
+                self.seq_lens.shape[0] == bs
+            ), f"seq_lens len {self.seq_lens.shape[0]} != reqs len {bs}"
+        if self.seq_lens_cpu is not None:
+            assert (
+                self.seq_lens_cpu.shape[0] == bs
+            ), f"seq_lens_cpu len {self.seq_lens_cpu.shape[0]} != reqs len {bs}"
+        if self.orig_seq_lens is not None:
+            assert (
+                self.orig_seq_lens.shape[0] == bs
+            ), f"orig_seq_lens len {self.orig_seq_lens.shape[0]} != reqs len {bs}"
+        if self.req_pool_indices is not None:
+            assert (
+                self.req_pool_indices.shape[0] == bs
+            ), f"req_pool_indices len {self.req_pool_indices.shape[0]} != reqs len {bs}"
+        if self.output_ids is not None:
+            assert (
+                self.output_ids.shape[0] == bs
+            ), f"output_ids len {self.output_ids.shape[0]} != reqs len {bs}"
+        if (
+            self.sampling_info is not None
+            and getattr(self.sampling_info, "temperatures", None) is not None
+        ):
+            assert len(self.sampling_info.temperatures) == bs, (
+                f"sampling_info.temperatures len {len(self.sampling_info.temperatures)}"
+                f" != reqs len {bs}"
+            )
+        for attr in ("top_logprobs_nums", "token_ids_logprobs"):
+            value = getattr(self, attr, None)
+            if value is not None:
+                assert len(value) == bs, f"{attr} len {len(value)} != reqs len {bs}"
 
     def is_dllm(self):
         return self.dllm_config is not None
@@ -2012,6 +2329,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
+            self.assert_lockstep()
+
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
@@ -2132,7 +2452,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            new_pages = sum(
+                1
+                for r in requests
+                if r.relayer_resolve_kv_committed_len() % page_size == 0
+            )
             return new_pages * page_size
 
         if self.is_spec_v2:
@@ -2162,7 +2486,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         alloc_len = get_alloc_len_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            kv_committed = r.relayer_resolve_kv_committed_len()
+            x = max(0, kv_committed + 2 * alloc_len - r.kv_allocated_len)
             cur = r.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
@@ -2352,18 +2677,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
-            # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # Producer-side mirror onto Relayer gpu_scalar channel so next-iter
+        # cross-stream consumers can resolve with sync.
+        ctx_relayer, ctx_gpu_fi = getattr(self, "_relayer_seq_lens_ctx", (None, None))
+        if ctx_relayer is not None and ctx_gpu_fi is not None:
+            ctx_relayer.store_seq_lens(ctx_gpu_fi, self.seq_lens)
+            ctx_relayer.store_seq_lens_cpu(ctx_gpu_fi, self.seq_lens_cpu)
+            ctx_relayer.store_orig_seq_lens(ctx_gpu_fi, self.orig_seq_lens)
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2403,11 +2733,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-    def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
+            self.assert_lockstep()
 
     def filter_batch(
         self,
@@ -2416,19 +2743,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
+            # Per-iter finished decision: use OR of the cpu_value channel
+            # snapshot and the live ``req.finished()`` attr. The channel is
+            # written by ``_resolve_spec_overlap_tokens`` BEFORE the per-iter
+            # ``req.check_finished`` runs, so a req that finishes this iter
+            # (e.g., hits max_new_tokens after spec accept) has channel=False
+            # but live ``req.finished()``=True after cache_finished_req sets
+            # ``kv_committed_freed=True``. Channel-only would keep such reqs
+            # and ``prepare_for_decode`` would allocate KV slots for them
+            # that ``_get_total_uncached_sizes`` excludes (committed_freed),
+            # leaking pool tokens.
+            ctx_relayer, ctx_cpu_fi = getattr(self, "_relayer_ctx", (None, None))
+            if ctx_relayer is not None and ctx_cpu_fi is not None:
+                finished_list = ctx_relayer.resolve_finished_status(ctx_cpu_fi)
+            else:
+                finished_list = [None] * len(self.reqs)
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
+                if not (bool(finished_list[i]) or self.reqs[i].finished())
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
@@ -2490,16 +2829,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
-    def merge_batch(self, other: "ScheduleBatch"):
-        # In the regular scheduler path:
-        # 1) self is always prefill, whose seq_lens is not a future
-        # 2) other is always decode, which is finished in previous step
-        # so verify_done is already synced and this is a no-op.
-        # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
-        # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
+            self.assert_lockstep()
 
+    def merge_batch(self, other: "ScheduleBatch"):
+        # Drop any pre-merge relayer ctx: cpu_value slot has only self's
+        # pre-merge bs entries, and is no longer aligned with the post-merge
+        # reqs. filter_batch on the merged batch must fall back to
+        # req.finished() until a fresh bind_relayer_for_iter rebinds.
+        self.clear_relayer_ctx()
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2543,6 +2881,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+        if envs.SGLANG_RELAYER_LOCKSTEP_ASSERT.get():
+            self.assert_lockstep()
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.

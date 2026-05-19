@@ -1,7 +1,22 @@
+"""Relayer: scheduler-owned cross-iter relay services.
+
+A relay is a value whose producer is iter N (forward kernel output, or
+CPU branch in process_batch_result reading forward output) and whose
+consumer is iter N+1. Two channels:
+
+- gpu_scalar: per-req GPU scalar stacked into a circular buffer indexed
+  by FutureIndices. Cross-stream sync via cuda event recorded on store
+  and waited on resolve.
+- cpu_value: per-req Python value (int/bool) indexed by slot.
+
+Plus an iter-pin ring for 2-iter Python ref retention of non-channel
+cross-stream tensors.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
@@ -38,11 +53,224 @@ else:
 
 @dataclass
 class FutureIndices:
+    """Slot handle. ``indices`` is the 1-D int64 advanced-index tensor;
+    ``interval`` is the equivalent slice. Slot 0 is the sentinel for the
+    negative-encoding input_ids relay.
+    """
+
     indices: torch.Tensor
     interval: Optional[slice] = None
 
 
-class FutureMap:
+class _SlotAllocator:
+    """Circular slot allocator. Slots wrap modulo future_limit; the
+    underlying buffer is sized to future_buffer_len = future_limit +
+    headroom so in-flight slots have room.
+    """
+
+    def __init__(self, future_limit: int, future_buffer_len: int, device: torch.device):
+        self.future_ct = 0
+        self.future_limit = future_limit
+        self.future_buffer_len = future_buffer_len
+        self.device = device
+
+    def alloc(self, bs: int) -> FutureIndices:
+        cur = self.future_ct
+        self.future_ct = (cur + bs) % self.future_limit
+        start = cur + 1
+        end = cur + 1 + bs
+        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        return FutureIndices(indices=indices, interval=slice(start, end))
+
+    def is_empty(self, intv: slice) -> bool:
+        start, stop, step = intv.indices(self.future_buffer_len)
+        return (start >= stop) if step > 0 else (start <= stop)
+
+
+class GpuScalarChannel:
+    """Per-req GPU scalar relay.
+
+    Named circular GPU buffers indexed by a shared slot allocator. Each
+    buffer is lazily allocated on first store. Cross-stream sync: each
+    store records a cuda event under the buffer name; resolve_* waits on
+    that buffer's event only.
+    """
+
+    def __init__(self, allocator: _SlotAllocator):
+        self._allocator = allocator
+        self._buffers: Dict[str, torch.Tensor] = {}
+        self._producer_events: Dict[str, torch.cuda.Event] = {}
+        # Track the most recent stored interval per buffer name. Consumers
+        # check this to distinguish "buffer exists, this iter's slot has
+        # been written" from "buffer exists from a prior iter, current slot
+        # is freshly alloc'd and holds stale data". Resolves over the
+        # currently-bound slot are only valid when it matches the last
+        # store's interval (within a single producer per name).
+        self._last_stored_interval: Dict[str, slice] = {}
+
+    @property
+    def device(self) -> torch.device:
+        return self._allocator.device
+
+    @property
+    def future_buffer_len(self) -> int:
+        return self._allocator.future_buffer_len
+
+    def alloc(self, bs: int) -> FutureIndices:
+        return self._allocator.alloc(bs)
+
+    def ensure_buffer(
+        self,
+        name: str,
+        per_slot_shape: torch.Size,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if name not in self._buffers:
+            self._buffers[name] = torch.empty(
+                (self._allocator.future_buffer_len, *per_slot_shape),
+                dtype=dtype,
+                device=self._allocator.device,
+            )
+        return self._buffers[name]
+
+    def _new_event(self) -> torch.cuda.Event:
+        return torch.get_device_module(self._allocator.device).Event()
+
+    def store(
+        self,
+        future_indices: FutureIndices,
+        name: str,
+        value: torch.Tensor,
+        producer_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        intv = future_indices.interval
+        if self._allocator.is_empty(intv):
+            return
+        if name not in self._buffers:
+            self.ensure_buffer(name, value.shape[1:], value.dtype)
+        self._buffers[name][intv] = value
+        self._last_stored_interval[name] = intv
+        event = self._new_event()
+        if producer_stream is None:
+            event.record()
+        else:
+            event.record(producer_stream)
+        self._producer_events[name] = event
+
+    def _wait_producer_on(
+        self, name: str, consumer_stream: Optional[torch.cuda.Stream]
+    ):
+        event = self._producer_events.get(name)
+        if event is None:
+            return
+        if consumer_stream is None:
+            consumer_stream = torch.get_device_module(
+                self._allocator.device
+            ).current_stream()
+        event.wait(consumer_stream)
+
+    def resolve_by_interval(
+        self,
+        future_indices: FutureIndices,
+        name: str,
+        consumer_stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        self._wait_producer_on(name, consumer_stream)
+        return self._buffers[name][future_indices.interval]
+
+    def resolve_by_indices(
+        self,
+        indices: torch.Tensor,
+        name: str,
+        consumer_stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        self._wait_producer_on(name, consumer_stream)
+        return self._buffers[name][indices]
+
+    def buffer(self, name: str) -> torch.Tensor:
+        return self._buffers[name]
+
+    def slot_ready(self, name: str, interval: slice) -> bool:
+        """``True`` when the named buffer's most recent store covers
+        ``interval``. Consumers reading via the currently-bound slot use
+        this to distinguish "buffer exists but my slot has not been
+        written this iter" from "my slot is valid"; the former case must
+        fall back to the direct attribute.
+        """
+        last = self._last_stored_interval.get(name)
+        if last is None:
+            return False
+        buf_len = self._allocator.future_buffer_len
+        a, b, _ = interval.indices(buf_len)
+        c, d, _ = last.indices(buf_len)
+        return c <= a and b <= d
+
+    def has_buffer(self, name: str) -> bool:
+        return name in self._buffers
+
+
+class CpuValueChannel:
+    """Per-req CPU value relay (Python int / bool / small object).
+
+    Backing store: ``slot_index -> Dict[name, value]``. Wraparound semantics
+    mirror the GPU ``_SlotAllocator``: ``future_ct`` wraps at
+    ``future_limit`` while the buffer holds ``future_buffer_len = future_limit
+    + headroom`` so an in-flight slot's interval never straddles the wrap
+    boundary, keeping ``intv.indices(future_buffer_len)`` aligned with the
+    stored slot keys.
+    """
+
+    def __init__(self, future_limit: int, future_buffer_len: int):
+        self.future_limit = future_limit
+        self.future_buffer_len = future_buffer_len
+        self.future_ct = 0
+        self._slots: Dict[int, Dict[str, Any]] = {}
+
+    def alloc(self, bs: int) -> FutureIndices:
+        cur = self.future_ct
+        self.future_ct = (cur + bs) % self.future_limit
+        start = cur + 1
+        end = cur + 1 + bs
+        # Clear stale data from prior wrap: ``future_ct`` wraps modulo
+        # ``future_limit`` so the same slot range is reused across iters,
+        # but ``_slots`` is a dict that retains old values until overwritten.
+        # If a producer (``_resolve_spec_overlap_tokens``) does not store
+        # into a freshly alloc'd slot before a consumer (``filter_batch``
+        # via ``resolve_finished_status``) reads it, the read returns the
+        # stale value from the previous wrap. For ``finished_status``,
+        # that means a freshly-allocated slot can report ``True`` even
+        # though the current req is not finished, causing ``filter_batch``
+        # to drop the req without running ``cache_finished_req`` and
+        # leaking its KV slots.
+        intv = slice(start, end)
+        s, e, _ = intv.indices(self.future_buffer_len)
+        for slot in range(s, e):
+            self._slots.pop(slot, None)
+        indices = torch.arange(start, end, dtype=torch.int64)
+        return FutureIndices(indices=indices, interval=slice(start, end))
+
+    def store(self, future_indices: FutureIndices, name: str, values: list):
+        intv = future_indices.interval
+        start, stop, _ = intv.indices(self.future_buffer_len)
+        for i, slot in enumerate(range(start, stop)):
+            self._slots.setdefault(slot, {})[name] = values[i]
+
+    def resolve(self, future_indices: FutureIndices, name: str) -> list:
+        intv = future_indices.interval
+        start, stop, _ = intv.indices(self.future_buffer_len)
+        return [self._slots.get(s, {}).get(name) for s in range(start, stop)]
+
+    def free_slot(self, slot_index: int):
+        self._slots.pop(slot_index, None)
+
+
+class Relayer:
+    """Scheduler-owned cross-iter relay state.
+
+    Channels: gpu_scalar (per-req GPU scalar) and cpu_value (per-req
+    Python value). Plus an iter-pin ring for 2-iter Python ref retention.
+    """
+
     def __init__(
         self,
         max_running_requests: int,
@@ -52,8 +280,6 @@ class FutureMap:
         spec_algo: SpeculativeAlgorithm,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
-        self.future_ct = 0
-
         # Circular buffer layout (wraps in this order):
         # Running decode batch -> Prefill chunk 1 -> ... -> Prefill chunk N
         # A running decode batch's result will be resolved after all prefill chunks are done.
@@ -63,127 +289,179 @@ class FutureMap:
             if chunked_prefill_size
             else 0
         )
-        self.future_limit = max_running_requests * (3 + max_num_chunks)
+        future_limit = max_running_requests * (3 + max_num_chunks)
         # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
-        self.future_buffer_len = self.future_limit + 2 * max_running_requests
+        future_buffer_len = future_limit + 2 * max_running_requests
+
         self.device = device
         self.spec_algo = spec_algo
 
+        self._gpu_allocator = _SlotAllocator(future_limit, future_buffer_len, device)
+
+        self.gpu_scalar = GpuScalarChannel(self._gpu_allocator)
+        self.cpu_value = CpuValueChannel(future_limit, future_buffer_len)
+
+        # Iter-pin ring: 2 slots of Python ref lists, rotated each iter.
+        self._iter_pin_ring: list = [None, None]
+        self._iter_pin_ct: int = 0
+
         if self.spec_algo.is_none():
-            # For non-speculative decoding, we only need to store the token ids.
-            self.buf_initialized = True
-            self.token_ids_buf = torch.empty(
-                (self.future_buffer_len,), dtype=torch.int64, device=self.device
-            )
-        else:
-            # For speculative decoding, we lazily initialize the buffers
-            # This is to make the shape derivation easier.
-            self.buf_initialized = False
+            self.gpu_scalar.ensure_buffer("token_ids", torch.Size(()), torch.int64)
 
-    def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        self.buf_initialized = True
+    @property
+    def future_ct(self) -> int:
+        return self._gpu_allocator.future_ct
 
-        # Get a reference for each tensor
-        topk_p0 = draft_input.topk_p[0]
-        topk_index0 = draft_input.topk_index[0]
-        bonus_token0 = draft_input.bonus_tokens[0]
-        new_seq_lens0 = draft_input.new_seq_lens[0]
+    @property
+    def future_limit(self) -> int:
+        return self._gpu_allocator.future_limit
 
-        self.topk_p_buf = torch.empty(
-            (self.future_buffer_len, *topk_p0.shape),
-            dtype=topk_p0.dtype,
-            device=self.device,
-        )
-        self.topk_index_buf = torch.empty(
-            (self.future_buffer_len, *topk_index0.shape),
-            dtype=topk_index0.dtype,
-            device=self.device,
-        )
-        self.bonus_tokens_buf = torch.empty(
-            (self.future_buffer_len, *bonus_token0.shape),
-            dtype=bonus_token0.dtype,
-            device=self.device,
-        )
-        self.new_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *new_seq_lens0.shape),
-            dtype=new_seq_lens0.dtype,
-            device=self.device,
-        )
-
-        if spec_need_hidden_states():
-            hidden_states0 = draft_input.hidden_states[0]
-            self.hidden_states_buf = torch.empty(
-                (self.future_buffer_len, *hidden_states0.shape),
-                dtype=hidden_states0.dtype,
-                device=self.device,
-            )
+    @property
+    def future_buffer_len(self) -> int:
+        return self._gpu_allocator.future_buffer_len
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
-        """Update the circular buffer pointer and allocate future indices."""
-        cur_future_ct = self.future_ct
-        self.future_ct = (cur_future_ct + bs) % self.future_limit
-        start = cur_future_ct + 1
-        end = cur_future_ct + 1 + bs
-        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
-        return FutureIndices(indices=indices, interval=slice(start, end))
-
-    def resolve_future(self, batch: ScheduleBatch):
-        if self.spec_algo.is_none():
-            _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
-        else:
-            # TODO(lsyin): write future indices into spec_info.future_indices
-            draft_input: EagleDraftInput = batch.spec_info
-            if draft_input is None:
-                # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
-                return
-            indices = draft_input.future_indices.indices
-            # The indices tensor was allocated on the default stream but is
-            # used here on the forward stream. Meanwhile, the old spec_info
-            # holding this tensor will lose all Python references (replaced at
-            # batch.spec_info), so the caching allocator (torch GC) could
-            # reclaim the memory before the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+        """Reserve ``bs`` consecutive gpu_scalar slot indices."""
+        return self._gpu_allocator.alloc(bs)
 
     def is_empty_slice(self, s: slice) -> bool:
-        start, stop, step = s.indices(self.future_buffer_len)
-        if step > 0:
-            return start >= stop
-        else:
-            return start <= stop
+        """``True`` for an empty interval (idle DP-attention zero-sized slot)."""
+        return self._gpu_allocator.is_empty(s)
+
+    def resolve_future(self, batch: ScheduleBatch):
+        """Forward-entry resolve.
+
+        Non-spec: rewrite ``batch.input_ids`` in-place from the gpu_scalar
+        token_ids slot.
+
+        Spec V2: re-resolve ``batch.spec_info`` tensor fields from channel
+        via current ``future_indices.indices``. This restores the invariant
+        that bonus_tokens / topk_p / topk_index / hidden_states / new_seq_lens
+        shape matches future_indices.indices shape. Cached views can drift
+        when ``running_batch`` accumulates merge/filter ops across iters
+        where it isn't the forwarded batch (so the end-of-iter
+        ``_apply_spec_v2_relay_outputs`` on that batch never runs on
+        running_batch's spec_info).
+        """
+        if self.spec_algo.is_none():
+            _resolve_future_token_ids(
+                batch.input_ids, self.gpu_scalar.buffer("token_ids")
+            )
+        elif self.spec_algo.supports_spec_v2():
+            self.resolve_draft_input_from_channel(batch.spec_info)
+
+    def resolve_draft_input_from_channel(self, draft_input: "EagleDraftInput"):
+        """Rebind a spec V2 draft input's tensor fields to gpu_scalar slot
+        views (cross-stream event.wait done at resolve time). The caller
+        must set ``draft_input.future_indices`` first."""
+        if draft_input is None or draft_input.future_indices is None:
+            return
+        indices = draft_input.future_indices.indices
+        # Idle / bs=0 batch: producer side (``store_to_map_for_new_batch``)
+        # skips store on empty interval and thus does not ensure the buffer;
+        # mirror that here so consumers do not trip a KeyError. Worker-side
+        # idle draft tensors stay attached to ``draft_input``.
+        if indices.numel() == 0:
+            return
+        # The indices tensor was allocated on the default stream but is
+        # used here on the forward stream. Meanwhile, the old spec_info
+        # holding this tensor will lose all Python references (replaced at
+        # batch.spec_info), so the caching allocator could reclaim the
+        # memory before the GPU finishes reading it.
+        # Temporary: until PR-7/8 makes future_indices a Relayer-owned
+        # handle that never gets its Python ref drop, this record_stream
+        # is needed.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        draft_input.topk_p = self.gpu_scalar.resolve_by_indices(indices, "topk_p")
+        draft_input.topk_index = self.gpu_scalar.resolve_by_indices(
+            indices, "topk_index"
+        )
+        draft_input.bonus_tokens = self.gpu_scalar.resolve_by_indices(
+            indices, "bonus_tokens"
+        )
+        draft_input.new_seq_lens = self.gpu_scalar.resolve_by_indices(
+            indices, "new_seq_lens"
+        )
+        if spec_need_hidden_states():
+            draft_input.hidden_states = self.gpu_scalar.resolve_by_indices(
+                indices, "hidden_states"
+            )
 
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
+        """Forward-stream write: token_ids (non-spec) or spec V2 draft input."""
         if self.spec_algo.is_none():
-            intv = future_indices.interval
-            if self.is_empty_slice(intv):
-                # idle indices in dp attention do not need store info
-                return
-            self.token_ids_buf[intv] = batch_result.next_token_ids
+            self.gpu_scalar.store(
+                future_indices, "token_ids", batch_result.next_token_ids
+            )
         else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
+            self.store_to_map_for_new_batch(
+                future_indices, batch_result.next_draft_input
+            )
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
         intv = future_indices.interval
-        if self.is_empty_slice(intv):
-            # idle indices in dp attention do not need store info
+        if self._gpu_allocator.is_empty(intv):
             return
-
-        if not self.buf_initialized:
-            self._lazy_init_buf(draft_input)
-
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        self.gpu_scalar.store(future_indices, "topk_p", draft_input.topk_p)
+        self.gpu_scalar.store(future_indices, "topk_index", draft_input.topk_index)
+        self.gpu_scalar.store(future_indices, "bonus_tokens", draft_input.bonus_tokens)
+        self.gpu_scalar.store(future_indices, "new_seq_lens", draft_input.new_seq_lens)
         if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+            self.gpu_scalar.store(
+                future_indices, "hidden_states", draft_input.hidden_states
+            )
+
+    def store_new_seq_lens(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "new_seq_lens", value)
+
+    def resolve_new_seq_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "new_seq_lens")
+
+    def store_seq_lens(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "seq_lens", value)
+
+    def resolve_seq_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "seq_lens")
+
+    def store_seq_lens_cpu(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "seq_lens_cpu", value)
+
+    def resolve_seq_lens_cpu(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "seq_lens_cpu")
+
+    def store_orig_seq_lens(self, future_indices: FutureIndices, value: torch.Tensor):
+        self.gpu_scalar.store(future_indices, "orig_seq_lens", value)
+
+    def resolve_orig_seq_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gpu_scalar.resolve_by_indices(indices, "orig_seq_lens")
+
+    def store_finished_status(self, future_indices: FutureIndices, values: list):
+        self.cpu_value.store(future_indices, "finished", values)
+
+    def resolve_finished_status(self, future_indices: FutureIndices) -> list:
+        return self.cpu_value.resolve(future_indices, "finished")
+
+    def store_kv_committed_delta(self, future_indices: FutureIndices, values: list):
+        self.cpu_value.store(future_indices, "kv_committed_delta", values)
+
+    def resolve_kv_committed_delta(self, future_indices: FutureIndices) -> list:
+        return self.cpu_value.resolve(future_indices, "kv_committed_delta")
+
+    # ------------------------------------------------------------------
+    # Iter-pin ring: 2-iter Python ref retention for cross-stream tensors
+    # not yet routed through channel slots.
+    # ------------------------------------------------------------------
+
+    def begin_iter_pin(self) -> int:
+        self._iter_pin_ct = (self._iter_pin_ct + 1) % 2
+        self._iter_pin_ring[self._iter_pin_ct] = []
+        return self._iter_pin_ct
+
+    def add_iter_pin(self, *refs):
+        """Pin ``refs`` for two iters (slot survives one rotation)."""
+        for ref in refs:
+            self._iter_pin_ring[self._iter_pin_ct].append(ref)

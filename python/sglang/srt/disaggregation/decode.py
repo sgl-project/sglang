@@ -151,6 +151,9 @@ class DecodeReqToTokenPool:
         assert (
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
+        # ``req.kv_committed_len`` is updated in place by
+        # _resolve_spec_overlap_tokens (main-style); attribute is the
+        # post-iter value, no channel resolve needed.
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -1216,7 +1219,13 @@ class DecodePreallocQueue:
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
+        # disagg-init kv_committed_len: this is the schedule-side
+        # initialization of a freshly-received KV-ready req, not a
+        # cross-iter relay value, so it remains a direct attribute write.
+        # The Relayer cpu_value channel only owns the per-iter delta
+        # produced by process_batch_result.
         req.kv_committed_len = fill_len
+        req.clear_relayer_kv_committed_ctx()
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
@@ -1331,7 +1340,12 @@ class DecodePreallocQueue:
         # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (fill_ids is 1 ahead).
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        # Route through Relayer cpu_value channel when a kv_committed ctx is
+        # attached to ``req`` (the channel resolve returns ``baseline +
+        # delta`` from the per-iter store); falls back to the attribute.
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[
+            : req.relayer_resolve_kv_committed_len()
+        ]
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1733,8 +1747,11 @@ class SchedulerDisaggregationDecodeMixin:
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_ids to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (fill_ids includes one uncommitted token).
-                if req.kv_committed_len is not None:
-                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                # Route through Relayer cpu_value channel when a kv_committed
+                # ctx is attached to the req; falls back to the attribute.
+                committed_len = req.relayer_resolve_kv_committed_len()
+                if committed_len is not None:
+                    req.fill_ids = req.fill_ids[:committed_len]
                     req.set_extend_input_len(
                         len(req.fill_ids) - len(req.prefix_indices)
                     )
@@ -1760,7 +1777,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.future_map)
+        new_batch.process_prebuilt(self.server_args, self.relayer)
 
         return new_batch
 

@@ -41,6 +41,9 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
+    # cpu_value channel slot for kv_committed_delta / finished status,
+    # allocated in lockstep with future_indices.
+    cpu_future_indices: Optional[FutureIndices] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
@@ -50,9 +53,7 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
-    # Refs the worker wants scheduler to keep alive for the same 2-iter window
-    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
-    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    # Worker-registered refs to pin for 2 iters via Relayer.add_iter_pin.
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling

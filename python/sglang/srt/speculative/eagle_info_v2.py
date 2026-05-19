@@ -93,9 +93,6 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
-
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
@@ -129,13 +126,15 @@ class EagleDraftInputV2Mixin:
             # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
             # switches one batch later than a seq_lens-based baseline; the 2*alloc
             # over-allocation buffer absorbs that lag.
-            nxt = max(cur, r.kv_committed_len + double_alloc)
+            kv_committed = r.relayer_resolve_kv_committed_len()
+            nxt = max(cur, kv_committed + double_alloc)
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
             r.kv_allocated_len = nxt
             r.decode_batch_idx += 1
-            # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
+            # Pre-claim bonus slot here (like normal decode); _resolve_spec_overlap_tokens
+            # writes the per-iter delta to channel which corrects for accepted lens.
             r.kv_committed_len += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -225,6 +224,9 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        # Worker-internal FD mutation: draft-extend adjusts seq_lens family
+        # by +num_draft_tokens so the draft kernel sees the extended shape.
+        # SB.seq_lens family stays untouched.
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
