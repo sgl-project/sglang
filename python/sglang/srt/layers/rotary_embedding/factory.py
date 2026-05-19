@@ -21,6 +21,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     DynamicNTKAlphaRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
     FourierRotaryEmbedding,
+    Gemma4RotaryEmbedding,
     Llama3RotaryEmbedding,
     Phi3LongRoPEScaledRotaryEmbedding,
 )
@@ -171,6 +172,9 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved_glm=rope_scaling.get(
+                        "mrope_interleaved_glm", False
+                    ),
                 )
             elif rope_scaling.get("use_fope", False):
                 rotary_emb = FourierRotaryEmbedding(
@@ -322,6 +326,15 @@ def get_rope(
                 short_factor,
                 long_factor,
                 **extra_kwargs,
+            )
+        elif scaling_type == "proportional":
+            rotary_emb = Gemma4RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

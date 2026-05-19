@@ -52,9 +52,11 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -261,6 +263,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
             self.to_k = ColumnParallelLinear(
                 query_dim,
@@ -268,6 +271,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
             self.to_v = ColumnParallelLinear(
                 query_dim,
@@ -275,6 +279,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -310,6 +315,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
                 )
                 self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -317,6 +323,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
                 )
                 self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -324,6 +331,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
                 )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
@@ -349,9 +357,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         freqs_cis=None,
         num_replicated_prefix: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        query, key, value, encoder_query, encoder_key, encoder_value = (
-            _get_qkv_projections(self, x, encoder_hidden_states)
-        )
+        (
+            query,
+            key,
+            value,
+            encoder_query,
+            encoder_key,
+            encoder_value,
+        ) = _get_qkv_projections(self, x, encoder_hidden_states)
 
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
@@ -495,6 +508,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
             self.proj_out = ColumnParallelLinear(
@@ -503,6 +517,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -513,6 +528,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 eps=1e-6,
                 pre_only=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.attn" if prefix else "attn",
             )
 
     def forward(
@@ -649,9 +665,13 @@ class FluxTransformerBlock(nn.Module):
             hidden_states, emb=temb
         )
 
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
-            self.norm1_context(encoder_hidden_states, emb=temb)
-        )
+        (
+            norm_encoder_hidden_states,
+            c_gate_msa,
+            c_shift_mlp,
+            c_scale_mlp,
+            c_gate_mlp,
+        ) = self.norm1_context(encoder_hidden_states, emb=temb)
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         # Attention.
@@ -722,9 +742,9 @@ class FluxPosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 
@@ -736,7 +756,7 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
 
