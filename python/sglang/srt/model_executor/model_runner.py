@@ -3222,8 +3222,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Launch model forward
         if not skip_attn_backend_init:
             # prepare kv cache buffer for dcp to gather kv cache
-            prepare_decode_context_parallel_metadata(
-                forward_batch, self.kv_cache_dtype, self.device
+            forward_batch.attn_dcp_metadata = prepare_decode_context_parallel_metadata(
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens,
+                forward_batch.req_pool_indices,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.seq_lens_sum,
+                forward_batch.token_to_kv_pool.get_key_buffer(0).shape,
+                self.kv_cache_dtype,
+                self.device,
             )
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
