@@ -827,8 +827,6 @@ class Scheduler(
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
-        # Detect any of the known variants so that the MoE backend config is
-        # initialized for every MoE model.
         moe_topk_attrs = (
             "num_experts_per_tok",
             "num_experts_per_token",

@@ -41,6 +41,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1002,6 +1003,23 @@ class Gemma4ForCausalLM(PreTrainedModel):
         ]
         num_experts = self.config.num_experts
 
+        # Per-expert checkpoint format used by compressed-tensors / FP8
+        # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
+        # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
+        # separate key with shape (out, in):
+        #   experts.<id>.{gate,up,down}_proj.{weight,weight_scale,
+        #                                     weight_scale_2,input_scale}
+        # `make_expert_params_mapping` emits tuples whose `weight_name` ends
+        # in a trailing dot, so the standard `name.replace(weight_name,
+        # param_name)` collapses every suffix uniformly to the fused
+        # FusedMoE params (experts.w13_*, experts.w2_*).
+        per_expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         params_dict = dict(self.named_parameters())
@@ -1033,70 +1051,44 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
-            # Per-expert checkpoint format used by compressed-tensors / FP8
-            # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
-            # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
-            # separate key with shape (out, in):
-            #   experts.<id>.gate_proj.{weight,weight_scale,weight_scale_2,input_scale}
-            #   experts.<id>.up_proj.{weight,weight_scale,weight_scale_2,input_scale}
-            #   experts.<id>.down_proj.{weight,weight_scale,weight_scale_2,input_scale}
-            # These need to be folded into sglang's fused FusedMoE params:
-            #   experts.w13_{weight,weight_scale,weight_scale_2,input_scale}
-            #     (gate->shard "w1", up->shard "w3")
-            #   experts.w2_{weight,weight_scale,weight_scale_2,input_scale}
-            #     (down->shard "w2")
-            per_expert_match = re.match(
-                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
-                r"\.(weight|weight_scale|weight_scale_2|input_scale)$",
-                name,
-            )
-            if per_expert_match:
-                prefix = per_expert_match.group(1)
-                expert_id = int(per_expert_match.group(2))
-                proj = per_expert_match.group(3)
-                suffix = per_expert_match.group(4)
-                if proj == "gate_proj":
-                    base, sid = "w13_weight", "w1"
-                elif proj == "up_proj":
-                    base, sid = "w13_weight", "w3"
-                else:  # down_proj
-                    base, sid = "w2_weight", "w2"
-                if suffix != "weight":
-                    # "weight_scale", "weight_scale_2", or "input_scale": replace
-                    # "weight" suffix in `base` with the actual scale suffix.
-                    if suffix.startswith("weight_"):
-                        base = base + "_" + suffix[len("weight_") :]
-                    elif suffix == "input_scale":
-                        # w13_weight -> w13_input_scale, w2_weight -> w2_input_scale
-                        base = base.replace("weight", "input_scale")
-                fused_name = prefix + base
-                if fused_name in params_dict:
-                    param = params_dict[fused_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
-                    loaded_params.add(fused_name)
-                continue
-
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
 
-            for param_name, weight_name, shard_ids in fused_expert_params_mapping:
-                name = orig_name
-                if weight_name not in name:
+            # 1) Per-expert checkpoint layout (compressed-tensors FP8 like
+            #    RedHatAI/*-FP8-Dynamic, ModelOpt NVFP4 like
+            #    nvidia/Gemma-4-*-NVFP4): experts.<id>.{gate,up,down}_proj.*
+            #    The trailing dot in `weight_name` lets a single mapping fold
+            #    weight, weight_scale, weight_scale_2, and input_scale into
+            #    their corresponding fused FusedMoE params (experts.w13_*,
+            #    experts.w2_*).
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in per_expert_params_mapping:
+                if weight_name not in orig_name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = orig_name.replace(weight_name, param_name)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                for i in range(num_experts):
-                    chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
-                    for chunk, sid in zip(chunks, shard_ids):
-                        weight_loader(param, chunk, name, sid, i)
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded_params.add(name)
                 break
             else:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                # 2) BF16 fused checkpoint layout: experts.gate_up_proj is a
+                #    [E, 2*I, H] tensor that needs per-expert chunking into
+                #    w1 (gate) and w3 (up).
+                for param_name, weight_name, shard_ids in fused_expert_params_mapping:
                     name = orig_name
                     if weight_name not in name:
                         continue
@@ -1105,25 +1097,42 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    if should_dup_k_to_v:
-                        weight_loader(param, loaded_weight, "v")
+                    for i in range(num_experts):
+                        chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
+                        for chunk, sid in zip(chunks, shard_ids):
+                            weight_loader(param, chunk, name, sid, i)
+                    loaded_params.add(name)
                     break
                 else:
-                    name = orig_name
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    for param_name, weight_name, shard_id in stacked_params_mapping:
+                        name = orig_name
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        if should_dup_k_to_v:
+                            weight_loader(param, loaded_weight, "v")
+                        loaded_params.add(name)
+                        break
+                    else:
+                        name = orig_name
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())

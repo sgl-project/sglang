@@ -265,10 +265,7 @@ MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
-# Activation names recognized by the modelopt quant paths. The mapping to
-# FlashInfer ``ActivationType`` is gating-aware and lives in
-# ``flashinfer_trtllm.get_activation_type`` (e.g. ``"gelu"`` becomes
-# ``Geglu`` for a gated layer and ``Gelu`` for a non-gated layer).
+
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 
 
