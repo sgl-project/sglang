@@ -135,6 +135,14 @@ SGL_DEVICE uint64_t splitmix64_mix(uint64_t prev_hash, uint64_t token_id, uint64
   return splitmix64_finalize(prev_hash ^ token_id ^ position);
 }
 
+// 4-arg chain step used by the canary slot chain. Folds the predecessor's full
+// (prev_hash, token_id, position, real_kv_hash) tuple into the new prev_hash.
+// In real-KV OFF mode the predecessor's real_kv_hash is always 0, collapsing
+// this to the same value the 3-arg form would have produced.
+SGL_DEVICE uint64_t splitmix64_mix4(uint64_t prev_hash, uint64_t token_id, uint64_t position, uint64_t real_kv_hash) {
+  return splitmix64_finalize(prev_hash ^ token_id ^ position ^ real_kv_hash);
+}
+
 // Fold a real-KV slot's bytes through splitmix64 in 8-byte chunks. The last
 // chunk is zero-padded if ``read_bytes`` is not a multiple of 8. Returns 0
 // when the feature is disabled (mode == OFF) or when no buffer/byte budget is
@@ -247,8 +255,10 @@ SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
         static_cast<uint64_t>(load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
     const int64_t prev_token = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
     const int64_t prev_position = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    expected_prev_hash =
-        splitmix64_mix(prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position));
+    const uint64_t prev_real_kv_hash =
+        static_cast<uint64_t>(load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+    expected_prev_hash = splitmix64_mix4(
+        prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position), prev_real_kv_hash);
   }
 
   // Independent verify-path fail_reason categories: (b) position monotonic,
@@ -311,7 +321,10 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
         static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
     const int64_t seed_token = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
     const int64_t seed_position = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    prev_hash = splitmix64_mix(seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position));
+    const uint64_t seed_real_kv_hash =
+        static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash));
+    prev_hash = splitmix64_mix4(
+        seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position), seed_real_kv_hash);
   }
 
   for (int64_t k = 0; k < entry_count; ++k) {
@@ -326,7 +339,8 @@ SGL_DEVICE void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(prev_hash));
     store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash, static_cast<int64_t>(real_kv_hash));
 
-    prev_hash = splitmix64_mix(prev_hash, static_cast<uint64_t>(token_id), static_cast<uint64_t>(position));
+    prev_hash =
+        splitmix64_mix4(prev_hash, static_cast<uint64_t>(token_id), static_cast<uint64_t>(position), real_kv_hash);
     atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
   }
 }

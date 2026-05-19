@@ -48,16 +48,39 @@ def splitmix64(value: int) -> int:
 
 
 def splitmix64_mix(prev_hash: int, token_id: int, position: int) -> int:
-    """Chain step: combine prev/token/position via XOR then splitmix64.
+    """3-arg mix: XOR three uint64s and run splitmix64.
 
     Bit-wise equivalent of the device-side ``splitmix64_mix`` in
-    ``canary.cuh``. ``test_splitmix64_consistency.py`` cross-validates the
-    two implementations.
+    ``canary.cuh``. Used for real-KV byte folding (where the third arg is
+    a zero pad). The canary slot chain advance uses :func:`splitmix64_mix4`.
     """
     assert (
         0 <= prev_hash <= _U64_MASK
     ), f"kv-canary: splitmix64_mix prev_hash {prev_hash:#x} out of uint64 range"
     combined = (prev_hash & _U64_MASK) ^ (token_id & _U64_MASK) ^ (position & _U64_MASK)
+    return splitmix64(combined)
+
+
+def splitmix64_mix4(
+    prev_hash: int, token_id: int, position: int, real_kv_hash: int
+) -> int:
+    """4-arg chain step used by the canary slot chain.
+
+    Folds the predecessor's full ``(prev_hash, token_id, position,
+    real_kv_hash)`` tuple into the new ``prev_hash``. In real-KV OFF mode
+    the predecessor's ``real_kv_hash`` is always 0, collapsing this to
+    the same value :func:`splitmix64_mix` would produce. Bit-wise
+    equivalent of the device-side ``splitmix64_mix4`` in ``canary.cuh``.
+    """
+    assert (
+        0 <= prev_hash <= _U64_MASK
+    ), f"kv-canary: splitmix64_mix4 prev_hash {prev_hash:#x} out of uint64 range"
+    combined = (
+        (prev_hash & _U64_MASK)
+        ^ (token_id & _U64_MASK)
+        ^ (position & _U64_MASK)
+        ^ (real_kv_hash & _U64_MASK)
+    )
     return splitmix64(combined)
 
 
@@ -107,11 +130,11 @@ def canary_step_torch_reference(
       chain over ``[entry_starts, entry_starts + entry_counts)`` and
       store ``(token_id, position, prev_hash, real_kv_hash)`` per slot.
       Chain head is either ``seed`` (when ``seed_slot < 0``) or
-      ``splitmix64_mix`` of the seed slot's stored
-      ``(prev_hash, token, position)``.
+      ``splitmix64_mix4`` of the seed slot's stored
+      ``(prev_hash, token, position, real_kv_hash)``.
     - **Verify path**: for every active verify entry, load the slot's
       stored fields plus the previous slot's fields, recompute
-      ``expected_prev_hash`` via ``splitmix64_mix``, and compare fail
+      ``expected_prev_hash`` via ``splitmix64_mix4``, and compare fail
       reasons in the same priority order as the kernel:
       ``POSITION_MONOTONIC`` > ``HASH`` > ``REAL_KV_HASH``.
     - **Violation ring + first-violation latch**: ``first_violation`` is
@@ -434,8 +457,15 @@ def _run_verify_entries(
             )
             prev_token = int_views.load_field(prev_slot_idx, _CANARY_FIELD_TOKEN_ID)
             prev_position = int_views.load_field(prev_slot_idx, _CANARY_FIELD_POSITION)
-            expected_prev_hash = splitmix64_mix(
-                prev_prev_hash, prev_token & _U64_MASK, prev_position & _U64_MASK
+            prev_real_kv_hash = (
+                int_views.load_field(prev_slot_idx, _CANARY_FIELD_REAL_KV_HASH)
+                & _U64_MASK
+            )
+            expected_prev_hash = splitmix64_mix4(
+                prev_prev_hash,
+                prev_token & _U64_MASK,
+                prev_position & _U64_MASK,
+                prev_real_kv_hash,
             )
 
         expected_real_kv_hash = real_kv_view.hash_slot(slot_idx)
@@ -494,10 +524,15 @@ def _run_write_chains(
             )
             seed_token = int_views.load_field(seed_slot_idx, _CANARY_FIELD_TOKEN_ID)
             seed_position = int_views.load_field(seed_slot_idx, _CANARY_FIELD_POSITION)
-            prev_hash = splitmix64_mix(
+            seed_real_kv_hash = (
+                int_views.load_field(seed_slot_idx, _CANARY_FIELD_REAL_KV_HASH)
+                & _U64_MASK
+            )
+            prev_hash = splitmix64_mix4(
                 seed_prev_hash,
                 seed_token & _U64_MASK,
                 seed_position & _U64_MASK,
+                seed_real_kv_hash,
             )
 
         for k in range(entry_count):
@@ -512,8 +547,11 @@ def _run_write_chains(
             int_views.store_field(slot_idx, _CANARY_FIELD_PREV_HASH, prev_hash)
             int_views.store_field(slot_idx, _CANARY_FIELD_REAL_KV_HASH, real_kv_hash)
 
-            prev_hash = splitmix64_mix(
-                prev_hash, token_id & _U64_MASK, position & _U64_MASK
+            prev_hash = splitmix64_mix4(
+                prev_hash,
+                token_id & _U64_MASK,
+                position & _U64_MASK,
+                real_kv_hash & _U64_MASK,
             )
             active_slots += 1
 

@@ -98,8 +98,8 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
     )
     torch.cuda.synchronize()
 
-    # Read prev_hash field (offset 24 bytes) from each slot.
-    stored = buf.view(torch.int64).view(n, slot_stride // 8)[:, 3].cpu().tolist()
+    # Read prev_hash field (offset 16 bytes = field index 2) from each slot.
+    stored = buf.view(torch.int64).view(n, slot_stride // 8)[:, 2].cpu().tolist()
 
     # Recompute the chain in Python.
     expected_prev = _SEED

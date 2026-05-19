@@ -176,12 +176,15 @@ def canary_step(
 
     - ``token_id``     — vocab id of the token this slot represents.
     - ``position``     — sequence position of the token within its request.
-    - ``prev_hash``    — running fingerprint over ``(token_id, position)`` of every chain element *strictly before*
+    - ``prev_hash``    — running fingerprint over the entire 4-field tuple of every chain element *strictly before*
                          this slot. Anchored on ``seed`` for the chain head. Successive slots are linked by
-                         ``next.prev_hash == hash(this.prev_hash, this.token_id, this.position)``; that link is
-                         exactly what Verify recomputes and asserts on.
+                         ``next.prev_hash == hash(this.prev_hash, this.token_id, this.position, this.real_kv_hash)``;
+                         that link is exactly what Verify recomputes and asserts on. Folding ``real_kv_hash`` into
+                         the chain means any tampering with a slot's *full* contents (not just token/position)
+                         propagates forward and gets caught at every later slot's verify.
     - ``real_kv_hash`` — fingerprint of a configurable prefix of the *real* KV-pool slot at the same index, captured
-                         at write time and re-checked at verify time. Zero when the real-KV mixin is disabled.
+                         at write time and re-checked at verify time. Zero when the real-KV mixin is disabled
+                         (in which case the chain collapses to a token/position-only fingerprint).
 
     A call does two independent operations on the shadow:
 
