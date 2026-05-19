@@ -2377,8 +2377,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # Quant configs like Quark may rely on the model to provide fused-module
         # mappings so exclusion checks can unfuse derived names back to the
         # checkpoint's source layer names.
+        # Use `update` to adapt modelslim quantization at same time.
         if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
-            quant_config.packed_modules_mapping = self.packed_modules_mapping
+            quant_config.packed_modules_mapping.update(self.packed_modules_mapping)
 
         self.pp_group = get_pp_group()
         self.config = config
