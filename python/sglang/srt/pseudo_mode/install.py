@@ -117,19 +117,15 @@ def _install_plan_patch(*, oracle: "PseudoOracle") -> None:
         if plan is None or plan.num_write == 0:
             return plan
         try:
-            expected_tokens, expected_positions = (
-                oracle.predict_input_tokens_for_plan(
-                    plan=plan, forward_batch=forward_batch
-                )
+            expected_tokens, expected_positions = oracle.predict_input_tokens_for_plan(
+                plan=plan, forward_batch=forward_batch
             )
         except (KeyError, IndexError) as exc:
             # Unknown req_pool_idx / out-of-range history can happen
             # transiently around admit/finish boundaries; skip the
             # expected fill for this forward rather than crashing the
             # whole step. The canary still verifies slot identity.
-            logger.warning(
-                "pseudo-mode plan patch: skipping expected fill (%s)", exc
-            )
+            logger.warning("pseudo-mode plan patch: skipping expected fill (%s)", exc)
             return plan
 
         return dataclasses.replace(
@@ -321,9 +317,7 @@ def _post_step_oracle_sync(
         if oracle.is_in_decode(rid):
             for k in range(prev_len, new_len):
                 try:
-                    oracle.commit_step(
-                        req_id=rid, output_token=int(req.output_ids[k])
-                    )
+                    oracle.commit_step(req_id=rid, output_token=int(req.output_ids[k]))
                 except (RuntimeError, KeyError) as exc:
                     logger.debug("pseudo-mode commit_step skipped: %s", exc)
                     break
@@ -381,9 +375,7 @@ def install_harness_ipc_handlers(*, scheduler: "Scheduler") -> None:
         try:
             result = handler(self_scheduler, **params)
         except Exception as exc:  # noqa: BLE001 — bubble up to harness
-            logger.warning(
-                "pseudo-mode RPC %s raised: %s", method, exc, exc_info=True
-            )
+            logger.warning("pseudo-mode RPC %s raised: %s", method, exc, exc_info=True)
             return RpcReqOutput(False, f"{type(exc).__name__}: {exc}")
 
         payload = base64.b64encode(pickle.dumps(result)).decode("ascii")
@@ -431,9 +423,7 @@ def _handle_pseudo_step(scheduler: "Scheduler") -> Dict[str, Any]:
     }
 
 
-def _handle_pseudo_force_preempt(
-    scheduler: "Scheduler", *, rid: str
-) -> Dict[str, Any]:
+def _handle_pseudo_force_preempt(scheduler: "Scheduler", *, rid: str) -> Dict[str, Any]:
     """Flag a rid for retraction on the next ``run_batch``.
 
     Best-effort: production ``retract_decode`` only fires on OOM and
@@ -447,9 +437,7 @@ def _handle_pseudo_force_preempt(
             if req.rid == rid:
                 running.release_req(i, len(running.reqs) - 1, scheduler.server_args)
                 running.filter_batch(
-                    keep_indices=[
-                        j for j in range(len(running.reqs)) if j != i
-                    ]
+                    keep_indices=[j for j in range(len(running.reqs)) if j != i]
                 )
                 found = True
                 break

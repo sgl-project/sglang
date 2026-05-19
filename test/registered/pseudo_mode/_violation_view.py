@@ -18,9 +18,6 @@ from dataclasses import dataclass
 from typing import List
 
 from sglang.jit_kernel.kv_cache_canary import (
-    KERNEL_KIND_HEAD,
-    KERNEL_KIND_TAIL,
-    FailReason,
     _VIOLATION_FIELD_ACTUAL_HASH,
     _VIOLATION_FIELD_EXPECTED_HASH,
     _VIOLATION_FIELD_EXPECTED_POSITION,
@@ -31,6 +28,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_REQ_ID,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
+    KERNEL_KIND_HEAD,
+    KERNEL_KIND_TAIL,
+    FailReason,
 )
 
 logger = logging.getLogger(__name__)

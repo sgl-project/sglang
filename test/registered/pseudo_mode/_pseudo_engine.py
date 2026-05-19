@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from test.registered.pseudo_mode._violation_view import CanaryViolationView
 from typing import Any, Dict, List, Optional
 
 import zmq
@@ -42,8 +43,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.pseudo_mode.install import decode_harness_ipc_payload
 from sglang.srt.sampling.sampling_params import SamplingParams
-
-from test.registered.pseudo_mode._violation_view import CanaryViolationView
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +177,7 @@ class PseudoEngine:
                 eos_at,
             )
         rid = req_id if req_id is not None else f"pseudo-{uuid.uuid4().hex[:12]}"
-        sampling_params = SamplingParams(
-            max_new_tokens=max_new_tokens, temperature=0.0
-        )
+        sampling_params = SamplingParams(max_new_tokens=max_new_tokens, temperature=0.0)
         sampling_params.normalize(None)
         sampling_params.verify(None)
         tokenized = TokenizedGenerateReqInput(
@@ -369,7 +366,5 @@ class PseudoEngine:
                 f"PseudoEngine: unexpected RPC reply type {type(reply)!r}"
             )
         if not reply.success:
-            raise RuntimeError(
-                f"PseudoEngine: RPC {method} failed: {reply.message}"
-            )
+            raise RuntimeError(f"PseudoEngine: RPC {method} failed: {reply.message}")
         return decode_harness_ipc_payload(reply.message)

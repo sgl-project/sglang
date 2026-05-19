@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import time
 import unittest
-
-from sglang.test.ci.ci_register import register_cuda_ci
-
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
+
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
