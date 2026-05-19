@@ -349,7 +349,7 @@ class TestDSAModelConfigurator(unittest.TestCase):
 
     @contextlib.contextmanager
     def _pool_shape_only_allocation(self):
-        def fake_tensor_from_args(args, kwargs):
+        def fake_tensor_from_args(*args, **kwargs):
             if len(args) == 1 and isinstance(args[0], (tuple, list, torch.Size)):
                 shape = tuple(args[0])
             else:
