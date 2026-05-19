@@ -126,12 +126,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if self.forward_mode is not None and self.forward_mode.is_target_verify() and self.if_use_v2:
+        if self.if_use_v2:
             return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if self.forward_mode is not None and self.forward_mode.is_target_verify() and self.if_use_v2:
+        if self.if_use_v2:
             return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
