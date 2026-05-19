@@ -8,6 +8,11 @@ name: Notify RL360 of prod update
 # private key in secrets.DEPLOY_BOT_PRIVATE_KEY). App must be installed on
 # both this repo and LLM360/RL360.
 
+# This workflow never uses GITHUB_TOKEN: it authenticates as the
+# llm360-deploy-bot App (private key) and dispatches via the resulting App
+# installation token. Strip GITHUB_TOKEN to zero scopes.
+permissions: {}
+
 on:
   push:
     branches: [prod]
