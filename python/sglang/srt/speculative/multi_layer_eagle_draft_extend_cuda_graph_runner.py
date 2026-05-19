@@ -517,6 +517,19 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int
     ):
         buffers = self.buffers
+        # Pad buffers when bs > raw_bs to prevent stale values in padding region.
+        # Without this, init_forward_metadata_replay_cuda_graph() receives stale
+        # req_pool_indices causing OOB indexing in req_to_token lookup.
+        # Mirrors the padding logic in eagle_draft_extend_cuda_graph_runner.py.
+        if bs > raw_bs:
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+            buffers.out_cache_loc.zero_()
+            buffers.positions.zero_()
+            buffers.req_pool_indices.zero_()
+            if hasattr(buffers, "accept_length"):
+                buffers.accept_length.fill_(self.num_tokens_per_bs)
+            if hasattr(buffers, "extend_seq_lens"):
+                buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
@@ -548,6 +561,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
+            if bs > raw_bs:
+                self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (bs - raw_bs)
 
     def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
