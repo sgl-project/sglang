@@ -234,7 +234,10 @@ inline void canary_write_step_cuda(
 
   TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLCUDA>(device_).verify(canary_buf);
 
-  // write_offsets has shape [write_req_capacity + 1].
+  // write_offsets has shape [write_req_capacity + 1]; the length relationship is pinned by the
+  // RuntimeCheck below, this matcher pins dtype + device.
+  SymbolicSize N_write_offsets = {"write_offsets_len"};
+  TensorMatcher({N_write_offsets}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_offsets);
   TensorMatcher({N_write_reqs}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_seed_slot_indices);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_num_valid_reqs);
 
