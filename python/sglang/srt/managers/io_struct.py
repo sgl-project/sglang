@@ -1076,10 +1076,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[int]
+    decode_ids: List[array]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
