@@ -524,14 +524,12 @@ def _plan_phase3_kernel(
     )
 
     if HAS_SWA_LUT:
-        slot = _swa_translate_tile(
-            raw=slot_full, mask=j_mask, lut_ptr=full_to_swa_lut_ptr, lut_len=swa_lut_len
-        )
+        slot = _swa_translate_tile(slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len)
         prev_translated = _swa_translate_tile(
-            raw=prev_slot_full,
-            mask=prev_pos_valid,
-            lut_ptr=full_to_swa_lut_ptr,
-            lut_len=swa_lut_len,
+            prev_slot_full,
+            prev_pos_valid,
+            full_to_swa_lut_ptr,
+            swa_lut_len,
         )
     else:
         slot = slot_full
@@ -562,7 +560,7 @@ def _plan_phase3_kernel(
 
 
 @triton.jit
-def _swa_translate_tile(*, raw, mask, lut_ptr, lut_len):
+def _swa_translate_tile(raw, mask, lut_ptr, lut_len):
     """SWA-translate a tile of slot indices. Sentinels (raw < 0) are passed through unchanged.
 
     ``lut_len`` is the LUT's length (Python int from the host wrapper); when 0 the LUT is unused (the caller
