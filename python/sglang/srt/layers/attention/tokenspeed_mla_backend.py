@@ -40,10 +40,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
-from sglang.srt.utils import is_tokenspeed_mla_available
+from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
+
+if is_flashinfer_available():
+    import flashinfer.rope as _flashinfer_rope
 
 if is_tokenspeed_mla_available():
-    import flashinfer.rope as _flashinfer_rope
     import tokenspeed_mla
 
 if TYPE_CHECKING:
@@ -81,6 +83,9 @@ def _get_tokenspeed_workspace(
     return _g_tokenspeed_workspace[device]
 
 
+# TODO(Qiaolin-Yu): Merge this attention backend into trtllm_mla_backend.py
+# once the same CuteDSL kernels in flashinfer_trtllm are stable
+# and there is no performance gap compared to this backend.
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
