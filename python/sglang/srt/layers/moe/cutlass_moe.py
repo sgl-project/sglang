@@ -175,12 +175,12 @@ def cutlass_fused_experts_fp8(
             w2_q.shape[1] // 32,
             w2_q.shape[2],
         )
-        assert w1_scale.shape == expected_w1_scale_shape, (
-            f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
-        )
-        assert w2_scale.shape == expected_w2_scale_shape, (
-            f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
-        )
+        assert (
+            w1_scale.shape == expected_w1_scale_shape
+        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        assert (
+            w2_scale.shape == expected_w2_scale_shape
+        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
 
         mxfp8_blockscale_align = 128
         total_tokens = m * topk
@@ -435,13 +435,13 @@ def cutlass_moe_fp4(
         "Number of experts must match",
         " between weights.",
     )
-    assert k_a // 2 == half_k_w1 and params.hidden_size == k_w2, (
-        "Hidden size mismatch between a, w1 and w2"
-    )
+    assert (
+        k_a // 2 == half_k_w1 and params.hidden_size == k_w2
+    ), "Hidden size mismatch between a, w1 and w2"
     assert (
         nx2_w1 == params.intermediate_size_per_partition * 2
         and half_n_w2 == params.intermediate_size_per_partition // 2
-    ), "mismatch in expected `n`"
+    ), ("mismatch in " "expected `n`")
     assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 

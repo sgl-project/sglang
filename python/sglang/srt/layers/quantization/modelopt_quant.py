@@ -317,7 +317,9 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):  # noqa: B027
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
         # Map excluded module patterns from HF layout to sglang layout.
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
         # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
@@ -1043,9 +1045,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 )
                 or activation is ActivationType.Swiglu
                 and self.moe_runner_config.is_gated
-            ), (
-                "Only Relu2 non-gated or Swiglu gated are supported for flashinfer cutlass fp8 moe"
-            )
+            ), "Only Relu2 non-gated or Swiglu gated are supported for flashinfer cutlass fp8 moe"
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
             output_dtype = x.dtype
@@ -1744,9 +1744,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 assert w.shape == (layer.num_experts,)
                 assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
                 return w[
-                    layer.moe_ep_rank * layer.num_local_experts : (
-                        layer.moe_ep_rank + 1
-                    )
+                    layer.moe_ep_rank
+                    * layer.num_local_experts : (layer.moe_ep_rank + 1)
                     * layer.num_local_experts
                 ]
 
@@ -1806,9 +1805,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
                 }
-                assert weight_scale.shape[-1] == expected_blocks[name], (
-                    f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
-                )
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
             else:
                 if weight_scale.shape[assert_dim] % 4 != 0:
                     logger.warning(
@@ -1817,9 +1816,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         tuple(weight_scale.shape),
                         getattr(self.quant_config, "group_size", None),
                     )
-            assert weight_scale.dtype == torch.float8_e4m3fn, (
-                f"{name} Weight Blockscale must be represented as FP8-E4M3"
-            )
+            assert (
+                weight_scale.dtype == torch.float8_e4m3fn
+            ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
         if (
@@ -2015,9 +2014,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # consume them.
         activation = self.moe_runner_config.activation
 
-        assert activation in ACT_STR_TO_TYPE_MAP, (
-            f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
-        )
+        assert (
+            activation in ACT_STR_TO_TYPE_MAP
+        ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
         # FlashInfer TRTLLM FP4 path
@@ -2099,9 +2098,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
+            assert (
+                not moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             x = dispatch_output.hidden_states
