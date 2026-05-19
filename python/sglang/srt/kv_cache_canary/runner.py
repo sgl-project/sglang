@@ -656,6 +656,9 @@ class CanaryRunner:
                 )
                 continue
             assert forward_batch is not None and positions is not None
+            num_tokens = int(positions.shape[0])
+            expected_tokens_slice = self._expected_input_tokens[:num_tokens]
+            expected_positions_slice = self._expected_input_positions[:num_tokens]
             endpoint.launch_per_forward(
                 verify_plan=verify_plan,
                 write_plan=self._write_plan_per_forward,
@@ -663,8 +666,8 @@ class CanaryRunner:
                 fb_positions=positions,
                 fb_out_cache_loc=out_cache_loc,
                 input_check_mode=self.config.input_check_mode,
-                expected_input_tokens=self._expected_input_tokens,
-                expected_input_positions=self._expected_input_positions,
+                expected_input_tokens=expected_tokens_slice,
+                expected_input_positions=expected_positions_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self.config.real_kv_hash_mode,
             )
