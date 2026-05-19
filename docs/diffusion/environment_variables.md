@@ -87,6 +87,7 @@ These variables configure S3-compatible cloud storage for automatically uploadin
 | `SGLANG_S3_REGION_NAME`         | us-east-1 | AWS region name                                      |
 | `SGLANG_S3_ACCESS_KEY_ID`       | not set | AWS Access Key ID                                      |
 | `SGLANG_S3_SECRET_ACCESS_KEY`   | not set | AWS Secret Access Key                                  |
+| `SGLANG_S3_UPLOAD_TIMEOUT`      | 60      | Upload timeout in seconds for S3 and presigned URL uploads |
 
 ## CUDA Crash Debugging
 
