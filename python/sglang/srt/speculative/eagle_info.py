@@ -438,7 +438,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if not req.finished() and req.grammar is not None:
                     try:
                         req.grammar.accept_token(id)
@@ -447,7 +447,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                             f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                         )
                         raise e
-                    req.check_finished()
+                    req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
@@ -1012,6 +1012,10 @@ class EagleVerifyOutput:
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accept_indices: torch.Tensor
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.sample` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(

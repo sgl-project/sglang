@@ -354,6 +354,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_state_buf_infos(self):
+        if self.index_head_dim is None:
+            return [], [], []
         data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
         data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
