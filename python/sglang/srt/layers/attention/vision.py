@@ -706,11 +706,8 @@ class VisionAscendAttention(nn.Module):
             seq_len_arg = cu_seqlens
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu_seqlens[1:].to(torch.int32)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
@@ -718,16 +715,18 @@ class VisionAscendAttention(nn.Module):
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
         seq_len_arg = seq_len_arg.tolist()
-        output = torch_npu.npu_fusion_attention(
+        output = torch_npu.npu_fused_infer_attention_score(
             query=q,
             key=k,
             value=v,
-            actual_seq_qlen=seq_len_arg,
-            actual_seq_kvlen=seq_len_arg,
+            actual_seq_lengths=seq_len_arg,
+            actual_seq_lengths_kv=seq_len_arg,
             scale=scale_value,
-            head_num=num_heads,
+            num_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=0,
             input_layout="TND"
-        )
+        )[0]
         return output
 
 
