@@ -3,17 +3,14 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary import KERNEL_KIND_HEAD, KERNEL_KIND_TAIL
 from sglang.srt.kv_cache_canary.api import (
     attach,
-    finalize_replay,
     get_runners,
-    launch_canary_for_capture,
-    prepare_replay,
     run_head,
     run_tail,
 )
@@ -26,6 +23,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FORWARD_PATCHED_ATTR = "_kv_cache_canary_forward_patched"
+
+# Thread-local flag set by ``patched_replay`` around the ``original_replay``
+# call so the inner ``patched_model_forward`` (invoked through the captured
+# replay's inner ``model.forward``) knows the outer wrapper has already
+# launched the canary kernel pair and skips its own eager-path launch.
+_replay_in_flight = threading.local()
+
+
+def _is_inside_replay() -> bool:
+    return bool(getattr(_replay_in_flight, "active", False))
 
 
 def install_on_model_runner(
@@ -163,20 +170,26 @@ def _is_swa_pool(pool: object) -> bool:
 def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
     """Wrap ``model_runner.model.forward`` to run the canary kernel pair.
 
-    Three execution paths, all routed through this single wrapper:
+    Two execution paths, both routed through this single wrapper:
 
-    1. **Eager** (prefill/extend/decode outside cuda graph): builds a
-       ``BatchPlan`` from the ``ForwardBatch``, launches head kernel,
+    1. **Eager** (prefill/extend/decode outside any cuda graph): builds a
+       ``BatchPlan`` from the live ``ForwardBatch``, launches head kernel,
        runs real forward, launches tail kernel, ends forward.
-    2. **CUDA graph capture**: ``is_current_stream_capturing()`` is True.
-       We CANNOT compute a real plan here. Instead, we launch head+tail
-       kernels reading from the runner's fixed launch buffers — their
-       default skip-sentinel makes the recorded kernel a no-op. Replay-time
-       refill (see #3) turns the same recorded launches into real
-       verify/write work.
-    3. **CUDA graph replay**: handled by
-       :func:`_patch_cuda_graph_runner_replay_class_method` patching
-       ``CudaGraphRunner.replay``.
+    2. **Cuda graph capture** and **replay**: handled by
+       :func:`_patch_cuda_graph_runner_replay_class_method` patching the
+       graph runner's ``replay`` so the canary kernel pair runs **eagerly
+       around** ``original_replay``. The kernel is intentionally NOT
+       captured into any graph — capture-time recording of the
+       skip-sentinel buffer reset would clobber the replay-time refill
+       (see ``CanaryRunner.launch_for_capture``), and piecewise sub-graphs
+       don't include the canary at all anyway. Running purely outside the
+       graph keeps the wiring uniform across CudaGraphRunner / piecewise /
+       spec-decoding draft runners.
+
+    At capture time the wrapper short-circuits when inside a cuda graph
+    capture (so the canary kernel is not recorded into the captured
+    sub-graphs); the actual canary launches happen around the captured
+    replay via :func:`_patch_graph_runner_class_replay`.
     """
     model = model_runner.model
     original_forward = model.forward
@@ -193,10 +206,20 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         if is_capturing:
-            launch_canary_for_capture(runners, kernel_kind=KERNEL_KIND_HEAD)
-            output = original_forward(*args, **kwargs)
-            launch_canary_for_capture(runners, kernel_kind=KERNEL_KIND_TAIL)
-            return output
+            # Don't record canary kernels into ANY captured graph: the
+            # replay-side patched_replay launches them eagerly around
+            # the captured replay instead. Capturing here would also
+            # bake in a skip-sentinel buffer reset that wipes the
+            # replay-side refill — see CanaryRunner.launch_for_capture.
+            return original_forward(*args, **kwargs)
+
+        # If we're inside a patched_replay (CudaGraphRunner / piecewise /
+        # spec draft), the canary kernel pair is already launched
+        # eagerly around the outer replay; skip the inner-eager
+        # invocation so we don't double-launch and don't fail-build a
+        # plan from the padded static forward batch.
+        if _is_inside_replay():
+            return original_forward(*args, **kwargs)
 
         maybe_perturb_hook(
             runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
@@ -281,9 +304,26 @@ def _patch_graph_runner_class_replay(cls: type) -> None:
         maybe_perturb_hook(
             runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
         )
-        plans = prepare_replay(runners=runners, forward_batch=forward_batch)
-        output = original_replay(self, forward_batch, *args, **kwargs)
-        finalize_replay(runners=runners, plans=plans)
+        # Launch the canary kernel pair EAGERLY around the captured
+        # replay. ``run_head`` reads from the LIVE forward_batch (correct
+        # sizes / real req_pool_indices); the captured replay then runs
+        # the model itself; ``run_tail`` re-reads the same plan post-
+        # forward. Both kernels run outside any captured graph — see
+        # ``_patch_model_forward`` for why we don't bake the canary into
+        # the cuda graph.
+        plans = run_head(runners=runners, forward_batch=forward_batch)
+        # Set the thread-local "inside replay" flag so the inner
+        # patched_model_forward (invoked when piecewise replay calls
+        # model.forward on its static_forward_batch) skips its own
+        # eager-path canary launch and doesn't double-fire. The flag
+        # travels with the thread, so it works regardless of whether
+        # piecewise constructs a new ForwardBatch object for the model.
+        _replay_in_flight.active = True
+        try:
+            output = original_replay(self, forward_batch, *args, **kwargs)
+        finally:
+            _replay_in_flight.active = False
+        run_tail(runners=runners, plans=plans)
         return output
 
     cls.replay = patched_replay
