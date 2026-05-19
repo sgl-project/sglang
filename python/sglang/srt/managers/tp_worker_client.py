@@ -47,7 +47,10 @@ import torch
 import zmq
 
 from sglang.srt.managers.tp_worker import BaseTpWorker
-from sglang.srt.managers.tp_worker_server import M_DECODE_STEP
+from sglang.srt.managers.tp_worker_server import (
+    M_DECODE_STEP,
+    STATUS_OK_MSGPACK,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -60,6 +63,41 @@ logger = logging.getLogger(__name__)
 
 STATUS_OK = b"ok"
 STATUS_ERROR = b"error"
+
+
+def _encode_decode_step_control(kwargs: dict) -> bytes:
+    """Encode a dict of M_DECODE_STEP control kwargs as msgpack via the
+    ``DecodeStepControl`` typed schema. Used by the Python scheduler to
+    speak the Rust-decodable wire format with the worker.
+
+    Raises any exception from msgspec encoding or tensor conversion; the
+    caller is expected to fall back to pickle on failure.
+    """
+    import msgspec
+    import pickle as _pickle
+    from sglang.srt.managers.io_struct.msgpack_struct import DecodeStepControl
+    from sglang.srt.managers.io_struct import tensor_to_ipc
+
+    si = kwargs.get("sampling_info")
+    typed = DecodeStepControl(
+        seq_lens=tensor_to_ipc(kwargs["seq_lens"]),
+        seq_lens_cpu=tensor_to_ipc(kwargs["seq_lens_cpu"]),
+        orig_seq_lens=tensor_to_ipc(kwargs["orig_seq_lens"]),
+        seq_lens_sum=kwargs["seq_lens_sum"],
+        input_ids=tensor_to_ipc(kwargs.get("input_ids")),
+        indices_to_free=tensor_to_ipc(kwargs.get("indices_to_free")),
+        sampling_info_pickle=(
+            _pickle.dumps(si) if si is not None else None
+        ),
+        mamba_track_indices=tensor_to_ipc(kwargs.get("mamba_track_indices")),
+        mamba_track_mask=tensor_to_ipc(kwargs.get("mamba_track_mask")),
+        mamba_track_seqlens=tensor_to_ipc(kwargs.get("mamba_track_seqlens")),
+        global_num_tokens=kwargs.get("global_num_tokens"),
+        global_num_tokens_for_logprob=kwargs.get("global_num_tokens_for_logprob"),
+        input_slot=kwargs.get("input_slot"),
+        output_slot=kwargs.get("output_slot"),
+    )
+    return msgspec.msgpack.encode(typed)
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +361,50 @@ class TpWorkerClient(BaseTpWorker):
     # ------------------------------------------------------------------
 
     def _rpc_send(self, method: bytes, **kwargs) -> None:
-        """Enqueue an RPC request without waiting for the reply."""
+        """Enqueue an RPC request without waiting for the reply.
+
+        For ``M_DECODE_STEP`` we can send a typed msgpack control message
+        instead of a pickled dict — the worker decodes it as a
+        ``DecodeStepControl`` struct (see ``DecodeStepControl`` in
+        msgpack_struct.py). Other methods stay on pickle for now; the
+        Rust scheduler that will drive M_DECODE_STEP doesn't need
+        Rust-decodable wire for the rare paths.
+        """
+        import os
+        if (
+            method == M_DECODE_STEP
+            and os.environ.get("SGLANG_MSGPACK_DECODE_CONTROL", "1") == "1"
+        ):
+            try:
+                payload = _encode_decode_step_control(kwargs)
+                # 3-frame envelope: [method, b"mp", msgpack_bytes]. Worker
+                # checks for the b"mp" middle frame to route to msgpack
+                # decode. Stays back-compat with the 2-frame pickle path.
+                self._socket.send_multipart([method, b"mp", payload])
+                return
+            except Exception:
+                # Defensive: anything unrepresentable in the typed struct
+                # (rare path) falls back to pickle silently.
+                pass
         payload = pickle.dumps(kwargs)
         self._socket.send_multipart([method, payload])
 
     def _rpc_recv(self) -> Any:
-        """Receive and return the reply from the most recent _rpc_send."""
+        """Receive and return the reply from the most recent _rpc_send.
+
+        Status byte tells us how the payload is encoded:
+          * STATUS_OK              — pickle (legacy / non-hot-path methods)
+          * STATUS_OK_MSGPACK      — typed msgspec ``DecodeForwardReplySlim``
+                                     (the Rust-decodable hot-path encoding)
+          * STATUS_ERROR           — pickled error string
+        """
         status, result_bytes = self._socket.recv_multipart()
+        if status == STATUS_OK_MSGPACK:
+            import msgspec
+            from sglang.srt.managers.io_struct.msgpack_struct import (
+                DecodeForwardReplySlim,
+            )
+            return msgspec.msgpack.decode(result_bytes, type=DecodeForwardReplySlim)
         result = pickle.loads(result_bytes)
         if status == STATUS_ERROR:
             raise RuntimeError(f"TpWorkerServer raised an error: {result}")
@@ -533,10 +608,18 @@ class TpWorkerClientGroup(BaseTpWorker):
         return self._last_req_pool_fp is not None and fp == self._last_req_pool_fp
 
     def _maybe_rehydrate_decode_reply(self, slim):
-        """Rehydrate the worker's slim reply dict (decode OR prefill) into a
-        ``GenerationBatchResult``.  Returns *slim* unchanged if it's already
-        a full result object.
+        """Rehydrate the worker's slim reply into a ``GenerationBatchResult``.
+
+        Accepts three reply shapes:
+          1. Legacy dict with ``_slim_decode: True`` (pickle wire).
+          2. Typed ``DecodeForwardReplySlim`` msgspec.Struct (msgpack wire).
+          3. Anything else (full GenerationBatchResult) — pass through.
         """
+        from sglang.srt.managers.io_struct.msgpack_struct import (
+            DecodeForwardReplySlim,
+        )
+        if isinstance(slim, DecodeForwardReplySlim):
+            return self._rehydrate_typed_slim(slim)
         if isinstance(slim, dict) and slim.get("_slim_decode"):
             from sglang.srt.managers.utils import GenerationBatchResult
             return GenerationBatchResult(
@@ -552,6 +635,47 @@ class TpWorkerClientGroup(BaseTpWorker):
                 next_draft_input=slim.get("next_draft_input"),
             )
         return slim
+
+    def _rehydrate_typed_slim(self, ipc):
+        """Convert a typed ``DecodeForwardReplySlim`` msgspec.Struct back to
+        a ``GenerationBatchResult``. The Rust-decodable wire format is
+        ``TensorIPC`` for tensors and opaque pickle blobs for the rare
+        rich-Python-object fields."""
+        import pickle as _pickle
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.managers.io_struct import ipc_to_tensor
+
+        da = None
+        if ipc.deferred_alloc is not None:
+            d = ipc.deferred_alloc
+            da = {
+                "mode": d.mode,
+                "req_pool_indices": ipc_to_tensor(d.req_pool_indices),
+                "out_cache_loc": ipc_to_tensor(d.out_cache_loc),
+                "free_pages_remaining": d.free_pages_remaining,
+            }
+            if d.seq_lens_minus1 is not None:
+                da["seq_lens_minus1"] = ipc_to_tensor(d.seq_lens_minus1)
+            if d.prefix_lens is not None:
+                da["prefix_lens"] = ipc_to_tensor(d.prefix_lens)
+            if d.extend_lens is not None:
+                da["extend_lens"] = ipc_to_tensor(d.extend_lens)
+
+        def _unpkl(b):
+            return _pickle.loads(b) if b is not None else None
+
+        return GenerationBatchResult(
+            next_token_ids=ipc_to_tensor(ipc.next_token_ids),
+            deferred_alloc=da,
+            accept_lens=ipc_to_tensor(ipc.accept_lens),
+            can_run_cuda_graph=ipc.can_run_cuda_graph,
+            num_accepted_drafts=ipc.num_accepted_drafts,
+            num_accepted_drafts_per_req_cpu=ipc.num_accepted_drafts_per_req_cpu,
+            logits_output=_unpkl(ipc.logits_output_pickle),
+            routed_experts_output=_unpkl(ipc.routed_experts_output_pickle),
+            expert_distribution_metrics=_unpkl(ipc.expert_distribution_metrics_pickle),
+            next_draft_input=_unpkl(ipc.next_draft_input_pickle),
+        )
 
     def _build_decode_control(
         self,

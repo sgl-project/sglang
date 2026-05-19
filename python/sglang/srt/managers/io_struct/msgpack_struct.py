@@ -13,6 +13,93 @@ from sglang.srt.observability.req_time_stats import (
     ReqTimeStatsBase,
 )
 
+class TensorIPC(msgspec.Struct, tag=True):
+    """Compact wire-format for a CPU torch.Tensor.
+
+    Designed so a Rust scheduler / worker can decode it natively without
+    needing pickle. Encode/decode helpers live in ``tensor_to_ipc`` and
+    ``ipc_to_tensor`` (see ``managers/io_struct/__init__.py``).
+    """
+
+    # Raw little-endian byte representation of the tensor's storage.
+    data: bytes
+    # Tensor shape (use [] for a 0-d scalar tensor).
+    shape: List[int]
+    # Torch dtype name without the "torch." prefix (e.g. "int64", "int32",
+    # "float32"). Both sides use ``torch.{dtype}`` to resolve.
+    dtype: str
+
+
+class DeferredAllocIPC(msgspec.Struct, tag=True):
+    """Worker → scheduler GPU-allocated KV slot indices (CpuScheduler path)."""
+
+    mode: str  # "decode" | "extend"
+    req_pool_indices: TensorIPC
+    out_cache_loc: TensorIPC
+    # Decode-only fields.
+    seq_lens_minus1: Optional[TensorIPC] = None
+    # Extend-only fields.
+    prefix_lens: Optional[TensorIPC] = None
+    extend_lens: Optional[TensorIPC] = None
+    free_pages_remaining: int = 0
+
+
+class DecodeStepControl(msgspec.Struct, tag=True):
+    """M_DECODE_STEP control message: scheduler → worker.
+
+    Delta-only payload for the decode fast path. Stable fields
+    (req_pool_indices, lora_ids, forward_mode, etc.) live on the worker's
+    cached batch and are not re-sent.
+
+    Rust-decodable wire format. ``sampling_info_pickle`` is the one
+    holdout — sampling_info has nested object references and rare
+    branches we haven't fully audited, so we ferry it as an opaque blob.
+    """
+
+    seq_lens: TensorIPC
+    seq_lens_cpu: TensorIPC
+    orig_seq_lens: TensorIPC
+    seq_lens_sum: int
+    # None when input_slot is set — worker resolves input_ids from the
+    # FutureMap slot in that case.
+    input_ids: Optional[TensorIPC] = None
+    indices_to_free: Optional[TensorIPC] = None
+    sampling_info_pickle: Optional[bytes] = None
+    mamba_track_indices: Optional[TensorIPC] = None
+    mamba_track_mask: Optional[TensorIPC] = None
+    mamba_track_seqlens: Optional[TensorIPC] = None
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+    # FutureMap pipeline contract (see TpWorkerServer._future_tokens).
+    input_slot: Optional[int] = None
+    output_slot: Optional[int] = None
+
+
+class DecodeForwardReplySlim(msgspec.Struct, tag=True):
+    """Slim reply for M_DECODE_STEP / M_FORWARD_GENERATION on the
+    CpuScheduler path. Reconstructed into a GenerationBatchResult on the
+    scheduler side (see ``TpWorkerClientGroup._maybe_rehydrate_decode_reply``).
+
+    Designed for native decoding from Rust — the rich-Python-object
+    fallback fields (``logits_output``, ``routed_experts_output``,
+    ``expert_distribution_metrics``) are carried as opaque pickle blobs
+    because they only show up on rare paths (logprob streaming, MoE
+    metrics) the Rust scheduler will skip for now.
+    """
+
+    next_token_ids: TensorIPC
+    deferred_alloc: Optional[DeferredAllocIPC] = None
+    accept_lens: Optional[TensorIPC] = None
+    can_run_cuda_graph: bool = False
+    num_accepted_drafts: int = 0
+    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
+    # Opaque blobs for the rare paths.
+    logits_output_pickle: Optional[bytes] = None
+    routed_experts_output_pickle: Optional[bytes] = None
+    expert_distribution_metrics_pickle: Optional[bytes] = None
+    next_draft_input_pickle: Optional[bytes] = None
+
+
 class LoRAMetrics(msgspec.Struct, tag=True):
     """LoRA adapter pool metrics."""
 

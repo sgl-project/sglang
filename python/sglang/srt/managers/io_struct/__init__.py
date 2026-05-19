@@ -221,6 +221,56 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 PICKLE_MAGIC_NUMBER = b"0xSG01"
 MSGPACK_MAGIC_NUMBER = b"0xSG02"
 
+
+# ---------------------------------------------------------------------------
+# TensorIPC <-> torch.Tensor helpers.
+#
+# These bridge the typed msgspec wire (consumable from a Rust scheduler)
+# with PyTorch tensors on both sides of the IPC. CPU-only by design — the
+# worker D2Hs everything before encoding, and the scheduler never touches
+# GPU memory.
+# ---------------------------------------------------------------------------
+
+
+def tensor_to_ipc(t):
+    """Encode a CPU ``torch.Tensor`` as a ``TensorIPC`` for msgpack
+    transport. Returns ``None`` if *t* is ``None``."""
+    if t is None:
+        return None
+    from .msgpack_struct import TensorIPC
+    import torch  # local — keep top-level imports light
+    if t.is_cuda:
+        # Defensive: D2H here would silently materialize. The caller is
+        # expected to have called _move_generation_result_to_cpu first.
+        raise RuntimeError("tensor_to_ipc requires a CPU tensor")
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return TensorIPC(
+        data=bytes(t.numpy().tobytes()),
+        shape=list(t.shape),
+        dtype=str(t.dtype).replace("torch.", ""),
+    )
+
+
+def ipc_to_tensor(ipc):
+    """Decode a ``TensorIPC`` back to a CPU ``torch.Tensor``. Returns
+    ``None`` if *ipc* is ``None``."""
+    if ipc is None:
+        return None
+    import torch
+    import numpy as np
+    np_dtype = np.dtype(ipc.dtype)
+    if ipc.shape:
+        arr = np.frombuffer(ipc.data, dtype=np_dtype).reshape(ipc.shape)
+    else:
+        arr = np.frombuffer(ipc.data, dtype=np_dtype)
+    # ``frombuffer`` is read-only; copy so torch.from_numpy yields a
+    # writable tensor (and to detach from the IPC bytes buffer).
+    return torch.from_numpy(arr.copy())
+
+
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Function:
     description: Optional[str] = None
