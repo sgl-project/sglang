@@ -717,15 +717,16 @@ class VisionAscendAttention(nn.Module):
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        torch_npu._npu_flash_attention_unpad(
+        seq_len_arg = seq_len_arg.tolist()
+        output = torch_npu.npu_fusion_attention(
             query=q,
             key=k,
             value=v,
-            seq_len=seq_len_arg,
-            scale_value=scale_value,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            out=output,
+            actual_seq_qlen=seq_len_arg,
+            actual_seq_kvlen=seq_len_arg,
+            scale=scale_value,
+            head_num=num_heads,
+            input_layout="TND"
         )
         return output
 
