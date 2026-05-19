@@ -203,36 +203,16 @@ class TestPriorityScheduling(CustomTestCase):
         # ignore_eos on both: priority=0 stays running when priority=5 arrives
         # (exercises the no-preempt path), and priority=5's runtime must exceed
         # the stagger so its server-side e2e_latency stays > priority=0's.
+        async def _send(priority, **sampling):
+            return await send_concurrent_generate_requests_with_custom_params(
+                self.base_url,
+                [{"priority": priority, "sampling_params": sampling}],
+            )
+
         async def _run():
-            first = asyncio.create_task(
-                send_concurrent_generate_requests_with_custom_params(
-                    self.base_url,
-                    [
-                        {
-                            "priority": 0,
-                            "sampling_params": {
-                                "max_new_tokens": 1000,
-                                "ignore_eos": True,
-                            },
-                        }
-                    ],
-                )
-            )
+            first = asyncio.create_task(_send(0, max_new_tokens=1000, ignore_eos=True))
             await asyncio.sleep(1.0)
-            second = asyncio.create_task(
-                send_concurrent_generate_requests_with_custom_params(
-                    self.base_url,
-                    [
-                        {
-                            "priority": 5,
-                            "sampling_params": {
-                                "max_new_tokens": 1000,
-                                "ignore_eos": True,
-                            },
-                        }
-                    ],
-                )
-            )
+            second = asyncio.create_task(_send(5, max_new_tokens=1000, ignore_eos=True))
             return (await first) + (await second)
 
         responses = asyncio.run(_run())
