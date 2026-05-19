@@ -127,7 +127,9 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env={"TRANSFORMERS_VERBOSITY": "error",}
+            env={
+                "TRANSFORMERS_VERBOSITY": "error",
+            },
         )
 
     def test_gsm8k(self):
