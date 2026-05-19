@@ -13,6 +13,8 @@ import unittest
 from test.registered.pseudo_mode._fake_prompt import fake_prompt
 from test.registered.pseudo_mode._pseudo_engine import PseudoEngine
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
@@ -22,6 +24,7 @@ _MODEL = "Qwen/Qwen3-0.6B"
 _LAUNCH_BUDGET_S: float = 20.0
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "PseudoEngine requires CUDA")
 class TestPseudoEngineSmoke(unittest.TestCase):
     """Single end-to-end happy path: launch / admit / step / shutdown."""
 
