@@ -13,7 +13,7 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.kv_cache_canary_verify import (
-    _VIOLATION_FIELD_EXPECTED_CHAIN_HASH,
+    _VIOLATION_FIELD_EXPECTED_AUX,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
     _VIOLATION_FIELD_KERNEL_KIND,
@@ -313,6 +313,6 @@ def _build_pseudo_violation_row(
     # caller-supplied expected position (no chain-hash oracle on the write side because the chain is being
     # produced, not verified).
     row[_VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(running_prev_hash)
-    row[_VIOLATION_FIELD_EXPECTED_CHAIN_HASH] = expected_position
+    row[_VIOLATION_FIELD_EXPECTED_AUX] = expected_position
     row[_VIOLATION_FIELD_FAIL_REASON_BITS] = mismatch_bits
     return row

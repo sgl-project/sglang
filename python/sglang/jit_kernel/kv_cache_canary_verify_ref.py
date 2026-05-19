@@ -17,7 +17,7 @@ from sglang.jit_kernel.kv_cache_canary_verify import (
     _FAIL_REASON_BIT_CHAIN_HASH,
     _FAIL_REASON_BIT_POSITION,
     _FAIL_REASON_BIT_REAL_KV_HASH,
-    _VIOLATION_FIELD_EXPECTED_CHAIN_HASH,
+    _VIOLATION_FIELD_EXPECTED_AUX,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
     _VIOLATION_FIELD_KERNEL_KIND,
@@ -175,7 +175,7 @@ def canary_verify_step_torch_reference(
         0  # verify path does not have a token oracle
     )
     new_rows[:, _VIOLATION_FIELD_STORED_CHAIN_HASH] = sel_stored_chain
-    new_rows[:, _VIOLATION_FIELD_EXPECTED_CHAIN_HASH] = sel_expected_chain
+    new_rows[:, _VIOLATION_FIELD_EXPECTED_AUX] = sel_expected_chain
     new_rows[:, _VIOLATION_FIELD_FAIL_REASON_BITS] = sel_fail
 
     # Write only the rows that land inside the ring; beyond capacity they are dropped while the counter still
