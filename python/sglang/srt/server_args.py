@@ -2195,12 +2195,29 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif model_arch == "Gemma4ForConditionalGeneration":
-            if is_sm100_supported():
-                self.attention_backend = "trtllm_mha"
+            default_attention_backend = (
+                "trtllm_mha" if is_sm100_supported() else "triton"
+            )
+            if self.is_attention_backend_not_set():
+                self.attention_backend = default_attention_backend
+                logger.info(
+                    f"Use {self.attention_backend} as default attention backend for Gemma4"
+                )
             else:
-                self.attention_backend = "triton"
-            logger.info(
-                f"Use {self.attention_backend} as default attention backend for Gemma4"
+                # If only one split backend is set, keep the other side on a
+                # Gemma4-compatible fallback instead of letting generic backend
+                # selection choose an unsupported backend later.
+                if self.attention_backend is None:
+                    self.attention_backend = default_attention_backend
+
+            prefill_backend, decode_backend = self.get_attention_backends()
+            accepted_backends = ("trtllm_mha", "triton")
+            assert (
+                prefill_backend in accepted_backends
+                and decode_backend in accepted_backends
+            ), (
+                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                f"got prefill={prefill_backend}, decode={decode_backend}"
             )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
@@ -2411,7 +2428,7 @@ class ServerArgs:
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
+        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2428,6 +2445,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
