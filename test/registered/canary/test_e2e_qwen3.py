@@ -41,7 +41,8 @@ class TestKvCacheCanaryCleanRaiseMode(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         # Ensure no perturbation is configured.
-        env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN", None)
+        env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB", None)
+        env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED", None)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -88,9 +89,11 @@ class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
     during warmup) OR die under live traffic. Both outcomes prove the
     raise path is wired.
 
-    Hit-rate note: perturb is now active-row-aware (swap is restricted to
+    Hit-rate note: perturb is active-row-aware (swap is restricted to
     the in-use ``[0, seq_len)`` range of an active req), so it lands on a
-    column the canary actually verifies. Probability bumped to 0.1.
+    column the canary actually verifies. Probability kept at 0.01 so per-
+    forward mismatches stay sparse; over ~20 generate requests this still
+    triggers on a real wiring bug while leaving room for a clean baseline.
     """
 
     @classmethod
@@ -98,7 +101,8 @@ class TestKvCacheCanaryPerturbRaiseMode(CustomTestCase):
         cls.model = _MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
-        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN"] = "0.1:42"
+        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB"] = "0.01"
+        env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED"] = "42"
         cls.process = None
         cls.launch_failed_due_to_raise = False
         try:

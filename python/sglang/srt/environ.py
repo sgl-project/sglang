@@ -659,6 +659,14 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # KV cache canary perturbation (testing only).
+    # When >0, the canary install hooks corrupt ``req_to_token_pool`` rows
+    # with this per-write probability so the canary should fire. Combined
+    # with ``--kv-cache-canary=raise`` this gives a fault-injection harness
+    # for regression-testing the canary itself.
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
