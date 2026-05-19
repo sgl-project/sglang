@@ -1,7 +1,7 @@
 """Bit-wise consistency between Python and CUDA ``splitmix64_mix``.
 
 The canary kernel computes the chain hash on device; the Python reference
-in ``srt.kv_cache_canary.fingerprint`` lives only to document the
+in ``jit_kernel.kv_cache_canary_ref`` lives only to document the
 algorithm and to back this consistency check. Any drift between the two
 silently invalidates the canary's chain detection. We launch a single
 canary write kernel with 1000 chained entries — each iteration mixes the
@@ -21,8 +21,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_HEAD,
     VIOLATION_FIELDS,
     canary_step,
+    to_signed_int64,
 )
-from sglang.srt.kv_cache_canary.fingerprint import splitmix64_mix, to_signed_int64
+from sglang.jit_kernel.kv_cache_canary_ref import splitmix64_mix
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="base-b-kernel-unit-1-gpu-large")

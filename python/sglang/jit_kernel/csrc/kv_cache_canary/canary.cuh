@@ -125,9 +125,10 @@ __device__ inline void store_field(uint8_t* buf, int64_t slot_idx, int64_t strid
   p[field] = value;
 }
 
-// Standard splitmix64 finalizer. Bit-wise equivalent to the Python reference
-// in ``srt/kv_cache_canary/fingerprint.py``. ``test_splitmix64_consistency.py``
-// cross-validates the two implementations.
+// Standard splitmix64 finalizer. Bit-wise equivalent to the Python
+// mirror in ``jit_kernel/kv_cache_canary_ref.py``;
+// ``test_splitmix64_consistency.py`` cross-validates the two
+// implementations.
 __device__ inline uint64_t splitmix64_finalize(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;

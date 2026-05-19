@@ -19,9 +19,12 @@ from sglang.jit_kernel.kv_cache_canary import (
     VIOLATION_FIELDS,
     FailReason,
     canary_step,
-    canary_step_torch_reference,
+    to_signed_int64,
 )
-from sglang.srt.kv_cache_canary.fingerprint import splitmix64_mix, to_signed_int64
+from sglang.jit_kernel.kv_cache_canary_ref import (
+    canary_step_torch_reference,
+    splitmix64_mix,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")

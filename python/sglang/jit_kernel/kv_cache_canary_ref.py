@@ -1,24 +1,38 @@
-"""Python reference implementation of the canary chain hash.
+"""Test-only Python reference for the canary kernel.
 
-The hash is computed **on device** by the canary kernel (see
-``jit_kernel/csrc/kv_cache_canary/canary.cuh``); this module only exists
-to (a) document the algorithm in readable Python and (b) provide a
-bit-wise reference for a Python <-> CUDA consistency unit test
-(``test/registered/canary/test_splitmix64_consistency.py``). It is NOT
-used on the hot path.
+Two public surfaces:
 
-Algorithm:
+- :func:`splitmix64_mix` — Python mirror of the device-side chain hash
+  in ``jit_kernel/csrc/kv_cache_canary/canary.cuh``. Used by other
+  canary tests as the oracle for "what hash should the kernel have
+  computed". ``test_splitmix64_consistency.py`` cross-validates this
+  mirror against the actual kernel to keep them bit-identical.
+- :func:`canary_step_torch_reference` — pure-Python re-implementation
+  of the full kernel (verify path + write-req chains + violation ring).
+  Differential tests in ``test_kv_cache_canary.py`` drive both this and
+  the CUDA kernel with the same arguments and require byte-equality.
 
-- ``splitmix64`` finalizer: the standard variant
-  (`x ^= x >> 30; x *= 0xBF58476D1CE4E5B9; x ^= x >> 27; x *= 0x94D049BB133111EB; x ^= x >> 31`).
-- ``splitmix64_mix(prev, token_id, position)``: combine the three inputs
-  via XOR (``x = prev ^ token_id ^ position``) and run the finalizer.
-
-Chain head seed: comes from ``CanaryConfig.seed`` (default
-``0xC0FFEE1234567890``) and is passed into the kernel at every launch.
+Nothing in here is on the production hot path; production calls
+:func:`sglang.jit_kernel.kv_cache_canary.canary_step` which dispatches
+to the compiled CUDA kernel.
 """
 
 from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from sglang.jit_kernel.kv_cache_canary import (
+    _CANARY_FIELD_POSITION,
+    _CANARY_FIELD_PREV_HASH,
+    _CANARY_FIELD_REAL_KV_HASH,
+    _CANARY_FIELD_REQ_ID,
+    _CANARY_FIELD_TOKEN_ID,
+    REAL_KV_HASH_MODE_OFF,
+    FailReason,
+    to_signed_int64,
+)
 
 _U64_MASK = (1 << 64) - 1
 
@@ -48,18 +62,6 @@ def splitmix64_mix(prev_hash: int, token_id: int, position: int) -> int:
     return splitmix64(combined)
 
 
-def to_signed_int64(value: int) -> int:
-    """Reinterpret an unsigned uint64 as signed int64 (for torch.int64 storage).
-
-    The canary stores ``prev_hash`` (a uint64) into an int64 field. Python's
-    arbitrary-precision ints silently promote on overflow, so callers
-    construct torch.int64 tensors via this helper to avoid Python's
-    ``OverflowError: Python int too large to convert to C long``.
-    """
-    value &= _U64_MASK
-    if value >= (1 << 63):
-        value -= 1 << 64
-    return value
 def canary_step_torch_reference(
     *,
     src_buf: torch.Tensor,

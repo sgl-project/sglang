@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
-from sglang.srt.kv_cache_canary.fingerprint import splitmix64_mix, to_signed_int64
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -52,6 +51,21 @@ KERNEL_KIND_HEAD: int = 0
 KERNEL_KIND_TAIL: int = 1
 
 _U64_MASK: int = (1 << 64) - 1
+
+
+def to_signed_int64(value: int) -> int:
+    """Reinterpret an unsigned uint64 as signed int64 (for torch.int64 storage).
+
+    Python ints are arbitrary-precision, so a uint64 value above 2^63 - 1
+    overflows ``torch.tensor(..., dtype=torch.int64)`` with
+    ``OverflowError: Python int too large to convert to C long``. Used at
+    every uint64 -> int64 boundary (e.g. passing ``CanaryConfig.seed`` into
+    the C++ kernel).
+    """
+    value &= _U64_MASK
+    if value >= (1 << 63):
+        value -= 1 << 64
+    return value
 
 
 class FailReason(enum.IntEnum):
@@ -188,4 +202,3 @@ def canary_step(
         real_kv_read_bytes,
         real_kv_hash_mode,
     )
-
