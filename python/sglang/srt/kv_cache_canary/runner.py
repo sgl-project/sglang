@@ -140,6 +140,12 @@ class CanaryRunner:
         self._raised: bool = False
         self._perturb_undo: Optional[tuple[int, int, int]] = None
         self._last_forward_batch: Optional["ForwardBatch"] = None
+        self._alive_reqs_snapshot: Optional[AliveReqSnapshot] = None
+        self._alive_reqs_fallback_warned: bool = False
+
+        assert (
+            self._req_to_token_pool is not None
+        ), "kv-canary: req_to_token_pool must be bound at construction"
 
         active: set[CanaryLaunchTag] = set()
         for endpoints in self._endpoints_per_pool:
@@ -152,11 +158,18 @@ class CanaryRunner:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
+    def set_alive_reqs_snapshot(self, snapshot: Optional[AliveReqSnapshot]) -> None:
+        """Bind the running-reqs snapshot used for sweep coverage.
+
+        Scheduler should call this every step (or whenever the alive set changes) so sweep covers
+        all alive running reqs (including paused) per SOT §4.1. None clears the snapshot; the
+        runner then falls back to deriving it from forward_batch (degraded coverage).
+        """
+        self._alive_reqs_snapshot = snapshot
+
     def forward_step_before_model(self, forward_batch: "ForwardBatch") -> None:
         """SOT §6.2 step 1: perturb hook + plan + head launches. Stashes plan for the tail launches."""
         if self.config.mode == "off":
-            return
-        if self._req_to_token_pool is None:
             return
 
         self.perturb_hook(forward_batch)
@@ -267,7 +280,7 @@ class CanaryRunner:
         self.health_check_step()
         self._print_periodic_stats()
 
-        if self._perturb_undo is not None and self._req_to_token_pool is not None:
+        if self._perturb_undo is not None:
             row, col, original = self._perturb_undo
             self._req_to_token_pool.req_to_token[row, col] = original
             self._perturb_undo = None
@@ -286,22 +299,12 @@ class CanaryRunner:
             return
         self._last_sweep_step = self._step_counter
 
-        running_snapshot: Optional[AliveReqSnapshot] = None
-        forward_batch = self._last_forward_batch
-        if (
-            forward_batch is not None
-            and forward_batch.req_pool_indices is not None
-            and forward_batch.seq_lens is not None
-        ):
-            running_snapshot = AliveReqSnapshot(
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-            )
+        running_snapshot = self._resolve_running_sweep_snapshot()
 
         for pool_idx, groups in enumerate(self._groups_per_pool):
             for group in groups:
                 window = self._swa_window_size if group.kind is PoolKind.SWA else 0
-                if running_snapshot is not None and self._req_to_token_pool is not None:
+                if running_snapshot is not None:
                     running_input = build_plan_input_running_sweep(
                         req_to_token_pool=self._req_to_token_pool,
                         alive_reqs=running_snapshot,
@@ -383,8 +386,6 @@ class CanaryRunner:
     def perturb_hook(self, forward_batch: "ForwardBatch") -> None:
         if self.config.perturb_req_to_token_prob <= 0.0:
             return
-        if self._req_to_token_pool is None:
-            return
         table = self._req_to_token_pool.req_to_token
         if not isinstance(table, torch.Tensor) or table.numel() == 0:
             return
@@ -425,6 +426,26 @@ class CanaryRunner:
             len(CanaryLaunchTag),
         )
 
+    def _resolve_running_sweep_snapshot(self) -> Optional[AliveReqSnapshot]:
+        snapshot = self._alive_reqs_snapshot
+        if snapshot is not None:
+            return snapshot
+        forward_batch = self._last_forward_batch
+        if forward_batch is None:
+            return None
+        if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
+            return None
+        if not self._alive_reqs_fallback_warned:
+            logger.warning(
+                "kv-canary: alive_reqs_snapshot not bound; sweep falls back to forward_batch "
+                "(misses paused reqs per SOT §4.1)"
+            )
+            self._alive_reqs_fallback_warned = True
+        return AliveReqSnapshot(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+        )
+
     def _invoke_plan(
         self,
         *,
@@ -433,8 +454,6 @@ class CanaryRunner:
         write_plan: WritePlan,
         group: CanaryBufferGroup,
     ) -> None:
-        if self._req_to_token_pool is None:
-            return
         window = self._swa_window_size if group.kind is PoolKind.SWA else 0
         canary_plan_step(
             verify_plan_out=verify_plan,
