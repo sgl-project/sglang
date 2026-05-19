@@ -1,6 +1,6 @@
 """Lock the human-readable rendering of INPUT_TOKEN / INPUT_POSITION mismatch.
 
-The canary kernel reuses the existing 10-field violation row layout for
+The canary kernel reuses the existing 8-field violation row layout for
 the two new pseudo-mode fail reasons by overloading
 ``expected_hash`` / ``actual_hash`` (INPUT_TOKEN_MISMATCH carries
 expected_token / actual_token in those slots) and ``expected_position``
@@ -19,11 +19,9 @@ from sglang.jit_kernel.kv_cache_canary import (
     _VIOLATION_FIELD_ACTUAL_HASH,
     _VIOLATION_FIELD_EXPECTED_HASH,
     _VIOLATION_FIELD_EXPECTED_POSITION,
-    _VIOLATION_FIELD_EXPECTED_REQ_ID,
     _VIOLATION_FIELD_FAIL_REASON,
     _VIOLATION_FIELD_KERNEL_KIND,
     _VIOLATION_FIELD_POSITION,
-    _VIOLATION_FIELD_REQ_ID,
     _VIOLATION_FIELD_SLOT_IDX,
     _VIOLATION_FIELD_TOKEN_ID,
     KERNEL_KIND_HEAD,
@@ -42,12 +40,10 @@ def _make_row(
     kernel_kind: int,
     fail_reason: int,
     slot_idx: int,
-    req_id: int,
     token_id: int,
     position: int,
     expected_hash: int = 0,
     actual_hash: int = 0,
-    expected_req_id: int = 0,
     expected_position: int = 0,
 ) -> list[int]:
     # Build by field-offset index so a layout change in
@@ -56,12 +52,10 @@ def _make_row(
     row[_VIOLATION_FIELD_KERNEL_KIND] = kernel_kind
     row[_VIOLATION_FIELD_FAIL_REASON] = fail_reason
     row[_VIOLATION_FIELD_SLOT_IDX] = slot_idx
-    row[_VIOLATION_FIELD_REQ_ID] = req_id
     row[_VIOLATION_FIELD_TOKEN_ID] = token_id
     row[_VIOLATION_FIELD_POSITION] = position
     row[_VIOLATION_FIELD_EXPECTED_HASH] = expected_hash
     row[_VIOLATION_FIELD_ACTUAL_HASH] = actual_hash
-    row[_VIOLATION_FIELD_EXPECTED_REQ_ID] = expected_req_id
     row[_VIOLATION_FIELD_EXPECTED_POSITION] = expected_position
     return row
 
@@ -74,7 +68,6 @@ class TestFormatViolationInputTokenMismatch(unittest.TestCase):
             kernel_kind=KERNEL_KIND_HEAD,
             fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
             slot_idx=42,
-            req_id=7,
             token_id=999,
             position=3,
             expected_hash=123,
@@ -95,7 +88,6 @@ class TestFormatViolationInputTokenMismatch(unittest.TestCase):
             kernel_kind=KERNEL_KIND_HEAD,
             fail_reason=int(FailReason.INPUT_TOKEN_MISMATCH),
             slot_idx=1,
-            req_id=2,
             token_id=88,
             position=0,
             expected_hash=77,
@@ -114,7 +106,6 @@ class TestFormatViolationInputPositionMismatch(unittest.TestCase):
             kernel_kind=KERNEL_KIND_TAIL,
             fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
             slot_idx=5,
-            req_id=11,
             token_id=222,
             position=17,
             expected_position=16,
@@ -128,21 +119,6 @@ class TestFormatViolationInputPositionMismatch(unittest.TestCase):
         self.assertIn("TAIL", text)
         self.assertIn("tail_v", text)
 
-    def test_unused_expected_req_id_is_not_misrendered(self) -> None:
-        """expected_req_id is forced to 0 by the kernel for this reason; do not show as 'expected=0'."""
-        row = _make_row(
-            kernel_kind=KERNEL_KIND_HEAD,
-            fail_reason=int(FailReason.INPUT_POSITION_MISMATCH),
-            slot_idx=0,
-            req_id=9,
-            token_id=4,
-            position=2,
-            expected_position=1,
-        )
-        text = CanaryRunner._format_violation("head_k", row, write_index=1)
-        self.assertIn("req_id:            9", text)
-        self.assertNotIn("expected=0 actual=9", text)
-
 
 class TestFormatViolationOtherReasonsUnchanged(unittest.TestCase):
     """Existing HASH / REAL_KV_HASH formatting is not regressed."""
@@ -152,18 +128,16 @@ class TestFormatViolationOtherReasonsUnchanged(unittest.TestCase):
             kernel_kind=KERNEL_KIND_HEAD,
             fail_reason=int(FailReason.HASH),
             slot_idx=3,
-            req_id=1,
             token_id=10,
             position=2,
             expected_hash=0xDEADBEEF,
             actual_hash=0xCAFEBABE,
-            expected_req_id=1,
             expected_position=2,
         )
         text = CanaryRunner._format_violation("head_k", row, write_index=1)
         self.assertIn("expected_hash:", text)
         self.assertIn("hash_xor_diff:", text)
-        self.assertIn("expected=1 actual=1", text)
+        self.assertIn("expected=2 actual=2", text)
 
 
 if __name__ == "__main__":
