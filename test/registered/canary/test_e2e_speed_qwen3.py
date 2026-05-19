@@ -3,7 +3,7 @@
 We sweep two representative scenarios via ``bench_one_batch_server``:
 
 1. Prefill: bs=32, isl=16384, osl=1
-2. Large-bs decode: bs=256, isl=4096, osl=1024
+2. Large-bs decode: bs=256, isl=2048, osl=1024
 
 For each scenario we launch a fresh server twice -- once with
 ``--kv-cache-canary=off`` (baseline) and once with
@@ -20,6 +20,18 @@ The hard assertion is currently marked ``xfail(strict=False)`` because
 the kernel has not been perf-tuned yet (clean a baseline run showed
 ~50% overhead). Once perf work lands, drop the xfail decorator and the
 test becomes a hard regression gate.
+
+Decode scenario sizing: Qwen3-0.6B uses GQA with 8 KV heads / head_dim=128
+across 28 layers in bf16, so each token costs ~108 KB of KV. On a single
+H200 (141 GB) with ``--mem-fraction-static=0.65`` the server reports
+``max_total_num_tokens ~ 835k``. ``bench_one_batch_server`` silently
+skips a case when ``bs * (il + ol) > max_total_num_tokens`` (see
+``run_benchmark_internal``), which leaves the result list empty and
+trips a RuntimeError here. The decode case is sized to fit with
+headroom: bs=256, il=2048, ol=1024 = 786k tokens. The more aggressive
+bs=256 / il=4096 / ol=1024 = 1.31M-token configuration exceeds total
+H200 HBM for this model regardless of mem-fraction, so it can only run
+on a larger or multi-GPU setup.
 """
 
 from __future__ import annotations
@@ -72,9 +84,9 @@ _SCENARIOS: Tuple[_Scenario, ...] = (
         output_len=1,
     ),
     _Scenario(
-        label="decode_bs256_isl4096_osl1024",
+        label="decode_bs256_isl2048_osl1024",
         batch_size=256,
-        input_len=4096,
+        input_len=2048,
         output_len=1024,
     ),
 )
@@ -162,7 +174,7 @@ class TestKvCacheCanarySpeedQwen3(CustomTestCase):
     def test_prefill_bs32_isl16384_osl1(self) -> None:
         _check_overhead(_SCENARIOS[0], self)
 
-    def test_decode_bs256_isl4096_osl1024(self) -> None:
+    def test_decode_bs256_isl2048_osl1024(self) -> None:
         _check_overhead(_SCENARIOS[1], self)
 
 
@@ -221,7 +233,7 @@ class TestKvCacheCanarySweepSpeedQwen3(CustomTestCase):
     def test_prefill_bs32_isl16384_osl1(self) -> None:
         _check_sweep_overhead(_SCENARIOS[0], self)
 
-    def test_decode_bs256_isl4096_osl1024(self) -> None:
+    def test_decode_bs256_isl2048_osl1024(self) -> None:
         _check_sweep_overhead(_SCENARIOS[1], self)
 
 
