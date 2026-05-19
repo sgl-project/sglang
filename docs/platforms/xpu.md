@@ -90,3 +90,54 @@ python -m sglang.bench_serving -h
 Additionally, the requests can be formed with
 [OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
+
+## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
+
+SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
+
+**Tested models:**
+
+| Model | Notes |
+|:---:|:---:|
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Used in integration tests; verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+
+**Prerequisites:** `pip install nixl sglang-router`
+
+**Start the prefill server (GPU 0):**
+
+```bash
+ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
+    --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
+```
+
+**Start the decode server (GPU 1):**
+
+```bash
+ZE_AFFINITY_MASK=1 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
+    --disaggregation-mode decode --disaggregation-transfer-backend nixl \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
+```
+
+**Start the router:**
+
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill http://127.0.0.1:30000 \
+    --decode  http://127.0.0.1:30001 \
+    --host 0.0.0.0 --port 8000
+```
+
+**Send a request:**
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 32}'
+```
+
+> **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.
