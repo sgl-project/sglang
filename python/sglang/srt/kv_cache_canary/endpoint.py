@@ -71,7 +71,12 @@ class CanaryEndpoint:
         cross-latch into one another's first-violation row.
         """
         buf_specs: List[Tuple[torch.Tensor, torch.Tensor, int, CanaryViolationSlot]] = [
-            (src.k_canary_buf, self.k_canary_buf, self.k_slot_stride_bytes, self.k_violation)
+            (
+                src.k_canary_buf,
+                self.k_canary_buf,
+                self.k_slot_stride_bytes,
+                self.k_violation,
+            )
         ]
         if (
             self.has_v_half
