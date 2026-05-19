@@ -6110,6 +6110,39 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--kv-cache-canary-input-check-mode",
+            type=str,
+            default=ServerArgs.kv_cache_canary_input_check_mode,
+            choices=[None, "off", "on"],
+            help=(
+                "Enable comparison of forward_batch.input_ids/positions against "
+                "caller-supplied expected_input_tokens/positions inside the canary "
+                "write kernel. None (default) leaves the canary unaware of inputs; "
+                "'on' enables the comparison and requires an oracle (mock_model) "
+                "to populate the expected_* placeholders per forward."
+            ),
+        )
+        parser.add_argument(
+            "--mock-model-enabled",
+            action="store_true",
+            default=ServerArgs.mock_model_enabled,
+            help=(
+                "Enable mock-model testing mode: oracle sampler + canary input "
+                "check + dummy weights + 1-layer override. Defaults for each flag "
+                "are filled by apply_mock_model_defaults during ServerArgs "
+                "post-parse if the user has not already set them."
+            ),
+        )
+        parser.add_argument(
+            "--num-hidden-layers-override",
+            type=int,
+            default=ServerArgs.num_hidden_layers_override,
+            help=(
+                "Override num_hidden_layers on the model config. Useful for "
+                "mock-model testing to truncate large models to a few layers."
+            ),
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
