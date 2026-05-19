@@ -8,14 +8,14 @@ It accepts server arguments (the same as launch_server.py) and benchmark argumen
 ## with dummy weights:
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 ## sweep through multiple data points and store (append) the results in a jsonl file:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --profile
 ## run with profiling to custom directory:
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 --input-len 256 --profile
 ## run with CUDA profiler (nsys):
-nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile --profile-activities CUDA_PROFILER
+nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 --input-len 256 --profile --profile-activities CUDA_PROFILER
 # Usage (correctness test):
 python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
@@ -457,8 +457,7 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -469,8 +468,7 @@ def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -531,6 +529,7 @@ class _MlxBenchRunner:
             trust_remote_code=server_args.trust_remote_code,
             disable_radix_cache=True,
             mem_fraction_static=server_args.mem_fraction_static,
+            quantization=server_args.quantization,
         )
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens

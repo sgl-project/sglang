@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import tempfile
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -18,7 +19,7 @@ from sglang.srt.managers.io_struct import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.managers.scheduler import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
@@ -86,6 +87,8 @@ class KvMetrics:
 
 
 class SchedulerMetricsMixin:
+    enable_fpm: bool = False
+
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
@@ -105,11 +108,11 @@ class SchedulerMetricsMixin:
         }.get(getattr(self, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_accepted_drafts + bs, bs).
-        # `*_accepted_tokens` = drafts + bonus; `*_accepted_drafts` = drafts-only.
-        self.spec_num_accepted_tokens = 0  # per-log-interval
+        # Each update adds (num_correct_drafts + bs, bs).
+        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
+        self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0  # lifetime
+        self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
         # For PD disaggregation
@@ -118,7 +121,7 @@ class SchedulerMetricsMixin:
 
         # Metrics
         self.enable_metrics = self.server_args.enable_metrics
-        self.is_stats_logging_rank = self.attn_tp_rank == 0
+        self.is_stats_logging_rank = self.ps.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
             self.is_stats_logging_rank
             or self.server_args.enable_metrics_for_all_schedulers
@@ -135,7 +138,7 @@ class SchedulerMetricsMixin:
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
-                "moe_ep_rank": self.moe_ep_rank,
+                "moe_ep_rank": self.ps.moe_ep_rank,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
@@ -159,6 +162,8 @@ class SchedulerMetricsMixin:
 
         self.fwd_occupancy = float("nan")
 
+        self.forward_pass_device_timer: Optional[DeviceTimer] = None
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
@@ -175,12 +180,14 @@ class SchedulerMetricsMixin:
 
         self.init_kv_events(self.server_args.kv_events_config)
 
+        self._init_fpm()
+
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
 
     def install_device_timer_on_runners(self: Scheduler):
-        if not hasattr(self, "forward_pass_device_timer"):
+        if self.forward_pass_device_timer is None:
             return
         timer = self.forward_pass_device_timer
         self.tp_worker.model_runner.device_timer = timer
@@ -194,20 +201,142 @@ class SchedulerMetricsMixin:
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
-            kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
         )
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.attn_dp_rank
+                kv_events_config, self.ps.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_drafts: int):
-        self.spec_num_accepted_tokens += num_accepted_drafts + bs
+    def _init_fpm(self: Scheduler):
+        """Initialize Forward Pass Metrics (FPM) publisher if configured."""
+        self.enable_fpm = False
+        if (
+            self.server_args.enable_forward_pass_metrics
+            and self.ps.attn_tp_rank == 0
+            and self.ps.pp_rank == self.ps.pp_size - 1
+        ):
+            from sglang.srt.observability.forward_pass_metrics import (
+                _FpmPublisherThread,
+            )
+
+            self._fpm_dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            self._fpm_worker_id = self.server_args.forward_pass_metrics_worker_id
+            base_endpoint = self.server_args.forward_pass_metrics_ipc_name
+            if base_endpoint is None:
+                ipc_path = tempfile.NamedTemporaryFile(delete=False).name
+                base_endpoint = f"ipc://{ipc_path}"
+                self.server_args.forward_pass_metrics_ipc_name = base_endpoint
+            endpoint = f"{base_endpoint}.{self._fpm_dp_rank}"
+            self._fpm_publisher = _FpmPublisherThread(
+                endpoint,
+                worker_id=self._fpm_worker_id,
+                dp_rank=self._fpm_dp_rank,
+            )
+            self._fpm_gpu_time_acc = 0.0
+
+            def _fpm_device_timer_reporter(t, **_kwargs):
+                self._fpm_gpu_time_acc += t
+
+            if self.forward_pass_device_timer is not None:
+                self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
+            else:
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=_fpm_device_timer_reporter,
+                )
+            self._fpm_uses_device_timer = True
+            self.enable_fpm = True
+            logger.info(
+                "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
+                endpoint,
+                self._fpm_dp_rank,
+                self._fpm_uses_device_timer,
+            )
+
+    def _build_scheduled_request_metrics(self: Scheduler, batch: ScheduleBatch):
+        from sglang.srt.observability.forward_pass_metrics import (
+            ScheduledRequestMetrics,
+            WelfordAccumulator,
+        )
+
+        num_prefill_requests = 0
+        sum_prefill_tokens = 0
+        sum_prefill_kv_tokens = 0
+        prefill_lengths = WelfordAccumulator()
+
+        if batch.forward_mode.is_mixed():
+            decode_req_ids = {id(req) for req in batch.decoding_reqs or []}
+            prefill_reqs = [req for req in batch.reqs if id(req) not in decode_req_ids]
+        elif batch.forward_mode.is_extend():
+            prefill_reqs = batch.reqs
+        else:
+            prefill_reqs = []
+
+        if prefill_reqs:
+            stats = batch.prefill_stats
+            for req in prefill_reqs:
+                prefill_lengths.add(len(req.origin_input_ids))
+            num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
+            sum_prefill_tokens = stats.log_input_tokens if stats else 0
+            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+
+        decode_kv = WelfordAccumulator()
+        if batch.forward_mode.is_mixed():
+            for req in batch.decoding_reqs or []:
+                decode_kv.add(req.seqlen)
+        elif batch.forward_mode.is_decode():
+            for sl in batch.seq_lens_cpu:
+                decode_kv.add(int(sl))
+
+        return ScheduledRequestMetrics(
+            num_prefill_requests=num_prefill_requests,
+            sum_prefill_tokens=sum_prefill_tokens,
+            var_prefill_length=prefill_lengths.variance(),
+            sum_prefill_kv_tokens=sum_prefill_kv_tokens,
+            num_decode_requests=decode_kv.count,
+            sum_decode_kv_tokens=decode_kv.total,
+            var_decode_kv_tokens=decode_kv.variance(),
+        )
+
+    def _build_queued_request_metrics(self: Scheduler):
+        from sglang.srt.observability.forward_pass_metrics import (
+            QueuedRequestMetrics,
+            WelfordAccumulator,
+        )
+
+        prefill_q = WelfordAccumulator()
+        decode_q = WelfordAccumulator()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in self.disagg_prefill_bootstrap_queue.queue:
+                prefill_q.add(len(req.origin_input_ids))
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            for req in self.disagg_decode_prealloc_queue.queue:
+                decode_q.add(req.seqlen)
+            for req in self.disagg_decode_transfer_queue.queue:
+                decode_q.add(req.seqlen)
+        else:
+            for req in self.waiting_queue:
+                if len(req.output_ids) > 0:
+                    decode_q.add(req.seqlen)
+                else:
+                    prefill_q.add(len(req.origin_input_ids))
+
+        return QueuedRequestMetrics(
+            num_prefill_requests=prefill_q.count,
+            sum_prefill_tokens=prefill_q.total,
+            var_prefill_length=prefill_q.variance(),
+            num_decode_requests=decode_q.count,
+            sum_decode_kv_tokens=decode_q.total,
+            var_decode_kv_tokens=decode_q.variance(),
+        )
+
+    def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
+        self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_accepted_drafts
+        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -216,8 +345,8 @@ class SchedulerMetricsMixin:
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
         head_dim = float(getattr(model_config, "head_dim", 0))
-        num_attn_heads = float(model_config.get_num_attention_heads(self.tp_size))
-        num_kv_heads = float(model_config.get_num_kv_heads(self.tp_size))
+        num_attn_heads = float(model_config.get_num_attention_heads(self.ps.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(self.ps.tp_size))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
@@ -345,13 +474,14 @@ class SchedulerMetricsMixin:
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.spec_num_accepted_tokens = 0
+        self.spec_num_accept_tokens = 0
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
 
     def report_prefill_stats(
         self: Scheduler,
+        batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
@@ -373,7 +503,12 @@ class SchedulerMetricsMixin:
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -481,13 +616,13 @@ class SchedulerMetricsMixin:
         self: Scheduler,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_accepted_drafts: int = 0,
+        num_correct_drafts: int = 0,
     ):
         batch = running_batch or self.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_accepted_drafts
+            decode_tokens = batch.batch_size() + num_correct_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -533,32 +668,31 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
-            spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
-            )
-            num_accepted_drafts = (
-                self.spec_num_accepted_tokens - self.spec_num_forward_ct
-            )
+            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
             if self.server_args.speculative_num_draft_tokens:
                 draft_per_round = self.server_args.speculative_num_draft_tokens - 1
             else:
                 draft_per_round = self.server_args.speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
-                num_accepted_drafts / total_draft_tokens
-                if total_draft_tokens > 0
-                else 0
+                num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
-            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
@@ -700,7 +834,9 @@ class SchedulerMetricsMixin:
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
-        kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+        kv_metrics.data_parallel_rank = (
+            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        )
 
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
@@ -713,6 +849,47 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def _emit_forward_pass_metrics(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result=None,
+    ):
+        """Emit per-iteration ForwardPassMetrics over ZMQ PUB.
+
+        Prefers GPU-accurate timing from DeviceTimer (which wraps
+        model_runner.forward / cuda_graph.replay via PR #24197).
+        Falls back to monotonic clock when DeviceTimer is not enabled.
+        """
+        if not self.enable_fpm:
+            return
+
+        from sglang.srt.observability.forward_pass_metrics import (
+            ForwardPassMetrics,
+        )
+
+        if self._fpm_uses_device_timer:
+            self.forward_pass_device_timer._report()
+            wall_time = self._fpm_gpu_time_acc
+            self._fpm_gpu_time_acc = 0.0
+            if wall_time == 0.0:
+                return
+        else:
+            wall_time = max(0.0, time.monotonic() - batch.fpm_start_time)
+
+        fpm = ForwardPassMetrics(
+            worker_id=self._fpm_worker_id,
+            dp_rank=self._fpm_dp_rank,
+            wall_time=wall_time,
+            scheduled_requests=self._build_scheduled_request_metrics(batch),
+            queued_requests=self._build_queued_request_metrics(),
+        )
+        self._fpm_publisher.publish(fpm)
+
+    def _shutdown_fpm(self: Scheduler):
+        """Shut down the FPM publisher thread."""
+        if self.enable_fpm:
+            self._fpm_publisher.shutdown()
 
     def _log_hicache_stats(self: Scheduler):
         """Populate HiCache host-tier stats on self.stats.
@@ -750,14 +927,14 @@ class SchedulerMetricsMixin:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if hasattr(self, "running_mbs") and self.running_mbs:
+            if self.server_args.pp_size > 1:
                 for batch in self.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
-            elif hasattr(self, "running_batch") and self.running_batch:
+            elif self.running_batch:
                 if hasattr(self.running_batch, "reqs"):
                     for req in self.running_batch.reqs:
                         if hasattr(req, "lora_id") and req.lora_id is not None:
@@ -779,6 +956,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
+            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
             max_under_slo = getattr(self, "max_running_requests_under_SLO", None)
             if max_under_slo is not None and max_under_slo > 0:
                 self.stats.utilization = max(
@@ -859,7 +1037,7 @@ class SchedulerMetricsMixin:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 speculative = SpeculativeMetrics(
                     accept_length=(
-                        self.spec_total_num_accepted_tokens
+                        self.spec_total_num_accept_tokens
                         / self.spec_total_num_forward_ct
                     ),
                     accept_rate=self.stats.spec_accept_rate,
@@ -867,7 +1045,7 @@ class SchedulerMetricsMixin:
 
         lora = None
         if include_all or "lora" in include:
-            if hasattr(self, "lora_scheduler") and self.lora_scheduler is not None:
+            if self.enable_lora:
                 lora = LoRAMetrics(
                     slots_used=self.stats.lora_pool_slots_used,
                     slots_total=self.stats.lora_pool_slots_total,
@@ -916,7 +1094,7 @@ class SchedulerMetricsMixin:
             )
 
         return GetLoadsReqOutput(
-            dp_rank=self.dp_rank,
+            dp_rank=self.ps.dp_rank,
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,

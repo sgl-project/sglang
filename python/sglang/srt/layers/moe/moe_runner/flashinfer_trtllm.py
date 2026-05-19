@@ -10,6 +10,8 @@ from torch.nn.parameter import Parameter
 # Import to register custom ops for torch.compile compatibility
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
+    is_tensor_in_symmetric_mempool,
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -21,6 +23,7 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
+    _moe_output_buf,
     register_fused_func,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -49,7 +52,7 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    from flashinfer import fp4_quantize
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
@@ -877,14 +880,29 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     )
     activation_type = get_activation_type(runner_config.activation)
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        num_tokens = hs_fp4.shape[0]
-        hidden_size = (
-            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    num_tokens = hs_fp4.shape[0]
+    hidden_size = (
+        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    )
+    _provided = _moe_output_buf.get()
+    _symm_required = is_allocation_symmetric()
+    if (
+        _provided is not None
+        and _provided.shape == (num_tokens, hidden_size)
+        and _provided.dtype == hidden_states.dtype
+        and _provided.device == hs_fp4.device
+        and (
+            not _symm_required
+            or not is_symmetric_memory_enabled()
+            or is_tensor_in_symmetric_mempool(_provided)
         )
-        symm_output = torch.empty(
-            num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
-        )
+    ):
+        symm_output = _provided
+    else:
+        with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
+            )
 
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
@@ -1020,9 +1038,11 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
             ) from e
 
-    assert (
-        runner_config.activation == "silu"
-    ), "Only silu is supported for flashinfer trtllm moe"
+    _SUPPORTED_BF16_ACTIVATIONS = {"silu", "relu2"}
+    assert runner_config.activation in _SUPPORTED_BF16_ACTIVATIONS, (
+        f"Only {_SUPPORTED_BF16_ACTIVATIONS} are supported for flashinfer trtllm bf16 moe, "
+        f"got '{runner_config.activation}'."
+    )
     if not use_routed_topk:
         assert (
             dispatch_output.topk_output.topk_config.renormalize
@@ -1030,9 +1050,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     assert (
         runner_config.num_fused_shared_experts == 0
     ), "Fused shared experts are not supported for flashinfer trtllm moe"
-    assert (
-        runner_config.is_gated
-    ), "Only gated MoEs are supported for flashinfer trtllm moe"
+    activation_type = get_activation_type(runner_config.activation)
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -1072,6 +1090,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                     else 1.0
                 ),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                activation_type=activation_type,
             )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1094,6 +1113,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routing_method_type=runner_config.routing_method_type,
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                activation_type=activation_type,
             )
 
     return StandardCombineInput(hidden_states=final_hidden_states)
