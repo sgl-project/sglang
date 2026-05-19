@@ -245,6 +245,28 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            # Hybrid FP8(linear)+NVFP4(MoE) checkpoints (e.g.
+            # nvidia/DeepSeek-V4-Pro-NVFP4): wrap the built Fp8Config in
+            # HybridFp8NvFp4Config (a subclass) so FusedMoE layers dispatch
+            # to ModelOptNvFp4FusedMoEMethod while linear/attention stay on
+            # the FP8 path. The wrapper is a Fp8Config subclass so existing
+            # `isinstance(quant_config, Fp8Config)` checks still hold.
+            nvfp4_meta = model_config.nvfp4_moe_meta
+            if nvfp4_meta is not None:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    HybridFp8NvFp4Config,
+                    ModelOptFp4Config,
+                )
+
+                nvfp4_config = ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=True,
+                    group_size=int(nvfp4_meta["group_size"]),
+                    exclude_modules=list(nvfp4_meta.get("exclude_modules") or []),
+                    packed_modules_mapping=quant_config.packed_modules_mapping,
+                )
+                quant_config = HybridFp8NvFp4Config(
+                    fp8_config=quant_config, nvfp4_config=nvfp4_config
+                )
         if not _is_npu:
             major, minor = get_device_capability()
 
