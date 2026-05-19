@@ -96,6 +96,14 @@ class WritePlan:
         self.write_num_valid_reqs.zero_()
 
 
+# Write-launch fail-reason bits. Distinct from the verify-launch bits in
+# kv_cache_canary_verify (CHAIN_HASH=1<<0, POSITION=1<<1, REAL_KV_HASH=1<<2) because
+# both launches share the same violation ring; a single bit must unambiguously
+# identify the failing field across kernel kinds.
+_FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH: int = 1 << 3
+_FAIL_REASON_BIT_WRITE_POSITION_MISMATCH: int = 1 << 4
+
+
 def canary_write_step(
     *,
     canary_buf: torch.Tensor,

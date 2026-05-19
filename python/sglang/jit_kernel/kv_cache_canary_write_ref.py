@@ -13,7 +13,6 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.kv_cache_canary_verify import (
-    _FAIL_REASON_BIT_POSITION,
     _VIOLATION_FIELD_EXPECTED_CHAIN_HASH,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
@@ -34,12 +33,12 @@ from sglang.jit_kernel.kv_cache_canary_verify_ref import (
     _splitmix64_python,
     _to_signed_int64,
 )
-from sglang.jit_kernel.kv_cache_canary_write import CanaryPseudoMode, WritePlan
-
-# Bit reused for write-side pseudo-mode token mismatch. We piggyback the position bit for position mismatch and
-# define a write-only token bit here (does not overlap with verify's bits since they live in disjoint launches).
-_FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH: int = 1 << 3
-_FAIL_REASON_BIT_WRITE_POSITION_MISMATCH: int = _FAIL_REASON_BIT_POSITION
+from sglang.jit_kernel.kv_cache_canary_write import (
+    _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
+    _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
+    CanaryPseudoMode,
+    WritePlan,
+)
 
 # Canary slot field offsets within the 4-int64 layout. Kept in sync with the verify ref.
 _FIELD_TOKEN: int = 0
