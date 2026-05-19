@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -8,6 +7,7 @@ from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
 from sglang.jit_kernel.kv_cache_canary_write import (
     CanaryPseudoMode as CanaryInputCheckMode,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -59,66 +59,32 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
+        mode_raw = envs.SGLANG_KV_CANARY_MODE.get().strip().lower()
+        if mode_raw not in ("off", "on", "raise"):
+            raise ValueError(
+                f"kv-canary: SGLANG_KV_CANARY_MODE must be one of off/on/raise, got {mode_raw!r}"
+            )
+        real_kv_raw = envs.SGLANG_KV_CANARY_REAL_KV_HASH_MODE.get().strip().upper()
+        if real_kv_raw not in RealKvHashMode.__members__:
+            raise ValueError(
+                f"kv-canary: SGLANG_KV_CANARY_REAL_KV_HASH_MODE must be one of "
+                f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
+            )
+        input_check_raw = envs.SGLANG_KV_CANARY_INPUT_CHECK_MODE.get().strip().upper()
+        if input_check_raw not in CanaryInputCheckMode.__members__:
+            raise ValueError(
+                f"kv-canary: SGLANG_KV_CANARY_INPUT_CHECK_MODE must be one of "
+                f"{list(CanaryInputCheckMode.__members__)}, got {input_check_raw!r}"
+            )
+
         return cls(
-            mode=_parse_mode(os.getenv("SGLANG_KV_CANARY_MODE", "off")),
-            ring_capacity=int(os.getenv("SGLANG_KV_CANARY_RING_CAPACITY", "1024")),
-            sweep_every_n_steps=int(
-                os.getenv("SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS", "64")
-            ),
-            real_kv_hash_mode=_parse_real_kv_hash_mode(
-                os.getenv("SGLANG_KV_CANARY_REAL_KV_HASH_MODE", "BIT")
-            ),
-            input_check_mode=_parse_input_check_mode(
-                os.getenv("SGLANG_KV_CANARY_INPUT_CHECK_MODE", "OFF")
-            ),
-            perturb_req_to_token_prob=float(
-                os.getenv("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN", "0.0")
-            ),
-            perturb_real_kv_prob=float(
-                os.getenv("SGLANG_KV_CANARY_PERTURB_REAL_KV", "0.0")
-            ),
-            stats_print_every_n_steps=int(
-                os.getenv("SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS", "0")
-            ),
-            allreduce_violation_signal=_parse_bool(
-                os.getenv("SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL", "1")
-            ),
+            mode=mode_raw,  # type: ignore[arg-type]
+            ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
+            sweep_every_n_steps=envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get(),
+            real_kv_hash_mode=RealKvHashMode[real_kv_raw],
+            input_check_mode=CanaryInputCheckMode[input_check_raw],
+            perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN.get(),
+            perturb_real_kv_prob=envs.SGLANG_KV_CANARY_PERTURB_REAL_KV.get(),
+            stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
+            allreduce_violation_signal=envs.SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL.get(),
         )
-
-
-def _parse_mode(value: str) -> Literal["off", "on", "raise"]:
-    lowered = value.strip().lower()
-    if lowered not in ("off", "on", "raise"):
-        raise ValueError(
-            f"kv-canary: SGLANG_KV_CANARY_MODE must be one of off/on/raise, got {value!r}"
-        )
-    return lowered  # type: ignore[return-value]
-
-
-def _parse_real_kv_hash_mode(value: str) -> RealKvHashMode:
-    upper = value.strip().upper()
-    if upper not in RealKvHashMode.__members__:
-        raise ValueError(
-            f"kv-canary: SGLANG_KV_CANARY_REAL_KV_HASH_MODE must be one of "
-            f"{list(RealKvHashMode.__members__)}, got {value!r}"
-        )
-    return RealKvHashMode[upper]
-
-
-def _parse_input_check_mode(value: str) -> CanaryInputCheckMode:
-    upper = value.strip().upper()
-    if upper not in CanaryInputCheckMode.__members__:
-        raise ValueError(
-            f"kv-canary: SGLANG_KV_CANARY_INPUT_CHECK_MODE must be one of "
-            f"{list(CanaryInputCheckMode.__members__)}, got {value!r}"
-        )
-    return CanaryInputCheckMode[upper]
-
-
-def _parse_bool(value: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in ("1", "true", "yes", "y", "on"):
-        return True
-    if lowered in ("0", "false", "no", "n", "off"):
-        return False
-    raise ValueError(f"kv-canary: cannot parse boolean from {value!r}")

@@ -1,287 +1,206 @@
-"""Pool attach + buf_info patch for the canary.
-
-Per kernels.md §3.2 / §2.4, this module:
-
-- Allocates one or two :class:`CanaryBufferGroup` instances per pool (FULL alone for MHA / MLA; FULL + SWA
-  for SWA / DSV4).
-- Constructs each group's ``real_kv_sources_k`` / ``real_kv_sources_v`` tuples using the new
-  :class:`RealKvSource` ABI (kernels.md §2.4 + §2.4.1).
-- Monkey-patches ``get_contiguous_buf_infos`` (and ``get_state_buf_infos`` on SWA) so PD transfers and
-  state-buf consumers see the canary tensors alongside the real KV ones.
-"""
-
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+)
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary_verify import CANARY_SLOT_BYTES, RealKvSource
+from sglang.jit_kernel.kv_cache_canary_verify import (
+    CANARY_SLOT_BYTES,
+    RealKvHashMode,
+    RealKvSource,
+)
 from sglang.srt.kv_cache_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_cache_canary.config import CanaryConfig
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    MHATokenToKVPoolFP4,
+    MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
+    NSATokenToKVPool,
+)
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import (
-        KVCache,
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-    )
+_CANARY_ATTACHED_ATTR = "_kv_cache_canary_attached"
+_DEFAULT_READ_BYTES = 32
 
-logger = logging.getLogger(__name__)
-
-_CANARY_POOL_ATTR = "_kv_cache_canary_attached"
-_CANARY_BUFFER_GROUPS_ATTR = "_kv_cache_canary_buffer_groups"
+_BufInfoTriple = Tuple[List[int], List[int], List[int]]
 
 
 def attach_canary_buffers(
-    pool: "KVCache",
     *,
-    real_kv_read_bytes: int,
-) -> None:
-    """Attach canary buffers and patch ``buf_info`` methods on ``pool``.
+    pool: KVCache,
+    config: CanaryConfig,
+    device: torch.device,
+) -> tuple[CanaryBufferGroup, ...]:
+    """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple (1 entry per
+    pool sub-group: FULL only, or FULL + SWA). Patches the pool's get_contiguous_buf_infos to expose
+    canary slots at head and tail so the rest of sglang's plumbing (PD transfer, hicache, etc.) sees
+    them as first-class KV bytes.
 
-    Dispatches on the pool type (kernels.md §2.4 + §3.2):
+    Per-pool dispatch is done via a registered adapter (CanaryPoolAdapter) keyed on pool kind. Adapters
+    own the layout knowledge: where to insert head/tail canary buffers in the pool's internal storage,
+    how to expose RealKvSource for the canary's real-KV mixin, and which monkeypatches are needed.
 
-    - ``MHATokenToKVPool`` — one ``FULL`` group with K+V halves.
-    - ``MLATokenToKVPool`` / ``MLATokenToKVPoolFP4`` / ``NSATokenToKVPool`` — one ``FULL`` group with K only
-      (single ``kv_buffer``).
-    - ``BaseSWAKVPool`` (incl. ``SWAKVPool`` and ``DeepSeekV4TokenToKVPool``) — one ``FULL`` + one ``SWA``
-      group, each with its own canary tensors and ``RealKvSource`` lists.
-
-    ``real_kv_read_bytes`` controls how many leading bytes of each per-token slice each ``RealKvSource``
-    contributes to the canary fingerprint. Caller passes ``0`` to disable the real-KV mixin entirely
-    (kernel takes the OFF early-out and ignores the sources).
+    Idempotent: calling twice on the same pool is an error (raises). To re-attach, detach first.
     """
-    if getattr(pool, _CANARY_POOL_ATTR, False):
-        return
-
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup] = {}
-
-    if hasattr(pool, "swa_kv_pool"):
-        _attach_swa(
-            pool, buffer_groups=buffer_groups, real_kv_read_bytes=real_kv_read_bytes
-        )
-    elif hasattr(pool, "kv_buffer") and not hasattr(pool, "k_buffer"):
-        _attach_mla(
-            pool, buffer_groups=buffer_groups, real_kv_read_bytes=real_kv_read_bytes
-        )
-    elif hasattr(pool, "k_buffer") and hasattr(pool, "v_buffer"):
-        _attach_mha(
-            pool, buffer_groups=buffer_groups, real_kv_read_bytes=real_kv_read_bytes
-        )
-    else:
+    if getattr(pool, _CANARY_ATTACHED_ATTR, False):
         raise RuntimeError(
-            f"kv-canary: unsupported pool type {type(pool).__name__}; extend pool_patch.py with a "
-            "dispatch branch"
+            f"kv-canary: pool {type(pool).__name__} already has canary buffers attached"
         )
 
-    setattr(pool, _CANARY_BUFFER_GROUPS_ATTR, buffer_groups)
-    setattr(pool, _CANARY_POOL_ATTR, True)
+    adapter = _resolve_adapter(pool)
+    read_bytes = _resolve_read_bytes(config)
+    groups: List[CanaryBufferGroup] = []
 
-    first_group = next(iter(buffer_groups.values()))
-    pool.canary_k_head = first_group.k_head
-    pool.canary_k_tail = first_group.k_tail
-    pool.canary_v_head = first_group.v_head
-    pool.canary_v_tail = first_group.v_tail
-    pool.canary_has_v_half = first_group.has_v_half
+    full_group = _build_buffer_group(
+        pool=pool,
+        adapter=adapter,
+        kind=PoolKind.FULL,
+        device=device,
+        read_bytes=read_bytes,
+    )
+    adapter.install_full_group(pool, full_group)
+    groups.append(full_group)
+
+    if adapter.is_swa(pool):
+        swa_group = _build_buffer_group(
+            pool=pool,
+            adapter=adapter,
+            kind=PoolKind.SWA,
+            device=device,
+            read_bytes=read_bytes,
+        )
+        adapter.install_swa_group(pool, swa_group)
+        groups.append(swa_group)
+
+    setattr(pool, _CANARY_ATTACHED_ATTR, True)
+    return tuple(groups)
 
 
-def get_canary_buffer_groups(pool: "KVCache") -> Dict[PoolKind, CanaryBufferGroup]:
-    """Return the dict of attached canary buffer groups keyed by :class:`PoolKind`.
+class CanaryPoolAdapter(Protocol):
+    """Per-pool-kind adapter. One implementation per pool class (MHATokenToKVPool, MLATokenToKVPool,
+    SWATokenToKVPool, FP4TokenToKVPool, NSATokenToKVPool, DSV4PackedPool, ...). Registered via
+    @register_canary_adapter(PoolClass) decorator at module import.
 
-    Empty dict if the pool has not been attached yet (caller responsibility to invoke
-    :func:`attach_canary_buffers` first).
+    Each method is given the pool + a freshly-allocated CanaryBufferGroup (head + tail buffers already
+    allocated to the right slot count) and is responsible for wiring it into the pool.
     """
-    groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
-    if groups is None:
-        return {}
-    return groups
+
+    def is_swa(self, pool: KVCache) -> bool:
+        """Return True iff this pool exposes a SWA sub-pool. If True, attach_canary_buffers allocates
+        two CanaryBufferGroup instances (FULL + SWA) and calls install_swa_group as well.
+        """
+
+    def has_v_half(self, pool: KVCache) -> bool:
+        """False for MLA-style pools (single tensor for compressed KV)."""
+
+    def install_full_group(
+        self,
+        pool: KVCache,
+        group: CanaryBufferGroup,
+    ) -> None:
+        """Wire group.k_head / k_tail (+ v_head / v_tail if has_v_half) into the pool's FULL sub-pool.
+        Patches get_contiguous_buf_infos to prepend the head buffer and append the tail buffer to the
+        K/V buf list (per Rule: PD layout is k0 k1 ... kN v0 v1 ... vN — the head/tail canary buffers
+        sit at index 0 / N+1 within EACH half, not at the absolute ends of the combined list).
+        """
+
+    def install_swa_group(
+        self,
+        pool: KVCache,
+        group: CanaryBufferGroup,
+    ) -> None:
+        """Same as install_full_group but for the SWA sub-pool. Only called when is_swa returns True."""
+
+    def build_real_kv_sources(
+        self,
+        pool: KVCache,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        """Return up to 4 RealKvSource entries (kernels.md §2.4.1) describing the real-KV bytes the
+        canary should fingerprint for this (kind, half). read_bytes is the leading-byte budget per
+        slot per source. Empty tuple disables the mixin for this endpoint."""
+
+    def slot_count(self, pool: KVCache, kind: PoolKind) -> int: ...
+
+    def swa_index_lut(self, pool: KVCache) -> Optional[torch.Tensor]: ...
 
 
-def _attach_mha(
-    pool: "MHATokenToKVPool",
-    *,
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    real_kv_read_bytes: int,
-) -> None:
-    if pool.layer_num <= 0:
-        raise RuntimeError(f"kv-canary: pool has invalid layer_num={pool.layer_num}")
-
-    k_template = pool.k_buffer[0]
-    v_template = pool.v_buffer[0]
-
-    real_kv_sources_k = _build_real_kv_sources_simple(
-        layer_buffer=k_template, read_bytes=real_kv_read_bytes
-    )
-    real_kv_sources_v = _build_real_kv_sources_simple(
-        layer_buffer=v_template, read_bytes=real_kv_read_bytes
-    )
-
-    group = _allocate_buffer_group(
-        kind=PoolKind.FULL,
-        k_template=k_template,
-        v_template=v_template,
-        real_kv_sources_k=real_kv_sources_k,
-        real_kv_sources_v=real_kv_sources_v,
-    )
-    buffer_groups[PoolKind.FULL] = group
-    _patch_get_contiguous_buf_infos(pool, buffer_groups=buffer_groups, has_v_half=True)
-    logger.info(
-        "kv-canary: attached MHA canary buffer (FULL, dtype=%s, num_slots=%d)",
-        group.k_head.dtype,
-        int(group.k_head.shape[0]),
-    )
+_ADAPTERS: Dict[Type, CanaryPoolAdapter] = {}
 
 
-def _attach_mla(
-    pool: "MLATokenToKVPool",
-    *,
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    real_kv_read_bytes: int,
-) -> None:
-    """Attach to MLA / NSA / FP4 — single latent ``kv_buffer`` (no V half)."""
-    if pool.layer_num <= 0:
-        raise RuntimeError(
-            f"kv-canary: MLA pool has invalid layer_num={pool.layer_num}"
+def register_canary_adapter(
+    pool_class: Type,
+) -> Callable[[Type], Type]:
+    def _decorator(adapter_class: Type) -> Type:
+        _ADAPTERS[pool_class] = adapter_class()
+        return adapter_class
+
+    return _decorator
+
+
+def _resolve_adapter(pool: KVCache) -> CanaryPoolAdapter:
+    adapter = _ADAPTERS.get(type(pool))
+    if adapter is None:
+        raise NotImplementedError(
+            f"kv-canary: no CanaryPoolAdapter registered for pool class "
+            f"{type(pool).__name__}; supported: "
+            f"{sorted(cls.__name__ for cls in _ADAPTERS)}"
         )
-    k_template = pool.kv_buffer[0]
-    real_kv_sources_k = _build_real_kv_sources_simple(
-        layer_buffer=k_template, read_bytes=real_kv_read_bytes
-    )
-
-    group = _allocate_buffer_group(
-        kind=PoolKind.FULL,
-        k_template=k_template,
-        v_template=None,
-        real_kv_sources_k=real_kv_sources_k,
-        real_kv_sources_v=(),
-    )
-    buffer_groups[PoolKind.FULL] = group
-    _patch_get_contiguous_buf_infos(pool, buffer_groups=buffer_groups, has_v_half=False)
-    logger.info(
-        "kv-canary: attached MLA-style canary buffer on %s (FULL, dtype=%s, num_slots=%d)",
-        type(pool).__name__,
-        group.k_head.dtype,
-        int(group.k_head.shape[0]),
-    )
+    return adapter
 
 
-def _attach_swa(
-    pool: "BaseSWAKVPool",
+def _resolve_read_bytes(config: CanaryConfig) -> int:
+    if config.real_kv_hash_mode is RealKvHashMode.OFF:
+        return 0
+    return _DEFAULT_READ_BYTES
+
+
+def _build_buffer_group(
     *,
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    real_kv_read_bytes: int,
-) -> None:
-    """Attach BOTH a FULL and a SWA canary to an SWA system.
-
-    Mirrors the legacy layout but builds :class:`RealKvSource` tuples instead of carrying a single
-    ``real_kv_source`` tensor — DSV4 / multi-layer pools can be extended later by overriding
-    ``_build_real_kv_sources_simple`` to emit more than one source.
-    """
-    swa_sub_pool = pool.swa_kv_pool
-    swa_k_template, swa_v_template = _pull_kv_templates(
-        sub_pool=swa_sub_pool, label="SWA sub-pool"
-    )
-
-    full_sub_pool = getattr(pool, "full_kv_pool", None)
-    swa_lut: Optional[torch.Tensor]
-    if full_sub_pool is not None:
-        full_k_template, full_v_template = _pull_kv_templates(
-            sub_pool=full_sub_pool, label="SWA full sub-pool"
-        )
-        if hasattr(pool, "full_to_swa_index_mapping"):
-            swa_lut = pool.full_to_swa_index_mapping
-        else:
-            swa_lut = None
-    else:
-        full_k_template = swa_k_template
-        full_v_template = swa_v_template
-        swa_lut = None
-
-    full_real_kv_sources_k = _build_real_kv_sources_simple(
-        layer_buffer=full_k_template, read_bytes=real_kv_read_bytes
-    )
-    full_real_kv_sources_v = (
-        _build_real_kv_sources_simple(
-            layer_buffer=full_v_template, read_bytes=real_kv_read_bytes
-        )
-        if full_v_template is not None
-        else ()
-    )
-    swa_real_kv_sources_k = _build_real_kv_sources_simple(
-        layer_buffer=swa_k_template, read_bytes=real_kv_read_bytes
-    )
-    swa_real_kv_sources_v = (
-        _build_real_kv_sources_simple(
-            layer_buffer=swa_v_template, read_bytes=real_kv_read_bytes
-        )
-        if swa_v_template is not None
-        else ()
-    )
-
-    full_group = _allocate_buffer_group(
-        kind=PoolKind.FULL,
-        k_template=full_k_template,
-        v_template=full_v_template,
-        real_kv_sources_k=full_real_kv_sources_k,
-        real_kv_sources_v=full_real_kv_sources_v,
-    )
-    swa_group = _allocate_buffer_group(
-        kind=PoolKind.SWA,
-        k_template=swa_k_template,
-        v_template=swa_v_template,
-        real_kv_sources_k=swa_real_kv_sources_k,
-        real_kv_sources_v=swa_real_kv_sources_v,
-        swa_index_lut=swa_lut,
-    )
-    buffer_groups[PoolKind.FULL] = full_group
-    buffer_groups[PoolKind.SWA] = swa_group
-
-    _patch_get_state_buf_infos(
-        pool,
-        buffer_groups=buffer_groups,
-        has_v_half=swa_group.has_v_half,
-    )
-    logger.info(
-        "kv-canary: attached dual SWA canary buffers on %s (kinds=%s, v_half=%s, "
-        "full_slots=%d, swa_slots=%d)",
-        type(pool).__name__,
-        [k.value for k in buffer_groups.keys()],
-        swa_group.has_v_half,
-        int(full_group.k_head.shape[0]),
-        int(swa_group.k_head.shape[0]),
-    )
-
-
-def _allocate_buffer_group(
-    *,
+    pool: KVCache,
+    adapter: CanaryPoolAdapter,
     kind: PoolKind,
-    k_template: torch.Tensor,
-    v_template: Optional[torch.Tensor],
-    real_kv_sources_k: tuple[RealKvSource, ...],
-    real_kv_sources_v: tuple[RealKvSource, ...],
-    swa_index_lut: Optional[torch.Tensor] = None,
+    device: torch.device,
+    read_bytes: int,
 ) -> CanaryBufferGroup:
-    """Allocate a fresh canary buffer group sized off the provided slot templates."""
-    device = k_template.device
-    num_slots = int(k_template.shape[0])
+    num_slots = adapter.slot_count(pool, kind)
+    has_v = adapter.has_v_half(pool)
+
     k_head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     k_tail = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-
     v_head: Optional[torch.Tensor]
     v_tail: Optional[torch.Tensor]
-    if v_template is None:
-        v_head = None
-        v_tail = None
-    else:
-        v_num_slots = int(v_template.shape[0])
+    if has_v:
         v_head = torch.zeros(
-            v_num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
+            num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
         )
         v_tail = torch.zeros(
-            v_num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
+            num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
         )
+    else:
+        v_head = None
+        v_tail = None
+
+    real_kv_sources_k = adapter.build_real_kv_sources(pool, kind, "K", read_bytes)
+    real_kv_sources_v = (
+        adapter.build_real_kv_sources(pool, kind, "V", read_bytes) if has_v else ()
+    )
+
+    swa_index_lut = adapter.swa_index_lut(pool) if kind is PoolKind.SWA else None
 
     return CanaryBufferGroup(
         kind=kind,
@@ -295,145 +214,444 @@ def _allocate_buffer_group(
     )
 
 
-def _build_real_kv_sources_simple(
-    *, layer_buffer: torch.Tensor, read_bytes: int
+def _make_row_source(
+    *,
+    layer_buffer: torch.Tensor,
+    read_bytes: int,
 ) -> tuple[RealKvSource, ...]:
-    """Build a single :class:`RealKvSource` covering one KV layer-0 tensor.
-
-    Page-size is taken to be 1 (one slot per row of dim 0) because every supported pool's layer buffer is
-    laid out as ``[num_slots, ...]`` row-major contiguous. ``num_bytes_per_token`` is the flattened per-slot
-    byte count from the tensor's row stride; ``read_bytes`` is clipped into ``[0, num_bytes_per_token]``.
-    """
     contiguous = layer_buffer.contiguous()
     num_slots = int(contiguous.shape[0])
-    if num_slots == 0:
+    if num_slots == 0 or read_bytes == 0:
         return ()
     flat = contiguous.view(torch.uint8).reshape(num_slots, -1)
     num_bytes_per_token = int(flat.shape[1])
-    clipped_read_bytes = max(0, min(int(read_bytes), num_bytes_per_token))
+    clipped = max(0, min(int(read_bytes), num_bytes_per_token))
     return (
         RealKvSource(
             tensor=flat,
             page_size=1,
             num_bytes_per_token=num_bytes_per_token,
-            read_bytes=clipped_read_bytes,
+            read_bytes=clipped,
         ),
     )
 
 
-def _pull_kv_templates(
-    *, sub_pool: object, label: str
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Return ``(k_template, v_template)`` for an MHA-style or MLA-style sub-pool.
-
-    MHA-style sub-pools expose ``k_buffer`` + ``v_buffer``; MLA-style sub-pools expose a single
-    ``kv_buffer`` (V-half is ``None``).
-    """
-    if hasattr(sub_pool, "k_buffer") and hasattr(sub_pool, "v_buffer"):
-        return sub_pool.k_buffer[0], sub_pool.v_buffer[0]
-    if hasattr(sub_pool, "kv_buffer"):
-        return sub_pool.kv_buffer[0], None
-    raise RuntimeError(
-        f"kv-canary: {label} {type(sub_pool).__name__} has neither k_buffer/v_buffer nor kv_buffer; "
-        "cannot attach canary buffer"
+def _make_packed_source(
+    *,
+    page_buffer: torch.Tensor,
+    page_size: int,
+    bytes_per_token: int,
+    read_bytes: int,
+) -> tuple[RealKvSource, ...]:
+    if read_bytes == 0 or page_buffer.numel() == 0:
+        return ()
+    flat = page_buffer.contiguous().view(torch.uint8)
+    if flat.ndim == 1:
+        flat = flat.reshape(1, -1)
+    clipped = max(0, min(int(read_bytes), bytes_per_token))
+    return (
+        RealKvSource(
+            tensor=flat,
+            page_size=page_size,
+            num_bytes_per_token=bytes_per_token,
+            read_bytes=clipped,
+        ),
     )
 
 
-def _compose_buf_infos_with_canaries(
+def _patch_buf_info_method(
+    pool: object,
     *,
-    data_ptrs: List[int],
-    data_lens: List[int],
-    item_lens: List[int],
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    page_size: int,
+    method_name: str,
+    group: CanaryBufferGroup,
     has_v_half: bool,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Splice every attached group's canary entries into the buf-info triple."""
-    extra_k_ptrs: List[int] = []
-    extra_k_lens: List[int] = []
-    extra_k_item_lens: List[int] = []
-    extra_v_ptrs: List[int] = []
-    extra_v_lens: List[int] = []
-    extra_v_item_lens: List[int] = []
+    page_size: int,
+) -> None:
+    original = getattr(pool, method_name)
 
-    for group in buffer_groups.values():
-        extra_k_ptrs.extend([group.k_head.data_ptr(), group.k_tail.data_ptr()])
-        extra_k_lens.extend([group.k_head.nbytes, group.k_tail.nbytes])
-        extra_k_item_lens.extend(
-            [
-                group.k_head[0].nbytes * page_size,
-                group.k_tail[0].nbytes * page_size,
-            ]
+    def patched() -> _BufInfoTriple:
+        ptrs, lens, item_lens = original()
+        return _splice_canary_buf_info(
+            ptrs=ptrs,
+            lens=lens,
+            item_lens=item_lens,
+            group=group,
+            has_v_half=has_v_half,
+            page_size=page_size,
         )
-        if has_v_half and group.has_v_half:
-            assert group.v_head is not None and group.v_tail is not None
-            extra_v_ptrs.extend([group.v_head.data_ptr(), group.v_tail.data_ptr()])
-            extra_v_lens.extend([group.v_head.nbytes, group.v_tail.nbytes])
-            extra_v_item_lens.extend(
-                [
-                    group.v_head[0].nbytes * page_size,
-                    group.v_tail[0].nbytes * page_size,
-                ]
-            )
+
+    setattr(pool, method_name, patched)
+
+
+def _splice_canary_buf_info(
+    *,
+    ptrs: List[int],
+    lens: List[int],
+    item_lens: List[int],
+    group: CanaryBufferGroup,
+    has_v_half: bool,
+    page_size: int,
+) -> _BufInfoTriple:
+    k_head_entry = _entry_triple(group.k_head, page_size=page_size)
+    k_tail_entry = _entry_triple(group.k_tail, page_size=page_size)
 
     if not has_v_half:
         return (
-            list(data_ptrs) + extra_k_ptrs,
-            list(data_lens) + extra_k_lens,
-            list(item_lens) + extra_k_item_lens,
+            [k_head_entry[0]] + list(ptrs) + [k_tail_entry[0]],
+            [k_head_entry[1]] + list(lens) + [k_tail_entry[1]],
+            [k_head_entry[2]] + list(item_lens) + [k_tail_entry[2]],
         )
 
-    mid = len(data_ptrs) // 2
+    assert group.v_head is not None and group.v_tail is not None
+    v_head_entry = _entry_triple(group.v_head, page_size=page_size)
+    v_tail_entry = _entry_triple(group.v_tail, page_size=page_size)
+
+    mid = len(ptrs) // 2
     return (
-        list(data_ptrs[:mid]) + extra_k_ptrs + list(data_ptrs[mid:]) + extra_v_ptrs,
-        list(data_lens[:mid]) + extra_k_lens + list(data_lens[mid:]) + extra_v_lens,
-        list(item_lens[:mid])
-        + extra_k_item_lens
+        [k_head_entry[0]]
+        + list(ptrs[:mid])
+        + [k_tail_entry[0], v_head_entry[0]]
+        + list(ptrs[mid:])
+        + [v_tail_entry[0]],
+        [k_head_entry[1]]
+        + list(lens[:mid])
+        + [k_tail_entry[1], v_head_entry[1]]
+        + list(lens[mid:])
+        + [v_tail_entry[1]],
+        [k_head_entry[2]]
+        + list(item_lens[:mid])
+        + [k_tail_entry[2], v_head_entry[2]]
         + list(item_lens[mid:])
-        + extra_v_item_lens,
+        + [v_tail_entry[2]],
     )
 
 
-def _patch_get_contiguous_buf_infos(
-    pool: "KVCache",
-    *,
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    has_v_half: bool,
-) -> None:
-    original = pool.get_contiguous_buf_infos
+def _entry_triple(buf: torch.Tensor, *, page_size: int) -> Tuple[int, int, int]:
+    return (
+        buf.data_ptr(),
+        buf.nbytes,
+        buf[0].nbytes * page_size,
+    )
 
-    def patched() -> Tuple[List[int], List[int], List[int]]:
-        ptrs, lens, item_lens = original()
-        return _compose_buf_infos_with_canaries(
-            data_ptrs=ptrs,
-            data_lens=lens,
-            item_lens=item_lens,
-            buffer_groups=buffer_groups,
+
+@register_canary_adapter(MHATokenToKVPool)
+class _MHAAdapter:
+    def is_swa(self, pool: MHATokenToKVPool) -> bool:
+        return False
+
+    def has_v_half(self, pool: MHATokenToKVPool) -> bool:
+        return True
+
+    def slot_count(self, pool: MHATokenToKVPool, kind: PoolKind) -> int:
+        return int(pool.k_buffer[0].shape[0])
+
+    def swa_index_lut(self, pool: MHATokenToKVPool) -> Optional[torch.Tensor]:
+        return None
+
+    def build_real_kv_sources(
+        self,
+        pool: MHATokenToKVPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        buf = pool.k_buffer[0] if half == "K" else pool.v_buffer[0]
+        return _make_row_source(layer_buffer=buf, read_bytes=read_bytes)
+
+    def install_full_group(
+        self, pool: MHATokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_contiguous_buf_infos",
+            group=group,
+            has_v_half=True,
             page_size=pool.page_size,
-            has_v_half=has_v_half,
         )
 
-    pool.get_contiguous_buf_infos = patched
-
-
-def _patch_get_state_buf_infos(
-    pool: "BaseSWAKVPool",
-    *,
-    buffer_groups: Dict[PoolKind, CanaryBufferGroup],
-    has_v_half: bool,
-) -> None:
-    """SWA + PD: ``get_state_buf_infos`` is the main path."""
-    original = pool.get_state_buf_infos
-
-    def patched() -> Tuple[List[int], List[int], List[int]]:
-        ptrs, lens, item_lens = original()
-        return _compose_buf_infos_with_canaries(
-            data_ptrs=ptrs,
-            data_lens=lens,
-            item_lens=item_lens,
-            buffer_groups=buffer_groups,
-            page_size=pool.page_size,
-            has_v_half=has_v_half,
+    def install_swa_group(
+        self, pool: MHATokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        raise NotImplementedError(
+            f"kv-canary: MHA pool {type(pool).__name__} has no SWA sub-pool"
         )
 
-    pool.get_state_buf_infos = patched
+
+@register_canary_adapter(MHATokenToKVPoolFP4)
+class _MHAFp4Adapter(_MHAAdapter):
+    pass
+
+
+@register_canary_adapter(MLATokenToKVPool)
+class _MLAAdapter:
+    def is_swa(self, pool: MLATokenToKVPool) -> bool:
+        return False
+
+    def has_v_half(self, pool: MLATokenToKVPool) -> bool:
+        return False
+
+    def slot_count(self, pool: MLATokenToKVPool, kind: PoolKind) -> int:
+        return int(pool.kv_buffer[0].shape[0])
+
+    def swa_index_lut(self, pool: MLATokenToKVPool) -> Optional[torch.Tensor]:
+        return None
+
+    def build_real_kv_sources(
+        self,
+        pool: MLATokenToKVPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        if half == "V":
+            return ()
+        return _make_row_source(layer_buffer=pool.kv_buffer[0], read_bytes=read_bytes)
+
+    def install_full_group(
+        self, pool: MLATokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_contiguous_buf_infos",
+            group=group,
+            has_v_half=False,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(
+        self, pool: MLATokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        raise NotImplementedError(
+            f"kv-canary: MLA pool {type(pool).__name__} has no SWA sub-pool"
+        )
+
+
+@register_canary_adapter(MLATokenToKVPoolFP4)
+class _MLAFp4Adapter(_MLAAdapter):
+    pass
+
+
+@register_canary_adapter(NSATokenToKVPool)
+class _NSAAdapter(_MLAAdapter):
+    def build_real_kv_sources(
+        self,
+        pool: NSATokenToKVPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        if half == "V":
+            return ()
+        kv_sources = _make_row_source(
+            layer_buffer=pool.kv_buffer[0], read_bytes=read_bytes
+        )
+        index_buffer = pool.index_k_with_scale_buffer[0]
+        index_page_size = pool.page_size
+        index_bytes_per_token = int(index_buffer.shape[1]) // index_page_size
+        index_sources = _make_packed_source(
+            page_buffer=index_buffer,
+            page_size=index_page_size,
+            bytes_per_token=index_bytes_per_token,
+            read_bytes=read_bytes,
+        )
+        return kv_sources + index_sources
+
+
+@register_canary_adapter(SWAKVPool)
+class _SWAAdapter:
+    def is_swa(self, pool: SWAKVPool) -> bool:
+        return True
+
+    def has_v_half(self, pool: SWAKVPool) -> bool:
+        return True
+
+    def slot_count(self, pool: SWAKVPool, kind: PoolKind) -> int:
+        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+        return int(sub_pool.k_buffer[0].shape[0])
+
+    def swa_index_lut(self, pool: SWAKVPool) -> Optional[torch.Tensor]:
+        return pool.full_to_swa_index_mapping
+
+    def build_real_kv_sources(
+        self,
+        pool: SWAKVPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        sub_pool = pool.full_kv_pool if kind is PoolKind.FULL else pool.swa_kv_pool
+        buf = sub_pool.k_buffer[0] if half == "K" else sub_pool.v_buffer[0]
+        return _make_row_source(layer_buffer=buf, read_bytes=read_bytes)
+
+    def install_full_group(self, pool: SWAKVPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_contiguous_buf_infos",
+            group=group,
+            has_v_half=True,
+            page_size=pool.page_size,
+        )
+
+    def install_swa_group(self, pool: SWAKVPool, group: CanaryBufferGroup) -> None:
+        _patch_buf_info_method(
+            pool,
+            method_name="get_state_buf_infos",
+            group=group,
+            has_v_half=True,
+            page_size=pool.page_size,
+        )
+
+
+@register_canary_adapter(DeepSeekV4TokenToKVPool)
+class _DeepSeekV4Adapter:
+    def is_swa(self, pool: DeepSeekV4TokenToKVPool) -> bool:
+        return True
+
+    def has_v_half(self, pool: DeepSeekV4TokenToKVPool) -> bool:
+        return False
+
+    def slot_count(self, pool: DeepSeekV4TokenToKVPool, kind: PoolKind) -> int:
+        if kind is PoolKind.SWA:
+            return (
+                int(pool.swa_kv_pool.kv_buffer[0].shape[0]) * pool.swa_kv_pool.page_size
+            )
+        return int(pool.c4_kv_pool.kv_buffer[0].shape[0]) * pool.c4_kv_pool.page_size
+
+    def swa_index_lut(self, pool: DeepSeekV4TokenToKVPool) -> Optional[torch.Tensor]:
+        return getattr(pool, "full_to_swa_index_mapping", None)
+
+    def build_real_kv_sources(
+        self,
+        pool: DeepSeekV4TokenToKVPool,
+        kind: PoolKind,
+        half: Literal["K", "V"],
+        read_bytes: int,
+    ) -> tuple[RealKvSource, ...]:
+        if half == "V":
+            return ()
+        if kind is PoolKind.SWA:
+            swa_buf = pool.swa_kv_pool.kv_buffer[0]
+            return _make_row_source(layer_buffer=swa_buf, read_bytes=read_bytes)
+
+        c4_buf = pool.c4_kv_pool.kv_buffer[0]
+        c4_page_size = pool.c4_kv_pool.page_size
+        c4_bytes_per_token = pool.c4_kv_pool.get_bytes_per_token()
+        c4_sources = _make_packed_source(
+            page_buffer=c4_buf,
+            page_size=c4_page_size,
+            bytes_per_token=c4_bytes_per_token,
+            read_bytes=read_bytes,
+        )
+
+        indexer_buf = pool.c4_indexer_kv_pool.index_k_with_scale_buffer[0]
+        indexer_page_size = pool.c4_indexer_kv_pool.page_size
+        indexer_bytes_per_token = int(indexer_buf.shape[1]) // indexer_page_size
+        indexer_sources = _make_packed_source(
+            page_buffer=indexer_buf,
+            page_size=indexer_page_size,
+            bytes_per_token=indexer_bytes_per_token,
+            read_bytes=read_bytes,
+        )
+
+        c128_buf = pool.c128_kv_pool.kv_buffer[0]
+        c128_page_size = pool.c128_kv_pool.page_size
+        c128_bytes_per_token = pool.c128_kv_pool.get_bytes_per_token()
+        c128_sources = _make_packed_source(
+            page_buffer=c128_buf,
+            page_size=c128_page_size,
+            bytes_per_token=c128_bytes_per_token,
+            read_bytes=read_bytes,
+        )
+
+        return c4_sources + indexer_sources + c128_sources
+
+    def install_full_group(
+        self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        _patch_dsv4_buf_info(pool, method_name="get_contiguous_buf_infos", group=group)
+
+    def install_swa_group(
+        self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
+    ) -> None:
+        _patch_dsv4_buf_info(pool, method_name="get_state_buf_infos", group=group)
+
+
+def _patch_dsv4_buf_info(
+    pool: DeepSeekV4TokenToKVPool,
+    *,
+    method_name: str,
+    group: CanaryBufferGroup,
+) -> None:
+    original = getattr(pool, method_name, None)
+    if original is None:
+        return
+
+    c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
+    indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
+    c128_layer_num = len(pool.c128_kv_pool.kv_buffer)
+    segment_offsets = [
+        0,
+        c4_layer_num,
+        c4_layer_num + indexer_layer_num,
+    ]
+    expected_total = c4_layer_num + indexer_layer_num + c128_layer_num
+
+    page_size = pool.page_size
+
+    def patched() -> _BufInfoTriple:
+        ptrs, lens, item_lens = original()
+        if len(ptrs) != expected_total:
+            return _splice_canary_buf_info(
+                ptrs=ptrs,
+                lens=lens,
+                item_lens=item_lens,
+                group=group,
+                has_v_half=False,
+                page_size=page_size,
+            )
+        return _splice_packed_buf_info(
+            ptrs=ptrs,
+            lens=lens,
+            item_lens=item_lens,
+            segment_offsets=segment_offsets,
+            group=group,
+            page_size=page_size,
+        )
+
+    setattr(pool, method_name, patched)
+
+
+def _splice_packed_buf_info(
+    *,
+    ptrs: List[int],
+    lens: List[int],
+    item_lens: List[int],
+    segment_offsets: List[int],
+    group: CanaryBufferGroup,
+    page_size: int,
+) -> _BufInfoTriple:
+    head_entry = _entry_triple(group.k_head, page_size=page_size)
+    tail_entry = _entry_triple(group.k_tail, page_size=page_size)
+
+    out_ptrs: List[int] = []
+    out_lens: List[int] = []
+    out_item_lens: List[int] = []
+
+    for seg_idx in range(len(segment_offsets)):
+        start = segment_offsets[seg_idx]
+        stop = (
+            segment_offsets[seg_idx + 1]
+            if seg_idx + 1 < len(segment_offsets)
+            else len(ptrs)
+        )
+        out_ptrs.append(head_entry[0])
+        out_lens.append(head_entry[1])
+        out_item_lens.append(head_entry[2])
+        out_ptrs.extend(ptrs[start:stop])
+        out_lens.extend(lens[start:stop])
+        out_item_lens.extend(item_lens[start:stop])
+        out_ptrs.append(tail_entry[0])
+        out_lens.append(tail_entry[1])
+        out_item_lens.append(tail_entry[2])
+
+    return out_ptrs, out_lens, out_item_lens

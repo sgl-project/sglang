@@ -698,6 +698,17 @@ class Envs:
     # violations. Counterpart of ``SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB``;
     # this SOT-named alias is consumed by the new testing harness.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN = EnvFloat(0.0)
+    # KV cache canary upper-level config (upper-level SOT §10). All
+    # canary tunables are read once by ``CanaryConfig.from_env`` at
+    # server start; deeper modules must not read env vars directly.
+    SGLANG_KV_CANARY_MODE = EnvStr("off")
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS = EnvInt(64)
+    SGLANG_KV_CANARY_REAL_KV_HASH_MODE = EnvStr("BIT")
+    SGLANG_KV_CANARY_INPUT_CHECK_MODE = EnvStr("OFF")
+    SGLANG_KV_CANARY_PERTURB_REAL_KV = EnvFloat(0.0)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
+    SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
     # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
     # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
     # (default 1.5x). Override via env var when runner jitter or temporary
