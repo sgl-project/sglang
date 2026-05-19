@@ -570,11 +570,7 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
-        if (
-            _is_npu
-            and envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
-            and not forward_batch.forward_mode.is_idle()
-        ):
+        if _is_npu and not forward_batch.forward_mode.is_idle():
             # NPU path: do the indexer compute inline (compressor write +
             # q/weights + lightning indexer call) and stash topk indices on
             # the backend's forward_metadata for _forward_compressed to pick

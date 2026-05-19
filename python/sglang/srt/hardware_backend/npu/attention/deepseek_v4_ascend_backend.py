@@ -237,15 +237,13 @@ class DeepseekV4AscendAttnBackend(
         # compress KV) right now; c4a/c128a follow when we add those paths.
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
-        # Step-3 NPU compress metadata: only built when forward_npu paths are
-        # active (env-gated). Each field is a per-request tensor consumed by
+        # NPU compress metadata: per-request tensors consumed by
         # dsv4/{compressor,indexer}.py forward_npu. See iforgetmyname/dsv4_
         # release ascend_backend.init_forward_metadata @ ~L735-790 for the
         # reference impl on top of pre-allocated req_to_token_c{N} tables;
         # main has no req_to_token_c{N}, so we compute equivalents on the
         # fly from req_to_token + the V4 KV pool's swa translation.
-
-        if envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
+        if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
@@ -476,16 +474,9 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        # ratio 4 / 128 routing — TWO independent gates:
-        #   SGLANG_DSV4_NPU_REAL_COMPRESSOR=1 turns on the in-module
-        #     forward_npu (compressor writes real KV; output unchanged
-        #     because attention still falls back to dense here).
-        #   SGLANG_DSV4_NPU_SPARSE_ATTN=1 additionally routes attention
-        #     through _forward_compressed (has_cmp_kv=True kernel path).
-        # The second gate stays OFF by default until the kernel call's
-        # size / sparse-indices mismatch is resolved; with it OFF, output
-        # is bit-for-bit identical to the flag-OFF baseline.
-
+        # ratio 4 / 128 routing gated by SGLANG_DSV4_NPU_SPARSE_ATTN. When OFF
+        # we fall back to dense SWA (matches the bit-for-bit baseline); when
+        # ON we route through _forward_compressed (has_cmp_kv kernel path).
         sparse_on = envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get()
         c128_only = envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
         # Bisect mode: only c128 layers route to _forward_compressed.
@@ -537,11 +528,11 @@ class DeepseekV4AscendAttnBackend(
         compress_ratio: int,
     ) -> torch.Tensor:
         """ratio=4 / ratio=128 layers — sliding-window + compressed-KV sparse
-        attention via npu_sparse_attn_sharedkv with has_cmp_kv=True. cmp_kv is
-        read from the c4 / c128 pool (populated by the compressor when
-        SGLANG_DSV4_NPU_REAL_COMPRESSOR=1) and cmp_sparse_indices for c4 comes
-        from forward_metadata.c4_topk_indices (populated by the lightning
-        indexer when SGLANG_DSV4_NPU_REAL_INDEXER=1; -1 sentinel otherwise).
+        attention via npu_sparse_attn_sharedkv with has_cmp_kv=True. cmp_kv
+        comes from the c4 / c128 pool (populated by the compressor) and
+        cmp_sparse_indices for c4 comes from forward_metadata.c4_topk_indices
+        (populated by the lightning indexer when SGLANG_DSV4_NPU_REAL_INDEXER=1;
+        -1 sentinel otherwise).
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
@@ -671,13 +662,9 @@ class DeepseekV4AscendAttnBackend(
 
         CUDA's ``forward_core_compressor`` does (compressor → set_extra_key_*).
         On NPU, ``Compressor.forward_npu`` writes the KV pool inline, so we
-        just call the compressor. Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR;
-        when OFF, c4/c128 layers fall back to dense SWA in forward().
+        just call the compressor.
         """
         if forward_batch.forward_mode.is_idle():
-            return
-
-        if not envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
             return
         compressor(x, forward_batch)
 

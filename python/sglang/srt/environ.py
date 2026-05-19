@@ -346,8 +346,6 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
-    # Activate the in-module NPU compute path inside dsv4 Compressor / C4Indexer.
-    SGLANG_DSV4_NPU_REAL_COMPRESSOR = EnvBool(False)
     # Route ratio-4/128 attention through the has_cmp_kv kernel path.
     SGLANG_DSV4_NPU_SPARSE_ATTN = EnvBool(False)
     # Log cmp_kv / cmp_block_table / cmp_sparse_indices per call (spammy).

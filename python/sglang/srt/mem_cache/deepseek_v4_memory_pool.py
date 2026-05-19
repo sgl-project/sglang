@@ -325,18 +325,13 @@ class DeepSeekV4IndexerPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
-        # NPU layout: separate int8 K buffer + float16 scale buffer per
-        # layer, matching iforgetmyname/dsv4_release NPUSingleBufferTokenToKVPool
-        # so torch_npu.npu_scatter_nd_update_ + torch.ops.custom.npu_quant_
+        # NPU layout: separate int8 K buffer + float16 scale buffer per layer,
+        # matching iforgetmyname/dsv4_release NPUSingleBufferTokenToKVPool so
+        # torch_npu.npu_scatter_nd_update_ + torch.ops.custom.npu_quant_
         # lightning_indexer can read/write directly without unpacking the
         # CUDA-only uint8 packed layout. CUDA path keeps using
         # `index_k_with_scale_buffer` above; NPU path uses the buffers below.
-        # ONLY allocate when SGLANG_DSV4_NPU_REAL_COMPRESSOR is on — these
-        # buffers add ~570 MB total which would otherwise eat into the KV
-        # pool budget for Tier 1 baseline launches.
-        self._npu_buffers_present = (
-            _is_npu and envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
-        )
+        self._npu_buffers_present = _is_npu
         if self._npu_buffers_present:
             # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
             # pool's per-ratio page_size (= 64 for c4 indexer pool). This
@@ -986,10 +981,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
 
     # ------------------------------------------------------------------
-    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu
-    # (gated by env SGLANG_DSV4_NPU_REAL_COMPRESSOR). Mirror the
-    # iforgetmyname/dsv4_release SWAC4C128KVPool API on top of main's
-    # CompressStatePool / DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool.
+    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
+    # Mirror the iforgetmyname/dsv4_release SWAC4C128KVPool API on top of
+    # main's CompressStatePool / DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool.
     #
     # CompressStatePool stores a single fused [kv | score] tensor of shape
     # (size, 2*coff*head_dim); split + cat is just a last-dim slice.

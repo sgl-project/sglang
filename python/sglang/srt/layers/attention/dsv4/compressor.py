@@ -406,7 +406,7 @@ class Compressor(nn.Module):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        if _is_npu and envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
+        if _is_npu:
             # NPU path: do the full compress flow inline (writes go straight
             # to the kv pool via set_compress_*_buffer; nothing to return for
             # forward_core_compressor to write afterwards). Mirrors
@@ -482,10 +482,8 @@ class Compressor(nn.Module):
           softmax + sum, and write the compressed token via
           ``set_compress_buffer``.
 
-        ``set_compress_state_buffer`` / ``get_compress_state_buffer`` /
-        ``set_compress_buffer`` are pool API additions that come in roadmap
-        step 2 — until they exist this function fails AttributeError, which
-        is fine because ``SGLANG_DSV4_NPU_REAL_COMPRESSOR`` is off by default.
+        Relies on the pool's ``set_compress_state_buffer`` /
+        ``get_compress_state_buffer`` / ``set_compress_buffer`` API.
         """
         import torch_npu  # local: NPU-only, used for npu_rotary_mul below
 
