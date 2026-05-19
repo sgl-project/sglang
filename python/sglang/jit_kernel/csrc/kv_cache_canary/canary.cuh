@@ -110,13 +110,12 @@ struct CanaryParams {
   // splitmix64 chain seed (== CanaryConfig.seed).
   uint64_t seed;
 
-  // Violation ring + first-violation slot + is_errored flag.
+  // Violation ring. ``violation_write_index`` is the monotonic atomic counter
+  // for total violation arrivals; ``violation_ring`` is fill-once for the
+  // first ``ring_capacity`` arrivals. Row 0 is the first violation; non-zero
+  // ``violation_write_index`` is the canonical "errored" signal.
   int64_t* __restrict__ violation_ring;          // [ring_capacity, kViolationFields]
-  int32_t* __restrict__ violation_ring_valid;    // [ring_capacity] per-row valid latch
   uint32_t* __restrict__ violation_write_index;  // [1], atomicAdd target
-  int64_t* __restrict__ first_violation;         // [kViolationFields]
-  uint32_t* __restrict__ first_violation_set;    // [1], 0/1
-  int32_t* __restrict__ is_errored;              // [1] (32-bit so atomicOr is in-bounds)
   uint64_t* __restrict__ slot_run_counter;       // [1], +num_slots
   uint64_t* __restrict__ kernel_run_counter;     // [1], +1
   uint32_t ring_capacity;
@@ -216,47 +215,22 @@ SGL_DEVICE void record_violation(
   entry[kViolationFieldActualHash] = static_cast<int64_t>(actual_hash);
   entry[kViolationFieldExpectedPosition] = expected_position;
 
-  // First-violation latch: only the first writer wins; ensures the very first
-  // mismatch is preserved verbatim even if subsequent cascades overrun the ring.
-  // We CAS-claim the set flag BEFORE writing the 8 fields, then __threadfence_system
-  // after the writes — but importantly we use a 2-stage latch (claimed → committed)
-  // so a host that races to read after seeing ``is_errored == 1`` can detect a
-  // partial write. Stage 1: CAS 0→1 (claimed). Stage 2: __threadfence_system +
-  // CAS 1→2 (committed). The later atomicOr on is_errored is fenced by the same
-  // __threadfence_system, so host that reads is_errored==1 sees ``first_violation_set
-  // >= 2`` and a complete 8-field write.
-  unsigned int prev = atomicCAS(p.first_violation_set, 0u, 1u);
-  if (prev == 0u) {
-#pragma unroll
-    for (int i = 0; i < kViolationFields; ++i) {
-      p.first_violation[i] = entry[i];
-    }
-    __threadfence_system();
-    atomicExch(p.first_violation_set, 2u);
-  }
-
-  // Ring buffer append: atomicAdd reserves a unique sequence. Two threads with
-  // colliding ``seq % capacity`` would otherwise tear each other's 8-field
-  // stores, so we per-row CAS-latch the valid-flag (0=empty→1=writing) and
-  // only flip to 2 (=readable) after all 8 fields are stored.
+  // atomicAdd serializes every violation arrival: the thread that observes
+  // ``seq == 0`` is the unique "first violation" writer and lands at ring[0].
+  // Fill-once: only ``seq < ring_capacity`` writers store into the ring; later
+  // arrivals just advance the counter (the ring keeps the earliest entries).
+  // ``violation_write_index >= 1`` is the canonical "errored" signal; the
+  // ``__threadfence_system`` after the ring store guarantees any host that
+  // observes the post-increment counter also sees the committed ring row.
   unsigned int seq = atomicAdd(p.violation_write_index, 1u);
-  unsigned int idx = seq % p.ring_capacity;
-  int32_t* row_valid = p.violation_ring_valid + idx;
-  unsigned int prev_valid = atomicCAS(reinterpret_cast<unsigned int*>(row_valid), 0u, 1u);
-  if (prev_valid == 0u) {
-    int64_t* row = p.violation_ring + static_cast<int64_t>(idx) * kViolationFields;
+  if (seq < p.ring_capacity) {
+    int64_t* row = p.violation_ring + static_cast<int64_t>(seq) * kViolationFields;
 #pragma unroll
     for (int i = 0; i < kViolationFields; ++i) {
       row[i] = entry[i];
     }
     __threadfence_system();
-    atomicExch(reinterpret_cast<unsigned int*>(row_valid), 2u);
   }
-
-  // Order: violation buffer writes must be visible before is_errored is set,
-  // otherwise the host can read is_errored=true but see torn / empty entries.
-  __threadfence_system();
-  atomicOr(reinterpret_cast<unsigned int*>(p.is_errored), 1u);
 }
 
 SGL_DEVICE void run_verify_entry(const CanaryParams& p, uint32_t tid) {
@@ -452,11 +426,7 @@ void canary_step(
     tvm::ffi::TensorView expected_write_positions,
     int64_t seed,
     tvm::ffi::TensorView violation_ring,
-    tvm::ffi::TensorView violation_ring_valid,
     tvm::ffi::TensorView violation_write_index,
-    tvm::ffi::TensorView first_violation,
-    tvm::ffi::TensorView first_violation_set,
-    tvm::ffi::TensorView is_errored,
     tvm::ffi::TensorView slot_run_counter,
     tvm::ffi::TensorView kernel_run_counter,
     int64_t kernel_kind,
@@ -526,9 +496,6 @@ void canary_step(
       violation_ring.size(1));
   const uint32_t ring_capacity = static_cast<uint32_t>(violation_ring.size(0));
   RuntimeCheck(ring_capacity > 0, "canary: violation_ring capacity must be positive");
-  RuntimeCheck(
-      violation_ring_valid.size(0) == static_cast<int64_t>(ring_capacity),
-      "canary: violation_ring_valid first dim must equal ring_capacity");
 
   // real_kv_buf is 2D [num_slots, real_kv_slot_stride_bytes] when the
   // real-KV feature is ON. In OFF mode it is a 2D placeholder (any shape)
@@ -561,11 +528,7 @@ void canary_step(
   p.num_write_reqs = num_write_reqs;
   p.seed = static_cast<uint64_t>(seed);
   p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());
-  p.violation_ring_valid = static_cast<int32_t*>(violation_ring_valid.data_ptr());
   p.violation_write_index = static_cast<uint32_t*>(violation_write_index.data_ptr());
-  p.first_violation = static_cast<int64_t*>(first_violation.data_ptr());
-  p.first_violation_set = static_cast<uint32_t*>(first_violation_set.data_ptr());
-  p.is_errored = static_cast<int32_t*>(is_errored.data_ptr());
   p.slot_run_counter = static_cast<uint64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<uint64_t*>(kernel_run_counter.data_ptr());
   p.ring_capacity = ring_capacity;

@@ -467,7 +467,7 @@ def _handle_pseudo_pull_violations(scheduler: "Scheduler") -> List[Dict[str, Any
     for runner in get_runners(pool):
         for kind in VIOLATION_KINDS:
             row, write_index = runner._pull_first_violation(kind)
-            if int(row[1]) == 0 and int(write_index) == 0:
+            if int(write_index) == 0:
                 continue
             out.append({"row": row, "kind": kind, "write_index": write_index})
     return out

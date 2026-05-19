@@ -164,11 +164,7 @@ def canary_step(
     plan: BatchPlanGpu,
     seed: int,
     violation_ring: torch.Tensor,
-    violation_ring_valid: torch.Tensor,
     violation_write_index: torch.Tensor,
-    first_violation: torch.Tensor,
-    first_violation_set: torch.Tensor,
-    is_errored: torch.Tensor,
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
@@ -216,16 +212,15 @@ def canary_step(
                                      ``BatchPlanGpu`` docstring for the per-field layout, sentinel encodings, and the
                                      cuda-graph fixed-capacity lifecycle.
         seed:                        Chain anchor used wherever a slot has no predecessor (``CanaryConfig.seed``).
-        violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — append-only sink. Each populated
-                                     row is fill-once: never overwritten.
-        violation_ring_valid:        ``int32 [ring_capacity]`` — per-row "occupied" flag.
+        violation_ring:              ``int64 [ring_capacity, VIOLATION_FIELDS]`` — fill-once append sink. Row ``0`` is
+                                     the first violation (atomic ``seq == 0`` writer wins and never gets overwritten).
+                                     Rows ``1..ring_capacity-1`` hold subsequent arrivals; once the ring fills,
+                                     further violations are dropped from the ring but still advance
+                                     ``violation_write_index``.
         violation_write_index:       ``int32 [1]`` — monotonic violation counter. Advanced on every recorded violation
-                                     regardless of whether the ring still has room.
-        first_violation:             ``int64 [VIOLATION_FIELDS]`` — sticky copy of the first violation ever seen on
-                                     this buffer (latched across calls; never cleared by the kernel).
-        first_violation_set:         ``int32 [1]`` — latch flag for ``first_violation``.
-        is_errored:                  ``int32 [1]`` — set to 1 the moment any violation lands; never cleared by the
-                                     kernel.
+                                     regardless of whether the ring still has room. ``> 0`` is the canonical "any
+                                     violation has landed" signal; the host derives all of ``is_errored`` /
+                                     ``first_violation`` / valid-ring-row count from this counter plus the ring.
         slot_run_counter:            ``int64 [1]`` — incremented by the total number of active verify entries plus
                                      active write entries processed.
         kernel_run_counter:          ``int64 [1]`` — incremented by exactly 1 per call, unconditionally. The host
@@ -245,13 +240,15 @@ def canary_step(
     Calling contract:
 
     - Pure side-effect: returns ``None``; only the output tensors listed above are mutated. Inputs are read-only.
-    - Verification is out-of-band: failed checks never raise and never block. Callers inspect ``is_errored`` /
-      ``first_violation`` / ``violation_ring`` asynchronously.
+    - Verification is out-of-band: failed checks never raise and never block. Callers inspect
+      ``violation_write_index`` / ``violation_ring`` asynchronously.
+    - ``violation_write_index[0] >= 1`` is the canonical "any violation has landed" signal; ``violation_ring[0]`` is
+      the first violation row whenever that condition holds. The atomic ``seq == 0`` writer is the unique first-
+      violation owner and never gets overwritten, so the row 0 latch is consistent across cascading mismatches.
     - ``kernel_run_counter`` is bumped on every call — even one with zero active verify + zero active write entries
       — and is the canonical "did the canary actually run" signal.
-    - When multiple violations land in one call, all of them set ``is_errored`` and each advances
-      ``violation_write_index``; which one wins the ``first_violation`` latch and the relative ordering of rows in
-      the ring are unspecified.
+    - When multiple violations land in one call, each advances ``violation_write_index`` and (if still in range)
+      writes a distinct ring row; the relative ordering of rows in the ring across concurrent threads is unspecified.
     - Safe to invoke inside cuda-graph capture. Replay reuses the buffer addresses captured here, so callers must
       refill the input tensors in-place before ``graph.replay()``.
 
@@ -277,11 +274,7 @@ def canary_step(
         plan.expected_write_positions,
         to_signed_int64(int(seed)),
         violation_ring,
-        violation_ring_valid,
         violation_write_index,
-        first_violation,
-        first_violation_set,
-        is_errored,
         slot_run_counter,
         kernel_run_counter,
         kernel_kind,

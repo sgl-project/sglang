@@ -128,8 +128,8 @@ def _resolve_real_kv_kernel_args(
 
 class CanaryRunner:
     """Per-rank orchestrator: owns the GPU violation buffer + counters,
-    the side stream that async-D2Hs the ``is_errored`` flag + counters,
-    and the log / raise policy.
+    the side stream that async-D2Hs the per-kind ``violation_write_index``
+    plus the health counters, and the log / raise policy.
 
     .. warning::
         These three pieces are critical safety logic and must NOT be
@@ -240,7 +240,7 @@ class CanaryRunner:
         self._side_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
         )
-        self._is_errored_host_per_kind: Dict[str, torch.Tensor] = {
+        self._violation_write_index_host_per_kind: Dict[str, torch.Tensor] = {
             kind: torch.zeros(
                 1, dtype=torch.int32, pin_memory=torch.cuda.is_available()
             )
@@ -249,7 +249,9 @@ class CanaryRunner:
         self._counters_host = torch.zeros(
             6, dtype=torch.int64, pin_memory=torch.cuda.is_available()
         )
-        self._is_errored_event_per_kind: Dict[str, Optional[torch.cuda.Event]] = {
+        self._violation_write_index_event_per_kind: Dict[
+            str, Optional[torch.cuda.Event]
+        ] = {
             kind: (torch.cuda.Event() if torch.cuda.is_available() else None)
             for kind in VIOLATION_KINDS
         }
@@ -257,7 +259,10 @@ class CanaryRunner:
             torch.cuda.Event() if torch.cuda.is_available() else None
         )
 
-        self._latest_is_errored_per_kind: Dict[str, int] = {
+        # Latest host-cached ``violation_write_index`` per kind. ``>= 1`` means
+        # "this kind has seen a violation"; the raise / log path also uses the
+        # exact integer for the ``total_violations`` field in error messages.
+        self._latest_violation_write_index_per_kind: Dict[str, int] = {
             kind: 0 for kind in VIOLATION_KINDS
         }
         self._latest_counters: Tuple[int, int, int, int, int, int] = (
@@ -425,7 +430,13 @@ class CanaryRunner:
         if self._sweep_every_n > 0 and self._forward_step % self._sweep_every_n == 0:
             self._run_sweep()
 
-        local_flag = 1 if any(self._latest_is_errored_per_kind.values()) else 0
+        local_flag = (
+            1
+            if any(
+                wi >= 1 for wi in self._latest_violation_write_index_per_kind.values()
+            )
+            else 0
+        )
         global_flag = self._cross_rank_max(local_flag)
         self._maybe_health_check()
         if global_flag:
@@ -472,10 +483,10 @@ class CanaryRunner:
         """Non-blocking event.query() — if done, refresh host-cached values."""
         try:
             for kind in VIOLATION_KINDS:
-                event = self._is_errored_event_per_kind[kind]
+                event = self._violation_write_index_event_per_kind[kind]
                 if event is not None and self._poll_armed and event.query():
-                    self._latest_is_errored_per_kind[kind] = int(
-                        self._is_errored_host_per_kind[kind].item()
+                    self._latest_violation_write_index_per_kind[kind] = int(
+                        self._violation_write_index_host_per_kind[kind].item()
                     )
             if (
                 self._counters_event is not None
@@ -497,11 +508,11 @@ class CanaryRunner:
         with torch.cuda.stream(self._side_stream):
             self._side_stream.wait_stream(compute_stream)
             for kind in VIOLATION_KINDS:
-                event = self._is_errored_event_per_kind[kind]
+                event = self._violation_write_index_event_per_kind[kind]
                 if event is None:
                     continue
-                self._is_errored_host_per_kind[kind].copy_(
-                    self._device_state.get_violation_slot(kind).is_errored,
+                self._violation_write_index_host_per_kind[kind].copy_(
+                    self._device_state.get_violation_slot(kind).violation_write_index,
                     non_blocking=True,
                 )
                 event.record(stream=self._side_stream)
@@ -571,7 +582,7 @@ class CanaryRunner:
         Shared by capture-time recording (skip-sentinel contents) and
         replay-graph re-launch (real contents after pre-fill). K-half and
         V-half each get their own ``CanaryViolationSlot`` so the
-        first-violation latch / ring / is_errored never cross-pollinate;
+        first-violation row (ring[0]) and write-index counter never cross-pollinate;
         head/tail symmetry is captured by :class:`CanaryEndpoint`. Each
         endpoint is self-verifying — it reads and writes its own canary
         buffer, no cross-shadow link.
@@ -720,9 +731,18 @@ class CanaryRunner:
             self._raise_with_first_violation()
 
     def _pull_first_violation(self, kind: str) -> Tuple[List[int], int]:
-        """Synchronous D2H pull of one kind's first-violation row + write count."""
+        """Synchronous D2H pull of one kind's first-violation row + write count.
+
+        The first-violation row is ``violation_ring[0]`` whenever
+        ``violation_write_index >= 1``; the atomicAdd ``seq == 0`` writer is
+        the unique owner of row 0, so row 0 always carries the earliest
+        violation that landed in the ring. When ``write_index == 0`` the
+        returned row is the zero-initialised buffer; callers must check
+        ``write_index`` (or the row's ``fail_reason`` field) before using the
+        row.
+        """
         slot = self._device_state.get_violation_slot(kind)
-        first_violation = slot.first_violation.cpu().tolist()
+        first_violation = slot.violation_ring[0].cpu().tolist()
         write_index = int(slot.violation_write_index.cpu().item())
         return first_violation, write_index
 
@@ -730,7 +750,7 @@ class CanaryRunner:
         return [
             kind
             for kind in VIOLATION_KINDS
-            if self._latest_is_errored_per_kind.get(kind, 0)
+            if self._latest_violation_write_index_per_kind.get(kind, 0) >= 1
         ]
 
     def _handle_violation_log(self) -> None:
@@ -746,7 +766,7 @@ class CanaryRunner:
 
         self._device_state.reset_violation_state()
         for kind in VIOLATION_KINDS:
-            self._latest_is_errored_per_kind[kind] = 0
+            self._latest_violation_write_index_per_kind[kind] = 0
 
     def _raise_with_first_violation(self) -> None:
         kinds = self._kinds_with_violation()
@@ -755,7 +775,7 @@ class CanaryRunner:
         messages: List[str] = []
         for kind in kinds:
             first_violation, write_index = self._pull_first_violation(kind)
-            if int(first_violation[1]) == 0 and write_index == 0:
+            if write_index == 0:
                 continue
             messages.append(self._format_violation(kind, first_violation, write_index))
         if not messages:

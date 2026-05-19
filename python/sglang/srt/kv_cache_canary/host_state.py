@@ -59,22 +59,23 @@ VIOLATION_KINDS: Tuple[str, ...] = (
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryViolationSlot:
-    """One independent violation-state set (ring + first_violation + is_errored).
+    """One independent violation-state set (ring + monotonic write index).
 
-    Four instances live on ``CanaryDeviceState`` — one per
-    (head|tail) x (K-half|V-half) kernel launch. Keeping them disjoint stops
-    the K-half launch from CAS-latching ``first_violation_set`` and
-    silently masking every V-half mismatch (and vice versa), so V-half page
-    table bugs become visible instead of being shadowed by an earlier K-half
-    mismatch in the same forward.
+    Six instances live on ``CanaryDeviceState`` — one per
+    (head|tail|sweep) x (K-half|V-half) kernel launch. Keeping them disjoint
+    stops the K-half launch from filling row 0 with a K-half hit and silently
+    masking the row-0 evidence of a later V-half mismatch (and vice versa), so
+    V-half page table bugs become visible as their own dedicated first
+    violation instead of being shadowed.
+
+    ``violation_ring[0]`` is the first violation; ``violation_write_index[0]
+    >= 1`` is the canonical "any violation has landed" signal. Both
+    properties hold because the kernel uses ``atomicAdd`` to serialize
+    arrivals and writes fill-once into the ring (``seq < ring_capacity``).
     """
 
     violation_ring: torch.Tensor
-    violation_ring_valid: torch.Tensor
     violation_write_index: torch.Tensor
-    first_violation: torch.Tensor
-    first_violation_set: torch.Tensor
-    is_errored: torch.Tensor
 
     @classmethod
     def allocate(
@@ -84,22 +85,11 @@ class CanaryViolationSlot:
             violation_ring=torch.zeros(
                 ring_capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
             ),
-            violation_ring_valid=torch.zeros(
-                ring_capacity, dtype=torch.int32, device=device
-            ),
             violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
-            first_violation=torch.zeros(
-                VIOLATION_FIELDS, dtype=torch.int64, device=device
-            ),
-            first_violation_set=torch.zeros(1, dtype=torch.int32, device=device),
-            is_errored=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
     def reset(self) -> None:
-        self.is_errored.zero_()
-        self.first_violation_set.zero_()
-        self.first_violation.zero_()
-        self.violation_ring_valid.zero_()
+        self.violation_ring.zero_()
         self.violation_write_index.zero_()
 
 
@@ -109,10 +99,11 @@ class CanaryDeviceState:
 
     Violation state is split four ways — one ``CanaryViolationSlot`` per
     ``(head|tail) x (K-half|V-half)`` kernel launch — so K-half and V-half
-    detection paths never share a ``first_violation`` latch or an
-    ``is_errored`` flag. Counters stay split only by head/tail (K/V launches
-    of the same kernel kind share write/verify work over the same slot
-    indices, so per-kernel-kind counters are enough for health monitoring).
+    detection paths never share a ring (and therefore never cross-claim
+    each other's row-0 first-violation slot). Counters stay split only by
+    head/tail (K/V launches of the same kernel kind share write/verify
+    work over the same slot indices, so per-kernel-kind counters are
+    enough for health monitoring).
     """
 
     violation_slots: Dict[str, CanaryViolationSlot]
@@ -150,11 +141,10 @@ class CanaryDeviceState:
 
         Called from the LOG-mode violation handler after each kind's
         first-violation row has been pulled to host. Without this reset the
-        GPU-side ``is_errored`` flag stays at 1 forever,
-        ``first_violation_set`` latches the first row permanently (new
-        violations are silently masked), and ``violation_ring_valid`` fills
-        up so subsequent CAS attempts all fail (= permanent ring deadlock
-        after capacity rows).
+        GPU-side ``violation_write_index`` stays positive forever (the
+        canonical "errored" signal latches permanently), and ``ring[0]``
+        keeps reporting the original first-violation row even after new
+        mismatches arrive.
 
         Counters (slot/kernel run counters) are intentionally NOT reset:
         the host-side health monitor uses their monotonic growth to detect

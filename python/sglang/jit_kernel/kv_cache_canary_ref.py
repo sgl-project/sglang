@@ -95,11 +95,7 @@ def canary_step_torch_reference(
     plan: BatchPlanGpu,
     seed: int,
     violation_ring: torch.Tensor,
-    violation_ring_valid: torch.Tensor,
     violation_write_index: torch.Tensor,
-    first_violation: torch.Tensor,
-    first_violation_set: torch.Tensor,
-    is_errored: torch.Tensor,
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     kernel_kind: int,
@@ -128,13 +124,16 @@ def canary_step_torch_reference(
       ``expected_prev_hash`` via ``splitmix64_mix4``, and compare fail
       reasons in the same priority order as the kernel:
       ``POSITION_MONOTONIC`` > ``HASH`` > ``REAL_KV_HASH``.
-    - **Violation ring + first-violation latch**: ``first_violation`` is
-      latched once per launch (CAS-style); ring rows fill sequentially
-      until capacity. The CUDA kernel uses atomic CAS, so multiple
-      threads competing for the same ring row produce
-      implementation-defined ordering — see the test scenarios for the
-      contract this reference upholds (one violation per scenario, or
-      independent violations across separate ring rows).
+    - **Violation ring**: violation arrivals advance
+      ``violation_write_index`` monotonically. Each arrival with
+      ``seq < ring_capacity`` writes the corresponding ring row; later
+      arrivals are dropped from the ring but still bump the counter. The
+      CUDA kernel uses ``atomicAdd``, so multiple concurrent arrivals
+      produce implementation-defined ordering — see the test scenarios
+      for the contract this reference upholds (one violation per
+      scenario, or independent violations across separate ring rows).
+      Row ``0`` is by definition the first violation and never gets
+      overwritten.
     - **Counters**: ``slot_run_counter += active_verify + active_writes``;
       ``kernel_run_counter += 1``.
 
@@ -152,11 +151,7 @@ def canary_step_torch_reference(
     ref_plan = _RefPlan.from_batch_plan_gpu(plan)
     sink = _RefViolationSink(
         violation_ring=violation_ring,
-        violation_ring_valid=violation_ring_valid,
         violation_write_index=violation_write_index,
-        first_violation=first_violation,
-        first_violation_set=first_violation_set,
-        is_errored=is_errored,
         kernel_kind=kernel_kind,
     )
 
@@ -334,35 +329,21 @@ class _RefPlan:
 
 
 class _RefViolationSink:
-    """Host-side view of violation ring + first_violation + is_errored."""
+    """Host-side view of violation ring + monotonic write index."""
 
     def __init__(
         self,
         *,
         violation_ring: torch.Tensor,
-        violation_ring_valid: torch.Tensor,
         violation_write_index: torch.Tensor,
-        first_violation: torch.Tensor,
-        first_violation_set: torch.Tensor,
-        is_errored: torch.Tensor,
         kernel_kind: int,
     ) -> None:
         self._violation_ring = violation_ring
-        self._violation_ring_valid = violation_ring_valid
         self._violation_write_index = violation_write_index
-        self._first_violation = first_violation
-        self._first_violation_set = first_violation_set
-        self._is_errored = is_errored
         self._kernel_kind = int(kernel_kind)
 
         self._ring_host = violation_ring.detach().to("cpu").clone()
-        self._ring_valid_host = violation_ring_valid.detach().to("cpu").clone()
         self._write_index_host = int(violation_write_index.detach().to("cpu").item())
-        self._first_violation_host = first_violation.detach().to("cpu").clone()
-        self._first_violation_set_host = int(
-            first_violation_set.detach().to("cpu").item()
-        )
-        self._is_errored_host = int(is_errored.detach().to("cpu").item())
         self._ring_capacity = int(self._ring_host.shape[0])
 
     def record(
@@ -387,33 +368,15 @@ class _RefViolationSink:
             int(expected_position),
         ]
 
-        if self._first_violation_set_host == 0:
-            for i, value in enumerate(entry):
-                self._first_violation_host[i] = value
-            # Mirror the kernel's 2-stage CAS latch (claimed=1, committed=2).
-            self._first_violation_set_host = 2
-
         seq = self._write_index_host
         self._write_index_host += 1
-        idx = seq % self._ring_capacity
-        if int(self._ring_valid_host[idx].item()) == 0:
+        if seq < self._ring_capacity:
             for i, value in enumerate(entry):
-                self._ring_host[idx, i] = value
-            self._ring_valid_host[idx] = 2
-
-        self._is_errored_host = 1
+                self._ring_host[seq, i] = value
 
     def commit(self) -> None:
         self._violation_ring.copy_(self._ring_host.to(self._violation_ring.device))
-        self._violation_ring_valid.copy_(
-            self._ring_valid_host.to(self._violation_ring_valid.device)
-        )
         self._violation_write_index.fill_(self._write_index_host)
-        self._first_violation.copy_(
-            self._first_violation_host.to(self._first_violation.device)
-        )
-        self._first_violation_set.fill_(self._first_violation_set_host)
-        self._is_errored.fill_(self._is_errored_host)
 
 
 def _run_verify_entries(

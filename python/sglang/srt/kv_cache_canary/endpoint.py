@@ -64,8 +64,8 @@ class CanaryEndpoint:
 
         Iterates over (K-half) and (V-half, if present); each half launches
         an independent ``canary_step`` against its own
-        ``CanaryViolationSlot`` so K-half and V-half mismatches never
-        cross-latch into one another's first-violation row.
+        ``CanaryViolationSlot`` so K-half and V-half mismatches each get their
+        own ring (and therefore their own row-0 first-violation slot).
         """
         buf_specs: List[Tuple[torch.Tensor, CanaryViolationSlot]] = [
             (self.k_canary_buf, self.k_violation),
@@ -84,11 +84,7 @@ class CanaryEndpoint:
                 plan=plan,
                 seed=int(seed),
                 violation_ring=violation_slot.violation_ring,
-                violation_ring_valid=violation_slot.violation_ring_valid,
                 violation_write_index=violation_slot.violation_write_index,
-                first_violation=violation_slot.first_violation,
-                first_violation_set=violation_slot.first_violation_set,
-                is_errored=violation_slot.is_errored,
                 slot_run_counter=self.slot_run_counter,
                 kernel_run_counter=self.kernel_run_counter,
                 kernel_kind=self.kernel_kind,
