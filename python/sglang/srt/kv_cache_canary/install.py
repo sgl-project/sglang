@@ -16,6 +16,10 @@ from sglang.srt.kv_cache_canary.api import (
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
 from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_hook
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -153,15 +157,10 @@ def _compute_launch_capacities(
 
 def _supports_canary(pool: object) -> bool:
     """Return True if ``pool`` matches any of the known canary dispatch shapes."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-
     return isinstance(pool, (BaseSWAKVPool, MLATokenToKVPool, MHATokenToKVPool))
 
 
 def _is_swa_pool(pool: object) -> bool:
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-
     return isinstance(pool, BaseSWAKVPool)
 
 
@@ -264,8 +263,6 @@ def _patch_cuda_graph_runner_replay_class_method() -> None:
 
     Idempotent at the class level: a second install call is a no-op.
     """
-    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-
     classes_to_patch: List[type] = [CudaGraphRunner]
     for module_path, class_name in _OPTIONAL_GRAPH_RUNNER_CLASSES:
         optional_cls = _try_import_class(module_path, class_name)
@@ -329,8 +326,6 @@ def _patch_graph_runner_class_replay(cls: type) -> None:
 
 
 def _extract_forward_batch(args, kwargs):
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
     if "forward_batch" in kwargs and isinstance(kwargs["forward_batch"], ForwardBatch):
         return kwargs["forward_batch"]
     for arg in args:
