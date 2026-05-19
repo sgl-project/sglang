@@ -487,16 +487,21 @@ class FusedMoE(torch.nn.Module):
             and self.moe_runner_config.is_gated
             and not is_bias
         ):
+            # A fused W13 source is laid out as two logical halves, W1 then W3.
+            # Shard each half independently before copying into the padded
+            # FlashInfer TRTLLM destination layout.
             param_half_size = expert_data.shape[shard_dim] // 2
-            weight_shard_size = loaded_weight.shape[shard_dim]
+            source_half_size = loaded_weight.shape[shard_dim] // 2
+            weight_half_shard_size = source_half_size
             if not self.use_presharded_weights:
-                weight_shard_size //= self.moe_tp_size
-            weight_half_size = weight_shard_size // 2
-            weight_start = weight_shard_size * tp_rank
+                weight_half_shard_size //= self.moe_tp_size
+            weight_start = (
+                0 if self.use_presharded_weights else weight_half_shard_size * tp_rank
+            )
 
             for param_start, source_start in (
                 (0, weight_start),
-                (param_half_size, weight_start + weight_half_size),
+                (param_half_size, source_half_size + weight_start),
             ):
                 half_expert_data, half_loaded_weight = (
                     narrow_padded_param_and_loaded_weight(
@@ -507,7 +512,7 @@ class FusedMoE(torch.nn.Module):
                         shard_dim,
                         param_half_size,
                         narrow_weight=not self.use_presharded_weights,
-                        weight_shard_size=weight_half_size,
+                        weight_shard_size=weight_half_shard_size,
                     )
                 )
                 half_expert_data.copy_(half_loaded_weight)
