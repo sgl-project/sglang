@@ -51,7 +51,7 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.dsv4.sparse_indices import (
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
 from sglang.srt.layers.dp_attention import (

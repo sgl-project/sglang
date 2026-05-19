@@ -27,7 +27,7 @@ def dequantize_k_cache_paged(
     page_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Dequantize the v4 paged KV cache for a list of token IDs.
+    """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
     Args:
         quant_k_cache: (num_pages, bytes_per_page_padded) uint8.
