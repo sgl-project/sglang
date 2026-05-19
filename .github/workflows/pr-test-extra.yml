@@ -12,6 +12,11 @@ name: PR Test Extra
 on:
   pull_request:
     branches: [main]
+    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
+    # is added after the latest push — otherwise GHA leaves the stale
+    # skipped run in place and there's no way to enable extra without
+    # another push. See check-changes.if below for the matching guard.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -36,8 +41,8 @@ on:
         required: false
         type: boolean
         default: false
-      skip_stage_health_check:
-        description: "Skip stage health check fast-fail (e.g. for release branch cuts)"
+      skip_pr_test_health_check:
+        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
@@ -50,7 +55,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ (inputs.skip_stage_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -70,10 +75,17 @@ jobs:
   # (workflow_dispatch / workflow_call) always run. When this job is
   # skipped by the gate, every downstream caller stub naturally skips
   # because its needs do not resolve.
+  #
+  # For `labeled` events we additionally require the just-added label to be
+  # one of the two gating labels — otherwise every unrelated label addition
+  # would dispatch a full CI run.
   check-changes:
     if: |
       github.event_name != 'pull_request' ||
       (
+        (github.event.action != 'labeled' ||
+         github.event.label.name == 'run-ci' ||
+         github.event.label.name == 'run-ci-extra') &&
         contains(github.event.pull_request.labels.*.name, 'run-ci') &&
         contains(github.event.pull_request.labels.*.name, 'run-ci-extra')
       )
@@ -96,7 +108,7 @@ jobs:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
   # =============================================== extra-a (1-/2-gpu) ===============================================
