@@ -221,3 +221,36 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '60'
     secrets: inherit
+
+  # =============================================== notify pr-states ====================================================
+  # Explicit dispatch of pr-states.yml on every run completion (initial +
+  # every rerun attempt). GitHub does not re-fire `workflow_run.completed`
+  # for rerun attempts, so a `workflow_run` subscription only catches the
+  # initial completion. `workflow_dispatch` is the only event GITHUB_TOKEN
+  # is allowed to cascade-create, so this works regardless of who initiated
+  # the rerun. Runs unconditionally (`if: always()`) so the PR-body status
+  # block reflects the latest attempt even after cancellation / failure.
+  notify-pr-states:
+    needs:
+      - check-changes
+      - call-gate
+      - sgl-kernel-build-wheels
+      - extra-a-test-1-gpu-small
+      - extra-a-test-1-gpu-large
+      - extra-a-test-2-gpu-large
+      - extra-b-test-4-gpu-h100
+      - extra-b-test-4-gpu-b200
+      - extra-b-test-8-gpu-h200
+      - extra-b-test-deepep-8-gpu-h200
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"

@@ -563,3 +563,26 @@ jobs:
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+  # =============================================== notify pr-states ====================================================
+  # Explicit dispatch of pr-states.yml on every run completion (initial +
+  # every rerun attempt). GitHub does not re-fire `workflow_run.completed`
+  # for rerun attempts, so a `workflow_run` subscription only catches the
+  # initial completion. `workflow_dispatch` is the only event GITHUB_TOKEN
+  # is allowed to cascade-create, so this works regardless of who initiated
+  # the rerun. Depends only on pr-test-finish (which aggregates everything)
+  # so the needs list stays maintenance-free.
+  notify-pr-states:
+    needs: [pr-test-finish]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"
