@@ -131,20 +131,7 @@ class MlxTpModelWorker(TpModelWorker):
     def _decode_with_sampling(
         self, batch: ScheduleBatch, req_ids: list[str]
     ) -> tuple[list[int], "LogitsProcessorOutput"]:
-        """Run a pure-decode forward pass and route the logits through
-        sglang's sampler (temperature / top-k / top-p / penalties) instead
-        of MLX-side greedy argmax.
-
-        Mirrors the CUDA path's ModelRunner.sample(): calls
-        ``_preprocess_logits`` (which applies vocab_mask, penalties via
-        ``penalizer_orchestrator``, and ``logit_bias``) before the sampler,
-        and uses ``clamp_position(seq_lens)`` so seeded sampling matches
-        the standard contract.
-
-        Returns ``(next_token_ids, logits_output)`` — the populated
-        ``LogitsProcessorOutput`` so logprob / top_logprob requests can
-        be served downstream.
-        """
+        """Run a pure-decode pass and sample via sglang's Sampler instead of mx.argmax."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.model_executor.forward_batch_info import clamp_position
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
@@ -159,12 +146,8 @@ class MlxTpModelWorker(TpModelWorker):
 
         logits_output = LogitsProcessorOutput(next_token_logits=logits_cpu)
 
-        # CUDA-side equivalent: ModelRunner._preprocess_logits ->
-        # sampling_info.apply_logits_bias. We hand-roll the same effect here
-        # but skip penalizer_orchestrator.apply: the penalty kernels are wrapped
-        # in torch.compile, which dispatches to Triton — unsupported on Apple
-        # Silicon. Repetition / frequency / presence penalties therefore remain
-        # in-scope only when the Triton-free path lands (planned follow-up).
+        # Inline the safe parts of ModelRunner._preprocess_logits;
+        # penalizer_orchestrator.apply is torch.compile + Triton, unsupported on MPS.
         sinfo = batch.sampling_info
         sinfo.update_regex_vocab_mask()
         if sinfo.vocab_mask is not None:
@@ -174,7 +157,7 @@ class MlxTpModelWorker(TpModelWorker):
             )
         if sinfo.logit_bias is not None:
             logits_output.next_token_logits.add_(sinfo.logit_bias)
-        sinfo.vocab_mask = None  # release like _preprocess_logits does
+        sinfo.vocab_mask = None
 
         next_token_ids = self._model_runner.sampler(
             logits_output,
@@ -206,10 +189,6 @@ class MlxTpModelWorker(TpModelWorker):
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         next_token_ids_list: list[int] = []
-        # Populated only on the --mlx-enable-sampling decode path. When set,
-        # carries the sampler's annotated next-token logprobs / top-logprobs so
-        # the scheduler can serve return_logprob=True requests without crashing
-        # on a None next_token_logprobs.tolist().
         sampled_logits_output: Optional["LogitsProcessorOutput"] = None
 
         if forward_mode.is_extend():

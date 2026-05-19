@@ -90,10 +90,6 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list  # list[list[ContiguousKVCache]]
-    # Last-token logits [batch, vocab], populated only when the runner was
-    # constructed with enable_sampling=True. The caller materialises and
-    # samples from this instead of using lazy_tokens (which is still set to
-    # the greedy argmax as a fallback).
     lazy_last_logits: mx.array | None = None
 
 
@@ -129,11 +125,6 @@ class MlxModelRunner:
         # regardless of this setting — mlx_lm.load() detects the config and instantiates
         # QuantizedLinear modules directly.
         self._quantization: str | None = quantization
-        # When True, decode_batch_start additionally exposes last-token logits via
-        # MlxPendingDecode.lazy_last_logits so the caller can run sglang's full
-        # sampling pipeline (temperature / top-k / top-p / penalties) instead of
-        # the greedy argmax fallback. Affects the synchronous decode path only;
-        # the overlap-scheduler lazy path is unchanged for this phase.
         self._enable_sampling: bool = enable_sampling
 
         self._load_model()
@@ -454,18 +445,8 @@ class MlxModelRunner:
         self,
         req_ids: list[str],
     ) -> tuple[MlxPendingDecode, mx.array]:
-        """Like :meth:`decode_batch`, but materialises last-token logits.
-
-        Returns ``(pending, last_logits)`` where ``last_logits`` is an
-        evaluated ``mx.array`` of shape ``[batch, vocab]``. The caller is
-        expected to run an external sampler on the logits and then call
-        :meth:`decode_batch_commit` with the resulting token ids to commit
-        per-request state.
-
-        Requires the runner to be constructed with
-        ``enable_sampling=True`` so that ``decode_batch_start`` populates
-        ``pending.lazy_last_logits``.
-        """
+        """Like decode_batch, but returns (pending, [batch, vocab] last-token logits)
+        for external sampling. Pair with decode_batch_commit."""
         if not self._enable_sampling:
             raise RuntimeError(
                 "decode_batch_logits requires MlxModelRunner(enable_sampling=True)"
@@ -789,16 +770,7 @@ class MlxModelRunner:
         pending: MlxPendingDecode,
         next_tokens: list[int],
     ) -> list[int]:
-        """Commit a pending decode using caller-supplied tokens.
-
-        Mirrors :meth:`decode_batch_finalize` but skips the
-        ``lazy_tokens.tolist()`` blocking read — the caller has already
-        materialised ``pending.lazy_last_logits`` and run an external
-        sampler (e.g. sglang's ``Sampler`` for temperature/top-p/penalties),
-        and passes the resulting token ids back in. The caller is still
-        responsible for evaluating per-request cache writes before this
-        call so the next decode step sees the updated KV.
-        """
+        """Like decode_batch_finalize but uses caller-supplied tokens (no argmax)."""
         if len(next_tokens) != len(pending.req_ids):
             raise ValueError(
                 f"decode_batch_commit: expected {len(pending.req_ids)} tokens, "

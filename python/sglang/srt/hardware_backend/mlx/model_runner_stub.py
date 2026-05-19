@@ -112,10 +112,7 @@ class MlxModelRunnerStub(ModelRunner):
             enable=self.server_args.enable_memory_saver
         )
 
-        # Load model (sets metadata only). When --mlx-enable-sampling is on the
-        # MLX path routes decode-step logits through sglang's sampler, so we
-        # need a real Sampler here; otherwise leave it None to match the
-        # historical zero-PyTorch-memory contract.
+        # Load model (sets metadata only)
         if getattr(self.server_args, "mlx_enable_sampling", False):
             from sglang.srt.layers.sampler import create_sampler
 
