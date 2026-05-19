@@ -43,7 +43,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=420, stage="extra-b", runner_config="8-gpu-h200")
 
 _MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 # First-5 prefix of the real HF ``compress_ratios`` array; covers full

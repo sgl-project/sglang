@@ -26,7 +26,7 @@ from sglang.jit_kernel.kv_cache_canary import (
 from sglang.jit_kernel.kv_cache_canary_ref import splitmix64_mix
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-large")
 
 _SEED = 0xC0FFEE1234567890
 _U64_MASK = (1 << 64) - 1

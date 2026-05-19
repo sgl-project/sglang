@@ -23,7 +23,7 @@ import torch
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestMetadataBuffersHasNoCanaryFields(unittest.TestCase):

@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 _MODEL = "Qwen/Qwen3-0.6B"
 
-register_cuda_ci(est_time=240, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestKvCacheCanaryCleanRaiseMode(CustomTestCase):
