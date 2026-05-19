@@ -198,21 +198,35 @@ class TestPriorityScheduling(CustomTestCase):
     def test_priority_scheduling_preemption_below_threshold_validation(self):
         """Verify running requests are not preempted by requests with priorities below preemption threshold"""
 
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
-                self.base_url,
-                [
-                    {
-                        "priority": 0,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },
-                    {
-                        "priority": 5,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },
-                ],
+        # Stagger sends so priority=0 occupies the running queue before
+        # priority=5 arrives -- asyncio.gather gives no arrival-order guarantee.
+        # ignore_eos on priority=0 ensures it is still running when priority=5
+        # arrives, so the "below threshold = no preempt" path is actually exercised.
+        async def _run():
+            first = asyncio.create_task(
+                send_concurrent_generate_requests_with_custom_params(
+                    self.base_url,
+                    [
+                        {
+                            "priority": 0,
+                            "sampling_params": {
+                                "max_new_tokens": 1000,
+                                "ignore_eos": True,
+                            },
+                        }
+                    ],
+                )
             )
-        )
+            await asyncio.sleep(1.0)
+            second = asyncio.create_task(
+                send_concurrent_generate_requests_with_custom_params(
+                    self.base_url,
+                    [{"priority": 5, "sampling_params": {"max_new_tokens": 1000}}],
+                )
+            )
+            return (await first) + (await second)
+
+        responses = asyncio.run(_run())
 
         expected_status_and_error_messages = [
             (200, None),
