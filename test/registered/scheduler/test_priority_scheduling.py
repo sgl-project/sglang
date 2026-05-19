@@ -200,8 +200,9 @@ class TestPriorityScheduling(CustomTestCase):
 
         # Stagger sends so priority=0 occupies the running queue before
         # priority=5 arrives -- asyncio.gather gives no arrival-order guarantee.
-        # ignore_eos on priority=0 ensures it is still running when priority=5
-        # arrives, so the "below threshold = no preempt" path is actually exercised.
+        # ignore_eos on both: priority=0 stays running when priority=5 arrives
+        # (exercises the no-preempt path), and priority=5's runtime must exceed
+        # the stagger so its server-side e2e_latency stays > priority=0's.
         async def _run():
             first = asyncio.create_task(
                 send_concurrent_generate_requests_with_custom_params(
@@ -221,7 +222,15 @@ class TestPriorityScheduling(CustomTestCase):
             second = asyncio.create_task(
                 send_concurrent_generate_requests_with_custom_params(
                     self.base_url,
-                    [{"priority": 5, "sampling_params": {"max_new_tokens": 1000}}],
+                    [
+                        {
+                            "priority": 5,
+                            "sampling_params": {
+                                "max_new_tokens": 1000,
+                                "ignore_eos": True,
+                            },
+                        }
+                    ],
                 )
             )
             return (await first) + (await second)
