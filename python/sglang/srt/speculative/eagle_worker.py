@@ -1105,7 +1105,19 @@ class EAGLEWorker(TpModelWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        # EAGLE input rotation: target sees prompt [t_0..t_{n-1}] and
+        # predicts next_token_ids = t_n. Draft prefill consumes [t_1..t_n]
+        # so each position's draft hidden aligns with target's next-position
+        # label, enabling chain prediction.
+        if not batch.forward_mode.is_idle():
+            assert len(next_token_ids) == len(batch.seq_lens)
+            pt = 0
+            for i, extend_len in enumerate(batch.extend_lens):
+                s = batch.input_ids[pt : pt + extend_len]
+                batch.input_ids[pt : pt + extend_len] = torch.cat(
+                    (s[1:], next_token_ids[i].reshape(1))
+                )
+                pt += extend_len
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
