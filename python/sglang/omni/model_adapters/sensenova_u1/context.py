@@ -13,8 +13,8 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from sglang.omni.core.interleaved import (
-    GenerationBoundaryMetadata,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+    GenerationBoundaryMetadata,
 )
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,

@@ -15,10 +15,10 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from sglang.omni.core.interleaved import (
-    GenerationBoundaryMetadata,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
     TEXT_ROLE_METADATA_KEY,
+    GenerationBoundaryMetadata,
 )
 from sglang.omni.core.protocol import (
     ARBackend,

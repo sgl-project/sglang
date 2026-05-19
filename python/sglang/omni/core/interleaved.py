@@ -8,8 +8,7 @@ metadata used when AR output asks the generation backend to produce media.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 MediaModality = Literal["image", "audio", "video"]
 GenerationTokenCountSource = Literal["request", "ar"]
@@ -71,16 +70,13 @@ class GenerationBoundaryMetadata:
         if raw_modality not in _BOUNDARY_MODALITIES:
             raise ValueError(f"Unsupported boundary modality: {raw_modality!r}")
 
-        token_count_source = metadata.get(
-            INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY
-        )
+        token_count_source = metadata.get(INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY)
         if (
             token_count_source is not None
             and token_count_source not in _GENERATION_TOKEN_COUNT_SOURCES
         ):
             raise ValueError(
-                "Unsupported generation token count source: "
-                f"{token_count_source!r}"
+                "Unsupported generation token count source: " f"{token_count_source!r}"
             )
         return cls(
             modality=raw_modality,

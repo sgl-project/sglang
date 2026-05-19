@@ -13,23 +13,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sglang.omni.core.interleaved import (
-    GenerationBoundaryMetadata,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
     TEXT_ROLE_METADATA_KEY,
     TEXT_ROLE_THINK,
+    GenerationBoundaryMetadata,
     ar_appended_token_positions,
     ar_output_position,
     get_ar_decode_input_position,
     get_ar_next_output_position,
 )
 from sglang.omni.core.protocol import GeneratedSegment
-from sglang.omni.model_adapters.session_model_hooks import (
-    OmniSessionAppendImageResult,
-    OmniSessionPrefillResult,
-    OmniSessionModelView,
-    OmniSessionModelHooks,
-)
 from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
@@ -55,6 +49,12 @@ from sglang.omni.model_adapters.sensenova_u1.context import (
     build_u1_native_t2i_cfg_uncondition_prepared_input,
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
+)
+from sglang.omni.model_adapters.session_model_hooks import (
+    OmniSessionAppendImageResult,
+    OmniSessionModelHooks,
+    OmniSessionModelView,
+    OmniSessionPrefillResult,
 )
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
