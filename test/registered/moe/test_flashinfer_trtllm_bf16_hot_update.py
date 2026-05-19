@@ -46,7 +46,12 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         ).reshape(shape)
         return (values / 1000 + offset).to(torch.bfloat16)
 
-    def _make_layer(self):
+    def _make_layer(
+        self,
+        tp_size=1,
+        tp_rank=0,
+        use_weight_loader_fused=False,
+    ):
         from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
         from sglang.srt.layers.moe.token_dispatcher import standard
 
@@ -55,8 +60,8 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         with (
             patch.object(fm, "get_moe_expert_parallel_world_size", return_value=1),
             patch.object(fm, "get_moe_expert_parallel_rank", return_value=0),
-            patch.object(fm, "get_moe_tensor_parallel_world_size", return_value=1),
-            patch.object(fm, "get_moe_tensor_parallel_rank", return_value=0),
+            patch.object(fm, "get_moe_tensor_parallel_world_size", return_value=tp_size),
+            patch.object(fm, "get_moe_tensor_parallel_rank", return_value=tp_rank),
             patch.object(std, "get_moe_expert_parallel_world_size", return_value=1),
             patch.object(std, "get_moe_expert_parallel_rank", return_value=0),
         ):
@@ -67,6 +72,7 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
                 layer_id=0,
                 top_k=1,
                 params_dtype=torch.bfloat16,
+                use_weight_loader_fused=use_weight_loader_fused,
             )
             return layer.cuda()
 
@@ -157,6 +163,53 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         layer.quant_method.process_weights_after_loading(layer)
         self.assertNotEqual(tuple(layer.w13_weight.shape), canonical_w13_shape)
         self.assertNotEqual(tuple(layer.w2_weight.shape), canonical_w2_shape)
+
+    def test_fused_w13_load_shards_each_half_independently(self):
+        tp_size = 2
+        per_rank_size = self.intermediate_size // tp_size
+
+        for tp_rank in range(tp_size):
+            with self.subTest(tp_rank=tp_rank):
+                layer = self._make_layer(
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    use_weight_loader_fused=True,
+                )
+                padded_per_rank_size = layer.intermediate_size_per_partition
+                full_w13 = self._make_weight(
+                    (
+                        self.num_experts,
+                        2 * self.intermediate_size,
+                        self.hidden_size,
+                    ),
+                    offset=200 + tp_rank,
+                )
+
+                layer.weight_loader_fused(
+                    layer.w13_weight,
+                    full_w13,
+                    "model.layers.0.mlp.experts.gate_up_proj.weight",
+                    "w13",
+                )
+
+                first_half_start = per_rank_size * tp_rank
+                second_half_start = self.intermediate_size + per_rank_size * tp_rank
+                torch.testing.assert_close(
+                    layer.w13_weight[:, :per_rank_size, :],
+                    full_w13[
+                        :, first_half_start : first_half_start + per_rank_size, :
+                    ],
+                )
+                torch.testing.assert_close(
+                    layer.w13_weight[
+                        :,
+                        padded_per_rank_size : padded_per_rank_size + per_rank_size,
+                        :,
+                    ],
+                    full_w13[
+                        :, second_half_start : second_half_start + per_rank_size, :
+                    ],
+                )
 
 
 if __name__ == "__main__":
