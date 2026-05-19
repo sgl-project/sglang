@@ -33,7 +33,11 @@
     <a href="products.html">Products</a>
     <a href="consulting.html">Consulting</a>
     <a href="tools.html">Tools</a>
+    <a href="intelligence.html">Intelligence</a>
+    <a href="blog.html">Blog</a>
+    <a href="about.html">About</a>
     <a href="contact.html">Contact</a>
+    <a href="dashboard.html" style="color:#22d3ee;border:1px solid #22d3ee33;padding:.2rem .7rem;border-radius:.25rem;font-size:.8rem" title="Operator Dashboard">Dashboard →</a>
   </div>
 </nav>
 
@@ -44,75 +48,143 @@
 
 <!-- CATEGORY FILTERS -->
 <section class="px-6 pb-8 max-w-5xl mx-auto flex flex-wrap gap-2 justify-center">
-  <span class="tag tag-infra px-3 py-1 cursor-pointer">Sovereign Infrastructure</span>
-  <span class="tag tag-rf px-3 py-1 cursor-pointer">RF Intelligence</span>
-  <span class="tag tag-compliance px-3 py-1 cursor-pointer">Compliance</span>
-  <span class="tag tag-automation px-3 py-1 cursor-pointer">Automation</span>
-  <span class="tag tag-resilience px-3 py-1 cursor-pointer">Resilience</span>
-  <span class="tag tag-depin px-3 py-1 cursor-pointer">DePIN</span>
-  <span class="tag tag-tools px-3 py-1 cursor-pointer">Tools</span>
+  <span class="tag tag-all px-3 py-1 cursor-pointer ring-2 ring-cyan-400 font-bold" onclick="filterPosts('all',this)" style="background:#1e3a5f;color:#7dd3fc">All</span>
+  <span class="tag tag-infra px-3 py-1 cursor-pointer" onclick="filterPosts('infra',this)">Sovereign Infrastructure</span>
+  <span class="tag tag-rf px-3 py-1 cursor-pointer" onclick="filterPosts('rf',this)">RF Intelligence</span>
+  <span class="tag tag-compliance px-3 py-1 cursor-pointer" onclick="filterPosts('compliance',this)">Compliance</span>
+  <span class="tag tag-automation px-3 py-1 cursor-pointer" onclick="filterPosts('automation',this)">Automation</span>
+  <span class="tag tag-resilience px-3 py-1 cursor-pointer" onclick="filterPosts('resilience',this)">Resilience</span>
+  <span class="tag tag-depin px-3 py-1 cursor-pointer" onclick="filterPosts('depin',this)">DePIN</span>
+  <span class="tag tag-tools px-3 py-1 cursor-pointer" onclick="filterPosts('tools',this)">Tools</span>
 </section>
 
 <!-- BLOG POSTS -->
-<section class="px-6 pb-20 max-w-5xl mx-auto grid md:grid-cols-2 gap-6">
+<section class="px-6 pb-20 max-w-5xl mx-auto grid md:grid-cols-2 gap-6" id="posts-grid">
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="infra" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-infra">Sovereign Infrastructure</span></div>
     <h2 class="font-bold text-lg mb-2">What Is Sovereign Edge Computing?</h2>
-    <p class="text-gray-400 text-sm mb-4">Local-first execution, zero cloud dependency, and operator-controlled systems — the foundation of resilient infrastructure for 2026 and beyond.</p>
-    <p class="text-xs text-gray-600">April 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">Local-first execution, zero cloud dependency, and operator-controlled systems — the foundation of resilient infrastructure for 2026 and beyond.</p>
+    <p class="text-xs text-gray-600 mb-3">April 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>Sovereign edge computing means running your critical workloads on infrastructure you own, control, and understand — not outsourced to a hyperscaler that can suspend your account, raise prices, or go down during your most critical hour.</p>
+      <p>The core architecture: a local node (Raspberry Pi, mini-PC, or VPS you control), running containerised workloads via Docker Compose, supervised by PM2, with data in a WAL-locked SQLite database. No cloud dependency. No surprise egress fees. No vendor lock-in.</p>
+      <p>The shift is happening now: rising compliance requirements, geopolitical instability, and energy volatility are all accelerating the move toward local-first systems. The operators who build this capacity today will have structural advantages by 2027.</p>
+      <p><a href="blueprint.html" class="accent hover:underline">Download the free blueprint →</a></p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="rf" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-rf">RF Intelligence</span></div>
     <h2 class="font-bold text-lg mb-2">RF Fingerprinting Explained in Simple Terms</h2>
-    <p class="text-gray-400 text-sm mb-4">How wireless signals become privacy-preserving proof-of-presence — without collecting personal data.</p>
-    <p class="text-xs text-gray-600">April 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">How wireless signals become privacy-preserving proof-of-presence — without collecting personal data.</p>
+    <p class="text-xs text-gray-600 mb-3">April 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>Every wireless environment has a unique signature — a fingerprint made up of the devices broadcasting, their signal strengths, and their patterns over time. RF fingerprinting captures this signature without identifying any individual device or person.</p>
+      <p>Used correctly, this creates tamper-evident proof-of-presence: you can prove a physical asset was in a specific location at a specific time, without installing tracking hardware or collecting personal data. This has enormous applications in logistics, compliance, and audit-ready supply chain management.</p>
+      <p>The GBWiGLE project uses exactly this approach — building local RF intelligence maps that serve as audit records without privacy violations. The data is held locally, processed locally, and stays sovereign.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="compliance" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-compliance">Compliance</span></div>
     <h2 class="font-bold text-lg mb-2">Why Compliance Pressure Is Rising in 2026</h2>
-    <p class="text-gray-400 text-sm mb-4">Regulators are demanding better audit trails, stronger data lineage, and clearer operational transparency. What it means for you.</p>
-    <p class="text-xs text-gray-600">April 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">Regulators are demanding better audit trails, stronger data lineage, and clearer operational transparency. What it means for you.</p>
+    <p class="text-xs text-gray-600 mb-3">April 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>ASIC's s912A obligations, APRA's CPS 234, Privacy Act reforms, and new supply chain disclosure requirements are converging. Businesses that relied on informal "we'll fix it before an audit" approaches are finding themselves exposed.</p>
+      <p>The key architectural shift: compliance should be a structural property of your system, not a checklist you run before inspection. WAL-locked databases give you immutable write-ahead logs. PM2 ecosystem configs give you reproducible deployment records. Cron-based audit exports give you date-stamped evidence packs.</p>
+      <p>The organisations that build audit-readiness into the stack now will handle the 2026-2028 compliance wave with confidence. The ones that don't will be retrofitting under pressure.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="tools" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-tools">Tools</span></div>
     <h2 class="font-bold text-lg mb-2">Tools I Use to Build Local-First Systems</h2>
-    <p class="text-gray-400 text-sm mb-4">Privacy-preserving, resilient, low-overhead tools — every one battle-tested and affiliate-link friendly.</p>
-    <p class="text-xs text-gray-600">April 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">Privacy-preserving, resilient, low-overhead tools — every one battle-tested and affiliate-link friendly.</p>
+    <p class="text-xs text-gray-600 mb-3">April 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>Core stack: Docker + PM2 for process orchestration, SQLite in WAL mode for local-first persistence, n8n for automation workflows, Proton for secure communication, and Cloudflare Zero Trust for secure remote access without opening ports.</p>
+      <p>For RF intelligence: a Raspberry Pi 4/5 with a monitor-mode USB Wi-Fi adapter, running a custom scanning stack. For DePIN participation: Helium hotspot hardware for wireless coverage rewards.</p>
+      <p>Every tool on my <a href="tools.html" class="accent hover:underline">tools page</a> is one I personally run in production. No filler, no promoted garbage.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="resilience" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-resilience">Resilience</span></div>
     <h2 class="font-bold text-lg mb-2">How to Build Infrastructure That Survives Cloud Outages</h2>
-    <p class="text-gray-400 text-sm mb-4">Hybrid Docker Compose + PM2 patterns for operational continuity when the cloud goes dark.</p>
-    <p class="text-xs text-gray-600">March 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">Hybrid Docker Compose + PM2 patterns for operational continuity when the cloud goes dark.</p>
+    <p class="text-xs text-gray-600 mb-3">March 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>The 2025 multi-cloud outages showed that resilience can't be achieved by adding more cloud. The answer is hybrid: keep critical data and processing local, use cloud only for what genuinely requires global distribution.</p>
+      <p>Pattern: run your primary database and core APIs on a local node. Mirror non-critical telemetry to cloud. Use Cloudflare tunnels for remote access without opening ports. Set PM2 to autorestart all critical processes with exponential backoff.</p>
+      <p>Result: when AWS goes down, your core operations continue. When your internet drops, your internal systems still work. When a vendor changes pricing, you're not hostage to it.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="depin" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-depin">DePIN</span></div>
     <h2 class="font-bold text-lg mb-2">The Future of Decentralised Physical Infrastructure</h2>
-    <p class="text-gray-400 text-sm mb-4">How RF data strengthens DePIN networks, and why the sector thrives during instability.</p>
-    <p class="text-xs text-gray-600">March 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">How RF data strengthens DePIN networks, and why the sector thrives during instability.</p>
+    <p class="text-xs text-gray-600 mb-3">March 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>Decentralised Physical Infrastructure Networks (DePIN) use token incentives to crowdsource real-world infrastructure — wireless coverage, compute, storage, sensor data. The key insight: this infrastructure is geopolitically resilient by design because it has no single point of failure.</p>
+      <p>RF intelligence feeds naturally into DePIN: verified proof-of-presence from wireless scans, contributed to networks like Helium or XYO, generates passive income while building public infrastructure. The operator who runs a Helium hotspot in Albury is simultaneously earning HNT and strengthening regional wireless coverage.</p>
+      <p>The sector thrives during instability because the more centralized infrastructure fails, the more valuable decentralised alternatives become. Build now, while the competition is low.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="compliance" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-compliance">Compliance</span></div>
     <h2 class="font-bold text-lg mb-2">How to Build Audit-Ready Systems</h2>
-    <p class="text-gray-400 text-sm mb-4">WAL-locked databases, immutable logs, lineage tracking — the architecture that makes compliance a structural property, not a checklist.</p>
-    <p class="text-xs text-gray-600">March 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">WAL-locked databases, immutable logs, lineage tracking — the architecture that makes compliance a structural property, not a checklist.</p>
+    <p class="text-xs text-gray-600 mb-3">March 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>Three structural properties make a system audit-ready: immutability (write-ahead logs you can't quietly edit), lineage (every record carries its provenance), and exportability (you can produce evidence on demand without scrambling).</p>
+      <p>Implementation: SQLite in WAL mode for all persistent data. Every significant operation logged to an append-only audit table with timestamp, actor, action, and hash of relevant data. Cron job exports weekly audit packs as signed CSV + JSON.</p>
+      <p>The regulator or auditor who shows up gets a dated, hashed evidence pack, not a frantic scramble through log files. That's the difference between structural compliance and compliance theatre.</p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
-  <div class="bg-card border border-gray-700 rounded-xl p-6">
+  <article class="bg-card border border-gray-700 rounded-xl p-6 cursor-pointer hover:border-cyan-700 transition-colors post-card" data-tag="automation" onclick="openPost(this)">
     <div class="flex gap-2 mb-3"><span class="tag tag-automation">Automation</span></div>
     <h2 class="font-bold text-lg mb-2">How to Automate Infrastructure Without Cloud Lock-In</h2>
-    <p class="text-gray-400 text-sm mb-4">n8n, PM2, and operator-run cron streams — sovereign automation pipelines you actually own.</p>
-    <p class="text-xs text-gray-600">February 2026 · Samuel James Hiotis</p>
-  </div>
+    <p class="post-summary text-gray-400 text-sm mb-4">n8n, PM2, and operator-run cron streams — sovereign automation pipelines you actually own.</p>
+    <p class="text-xs text-gray-600 mb-3">February 2026 · Samuel James Hiotis</p>
+    <div class="post-body hidden text-gray-300 text-sm space-y-3 mt-4 pt-4 border-t border-gray-700">
+      <p>The mistake most operators make: they automate with tools they don't control (Zapier, Make.com, cloud functions). When pricing changes or the platform goes down, the automation breaks and you have no recourse.</p>
+      <p>Sovereign automation stack: n8n (self-hosted, open-source, Docker Compose) for event-driven workflows. PM2 cron expressions for scheduled tasks. Python scripts for custom logic. Everything runs on your hardware, in your network, with your data.</p>
+      <p>You own the source. You own the schedule. You own the data. If n8n changes their license tomorrow, you fork it. That's sovereignty in practice.</p>
+      <p><a href="products.html" class="accent hover:underline">Get the Sovereign Automation Pack →</a></p>
+    </div>
+    <span class="text-xs accent hover:underline read-more-btn">Read more →</span>
+  </article>
 
 </section>
+
+<script>
+function filterPosts(tag, btn) {
+  document.querySelectorAll('.tag').forEach(t => t.classList.remove('ring-2','ring-cyan-400','font-bold'));
+  btn.classList.add('ring-2','ring-cyan-400','font-bold');
+  document.querySelectorAll('.post-card').forEach(card => {
+    card.style.display = (tag === 'all' || card.dataset.tag === tag) ? '' : 'none';
+  });
+}
+function openPost(card) {
+  const body = card.querySelector('.post-body');
+  const btn  = card.querySelector('.read-more-btn');
+  const open = !body.classList.contains('hidden');
+  body.classList.toggle('hidden', open);
+  btn.textContent = open ? 'Read more →' : 'Collapse ↑';
+}
+</script>
 
 <!-- CTA -->
 <section class="px-6 py-16 bg-card border-y border-gray-800 text-center">

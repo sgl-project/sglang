@@ -27,7 +27,10 @@
     <a href="consulting.html">Consulting</a>
     <a href="tools.html">Tools</a>
     <a href="intelligence.html">Intelligence</a>
+    <a href="blog.html">Blog</a>
+    <a href="about.html">About</a>
     <a href="contact.html">Contact</a>
+    <a href="dashboard.html" style="color:#22d3ee;border:1px solid #22d3ee33;padding:.2rem .7rem;border-radius:.25rem;font-size:.8rem" title="Operator Dashboard">Dashboard →</a>
   </div>
 </nav>
 
@@ -126,8 +129,23 @@
 
 </div>
 
+<!-- SUBSCRIBE STRIP -->
+<section class="px-6 py-12 bg-card border-y border-gray-800">
+  <div class="max-w-lg mx-auto text-center">
+    <h2 class="text-2xl font-bold mb-2">Get full briefings — free</h2>
+    <p class="text-gray-400 text-sm mb-6">Monthly intelligence + compliance alerts. No spam, no dark patterns.</p>
+    <form id="intel-form" class="flex gap-2 flex-wrap justify-center" onsubmit="subscribeIntel(event)">
+      <input id="intel-email" type="email" required placeholder="your@email.com"
+        class="flex-1 min-w-[240px] px-4 py-2 bg-gray-900 border border-gray-700 rounded text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400 text-sm" />
+      <button type="submit" id="intel-btn" class="btn-primary px-6 py-2 text-sm whitespace-nowrap">Subscribe Free</button>
+    </form>
+    <p id="intel-msg" class="hidden text-sm text-emerald-400 mt-3">✓ Subscribed — first briefing on its way.</p>
+    <p class="text-xs text-gray-600 mt-3">Unsubscribe anytime. Your email is never shared.</p>
+  </div>
+</section>
+
 <!-- FEATURED BRIEFING EXCERPT -->
-<section class="px-6 py-16 bg-card border-y border-gray-800">
+<section class="px-6 py-16 border-b border-gray-800">
   <div class="max-w-3xl mx-auto">
     <p class="text-xs accent uppercase tracking-widest mb-3">Featured — April 2026</p>
     <h2 class="text-2xl font-bold mb-6">Resilience Intelligence Briefing</h2>
@@ -137,9 +155,31 @@
       <p><strong class="accent">2. Supply Chains Are Being Redrawn.</strong> Manufacturers and logistics operators are moving toward local suppliers, local infrastructure, and local automation. Local systems fail less, cost less, and recover faster.</p>
       <p><strong class="accent">3. RF Intelligence Is Emerging as a New Verification Layer.</strong> Wireless environments are unique at every location — making them ideal for proof-of-presence, logistics validation, and compliance automation.</p>
     </div>
-    <a href="blueprint.html" class="btn-primary">Subscribe for Full Briefings</a>
   </div>
 </section>
+
+<script>
+async function subscribeIntel(e) {
+  e.preventDefault();
+  const btn = document.getElementById('intel-btn');
+  const msg = document.getElementById('intel-msg');
+  btn.textContent = 'Subscribing…';
+  btn.disabled = true;
+
+  const API = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://localhost:5058' : '';
+  try {
+    await fetch(API + '/api/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: document.getElementById('intel-email').value, type: 'intelligence' }),
+    });
+  } catch(_) {}
+
+  msg.classList.remove('hidden');
+  btn.textContent = 'Subscribed ✓';
+}
+</script>
 
 <footer class="border-t border-gray-800 px-6 py-8 text-center text-sm text-gray-600">
   Samuel James Hiotis · ABN 56 628 117 363 · Albury, NSW · White-hat, defensive operations only.

@@ -30,7 +30,11 @@
     <a href="products.html">Products</a>
     <a href="consulting.html">Consulting</a>
     <a href="tools.html">Tools</a>
+    <a href="intelligence.html">Intelligence</a>
+    <a href="blog.html">Blog</a>
+    <a href="about.html">About</a>
     <a href="contact.html">Contact</a>
+    <a href="dashboard.html" style="color:#22d3ee;border:1px solid #22d3ee33;padding:.2rem .7rem;border-radius:.25rem;font-size:.8rem" title="Operator Dashboard">Dashboard →</a>
   </div>
 </nav>
 
@@ -82,7 +86,7 @@
       <div class="text-right">
         <div class="text-3xl font-bold amber mb-1">$49</div>
         <div class="text-gray-500 text-sm mb-4">— $79/mo</div>
-        <a href="contact.html" class="btn-primary">Buy Now</a>
+        <a href="contact.html?product=automation-pack&price=49" class="btn-primary" onclick="prefillContact('Sovereign Automation Pack','$49')">Buy Now — $49 AUD</a>
       </div>
     </div>
   </div>
@@ -109,7 +113,7 @@
       <div class="text-right">
         <div class="text-3xl font-bold amber mb-1">$149</div>
         <div class="text-gray-500 text-sm mb-4">— $199</div>
-        <a href="contact.html" class="btn-primary">Buy Now</a>
+        <a href="contact.html?product=deployment-kit&price=149" class="btn-primary" onclick="prefillContact('Full Deployment Kit','$149')">Buy Now — $149 AUD</a>
       </div>
     </div>
   </div>
@@ -135,7 +139,7 @@
         <div class="text-xs text-gray-500 line-through mb-1">$348 separately</div>
         <div class="text-3xl font-bold" style="color:#a855f7;">$199</div>
         <div class="text-gray-500 text-sm mb-4">— $299</div>
-        <a href="contact.html" class="btn-primary">Buy Bundle</a>
+        <a href="contact.html?product=suite&price=199" class="btn-primary" onclick="prefillContact('Sovereign Infrastructure Suite','$199')">Buy Bundle — $199 AUD</a>
       </div>
     </div>
   </div>
@@ -144,5 +148,22 @@
 <footer class="border-t border-gray-800 px-6 py-8 text-center text-sm text-gray-600">
   Samuel James Hiotis · ABN 56 628 117 363 · Albury, NSW · White-hat, defensive operations only.
 </footer>
+
+<script>
+function prefillContact(product, price) {
+  sessionStorage.setItem('fm_product_interest', `I'd like to purchase: ${product} (${price} AUD)`);
+}
+// On contact page, prefill if arriving from products
+if (location.pathname.includes('contact')) {
+  const interest = sessionStorage.getItem('fm_product_interest');
+  if (interest) {
+    window.addEventListener('DOMContentLoaded', () => {
+      const needs = document.querySelector('[name=needs]');
+      if (needs) needs.value = interest;
+      sessionStorage.removeItem('fm_product_interest');
+    });
+  }
+}
+</script>
 </body>
 </html>

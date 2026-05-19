@@ -20,10 +20,15 @@
   <a href="index.html" class="font-bold text-lg accent">FractalMesh Ω Titan</a>
   <div>
     <a href="index.html">Home</a>
+    <a href="blueprint.html">Blueprint</a>
     <a href="products.html">Products</a>
     <a href="consulting.html">Consulting</a>
     <a href="tools.html">Tools</a>
+    <a href="intelligence.html">Intelligence</a>
+    <a href="blog.html">Blog</a>
+    <a href="about.html">About</a>
     <a href="contact.html">Contact</a>
+    <a href="dashboard.html" style="color:#22d3ee;border:1px solid #22d3ee33;padding:.2rem .7rem;border-radius:.25rem;font-size:.8rem" title="Operator Dashboard">Dashboard →</a>
   </div>
 </nav>
 
@@ -100,12 +105,47 @@
   <div class="max-w-lg mx-auto text-center">
     <h2 class="text-2xl font-bold mb-4">Download the Blueprint — Free</h2>
     <p class="text-gray-400 mb-8 text-sm">No spam. No dark patterns. Just the blueprint.</p>
-    <form class="space-y-4" onsubmit="return false;">
-      <input type="text" placeholder="Your name" class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400" />
-      <input type="email" placeholder="Your email" class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400" />
-      <button type="submit" class="btn-primary w-full">Download Free Blueprint</button>
+    <form class="space-y-4" id="bp-form" onsubmit="submitBlueprint(event)">
+      <input id="bp-name" type="text" placeholder="Your name" required
+        class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400" />
+      <input id="bp-email" type="email" placeholder="your@email.com" required
+        class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400" />
+      <button type="submit" id="bp-btn" class="btn-primary w-full">Download Free Blueprint</button>
+      <div id="bp-msg" class="hidden text-sm text-center pt-2"></div>
     </form>
-    <p class="text-xs text-gray-600 mt-4">By downloading you agree to receive occasional infrastructure intelligence briefings. Unsubscribe anytime.</p>
+    <p class="text-xs text-gray-600 mt-4">No spam. No dark patterns. Occasional intelligence briefings only. Unsubscribe anytime.</p>
+
+<script>
+async function submitBlueprint(e) {
+  e.preventDefault();
+  const btn = document.getElementById('bp-btn');
+  const msg = document.getElementById('bp-msg');
+  btn.textContent = 'Sending…';
+  btn.disabled = true;
+
+  const payload = {
+    name:  document.getElementById('bp-name').value,
+    email: document.getElementById('bp-email').value,
+    type:  'blueprint_download',
+  };
+
+  const API = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://localhost:5058' : '';
+
+  try {
+    await fetch(API + '/api/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch(_) {}
+
+  msg.classList.remove('hidden');
+  msg.innerHTML = '✓ Blueprint sent — check your email. <a href="blueprint-content.html" class="accent underline">Or read it here →</a>';
+  msg.style.color = '#22d3ee';
+  btn.textContent = 'Done ✓';
+}
+</script>
   </div>
 </section>
 

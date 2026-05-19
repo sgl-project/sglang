@@ -34,8 +34,12 @@
     <a href="blueprint.html">Blueprint</a>
     <a href="products.html">Products</a>
     <a href="consulting.html">Consulting</a>
+    <a href="tools.html">Tools</a>
+    <a href="intelligence.html">Intelligence</a>
+    <a href="blog.html">Blog</a>
     <a href="about.html">About</a>
     <a href="contact.html">Contact</a>
+    <a href="dashboard.html" style="color:#22d3ee;border:1px solid #22d3ee33;padding:.2rem .7rem;border-radius:.25rem;font-size:.8rem" title="Operator Dashboard">Dashboard →</a>
   </div>
 </nav>
 
@@ -69,27 +73,27 @@
   <form class="space-y-5" onsubmit="handleSubmit(event)">
     <div>
       <label class="block text-sm text-gray-400 mb-1">Name</label>
-      <input type="text" placeholder="Your name" required />
+      <input type="text" name="name" placeholder="Your name" required />
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">Email</label>
-      <input type="email" placeholder="your@email.com" required />
+      <input type="email" name="email" placeholder="your@email.com" required />
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">Organisation (optional)</label>
-      <input type="text" placeholder="Company or project name" />
+      <input type="text" name="org" placeholder="Company or project name" />
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">What are you running today?</label>
-      <input type="text" placeholder="Current stack, systems, or situation" />
+      <input type="text" name="stack" placeholder="Current stack, systems, or situation" />
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">What do you want to build or fix?</label>
-      <textarea rows="4" placeholder="Describe what you need..."></textarea>
+      <textarea rows="4" name="needs" placeholder="Describe what you need..."></textarea>
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">Urgency</label>
-      <select>
+      <select name="urgency">
         <option value="exploring">Exploring</option>
         <option value="planning">Planning (weeks)</option>
         <option value="live-fire">Live-fire (now)</option>
@@ -97,7 +101,7 @@
     </div>
     <div>
       <label class="block text-sm text-gray-400 mb-1">Do you need e-sign ready documents?</label>
-      <select>
+      <select name="esign">
         <option value="no">No, not yet</option>
         <option value="yes">Yes — contracts, MSAs, agreements</option>
       </select>
@@ -129,9 +133,33 @@
 </section>
 
 <script>
-function handleSubmit(e) {
+async function handleSubmit(e) {
   e.preventDefault();
-  alert('Message received. Samuel will be in touch shortly.');
+  const form = e.target;
+  const btn  = form.querySelector('[type=submit]');
+  const fields = form.querySelectorAll('input,textarea,select');
+  btn.textContent = 'Sending…';
+  btn.disabled = true;
+
+  const data = {};
+  form.querySelectorAll('[name]').forEach(el => { data[el.name] = el.value; });
+
+  const API = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://localhost:5058' : '';
+  try {
+    await fetch(API + '/api/contact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+  } catch(_) {}
+
+  btn.textContent = 'Message sent ✓';
+  btn.style.background = '#10b981';
+  const thanks = document.createElement('p');
+  thanks.className = 'text-sm text-center text-emerald-400 mt-4';
+  thanks.textContent = 'Message received. Samuel will be in touch within 24–48 hours.';
+  form.appendChild(thanks);
 }
 </script>
 
