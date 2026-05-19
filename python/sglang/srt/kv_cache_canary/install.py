@@ -1,3 +1,16 @@
+"""Install glue: attach a canary runner to a :class:`ModelRunner` and patch its forward hooks.
+
+The install function:
+
+- builds a :class:`CanaryConfig` from server args,
+- detects pool type (MHA / MLA / SWA) and supplies the SWA window length if applicable,
+- computes capacities for all three (per-forward, running-sweep, radix-orphan-sweep) plan slots,
+- delegates to :func:`api.attach` to install canary buffers and create runners,
+- patches ``model_runner.model.forward`` to drive head/tail launches,
+- patches every cuda-graph runner class's ``replay`` so head/tail launches fire eagerly around the captured
+  replay (the canary itself is NOT baked into cuda-graph capture).
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -26,10 +39,9 @@ logger = logging.getLogger(__name__)
 
 _FORWARD_PATCHED_ATTR = "_kv_cache_canary_forward_patched"
 
-# Thread-local flag set by ``patched_replay`` around the ``original_replay``
-# call so the inner ``patched_model_forward`` (invoked through the captured
-# replay's inner ``model.forward``) knows the outer wrapper has already
-# launched the canary kernel pair and skips its own eager-path launch.
+# Thread-local flag set by ``patched_replay`` around the ``original_replay`` call so the inner
+# ``patched_model_forward`` (invoked through the captured replay's inner ``model.forward``) knows the outer
+# wrapper has already launched the canary kernel pair and skips its own eager-path launch.
 _replay_in_flight = threading.local()
 
 
@@ -46,23 +58,8 @@ def install_on_model_runner(
 ) -> None:
     """Attach the canary to the model runner's pool and wire its hooks.
 
-    Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs``.
-    Idempotent: a second call on the same ``model_runner`` is a no-op.
-
-    The canary patches ``model_runner.model.forward`` (the bound method).
-    SGLang calls ``self.model.forward(...)`` directly (not ``self.model(...)``)
-    and ``cuda_graph_runner.patch_model`` yields ``model.forward`` for capture
-    too — so patching the bound method is the single point that covers both
-    the eager and the captured-into-cuda-graph paths.
-
-    ``real_kv_hash_mode`` (one of ``off`` / ``portion`` / ``all``, default
-    ``off``) controls whether a fingerprint of the real KV-cache slot is
-    folded into the canary's chain hash. ``off`` leaves the field zero;
-    ``portion`` hashes the first 16 bytes of the real slot; ``all`` hashes
-    the full slot stride.
-
-    ``real_data_sweep_every_n_steps`` controls the periodic full-pool sweep
-    that verifies real_kv_hash on every alive slot. 0 disables it.
+    Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs``. Idempotent: a second call
+    on the same ``model_runner`` is a no-op.
     """
     config = CanaryConfig.from_server_args(
         mode,
@@ -84,16 +81,11 @@ def install_on_model_runner(
         return
 
     if isinstance(pool, BaseSWAKVPool):
-        # SWA's req_to_token mapping only addresses the most recent
-        # ``sliding_window_size`` slots; the verify range for the SWA
-        # canary must be clipped accordingly. The FULL canary on the
-        # same pool gets ``swa_window_size = None`` injected by
-        # :func:`attach` and uses the full prefix.
         window_size = model_runner.sliding_window_size
         if window_size is None or int(window_size) <= 0:
             logger.warning(
-                "kv-canary: SWA pool detected but model_runner.sliding_window_size "
-                "is %r; falling back to full-prefix verify for the SWA canary "
+                "kv-canary: SWA pool detected but model_runner.sliding_window_size is %r; "
+                "falling back to full-prefix verify for the SWA canary "
                 "(may produce spurious violations on long prefixes).",
                 window_size,
             )
@@ -106,10 +98,16 @@ def install_on_model_runner(
         pool=pool,
         config=config,
         device=device,
-        verify_capacity=capacities.verify_capacity,
-        write_capacity=capacities.write_capacity,
-        write_req_capacity=capacities.write_req_capacity,
+        per_forward_verify_capacity=capacities.per_forward_verify_capacity,
+        per_forward_write_req_capacity=capacities.per_forward_write_req_capacity,
+        running_sweep_verify_capacity=capacities.running_sweep_verify_capacity,
+        radix_sweep_verify_capacity=capacities.radix_sweep_verify_capacity,
+        radix_sweep_extras_capacity=capacities.radix_sweep_extras_capacity,
+        per_forward_extras_capacity=capacities.per_forward_extras_capacity,
+        running_sweep_extras_capacity=capacities.running_sweep_extras_capacity,
+        pseudo_token_capacity=capacities.pseudo_token_capacity,
         req_to_token_pool=model_runner.req_to_token_pool,
+        radix_cache=None,
         tp_rank=model_runner.tp_rank,
     )
     if not runners:
@@ -122,20 +120,25 @@ def install_on_model_runner(
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class _LaunchCapacities:
-    """Fixed launch-buffer capacities sized for every plausible forward."""
+    """Fixed launch-buffer capacities sized for every plausible forward and sweep cycle."""
 
-    verify_capacity: int
-    write_capacity: int
-    write_req_capacity: int
+    per_forward_verify_capacity: int
+    per_forward_write_req_capacity: int
+    per_forward_extras_capacity: int
+    running_sweep_verify_capacity: int
+    running_sweep_extras_capacity: int
+    radix_sweep_verify_capacity: int
+    radix_sweep_extras_capacity: int
+    pseudo_token_capacity: int
 
 
 def _compute_launch_capacities(
     *, model_runner: ModelRunner, config: CanaryConfig
 ) -> _LaunchCapacities:
-    """Pick fixed launch-buffer capacities that cover every forward shape.
+    """Pick fixed launch-buffer capacities that cover every forward shape and worst-case sweep.
 
-    Padding rows past ``num_active_*`` carry ``*_active_mask == 0`` and the
-    kernel short-circuits them with zero I/O, so oversizing is cheap.
+    Padding rows past the active count carry ``num_valid == 0`` and the kernel short-circuits them with
+    zero I/O, so oversizing is cheap.
     """
     server_args = model_runner.server_args
     cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
@@ -145,45 +148,40 @@ def _compute_launch_capacities(
         num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
     max_running_requests = int(model_runner.req_to_token_pool.size)
     max_bs = max(int(cuda_graph_max_bs), max_running_requests)
-    # Prefill batches write one entry per extend token, not per request, so
-    # the per-forward write count is bounded by the chunked-prefill budget
-    # (or ``max_prefill_tokens`` if chunking is disabled), not by ``max_bs``.
     chunked_prefill_size = server_args.chunked_prefill_size
     max_prefill_tokens = int(server_args.max_prefill_tokens)
     if chunked_prefill_size is None or chunked_prefill_size < 0:
         max_extend_tokens_per_forward = max_prefill_tokens
     else:
         max_extend_tokens_per_forward = int(chunked_prefill_size)
+    pool_slot_count = int(model_runner.max_total_num_tokens)
+
     return _LaunchCapacities(
-        verify_capacity=max(1, int(model_runner.max_total_num_tokens)),
-        write_capacity=max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward),
-        write_req_capacity=max_bs,
+        per_forward_verify_capacity=max(1, pool_slot_count),
+        per_forward_write_req_capacity=max(1, max_bs),
+        per_forward_extras_capacity=1,
+        running_sweep_verify_capacity=max(1, pool_slot_count),
+        running_sweep_extras_capacity=1,
+        radix_sweep_verify_capacity=max(1, pool_slot_count),
+        radix_sweep_extras_capacity=max(1, pool_slot_count),
+        pseudo_token_capacity=max(
+            1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
+        ),
     )
 
 
 def _patch_model_forward(*, model_runner: ModelRunner) -> None:
-    """Wrap ``model_runner.model.forward`` to run the canary kernel pair.
+    """Wrap ``model_runner.model.forward`` to run the canary head/tail launches.
 
     Two execution paths, both routed through this single wrapper:
 
-    1. **Eager** (prefill/extend/decode outside any cuda graph): builds a
-       ``BatchPlan`` from the live ``ForwardBatch``, launches head kernel,
-       runs real forward, launches tail kernel, ends forward.
-    2. **Cuda graph capture** and **replay**: handled by
-       :func:`_patch_cuda_graph_runner_replay_class_method` patching the
-       graph runner's ``replay`` so the canary kernel pair runs **eagerly
-       around** ``original_replay``. The kernel is intentionally NOT
-       captured into any graph — capture-time recording of the
-       skip-sentinel buffer reset would clobber the replay-time refill
-       (see ``CanaryRunner.launch_for_capture``), and piecewise sub-graphs
-       don't include the canary at all anyway. Running purely outside the
-       graph keeps the wiring uniform across CudaGraphRunner / piecewise /
-       spec-decoding draft runners.
-
-    At capture time the wrapper short-circuits when inside a cuda graph
-    capture (so the canary kernel is not recorded into the captured
-    sub-graphs); the actual canary launches happen around the captured
-    replay via :func:`_patch_graph_runner_class_replay`.
+    1. **Eager** (prefill/extend/decode outside any cuda graph): builds a plan from the live
+       ``ForwardBatch``, launches head, runs real forward, launches tail, ends forward.
+    2. **Cuda graph capture** and **replay**: handled by :func:`_patch_cuda_graph_runner_replay_class_method`
+       patching the graph runner's ``replay`` so the canary kernel pair runs **eagerly around**
+       ``original_replay``. The canary is intentionally NOT recorded into any captured graph (see the
+       runner's plan-input ABI: cuda-graph capture pins the plan tensor addresses, but the launches
+       themselves stay eager so the pump can D2H without blocking inside capture).
     """
     model = model_runner.model
     original_forward = model.forward
@@ -200,27 +198,17 @@ def _patch_model_forward(*, model_runner: ModelRunner) -> None:
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         if is_capturing:
-            # Don't record canary kernels into ANY captured graph: the
-            # replay-side patched_replay launches them eagerly around
-            # the captured replay instead. Capturing here would also
-            # bake in a skip-sentinel buffer reset that wipes the
-            # replay-side refill — see CanaryRunner.launch_for_capture.
             return original_forward(*args, **kwargs)
 
-        # If we're inside a patched_replay (CudaGraphRunner / piecewise /
-        # spec draft), the canary kernel pair is already launched
-        # eagerly around the outer replay; skip the inner-eager
-        # invocation so we don't double-launch and don't fail-build a
-        # plan from the padded static forward batch.
         if _is_inside_replay():
             return original_forward(*args, **kwargs)
 
         maybe_perturb_hook(
             runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
         )
-        plans = run_head(runners=runners, forward_batch=forward_batch)
+        run_head(runners=runners, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
-        run_tail(runners=runners, plans=plans)
+        run_tail(runners=runners, forward_batch=forward_batch)
         return output
 
     model.forward = patched_model_forward
@@ -248,15 +236,14 @@ _OPTIONAL_GRAPH_RUNNER_CLASSES: Tuple[Tuple[str, str], ...] = (
 def _patch_cuda_graph_runner_replay_class_method() -> None:
     """Wrap ``replay`` at the CLASS level for every graph-runner family.
 
-    SGLang has several independent graph-runner classes that each manage
-    their own captured CUDA graphs and bypass ``model.forward`` by calling
-    ``self.graphs[bs].replay()`` directly. Patching only the base
-    ``CudaGraphRunner`` leaves the spec decoding draft worker and piecewise
-    hot paths uninstrumented; we enumerate the full family.
+    SGLang has several independent graph-runner classes that each manage their own captured CUDA graphs and
+    bypass ``model.forward`` by calling ``self.graphs[bs].replay()`` directly. Patching only the base
+    ``CudaGraphRunner`` leaves the spec decoding draft worker and piecewise hot paths uninstrumented; we
+    enumerate the full family.
 
-    Why CLASS-level: the canary install runs BEFORE ``init_device_graphs``,
-    so the per-instance graph runners don't exist yet at install time.
-    Patching the class method covers every instance created afterwards.
+    Why CLASS-level: the canary install runs BEFORE ``init_device_graphs``, so the per-instance graph
+    runners don't exist yet at install time. Patching the class method covers every instance created
+    afterwards.
 
     Idempotent at the class level: a second install call is a no-op.
     """
@@ -296,26 +283,13 @@ def _patch_graph_runner_class_replay(cls: type) -> None:
         maybe_perturb_hook(
             runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
         )
-        # Launch the canary kernel pair EAGERLY around the captured
-        # replay. ``run_head`` reads from the LIVE forward_batch (correct
-        # sizes / real req_pool_indices); the captured replay then runs
-        # the model itself; ``run_tail`` re-reads the same plan post-
-        # forward. Both kernels run outside any captured graph — see
-        # ``_patch_model_forward`` for why we don't bake the canary into
-        # the cuda graph.
-        plans = run_head(runners=runners, forward_batch=forward_batch)
-        # Set the thread-local "inside replay" flag so the inner
-        # patched_model_forward (invoked when piecewise replay calls
-        # model.forward on its static_forward_batch) skips its own
-        # eager-path canary launch and doesn't double-fire. The flag
-        # travels with the thread, so it works regardless of whether
-        # piecewise constructs a new ForwardBatch object for the model.
+        run_head(runners=runners, forward_batch=forward_batch)
         _replay_in_flight.active = True
         try:
             output = original_replay(self, forward_batch, *args, **kwargs)
         finally:
             _replay_in_flight.active = False
-        run_tail(runners=runners, plans=plans)
+        run_tail(runners=runners, forward_batch=forward_batch)
         return output
 
     cls.replay = patched_replay
