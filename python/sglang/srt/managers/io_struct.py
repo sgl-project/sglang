@@ -713,7 +713,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: array
+    input_ids: Optional[array]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
