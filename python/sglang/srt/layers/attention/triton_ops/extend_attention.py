@@ -61,10 +61,6 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int, max_len_extend: int)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware.
-    #
-    # ``num_warps_override`` lets a hardware/shape-specific branch pin a
-    # warp count that differs from the generic "8 warps for Lq>64"
-    # heuristic at the bottom of this function.
     num_warps_override = None
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
@@ -83,9 +79,6 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int, max_len_extend: int)
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (64, 64)
             elif max_len_extend <= 16:
-                # Small-extend (e.g. spec verify with num_draft_tokens<=16):
-                # BLOCK_M=32 would waste most of the M-axis rows here, so
-                # keep the tighter tile. (Imported from PR #25550.)
                 BLOCK_M, BLOCK_N = (16, 64)
             else:
                 # For Lq=512 (Gemma-4-31B full-attention layers) the
