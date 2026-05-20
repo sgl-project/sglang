@@ -388,6 +388,7 @@ def run_once() -> dict[str, Any]:
         "regressions_resolved": 0,
         "skipped": 0,
         "errors": 0,
+        "already_ingested": 0,
         "reconcile_failed": 0,
         "reconcile_partial": 0,
         "reconcile_orphans": 0,
@@ -418,6 +419,30 @@ def run_once() -> dict[str, Any]:
                 _advance(last_modified)
                 continue
             stats["parsed"] += 1
+
+            # Skip if this exact run is already ingested as 'passed'. Saves the
+            # S3 GetObject + 3 GitHub API calls per key on rescans (cursor reset,
+            # late-arriving cursor advance, etc.). A placeholder row (failed /
+            # partial) does NOT short-circuit — the JSON still upgrades it.
+            existing = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE github_run_id = ? AND github_run_attempt = ?
+                  AND config_name = ? AND concurrency = ?
+                  AND status = 'passed'
+                LIMIT 1
+                """,
+                (
+                    parsed.github_run_id,
+                    parsed.github_run_attempt,
+                    parsed.config_name,
+                    parsed.concurrency,
+                ),
+            ).fetchone()
+            if existing:
+                stats["already_ingested"] += 1
+                _advance(last_modified)
+                continue
 
             payload = _read_json(s3, key)
             if payload is None:
