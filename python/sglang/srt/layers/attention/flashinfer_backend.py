@@ -508,6 +508,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                extend_num_tokens=forward_batch.extend_num_tokens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1244,6 +1245,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        extend_num_tokens: Optional[int] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1269,6 +1271,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            extend_num_tokens=extend_num_tokens,
         )
 
     def update_sliding_window(
@@ -1284,6 +1287,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        extend_num_tokens: Optional[int] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1318,6 +1322,7 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                extend_num_tokens=extend_num_tokens,
             )
 
     def update_cross_attention(
@@ -1333,6 +1338,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        extend_num_tokens: Optional[int] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1360,6 +1366,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                extend_num_tokens=extend_num_tokens,
             )
 
     def call_begin_forward(
@@ -1379,6 +1386,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        extend_num_tokens: Optional[int] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1391,7 +1399,9 @@ class FlashInferIndicesUpdaterPrefill:
             fwd_ctx = get_forward_context()
             pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
             padded_num_tokens = (
-                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
+                fwd_ctx.forward_batch.extend_num_tokens
+                if fwd_ctx is not None
+                else extend_num_tokens
             )
             extra_kv = max(pcg_num_tokens or 0, padded_num_tokens or 0)
             kv_indices = torch.empty(
