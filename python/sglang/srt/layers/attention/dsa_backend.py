@@ -302,6 +302,15 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             else None
         )
 
+        if (
+            row_to_batch is not None
+            and cu_seqlens_q_topk is not None
+            and num_rows is not None
+            and row_to_batch.shape[0] != num_rows
+        ):
+            q_lens = torch.diff(cu_seqlens_q_topk).to(dtype=torch.int32, device=device)
+            row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
+
         if row_to_batch is None and cu_seqlens_q_topk is not None:
             # Decode-like case (one query row per batch) does not need an explicit mapping.
             # Avoid dynamic tensor construction in this branch to keep CUDA graph capture safe.
@@ -322,10 +331,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
         row_starts = ks
         if row_starts is not None and row_to_batch is not None:
-            batch_base = self.attn_metadata.cu_seqlens_k.to(
-                dtype=torch.int32, device=device
-            )[:-1]
-            row_starts = row_starts - batch_base[row_to_batch]
+            row_starts = row_starts - self.attn_metadata.cu_seqlens_k[:-1][row_to_batch]
 
         return row_to_batch, row_starts
 
@@ -424,7 +430,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
                         row_starts=ks,
                     )
                 else:
-                    assert False, f"Unsupported {self.topk_transform_method = }"
+                    raise RuntimeError(f"Unsupported {self.topk_transform_method = }")
             elif self.topk_backend.is_flashinfer():
                 import flashinfer
 
@@ -465,11 +471,11 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
                         row_starts=ks,
                     )
                 else:
-                    assert False, f"Unsupported {self.topk_transform_method = }"
+                    raise RuntimeError(f"Unsupported {self.topk_transform_method = }")
             else:
-                assert (
-                    False
-                ), f"Unsupported {self.topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+                raise RuntimeError(
+                    f"Unsupported {self.topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+                )
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
@@ -576,6 +582,16 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        if (
+            self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_flashinfer()
+        ):
+            return topk_indices
+        raise RuntimeError(
+            f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+        )
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -1612,15 +1628,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            if (
-                self.dsa_topk_backend.is_sgl_kernel()
-                or self.dsa_topk_backend.is_flashinfer()
-            ):
-                page_table_1 = topk_indices
-            else:
-                assert (
-                    False
-                ), f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = metadata.topk_indices_offset
@@ -1810,15 +1818,7 @@ class DeepseekSparseAttnBackend(
                 layer.layer_id,
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
-            if (
-                self.dsa_topk_backend.is_sgl_kernel()
-                or self.dsa_topk_backend.is_flashinfer()
-            ):
-                page_table_1 = topk_indices
-            else:
-                assert (
-                    False
-                ), f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2327,15 +2327,7 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            if (
-                self.dsa_topk_backend.is_sgl_kernel()
-                or self.dsa_topk_backend.is_flashinfer()
-            ):
-                page_table_1 = topk_indices
-            else:
-                assert (
-                    False
-                ), f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
                 page_table=metadata.page_table_1,
@@ -2736,9 +2728,3 @@ DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
 DSAMetadata = DSAMetadata
 DSAFlashMLAMetadata = DSAFlashMLAMetadata
 DSAIndexerMetadata = DSAIndexerMetadata
-NativeSparseAttnBackend = DeepseekSparseAttnBackend
-NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-NSAMetadata = DSAMetadata
-NSAFlashMLAMetadata = DSAFlashMLAMetadata
-NSAIndexerMetadata = DSAIndexerMetadata
-NSATopKBackend = DSATopKBackend

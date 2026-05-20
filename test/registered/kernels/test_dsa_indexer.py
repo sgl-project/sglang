@@ -560,14 +560,16 @@ class TestDSAIndexer(CustomTestCase):
         topk: int,
         topk_transform_method: TopkTransformMethod,
         with_row_starts: bool,
+        query_lens: Optional[List[int]] = None,
     ):
-        logits = self._make_tie_free_logits(batch_size, max_score_len)
+        num_rows = sum(query_lens) if query_lens is not None else batch_size
+        logits = self._make_tie_free_logits(num_rows, max_score_len)
 
         if with_row_starts:
             row_starts = torch.randint(
                 0,
                 max_score_len - 1,
-                (batch_size,),
+                (num_rows,),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -575,7 +577,7 @@ class TestDSAIndexer(CustomTestCase):
             random_lengths = torch.randint(
                 1,
                 max_score_len,
-                (batch_size,),
+                (num_rows,),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -585,22 +587,32 @@ class TestDSAIndexer(CustomTestCase):
             seq_lens_expanded = torch.randint(
                 1,
                 max_score_len,
-                (batch_size,),
+                (num_rows,),
                 dtype=torch.int32,
                 device=self.device,
             )
 
         topk_indices_offset = (
-            torch.arange(batch_size, dtype=torch.int32, device=self.device) * 1024
+            torch.arange(num_rows, dtype=torch.int32, device=self.device) * 1024
         )
-        cu_seqlens_q = torch.arange(
-            batch_size + 1, dtype=torch.int32, device=self.device
-        )
+        if query_lens is None:
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            q_lens = None
+            batch_idx_list = None
+        else:
+            q_lens = torch.tensor(query_lens, dtype=torch.int32, device=self.device)
+            cu_seqlens_q = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
+            batch_idx_list = list(range(batch_size))
         cu_seqlens_k = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=self.device
         )
         dsa_cu_seqlens_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device
+            num_rows + 1, dtype=torch.int32, device=self.device
         )
         dsa_cu_seqlens_k[1:] = torch.cumsum(seq_lens_expanded, dim=0)
 
@@ -651,9 +663,19 @@ class TestDSAIndexer(CustomTestCase):
         )
 
         with envs.SGLANG_DSA_FUSE_TOPK.override(True):
-            out_sgl = metadata_sgl.topk_transform(logits, topk, ks=row_starts)
+            out_sgl = metadata_sgl.topk_transform(
+                logits,
+                topk,
+                ks=row_starts,
+                cu_seqlens_q=q_lens,
+                batch_idx_list=batch_idx_list,
+            )
             out_flashinfer = metadata_flashinfer.topk_transform(
-                logits, topk, ks=row_starts
+                logits,
+                topk,
+                ks=row_starts,
+                cu_seqlens_q=q_lens,
+                batch_idx_list=batch_idx_list,
             )
 
         self.assertEqual(out_sgl.shape, out_flashinfer.shape)
@@ -876,7 +898,7 @@ class TestDSAIndexer(CustomTestCase):
         topk_indices = metadata.topk_transform(logits, topk)
         self.assertEqual(topk_indices.shape, (batch_size, topk))
 
-    def test_topk_backends_unfused(self):
+    def test_topk_unfused_backends_valid_selection(self):
         batch_size = 8
         max_score_len = 16 * 1024
         topk = 2048
@@ -906,7 +928,7 @@ class TestDSAIndexer(CustomTestCase):
                                 with_row_starts=with_row_starts,
                             )
 
-    def test_topk_backends_fused(self):
+    def test_topk_fused_backends_equivalence(self):
         batch_size = 8
         max_score_len = 16 * 1024
         topk = 2048
@@ -920,6 +942,8 @@ class TestDSAIndexer(CustomTestCase):
                         topk_transform_method == TopkTransformMethod.PAGED
                         and with_row_starts
                     ):
+                        # The synthetic paged fixture uses the decode-like row mapping.
+                        # Ragged fused and unfused cases cover shifted row windows.
                         continue
                     with self.subTest(
                         tie_break=tie_break,
@@ -936,6 +960,21 @@ class TestDSAIndexer(CustomTestCase):
                                 topk_transform_method=topk_transform_method,
                                 with_row_starts=with_row_starts,
                             )
+            with self.subTest(
+                tie_break=tie_break,
+                topk_transform_method=TopkTransformMethod.PAGED.name,
+                with_row_starts=False,
+                query_lens="multi",
+            ):
+                with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break):
+                    self._run_fused_topk_backend_equivalence_test(
+                        batch_size=batch_size,
+                        max_score_len=max_score_len,
+                        topk=topk,
+                        topk_transform_method=TopkTransformMethod.PAGED,
+                        with_row_starts=False,
+                        query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
+                    )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

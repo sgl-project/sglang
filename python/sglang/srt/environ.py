@@ -465,12 +465,8 @@ class Envs:
 
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
-    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_NSA_TOPK_FLASHINFER_DETERMINISTIC"
-    )
-    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvIntWithAlias(
-        0, deprecated_name="SGLANG_NSA_TOPK_FLASHINFER_TIE_BREAK"
-    )
+    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvInt(0)
     SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA"
     )

@@ -267,7 +267,6 @@ DSA_CHOICES = [
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
-NSA_TOPK_BACKEND_CHOICES = DSA_TOPK_BACKEND_CHOICES  # deprecated alias
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
@@ -5436,16 +5435,6 @@ class ServerArgs:
             choices=DSA_TOPK_BACKEND_CHOICES,
             help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. "
             "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-        )
-        parser.add_argument(
-            "--nsa-topk-backend",
-            dest="dsa_topk_backend",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-topk-backend",
-            default=argparse.SUPPRESS,
-            type=str,
-            choices=DSA_TOPK_BACKEND_CHOICES,
-            help="[Deprecated] Use --dsa-topk-backend instead.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
