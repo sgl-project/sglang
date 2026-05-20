@@ -341,6 +341,14 @@ fn default_poll_ms() -> u64 {
 ///    decode_selector  = "app=sglang,role=decode"
 ///    ```
 ///
+/// In PD mode, the selectors drive **slice-classification** (which
+/// EndpointSlices feed the prefill pool vs the decode pool). The actual
+/// `WorkerMode` and `bootstrap_port` for each worker are filled in by
+/// the worker manager from each worker's `/server_info` introspection,
+/// so PD works without any pod-level annotations — see
+/// [`crate::workers::introspect`] for the `disaggregation_mode` and
+/// `disaggregation_bootstrap_port` extraction.
+///
 /// `mode()` validates the combination and returns the resolved
 /// [`K8sDiscoveryMode`]; any other selector combination is rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,14 +392,6 @@ pub enum ConfigError {
     MixedModes,
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,
-    #[error(
-        "discovery.k8s: PD-disaggregation mode is not yet supported on K8s discovery. \
-         EndpointSlice does not carry the per-pod `sglang.ai/bootstrap-port` annotation, \
-         so workers are emitted with `bootstrap_port: None` and the engine rejects them \
-         at runtime. Use `discovery.static_file` for PD until pod-annotation plumbing \
-         lands."
-    )]
-    PdNotImplemented,
     #[error(
         "discovery.k8s: {selector}_selector `{value}` uses unsupported syntax — \
          only equality terms (`key=value` or `key==value`) joined by `,` are accepted. \
@@ -457,12 +457,29 @@ impl K8sDiscoveryConfig {
                     label_selector: label.to_string(),
                 })
             }
-            (None, Some(_), Some(_)) => {
-                // PD disaggregation is not yet wired through K8s discovery —
-                // bootstrap_port can't be populated from EndpointSlice. Reject
-                // before we get to per-selector validation, so the operator
-                // sees the actionable error first.
-                Err(ConfigError::PdNotImplemented)
+            (None, Some(prefill), Some(decode)) => {
+                // Both selectors validated individually so the operator
+                // sees which one is malformed. WorkerMode + bootstrap_port
+                // for each prefill pod are filled in by the worker
+                // manager from each worker's `/server_info` — these
+                // selectors only drive client-side classification per
+                // EndpointSlice (see `classify_mode` in discovery/k8s.rs).
+                if !is_equality_selector(prefill) {
+                    return Err(ConfigError::UnsupportedSelectorGrammar {
+                        selector: "prefill",
+                        value: prefill.to_string(),
+                    });
+                }
+                if !is_equality_selector(decode) {
+                    return Err(ConfigError::UnsupportedSelectorGrammar {
+                        selector: "decode",
+                        value: decode.to_string(),
+                    });
+                }
+                Ok(K8sDiscoveryMode::PdDisaggregation {
+                    prefill_selector: prefill.to_string(),
+                    decode_selector: decode.to_string(),
+                })
             }
             (None, None, None) => Err(ConfigError::NoSelector),
             (None, Some(_), None) | (None, None, Some(_)) => Err(ConfigError::PartialPdSelectors),
@@ -485,17 +502,51 @@ mod k8s_discovery_config_tests {
     }
 
     #[test]
-    fn mode_rejects_pd_until_pod_annotation_plumbing_lands() {
-        // K8s PD requires per-pod `sglang.ai/bootstrap-port` annotations, which
-        // EndpointSlice doesn't carry. The discovery path silently sets
-        // `bootstrap_port: None` and the chat handler forwards JSON `null` to
-        // the engine. Config validation must fail-fast instead.
-        let err = cfg(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
+    fn mode_constructs_pd_disaggregation_from_prefill_and_decode_selectors() {
+        // K8s PD now works without per-pod annotations: each worker's
+        // `/server_info` carries `disaggregation_bootstrap_port`, and the
+        // worker manager applies it post-discovery. The K8s config layer's
+        // job is just to validate the selector combination.
+        let m = cfg(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
+            .mode()
+            .expect("PD mode is now valid");
+        assert_eq!(
+            m,
+            K8sDiscoveryMode::PdDisaggregation {
+                prefill_selector: "app=sglang,role=p".to_string(),
+                decode_selector: "app=sglang,role=d".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mode_pd_rejects_set_based_prefill_selector() {
+        // Both PD selectors get the same equality-only grammar check as
+        // the plain label_selector. A set-based prefill selector would
+        // silently match zero pods at runtime → fail-fast at load.
+        let err = cfg(None, Some("app in (sglang, vllm)"), Some("app=sglang"))
             .mode()
             .unwrap_err();
         assert!(
-            matches!(err, ConfigError::PdNotImplemented),
-            "expected PdNotImplemented, got {err:?}"
+            matches!(
+                err,
+                ConfigError::UnsupportedSelectorGrammar { selector: "prefill", .. },
+            ),
+            "expected UnsupportedSelectorGrammar(prefill), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn mode_pd_rejects_set_based_decode_selector() {
+        let err = cfg(None, Some("app=sglang"), Some("app in (sglang, vllm)"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::UnsupportedSelectorGrammar { selector: "decode", .. },
+            ),
+            "expected UnsupportedSelectorGrammar(decode), got {err:?}",
         );
     }
 

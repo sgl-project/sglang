@@ -113,13 +113,15 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         for addr in &ep.addresses {
             let url = format!("http://{addr}:{port}");
             let id = WorkerId(format!("{ns}/{slice_name}/{addr}:{port}"));
-            // TODO: plumb bootstrap_port from the Pod annotation
-            // `sglang.ai/bootstrap-port` (matching SMG's
-            // `service_discovery.rs`). EndpointSlice doesn't carry pod
-            // annotations directly; this requires either a parallel
-            // Pod informer or shifting discovery to a Pod watcher.
-            // PD-disagg in K8s won't work until this lands; current
-            // acceptance tests exercise the static-file backend only.
+            // bootstrap_port stays `None` here on purpose. The final
+            // `WorkerMode` and the bootstrap port are both filled in by
+            // the worker manager from each worker's `/server_info`
+            // body (`disaggregation_mode` + `disaggregation_bootstrap_port`,
+            // both fields on SGLang's ServerArgs and already surfaced
+            // via `**asdict(server_args)` in the response). EndpointSlice
+            // carries neither, but doesn't need to — see
+            // `src/workers/introspect.rs` for the extraction and
+            // `register_one` in `src/workers/manager.rs` for the override.
             out.push(WorkerSpec {
                 id,
                 url,
