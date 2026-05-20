@@ -739,17 +739,6 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def get_registry() -> dict[str, EnvField]:
-    """Return all registered environment variable descriptors as a name -> EnvField map.
-
-    Test code uses this to assert declared types (e.g. canary perturb env vars must
-    be primitive ``EnvFloat`` / ``EnvInt`` / ``EnvBool``, not compound types).
-    """
-    return {
-        name: value for name, value in vars(Envs).items() if isinstance(value, EnvField)
-    }
-
-
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
         if new_name is None:
