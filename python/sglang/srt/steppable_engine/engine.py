@@ -4,11 +4,13 @@ import logging
 import pickle
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import zmq
 
-from sglang.srt.entrypoints.engine import Engine
+if TYPE_CHECKING:
+    from sglang.srt.entrypoints.engine import Engine
+
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.steppable_engine.messages import (
