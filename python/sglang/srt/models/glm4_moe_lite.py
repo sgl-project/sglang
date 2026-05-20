@@ -80,9 +80,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
 
-if _is_cuda:
-    from sgl_kernel import dsv3_router_gemm
-
 logger = logging.getLogger(__name__)
 
 
@@ -190,10 +187,17 @@ class Glm4MoeLiteGate(nn.Module):
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-
-            logits = dsv3_router_gemm(hidden_states, self.weight).to(
-                hidden_states.dtype
+            from sglang.jit_kernel.dsv3_router_gemm import (
+                can_use_dsv3_router_gemm,
+                dsv3_router_gemm,
             )
+
+            if can_use_dsv3_router_gemm(self.weight.shape[0], hidden_states.shape[1]):
+                logits = dsv3_router_gemm(hidden_states, self.weight).to(
+                    hidden_states.dtype
+                )
+            else:
+                logits = F.linear(hidden_states, self.weight, None)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
