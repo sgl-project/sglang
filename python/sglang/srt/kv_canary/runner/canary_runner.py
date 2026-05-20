@@ -18,6 +18,7 @@ from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
+from sglang.srt.kv_canary.runner.perturb_config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
@@ -133,7 +134,7 @@ class CanaryRunner:
             pump_and_allreduce=self._pump_and_allreduce,
         )
         self._perturb_hook = PerturbHook(
-            config=config,
+            config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
         )

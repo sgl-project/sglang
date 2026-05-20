@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
-from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
+from sglang.srt.kv_canary.runner.perturb_config import PerturbConfig
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -18,7 +18,7 @@ class PerturbHook:
     def __init__(
         self,
         *,
-        config: CanaryConfig,
+        config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
     ) -> None:
@@ -32,17 +32,14 @@ class PerturbHook:
         self._radix_cache = radix_cache
 
     def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        if self._config.perturb_req_to_token_prob <= 0.0:
+        if self._config.req_to_token_prob <= 0.0:
             return
         table = self._req_to_token_pool.req_to_token
         if not isinstance(table, torch.Tensor) or table.numel() == 0:
             return
         if forward_batch is None:
             return
-        if (
-            torch.rand((), device="cpu").item()
-            >= self._config.perturb_req_to_token_prob
-        ):
+        if torch.rand((), device="cpu").item() >= self._config.req_to_token_prob:
             return
 
         req_pool_indices = forward_batch.req_pool_indices
@@ -84,11 +81,11 @@ class PerturbHook:
         self._perturb_undo = (req_pool_idx, position, original)
 
     def perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        if self._config.perturb_real_kv_prob <= 0.0:
+        if self._config.real_kv_prob <= 0.0:
             return
         if forward_batch is None:
             return
-        if torch.rand((), device="cpu").item() >= self._config.perturb_real_kv_prob:
+        if torch.rand((), device="cpu").item() >= self._config.real_kv_prob:
             return
 
         candidate_slots = self._collect_real_kv_perturb_candidates(forward_batch)
@@ -144,7 +141,7 @@ class PerturbHook:
         orphan_slots = self._collect_radix_orphan_slots(excluded=excluded)
         if orphan_slots:
             return orphan_slots
-        if self._config.perturb_real_kv_require_orphan:
+        if self._config.real_kv_require_orphan:
             return []
         return self._collect_running_req_slots(
             forward_batch=forward_batch, excluded=excluded
