@@ -5,6 +5,7 @@ from typing import Literal, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,
@@ -247,27 +248,6 @@ def derive_plan_capacity(
     if kind == "under_by_one":
         return max(needed - 1, 1), max(bs + 4, 8)
     raise ValueError(f"unknown CapacityKind: {kind}")
-
-
-def splitmix64(value: int) -> int:
-    """Python splitmix64 finalizer used by hardcoded-expected cases (bit-equal CUDA + ref + cuh).
-
-    Hardcoded cases manually compute multi-step chains via this helper so a ref / kernel co-regression
-    cannot silently fix the diff comparison.
-    """
-    x = value & _U64_MASK
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
-    return (x ^ (x >> 31)) & _U64_MASK
-
-
-def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
-    """Chained 4-input splitmix64; byte-equal to the canonical helper in verify_ref/csrc canary_common.cuh."""
-    h = splitmix64(a & _U64_MASK)
-    h = splitmix64(h ^ (b & _U64_MASK))
-    h = splitmix64(h ^ (c & _U64_MASK))
-    h = splitmix64(h ^ (d & _U64_MASK))
-    return h
 
 
 def _allocate_plan_pair(
