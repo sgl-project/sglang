@@ -104,10 +104,11 @@ class TransferInfo:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
-            if len(msg) > 9 and msg[9] != b"":
-                dst_device_kv_indices = np.frombuffer(msg[9], dtype=np.int32)
-            else:
-                dst_device_kv_indices = None
+            dst_device_kv_indices = (
+                np.frombuffer(msg[9], dtype=np.int32)
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            )
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -142,7 +143,6 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    enable_hisparse: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -165,11 +165,8 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
-            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
         )
 
 
@@ -1367,12 +1364,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            if (
-                                target_rank_registration_info.enable_hisparse
-                                and getattr(
-                                    self.kv_args, "mla_compression_ratios", None
-                                )
-                            ):
+                            if req.dst_device_kv_indices is not None:
                                 ret = self._send_kvcache_hisparse_dsv4(
                                     req.mooncake_session_id,
                                     kv_chunk.prefill_kv_indices,
@@ -1931,7 +1923,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -1959,7 +1950,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
-                        enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]

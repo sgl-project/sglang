@@ -380,26 +380,25 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        if self.scheduler.enable_hisparse:
-            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                host_pool.get_contiguous_buf_infos()
-            )
-            if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-                # DSV4 HiSparse writes only C4 KV to host.  The c4_indexer and
-                # c128 KV remain device-to-device transfers and are appended
-                # after the host C4 entries in Mooncake's KV pointer table.
-                device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
-                    self.token_to_kv_pool.get_contiguous_buf_infos()
-                )
-                c4_layer_num = host_pool.layer_num
-                kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
-                kv_data_lens += device_kv_data_lens[c4_layer_num:]
-                kv_item_lens += device_kv_item_lens[c4_layer_num:]
-        else:
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+        transfer_kv_pool = (
+            self.scheduler.hisparse_coordinator.mem_pool_host
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool
+        )
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+        )
+        if self.scheduler.enable_hisparse and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            # DSV4 HiSparse writes C4 KV to host. c4_indexer/c128 stay on device.
+            device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+            c4_layer_num = transfer_kv_pool.layer_num
+            kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+            kv_data_lens += device_kv_data_lens[c4_layer_num:]
+            kv_item_lens += device_kv_item_lens[c4_layer_num:]
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -1007,29 +1006,23 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
-            is_fake_transfer = _is_fake_transfer(
+            metadata_kwargs = {}
+            if device_kv_page_indices is not None and not _is_fake_transfer(
                 decode_req.req, self.scheduler.server_args
-            )
-            if device_kv_page_indices is not None and not is_fake_transfer:
+            ):
                 if self.transfer_backend != TransferBackend.MOONCAKE:
                     raise NotImplementedError(
                         "DeepSeek V4 HiSparse PD direct-to-host currently "
                         "requires the Mooncake transfer backend."
                     )
-                decode_req.kv_receiver.send_metadata(
-                    page_indices,
-                    decode_req.metadata_buffer_index,
-                    state_indices,
-                    decode_prefix_len=prefix_len,
-                    device_kv_indices=device_kv_page_indices,
-                )
-            else:
-                decode_req.kv_receiver.send_metadata(
-                    page_indices,
-                    decode_req.metadata_buffer_index,
-                    state_indices,
-                    decode_prefix_len=prefix_len,
-                )
+                metadata_kwargs["device_kv_indices"] = device_kv_page_indices
+            decode_req.kv_receiver.send_metadata(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                decode_prefix_len=prefix_len,
+                **metadata_kwargs,
+            )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1306,19 +1299,12 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target. DeepSeek V4
-            # stores HiSparse host KV at c4-token granularity.
-            host_len = (
-                fill_len // coordinator.compress_ratio
-                if coordinator.is_dsv4_hisparse
-                else fill_len
-            )
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                host_len,
+                coordinator._host_token_len(fill_len),
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
