@@ -53,6 +53,8 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+from sglang.srt.layers.attention.dsv4.triton_flashmla import (
+    flash_mla_with_kvcache_triton,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -1150,9 +1152,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             elif _is_xpu:
-                from .flash_mla_with_kvcache_torch import flash_mla_with_kvcache_torch
-
-                o = flash_mla_with_kvcache_torch(
+                o = flash_mla_with_kvcache_triton(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
