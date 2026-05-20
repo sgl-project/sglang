@@ -18,6 +18,7 @@ from sglang.jit_kernel.kv_canary.write import (
     canary_write_step,
 )
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.state import (
     CanaryDeviceState,
     ViolationLog,
@@ -67,8 +68,7 @@ class CanaryEndpoint:
         fb_positions: torch.Tensor,
         fb_out_cache_loc: torch.Tensor,
         input_check_mode: CanaryInputCheckMode,
-        expected_input_tokens: torch.Tensor,
-        expected_input_positions: torch.Tensor,
+        expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
@@ -111,8 +111,8 @@ class CanaryEndpoint:
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             pseudo_mode=input_check_mode,
-            pseudo_expected_tokens=expected_input_tokens,
-            pseudo_expected_positions=expected_input_positions,
+            pseudo_expected_tokens=expected_inputs.tokens,
+            pseudo_expected_positions=expected_inputs.positions,
             violation_ring=violation_log.violation_ring,
             violation_write_index=violation_log.violation_write_index,
             slot_run_counter=self.slot_run_counter_view,

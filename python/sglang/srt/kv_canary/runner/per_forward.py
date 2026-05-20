@@ -10,6 +10,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.launch import (
@@ -71,11 +72,8 @@ class PerForwardOrchestrator:
         )
 
         write_entry_capacity = max(1, per_forward_write_entry_capacity)
-        self._expected_input_tokens = torch.zeros(
-            write_entry_capacity, dtype=torch.int32, device=device
-        )
-        self._expected_input_positions = torch.zeros(
-            write_entry_capacity, dtype=torch.int32, device=device
+        self._expected_inputs = ExpectedInputs.allocate(
+            capacity=write_entry_capacity, device=device
         )
 
         bs_capacity = max(1, per_forward_write_req_capacity)
@@ -108,8 +106,7 @@ class PerForwardOrchestrator:
                 )
             hook.fill_expected_inputs(
                 forward_batch=forward_batch,
-                expected_input_tokens_out=self._expected_input_tokens,
-                expected_input_positions_out=self._expected_input_positions,
+                expected_inputs_out=self._expected_inputs,
             )
 
         fill_plan_input_per_forward(
@@ -138,8 +135,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_input_tokens=self._expected_input_tokens,
-                expected_input_positions=self._expected_input_positions,
+                expected_inputs=self._expected_inputs,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,
@@ -158,8 +154,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_input_tokens=self._expected_input_tokens,
-                expected_input_positions=self._expected_input_positions,
+                expected_inputs=self._expected_inputs,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,

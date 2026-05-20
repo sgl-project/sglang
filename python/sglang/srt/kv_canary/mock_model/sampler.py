@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.mock_model.oracle import Oracle
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 
@@ -34,8 +35,7 @@ class OracleSamplerHook:
         self,
         *,
         forward_batch: "ForwardBatch",
-        expected_input_tokens_out: torch.Tensor,
-        expected_input_positions_out: torch.Tensor,
+        expected_inputs_out: ExpectedInputs,
     ) -> None:
         """Per-token compute expected (token, position) from oracle and write into placeholders.
 
@@ -81,15 +81,15 @@ class OracleSamplerHook:
         tokens_tensor = torch.tensor(
             expected_tokens,
             dtype=torch.int32,
-            device=expected_input_tokens_out.device,
+            device=expected_inputs_out.tokens.device,
         )
         positions_tensor = torch.tensor(
             expected_positions,
             dtype=torch.int32,
-            device=expected_input_positions_out.device,
+            device=expected_inputs_out.tokens.device,
         )
-        expected_input_tokens_out[:num_tokens].copy_(tokens_tensor)
-        expected_input_positions_out[:num_tokens].copy_(positions_tensor)
+        expected_inputs_out.tokens[:num_tokens].copy_(tokens_tensor)
+        expected_inputs_out.positions[:num_tokens].copy_(positions_tensor)
 
     def sample(self, *, logits: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Produce one token per row from the oracle, using the row -> req-id stash filled by
