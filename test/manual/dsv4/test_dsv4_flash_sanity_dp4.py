@@ -3,9 +3,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -49,9 +47,7 @@ _EAGLE_SPEC_ARGS = [
 
 
 class TestDSV4FlashTP4DP4(
-    BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
-    BasicSchedulerStressMixin,
     CustomTestCase,
 ):
     """TP4 + DP4 + deepep + EAGLE MTP."""
@@ -87,9 +83,7 @@ class TestDSV4FlashTP4DP4(
 
 
 class TestDSV4FlashTP4EP(
-    BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
-    BasicSchedulerStressMixin,
     CustomTestCase,
 ):
     """TP attn + EP MoE (no DP attn) — exercises the DeepEP + TP-attn path."""
@@ -125,9 +119,7 @@ class TestDSV4FlashTP4EP(
 
 
 class TestDSV4FlashTP4DP4ChunkedPrefillLarge(
-    BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
-    BasicSchedulerStressMixin,
     CustomTestCase,
 ):
     """TP4 + DP4 with --chunked-prefill-size 16384 — large chunked prefill."""

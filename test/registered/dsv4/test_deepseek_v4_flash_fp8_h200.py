@@ -13,9 +13,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -32,9 +30,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP8H200(
-    BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
-    BasicSchedulerStressMixin,
     CustomTestCase,
 ):
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""

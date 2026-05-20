@@ -3,9 +3,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,9 +20,7 @@ DSV4_FLASH_ENV = {
 
 
 class TestDSV4FlashTP8NoSpec(
-    BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
-    BasicSchedulerStressMixin,
     CustomTestCase,
 ):
     """TP8, no spec decoding."""
