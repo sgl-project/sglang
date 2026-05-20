@@ -1,4 +1,4 @@
-# mock_model — pseudo-mode + e2e tests
+# token_oracle — pseudo-mode + e2e tests
 
 Self-unit / self-e2e / e2e tests built on top of the mock-engine + oracle
 sampler-override harness (see `python/sglang/srt/kv_canary/pseudo_*`).

@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle
-from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
-from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenIdOracleManager
+from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs

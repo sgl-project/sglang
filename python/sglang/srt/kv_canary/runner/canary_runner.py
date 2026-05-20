@@ -14,7 +14,6 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
@@ -23,6 +22,7 @@ from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
 from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenIdOracleManager
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator

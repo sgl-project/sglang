@@ -669,7 +669,7 @@ class Envs:
     # Input-id / position verification inside canary_write_step. Only useful
     # when a mock_model oracle is feeding expected_input_* tensors per forward;
     # production users never set this. Test harnesses flip it on via
-    # ``mock_model_engine_kwargs`` (test/registered/mock_model/utils.py).
+    # ``mock_model_engine_kwargs`` (test/registered/token_oracle/utils.py).
     SGLANG_KV_CANARY_INPUT_CHECK = EnvBool(False)
     # KV cache canary perturbation. When >0, the canary install hooks corrupt
     # ``req_to_token_pool`` rows with this per-write probability so the canary

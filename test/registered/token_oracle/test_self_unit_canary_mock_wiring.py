@@ -11,8 +11,8 @@ import os
 import torch
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle
-from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
+from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 
 from .utils import mock_model_engine_kwargs

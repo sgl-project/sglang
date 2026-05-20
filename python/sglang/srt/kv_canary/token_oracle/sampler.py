@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.kv_canary.mock_model.oracle import TokenIdOracle
-from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
+from sglang.srt.kv_canary.token_oracle.oracle import TokenIdOracle
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenIdOracleManager
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 
 if TYPE_CHECKING:

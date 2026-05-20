@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle, TokenIdOracle
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle, TokenIdOracle
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")

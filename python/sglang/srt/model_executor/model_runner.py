@@ -106,7 +106,7 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
-from sglang.srt.kv_canary.mock_model.install import install_mock_model_sampler
+from sglang.srt.kv_canary.token_oracle.install import install_mock_model_sampler
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
