@@ -18,6 +18,7 @@ from sglang.jit_kernel.kv_canary.write import (
     canary_write_step,
 )
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.state import (
     CanaryDeviceState,
     ViolationLog,
@@ -67,8 +68,7 @@ class CanaryEndpoint:
         fb_positions: torch.Tensor,
         fb_out_cache_loc: torch.Tensor,
         input_check_mode: CanaryInputCheckMode,
-        expected_input_tokens: torch.Tensor,
-        expected_input_positions: torch.Tensor,
+        expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
@@ -111,8 +111,8 @@ class CanaryEndpoint:
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             pseudo_mode=input_check_mode,
-            pseudo_expected_tokens=expected_input_tokens,
-            pseudo_expected_positions=expected_input_positions,
+            pseudo_expected_tokens=expected_inputs.tokens,
+            pseudo_expected_positions=expected_inputs.positions,
             violation_ring=violation_log.violation_ring,
             violation_write_index=violation_log.violation_write_index,
             slot_run_counter=self.slot_run_counter_view,
@@ -183,6 +183,26 @@ def _resolve_real_kv_sources(
     return group.real_kv_sources_v
 
 
+_FULL_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
+    (CanaryLaunchTag.HEAD_K_FULL, "HEAD", "K"),
+    (CanaryLaunchTag.HEAD_V_FULL, "HEAD", "V"),
+    (CanaryLaunchTag.TAIL_K_FULL, "TAIL", "K"),
+    (CanaryLaunchTag.TAIL_V_FULL, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_FULL, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_FULL, "SWEEP", "V"),
+)
+
+
+_SWA_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
+    (CanaryLaunchTag.HEAD_K_SWA, "HEAD", "K"),
+    (CanaryLaunchTag.HEAD_V_SWA, "HEAD", "V"),
+    (CanaryLaunchTag.TAIL_K_SWA, "TAIL", "K"),
+    (CanaryLaunchTag.TAIL_V_SWA, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_SWA, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_SWA, "SWEEP", "V"),
+)
+
+
 def build_endpoints_from_group(
     *,
     group: CanaryBufferGroup,
@@ -203,14 +223,10 @@ def build_endpoints_from_group(
     groups and left None for FULL groups.
     """
     pool_kind = group.kind
-    expected_suffix = pool_kind.name
+    layout = _FULL_LAYOUT if pool_kind is PoolKind.FULL else _SWA_LAYOUT
 
     endpoints: list[CanaryEndpoint] = []
-    for tag in CanaryLaunchTag:
-        slot, half, suffix = tag.name.split("_")
-
-        if suffix != expected_suffix:
-            continue
+    for tag, slot, half in layout:
         if half == "V" and not group.has_v_half:
             continue
 

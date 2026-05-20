@@ -19,6 +19,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.state import (
     CanaryDeviceState,
     ViolationLog,
@@ -68,8 +69,7 @@ def _make_kernel_args(device):
         fb_positions=torch.zeros(1, dtype=torch.int32, device=device),
         fb_out_cache_loc=torch.zeros(1, dtype=torch.int32, device=device),
         input_check_mode=CanaryPseudoMode.OFF,
-        expected_input_tokens=torch.zeros(1, dtype=torch.int32, device=device),
-        expected_input_positions=torch.zeros(1, dtype=torch.int32, device=device),
+        expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
         real_kv_hash_mode=RealKvHashMode.OFF,
     )
 
@@ -94,8 +94,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 fb_positions=args.fb_positions,
                 fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
-                expected_input_tokens=args.expected_input_tokens,
-                expected_input_positions=args.expected_input_positions,
+                expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
@@ -124,8 +123,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 fb_positions=args.fb_positions,
                 fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
-                expected_input_tokens=args.expected_input_tokens,
-                expected_input_positions=args.expected_input_positions,
+                expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
@@ -218,8 +216,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 fb_positions=args.fb_positions,
                 fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
-                expected_input_tokens=args.expected_input_tokens,
-                expected_input_positions=args.expected_input_positions,
+                expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
@@ -230,8 +227,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 fb_positions=args.fb_positions,
                 fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
-                expected_input_tokens=args.expected_input_tokens,
-                expected_input_positions=args.expected_input_positions,
+                expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
@@ -278,8 +274,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 fb_positions=args.fb_positions,
                 fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
-                expected_input_tokens=args.expected_input_tokens,
-                expected_input_positions=args.expected_input_positions,
+                expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )

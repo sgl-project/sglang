@@ -7,7 +7,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.d2h_pipeline import CanaryD2HPipeline
+from sglang.srt.kv_canary.runner.d2h_slot import DelayedD2HReadSlot
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState, CanaryHostState
@@ -29,6 +29,7 @@ class HealthAndStats:
         active_tags: tuple[CanaryLaunchTag, ...],
         pump_and_allreduce: PumpAndAllreduce,
         sweep_orchestrator: SweepOrchestrator,
+        d2h_stream: Optional[torch.cuda.Stream],
     ) -> None:
         self._config = config
         self._device_state = device_state
@@ -36,10 +37,18 @@ class HealthAndStats:
         self._active_tags = active_tags
         self._pump_and_allreduce = pump_and_allreduce
         self._sweep_orchestrator = sweep_orchestrator
-        self._d2h: CanaryD2HPipeline = CanaryD2HPipeline(device=device)
-        self._previous_health_event: Optional[torch.cuda.Event] = None
-        self._previous_stats_write_index_event: Optional[torch.cuda.Event] = None
-        self._previous_stats_slot_sum_event: Optional[torch.cuda.Event] = None
+        self._health_slot: DelayedD2HReadSlot = DelayedD2HReadSlot(
+            host=host_state.kernel_run_counters_host,
+            stream=d2h_stream,
+        )
+        self._stats_slot_sum_slot: DelayedD2HReadSlot = DelayedD2HReadSlot(
+            host=host_state.slot_run_counters_sum_host,
+            stream=d2h_stream,
+        )
+        self._stats_write_index_slot: DelayedD2HReadSlot = DelayedD2HReadSlot(
+            host=host_state.violation_write_index_host,
+            stream=d2h_stream,
+        )
 
     def health_check_step(self) -> None:
         step_counter = self._pump_and_allreduce.step_counter
@@ -51,10 +60,9 @@ class HealthAndStats:
             return
 
         device_state = self._device_state
-        host_state = self._host_state
-        if self._previous_health_event is not None:
-            CanaryD2HPipeline.wait(self._previous_health_event)
-            counters = host_state.kernel_run_counters_host.tolist()
+        prev_counters = self._health_slot.pop()
+        if prev_counters is not None:
+            counters = prev_counters.tolist()
             zero_tags = [
                 tag for tag in self._active_tags if int(counters[tag.value]) == 0
             ]
@@ -65,10 +73,7 @@ class HealthAndStats:
                     f"at step={step_counter}; canary path is not executing"
                 )
 
-        self._previous_health_event = self._d2h.stage(
-            dst_host=host_state.kernel_run_counters_host,
-            src_device=device_state.kernel_run_counters,
-        )
+        self._health_slot.stage(src_device=device_state.kernel_run_counters)
 
     def print_periodic_stats(self) -> None:
         period = self._config.stats_print_every_n_steps
@@ -79,15 +84,11 @@ class HealthAndStats:
             return
 
         device_state = self._device_state
-        host_state = self._host_state
-        if (
-            self._previous_stats_slot_sum_event is not None
-            and self._previous_stats_write_index_event is not None
-        ):
-            CanaryD2HPipeline.wait(self._previous_stats_slot_sum_event)
-            CanaryD2HPipeline.wait(self._previous_stats_write_index_event)
-            protected = int(host_state.slot_run_counters_sum_host.item())
-            violations = int(host_state.violation_write_index_host.item())
+        prev_slot_sum = self._stats_slot_sum_slot.pop()
+        prev_write_index = self._stats_write_index_slot.pop()
+        if prev_slot_sum is not None and prev_write_index is not None:
+            protected = int(prev_slot_sum.item())
+            violations = int(prev_write_index.item())
             active = len(self._active_tags)
             logger.info(
                 "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
@@ -101,11 +102,7 @@ class HealthAndStats:
             )
 
         slot_sum_device = device_state.slot_run_counters.sum().view(1)
-        self._previous_stats_slot_sum_event = self._d2h.stage(
-            dst_host=host_state.slot_run_counters_sum_host,
-            src_device=slot_sum_device,
-        )
-        self._previous_stats_write_index_event = self._d2h.stage(
-            dst_host=host_state.violation_write_index_host,
+        self._stats_slot_sum_slot.stage(src_device=slot_sum_device)
+        self._stats_write_index_slot.stage(
             src_device=device_state.violation_log.violation_write_index,
         )

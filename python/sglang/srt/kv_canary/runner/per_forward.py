@@ -10,6 +10,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.launch import (
@@ -71,28 +72,15 @@ class PerForwardOrchestrator:
         )
 
         write_entry_capacity = max(1, per_forward_write_entry_capacity)
-        self._expected_input_tokens = torch.zeros(
-            write_entry_capacity, dtype=torch.int32, device=device
-        )
-        self._expected_input_positions = torch.zeros(
-            write_entry_capacity, dtype=torch.int32, device=device
+        self._expected_inputs = ExpectedInputs.allocate(
+            capacity=write_entry_capacity, device=device
         )
 
         bs_capacity = max(1, per_forward_write_req_capacity)
-        self._plan_input_per_forward = PlanInput(
-            fb_req_pool_indices=torch.zeros(
-                bs_capacity, dtype=torch.int64, device=device
-            ),
-            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
-            fb_extend_seq_lens=torch.zeros(
-                bs_capacity, dtype=torch.int32, device=device
-            ),
-            extra_verify_slot_indices=torch.zeros(0, dtype=torch.int32, device=device),
-            extra_verify_positions=torch.zeros(0, dtype=torch.int32, device=device),
-            extra_verify_prev_slot_indices=torch.zeros(
-                0, dtype=torch.int32, device=device
-            ),
-            extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
+        self._plan_input_per_forward = PlanInput.allocate(
+            bs_capacity=bs_capacity,
+            extra_verify_capacity=0,
+            device=device,
         )
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
@@ -118,8 +106,7 @@ class PerForwardOrchestrator:
                 )
             hook.fill_expected_inputs(
                 forward_batch=forward_batch,
-                expected_input_tokens_out=self._expected_input_tokens,
-                expected_input_positions_out=self._expected_input_positions,
+                expected_inputs_out=self._expected_inputs,
             )
 
         fill_plan_input_per_forward(
@@ -132,6 +119,8 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             invoke_plan(
                 plan_input=self._plan_input_per_forward,
@@ -148,8 +137,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_input_tokens=self._expected_input_tokens,
-                expected_input_positions=self._expected_input_positions,
+                expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,
@@ -160,6 +148,8 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -168,8 +158,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_input_tokens=self._expected_input_tokens,
-                expected_input_positions=self._expected_input_positions,
+                expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,

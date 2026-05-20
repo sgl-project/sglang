@@ -14,6 +14,7 @@ from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputChe
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.state import ViolationLog
 
@@ -56,8 +57,7 @@ def launch_endpoints_per_forward(
     verify_plan: VerifyPlan,
     write_plan: WritePlan,
     forward_batch: "ForwardBatch",
-    expected_input_tokens: torch.Tensor,
-    expected_input_positions: torch.Tensor,
+    expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: CanaryInputCheckMode,
@@ -76,8 +76,14 @@ def launch_endpoints_per_forward(
         input_ids = input_ids.to(torch.int32)
 
     num_tokens = int(positions.shape[0])
-    expected_tokens_slice = expected_input_tokens[:num_tokens]
-    expected_positions_slice = expected_input_positions[:num_tokens]
+    assert expected_inputs.tokens.shape[0] == num_tokens, (
+        f"kv-canary: expected_inputs.tokens shape {expected_inputs.tokens.shape[0]} "
+        f"!= num_tokens {num_tokens}; caller must slice before invoking"
+    )
+    assert expected_inputs.positions.shape[0] == num_tokens, (
+        f"kv-canary: expected_inputs.positions shape {expected_inputs.positions.shape[0]} "
+        f"!= num_tokens {num_tokens}; caller must slice before invoking"
+    )
 
     for endpoint in endpoints:
         if not _endpoint_belongs_to_group(endpoint, group):
@@ -93,8 +99,7 @@ def launch_endpoints_per_forward(
             fb_positions=positions,
             fb_out_cache_loc=out_cache_loc,
             input_check_mode=input_check_mode,
-            expected_input_tokens=expected_tokens_slice,
-            expected_input_positions=expected_positions_slice,
+            expected_inputs=expected_inputs,
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,
         )

@@ -9,6 +9,7 @@ import json
 
 import torch
 
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.mock_model.oracle import ScriptedOracle
 from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -46,17 +47,15 @@ def test_fill_expected_inputs_decode_one_token_per_req() -> None:
         forward_mode=_StubForwardMode(extend=False),
         extend_seq_lens=None,
     )
-    tokens_out = torch.zeros(8, dtype=torch.int32)
-    positions_out = torch.zeros(8, dtype=torch.int32)
+    expected_inputs = ExpectedInputs.allocate(capacity=8, device=torch.device("cpu"))
 
     hook.fill_expected_inputs(
         forward_batch=fb,
-        expected_input_tokens_out=tokens_out,
-        expected_input_positions_out=positions_out,
+        expected_inputs_out=expected_inputs,
     )
 
-    assert tokens_out[:2].tolist() == [111, 333]
-    assert positions_out[:2].tolist() == [10, 20]
+    assert expected_inputs.tokens[:2].tolist() == [111, 333]
+    assert expected_inputs.positions[:2].tolist() == [10, 20]
 
 
 def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
@@ -70,17 +69,15 @@ def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
         forward_mode=_StubForwardMode(extend=True),
         extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
     )
-    tokens_out = torch.zeros(8, dtype=torch.int32)
-    positions_out = torch.zeros(8, dtype=torch.int32)
+    expected_inputs = ExpectedInputs.allocate(capacity=8, device=torch.device("cpu"))
 
     hook.fill_expected_inputs(
         forward_batch=fb,
-        expected_input_tokens_out=tokens_out,
-        expected_input_positions_out=positions_out,
+        expected_inputs_out=expected_inputs,
     )
 
-    assert tokens_out[:4].tolist() == [11, 22, 33, 99]
-    assert positions_out[:4].tolist() == [0, 1, 2, 0]
+    assert expected_inputs.tokens[:4].tolist() == [11, 22, 33, 99]
+    assert expected_inputs.positions[:4].tolist() == [0, 1, 2, 0]
 
 
 def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None:
@@ -93,13 +90,11 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
         forward_mode=_StubForwardMode(extend=False),
         extend_seq_lens=None,
     )
-    tokens_out = torch.zeros(4, dtype=torch.int32)
-    positions_out = torch.zeros(4, dtype=torch.int32)
+    expected_inputs = ExpectedInputs.allocate(capacity=4, device=torch.device("cpu"))
 
     hook.fill_expected_inputs(
         forward_batch=fb,
-        expected_input_tokens_out=tokens_out,
-        expected_input_positions_out=positions_out,
+        expected_inputs_out=expected_inputs,
     )
 
     assert hook._req_pool_indices_per_row == [5, 7]
