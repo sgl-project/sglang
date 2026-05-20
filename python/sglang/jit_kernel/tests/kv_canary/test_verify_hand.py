@@ -26,7 +26,9 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_real_kv_source,
     make_real_kv_sources,
     make_verify_plan,
+    make_verify_plan_pair,
     make_write_plan,
+    make_write_plan_pair,
     read_slot_fields,
     splitmix64,
     splitmix64_mix4,
@@ -87,13 +89,7 @@ def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
         )
     sources_cuda = case.real_kv_sources
     sources_ref = clone_real_kv_sources(sources_cuda)
-    plan_cuda = make_verify_plan(
-        slot_indices=[1],
-        positions=[case.position],
-        prev_slot_indices=[-1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1],
         positions=[case.position],
         prev_slot_indices=[-1],
@@ -130,10 +126,7 @@ def test_chain_head_anchor() -> None:
         )
 
     # Step 2: a single-entry plan with prev_slot_idx = -1 should record no violation.
-    plan_cuda = make_verify_plan(
-        slot_indices=[5], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[5], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -169,13 +162,7 @@ def test_chain_link_byte_equal_5_step() -> None:
     )
     prev_slot_indices = [-1, 1, 2, 3, 4]
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=prev_slot_indices,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=prev_slot_indices,
@@ -233,13 +220,7 @@ def test_violation_token_mismatch() -> None:
         real_kv_hash=0,
     )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[3],
-        positions=[2],
-        prev_slot_indices=[2],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[3],
         positions=[2],
         prev_slot_indices=[2],
@@ -280,10 +261,7 @@ def test_violation_position_mismatch() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[7], positions=[5], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[7], positions=[5], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -321,10 +299,7 @@ def test_violation_position_diverges_from_plan() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[3], positions=[99], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[3], positions=[99], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -378,10 +353,7 @@ def test_violation_prev_hash_mismatch() -> None:
         real_kv_hash=0,
     )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[2], positions=[1], prev_slot_indices=[1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[2], positions=[1], prev_slot_indices=[1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -411,13 +383,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
 
     # Step: write a chain with real_kv_hash mixin, then mutate one byte in the source tensors so the next
     # verify reconstructs a hash that differs from the stored one.
-    write_plan_cuda = make_write_plan(
-        write_offsets=[0, 3],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    write_plan_ref = make_write_plan(
+    write_plan_cuda, write_plan_ref = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -453,13 +419,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
     sources_cuda[0].tensor[1, 0] ^= 0xFF
     sources_ref[0].tensor.copy_(sources_cuda[0].tensor)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1],
-        positions=[0],
-        prev_slot_indices=[-1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1],
         positions=[0],
         prev_slot_indices=[-1],
@@ -489,10 +449,7 @@ def test_real_kv_mode_off_yields_zero() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -561,13 +518,7 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     )
     ref_buf.copy_(cuda_buf)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 2, 3],
-        positions=[0, 1, 2],
-        prev_slot_indices=[-1, 1, 2],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 2, 3],
         positions=[0, 1, 2],
         prev_slot_indices=[-1, 1, 2],
@@ -637,13 +588,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     )
     ref_buf.copy_(cuda_buf)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 2],
-        positions=[0, 1],
-        prev_slot_indices=[-1, 1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 2],
         positions=[0, 1],
         prev_slot_indices=[-1, 1],
@@ -683,10 +628,7 @@ def test_real_kv_source_padding_below_4() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     anchor_signed = chain_anchor_signed()
@@ -787,13 +729,7 @@ def test_real_kv_source_holey_dim1() -> None:
     )
     ref_buf.copy_(cuda_buf)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 2],
-        positions=[0, 1],
-        prev_slot_indices=[-1, 1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 2],
         positions=[0, 1],
         prev_slot_indices=[-1, 1],
@@ -869,13 +805,7 @@ def test_page_size_gt_1_access_pattern() -> None:
     )
     ref_buf.copy_(cuda_buf)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 5],
-        positions=[0, 1],
-        prev_slot_indices=[-1, 1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 5],
         positions=[0, 1],
         prev_slot_indices=[-1, 1],
@@ -916,10 +846,7 @@ def test_swa_translated_slot_indices() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[2], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[2], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -943,10 +870,7 @@ def test_swa_translated_slot_indices() -> None:
 def test_kernel_run_counter_per_call() -> None:
     """``kernel_run_counter`` increments by 1 per call, even when ``verify_num_valid == 0``."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
-    plan_cuda = make_verify_plan(
-        slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -982,13 +906,7 @@ def test_slot_run_counter_per_entry() -> None:
         slot_indices=slot_indices,
     )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1, 1, 2, 3],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1, 1, 2, 3],
@@ -1028,13 +946,7 @@ def test_violation_ring_fill_once_first_row() -> None:
                 real_kv_hash=0,
             )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 2, 3],
-        positions=[99, 99, 99],
-        prev_slot_indices=[-1, -1, -1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 2, 3],
         positions=[99, 99, 99],
         prev_slot_indices=[-1, -1, -1],
@@ -1081,13 +993,7 @@ def test_violation_ring_overflow_counter_still_increments() -> None:
                 real_kv_hash=0,
             )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=[99] * n_violations,
-        prev_slot_indices=[-1] * n_violations,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=[99] * n_violations,
         prev_slot_indices=[-1] * n_violations,
@@ -1131,10 +1037,7 @@ def test_kernel_kind_stamped_into_row() -> None:
         )
 
     for tag in (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.SWEEP_V_SWA):
-        plan_cuda = make_verify_plan(
-            slot_indices=[1], positions=[99], prev_slot_indices=[-1], device=_DEVICE
-        )
-        plan_ref = make_verify_plan(
+        plan_cuda, plan_ref = make_verify_plan_pair(
             slot_indices=[1], positions=[99], prev_slot_indices=[-1], device=_DEVICE
         )
         cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -1158,10 +1061,7 @@ def test_kernel_kind_stamped_into_row() -> None:
 def test_empty_plan_no_op() -> None:
     """``verify_num_valid = 0`` → no ring write, no slot_run_counter bump, only kernel_run_counter += 1."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
-    plan_cuda = make_verify_plan(
-        slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -1215,13 +1115,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
             )
 
     # Step 3: verify the 5-step chain — no violation expected and the ref vs CUDA state byte-equal.
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1, 1, 2, 3, 4],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1, 1, 2, 3, 4],
@@ -1374,13 +1268,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
                     prev_hash=anchor_signed,
                     real_kv_hash=0,
                 )
-        prefill_plan_cuda = make_verify_plan(
-            slot_indices=prefill_slots,
-            positions=[99] * ring_capacity,
-            prev_slot_indices=[-1] * ring_capacity,
-            device=_DEVICE,
-        )
-        prefill_plan_ref = make_verify_plan(
+        prefill_plan_cuda, prefill_plan_ref = make_verify_plan_pair(
             slot_indices=prefill_slots,
             positions=[99] * ring_capacity,
             prev_slot_indices=[-1] * ring_capacity,
@@ -1401,13 +1289,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
         assert int(cuda_log.write_index[0].item()) == ring_capacity
 
     prev_slot_indices = [-1, 1, 2, 3, 4]
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=prev_slot_indices,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=prev_slot_indices,
@@ -1511,10 +1393,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
         )
 
     # Step 4: 1-entry verify plan; no violation because stored matches recomputed.
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -1539,10 +1418,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
     source_cuda.tensor[1, 0] ^= 0xFF
     source_ref.tensor.copy_(source_cuda.tensor)
 
-    plan_cuda2 = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref2 = make_verify_plan(
+    plan_cuda2, plan_ref2 = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log2 = FakeViolationLog.allocate(device=_DEVICE)
@@ -1616,10 +1492,7 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[5], positions=[99], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[5], positions=[99], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
@@ -1801,13 +1674,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
             )
         running = splitmix64_mix4(running, token, position, rkv)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1, 1, 2],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1, 1, 2],
@@ -1855,13 +1722,7 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
     sources_cuda[0].tensor[slot_idx, 0] ^= 1
     sources_ref = clone_real_kv_sources(sources_cuda)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[slot_idx],
-        positions=[0],
-        prev_slot_indices=[-1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[slot_idx],
         positions=[0],
         prev_slot_indices=[-1],
@@ -1939,13 +1800,7 @@ def test_paged_layout_page_size_16() -> None:
             )
         running = splitmix64_mix4(running, token, position, rkv)
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1, 15],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1, 15],
@@ -1975,14 +1830,7 @@ def test_violation_ring_atomic_with_many_violations() -> None:
     slot_indices = list(range(1, n + 1))
     positions = [0] * n
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1] * n,
-        capacity=n,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1] * n,
@@ -2023,13 +1871,7 @@ def test_chain_head_anchored_on_constant() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[slot_idx],
-        positions=[0],
-        prev_slot_indices=[-1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[slot_idx],
         positions=[0],
         prev_slot_indices=[-1],
@@ -2067,13 +1909,7 @@ def test_position_mismatch_sets_position_bit_only() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[slot_idx],
-        positions=[99],
-        prev_slot_indices=[-1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[slot_idx],
         positions=[99],
         prev_slot_indices=[-1],
@@ -2113,13 +1949,7 @@ def test_replay_does_not_double_count_run_counters() -> None:
         positions=positions,
         slot_indices=slot_indices,
     )
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1, 1, 2],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1, 1, 2],
@@ -2150,13 +1980,7 @@ def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     slot_indices = [1, 2, 3, 4]
     positions = [0, 1, 2, 3]
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=[-1] * 4,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=[-1] * 4,
@@ -2226,13 +2050,7 @@ def test_slot_run_counter_delta_equals_active_entries_across_random_plans() -> N
         positions = [random.randint(0, 99) for _ in range(n_entries)]
         prev_slot_indices = [-1] * n_entries
 
-        plan_cuda = make_verify_plan(
-            slot_indices=slot_indices,
-            positions=positions,
-            prev_slot_indices=prev_slot_indices,
-            device=_DEVICE,
-        )
-        plan_ref = make_verify_plan(
+        plan_cuda, plan_ref = make_verify_plan_pair(
             slot_indices=slot_indices,
             positions=positions,
             prev_slot_indices=prev_slot_indices,
@@ -2270,10 +2088,7 @@ def test_kernel_run_counter_per_call_invariant_50_calls() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -2309,16 +2124,10 @@ def test_empty_plan_keeps_slot_counter_unchanged() -> None:
             real_kv_hash=0,
         )
 
-    nonempty_plan_cuda = make_verify_plan(
+    nonempty_plan_cuda, nonempty_plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    nonempty_plan_ref = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    empty_plan_cuda = make_verify_plan(
-        slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
-    )
-    empty_plan_ref = make_verify_plan(
+    empty_plan_cuda, empty_plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -2379,13 +2188,7 @@ def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50() -> None:
                 real_kv_hash=0,
             )
 
-        plan_cuda = make_verify_plan(
-            slot_indices=[slot_idx],
-            positions=[position],
-            prev_slot_indices=[-1],
-            device=_DEVICE,
-        )
-        plan_ref = make_verify_plan(
+        plan_cuda, plan_ref = make_verify_plan_pair(
             slot_indices=[slot_idx],
             positions=[position],
             prev_slot_indices=[-1],
@@ -2435,10 +2238,7 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
         fill=0xDE,
     )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -2476,13 +2276,7 @@ def test_clear_resets_ring_and_write_index_zero() -> None:
                 real_kv_hash=0,
             )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[1, 2, 3],
-        positions=[0, 0, 0],
-        prev_slot_indices=[-1, -1, -1],
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1, 2, 3],
         positions=[0, 0, 0],
         prev_slot_indices=[-1, -1, -1],

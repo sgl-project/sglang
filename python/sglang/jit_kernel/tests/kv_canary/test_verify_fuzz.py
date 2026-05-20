@@ -15,7 +15,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
-    make_verify_plan,
+    make_verify_plan_pair,
     stamp_clean_chain,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_verify
@@ -104,14 +104,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
             positions=positions,
         )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions,
-        prev_slot_indices=prev_slot_indices,
-        capacity=max(plan_size, 1),
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=prev_slot_indices,

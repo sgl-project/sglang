@@ -29,7 +29,9 @@ __all__ = [
     "make_real_kv_source",
     "make_real_kv_sources",
     "make_verify_plan",
+    "make_verify_plan_pair",
     "make_write_plan",
+    "make_write_plan_pair",
     "read_slot_fields",
     "splitmix64",
     "splitmix64_mix4",
@@ -135,6 +137,32 @@ def make_verify_plan(
     return plan
 
 
+def make_verify_plan_pair(
+    *,
+    slot_indices: list[int],
+    positions: list[int],
+    prev_slot_indices: list[int],
+    capacity: Optional[int] = None,
+    device: torch.device,
+) -> tuple[VerifyPlan, VerifyPlan]:
+    return (
+        make_verify_plan(
+            slot_indices=slot_indices,
+            positions=positions,
+            prev_slot_indices=prev_slot_indices,
+            capacity=capacity,
+            device=device,
+        ),
+        make_verify_plan(
+            slot_indices=slot_indices,
+            positions=positions,
+            prev_slot_indices=prev_slot_indices,
+            capacity=capacity,
+            device=device,
+        ),
+    )
+
+
 def make_write_plan(
     *,
     write_offsets: list[int],
@@ -163,6 +191,32 @@ def make_write_plan(
     )
     plan.write_num_valid_reqs[0] = num_valid_reqs
     return plan
+
+
+def make_write_plan_pair(
+    *,
+    write_offsets: list[int],
+    seed_slot_indices: list[int],
+    num_valid_reqs: int,
+    req_capacity: Optional[int] = None,
+    device: torch.device,
+) -> tuple[WritePlan, WritePlan]:
+    return (
+        make_write_plan(
+            write_offsets=write_offsets,
+            seed_slot_indices=seed_slot_indices,
+            num_valid_reqs=num_valid_reqs,
+            req_capacity=req_capacity,
+            device=device,
+        ),
+        make_write_plan(
+            write_offsets=write_offsets,
+            seed_slot_indices=seed_slot_indices,
+            num_valid_reqs=num_valid_reqs,
+            req_capacity=req_capacity,
+            device=device,
+        ),
+    )
 
 
 def to_signed_int64(value: int) -> int:

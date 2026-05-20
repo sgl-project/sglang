@@ -15,7 +15,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
-    make_write_plan,
+    make_write_plan_pair,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
@@ -116,13 +116,7 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
             else:
                 out_cache_loc_list.append(slot_pool.pop())
 
-    plan_cuda = make_write_plan(
-        write_offsets=write_offsets,
-        seed_slot_indices=seed_slot_indices,
-        num_valid_reqs=n_reqs,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=write_offsets,
         seed_slot_indices=seed_slot_indices,
         num_valid_reqs=n_reqs,

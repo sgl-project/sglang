@@ -18,7 +18,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_canary_buf_pair,
     make_log_pair,
     make_verify_plan,
-    make_write_plan,
+    make_verify_plan_pair,
+    make_write_plan_pair,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _assert_plans_byte_equal,
@@ -47,14 +48,7 @@ def _build_verify_plan_5_entries(
         num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
     )
 
-    plan_cuda = make_verify_plan(
-        slot_indices=[0, 1, 2, 3, 4],
-        positions=[0, 1, 2, 3, 4],
-        prev_slot_indices=[-1, 0, 1, 2, 3],
-        capacity=8,
-        device=device,
-    )
-    plan_ref = make_verify_plan(
+    plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[0, 1, 2, 3, 4],
         positions=[0, 1, 2, 3, 4],
         prev_slot_indices=[-1, 0, 1, 2, 3],
@@ -68,14 +62,7 @@ def _build_write_fixtures(
     *, device: torch.device
 ) -> tuple[WritePlan, WritePlan, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = 5
-    plan_cuda = make_write_plan(
-        write_offsets=[0, num_tokens],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        req_capacity=4,
-        device=device,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, num_tokens],
         seed_slot_indices=[-1],
         num_valid_reqs=1,

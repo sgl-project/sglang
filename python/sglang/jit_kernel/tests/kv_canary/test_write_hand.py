@@ -22,6 +22,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_real_kv_source,
     make_real_kv_sources,
     make_write_plan,
+    make_write_plan_pair,
     read_slot_fields,
     splitmix64,
     splitmix64_mix4,
@@ -62,10 +63,7 @@ class _WriteSingleSlotInput:
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([case.token], dtype=torch.int32, device=_DEVICE)
@@ -98,10 +96,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
 def test_seed_slot_idx_negative_uses_anchor() -> None:
     """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(consts.CANARY_CHAIN_ANCHOR)``."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
@@ -154,10 +149,7 @@ def test_seed_slot_idx_loads_predecessor() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[7], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[7], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([999], dtype=torch.int32, device=_DEVICE)
@@ -209,10 +201,7 @@ def test_seed_slot_chain_link_continuous() -> None:
             real_kv_hash=0,
         )
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[7], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[7], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([222], dtype=torch.int32, device=_DEVICE)
@@ -267,10 +256,7 @@ def test_seed_slot_chain_link_continuous() -> None:
 def test_chain_link_byte_equal_5_step() -> None:
     """5-step chain, buf / ring / counters byte-equal against ref."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 5], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 5], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32, device=_DEVICE)
@@ -302,10 +288,7 @@ def test_chain_link_byte_equal_5_step() -> None:
 def test_mock_mode_off_ignores_expected() -> None:
     """``enable_write_verify_inputs = OFF`` → expected tensors are ignored (we pass garbage to prove the kernel skips them)."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
@@ -341,10 +324,7 @@ def test_mock_mode_off_ignores_expected() -> None:
 def test_mock_mode_on_match_no_violation() -> None:
     """``enable_write_verify_inputs = ON`` and expected matches actual → no violation, chain advances."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([7, 8, 9], dtype=torch.int32, device=_DEVICE)
@@ -379,10 +359,7 @@ def test_mock_mode_on_match_no_violation() -> None:
 def test_mock_mode_on_token_mismatch_records_violation() -> None:
     """``enable_write_verify_inputs = ON`` token mismatch → violation recorded; chain advances on ACTUAL token."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
@@ -421,10 +398,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
 def test_mock_mode_on_position_mismatch_records_violation() -> None:
     """``enable_write_verify_inputs = ON`` position mismatch → violation recorded; chain advances on ACTUAL position."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
@@ -462,10 +436,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
 def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     """Expected differs from actual on every entry → downstream verify must NOT cascade chain errors."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([10, 20, 30], dtype=torch.int32, device=_DEVICE)
@@ -530,10 +501,7 @@ def test_negative_slot_skips_entry() -> None:
     """
     cuda_buf, ref_buf = _setup_pair()
     # Two entries: first writes to slot 4 normally; second has slot=-1 and must be skipped.
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([42, 99], dtype=torch.int32, device=_DEVICE)
@@ -573,10 +541,7 @@ def test_pre_translated_slot_writes_normally() -> None:
     host-side gather, so the contract is symmetric across FULL / SWA groups.
     """
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([55], dtype=torch.int32, device=_DEVICE)
@@ -615,10 +580,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
     cuda_buf, ref_buf = _setup_pair()
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
@@ -657,10 +619,7 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([10, 20, 30], dtype=torch.int32, device=_DEVICE)
@@ -704,10 +663,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
@@ -774,10 +730,7 @@ def test_real_kv_source_above_4_raises() -> None:
 def test_kernel_run_counter_per_call() -> None:
     """``kernel_run_counter`` increments by 1 per call (even when ``write_num_valid_reqs == 0``)."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 0], seed_slot_indices=[-1], num_valid_reqs=0, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 0], seed_slot_indices=[-1], num_valid_reqs=0, device=_DEVICE
     )
     fb_input_ids = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
@@ -814,13 +767,7 @@ def test_kernel_run_counter_per_call() -> None:
 def test_slot_run_counter_sums_entries() -> None:
     """``slot_run_counter`` += sum(entry_count) across all active reqs in this call."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 2, 5],
-        seed_slot_indices=[-1, -1],
-        num_valid_reqs=2,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 2, 5],
         seed_slot_indices=[-1, -1],
         num_valid_reqs=2,
@@ -857,14 +804,7 @@ def test_slot_run_counter_sums_entries() -> None:
 def test_empty_plan_no_op() -> None:
     """``write_num_valid_reqs = 0`` → no buf write, no slot_run_counter bump, only kernel_run_counter += 1."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 0],
-        seed_slot_indices=[-1],
-        num_valid_reqs=0,
-        req_capacity=4,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 0],
         seed_slot_indices=[-1],
         num_valid_reqs=0,
@@ -905,14 +845,7 @@ def test_padding_block_skipped() -> None:
     """``blockIdx.x >= write_num_valid_reqs[0]`` → block early-exits, no write to canary_buf."""
     cuda_buf, ref_buf = _setup_pair()
     # Allocate plan with req_capacity=4 but only declare 1 active req.
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        req_capacity=4,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -957,10 +890,7 @@ def test_padding_block_skipped() -> None:
 def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     """5-step write chain with hand-computed splitmix64 expected fields per slot."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 5], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 5], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     tokens = [101, 202, 303, 404, 505]
@@ -1034,13 +964,7 @@ def test_mock_violation_bit_injection_position_matrix(
     }[bit_to_trigger]
 
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, slot_count],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, slot_count],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1147,10 +1071,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     )
 
     # Step 3: run write kernel on slot 0 with the given mode.
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
@@ -1217,10 +1138,7 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
         expected_prev_hashes.append(running)
         running = splitmix64_mix4(running, t, p, r)
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 5], seed_slot_indices=[42], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 5], seed_slot_indices=[42], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor(tokens, dtype=torch.int32, device=_DEVICE)
@@ -1283,13 +1201,7 @@ def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
 def test_pseudo_mode_on_catches_token_mismatch() -> None:
     """enable_write_verify_inputs=ON + intentional token mismatch → WRITE_TOKEN_MISMATCH bit recorded."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 5],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 5],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1345,13 +1257,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
     tokens = [11, 22, 33, 44, 55]
     positions = [0, 1, 2, 3, 4]
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 5],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 5],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1400,13 +1306,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
 def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
     """fb_out_cache_loc[i] = -1 → that entry's slot is untouched by write kernel."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1474,13 +1374,7 @@ def test_seed_continues_existing_chain() -> None:
         & ((1 << 64) - 1)
     )
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1],
-        seed_slot_indices=[seed_slot],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[seed_slot],
         num_valid_reqs=1,
@@ -1530,13 +1424,7 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
     )
     sources_ref = clone_real_kv_sources(sources_cuda)
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 2],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 2],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1624,13 +1512,7 @@ def test_multi_source_real_kv_fold_order_matters() -> None:
 def test_pseudo_mode_off_skips_token_check() -> None:
     """enable_write_verify_inputs=False + intentional mismatch in expected_input_* → no violation recorded."""
     cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 3],
-        seed_slot_indices=[-1],
-        num_valid_reqs=1,
-        device=_DEVICE,
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
         num_valid_reqs=1,
@@ -1672,13 +1554,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
     big_offsets = [0, 1, 2, 3, 4, 5, 6, 7, 8]
     big_seeds = [-1] * 8
     big_slots = list(range(1, 9))
-    plan_cuda_big = make_write_plan(
-        write_offsets=big_offsets,
-        seed_slot_indices=big_seeds,
-        num_valid_reqs=8,
-        device=_DEVICE,
-    )
-    plan_ref_big = make_write_plan(
+    plan_cuda_big, plan_ref_big = make_write_plan_pair(
         write_offsets=big_offsets,
         seed_slot_indices=big_seeds,
         num_valid_reqs=8,
@@ -1716,13 +1592,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
     small_offsets = [0, 1, 2, 3]
     small_seeds = [-1, -1, -1]
     small_slots = [20, 21, 22]
-    plan_cuda_small = make_write_plan(
-        write_offsets=small_offsets,
-        seed_slot_indices=small_seeds,
-        num_valid_reqs=3,
-        device=_DEVICE,
-    )
-    plan_ref_small = make_write_plan(
+    plan_cuda_small, plan_ref_small = make_write_plan_pair(
         write_offsets=small_offsets,
         seed_slot_indices=small_seeds,
         num_valid_reqs=3,
@@ -1766,10 +1636,7 @@ def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
     cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
     ref_buf = cuda_buf.clone()
 
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
+    plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
     fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
