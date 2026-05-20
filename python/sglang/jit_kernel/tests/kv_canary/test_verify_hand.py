@@ -1716,8 +1716,8 @@ def test_chain_advance_formula_matches_spec() -> None:
     """Ref impl agrees with the chained splitmix64 chain-step formula.
 
     The chain step folds each of the 4 inputs into the accumulator sequentially via
-    ``acc = splitmix64(acc ^ next)``, starting from ``splitmix64(prev_hash)``. The vec helper must produce
-    the same result as the explicit chain.
+    ``acc = splitmix64(acc ^ next)``, starting from ``splitmix64(prev_hash)``. ``splitmix64_mix4``
+    must produce the same result as the explicit chain.
     """
     cases = [
         (consts.CANARY_CHAIN_ANCHOR, 0, 0, 0),
