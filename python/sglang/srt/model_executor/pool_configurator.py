@@ -84,7 +84,7 @@ class MemoryPoolConfigurator:
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
-    """Configurator for standard models: MHA, MLA, NSA, FP4.
+    """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
     bias = 0
@@ -149,7 +149,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
-            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+            # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (

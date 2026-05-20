@@ -707,7 +707,7 @@ class DeepseekMLAForwardMixin:
 
     def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
-        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
+        Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
         server_args = get_global_server_args()
         return (

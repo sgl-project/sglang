@@ -1078,7 +1078,7 @@ class Indexer(MultiPlatformOp):
         act_quant=None,  # fallback only
     ) -> None:
         """
-        Store NSA indexer K cache for current step.
+        Store DSA indexer K cache for current step.
 
         Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
@@ -1190,7 +1190,7 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # skip NSA if attention backend choose to skip this batch
+        # skip DSA if attention backend choose to skip this batch
         if metadata is None:
             return None
 

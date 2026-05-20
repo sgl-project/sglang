@@ -143,12 +143,12 @@ class ModelRunnerKVCacheMixin:
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+        # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
         if not is_nsa_model:
             return kv_cache_dim
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
-        # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
+        # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
@@ -216,7 +216,7 @@ class ModelRunnerKVCacheMixin:
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_nsa_model:
-            unsupported_pool_family = "NSA/MLA KV pool"
+            unsupported_pool_family = "DSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
         elif self.is_hybrid_swa:

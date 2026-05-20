@@ -1582,7 +1582,7 @@ class DeepseekV2AttentionMLA(
 
     def op_core(self, state):
         result = self.forward_core(state.pop("attn_intermediate_state"))
-        # forward_core may return (hidden_states, topk_indices) for NSA models
+        # forward_core may return (hidden_states, topk_indices) for DSA models
         # with index cache enabled. In the TBO path, topk_indices is not
         # propagated between layers, so we discard it here.
         if isinstance(result, tuple):

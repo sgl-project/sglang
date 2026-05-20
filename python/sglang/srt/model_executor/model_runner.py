@@ -3062,7 +3062,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
         # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
 

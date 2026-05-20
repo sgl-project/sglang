@@ -505,9 +505,9 @@ def prepare_context_parallel_metadata(
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
     # Prefix offset is critical when radix cache hits (prefix_len > 0).
-    # For non-NSA CP (e.g. qwen3-moe), consumers use these values directly as
+    # For non-DSA CP (e.g. qwen3-moe), consumers use these values directly as
     # FlashAttention cache_seqlens, so the prefix must be baked in here.
-    # For NSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
+    # For DSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
     # from (seq_lens_cpu - extend_seq_lens_cpu); baking prefix_len in here
     # would silently drop it whenever the scheduler packs multiple requests
     # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back

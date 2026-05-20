@@ -43,7 +43,7 @@ def forward_mha_prepare_npu(
             )
         )
 
-        # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+        # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
         if m.use_dsa:
             q_lora = m.q_a_layernorm(q)

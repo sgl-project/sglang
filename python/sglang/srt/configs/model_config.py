@@ -139,7 +139,7 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
-    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    DSA models (V3.2) instantiate an Indexer on every transformer layer.
     With index_topk_freq > 1 some layers reuse prev layer's topk; those still
     get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
     layers whose compress_ratio == 4. Other architectures: set

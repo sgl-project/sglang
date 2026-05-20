@@ -390,7 +390,7 @@ class MQALayer(nn.Module):
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
-        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
+        Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
         if qkv_a is not None:
@@ -416,7 +416,7 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
+        """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
@@ -511,7 +511,7 @@ class MQALayer(nn.Module):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
             # write to the FlashMLA cache after gather.
             kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
             kv = cp_all_gather_rerange_output(
@@ -591,7 +591,7 @@ class MQALayer(nn.Module):
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
+        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
         o = attn_backend.forward(

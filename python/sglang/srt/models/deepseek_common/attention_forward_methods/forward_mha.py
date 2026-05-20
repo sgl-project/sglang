@@ -122,10 +122,10 @@ class DeepseekMHAForwardMixin:
                 )
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
             if self.use_dsa:
-                # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
+                # DSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
@@ -237,7 +237,7 @@ class DeepseekMHAForwardMixin:
                     or not get_global_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
+                # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
@@ -476,7 +476,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+        Dequantize FP8 KV cache to BF16 for MLA attention (DSA-specific format).
 
         Returns: (kv_a, k_pe) both in BF16
         """

@@ -26,7 +26,7 @@ def apply_hisparse_dsa_backend_defaults(
     user_set_decode: bool,
     kv_cache_dtype: str,
 ) -> bool:
-    """Pick NSA backends for --enable-hisparse based on KV dtype.
+    """Pick DSA backends for --enable-hisparse based on KV dtype.
 
     BF16 KV -> flashmla_sparse, FP8 KV -> flashmla_kv. Returns True if hisparse
     handled backend selection (caller should skip its own default logic).
@@ -47,7 +47,7 @@ def apply_hisparse_dsa_backend_defaults(
 
 
 def validate_hisparse(server_args: "ServerArgs") -> None:
-    """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
+    """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
     if not server_args.enable_hisparse:
         return
 
