@@ -433,6 +433,13 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
+        # Populate kv_cache_dtype / is_swa (this ctor bypasses init_new).
+        ForwardBatch.populate_pool_fields_static(
+            forward_batch,
+            self.model_runner.token_to_kv_pool,
+            self.model_runner.is_hybrid_swa,
+        )
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -606,6 +613,13 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
+        # Populate kv_cache_dtype / is_swa (this ctor bypasses init_new).
+        ForwardBatch.populate_pool_fields_static(
+            forward_batch,
+            self.model_runner.token_to_kv_pool,
+            self.model_runner.is_hybrid_swa,
+        )
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)

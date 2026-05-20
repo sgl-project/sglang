@@ -1060,9 +1060,9 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
-        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
-        # as a fallback when pool.swa_loc is not pre-populated.
+        # For SWA layers, use forward_batch.out_cache_loc_swa (already narrowed
+        # by radix_attention when in piecewise path). Fall back to translating
+        # out_cache_loc via the full→SWA index mapping if not available.
         extend_kv_indices = forward_batch.out_cache_loc
         pool = forward_batch.token_to_kv_pool
         if (
@@ -1071,9 +1071,9 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            if pool.swa_loc is not None:
-                extend_kv_indices = pool.swa_loc
-            else:
+            if forward_batch.out_cache_loc_swa is not None:
+                extend_kv_indices = forward_batch.out_cache_loc_swa
+            elif pool.full_to_swa_index_mapping is not None:
                 extend_kv_indices = pool.translate_loc_from_full_to_swa(
                     extend_kv_indices
                 )

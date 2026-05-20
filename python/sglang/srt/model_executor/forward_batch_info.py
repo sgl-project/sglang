@@ -665,12 +665,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         # Populate pool-derived fields so forward-time code reads from ForwardBatch
-        pool = model_runner.token_to_kv_pool
-        ret.kv_cache_dtype = getattr(pool, "dtype", None)
-        if model_runner.is_hybrid_swa:
-            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
-            ret.is_swa = isinstance(pool, SWAKVPool)
+        ForwardBatch.populate_pool_fields_static(
+            ret, model_runner.token_to_kv_pool, model_runner.is_hybrid_swa
+        )
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -682,6 +679,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    @staticmethod
+    def populate_pool_fields_static(
+        forward_batch: "ForwardBatch", token_to_kv_pool, is_hybrid_swa: bool
+    ) -> None:
+        """Populate kv_cache_dtype / is_swa from the KV pool.
+
+        Called from init_new and from graph-runner capture paths (which construct
+        ForwardBatch directly, bypassing init_new).
+        """
+        forward_batch.kv_cache_dtype = getattr(token_to_kv_pool, "dtype", None)
+        if is_hybrid_swa:
+            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+            forward_batch.is_swa = isinstance(token_to_kv_pool, SWAKVPool)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
