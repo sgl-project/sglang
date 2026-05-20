@@ -20,6 +20,10 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _dummy_pseudo_tensors,
     clone_real_kv_sources,
 )
+from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+    _hand_fold_all,
+    _hand_fold_partial,
+)
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -1193,56 +1197,11 @@ def test_chain_link_byte_equal_100_step_hardcoded() -> None:
         ), f"slot {i}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
 
 
-def _hand_fold_partial_write(raw_bytes: bytes) -> int:
-    """PARTIAL-mode fold: first min(16, len) bytes, little-endian word-pack + splitmix64, same as ALL."""
-    _u64 = (1 << 64) - 1
-
-    def _sm64(v: int) -> int:
-        v = v & _u64
-        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
-        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
-        return (v ^ (v >> 31)) & _u64
-
-    truncated = raw_bytes[: min(16, len(raw_bytes))]
-    pad = (8 - len(truncated) % 8) % 8
-    padded = bytes(truncated) + bytes(pad)
-    num_words = len(padded) // 8
-    acc = 0
-    for w in range(num_words):
-        chunk = padded[w * 8 : (w + 1) * 8]
-        word = sum(b << (8 * k) for k, b in enumerate(chunk))
-        acc = _sm64(acc ^ word)
-    source_hash = acc
-    return _sm64(0 ^ source_hash)
-
-
-def _hand_fold_all_write(raw_bytes: bytes) -> int:
-    """ALL-mode fold: pack bytes little-endian into 8-byte words, fold each via splitmix64, then mix into acc=0."""
-    _u64 = (1 << 64) - 1
-
-    def _sm64(v: int) -> int:
-        v = v & _u64
-        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
-        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
-        return (v ^ (v >> 31)) & _u64
-
-    pad = (8 - len(raw_bytes) % 8) % 8
-    padded = raw_bytes + bytes(pad)
-    num_words = len(padded) // 8
-    acc = 0
-    for w in range(num_words):
-        chunk = padded[w * 8 : (w + 1) * 8]
-        word = sum(b << (8 * k) for k, b in enumerate(chunk))
-        acc = _sm64(acc ^ word)
-    source_hash = acc
-    return _sm64(0 ^ source_hash)
-
-
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial_write, 0x6041580849E6407D),
-        (consts.RealKvHashMode.ALL, _hand_fold_all_write, 0x6041580849E6407D),
+        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial, 0x6041580849E6407D),
+        (consts.RealKvHashMode.ALL, _hand_fold_all, 0x6041580849E6407D),
     ],
     ids=["partial", "all"],
 )

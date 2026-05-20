@@ -47,3 +47,25 @@ class RealKvHashMode(IntEnum):
 class CanaryPseudoMode(IntEnum):
     OFF = 0
     ON = 1
+
+
+_U64_MASK: int = (1 << 64) - 1
+
+
+def splitmix64(value: int) -> int:
+    x = value & _U64_MASK
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+    return (x ^ (x >> 31)) & _U64_MASK
+
+
+def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
+    """Chained 4-input splitmix64. Folds each input into a running accumulator via
+    ``acc = splitmix64(acc ^ next)``; order-sensitive, no XOR self-cancellation between equal inputs.
+    Must stay byte-equal to ``splitmix64_mix4`` in csrc/kv_canary/canary_common.cuh.
+    """
+    h = splitmix64(a & _U64_MASK)
+    h = splitmix64(h ^ (b & _U64_MASK))
+    h = splitmix64(h ^ (c & _U64_MASK))
+    h = splitmix64(h ^ (d & _U64_MASK))
+    return h

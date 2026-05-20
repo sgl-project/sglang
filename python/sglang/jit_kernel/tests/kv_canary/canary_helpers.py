@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     VerifyPlan,
@@ -14,8 +15,6 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
-    splitmix64,
-    splitmix64_mix4,
 )
 
 __all__ = [
