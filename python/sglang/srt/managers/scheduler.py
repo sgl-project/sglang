@@ -510,6 +510,7 @@ class Scheduler(
         # steppable_engine stepping mode (see SOT §3.3)
         self._stepping_mode: bool = False
         self._stepping_queue: List[Any] = []
+        self._armed_perturbation = None
         from sglang.srt.steppable_engine.handlers import install_steppable_handlers
 
         install_steppable_handlers(self)

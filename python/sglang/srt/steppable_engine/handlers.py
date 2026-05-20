@@ -242,4 +242,6 @@ def _handle_canary_overhead_pct(
 
 
 def _handle_inject_perturbation(self: "Scheduler", req: InjectPerturbationReq) -> None:
-    raise NotImplementedError("perturb hookup lands in Step 5")
+    from sglang.srt.steppable_engine.perturb import arm_one_shot
+
+    arm_one_shot(self, channel=req.channel, kind=req.kind, rank=req.rank)

@@ -22,6 +22,7 @@ from sglang.srt.steppable_engine.messages import (
     CanaryViolationsReq,
     CanaryViolationsResp,
     EnterSteppingModeReq,
+    InjectPerturbationReq,
     IsActiveReq,
     IsActiveResp,
     LastWritePlanReq,
@@ -318,7 +319,12 @@ class SteppableEngine:
         rank: Optional[int] = None,
     ) -> None:
         self._check_alive()
-        raise NotImplementedError("inject_perturbation will be wired up later")
+        from sglang.srt.steppable_engine.perturb import validate_channel_kind
+
+        validate_channel_kind(channel=channel, kind=kind)
+        self._send_to_scheduler(
+            InjectPerturbationReq(channel=channel, kind=kind, rank=rank)
+        )
 
     def _send_to_scheduler(self, msg: Any) -> None:
         self._engine.tokenizer_manager.send_to_scheduler.send_pyobj(msg)
