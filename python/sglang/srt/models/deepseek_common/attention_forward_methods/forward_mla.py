@@ -23,6 +23,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -420,9 +421,7 @@ class DeepseekMLAForwardMixin:
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
@@ -516,9 +515,7 @@ class DeepseekMLAForwardMixin:
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
