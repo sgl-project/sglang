@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
@@ -68,8 +69,8 @@ def install_canary(
         config=config,
         buffer_groups=buffer_groups,
         device=device,
-        tp_group=_resolve_tp_group(),
-        pp_group=_resolve_pp_group(),
+        tp_group=get_tp_group(),
+        pp_group=get_pp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
@@ -86,33 +87,6 @@ def install_canary(
 def get_canary_runner(model_runner: "ModelRunner") -> Optional[CanaryRunner]:
     """Return the runner attached to this ModelRunner, or None if canary was not installed."""
     return model_runner.canary_runner
-
-
-def _resolve_tp_group():
-    from sglang.srt.distributed.parallel_state import get_tp_group
-
-    try:
-        return get_tp_group()
-    except AssertionError:
-        logger.warning(
-            "kv-canary: TP group not initialized; cross-rank error allreduce disabled "
-            "(raise mode will not be globally synchronized)",
-            exc_info=True,
-        )
-        return None
-
-
-def _resolve_pp_group():
-    from sglang.srt.distributed.parallel_state import get_pp_group
-
-    try:
-        return get_pp_group()
-    except AssertionError:
-        logger.warning(
-            "kv-canary: PP group not initialized; cross-stage error allreduce disabled",
-            exc_info=True,
-        )
-        return None
 
 
 def _compute_launch_capacities(
