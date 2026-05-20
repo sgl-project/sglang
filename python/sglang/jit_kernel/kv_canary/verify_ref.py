@@ -195,9 +195,6 @@ def _compute_real_kv_hash_scalar(
     acc: int = 0
 
     for source in real_kv_sources:
-        if source.read_bytes <= 0:
-            continue
-
         page_size = source.page_size
         num_bytes_per_token = source.num_bytes_per_token
         read_bytes = source.read_bytes

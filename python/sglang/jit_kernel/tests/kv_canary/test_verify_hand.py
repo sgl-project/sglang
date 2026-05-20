@@ -681,50 +681,15 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def test_real_kv_source_read_bytes_zero_skipped() -> None:
-    """``read_bytes == 0`` → source is skipped; CUDA must not dereference dim-1 beyond the 1-byte dummy."""
-    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
-    # 1-byte dummy tensor with read_bytes = 0; kernel must never touch it.
-    dummy = RealKvSource(
-        tensor=torch.zeros((1, 1), dtype=torch.uint8, device=_DEVICE),
-        page_size=1,
-        num_bytes_per_token=1,
-        read_bytes=0,
-    )
-
-    plan_cuda = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    plan_ref = make_verify_plan(
-        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-    )
-    anchor_signed = chain_anchor_signed()
-    for buf in (cuda_buf, ref_buf):
-        write_slot_fields(
-            canary_buf=buf,
-            slot_idx=1,
-            token=1,
-            position=0,
-            prev_hash=anchor_signed,
-            real_kv_hash=0,
+def test_real_kv_source_rejects_zero_read_bytes() -> None:
+    """RealKvSource has no \"skip me\" sentinel — read_bytes=0 must raise rather than silently pass."""
+    with pytest.raises(ValueError, match="read_bytes"):
+        RealKvSource(
+            tensor=torch.zeros((1, 16), dtype=torch.uint8, device=_DEVICE),
+            page_size=1,
+            num_bytes_per_token=16,
+            read_bytes=0,
         )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
-
-    _run_both(
-        cuda_canary_buf=cuda_buf,
-        ref_canary_buf=ref_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=(dummy,),
-        real_kv_sources_ref=(dummy,),
-        real_kv_hash_mode=consts.RealKvHashMode.ALL,
-    )
-
-    assert int(cuda_log.write_index[0].item()) == 0
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_real_kv_source_padding_below_4() -> None:

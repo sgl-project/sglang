@@ -2,8 +2,9 @@
 //
 // Real-KV source ABI (tvm-ffi cannot pass tuple[RealKvSource, ...] directly): the host wrapper unpacks the
 // tuple into a fixed-size array of 4 sources and passes 4 separate uint8 tensors plus a single int32 array
-// of (page_size, num_bytes_per_token, read_bytes) triplets of length 12 (4 sources x 3 fields). Unused
-// padding sources have read_bytes = 0 so real_kv_fold_sources skips them.
+// of (page_size, num_bytes_per_token, read_bytes) triplets of length 12 (4 sources x 3 fields). The host
+// also passes ``num_sources`` (count of valid leading entries); the kernel iterates only
+// ``sources[0..num_sources)`` and never reads the padding tail.
 
 #pragma once
 
@@ -76,9 +77,6 @@ SGL_DEVICE void real_kv_load_uint4(
 // >= 16 when non-zero, so PARTIAL collapses to a constant 16B prefix. Output is byte-equal to the
 // Python ref helper _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
-  if (src.read_bytes <= 0) {
-    return 0ULL;
-  }
   const int64_t effective_read_bytes =
       (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
@@ -94,15 +92,8 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
 
 // Fold all configured real-KV sources for a given slot. Iterates sequentially and combines each source's
 // contribution via acc = splitmix64(acc XOR source_hash); matches _compute_real_kv_hash_scalar in
-// kv_canary/verify_ref.py.
-//
-// In OFF mode the function returns 0 unconditionally (the running real_kv_hash field is always 0). Sources
-// with read_bytes == 0 contribute nothing (their source_hash is 0 and acc = splitmix64(acc ^ 0)).
-//
-// IMPORTANT: the Python ref ONLY enters the fold loop when read_bytes > 0 (see _compute_real_kv_hash_scalar
-// in kv_canary/verify_ref.py: `if source.read_bytes <= 0: continue`). To stay byte-equal, this
-// helper must skip the splitmix64 step entirely for read_bytes == 0 sources rather than treating them as
-// "fold 0".
+// kv_canary/verify_ref.py. In OFF mode the function returns 0 unconditionally (the running real_kv_hash
+// field is always 0).
 SGL_DEVICE uint64_t
 real_kv_fold_sources(const RealKvSourceHandle* sources, int num_sources, int64_t slot_idx, RealKvHashMode mode) {
   if (mode == RealKvHashMode::kOff || num_sources <= 0) {
@@ -110,9 +101,6 @@ real_kv_fold_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
   }
   uint64_t acc = 0ULL;
   for (int s = 0; s < num_sources; ++s) {
-    if (sources[s].read_bytes <= 0) {
-      continue;
-    }
     const uint64_t source_hash = real_kv_fold_one_source(sources[s], slot_idx, mode);
     acc = splitmix64(acc ^ source_hash);
   }

@@ -81,18 +81,19 @@ class RealKvSource:
       skipped).
 
     16-byte alignment precondition: the CUDA fold kernel issues 128-bit aligned loads, so ``read_bytes``,
-    ``num_bytes_per_token``, and the row stride (``tensor.shape[1]`` in bytes) must all be multiples of 16.
-    ``read_bytes == 0`` is the sentinel for "skip this source" and is exempt from the modulo check.
+    ``num_bytes_per_token``, and the row stride (``tensor.shape[1]`` in bytes) must all be positive
+    multiples of 16. There is no "skip this source" sentinel — callers omit the source from their
+    ``real_kv_sources`` tuple entirely (factory helpers return an empty tuple in that case).
 
     Fields:
         tensor: The source tensor, any shape such that the access pattern above yields ``num_bytes_per_token``
             uint8 bytes per slot. Dtype is whatever the underlying pool uses; the canary views the relevant
             bytes via ``.view(torch.uint8)``.
         page_size: Number of slots packed into one row of dim 0. ``>= 1``.
-        num_bytes_per_token: Bytes per slot in the dim-1 strip the canary reads. Must be a multiple of 16.
+        num_bytes_per_token: Bytes per slot in the dim-1 strip the canary reads. Must be a positive
+            multiple of 16.
         read_bytes: Leading bytes (out of ``num_bytes_per_token``) per slot folded into the fingerprint.
-            ``0 <= read_bytes <= num_bytes_per_token``; ``0`` skips this source's contribution this call. When
-            non-zero, must be a multiple of 16.
+            Must be a positive multiple of 16, ``<= num_bytes_per_token``.
     """
 
     tensor: torch.Tensor
@@ -105,29 +106,22 @@ class RealKvSource:
             raise ValueError(
                 f"kv-canary: RealKvSource.page_size must be >= 1, got {self.page_size}"
             )
-        if self.num_bytes_per_token <= 0:
+        if self.num_bytes_per_token <= 0 or self.num_bytes_per_token % 16 != 0:
             raise ValueError(
-                f"kv-canary: RealKvSource.num_bytes_per_token must be positive, got {self.num_bytes_per_token}"
+                f"kv-canary: RealKvSource.num_bytes_per_token must be a positive multiple of 16, "
+                f"got {self.num_bytes_per_token}"
             )
-        if self.read_bytes < 0 or self.read_bytes > self.num_bytes_per_token:
+        # ``read_bytes`` must be positive and a multiple of 16. Callers that want "no contribution" omit
+        # the source from the tuple entirely (see make_row_source / make_packed_source, which return an
+        # empty tuple for the zero-byte case) — there is no zero-sentinel.
+        if (
+            self.read_bytes <= 0
+            or self.read_bytes > self.num_bytes_per_token
+            or self.read_bytes % 16 != 0
+        ):
             raise ValueError(
-                f"kv-canary: RealKvSource.read_bytes must satisfy 0 <= read_bytes <= num_bytes_per_token "
-                f"(={self.num_bytes_per_token}), got {self.read_bytes}"
-            )
-        # ``read_bytes == 0`` is the "skip this source" sentinel and exempts the source from the 16B-alignment
-        # contract — the kernel short-circuits before any address arithmetic, so the dummy tensor / stride
-        # shape do not matter.
-        if self.read_bytes == 0:
-            return
-        if self.read_bytes % 16 != 0:
-            raise ValueError(
-                f"kv-canary: RealKvSource.read_bytes must be 0 or a multiple of 16 (the CUDA fold kernel "
-                f"loads in 128-bit chunks), got {self.read_bytes}"
-            )
-        if self.num_bytes_per_token % 16 != 0:
-            raise ValueError(
-                f"kv-canary: RealKvSource.num_bytes_per_token must be a multiple of 16 when "
-                f"read_bytes > 0, got {self.num_bytes_per_token}"
+                f"kv-canary: RealKvSource.read_bytes must be a positive multiple of 16 in "
+                f"(0, num_bytes_per_token={self.num_bytes_per_token}], got {self.read_bytes}"
             )
         if self.tensor.ndim < 2:
             raise ValueError(
@@ -327,12 +321,15 @@ def _build_real_kv_source_abi(
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Pad a RealKvSource tuple up to consts.MAX_REAL_KV_SOURCES dummy entries and build the (bufs, params) ABI.
 
+    The kernel iterates only ``sources[0..num_sources)`` (caller passes ``num_sources = len(real_kv_sources)``
+    separately), so trailing padding bufs/params are never dereferenced; their contents are arbitrary.
+
     Returns:
-        padded_bufs: list of length consts.MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Unused trailing
-            slots are tiny 1-byte placeholders that the kernel never dereferences (their read_bytes is 0).
-        source_params: int32 tensor on CPU, shape [consts.MAX_REAL_KV_SOURCES, 3]. Per row: (page_size,
-            num_bytes_per_token, read_bytes). Padding rows are all zeros except page_size = 1 and
-            num_bytes_per_token = 1 to keep the device-side address arithmetic well-defined.
+        padded_bufs: list of length consts.MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Padding
+            tail is filled with a tiny 1-byte placeholder that the kernel never reads.
+        source_params: int32 tensor on CPU, shape [consts.MAX_REAL_KV_SOURCES, 3]. Leading rows hold each
+            source's (page_size, num_bytes_per_token, read_bytes); padding rows are left as the initial
+            zeros and never read.
     """
     padded_bufs: list[torch.Tensor] = []
     params = torch.zeros(
@@ -356,11 +353,9 @@ def _build_real_kv_source_abi(
         )
         params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
+    # Pad bufs (never read by the kernel — num_sources bounds the iteration); params already zero.
     dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
-    for i in range(len(real_kv_sources), consts.MAX_REAL_KV_SOURCES):
+    for _ in range(len(real_kv_sources), consts.MAX_REAL_KV_SOURCES):
         padded_bufs.append(dummy)
-        params[i, consts.REAL_KV_SOURCE_FIELD_PAGE_SIZE] = 1
-        params[i, consts.REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = 1
-        params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = 0  # kernel skips this slot
 
     return padded_bufs, params
