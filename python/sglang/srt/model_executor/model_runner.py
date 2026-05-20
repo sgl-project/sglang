@@ -1770,7 +1770,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         world_size,
         group_name,
         backend="nccl",
-        transfer_mode="broadcast",
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -1787,22 +1786,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        if transfer_mode == "broadcast":
-            rank = rank_offset + self.tp_rank
-        elif transfer_mode == "relay":
-            if self.tp_rank != 0:
-                self._skipped_model_update_groups.add(group_name)
-                return True, "Skipped custom process group on non-participant TP rank."
-            rank = rank_offset
-        else:
-            message = f"Unsupported distributed weight transfer_mode={transfer_mode}."
-            logger.error(message)
-            return False, message
+        rank = rank_offset + self.tp_rank
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, "
-            f"backend={backend}, transfer_mode={transfer_mode}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
         try:
@@ -1821,11 +1809,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
+    def init_relay_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Initialize the trainer-to-relay process group on TP0 only."""
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        if self.tp_rank != 0:
+            self._skipped_model_update_groups.add(group_name)
+            return True, "Skipped custom process group on non-participant TP rank."
+
+        rank = rank_offset
+        logger.info(
+            f"init relay custom process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            na = NetworkAddress(master_address, master_port)
+            self._model_update_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=na.to_tcp(),
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            self._skipped_model_update_groups.discard(group_name)
+            return True, "Succeeded to initialize relay custom process group."
+        except Exception as e:
+            message = f"Failed to initialize relay custom process group: {e}."
+            logger.error(message)
+            return False, message
+
     def destroy_weights_update_group(self, group_name):
         try:
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
                 torch.distributed.destroy_process_group(pg)
+                self._skipped_model_update_groups.discard(group_name)
                 return True, "Succeeded to destroy custom process group."
             elif group_name in self._skipped_model_update_groups:
                 self._skipped_model_update_groups.remove(group_name)
@@ -1844,7 +1874,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         shapes,
         group_name,
         load_format: Optional[str] = None,
-        transfer_mode: str = "broadcast",
     ):
         """
         Update specific parameter in the model weights online
@@ -1856,26 +1885,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
-        if transfer_mode == "relay":
-            if load_format is not None:
-                message = (
-                    "relay distributed weight transfer does not support "
-                    f"load_format={load_format}."
-                )
-                logger.error(message)
-                return False, message
-            return self._update_weights_from_distributed_relay(
-                names, dtypes, shapes, group_name
-            )
         self._flush_pending_relay_weight_updates()
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
-        if transfer_mode != "broadcast":
-            message = f"Unsupported distributed weight transfer_mode={transfer_mode}."
-            logger.error(message)
-            return False, message
 
         if load_format == "flattened_bucket":
             return self._update_bucketed_weights_from_distributed(
@@ -1913,17 +1927,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
-    def _update_weights_from_distributed_relay(self, names, dtypes, shapes, group_name):
+    def update_relay_weights_from_distributed(self, names, dtypes, shapes, group_name):
         total_bytes = self._compute_relay_weight_update_bytes(dtypes, shapes)
         reserved_pending_bytes = False
         try:
             is_receiver = self.tp_rank == 0
             if is_receiver:
+                if group_name not in self._model_update_group:
+                    message = (
+                        f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+                        "Please call `init_relay_weights_update_group` first."
+                    )
+                    logger.error(message)
+                    return False, message
                 send_group = self._model_update_group[group_name]
             elif group_name not in self._skipped_model_update_groups:
                 message = (
                     f"Group {group_name} is neither initialized nor marked as skipped. "
-                    "Please call `init_weights_update_group` first."
+                    "Please call `init_relay_weights_update_group` first."
                 )
                 logger.error(message)
                 return False, message
