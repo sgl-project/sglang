@@ -505,7 +505,7 @@ class CLIPTextTransformer(nn.Module):
                 ),
             ]
         else:
-            # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
+            # The config gets updated `eos_token_id` from PR #24773 (so the use of extra new tokens is possible)
             pooled_output = last_hidden_state[
                 torch.arange(
                     last_hidden_state.shape[0], device=last_hidden_state.device

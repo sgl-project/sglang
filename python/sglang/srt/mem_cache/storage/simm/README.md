@@ -10,7 +10,7 @@ For more details about SiMM, please refer to [SiMM project](https://github.com/s
 
 ### SiMM & SGLang HiCache
 
-SiMM serves as a high-performance L3 storage backend for SGLang HiCache, enabling distributed KV cache storage across multiple servers with RDMA-baed transport. This integration addresses the capacity limitations of traditional GPU-only or GPU+CPU caching by providing virtually unlimited cache storage through a distributed memory pool.
+SiMM serves as a high-performance L3 storage backend for SGLang HiCache, enabling distributed KV cache storage across multiple servers with RDMA-based transport. This integration addresses the capacity limitations of traditional GPU-only or GPU+CPU caching by providing virtually unlimited cache storage through a distributed memory pool.
 
 When a cache miss occurs in L1 and L2, HiCache automatically fetches the required KV cache from SiMM's distributed memory pool. The system uses intelligent prefetching strategies to minimize latency, and utilize RDMA technology and zero-copy technique to ensure high-bandwidth, low-latency data transfer between SGLang instances and SiMM data servers.
 

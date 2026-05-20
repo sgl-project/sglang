@@ -16,7 +16,7 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     dim_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_res_blocks: int = 2
     attn_scales: tuple[float, ...] = ()
-    temperal_downsample: tuple[bool, ...] = (False, True, True)
+    temporal_downsample: tuple[bool, ...] = (False, True, True)
     dropout: float = 0.0
 
     is_residual: bool = False
@@ -41,7 +41,7 @@ class QwenImageVAEConfig(VAEConfig):
     use_parallel_decode: bool = False
 
     def get_vae_scale_factor(self):
-        return 2 ** len(self.arch_config.temperal_downsample)
+        return 2 ** len(self.arch_config.temporal_downsample)
 
     def __post_init__(self):
         self.blend_num_frames = (
@@ -50,6 +50,6 @@ class QwenImageVAEConfig(VAEConfig):
 
     def post_init(self):
         self.arch_config.vae_scale_factor = 2 ** (
-            len(self.arch_config.temperal_downsample)
+            len(self.arch_config.temporal_downsample)
         )
         self.arch_config.spatial_compression_ratio = self.arch_config.vae_scale_factor

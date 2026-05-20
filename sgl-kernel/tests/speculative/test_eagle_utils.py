@@ -15,7 +15,7 @@ def test_verify_tree_greedy():
         dtype=torch.int64,
         device="cuda",
     )
-    retrive_index = torch.tensor(
+    retrieve_index = torch.tensor(
         [
             [0, 1, 2, 3, 4, 5],
             [6, 7, 8, 9, 10, 11],
@@ -23,7 +23,7 @@ def test_verify_tree_greedy():
         dtype=torch.int64,
         device="cuda",
     )
-    retrive_next_token = torch.tensor(
+    retrieve_next_token = torch.tensor(
         [
             [1, 2, -1, 4, 5, -1],
             [4, 2, 3, -1, 5, -1],
@@ -31,7 +31,7 @@ def test_verify_tree_greedy():
         dtype=torch.int64,
         device="cuda",
     )
-    retrive_next_sibling = torch.tensor(
+    retrieve_next_sibling = torch.tensor(
         [
             [-1, 3, -1, -1, -1, -1],
             [-1, -1, -1, -1, 1, -1],
@@ -70,9 +70,9 @@ def test_verify_tree_greedy():
         accept_index=accept_index,
         accept_token_num=accept_token_num,
         candidates=candidates,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
         target_predict=target_predict,
     )
 

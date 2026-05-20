@@ -70,7 +70,7 @@ jobs:
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
 
-  nighly-test-npu:
+  nightly-test-npu:
     needs: [set-image-config]
     name: nightly-test-npu
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
@@ -337,7 +337,7 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - nighly-test-npu
+      - nightly-test-npu
       - full-1-npu-a3
       - full-2-npu-a3
       - full-4-npu-a3

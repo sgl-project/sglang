@@ -434,7 +434,7 @@ class QwenImageEncoder3d(nn.Module):
         dim_mult (list of int): Multipliers for the number of channels in each block.
         num_res_blocks (int): Number of residual blocks in each block.
         attn_scales (list of float): Scales at which to apply attention mechanisms.
-        temperal_downsample (list of bool): Whether to downsample temporally in each block.
+        temporal_downsample (list of bool): Whether to downsample temporally in each block.
         dropout (float): Dropout rate for the dropout layers.
         non_linearity (str): Type of non-linearity to use.
     """
@@ -446,7 +446,7 @@ class QwenImageEncoder3d(nn.Module):
         dim_mult=[1, 2, 4, 4],
         num_res_blocks=2,
         attn_scales=[],
-        temperal_downsample=[True, True, False],
+        temporal_downsample=[True, True, False],
         dropout=0.0,
         non_linearity: str = "silu",
         input_channels: int = 3,
@@ -457,7 +457,7 @@ class QwenImageEncoder3d(nn.Module):
         # dim_mult = config.arch_config.dim_mult
         # num_res_blocks = config.arch_config.num_res_blocks
         # attn_scales = config.arch_config.attn_scales
-        # temperal_downsample = config.arch_config.temperal_downsample
+        # temporal_downsample = config.arch_config.temporal_downsample
         # dropout = config.arch_config.dropout
         # non_linearity = config.arch_config.non_linearity
         self.dim = dim
@@ -465,7 +465,7 @@ class QwenImageEncoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.attn_scales = attn_scales
-        self.temperal_downsample = temperal_downsample
+        self.temporal_downsample = temporal_downsample
         self.nonlinearity = get_activation(non_linearity)
 
         # dimensions
@@ -489,7 +489,7 @@ class QwenImageEncoder3d(nn.Module):
 
             # downsample block
             if i != len(dim_mult) - 1:
-                mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
+                mode = "downsample3d" if temporal_downsample[i] else "downsample2d"
                 self.down_blocks.append(QwenImageResample(out_dim, mode=mode))
                 scale /= 2.0
 
@@ -639,7 +639,7 @@ class QwenImageDecoder3d(nn.Module):
         dim_mult (list of int): Multipliers for the number of channels in each block.
         num_res_blocks (int): Number of residual blocks in each block.
         attn_scales (list of float): Scales at which to apply attention mechanisms.
-        temperal_upsample (list of bool): Whether to upsample temporally in each block.
+        temporal_upsample (list of bool): Whether to upsample temporally in each block.
         dropout (float): Dropout rate for the dropout layers.
         non_linearity (str): Type of non-linearity to use.
     """
@@ -651,7 +651,7 @@ class QwenImageDecoder3d(nn.Module):
         dim_mult=[1, 2, 4, 4],
         num_res_blocks=2,
         attn_scales=[],
-        temperal_upsample=[False, True, True],
+        temporal_upsample=[False, True, True],
         dropout=0.0,
         non_linearity: str = "silu",
         input_channels=3,
@@ -662,7 +662,7 @@ class QwenImageDecoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.attn_scales = attn_scales
-        self.temperal_upsample = temperal_upsample
+        self.temporal_upsample = temporal_upsample
 
         self.nonlinearity = get_activation(non_linearity)
 
@@ -688,7 +688,7 @@ class QwenImageDecoder3d(nn.Module):
             # Determine if we need upsampling
             upsample_mode = None
             if i != len(dim_mult) - 1:
-                upsample_mode = "upsample3d" if temperal_upsample[i] else "upsample2d"
+                upsample_mode = "upsample3d" if temporal_upsample[i] else "upsample2d"
 
             # Create and add the upsampling block
             up_block = QwenImageUpBlock(
@@ -783,26 +783,26 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         dim_mult = config.arch_config.dim_mult
         num_res_blocks = config.arch_config.num_res_blocks
         attn_scales = config.arch_config.attn_scales
-        temperal_downsample = config.arch_config.temperal_downsample
+        temporal_downsample = config.arch_config.temporal_downsample
         dropout = config.arch_config.dropout
         # non_linearity = config.arch_config.non_linearity
         self.z_dim = z_dim
-        self.temperal_downsample = temperal_downsample
-        self.temperal_upsample = temperal_downsample[::-1]
+        self.temporal_downsample = temporal_downsample
+        self.temporal_upsample = temporal_downsample[::-1]
         self.input_channels = config.arch_config.input_channels
         self.latents_mean = config.arch_config.latents_mean
         self.config = config.arch_config
         self.use_parallel_decode = config.use_parallel_decode
 
         self.encoder = QwenImageEncoder3d(
-            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
+            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temporal_downsample, dropout,
             input_channels=self.input_channels
         )
         self.quant_conv = QwenImageCausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.post_quant_conv = QwenImageCausalConv3d(z_dim, z_dim, 1)
 
         self.decoder = QwenImageDecoder3d(
-            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout,
+            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temporal_upsample, dropout,
             input_channels=self.input_channels
         )
 

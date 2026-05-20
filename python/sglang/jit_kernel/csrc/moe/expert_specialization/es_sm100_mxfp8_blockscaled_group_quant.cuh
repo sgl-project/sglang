@@ -430,7 +430,7 @@ struct EsSm100MXFP8BlockscaledGroupQuant {
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
     auto G = SymbolicSize{"num_experts"};
-    auto N_SF_Alinged = SymbolicSize{"num_tokens_sf_aligned"};
+    auto N_SF_Aligned = SymbolicSize{"num_tokens_sf_aligned"};
     auto D_SF = SymbolicSize{"hidden_size_sf"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
@@ -442,7 +442,7 @@ struct EsSm100MXFP8BlockscaledGroupQuant {
     RuntimeCheck(D.unwrap() % 128 == 0, "k must align to 128");
 
     TensorMatcher({N, D}).with_strides({D, 1}).with_dtype<fp8_e4m3_t>().with_device(device).verify(quant_output);
-    TensorMatcher({N_SF_Alinged, D_SF}).with_dtype<uint8_t>().with_device(device).verify(scale_factor);
+    TensorMatcher({N_SF_Aligned, D_SF}).with_dtype<uint8_t>().with_device(device).verify(scale_factor);
     RuntimeCheck(D.unwrap() / 32 == D_SF.unwrap(), "Scale factor K should be hidden_size / 32");
 
     cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());

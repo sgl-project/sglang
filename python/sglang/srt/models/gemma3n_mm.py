@@ -356,7 +356,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             # text to account for this. However, the audio preprocessing and encoder do not gurarantee they will
             # produce 188 soft tokens; they will produce at most that many tokens, but they may produce fewer tokens
             # depending on the length of the longest audio input in the batch. When we encounter this situation, we pad
-            # the audio feature out to 188 soft tokens with the emebedding of the last token in the embed_audio vocab.
+            # the audio feature out to 188 soft tokens with the embedding of the last token in the embed_audio vocab.
             audio_padding_toks = torch.tensor(
                 [[self.vocab_size - 1]], dtype=torch.long, device=audio_features.device
             )

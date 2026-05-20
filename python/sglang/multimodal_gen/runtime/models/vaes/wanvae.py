@@ -247,7 +247,7 @@ class WanResidualDownBlock(nn.Module):
         out_dim,
         dropout,
         num_res_blocks,
-        temperal_downsample=False,
+        temporal_downsample=False,
         down_flag=False,
     ):
         super().__init__()
@@ -256,7 +256,7 @@ class WanResidualDownBlock(nn.Module):
         self.avg_shortcut = AvgDown3D(
             in_dim,
             out_dim,
-            factor_t=2 if temperal_downsample else 1,
+            factor_t=2 if temporal_downsample else 1,
             factor_s=2 if down_flag else 1,
         )
 
@@ -269,7 +269,7 @@ class WanResidualDownBlock(nn.Module):
 
         # Add the final downsample block
         if down_flag:
-            mode = "downsample3d" if temperal_downsample else "downsample2d"
+            mode = "downsample3d" if temporal_downsample else "downsample2d"
             self.downsampler = WanResample(out_dim, mode=mode)
         else:
             self.downsampler = None
@@ -288,7 +288,7 @@ class WanEncoder3d(nn.Module):
         dim_mult (list of int): Multipliers for the number of channels in each block.
         num_res_blocks (int): Number of residual blocks in each block.
         attn_scales (list of float): Scales at which to apply attention mechanisms.
-        temperal_downsample (list of bool): Whether to downsample temporally in each block.
+        temporal_downsample (list of bool): Whether to downsample temporally in each block.
         dropout (float): Dropout rate for the dropout layers.
         non_linearity (str): Type of non-linearity to use.
     """
@@ -301,7 +301,7 @@ class WanEncoder3d(nn.Module):
         dim_mult=(1, 2, 4, 4),
         num_res_blocks=2,
         attn_scales=(),
-        temperal_downsample=(True, True, False),
+        temporal_downsample=(True, True, False),
         dropout=0.0,
         non_linearity: str = "silu",
         is_residual: bool = False,  # wan 2.2 vae use a residual downblock
@@ -314,7 +314,7 @@ class WanEncoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.attn_scales = list(attn_scales)
-        self.temperal_downsample = list(temperal_downsample)
+        self.temporal_downsample = list(temporal_downsample)
         self.nonlinearity = get_act_fn(non_linearity)
         self.use_parallel_encode = use_parallel_encode
         self.downsample_count = max(len(dim_mult) - 1, 0)
@@ -356,8 +356,8 @@ class WanEncoder3d(nn.Module):
                         out_dim,
                         dropout,
                         num_res_blocks,
-                        temperal_downsample=(
-                            temperal_downsample[i] if i != len(dim_mult) - 1 else False
+                        temporal_downsample=(
+                            temporal_downsample[i] if i != len(dim_mult) - 1 else False
                         ),
                         down_flag=i != len(dim_mult) - 1,
                     )
@@ -371,7 +371,7 @@ class WanEncoder3d(nn.Module):
 
                 # downsample block
                 if i != len(dim_mult) - 1:
-                    mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
+                    mode = "downsample3d" if temporal_downsample[i] else "downsample2d"
                     self.down_blocks.append(Resample(out_dim, mode=mode))
                     scale /= 2.0
 
@@ -472,7 +472,7 @@ class WanResidualUpBlock(nn.Module):
         out_dim (int): Output dimension
         num_res_blocks (int): Number of residual blocks
         dropout (float): Dropout rate
-        temperal_upsample (bool): Whether to upsample on temporal dimension
+        temporal_upsample (bool): Whether to upsample on temporal dimension
         up_flag (bool): Whether to upsample or not
         non_linearity (str): Type of non-linearity to use
     """
@@ -483,7 +483,7 @@ class WanResidualUpBlock(nn.Module):
         out_dim: int,
         num_res_blocks: int,
         dropout: float = 0.0,
-        temperal_upsample: bool = False,
+        temporal_upsample: bool = False,
         up_flag: bool = False,
         non_linearity: str = "silu",
     ):
@@ -495,7 +495,7 @@ class WanResidualUpBlock(nn.Module):
             self.avg_shortcut = DupUp3D(
                 in_dim,
                 out_dim,
-                factor_t=2 if temperal_upsample else 1,
+                factor_t=2 if temporal_upsample else 1,
                 factor_s=2,
             )
         else:
@@ -514,7 +514,7 @@ class WanResidualUpBlock(nn.Module):
 
         # Add upsampling layer if needed
         if up_flag:
-            upsample_mode = "upsample3d" if temperal_upsample else "upsample2d"
+            upsample_mode = "upsample3d" if temporal_upsample else "upsample2d"
             self.upsampler = WanResample(
                 out_dim, mode=upsample_mode, upsample_out_dim=out_dim
             )
@@ -586,7 +586,7 @@ class WanDecoder3d(nn.Module):
         dim_mult (list of int): Multipliers for the number of channels in each block.
         num_res_blocks (int): Number of residual blocks in each block.
         attn_scales (list of float): Scales at which to apply attention mechanisms.
-        temperal_upsample (list of bool): Whether to upsample temporally in each block.
+        temporal_upsample (list of bool): Whether to upsample temporally in each block.
         dropout (float): Dropout rate for the dropout layers.
         non_linearity (str): Type of non-linearity to use.
     """
@@ -598,7 +598,7 @@ class WanDecoder3d(nn.Module):
         dim_mult=(1, 2, 4, 4),
         num_res_blocks=2,
         attn_scales=(),
-        temperal_upsample=(False, True, True),
+        temporal_upsample=(False, True, True),
         dropout=0.0,
         non_linearity: str = "silu",
         out_channels: int = 3,
@@ -612,7 +612,7 @@ class WanDecoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.attn_scales = list(attn_scales)
-        self.temperal_upsample = list(temperal_upsample)
+        self.temporal_upsample = list(temporal_upsample)
 
         self.nonlinearity = get_act_fn(non_linearity)
         self.use_parallel_decode = use_parallel_decode
@@ -655,7 +655,7 @@ class WanDecoder3d(nn.Module):
             up_flag = i != len(dim_mult) - 1
             # determine upsampling mode, if not upsampling, set to None
             upsample_mode = None
-            if up_flag and temperal_upsample[i]:
+            if up_flag and temporal_upsample[i]:
                 upsample_mode = "upsample3d"
             elif up_flag:
                 upsample_mode = "upsample2d"
@@ -667,7 +667,7 @@ class WanDecoder3d(nn.Module):
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
                     dropout=dropout,
-                    temperal_upsample=temperal_upsample[i] if up_flag else False,
+                    temporal_upsample=temporal_upsample[i] if up_flag else False,
                     up_flag=up_flag,
                     non_linearity=non_linearity,
                 )
@@ -818,8 +818,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
         ParallelTiledVAE.__init__(self, config)
 
         self.z_dim = config.z_dim
-        self.temperal_downsample = list(config.temperal_downsample)
-        self.temperal_upsample = list(config.temperal_downsample)[::-1]
+        self.temporal_downsample = list(config.temporal_downsample)
+        self.temporal_upsample = list(config.temporal_downsample)[::-1]
 
         if config.decoder_base_dim is None:
             decoder_base_dim = config.base_dim
@@ -840,7 +840,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 dim_mult=config.dim_mult,
                 num_res_blocks=config.num_res_blocks,
                 attn_scales=config.attn_scales,
-                temperal_downsample=self.temperal_downsample,
+                temporal_downsample=self.temporal_downsample,
                 dropout=config.dropout,
                 is_residual=config.is_residual,
                 use_parallel_encode=self.use_parallel_encode,
@@ -855,7 +855,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 dim_mult=config.dim_mult,
                 num_res_blocks=config.num_res_blocks,
                 attn_scales=config.attn_scales,
-                temperal_upsample=self.temperal_upsample,
+                temporal_upsample=self.temporal_upsample,
                 dropout=config.dropout,
                 out_channels=config.out_channels,
                 is_residual=config.is_residual,

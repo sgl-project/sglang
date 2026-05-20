@@ -995,7 +995,7 @@ def _prepare_presharded_weights(
 
 
 class Grok1ModelForCausalLM(Grok1ForCausalLM):
-    """An alias for backward-compatbility."""
+    """An alias for backward-compatibility."""
 
     pass
 

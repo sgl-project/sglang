@@ -362,7 +362,7 @@ class EICStorage(HiCacheStorage):
         else:
             return self.generic_batch_get([key], [target_location])
 
-    # use for v1 interface, and shound not be called directly
+    # use for v1 interface, and should not be called directly
     def batch_get(
         self,
         keys: List[str],

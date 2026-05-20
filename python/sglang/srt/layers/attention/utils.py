@@ -1239,7 +1239,7 @@ def fused_qk_rope_reshape_and_cache(
     -     value_cache: shape (T_cache, KH, D, block_size).
     - slot_mapping: shape (T_slot, ).
 
-    T is the number of decode tokens, T_cahce * block_size is the max number of tokens of kv_cache
+    T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
 
     Returns:

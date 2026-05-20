@@ -10,16 +10,16 @@
 // tree_mask: [bs * draft_token_num * draft_token_num]
 // verified_seq_len: [bs]
 // positions: [bs * draft_token_num]
-// retrive_index: [bs, draft_token_num]
-// retrive_next_token: [bs, draft_token_num]
-// retrive_next_sibling: [bs, draft_token_num]
+// retrieve_index: [bs, draft_token_num]
+// retrieve_next_token: [bs, draft_token_num]
+// retrieve_next_sibling: [bs, draft_token_num]
 __global__ void reconstructIndicesFromTreeMask(
     bool* tree_mask,
     int64_t* verified_seq_len,
     int64_t* positions,
-    int64_t* retrive_index,
-    int64_t* retrive_next_token,
-    int64_t* retrive_next_sibling,
+    int64_t* retrieve_index,
+    int64_t* retrieve_next_token,
+    int64_t* retrieve_next_sibling,
     int batch_size,
     int draft_token_num) {
   int bid = blockIdx.x;
@@ -45,7 +45,7 @@ __global__ void reconstructIndicesFromTreeMask(
       }
     }
   }
-  retrive_index[token_idx + tid] = token_idx + tid;
+  retrieve_index[token_idx + tid] = token_idx + tid;
   positions[token_idx + tid] = depth + verified_seq_len[bid];
 
   int next_token_idx = -1;
@@ -55,7 +55,7 @@ __global__ void reconstructIndicesFromTreeMask(
       break;
     }
   }
-  retrive_next_token[token_idx + tid] = next_token_idx;
+  retrieve_next_token[token_idx + tid] = next_token_idx;
 
   int next_sibling_idx = -1;
   if (parent_idx != -1) {
@@ -77,16 +77,16 @@ __global__ void reconstructIndicesFromTreeMask(
       }
     }
   }
-  retrive_next_sibling[token_idx + tid] = next_sibling_idx;
+  retrieve_next_sibling[token_idx + tid] = next_sibling_idx;
 }
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
     at::Tensor verified_seq_len,
     at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    at::Tensor retrieve_index,
+    at::Tensor retrieve_next_token,
+    at::Tensor retrieve_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num) {
   dim3 grid(batch_size);
@@ -97,9 +97,9 @@ void reconstruct_indices_from_tree_mask(
       static_cast<bool*>(tree_mask.data_ptr()),
       static_cast<int64_t*>(verified_seq_len.data_ptr()),
       static_cast<int64_t*>(positions.data_ptr()),
-      static_cast<int64_t*>(retrive_index.data_ptr()),
-      static_cast<int64_t*>(retrive_next_token.data_ptr()),
-      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<int64_t*>(retrieve_index.data_ptr()),
+      static_cast<int64_t*>(retrieve_next_token.data_ptr()),
+      static_cast<int64_t*>(retrieve_next_sibling.data_ptr()),
       int(batch_size),
       int(draft_token_num));
 }

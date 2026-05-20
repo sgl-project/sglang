@@ -182,7 +182,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
             self.image_newline = nn.Parameter(
                 torch.randn(projector_config.n_embed) * embed_std
             )
-            self.view_seperator = nn.Parameter(
+            self.view_separator = nn.Parameter(
                 torch.randn(projector_config.n_embed) * embed_std
             )
         else:
@@ -339,7 +339,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                     global_local_features = torch.cat(
                         [
                             global_features,
-                            self.view_seperator[None, :],
+                            self.view_separator[None, :],
                             local_features,
                         ]
                     )
@@ -347,7 +347,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                     global_local_features = torch.cat(
                         [
                             local_features,
-                            self.view_seperator[None, :],
+                            self.view_separator[None, :],
                             global_features,
                         ]
                     )

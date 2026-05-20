@@ -6,7 +6,7 @@ import torch
 import yaml
 
 
-def pase_args():
+def parse_args():
     parser = argparse.ArgumentParser(description="EIC Storage Unit Test")
     parser.add_argument(
         "--config",
@@ -20,7 +20,7 @@ def pase_args():
 
 
 def init_eic_client():
-    args = pase_args()
+    args = parse_args()
     config_path = os.path.abspath(args.config)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")

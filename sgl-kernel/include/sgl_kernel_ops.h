@@ -385,9 +385,9 @@ void tree_speculative_sampling_target_only(
     at::Tensor accept_index,      // mutable
     at::Tensor accept_token_num,  // mutable
     at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    at::Tensor retrieve_index,
+    at::Tensor retrieve_next_token,
+    at::Tensor retrieve_next_sibling,
     at::Tensor uniform_samples,
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
@@ -401,18 +401,18 @@ void verify_tree_greedy(
     at::Tensor accept_index,      // mutable
     at::Tensor accept_token_num,  // mutable
     at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    at::Tensor retrieve_index,
+    at::Tensor retrieve_next_token,
+    at::Tensor retrieve_next_sibling,
     at::Tensor target_predict);
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
     at::Tensor verified_seq_len,
-    at::Tensor positions,             // mutable
-    at::Tensor retrive_index,         // mutable
-    at::Tensor retrive_next_token,    // mutable
-    at::Tensor retrive_next_sibling,  // mutable
+    at::Tensor positions,              // mutable
+    at::Tensor retrieve_index,         // mutable
+    at::Tensor retrieve_next_token,    // mutable
+    at::Tensor retrieve_next_sibling,  // mutable
     int64_t batch_size,
     int64_t draft_token_num);
 
@@ -422,9 +422,9 @@ void build_tree_kernel_efficient(
     at::Tensor verified_seq_len,
     at::Tensor tree_mask,
     at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    at::Tensor retrieve_index,
+    at::Tensor retrieve_next_token,
+    at::Tensor retrieve_next_sibling,
     int64_t topk,
     int64_t depth,
     int64_t draft_token_num,

@@ -278,9 +278,9 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_global_server_args().enable_mis
 
         # enable chunked logprobs processing
-        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSOR_CHUNK.get()
         # chunk size for logprobs processing
-        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSOR_CHUNK_SIZE.get()
 
     def forward(
         self,

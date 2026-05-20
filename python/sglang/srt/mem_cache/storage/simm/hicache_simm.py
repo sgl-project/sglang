@@ -160,7 +160,7 @@ class HiCacheSiMM(HiCacheStorage):
 
             # Set nic device according to current process numa node
             nic_mapping = get_numa_nic_mapping()
-            logger.info(f"SiMM NUMA-awared allocation: {nic_mapping}")
+            logger.info(f"SiMM NUMA-aware allocation: {nic_mapping}")
             current_numa = get_current_process_numa()
             if current_numa >= 0:
                 rdma_devices = nic_mapping.get(current_numa)
@@ -268,7 +268,7 @@ class HiCacheSiMM(HiCacheStorage):
             key_list.append(f"{key_}_{self.mha_suffix}_v")
         if len(key_list) != len(ptr_list):
             logger.error(
-                f"key size {len(key_list)} not equal with incides ptr size {len(ptr_list)}"
+                f"key size {len(key_list)} not equal with indices ptr size {len(ptr_list)}"
             )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
@@ -280,7 +280,7 @@ class HiCacheSiMM(HiCacheStorage):
             key_list.append(f"{key_}_{self.mla_suffix}_k")
         if len(key_list) != len(ptr_list):
             logger.error(
-                f"key size {len(key_list)} not equal with incides ptr size {len(ptr_list)}"
+                f"key size {len(key_list)} not equal with indices ptr size {len(ptr_list)}"
             )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list

@@ -141,7 +141,7 @@ void invokeFP4Quantization(
     T const* input,
     float const* SFScale,
     int64_t* output,
-    int32_t* SFOuput,
+    int32_t* SFOutput,
     bool useUE8M0,
     int multiProcessorCount,
     cudaStream_t stream) {
@@ -155,10 +155,10 @@ void invokeFP4Quantization(
   // Launch the cvt kernel.
   if (useUE8M0) {
     cvt_fp16_to_fp4<T, true><<<grid, block, 0, stream>>>(
-        m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput));
   } else {
     cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
-        m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput));
   }
 }
 
@@ -169,7 +169,7 @@ template void invokeFP4Quantization(
     half const* input,
     float const* SFScale,
     int64_t* output,
-    int32_t* SFOuput,
+    int32_t* SFOutput,
     bool useUE8M0,
     int multiProcessorCount,
     cudaStream_t stream);
@@ -180,7 +180,7 @@ template void invokeFP4Quantization(
     __nv_bfloat16 const* input,
     float const* SFScale,
     int64_t* output,
-    int32_t* SFOuput,
+    int32_t* SFOutput,
     bool useUE8M0,
     int multiProcessorCount,
     cudaStream_t stream);

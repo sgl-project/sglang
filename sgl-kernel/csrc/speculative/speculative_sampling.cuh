@@ -41,9 +41,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     IdType* accept_index,      // mutable
     IdType* accept_token_num,  // mutable
     IdType2* candidates,
-    IdType2* retrive_index,
-    IdType2* retrive_next_token,
-    IdType2* retrive_next_sibling,
+    IdType2* retrieve_index,
+    IdType2* retrieve_next_token,
+    IdType2* retrieve_next_sibling,
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
@@ -64,15 +64,15 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType prob_acc = 0.0;
   uint32_t cur_prob_offset = bx * num_draft_tokens * d;
   DType coin = uniform_samples[bx * num_draft_tokens];
-  IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
-  accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
+  IdType2 last_accepted_retrieve_idx = retrieve_index[bx * num_draft_tokens];
+  accept_index[bx * num_speculative_tokens] = last_accepted_retrieve_idx;
   uint32_t num_accepted_tokens = 0;
   IdType2 cur_index = 0;
 
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
-    cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
+    cur_index = retrieve_next_token[bx * num_draft_tokens + cur_index];
     while (cur_index != -1) {
-      IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
+      IdType2 draft_index = retrieve_index[bx * num_draft_tokens + cur_index];
       IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
@@ -82,15 +82,15 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         prob_acc = 0.;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
         coin = uniform_samples[bx * num_draft_tokens + cur_index];
-        predicts[last_accepted_retrive_idx] = draft_token_id;
+        predicts[last_accepted_retrieve_idx] = draft_token_id;
         ++num_accepted_tokens;
         accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
-        last_accepted_retrive_idx = draft_index;
+        last_accepted_retrieve_idx = draft_index;
         break;
       } else {
         // FIXME: leverage draft probs
         draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
-        cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
+        cur_index = retrieve_next_sibling[bx * num_draft_tokens + cur_index];
       }
     }
     if (cur_index == -1) break;
@@ -169,7 +169,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     }
   }
   // set the first rejected token
-  predicts[last_accepted_retrive_idx] = sampled_id;
+  predicts[last_accepted_retrieve_idx] = sampled_id;
   // value at not used indices are undefined
 }
 
@@ -179,9 +179,9 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
     IdType* output_token_ids,           // mutable
     IdType* output_accepted_token_num,  // mutable
     IdType2* candidates,
-    IdType2* retrive_index,
-    IdType2* retrive_next_token,
-    IdType2* retrive_next_sibling,
+    IdType2* retrieve_index,
+    IdType2* retrieve_next_token,
+    IdType2* retrieve_next_sibling,
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
@@ -206,9 +206,9 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
       &output_token_ids,
       &output_accepted_token_num,
       &candidates,
-      &retrive_index,
-      &retrive_next_token,
-      &retrive_next_sibling,
+      &retrieve_index,
+      &retrieve_next_token,
+      &retrieve_next_sibling,
       &uniform_samples,
       &uniform_samples_for_final_sampling,
       &target_probs,

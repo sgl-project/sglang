@@ -535,7 +535,7 @@ class WanDistResidualDownBlock(nn.Module):
         out_dim,
         dropout,
         num_res_blocks,
-        temperal_downsample=False,
+        temporal_downsample=False,
         down_flag=False,
     ):
         super().__init__()
@@ -544,7 +544,7 @@ class WanDistResidualDownBlock(nn.Module):
         self.avg_shortcut = AvgDown3D(
             in_dim,
             out_dim,
-            factor_t=2 if temperal_downsample else 1,
+            factor_t=2 if temporal_downsample else 1,
             factor_s=2 if down_flag else 1,
         )
 
@@ -557,7 +557,7 @@ class WanDistResidualDownBlock(nn.Module):
 
         # Add the final downsample block
         if down_flag:
-            mode = "downsample3d" if temperal_downsample else "downsample2d"
+            mode = "downsample3d" if temporal_downsample else "downsample2d"
             self.downsampler = WanDistResample(out_dim, mode=mode)
         else:
             self.downsampler = None
@@ -574,7 +574,7 @@ class WanDistResidualUpBlock(nn.Module):
         out_dim (int): Output dimension
         num_res_blocks (int): Number of residual blocks
         dropout (float): Dropout rate
-        temperal_upsample (bool): Whether to upsample on temporal dimension
+        temporal_upsample (bool): Whether to upsample on temporal dimension
         up_flag (bool): Whether to upsample or not
         non_linearity (str): Type of non-linearity to use
     """
@@ -585,7 +585,7 @@ class WanDistResidualUpBlock(nn.Module):
         out_dim: int,
         num_res_blocks: int,
         dropout: float = 0.0,
-        temperal_upsample: bool = False,
+        temporal_upsample: bool = False,
         up_flag: bool = False,
         non_linearity: str = "silu",
     ):
@@ -597,7 +597,7 @@ class WanDistResidualUpBlock(nn.Module):
             self.avg_shortcut = DupUp3D(
                 in_dim,
                 out_dim,
-                factor_t=2 if temperal_upsample else 1,
+                factor_t=2 if temporal_upsample else 1,
                 factor_s=2,
             )
         else:
@@ -616,7 +616,7 @@ class WanDistResidualUpBlock(nn.Module):
 
         # Add upsampling layer if needed
         if up_flag:
-            upsample_mode = "upsample3d" if temperal_upsample else "upsample2d"
+            upsample_mode = "upsample3d" if temporal_upsample else "upsample2d"
             self.upsampler = WanDistResample(
                 out_dim, mode=upsample_mode, upsample_out_dim=out_dim
             )

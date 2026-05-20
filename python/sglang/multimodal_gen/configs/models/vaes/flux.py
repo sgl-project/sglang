@@ -14,7 +14,7 @@ class FluxVAEArchConfig(VAEArchConfig):
     dim_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_res_blocks: int = 2
     attn_scales: tuple[float, ...] = ()
-    temperal_downsample: tuple[bool, ...] = (False, True, True)
+    temporal_downsample: tuple[bool, ...] = (False, True, True)
     dropout: float = 0.0
 
     is_residual: bool = False

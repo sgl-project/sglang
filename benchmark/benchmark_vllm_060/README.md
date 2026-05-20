@@ -13,7 +13,7 @@ In short, with multi step enabled, in online scenarios that we benchmarked, the 
 | 8    | 2400        | SGLang | 2175.02            | **35.68**   | 17.85       | **14.41**  |
 | 8    | 2400        | vLLM   | 2137.16            | **120.39**  | 17.09       | **158.63** |
 
-### Llama 3.1 70B Insruct 4 x H100 80G
+### Llama 3.1 70B Instruct 4 x H100 80G
 
 | RPS  | Num Prompts | Engine | Median E2E Latency | Median TTFT | Median TPOT | Median ITL |
 |------|-------------|--------|--------------------|-------------|-------------|------------|
@@ -31,7 +31,7 @@ In short, with multi step enabled, in online scenarios that we benchmarked, the 
 | inf  | 5000        | SGLang | 22.03              | **4281.51**             |
 | inf  | 5000        | vLLM   | 21.27              | **4132.37**             |
 
-### Llama 3.1 70B Insruct 4 x H100 80G
+### Llama 3.1 70B Instruct 4 x H100 80G
 
 | RPS  | Num Prompts | Engine | Request throughput | Output token throughput |
 |------|-------------|--------|--------------------|-------------------------|

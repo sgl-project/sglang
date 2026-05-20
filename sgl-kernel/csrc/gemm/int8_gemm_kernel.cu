@@ -684,7 +684,7 @@ torch::Tensor int8_scaled_mm(
   TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
   TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
   TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
-  TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
+  TORCH_CHECK(scales_b.is_contiguous(), "scales_b must be contiguous");
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
