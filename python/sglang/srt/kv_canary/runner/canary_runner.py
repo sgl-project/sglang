@@ -41,7 +41,12 @@ class CanaryLaunchCapacities:
 
     Fields:
         per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
-            launches (sized to the longest sequence the per-forward path may verify in one step).
+            launches. Sized to the total verify entries the per-forward path may produce in one
+            step (= sum_r prefix_lens[r] for the FULL group), upper-bounded by max_bs *
+            max_seq_len_per_req (the req_to_token table extent) and capped by the cuda grid safe
+            ceiling. PerForwardOrchestrator.before_forward asserts the per-step actual sum stays
+            within this capacity, so an undersized capacity fails fast instead of OOB-reading the
+            tail threads of the verify kernel grid.
         per_forward_write_req_capacity: WritePlan row capacity for per-forward writes, also used
             to size the static fb_* PlanInput buffers (= max batch size under cuda graph).
         per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,

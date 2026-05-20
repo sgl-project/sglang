@@ -34,19 +34,20 @@ class CanaryConfig:
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously
             (default 1024); overflow only drops detail beyond row N, the monotonic counter still grows.
         sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
-            additionally walks all alive slots (running ∪ radix-orphan) and verifies them.
+            additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
+            redundancy) and verifies them.
         real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Uniform across head/tail/sweep launches;
             PARTIAL (first 16B, hard cap) is cheap enough to be the default.
         input_check_mode: CanaryInputCheckMode (OFF / ON). ON = canary_write_step additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. ON is only useful when something
-            else (e.g. token_oracle.sampler.fill_expected_inputs) is feeding the expected_* placeholders
+            else (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
-        allreduce_violation_signal: True = end-of-step pump performs cross-rank allreduce on the local
+        allreduce_violation_signal: True = end-of-step pump performs TP- and PP-group allreduce on the local
             is_errored byte so all ranks raise in lockstep; False = each rank raises independently (faster
-            but produces partial-failure logs across TP groups). Default True.
+            but produces partial-failure logs across TP/PP groups). Default True.
     """
 
     mode: Literal["off", "log", "raise"]

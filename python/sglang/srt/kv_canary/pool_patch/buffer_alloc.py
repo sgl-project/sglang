@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Tuple
 
 import torch
@@ -11,13 +12,15 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.srt.kv_canary.config import CanaryConfig
 
-_DEFAULT_REAL_KV_READ_BYTES = 32
+_PARTIAL_REAL_KV_READ_BYTES = 32
 
 
 def resolve_read_bytes(config: CanaryConfig) -> int:
     if config.real_kv_hash_mode is RealKvHashMode.OFF:
         return 0
-    return _DEFAULT_REAL_KV_READ_BYTES
+    if config.real_kv_hash_mode is RealKvHashMode.ALL:
+        return sys.maxsize
+    return _PARTIAL_REAL_KV_READ_BYTES
 
 
 def alloc_canary_buf(

@@ -237,7 +237,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         pre-cleanup "kernel-side LUT[full_pool_size] = -1 → skip" path into "host gather → -1 → skip"
         without losing the sentinel semantics. (Replaces the kernel-side coverage of the deleted
         test_full_to_swa_lut_sentinel_skips_entry; the kernel-side -1 → skip path itself is covered by
-        test_negative_slot_skips_entry in test_write.py.)
+        test_negative_slot_skips_entry in test_write_hand.py.)
         """
         captured: List[torch.Tensor] = []
         with patch.object(

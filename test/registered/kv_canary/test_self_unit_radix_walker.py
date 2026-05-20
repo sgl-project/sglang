@@ -48,6 +48,22 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         self.assertEqual(positions.tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(slots.tolist(), [1, 2, 3, 4, 5])
 
+    def test_walk_includes_locked_nodes_by_default(self):
+        cache = make_radix_cache([[], [1, 2], [3, 4]], device=self.device)
+        locked_node = next(iter(cache.root_node.children.values()))
+        locked_node.lock_ref = 1
+        slots, _, _ = walk_radix_cache_for_canary(radix_cache=cache)
+        self.assertEqual(slots.tolist(), [1, 2, 3, 4])
+
+    def test_walk_unlocked_only_skips_locked(self):
+        cache = make_radix_cache([[], [1, 2], [3, 4]], device=self.device)
+        locked_node = next(iter(cache.root_node.children.values()))
+        locked_node.lock_ref = 1
+        slots, _, _ = walk_radix_cache_for_canary(
+            radix_cache=cache, unlocked_only=True
+        )
+        self.assertEqual(slots.tolist(), [3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()

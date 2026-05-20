@@ -18,8 +18,8 @@ class ViolationLog:
     (kernel_kind is a unique int per (head|tail|sweep, K|V, FULL|SWA) tuple; assigned by the runner).
 
     Ring capacity is sized generously (≥ 1024) so overflow is a non-concern in practice — violations are
-    cold-path and the host raises at the first one anyway. atomicAdd contention on a single counter is also
-    negligible since violation events are rare.
+    cold-path and the host raises at the first one anyway (or just logs it in mode="log"). atomicAdd
+    contention on a single counter is also negligible since violation events are rare.
 
     Derived state (host computes on read; not stored):
         is_errored = violation_write_index[0] > 0
