@@ -7,12 +7,15 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import (
-    canary_plan_step_torch_reference,
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _run_both_and_assert_plan_byte_equal as _run_both_and_assert_byte_equal,
 )
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _allocate_plan_pair,
+    _build_req_to_token,
+    _empty_extras,
+    _make_extras,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -20,202 +23,6 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _DEVICE = torch.device("cuda")
-
-
-def _allocate_plan_pair(
-    *,
-    verify_capacity: int,
-    write_req_capacity: int,
-) -> tuple[VerifyPlan, WritePlan, VerifyPlan, WritePlan]:
-    """Allocate (triton_verify, triton_write, ref_verify, ref_write) plan tensors."""
-    return (
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
-    )
-
-
-def _build_req_to_token(*, max_reqs: int, max_seq_len: int) -> torch.Tensor:
-    """Construct a deterministic [max_reqs, max_seq_len] req_to_token table.
-
-    Slot index = rp * max_seq_len + pos so every (rp, pos) maps to a distinct slot, which lets per-entry
-    assertions reason about which req contributed which slot.
-    """
-    rp_axis = torch.arange(max_reqs, device=_DEVICE, dtype=torch.int32).unsqueeze(1)
-    pos_axis = torch.arange(max_seq_len, device=_DEVICE, dtype=torch.int32).unsqueeze(0)
-    return (rp_axis * max_seq_len + pos_axis).contiguous()
-
-
-def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return four zero-filled length-1 int32 tensors representing an "extras absent" payload."""
-    return (
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-    )
-
-
-def _make_extras(
-    *,
-    slot_indices: list[int],
-    positions: list[int],
-    prev_slot_indices: list[int],
-    capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = len(slot_indices)
-    slots = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    pos = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    if n > 0:
-        slots[:n] = torch.tensor(slot_indices, dtype=torch.int32, device=_DEVICE)
-        pos[:n] = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
-        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int32, device=_DEVICE)
-    num_valid = torch.tensor([n], dtype=torch.int32, device=_DEVICE)
-    return slots, pos, prevs, num_valid
-
-
-def _run_both(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    swa_window_size: int,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-) -> None:
-    extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
-    canary_plan_step(
-        verify_plan_out=triton_verify,
-        write_plan_out=triton_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    canary_plan_step_torch_reference(
-        verify_plan_out=ref_verify,
-        write_plan_out=ref_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    torch.cuda.synchronize()
-
-
-def _run_both_and_assert_byte_equal(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    swa_window_size: int,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-    active_verify_entries: Optional[int] = None,
-    active_write_reqs: Optional[int] = None,
-) -> None:
-    _run_both(
-        triton_verify=triton_verify,
-        triton_write=triton_write,
-        ref_verify=ref_verify,
-        ref_write=ref_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extras=extras,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    _assert_plans_byte_equal(
-        triton_verify=triton_verify,
-        triton_write=triton_write,
-        ref_verify=ref_verify,
-        ref_write=ref_write,
-        active_verify_entries=active_verify_entries,
-        active_write_reqs=active_write_reqs,
-    )
-
-
-def _assert_plans_byte_equal(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-    active_verify_entries: Optional[int] = None,
-    active_write_reqs: Optional[int] = None,
-) -> None:
-    """Byte-equal check on (Triton vs ref) plan outputs.
-
-    Optional ``active_verify_entries`` / ``active_write_reqs`` truncate the comparison to the meaningful
-    prefix; tail entries past the active count are kernel-undefined and need not match byte-equal.
-    """
-    n_verify = (
-        active_verify_entries
-        if active_verify_entries is not None
-        else int(triton_verify.verify_num_valid[0].item())
-    )
-    n_verify_ref = int(ref_verify.verify_num_valid[0].item())
-    assert (
-        n_verify == n_verify_ref
-    ), f"verify_num_valid diverged: triton={n_verify} ref={n_verify_ref}"
-    if n_verify > 0:
-        assert torch.equal(
-            triton_verify.verify_slot_indices[:n_verify],
-            ref_verify.verify_slot_indices[:n_verify],
-        )
-        assert torch.equal(
-            triton_verify.verify_positions[:n_verify],
-            ref_verify.verify_positions[:n_verify],
-        )
-        assert torch.equal(
-            triton_verify.verify_prev_slot_indices[:n_verify],
-            ref_verify.verify_prev_slot_indices[:n_verify],
-        )
-
-    n_write = (
-        active_write_reqs
-        if active_write_reqs is not None
-        else int(triton_write.write_num_valid_reqs[0].item())
-    )
-    n_write_ref = int(ref_write.write_num_valid_reqs[0].item())
-    assert (
-        n_write == n_write_ref
-    ), f"write_num_valid_reqs diverged: triton={n_write} ref={n_write_ref}"
-    assert torch.equal(
-        triton_write.write_offsets[: n_write + 1],
-        ref_write.write_offsets[: n_write + 1],
-    )
-    if n_write > 0:
-        assert torch.equal(
-            triton_write.write_seed_slot_indices[:n_write],
-            ref_write.write_seed_slot_indices[:n_write],
-        )
 
 
 def test_single_req_extend_basic() -> None:
@@ -866,7 +673,6 @@ def test_byte_equal_python_reference() -> None:
     )
 
 
-
 @pytest.mark.parametrize("hardcoded", [True])
 def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
     """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots."""
@@ -935,9 +741,13 @@ def test_bs_boundary_byte_equal_sweep(bs: int) -> None:
     extend_seq_lens = [1] * bs
     max_seq_len = 32
 
-    fb_req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32, device=_DEVICE)
+    fb_req_pool_indices = torch.tensor(
+        req_pool_indices, dtype=torch.int32, device=_DEVICE
+    )
     fb_prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=_DEVICE)
-    fb_extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, device=_DEVICE)
+    fb_extend_seq_lens = torch.tensor(
+        extend_seq_lens, dtype=torch.int32, device=_DEVICE
+    )
     req_to_token = _build_req_to_token(max_reqs=bs + 1, max_seq_len=max_seq_len)
 
     total_verify = sum(min(p, max_seq_len) for p in prefix_lens)
@@ -1058,7 +868,9 @@ def _build_random_plan_inputs(
             ext = rng.randint(1, max_extend)
             prefix_lens.append(pfx)
             extend_lens.append(ext)
-    fb_req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32, device=_DEVICE)
+    fb_req_pool_indices = torch.tensor(
+        req_pool_indices, dtype=torch.int32, device=_DEVICE
+    )
     fb_prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor(extend_lens, dtype=torch.int32, device=_DEVICE)
     rp_axis = torch.arange(max_rp, device=_DEVICE, dtype=torch.int32).unsqueeze(1)
@@ -1108,7 +920,9 @@ def test_plan_pure_random_fuzz_byte_equal() -> None:
         full_to_swa_lut: Optional[torch.Tensor]
         if swa_window_size > 0:
             pool_size = max_rp * max_seq_len
-            full_to_swa_lut = torch.arange(pool_size + 1, dtype=torch.int32, device=_DEVICE)
+            full_to_swa_lut = torch.arange(
+                pool_size + 1, dtype=torch.int32, device=_DEVICE
+            )
         else:
             full_to_swa_lut = None
 
@@ -1171,20 +985,20 @@ def test_plan_random_extend_only() -> None:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
             )
-            assert int(triton_v.verify_num_valid[0].item()) == 0, (
-                f"iteration={iteration}: extend-only batch should have 0 verify entries"
-            )
+            assert (
+                int(triton_v.verify_num_valid[0].item()) == 0
+            ), f"iteration={iteration}: extend-only batch should have 0 verify entries"
             cumsum = 0
             for i, ext in enumerate(extend_lens):
-                assert int(triton_w.write_offsets[i].item()) == cumsum, (
-                    f"iteration={iteration} i={i}: write_offsets mismatch"
-                )
+                assert (
+                    int(triton_w.write_offsets[i].item()) == cumsum
+                ), f"iteration={iteration} i={i}: write_offsets mismatch"
                 cumsum += ext
             assert int(triton_w.write_offsets[bs].item()) == cumsum
             for i in range(bs):
-                assert int(triton_w.write_seed_slot_indices[i].item()) == -1, (
-                    f"iteration={iteration} i={i}: extend-only seed should be -1"
-                )
+                assert (
+                    int(triton_w.write_seed_slot_indices[i].item()) == -1
+                ), f"iteration={iteration} i={i}: extend-only seed should be -1"
         except AssertionError as exc:
             raise AssertionError(
                 f"iteration={iteration} bs={bs} extend_lens={extend_lens} rps={rps}"
@@ -1224,14 +1038,14 @@ def test_plan_random_decode_only() -> None:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
             )
-            assert int(triton_v.verify_num_valid[0].item()) == total_verify, (
-                f"iteration={iteration}: verify_num_valid mismatch"
-            )
+            assert (
+                int(triton_v.verify_num_valid[0].item()) == total_verify
+            ), f"iteration={iteration}: verify_num_valid mismatch"
             for i, (rp, pfx) in enumerate(zip(rps, prefix_lens)):
                 expected_seed = rp * max_seq_len + (pfx - 1)
-                assert int(triton_w.write_seed_slot_indices[i].item()) == expected_seed, (
-                    f"iteration={iteration} i={i}: seed mismatch"
-                )
+                assert (
+                    int(triton_w.write_seed_slot_indices[i].item()) == expected_seed
+                ), f"iteration={iteration} i={i}: seed mismatch"
         except AssertionError as exc:
             raise AssertionError(
                 f"iteration={iteration} bs={bs} prefix_lens={prefix_lens} rps={rps}"
@@ -1272,14 +1086,14 @@ def test_plan_random_mixed_extend_decode() -> None:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
             )
-            assert int(triton_v.verify_num_valid[0].item()) == total_verify, (
-                f"iteration={iteration}: verify_num_valid mismatch expected={total_verify}"
-            )
+            assert (
+                int(triton_v.verify_num_valid[0].item()) == total_verify
+            ), f"iteration={iteration}: verify_num_valid mismatch expected={total_verify}"
             cumsum = 0
             for i, ext in enumerate(extend_lens):
-                assert int(triton_w.write_offsets[i].item()) == cumsum, (
-                    f"iteration={iteration} i={i}: write_offsets[{i}] expected={cumsum}"
-                )
+                assert (
+                    int(triton_w.write_offsets[i].item()) == cumsum
+                ), f"iteration={iteration} i={i}: write_offsets[{i}] expected={cumsum}"
                 cumsum += ext
         except AssertionError as exc:
             raise AssertionError(
@@ -1376,13 +1190,13 @@ def test_plan_random_sweep_extras_only() -> None:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
             )
-            assert int(triton_v.verify_num_valid[0].item()) == n_extras, (
-                f"iteration={iteration}: verify_num_valid expected={n_extras}"
-            )
+            assert (
+                int(triton_v.verify_num_valid[0].item()) == n_extras
+            ), f"iteration={iteration}: verify_num_valid expected={n_extras}"
             for k, slot in enumerate(extra_slots):
-                assert int(triton_v.verify_slot_indices[k].item()) == slot, (
-                    f"iteration={iteration} k={k}: slot mismatch"
-                )
+                assert (
+                    int(triton_v.verify_slot_indices[k].item()) == slot
+                ), f"iteration={iteration} k={k}: slot mismatch"
         except AssertionError as exc:
             raise AssertionError(
                 f"iteration={iteration} bs={bs} n_extras={n_extras} extra_slots={extra_slots}"
@@ -1436,12 +1250,12 @@ def test_plan_random_padding_rows_mixed() -> None:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
             )
-            assert int(triton_v.verify_num_valid[0].item()) == total_verify, (
-                f"iteration={iteration}: verify_num_valid expected={total_verify}"
-            )
-            assert int(triton_w.write_offsets[bs].item()) == total_extend, (
-                f"iteration={iteration}: write_offsets[{bs}] expected={total_extend}"
-            )
+            assert (
+                int(triton_v.verify_num_valid[0].item()) == total_verify
+            ), f"iteration={iteration}: verify_num_valid expected={total_verify}"
+            assert (
+                int(triton_w.write_offsets[bs].item()) == total_extend
+            ), f"iteration={iteration}: write_offsets[{bs}] expected={total_extend}"
         except AssertionError as exc:
             raise AssertionError(
                 f"iteration={iteration} bs={bs} "

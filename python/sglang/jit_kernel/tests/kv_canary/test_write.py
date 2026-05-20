@@ -21,9 +21,10 @@ from sglang.jit_kernel.kv_canary.write import (
     CanaryPseudoMode,
     canary_write_step,
 )
-from sglang.jit_kernel.kv_canary.write_ref import (
-    canary_write_step_torch_reference,
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
 )
+from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write as _run_both
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -48,103 +49,6 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _DEVICE = torch.device("cuda")
-
-
-def _run_both(
-    *,
-    cuda_canary_buf: torch.Tensor,
-    ref_canary_buf: torch.Tensor,
-    plan_cuda,
-    plan_ref,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-    real_kv_sources_cuda: tuple[RealKvSource, ...],
-    real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
-    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-) -> None:
-    canary_write_step(
-        canary_buf=cuda_canary_buf,
-        plan=plan_cuda,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
-        violation_ring=cuda_log.ring,
-        violation_write_index=cuda_log.write_index,
-        slot_run_counter=cuda_log.slot_run_counter,
-        kernel_run_counter=cuda_log.kernel_run_counter,
-        real_kv_sources=real_kv_sources_cuda,
-        real_kv_hash_mode=real_kv_hash_mode,
-    )
-    canary_write_step_torch_reference(
-        canary_buf=ref_canary_buf,
-        plan=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
-        violation_ring=ref_log.ring,
-        violation_write_index=ref_log.write_index,
-        slot_run_counter=ref_log.slot_run_counter,
-        kernel_run_counter=ref_log.kernel_run_counter,
-        real_kv_sources=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
-    )
-    torch.cuda.synchronize()
-
-
-def _run_both_and_assert_buf_and_state_equal(
-    *,
-    cuda_canary_buf: torch.Tensor,
-    ref_canary_buf: torch.Tensor,
-    plan_cuda,
-    plan_ref,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-    real_kv_sources_cuda: tuple[RealKvSource, ...],
-    real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
-    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-) -> None:
-    _run_both(
-        cuda_canary_buf=cuda_canary_buf,
-        ref_canary_buf=ref_canary_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=real_kv_sources_cuda,
-        real_kv_sources_ref=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
-        kernel_kind=kernel_kind,
-    )
-    assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def _setup_pair() -> tuple[torch.Tensor, torch.Tensor]:
