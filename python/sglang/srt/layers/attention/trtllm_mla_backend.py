@@ -229,6 +229,11 @@ def _quantize_fp8_qkv(q, k, v, layer):
 
 
 global_zero_init_workspace_buffer = None
+# cute-dsl needs its own workspace: it overwrites the buffer with split-KV
+# partials, which corrupts the trtllm-gen multiCtasKv counters that rely on the
+# zero-init buffer (they share it under attention-backend=cutedsl_mla, where
+# draft-extend falls back to trtllm-gen) and deadlocks the reduction.
+global_cute_dsl_workspace_buffer = None
 
 
 @dataclass
@@ -296,14 +301,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
-                dtype=torch.int8,
-                device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        if self.backend == "cute-dsl":
+            # Separate buffer from trtllm-gen (see note above); safe to share
+            # among cute-dsl instances.
+            global global_cute_dsl_workspace_buffer
+            if global_cute_dsl_workspace_buffer is None:
+                global_cute_dsl_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.int8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_cute_dsl_workspace_buffer
+        else:
+            global global_zero_init_workspace_buffer
+            if global_zero_init_workspace_buffer is None:
+                global_zero_init_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.int8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
