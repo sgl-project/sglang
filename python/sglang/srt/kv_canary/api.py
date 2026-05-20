@@ -69,7 +69,9 @@ def install_canary(
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
         swa_window_size=int(model_runner.sliding_window_size or 0),
-        token_pool_allocator=getattr(model_runner, "token_to_kv_pool_allocator", None),
+        token_to_kv_pool_allocator=getattr(
+            model_runner, "token_to_kv_pool_allocator", None
+        ),
     )
 
     model_runner.canary_runner = runner

@@ -99,7 +99,7 @@ class CanaryRunner:
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         buffer_groups: Optional[tuple[CanaryBufferGroup, ...]] = None,
-        token_pool_allocator: Optional[object] = None,
+        token_to_kv_pool_allocator: Optional[object] = None,
     ) -> None:
         self.config = config
         self._device = device
@@ -123,7 +123,7 @@ class CanaryRunner:
                 pool=pool,
                 config=config,
                 device=device,
-                allocator=token_pool_allocator,
+                allocator=token_to_kv_pool_allocator,
             )
 
         self._device_state = CanaryDeviceState.allocate(
