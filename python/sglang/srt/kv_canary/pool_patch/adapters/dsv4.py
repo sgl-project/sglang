@@ -8,11 +8,9 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patch.utils import (
     BufInfoTriple,
     alloc_canary_buf,
-    ensure_swa_lut_int32,
     make_packed_source,
     make_row_source,
     splice_segmented_buf_info,
-    swa_index_lut,
     wrap_method,
 )
 
@@ -29,8 +27,6 @@ def attach_dsv4(
     FULL group covers three segments (c4 / indexer / c128) and splices into ``get_contiguous_buf_infos``;
     SWA group is a single-segment row pool and splices into ``get_state_buf_infos``.
     """
-    ensure_swa_lut_int32(pool=pool, allocator=allocator)
-
     full_group = _build_full_group(pool=pool, device=device, read_bytes=read_bytes)
     swa_group = _build_swa_group(pool=pool, device=device, read_bytes=read_bytes)
 
@@ -110,7 +106,7 @@ def _build_swa_group(
             layer_buffer=swa_pool.kv_buffer[0], read_bytes=read_bytes
         ),
         real_kv_sources_v=(),
-        swa_index_lut=swa_index_lut(pool),
+        swa_index_lut=pool.full_to_swa_index_mapping,
     )
 
 

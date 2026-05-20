@@ -42,7 +42,7 @@ class CanaryEndpoint:
             head and tail endpoints on the same (half, group) hold DISTINCT buffers (so they can be
             staged at different forward-pass points without overwriting); sweep endpoint shares its
             buffer with one of head/tail (typically tail — sweep verifies the most recent canary state).
-        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int32, or None. None iff this
+        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. None iff this
             endpoint is on the FULL group.
         real_kv_sources: RealKvSource tuple folded into real_kv_hash. Length 0..4 (kernels.md §2.4.1).
             Empty tuple disables the mixin for this endpoint.

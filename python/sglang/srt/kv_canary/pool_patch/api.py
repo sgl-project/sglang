@@ -62,11 +62,9 @@ def attach_canary_buffers(
 
     Idempotent: calling twice on the same pool raises. To re-attach, detach first.
 
-    allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Required
-    for SWA pools whose ``full_to_swa_index_mapping`` LUT is stored as int64: canary kernels read the
-    LUT as int32, so an int32 mirror is stashed on the pool and the allocator's LUT-mutating methods
-    are monkeypatched to mirror each allocation. Pools with an int32 LUT or no SWA group are left
-    untouched.
+    allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Forwarded
+    to per-pool attachers for any allocator-level integration; canary kernels consume the SWA LUT
+    directly in its native int64 dtype.
     """
     if getattr(pool, _CANARY_ATTACHED_ATTR, False):
         raise RuntimeError(
