@@ -611,13 +611,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # NOTE: We skip the reasoning output of the previous response
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
+                if not isinstance(output_item, ResponseOutputMessage):
+                    continue
                 for content in output_item.content:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": request.instructions,
-                        }
-                    )
+                    if isinstance(content, ResponseOutputText):
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": content.text,
+                            }
+                        )
 
         # Append the new input
         # Responses API supports simple text inputs without chat format
