@@ -38,7 +38,7 @@ class CanaryConfig:
         input_check_mode: CanaryInputCheckMode (OFF / ON). ON = canary_write_step additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. ON is only useful when something
-            else (e.g. mock_model.sampler.fill_expected_inputs) is feeding the expected_* placeholders
+            else (e.g. token_oracle.sampler.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.

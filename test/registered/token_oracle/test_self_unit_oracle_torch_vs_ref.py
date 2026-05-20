@@ -7,7 +7,7 @@ import random
 import torch
 
 from sglang.jit_kernel.kv_canary.verify_ref import splitmix64
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="extra-a-1-gpu-large")

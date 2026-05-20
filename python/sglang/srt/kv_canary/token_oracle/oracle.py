@@ -6,7 +6,7 @@ from typing import Protocol
 import torch
 
 
-class TokenIdOracle(Protocol):
+class TokenOracle(Protocol):
     """Deterministic (req_id, position) -> token_id mapping.
 
     All inputs/outputs live on device. Element-wise:

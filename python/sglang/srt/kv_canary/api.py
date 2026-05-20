@@ -15,7 +15,7 @@ from sglang.srt.kv_canary.runner.canary_runner import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
+    from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
@@ -28,7 +28,7 @@ def install_canary(
     *,
     server_args: "ServerArgs",
     model_runner: "ModelRunner",
-    token_id_oracle_manager: Optional["TokenIdOracleManager"] = None,
+    token_oracle_manager: Optional["TokenOracleManager"] = None,
 ) -> Optional[CanaryRunner]:
     """Build and install canary for a ModelRunner. Returns the CanaryRunner, or None when
     config.mode == "off". The caller is responsible for assigning the return value onto the
@@ -41,7 +41,7 @@ def install_canary(
     3. Build CanaryEndpoint tuple.
     4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
     5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers).
-    6. Bind ``token_id_oracle_manager`` (when provided) so the per-forward input-check path
+    6. Bind ``token_oracle_manager`` (when provided) so the per-forward input-check path
        can fill expected_input_* tensors from the same oracle that drives sampling.
     7. Monkeypatch the model nn.Module's ``.forward`` to bracket the original with
        ``canary_runner.launch_head_kernels(forward_batch)`` +
@@ -79,8 +79,8 @@ def install_canary(
         swa_window_size=int(model_runner.sliding_window_size or 0),
     )
 
-    if token_id_oracle_manager is not None:
-        runner.attach_token_id_oracle_manager(token_id_oracle_manager)
+    if token_oracle_manager is not None:
+        runner.attach_token_oracle_manager(token_oracle_manager)
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
 

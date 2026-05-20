@@ -661,15 +661,15 @@ class Envs:
     SGLANG_PLUGINS = EnvStr("")
 
     # ===================================================================
-    # KV-Canary / Mock-Model (testing-only)
+    # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
     SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
     # Input-id / position verification inside canary_write_step. Only useful
-    # when a mock_model oracle is feeding expected_input_* tensors per forward;
+    # when a token_oracle is feeding expected_input_* tensors per forward;
     # production users never set this. Test harnesses flip it on via
-    # ``mock_model_engine_kwargs`` (test/registered/mock_model/utils.py).
+    # ``token_oracle_engine_kwargs`` (test/registered/token_oracle/utils.py).
     SGLANG_KV_CANARY_INPUT_CHECK = EnvBool(False)
     # KV cache canary perturbation. When >0, the canary install hooks corrupt
     # ``req_to_token_pool`` rows with this per-write probability so the canary
@@ -682,9 +682,9 @@ class Envs:
     # detection value. Requires --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
-    SGLANG_MOCK_MODEL_ORACLE_SEED = EnvInt(0)
+    SGLANG_KV_CANARY_ORACLE_SEED = EnvInt(0)
     # ===================================================================
-    # /KV-Canary / Mock-Model
+    # /KV-Canary / Token-Oracle
     # ===================================================================
 
 

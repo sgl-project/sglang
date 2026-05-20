@@ -1,4 +1,4 @@
-"""End-to-end pipeline-parallel smoke under mock_model + canary."""
+"""End-to-end EAGLE speculative-decoding smoke under token_oracle + canary."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import pytest
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
-from .utils import mock_model_engine_kwargs
+from .utils import token_oracle_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
-    reason="requires PP > 1 support which is not currently implemented"
+    reason="requires EAGLE v2 spec decoding support which is not currently implemented"
 )
 
 
@@ -20,10 +20,10 @@ def _fake_prompt(length: int) -> list[int]:
     return list(range(1, length + 1))
 
 
-def test_pp_no_canary_violation() -> None:
+def test_spec_eagle_no_canary_violation() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
-        **mock_model_engine_kwargs(pp_size=2),
+        **token_oracle_engine_kwargs(speculative_algorithm="EAGLE"),
     )
     try:
         engine.generate(

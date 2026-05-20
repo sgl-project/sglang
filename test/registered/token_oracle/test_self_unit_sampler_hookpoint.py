@@ -9,8 +9,8 @@ the factory with one bound to the new oracle.
 
 from __future__ import annotations
 
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle
-from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
+from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_cuda_ci
