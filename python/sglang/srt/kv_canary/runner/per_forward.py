@@ -109,36 +109,32 @@ class PerForwardOrchestrator:
         if owner.config.mode == "off":
             return
 
-        for pool_idx, groups in enumerate(owner._groups_per_pool):
-            for group in groups:
-                owner._invoke_plan(
-                    plan_input=self._plan_input_per_forward,
-                    verify_plan=self._verify_plan_per_forward,
-                    write_plan=self._write_plan_per_forward,
-                    group=group,
-                )
-                owner._launch_endpoints(
-                    pool_idx=pool_idx,
-                    group=group,
-                    tag_filter=_is_head_tag,
-                    verify_plan=self._verify_plan_per_forward,
-                    forward_batch=forward_batch,
-                )
+        for group in owner._groups:
+            owner._invoke_plan(
+                plan_input=self._plan_input_per_forward,
+                verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
+                group=group,
+            )
+            owner._launch_endpoints(
+                group=group,
+                tag_filter=_is_head_tag,
+                verify_plan=self._verify_plan_per_forward,
+                forward_batch=forward_batch,
+            )
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
         owner = self._owner
         if owner.config.mode == "off":
             return
 
-        for pool_idx, groups in enumerate(owner._groups_per_pool):
-            for group in groups:
-                owner._launch_endpoints(
-                    pool_idx=pool_idx,
-                    group=group,
-                    tag_filter=_is_tail_tag,
-                    verify_plan=self._verify_plan_per_forward,
-                    forward_batch=forward_batch,
-                )
+        for group in owner._groups:
+            owner._launch_endpoints(
+                group=group,
+                tag_filter=_is_tail_tag,
+                verify_plan=self._verify_plan_per_forward,
+                forward_batch=forward_batch,
+            )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

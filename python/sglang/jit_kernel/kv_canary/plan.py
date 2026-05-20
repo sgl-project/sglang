@@ -24,16 +24,16 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
-# Upper bound on bs for the phase-1 block-level cumsum. Reqs larger than this exceed Triton's single-program
-# tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally generous so the
-# wrapper never silently truncates.
+# Upper bound on bs for _plan_offsets_kernel's block-level cumsum. Reqs larger than this exceed Triton's
+# single-program tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally
+# generous so the wrapper never silently truncates.
 _PLAN_BS_BLOCK_SIZE: int = 1024
 
-# Inner-tile width for the verify materialization phase. Each (req, j-tile) program owns this many entries
-# along the j-axis of the (bs, max_verify_per_req) logical grid.
+# Inner-tile width for _plan_entries_kernel. Each (req, j-tile) program owns this many entries along the
+# j-axis of the (bs, max_verify_per_req) logical grid.
 _PLAN_VERIFY_INNER_BLOCK: int = 64
 
-# Inner-tile width for the extras-append phase. Each program copies this many extras into the verify tail.
+# Inner-tile width for _plan_extras_kernel. Each program copies this many extras into the verify tail.
 _PLAN_EXTRAS_INNER_BLOCK: int = 64
 
 

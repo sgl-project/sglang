@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import torch
@@ -44,19 +45,44 @@ logger = logging.getLogger(__name__)
 _PAD_SENTINEL_SLOT: int = 0
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CanaryLaunchCapacities:
+    """Pre-allocation sizes for the per-forward and sweep tensors a CanaryRunner owns. Computed
+    once at install_canary from ServerArgs + ModelRunner metadata; all four fields are upper
+    bounds — actual per-step usage may be smaller but never larger.
+
+    Fields:
+        per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
+            launches (sized to the longest sequence the per-forward path may verify in one step).
+        per_forward_write_req_capacity: WritePlan row capacity for per-forward writes, also used
+            to size the static fb_* PlanInput buffers (= max batch size under cuda graph).
+        per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,
+            one entry per token written in a single forward.
+        sweep_verify_capacity: VerifyPlan row capacity for the radix sweep launch, sized to the
+            pool slot count bounded by the cuda grid safe upper limit.
+    """
+
+    per_forward_verify_capacity: int
+    per_forward_write_req_capacity: int
+    per_forward_write_entry_capacity: int
+    sweep_verify_capacity: int
+
+
 class CanaryRunner:
-    """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives until
-    server shutdown.
+    """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
+    until server shutdown.
 
     Internal state (private — never touched outside this class):
         config: CanaryConfig
         device_state: CanaryDeviceState
-        endpoints_per_pool: tuple[tuple[CanaryEndpoint, ...], ...]  # one tuple per pool
-        verify_plan_per_forward / write_plan_per_forward: VerifyPlan / WritePlan sized for per-forward
-            capacity (= max_batch_size × max_seq_len for verify, max_batch_size for write).
+        groups: tuple[CanaryBufferGroup, ...]  # one entry per group (FULL, optional SWA)
+        endpoints: tuple[CanaryEndpoint, ...]
+        verify_plan_per_forward / write_plan_per_forward: VerifyPlan / WritePlan sized for
+            per-forward capacity.
         plan_input_per_forward: PlanInput with STATIC per-forward fb_* buffers (allocated once,
             mutated in place by before_forward each step).
-        verify_plan_sweep_radix / write_plan_sweep: sized for sweep capacity (= total pool slots).
+        verify_plan_sweep_radix / write_plan_sweep: sized for sweep capacity (= total pool
+            slots).
         step_counter: int, host-side, bumped per forward.
         last_sweep_step: int, host-side.
     """
@@ -65,17 +91,14 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pools: Optional[list["KVCache"]] = None,
+        pool: Optional["KVCache"] = None,
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
-        req_to_token_pool: Optional["ReqToTokenPool"] = None,
+        req_to_token_pool: "ReqToTokenPool",
         radix_cache: Optional["BasePrefixCache"] = None,
-        per_forward_verify_capacity: int,
-        per_forward_write_req_capacity: int,
-        per_forward_write_entry_capacity: int,
-        sweep_verify_capacity: int,
+        launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
-        buffer_groups_per_pool: Optional[list[tuple[CanaryBufferGroup, ...]]] = None,
+        buffer_groups: Optional[tuple[CanaryBufferGroup, ...]] = None,
         token_pool_allocator: Optional[object] = None,
     ) -> None:
         self.config = config
@@ -85,48 +108,34 @@ class CanaryRunner:
         self._radix_cache = radix_cache
         self._swa_window_size = int(swa_window_size)
 
-        if buffer_groups_per_pool is not None:
-            if pools is not None:
+        if buffer_groups is not None:
+            if pool is not None:
                 raise ValueError(
-                    "kv-canary: pass either pools or buffer_groups_per_pool, not both"
+                    "kv-canary: pass either pool or buffer_groups, not both"
                 )
-            self._groups_per_pool = tuple(
-                tuple(groups) for groups in buffer_groups_per_pool
-            )
+            self._groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
         else:
-            if pools is None:
+            if pool is None:
                 raise ValueError(
-                    "kv-canary: either pools or buffer_groups_per_pool must be provided"
+                    "kv-canary: either pool or buffer_groups must be provided"
                 )
-            groups_per_pool: list[tuple[CanaryBufferGroup, ...]] = []
-            for pool in pools:
-                groups_per_pool.append(
-                    attach_canary_buffers(
-                        pool=pool,
-                        config=config,
-                        device=device,
-                        allocator=token_pool_allocator,
-                    )
-                )
-            self._groups_per_pool = tuple(groups_per_pool)
+            self._groups = attach_canary_buffers(
+                pool=pool,
+                config=config,
+                device=device,
+                allocator=token_pool_allocator,
+            )
 
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
 
-        endpoints_per_pool: list[tuple[CanaryEndpoint, ...]] = []
-        for groups in self._groups_per_pool:
-            pool_endpoints: list[CanaryEndpoint] = []
-            for group in groups:
-                pool_endpoints.extend(
-                    build_endpoints_from_group(
-                        group=group, device_state=self._device_state
-                    )
-                )
-            endpoints_per_pool.append(tuple(pool_endpoints))
-        self._endpoints_per_pool: tuple[tuple[CanaryEndpoint, ...], ...] = tuple(
-            endpoints_per_pool
-        )
+        endpoints: list[CanaryEndpoint] = []
+        for group in self._groups:
+            endpoints.extend(
+                build_endpoints_from_group(group=group, device_state=self._device_state)
+            )
+        self._endpoints: tuple[CanaryEndpoint, ...] = tuple(endpoints)
 
         self._step_counter: int = 0
         self._last_sweep_step: int = -1
@@ -134,26 +143,22 @@ class CanaryRunner:
         self._raised: bool = False
         self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
 
-        assert (
-            self._req_to_token_pool is not None
-        ), "kv-canary: req_to_token_pool must be bound at construction"
-
         active: set[CanaryLaunchTag] = set()
-        for endpoints in self._endpoints_per_pool:
-            for endpoint in endpoints:
-                active.add(endpoint.kernel_kind)
+        for endpoint in self._endpoints:
+            active.add(endpoint.kernel_kind)
         self._active_tags: tuple[CanaryLaunchTag, ...] = tuple(
             sorted(active, key=lambda tag: tag.value)
         )
 
         self._per_forward = PerForwardOrchestrator(
             owner=self,
-            per_forward_verify_capacity=per_forward_verify_capacity,
-            per_forward_write_req_capacity=per_forward_write_req_capacity,
-            per_forward_write_entry_capacity=per_forward_write_entry_capacity,
+            per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
+            per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
+            per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
         )
         self._sweep = SweepOrchestrator(
-            owner=self, sweep_verify_capacity=sweep_verify_capacity
+            owner=self,
+            sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
         )
         self._pump = PumpAndAllreduce(owner=self)
         self._violation = ViolationReporter(owner=self)
@@ -276,7 +281,6 @@ class CanaryRunner:
     def _launch_endpoints(
         self,
         *,
-        pool_idx: int,
         group: CanaryBufferGroup,
         tag_filter: Callable[[CanaryLaunchTag], bool],
         verify_plan: VerifyPlan,
@@ -297,7 +301,7 @@ class CanaryRunner:
             if input_ids is not None and input_ids.dtype != torch.int32:
                 input_ids = input_ids.to(torch.int32)
 
-        for endpoint in self._endpoints_per_pool[pool_idx]:
+        for endpoint in self._endpoints:
             if not _endpoint_belongs_to_group(endpoint, group):
                 continue
             if not tag_filter(endpoint.kernel_kind):

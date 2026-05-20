@@ -79,16 +79,14 @@ class PerturbHook:
         if not candidate_slots:
             return
 
-        groups_for_pools: list[tuple[int, CanaryBufferGroup]] = []
-        for pool_idx, groups in enumerate(owner._groups_per_pool):
-            for group in groups:
-                if group.real_kv_sources_k:
-                    groups_for_pools.append((pool_idx, group))
-        if not groups_for_pools:
+        groups_with_real_kv: list[CanaryBufferGroup] = [
+            group for group in owner._groups if group.real_kv_sources_k
+        ]
+        if not groups_with_real_kv:
             return
 
-        pool_pick = int(torch.randint(0, len(groups_for_pools), (1,)).item())
-        _, group = groups_for_pools[pool_pick]
+        group_pick = int(torch.randint(0, len(groups_with_real_kv), (1,)).item())
+        group = groups_with_real_kv[group_pick]
         sources = group.real_kv_sources_k
         source_pick = int(torch.randint(0, len(sources), (1,)).item())
         source = sources[source_pick]

@@ -51,26 +51,24 @@ class SweepOrchestrator:
         if owner._radix_cache is None:
             return
 
-        for pool_idx, groups in enumerate(owner._groups_per_pool):
-            for group in groups:
-                window = owner._swa_window_size if group.kind is PoolKind.SWA else 0
-                radix_input = build_plan_input_radix_sweep(
-                    radix_cache=owner._radix_cache,
-                    swa_window_size=window,
-                    full_to_swa_index_mapping=group.swa_index_lut,
-                )
-                owner._invoke_plan(
-                    plan_input=radix_input,
-                    verify_plan=self._verify_plan_sweep_radix,
-                    write_plan=self._write_plan_sweep,
-                    group=group,
-                )
-                owner._launch_endpoints(
-                    pool_idx=pool_idx,
-                    group=group,
-                    tag_filter=_is_sweep_tag,
-                    verify_plan=self._verify_plan_sweep_radix,
-                    forward_batch=None,
-                )
+        for group in owner._groups:
+            window = owner._swa_window_size if group.kind is PoolKind.SWA else 0
+            radix_input = build_plan_input_radix_sweep(
+                radix_cache=owner._radix_cache,
+                swa_window_size=window,
+                full_to_swa_index_mapping=group.swa_index_lut,
+            )
+            owner._invoke_plan(
+                plan_input=radix_input,
+                verify_plan=self._verify_plan_sweep_radix,
+                write_plan=self._write_plan_sweep,
+                group=group,
+            )
+            owner._launch_endpoints(
+                group=group,
+                tag_filter=_is_sweep_tag,
+                verify_plan=self._verify_plan_sweep_radix,
+                forward_batch=None,
+            )
 
         owner._sweep_passes += 1

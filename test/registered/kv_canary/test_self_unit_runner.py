@@ -15,7 +15,10 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
-from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.kv_canary.runner.canary_runner import (
+    CanaryLaunchCapacities,
+    CanaryRunner,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
@@ -71,13 +74,15 @@ def _make_runner(*, device, config=None, group=None, req_pool=None):
         req_pool = _make_pool(device)
     return CanaryRunner(
         config=config,
-        buffer_groups_per_pool=[(group,)],
+        buffer_groups=(group,),
         device=device,
         req_to_token_pool=req_pool,
-        per_forward_verify_capacity=4,
-        per_forward_write_req_capacity=2,
-        per_forward_write_entry_capacity=8,
-        sweep_verify_capacity=8,
+        launch_capacities=CanaryLaunchCapacities(
+            per_forward_verify_capacity=4,
+            per_forward_write_req_capacity=2,
+            per_forward_write_entry_capacity=8,
+            sweep_verify_capacity=8,
+        ),
     )
 
 
