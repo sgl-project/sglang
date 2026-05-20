@@ -1147,10 +1147,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
-                is_force_reasoning = (
-                    self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
-                )
+                is_force_reasoning = self._get_reasoning_from_request(request)
                 try:
                     parser = ReasoningParser(
                         model_type=reasoning_parser,
@@ -1411,10 +1408,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
-            is_force_reasoning = (
-                self.template_manager.force_reasoning
-                or self._get_reasoning_from_request(request)
-            )
+            is_force_reasoning = self._get_reasoning_from_request(request)
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
                 request.stream_reasoning,
