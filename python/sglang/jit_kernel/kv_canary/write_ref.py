@@ -10,7 +10,7 @@ a violation but the chain still advances on the actual values.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -60,6 +60,17 @@ class WriteEntries:
     pseudo_mismatch_bits: torch.Tensor
     active_reqs: int
     total_entries: int
+
+
+class _InitialChainHashes(NamedTuple):
+    buf_i64: torch.Tensor
+    initial_chain_hashes: torch.Tensor
+    slot_stride_i64: int
+
+
+class _ChainLoopResult(NamedTuple):
+    violation_rows: list[list[int]]
+    total_slots_written: int
 
 
 def canary_write_step_torch_reference(
@@ -212,7 +223,7 @@ def _compute_initial_chain_hashes(
     canary_buf: torch.Tensor,
     seed_slot_indices: torch.Tensor,
     work_device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> _InitialChainHashes:
     buf_i64 = (
         canary_buf.detach()
         .to(device=work_device)
@@ -247,7 +258,11 @@ def _compute_initial_chain_hashes(
         initial_chain_from_seed,
     )
 
-    return buf_i64, initial_chain_hashes, slot_stride_i64
+    return _InitialChainHashes(
+        buf_i64=buf_i64,
+        initial_chain_hashes=initial_chain_hashes,
+        slot_stride_i64=slot_stride_i64,
+    )
 
 
 def _run_chain_loop(
@@ -258,7 +273,7 @@ def _run_chain_loop(
     kernel_kind: CanaryLaunchTag,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
-) -> tuple[list[list[int]], int]:
+) -> _ChainLoopResult:
     violation_rows: list[list[int]] = []
     total_slots_written = 0
 
@@ -312,7 +327,10 @@ def _run_chain_loop(
 
             total_slots_written += 1
 
-    return violation_rows, total_slots_written
+    return _ChainLoopResult(
+        violation_rows=violation_rows,
+        total_slots_written=total_slots_written,
+    )
 
 
 def _emit_write_violations(

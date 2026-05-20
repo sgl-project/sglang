@@ -11,7 +11,7 @@ indexing positionally.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -43,6 +43,25 @@ _FIELD_TOKEN: int = 0
 _FIELD_POSITION: int = 1
 _FIELD_PREV_HASH: int = 2
 _FIELD_REAL_KV_HASH: int = 3
+
+
+class _ActiveVerifyEntries(NamedTuple):
+    slot_indices: torch.Tensor
+    expected_positions: torch.Tensor
+    prev_slot_indices: torch.Tensor
+    active: int
+
+
+class _StoredAndPrevFields(NamedTuple):
+    stored_tokens: torch.Tensor
+    stored_positions: torch.Tensor
+    stored_chain_hashes: torch.Tensor
+    stored_real_kv_hashes: torch.Tensor
+    prev_tokens: torch.Tensor
+    prev_positions: torch.Tensor
+    prev_chain_hashes: torch.Tensor
+    prev_real_kv_hashes: torch.Tensor
+    is_chain_head: torch.Tensor
 
 
 def canary_verify_step_torch_reference(
@@ -139,7 +158,7 @@ def _load_active_verify_entries(
     work_device: torch.device,
     pad_sentinel_slot: int,
     slot_run_counter: torch.Tensor,
-) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
+) -> Optional[_ActiveVerifyEntries]:
     num_valid = int(
         plan.verify_slot_indices.new_empty(()).copy_(plan.verify_num_valid[0]).item()
     )
@@ -175,7 +194,12 @@ def _load_active_verify_entries(
         if active <= 0:
             return None
 
-    return slot_indices, expected_positions, prev_slot_indices, active
+    return _ActiveVerifyEntries(
+        slot_indices=slot_indices,
+        expected_positions=expected_positions,
+        prev_slot_indices=prev_slot_indices,
+        active=active,
+    )
 
 
 def _load_stored_and_prev_fields(
@@ -184,17 +208,7 @@ def _load_stored_and_prev_fields(
     slot_indices: torch.Tensor,
     prev_slot_indices: torch.Tensor,
     work_device: torch.device,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+) -> _StoredAndPrevFields:
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
     slot_stride_i64 = (
         int(buf_i64.shape[1]) // 1
@@ -220,16 +234,16 @@ def _load_stored_and_prev_fields(
     prev_chain_hashes = buf_i64[safe_prev, _FIELD_PREV_HASH]
     prev_real_kv_hashes = buf_i64[safe_prev, _FIELD_REAL_KV_HASH]
 
-    return (
-        stored_tokens,
-        stored_positions,
-        stored_chain_hashes,
-        stored_real_kv_hashes,
-        prev_tokens,
-        prev_positions,
-        prev_chain_hashes,
-        prev_real_kv_hashes,
-        is_chain_head,
+    return _StoredAndPrevFields(
+        stored_tokens=stored_tokens,
+        stored_positions=stored_positions,
+        stored_chain_hashes=stored_chain_hashes,
+        stored_real_kv_hashes=stored_real_kv_hashes,
+        prev_tokens=prev_tokens,
+        prev_positions=prev_positions,
+        prev_chain_hashes=prev_chain_hashes,
+        prev_real_kv_hashes=prev_real_kv_hashes,
+        is_chain_head=is_chain_head,
     )
 
 
