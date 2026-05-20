@@ -58,6 +58,7 @@ concurrency:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_GPU_HEALTH_SNAPSHOT: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.

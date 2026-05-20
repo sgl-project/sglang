@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
-from sglang.srt.debug_utils import cuda_coredump
+from sglang.srt.debug_utils import cuda_coredump, gpu_health
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
@@ -148,6 +148,10 @@ def run_unittest_files(
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
         cuda_coredump.cleanup_dump_dir()
+    gpu_health_enabled = gpu_health.is_enabled()
+    if gpu_health_enabled:
+        gpu_health.cleanup_dump_dir()
+        gpu_health.write_snapshot("baseline")
 
     tic = time.perf_counter()
     success = True
@@ -286,6 +290,10 @@ def run_unittest_files(
 
     if coredump_enabled and not success:
         cuda_coredump.report()
+
+    if gpu_health_enabled:
+        gpu_health.write_snapshot("final")
+        gpu_health.report()
 
     if success:
         logger.info(f"Success. Time elapsed: {elapsed_total:.2f}s")
