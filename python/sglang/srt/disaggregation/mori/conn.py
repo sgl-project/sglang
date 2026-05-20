@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -278,8 +279,13 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
+        use_xgmi = envs.SGLANG_MORI_USE_XGMI.get()
+
         if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+
+        if use_xgmi:
+            os.environ["MORI_DISABLE_AUTO_XGMI"] = "0"
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)
@@ -294,23 +300,8 @@ class MoriKVManager(CommonKVManager):
         engine = IOEngine(engine_key, config)
         poll_mode = PollCqMode.POLLING
 
-        # Number of RDMA Queue Pairs (QPs) used per transfer operation.
-        # Higher values can increase parallelism and bandwidth utilization.
-        # Default: 4
         qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 4)
-
-        # Number of RDMA work requests posted in a single batch to each QP.
-        # Larger batch sizes reduce per-operation overhead and improve throughput
-        # at the cost of higher latency. Use -1 for automatic sizing based on
-        # the number of merged work requests and available endpoints.
-        # Default: -1 (automatic)
         post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
-
-        # Number of worker threads in the RDMA executor thread pool.
-        # Each worker handles RDMA operations on a separate CPU core (with affinity).
-        # More workers can improve parallelism for large batch transfers across
-        # multiple QPs, but excessive threads may cause contention.
-        # Default: 4
         num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 4)
 
         rdma_cfg = RdmaBackendConfig(
@@ -777,9 +768,11 @@ class MoriKVManager(CommonKVManager):
 
         if self.is_mla_backend:
             layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
-            src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
-            )
+            (
+                src_descs,
+                dst_descs,
+                layers_current_pp_stage,
+            ) = self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
                     self._submit_batch_transfer_plan(
@@ -1390,7 +1383,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,
