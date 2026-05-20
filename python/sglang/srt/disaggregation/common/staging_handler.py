@@ -133,6 +133,7 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: "DecodeRequest") -> None:
+        decode_req._staging_last_scatter_submitted = threading.Event()
         self._room_to_decode_req[room] = decode_req
 
     def unregister_decode_req(self, room: int) -> None:
@@ -225,7 +226,8 @@ class DecodeStagingHandler:
 
         Called from decode_thread.  Sets ``_scatter_event`` **before**
         ``_staging_last_scatter_submitted`` so the main thread sees the
-        event when it checks the flag (CPython GIL guarantees ordering).
+        event when it checks the flag.  A threading.Event provides the
+        required memory-visibility guarantee (previously relied on the GIL).
         """
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
@@ -242,7 +244,7 @@ class DecodeStagingHandler:
             event.record(self.staging_allocator._scatter_stream)
             decode_req._scatter_event = event
             decode_req._scatter_alloc_id = alloc_id
-            decode_req._staging_last_scatter_submitted = True
+            decode_req._staging_last_scatter_submitted.set()
         else:
             decode_req._staging_scatter_done = True
         return True
@@ -273,7 +275,8 @@ class DecodeStagingHandler:
                     chunk_events.pop(i)
                     self._free_and_send_watermark(alloc_id, decode_req)
 
-        if not getattr(decode_req, "_staging_last_scatter_submitted", False):
+        submitted_event = getattr(decode_req, "_staging_last_scatter_submitted", None)
+        if submitted_event is None or not submitted_event.is_set():
             return
 
         event = getattr(decode_req, "_scatter_event", None)

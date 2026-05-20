@@ -58,7 +58,7 @@ exec numactl {numactl_args} {old_executable} "$@"'''
 @contextmanager
 def _mp_set_executable(executable: str, debug_str: str):
     start_method = multiprocessing.get_start_method()
-    assert start_method == "spawn", f"{start_method=}"
+    assert start_method in ("spawn", "forkserver"), f"{start_method=}"
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
