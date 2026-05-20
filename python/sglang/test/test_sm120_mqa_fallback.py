@@ -12,7 +12,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
+from sglang.srt.layers.attention.dsa.sm120_mqa_fallback import (
     _dequant_fp8_with_scale_suffix,
     compute_paged_mqa_schedule_metadata,
     sm120_fp8_mqa_logits,

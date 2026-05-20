@@ -72,7 +72,7 @@ class DpPaddingMode(IntEnum):
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
-        # to enable symmetric memory optimization (needed for NSA CP, etc.).
+        # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
             return DpPaddingMode.SUM_LEN
 
