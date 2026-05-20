@@ -7,14 +7,11 @@
 # startup (per DEC-8).
 #
 # DEV-ONLY launcher. The DS startup validator refuses --enable-double-sparsity
-# until the page-table adapter milestone lands; this script sets the dev
-# override env vars so the rest of the boot pipeline still runs end-to-end
-# for smoke tests. The first request will still raise NotImplementedError
-# from the per-step hook (the adapter is the next milestone). Production
-# deployments MUST drop both env vars below.
-
-export SGLANG_DS_ALLOW_NO_ADAPTER="${SGLANG_DS_ALLOW_NO_ADAPTER:-1}"
-export SGLANG_DS_ALLOW_PLACEHOLDER="${SGLANG_DS_ALLOW_PLACEHOLDER:-1}"
+# The page-table adapter is now in place; production deployments boot
+# without any DS dev-override environment variable. The previous
+# adapter-bypass and placeholder-selector overrides were removed;
+# production must call bind_runtime_data with a real channel mask +
+# page signature table before serving.
 
 set -euo pipefail
 

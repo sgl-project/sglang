@@ -1804,10 +1804,19 @@ class DeepseekV2AttentionMLA(
                 )
             )
 
+            req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+            req_to_token = (
+                req_to_token_pool.req_to_token
+                if req_to_token_pool is not None
+                else None
+            )
             return expand_ds_selection_to_topk_indices(
                 selected_indices=selected_indices,
                 valid_lengths=valid_lengths,
                 page_size=self.double_sparsity_selector.page_size,
+                req_to_token=req_to_token,
+                req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
+                seq_lens=getattr(forward_batch, "seq_lens", None),
             )
 
         return self.indexer(

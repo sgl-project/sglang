@@ -191,3 +191,65 @@ def reset_for_testing() -> None:
                     pass
         _metric_objs.clear()
         _metrics_registered = False
+
+
+# ---------------------------------------------------------------------------
+# Error taxonomy (AC-3 observability)
+# ---------------------------------------------------------------------------
+
+DS_ERROR_CLASSES = (
+    "bad_mask",
+    "bad_adapter_input",
+    "selector_runtime_error",
+    "rank_mismatch",
+)
+
+
+def record_error(cls: str, *, message: str = "", request_id: str = "") -> None:
+    """Record a DS production failure.
+
+    Increments the Prometheus counter `sglang_double_sparsity_errors_total{cls}`
+    (best-effort; silent when `prometheus_client` is unavailable) and emits a
+    WARNING-level structured log line so operators see the failure class,
+    request_id, and message.
+
+    Raises:
+        ValueError: when `cls` is not one of `DS_ERROR_CLASSES`. Callers
+        must use the named classes to keep the label set bounded.
+    """
+    if cls not in DS_ERROR_CLASSES:
+        raise ValueError(
+            f"Unknown DS error class {cls!r}; must be one of {DS_ERROR_CLASSES!r}."
+        )
+    try:
+        from prometheus_client import Counter as _Counter
+        global _DS_ERRORS_COUNTER
+        try:
+            counter = _DS_ERRORS_COUNTER
+        except NameError:
+            counter = None
+        if counter is None:
+            try:
+                counter = _Counter(
+                    "sglang_double_sparsity_errors_total",
+                    "Double Sparsity production failures by class.",
+                    ["cls"],
+                )
+                _DS_ERRORS_COUNTER = counter
+            except ValueError:
+                # Already registered in another import path.
+                counter = None
+        if counter is not None:
+            counter.labels(cls=cls).inc()
+    except ImportError:
+        pass
+
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+    _logger.warning(
+        "double_sparsity error cls=%s request_id=%s message=%s",
+        cls,
+        request_id,
+        message,
+    )
+

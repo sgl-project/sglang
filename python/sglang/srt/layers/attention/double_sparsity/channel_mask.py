@@ -64,6 +64,17 @@ _REQUIRED_METADATA_FIELDS = (
 _SUPPORTED_DTYPES = ("fp8_e4m3", "bfloat16")
 
 
+class DoubleSparsityChannelMaskMissing(FileNotFoundError):
+    """Channel-mask file is absent (typed)."""
+
+
+class DoubleSparsityChannelMaskCorrupt(ValueError):
+    """Channel-mask file present but content is corrupt: schema drift,
+    hash mismatch, dtype mismatch, out-of-range channel selection, OR
+    value-domain corruption (NaN / Inf / all-zero per-row weights).
+    """
+
+
 @dataclass
 class ChannelMask:
     """Loaded channel mask payload + metadata."""
@@ -126,7 +137,7 @@ def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
     if not isinstance(path, str) or not path:
         raise ValueError("channel mask file path must be a non-empty string.")
     if not os.path.isfile(path):
-        raise FileNotFoundError(
+        raise DoubleSparsityChannelMaskMissing(
             f"channel mask file not found at {path!r}. Set "
             "'channel_mask_path' in --double-sparsity-config to a readable file."
         )
@@ -201,10 +212,36 @@ def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
                 "with a current calibrate.py."
             )
 
+    # Value-domain validation: NaN, +/-Inf, or all-zero per-row weights
+    # silently degrade compute_page_scores into NaN / flat top-K and yield
+    # arbitrary selections. Reject at startup with a typed exception.
+    if channel_weights.numel() > 0:
+        cw_float = channel_weights.to(torch.float32)
+        if bool(torch.isnan(cw_float).any().item()):
+            raise DoubleSparsityChannelMaskCorrupt(
+                f"channel mask file {path!r} channel_weights contain NaN. "
+                "The file's hash may still match, but NaN weights produce "
+                "NaN scores and arbitrary top-K. Recalibrate."
+            )
+        if bool(torch.isinf(cw_float).any().item()):
+            raise DoubleSparsityChannelMaskCorrupt(
+                f"channel mask file {path!r} channel_weights contain +/-Inf. "
+                "Recalibrate with a current calibrate.py."
+            )
+        # All-zero per-(layer, head) row: collapses the projection to zero
+        # for that row → all pages tie at score 0 → degenerate top-K.
+        per_row_abs_sum = cw_float.abs().sum(dim=-1)
+        if bool((per_row_abs_sum == 0).any().item()):
+            raise DoubleSparsityChannelMaskCorrupt(
+                f"channel mask file {path!r} contains at least one all-zero "
+                "channel_weights row (per (layer, head)). Such rows degrade "
+                "top-K into ties at score 0; recalibrate."
+            )
+
     expected_hash = raw_metadata["content_sha256"]
     actual_hash = compute_content_sha256(channel_selection, channel_weights)
     if expected_hash != actual_hash:
-        raise ValueError(
+        raise DoubleSparsityChannelMaskCorrupt(
             f"channel mask file {path!r} content hash mismatch: metadata "
             f"reports {expected_hash[:12]}... but recompute yields {actual_hash[:12]}.... "
             "The file is corrupted or was edited after calibration."

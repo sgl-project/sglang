@@ -1130,8 +1130,11 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Load for DP balance
     load: GetLoadsReqOutput = None
-    # Customized info
+    # Customized info (per-output-token accumulator)
     customized_info: Optional[Dict[str, List[Any]]] = None
+    # Per-request summary (one dict per request, NOT per output token).
+    # Used by Double Sparsity to surface request-level stats in meta_info.
+    per_request_summary: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request

@@ -4,7 +4,8 @@ This is the **placeholder** implementation. It returns deterministic
 sequence-order-ascending logical page IDs so that the FlashMLA block-table
 plumbing in ``DeepseekV2AttentionMLA.forward_core`` can be wired and tested
 end-to-end before real selection kernels land. The placeholder guard refuses
-to serve real traffic unless ``SGLANG_DS_ALLOW_PLACEHOLDER=1`` is set.
+to serve real traffic; production must call ``bind_runtime_data`` with the
+real ``PageSignatureTable`` and ``ChannelMask`` before serving.
 
 The class does NOT inherit from any HiSparse base and is NOT registered in
 ``_ALGORITHM_REGISTRY``.
@@ -12,7 +13,6 @@ The class does NOT inherit from any HiSparse base and is NOT registered in
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -28,6 +28,23 @@ if TYPE_CHECKING:
     )
 
 
+class DoubleSparsityRebindError(RuntimeError):
+    """Raised when ``bind_runtime_data`` is called a second time with
+    different objects than the first call. Re-binding with the SAME
+    objects (identity check) is a no-op; binding with different objects
+    is a contract violation because CUDA-graph capture and TP setup
+    cache references to the first set.
+    """
+
+
+class DoubleSparsityTPMisconfigured(RuntimeError):
+    """Raised at startup or at ``bind_runtime_data`` time when a TP world
+    size > 1 is detected with no ``process_group`` provided. A missing
+    process group would silently turn the page-score all-reduce into a
+    no-op and produce divergent ``selected_indices`` across ranks.
+    """
+
+
 class DoubleSparsitySelector:
     """Sequence-order-ascending top-K logical-page selector.
 
@@ -37,7 +54,8 @@ class DoubleSparsitySelector:
       deterministic ascending logical-page IDs so the downstream FlashMLA
       wiring is exercisable in unit tests before real selection kernels and
       a real channel mask are wired. Production serving is refused by the
-      placeholder guard unless ``SGLANG_DS_ALLOW_PLACEHOLDER=1`` is set.
+      placeholder guard until ``bind_runtime_data`` flips the selector
+      into real mode.
 
     * **Real** — after :meth:`bind_runtime_data` is called with a populated
       :class:`PageSignatureTable` and a loaded :class:`ChannelMask`, the
@@ -85,7 +103,30 @@ class DoubleSparsitySelector:
         Both arguments must be non-None and shape-compatible. Subsequent
         calls to ``retrieve_topk`` use the real score → all-reduce → top-K
         flow from :mod:`selection_kernel`.
+
+        Idempotence contract: a second call with the SAME object
+        identities for ``page_signature_table``, ``channel_mask``, and
+        ``process_group`` is a no-op. A second call with any different
+        object raises :class:`DoubleSparsityRebindError` to prevent
+        silent invalidation of CUDA-graph buffers and TP state captured
+        on the first bind.
         """
+
+        if not self.IS_PLACEHOLDER:
+            same_objects = (
+                self.page_signature_table is page_signature_table
+                and self.channel_mask is channel_mask
+                and self.process_group is process_group
+            )
+            if same_objects:
+                return
+            raise DoubleSparsityRebindError(
+                "bind_runtime_data was called a second time with different "
+                "objects. CUDA-graph capture and TP setup may have cached "
+                "references to the first bind; swapping silently would "
+                "corrupt those references. To rebind, construct a new "
+                "DoubleSparsitySelector."
+            )
 
         if page_signature_table is None:
             raise ValueError("page_signature_table is required for real selection.")
@@ -212,21 +253,41 @@ class DoubleSparsitySelector:
         return selected_indices, valid_lengths
 
 
+def assert_tp_configured(
+    selector: DoubleSparsitySelector, *, tp_world_size: int
+) -> None:
+    """Fail fast at startup if TP world size > 1 but the selector has no
+    process group.
+
+    A missing process group would silently no-op the page-score
+    all-reduce inside :mod:`selection_kernel` and produce divergent
+    ``selected_indices`` across ranks. Refuse to serve.
+    """
+    if tp_world_size <= 1:
+        return
+    if getattr(selector, "process_group", None) is None:
+        raise DoubleSparsityTPMisconfigured(
+            f"Double Sparsity selector at tp_world_size={tp_world_size} "
+            "must be bound with a non-None process_group. Without it the "
+            "page-score all-reduce becomes a no-op and ranks diverge."
+        )
+
+
 def assert_real_selector_or_placeholder_allowed(selector: DoubleSparsitySelector) -> None:
     """Refuse to serve real traffic when the placeholder selector is live.
 
-    Set ``SGLANG_DS_ALLOW_PLACEHOLDER=1`` to bypass — intended only for unit
-    tests and smoke tests that exercise the wiring without depending on real
-    selection kernels.
+    ``bind_runtime_data`` is the only sanctioned way to flip a selector
+    out of placeholder mode in production; tests that want to exercise a
+    real selector without binding real runtime data can either call
+    ``bind_runtime_data`` with synthetic page signatures and channel
+    mask, or build a selector instance via ``object.__new__`` and toggle
+    ``IS_PLACEHOLDER`` directly.
     """
 
     if not getattr(selector, "IS_PLACEHOLDER", False):
         return
-    if os.environ.get("SGLANG_DS_ALLOW_PLACEHOLDER") == "1":
-        return
     raise RuntimeError(
         "Double Sparsity is built with the placeholder selector. Refusing to serve "
-        "production traffic. Land the real selection kernels and channel-mask "
-        "projection before enabling this in production, or set "
-        "SGLANG_DS_ALLOW_PLACEHOLDER=1 if this is an explicit test invocation."
+        "production traffic. Call DoubleSparsitySelector.bind_runtime_data with the "
+        "real PageSignatureTable and ChannelMask before serving."
     )

@@ -1739,6 +1739,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
+            # Per-request summary channel: v is a list of length bs, one dict
+            # per request. Unpacks to a single dict per request in meta_info
+            # (NOT a list of per-output-token dicts). Used by Double Sparsity.
+            if getattr(recv_obj, "per_request_summary", None):
+                for k, v in recv_obj.per_request_summary.items():
+                    meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
