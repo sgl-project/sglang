@@ -15,19 +15,18 @@ from sglang.srt.kv_canary.endpoint import (
     build_endpoints_from_group,
 )
 from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
-from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+from sglang.srt.kv_canary.violation_state import CanaryDeviceState, CanaryHostState
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -67,45 +66,30 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pool: Optional["KVCache"] = None,
+        buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: "ReqToTokenPool",
         radix_cache: Optional["BasePrefixCache"] = None,
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
-        buffer_groups: Optional[tuple[CanaryBufferGroup, ...]] = None,
-        token_to_kv_pool_allocator: Optional[object] = None,
     ) -> None:
         self.config = config
         self._device = device
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = int(swa_window_size)
 
-        if buffer_groups is not None:
-            if pool is not None:
-                raise ValueError(
-                    "kv-canary: pass either pool or buffer_groups, not both"
-                )
-            self._groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
-        else:
-            if pool is None:
-                raise ValueError(
-                    "kv-canary: either pool or buffer_groups must be provided"
-                )
-            self._groups = attach_canary_buffers(
-                pool=pool,
-                config=config,
-                device=device,
-                allocator=token_to_kv_pool_allocator,
-            )
+        self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
+        self._host_state = CanaryHostState.allocate(
+            config=config, num_tags=len(CanaryLaunchTag)
+        )
 
         endpoints: list[CanaryEndpoint] = []
-        for group in self._groups:
+        for group in self._buffer_groups:
             endpoints.extend(
                 build_endpoints_from_group(group=group, device_state=self._device_state)
             )
@@ -118,53 +102,55 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
-        self._pump = PumpAndAllreduce(
+        self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
             device=device,
             device_state=self._device_state,
+            host_state=self._host_state,
             tp_group=tp_group,
         )
-        self._sweep = SweepOrchestrator(
+        self._sweep_orchestrator = SweepOrchestrator(
             config=config,
             device=device,
             device_state=self._device_state,
-            groups=self._groups,
+            buffer_groups=self._buffer_groups,
             endpoints=self._endpoints,
             req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
             sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
-            pump=self._pump,
+            pump_and_allreduce=self._pump_and_allreduce,
         )
-        self._violation = ViolationReporter(
+        self._violation_reporter = ViolationReporter(
             config=config,
             device_state=self._device_state,
-            pump=self._pump,
+            pump_and_allreduce=self._pump_and_allreduce,
         )
-        self._perturb = PerturbHook(
+        self._perturb_hook = PerturbHook(
             config=config,
             req_to_token_pool=req_to_token_pool,
-            groups=self._groups,
+            buffer_groups=self._buffer_groups,
         )
-        self._per_forward = PerForwardOrchestrator(
+        self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,
             device=device,
             device_state=self._device_state,
-            groups=self._groups,
+            buffer_groups=self._buffer_groups,
             endpoints=self._endpoints,
             req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
-            perturb=self._perturb,
+            perturb_hook=self._perturb_hook,
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
         )
-        self._health = HealthAndStats(
+        self._health_and_stats = HealthAndStats(
             config=config,
             device=device,
             device_state=self._device_state,
+            host_state=self._host_state,
             active_tags=self._active_tags,
-            pump=self._pump,
-            sweep=self._sweep,
+            pump_and_allreduce=self._pump_and_allreduce,
+            sweep_orchestrator=self._sweep_orchestrator,
         )
 
         if radix_cache is not None:
@@ -176,22 +162,22 @@ class CanaryRunner:
 
     @property
     def step_counter(self) -> int:
-        return self._pump.step_counter
+        return self._pump_and_allreduce.step_counter
 
     @property
     def sweep_passes(self) -> int:
-        return self._sweep.sweep_passes
+        return self._sweep_orchestrator.sweep_passes
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
-        self._sweep.attach_radix_cache(radix_cache)
-        self._perturb.attach_radix_cache(radix_cache)
+        self._sweep_orchestrator.attach_radix_cache(radix_cache)
+        self._perturb_hook.attach_radix_cache(radix_cache)
 
     def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
         """Bind the OracleSamplerHook returned by install_oracle_sampler so the per-forward
         input-check path (input_check_mode == ON) can fill expected_input_* tensors from the
         same oracle that drives sampling.
         """
-        self._per_forward.attach_oracle_sampler_hook(hook)
+        self._per_forward_orchestrator.attach_oracle_sampler_hook(hook)
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
@@ -207,42 +193,34 @@ class CanaryRunner:
         from the monkey-patched ``model.forward`` so they are captured (and auto-replayed) the
         same way the model itself is.
         """
-        self.before_forward(forward_batch)
+        self._before_forward(forward_batch)
         try:
             yield
         finally:
-            self.end_of_step()
+            self._end_of_step()
 
-    def before_forward(self, forward_batch: "ForwardBatch") -> None:
-        """Host-side prep (perturb + plan-input fill). Runs OUTSIDE the cuda-graph capture
-        region. Prefer ``with_forward_pass`` over calling this + ``end_of_step`` directly.
-        """
-        self._per_forward.before_forward(forward_batch)
+    def _before_forward(self, forward_batch: "ForwardBatch") -> None:
+        self._per_forward_orchestrator.before_forward(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
         ``model.forward`` - kernels here are captured into the cuda graph.
         """
-        self._per_forward.launch_head_kernels(forward_batch)
+        self._per_forward_orchestrator.launch_head_kernels(forward_batch)
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
-        self._per_forward.launch_tail_kernels(forward_batch)
+        self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def end_of_step(self) -> None:
-        """Sweep + async D2H pump + step bump + drain previous pump + allreduce + raise.
-
-        Host-side, runs in ``ModelRunner.forward`` AFTER ``graph_runner.replay()`` /
-        ``model.forward()`` returns.
-        """
+    def _end_of_step(self) -> None:
         if self.config.mode == "off":
             return
 
-        self._sweep.maybe_run_sweep()
-        any_rank_errored = self._pump.pump_and_drain()
-        self._health.health_check_step()
-        self._health.print_periodic_stats()
-        self._perturb.undo_after_step()
+        self._sweep_orchestrator.maybe_run_sweep()
+        any_rank_errored = self._pump_and_allreduce.pump_and_drain()
+        self._health_and_stats.health_check_step()
+        self._health_and_stats.print_periodic_stats()
+        self._perturb_hook.undo_after_step()
 
-        if any_rank_errored and not self._violation.is_raised:
-            self._violation.raise_violation()
+        if any_rank_errored and not self._violation_reporter.is_raised:
+            self._violation_reporter.raise_violation()

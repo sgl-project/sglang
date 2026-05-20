@@ -60,7 +60,7 @@ class ViolationLog:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryDeviceState:
-    """All device-side state owned by one CanaryRunner instance.
+    """Device-side state owned by one CanaryRunner instance.
 
     One instance per ModelRunner. Held on the same device as the KV pool. All tensors are allocated up
     front (sizes fixed by CanaryConfig + cuda-graph capture capacity) and reused across forward steps —
@@ -78,35 +78,14 @@ class CanaryDeviceState:
         slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
             view-handed-to-kernel pattern as kernel_run_counters; each launch adds its active entry
             count to its slot. Used for periodic stats ("protected N tokens").
-        violation_signal_host: Pinned-host uint8 scalar, shape [1]. async D2H snapshot of
-            (violation_log.violation_write_index > 0). Snapshotted on a side stream at end_of_step N
-            (§6.4) and consumed at start of step N+1 after pump_event.synchronize(); this 1-step delay
-            is intentional — bug is detected one step later but forward path stays sync-free. Slot
-            contents at raise time may already have been overwritten by step N+1's head/tail; the
-            violation_ring row (kernel-side snapshot) is the authoritative record, not live canary_buf.
         allreduce_buf: Device byte buffer used for cross-rank allreduce of is_errored, shape [1], uint8.
             Only allocated when CanaryConfig.allreduce_violation_signal is True.
-        allreduce_signal_host: Pinned-host uint8 scalar, shape [1]. async D2H mirror of allreduce_buf
-            after the cross-rank reduction. Same 1-step delay pattern as violation_signal_host: staged
-            on the alt stream at end_of_step N and read at start of step N+1. Only allocated when
-            CanaryConfig.allreduce_violation_signal is True.
-        kernel_run_counters_host: Pinned-host int64 mirror of kernel_run_counters, shape [num_tags].
-            Health watchdog stages a D2H copy here on the alt stream and reads on the next call.
-        slot_run_counters_sum_host: Pinned-host int64 scalar, shape [1]. Stat path stages
-            ``slot_run_counters.sum()`` here on the alt stream and reads on the next call.
-        violation_write_index_host: Pinned-host int32 mirror of violation_log.violation_write_index,
-            shape [1]. Stat path stages a D2H copy here on the alt stream and reads on the next call.
     """
 
     violation_log: ViolationLog
     kernel_run_counters: torch.Tensor
     slot_run_counters: torch.Tensor
-    violation_signal_host: torch.Tensor
     allreduce_buf: Optional[torch.Tensor]
-    allreduce_signal_host: Optional[torch.Tensor]
-    kernel_run_counters_host: torch.Tensor
-    slot_run_counters_sum_host: torch.Tensor
-    violation_write_index_host: torch.Tensor
 
     @classmethod
     def allocate(
@@ -125,11 +104,60 @@ class CanaryDeviceState:
         )
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
-        violation_signal_host = torch.zeros(1, dtype=torch.uint8, pin_memory=True)
         allreduce_buf: Optional[torch.Tensor] = None
-        allreduce_signal_host: Optional[torch.Tensor] = None
         if config.allreduce_violation_signal:
             allreduce_buf = torch.zeros(1, dtype=torch.uint8, device=device)
+        return cls(
+            violation_log=violation_log,
+            kernel_run_counters=kernel_run_counters,
+            slot_run_counters=slot_run_counters,
+            allreduce_buf=allreduce_buf,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CanaryHostState:
+    """Pinned-host state owned by one CanaryRunner instance.
+
+    All tensors are pinned-host (pin_memory=True) for async D2H transfers. One instance per
+    ModelRunner, allocated at install time alongside CanaryDeviceState.
+
+    Fields:
+        violation_signal_host: Pinned-host uint8 scalar, shape [1]. async D2H snapshot of
+            (violation_log.violation_write_index > 0). Snapshotted on a side stream at end_of_step N
+            and consumed at start of step N+1 after pump_event.synchronize(); this 1-step delay is
+            intentional — bug is detected one step later but forward path stays sync-free.
+        allreduce_signal_host: Pinned-host uint8 scalar, shape [1]. async D2H mirror of allreduce_buf
+            after the cross-rank reduction. Same 1-step delay pattern as violation_signal_host.
+            Only allocated when CanaryConfig.allreduce_violation_signal is True.
+        kernel_run_counters_host: Pinned-host int64 mirror of kernel_run_counters, shape [num_tags].
+            Health watchdog stages a D2H copy here on the alt stream and reads on the next call.
+        slot_run_counters_sum_host: Pinned-host int64 scalar, shape [1]. Stat path stages
+            ``slot_run_counters.sum()`` here on the alt stream and reads on the next call.
+        violation_write_index_host: Pinned-host int32 mirror of violation_log.violation_write_index,
+            shape [1]. Stat path stages a D2H copy here on the alt stream and reads on the next call.
+    """
+
+    violation_signal_host: torch.Tensor
+    allreduce_signal_host: Optional[torch.Tensor]
+    kernel_run_counters_host: torch.Tensor
+    slot_run_counters_sum_host: torch.Tensor
+    violation_write_index_host: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        config: CanaryConfig,
+        num_tags: int,
+    ) -> "CanaryHostState":
+        if num_tags <= 0:
+            raise ValueError(
+                f"kv-canary: CanaryHostState num_tags must be positive, got {num_tags}"
+            )
+        violation_signal_host = torch.zeros(1, dtype=torch.uint8, pin_memory=True)
+        allreduce_signal_host: Optional[torch.Tensor] = None
+        if config.allreduce_violation_signal:
             allreduce_signal_host = torch.zeros(1, dtype=torch.uint8, pin_memory=True)
         kernel_run_counters_host = torch.zeros(
             num_tags, dtype=torch.int64, pin_memory=True
@@ -137,11 +165,7 @@ class CanaryDeviceState:
         slot_run_counters_sum_host = torch.zeros(1, dtype=torch.int64, pin_memory=True)
         violation_write_index_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
         return cls(
-            violation_log=violation_log,
-            kernel_run_counters=kernel_run_counters,
-            slot_run_counters=slot_run_counters,
             violation_signal_host=violation_signal_host,
-            allreduce_buf=allreduce_buf,
             allreduce_signal_host=allreduce_signal_host,
             kernel_run_counters_host=kernel_run_counters_host,
             slot_run_counters_sum_host=slot_run_counters_sum_host,

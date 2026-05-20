@@ -258,9 +258,9 @@ def test_jitter_disabled_zero_overhead(monkeypatch) -> None:
     ), "disabled jitter must yield CanaryRunner._jitter is None (no buffer allocation)"
 
     fb = _make_forward_batch_for_disabled_jitter(device)
-    runner.before_forward(fb)
-    runner.launch_head_kernels(fb)
-    runner.launch_tail_kernels(fb)
+    with runner.with_forward_pass(fb):
+        runner.launch_head_kernels(fb)
+        runner.launch_tail_kernels(fb)
 
     assert spin_wait_calls == [], (
         f"disabled jitter must not launch any spin_wait_step kernel; "

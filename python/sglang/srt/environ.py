@@ -731,6 +731,7 @@ class Envs:
     # the next forward. Used by the canary <-> mock-oracle wiring tests in
     # ``test/registered/mock_model/test_self_unit_canary_mock_wiring.py``.
     SGLANG_MOCK_INPUT_PERTURB_PROB = EnvFloat(0.0)
+    SGLANG_MOCK_MODEL_ORACLE_SEED = EnvInt(0)
 
 
 envs = Envs()

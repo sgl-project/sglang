@@ -45,22 +45,22 @@ class PerForwardOrchestrator:
         config: CanaryConfig,
         device: torch.device,
         device_state: CanaryDeviceState,
-        groups: tuple[CanaryBufferGroup, ...],
+        buffer_groups: tuple[CanaryBufferGroup, ...],
         endpoints: tuple[CanaryEndpoint, ...],
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
-        perturb: PerturbHook,
+        perturb_hook: PerturbHook,
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
     ) -> None:
         self._config = config
         self._device_state = device_state
-        self._groups = groups
+        self._buffer_groups = buffer_groups
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._perturb = perturb
+        self._perturb_hook = perturb_hook
         self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
@@ -104,8 +104,8 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
 
-        self._perturb.perturb_hook(forward_batch)
-        self._perturb.perturb_real_kv_hook(forward_batch)
+        self._perturb_hook.perturb_hook(forward_batch)
+        self._perturb_hook.perturb_real_kv_hook(forward_batch)
         self._last_forward_batch = forward_batch
 
         if self._config.input_check_mode == CanaryInputCheckMode.ON:
@@ -132,7 +132,7 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        for group in self._groups:
+        for group in self._buffer_groups:
             invoke_plan(
                 plan_input=self._plan_input_per_forward,
                 verify_plan=self._verify_plan_per_forward,
@@ -160,7 +160,7 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        for group in self._groups:
+        for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,

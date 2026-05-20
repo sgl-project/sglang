@@ -106,6 +106,7 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.mock_model.install import install_mock_model_sampler
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -638,6 +639,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        self._mock_model_oracle_hook = install_mock_model_sampler(
+            server_args=server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -745,6 +750,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
         install_canary(server_args=server_args, model_runner=self)
+        if self._mock_model_oracle_hook is not None and self.canary_runner is not None:
+            self.canary_runner.attach_oracle_sampler_hook(self._mock_model_oracle_hook)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
