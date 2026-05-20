@@ -18,7 +18,7 @@ from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     make_row_source,
 )
 
-CPU_DEVICE: torch.device = torch.device("cpu")
+DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
 
 @dataclass
@@ -127,7 +127,7 @@ class FakeDsv4SubPool:
 
 
 def make_mha_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     num_slots: int = 16,
     dim: int = 8,
@@ -145,7 +145,7 @@ def make_mha_pool(
 
 
 def make_swa_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     full_slots: int = 16,
     swa_slots: int = 8,
@@ -180,7 +180,7 @@ def make_swa_pool(
 
 
 def make_dsv4_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     full_slots: int = 16,
     swa_slots: int = 8,
@@ -217,7 +217,7 @@ def make_base_config() -> CanaryConfig:
 
 
 def make_req_to_token_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     max_reqs: int = 8,
     max_seq_len: int = 32,
@@ -227,7 +227,7 @@ def make_req_to_token_pool(
 
 
 def make_forward_batch(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
@@ -256,7 +256,7 @@ def make_forward_batch(
     )
 
 
-def make_radix_cache(slot_lists: List[List[int]], device: torch.device = CPU_DEVICE):
+def make_radix_cache(slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE):
     """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path.
 
     slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.

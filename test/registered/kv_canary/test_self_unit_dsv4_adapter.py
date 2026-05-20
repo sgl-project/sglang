@@ -13,7 +13,7 @@ from sglang.srt.kv_canary.pool_patch.adapters.dsv4 import (
     _dsv4_packed_nope_rope_bytes_per_token,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import CPU_DEVICE
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-large")
 
@@ -66,7 +66,7 @@ def _make_packed_buffer(*, num_pages: int, page_size: int) -> torch.Tensor:
         num_pages,
         _bytes_per_page_padded(page_size=page_size),
         dtype=torch.uint8,
-        device=CPU_DEVICE,
+        device=DEFAULT_DEVICE,
     )
 
 
@@ -75,7 +75,7 @@ def _make_indexer_buffer(
 ) -> torch.Tensor:
     num_scales = index_head_dim // 128
     page_bytes = page_size * index_head_dim + page_size * num_scales * 4
-    return torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=CPU_DEVICE)
+    return torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=DEFAULT_DEVICE)
 
 
 def _make_pool(
@@ -122,7 +122,7 @@ def test_dsv4_packed_nope_rope_bytes_per_token_returns_576() -> None:
 def test_dsv4_full_group_uses_576_bytes_per_token_for_c4_and_c128() -> None:
     # Step 1: build a mock DSv4 pool and call the adapter's full-group builder.
     pool = _make_pool()
-    group = _build_full_group(pool=pool, device=CPU_DEVICE, read_bytes=32)
+    group = _build_full_group(pool=pool, device=DEFAULT_DEVICE, read_bytes=32)
 
     # Step 2: full group emits one source per sub-pool (c4, indexer, c128).
     assert group.kind is PoolKind.FULL
@@ -139,7 +139,7 @@ def test_dsv4_full_group_uses_576_bytes_per_token_for_c4_and_c128() -> None:
 
 def test_dsv4_full_group_sources_preserve_page_size() -> None:
     pool = _make_pool(page_size=128)
-    group = _build_full_group(pool=pool, device=CPU_DEVICE, read_bytes=32)
+    group = _build_full_group(pool=pool, device=DEFAULT_DEVICE, read_bytes=32)
     for source in group.real_kv_sources_k:
         assert source.page_size == 128
 
@@ -147,7 +147,7 @@ def test_dsv4_full_group_sources_preserve_page_size() -> None:
 def test_dsv4_swa_group_uses_packed_source_not_row_source() -> None:
     # Step 1: build SWA group from a mock DSv4 pool with page_size=128.
     pool = _make_pool(page_size=128)
-    group = _build_swa_group(pool=pool, device=CPU_DEVICE, read_bytes=32)
+    group = _build_swa_group(pool=pool, device=DEFAULT_DEVICE, read_bytes=32)
 
     # Step 2: must be a packed source (page_size matches pool) — not row source which forces page_size=1.
     assert group.kind is PoolKind.SWA
@@ -162,7 +162,7 @@ def test_dsv4_swa_group_uses_packed_source_not_row_source() -> None:
 
 def test_dsv4_swa_group_carries_index_lut() -> None:
     pool = _make_pool()
-    group = _build_swa_group(pool=pool, device=CPU_DEVICE, read_bytes=32)
+    group = _build_swa_group(pool=pool, device=DEFAULT_DEVICE, read_bytes=32)
     assert group.swa_index_lut is pool.full_to_swa_index_mapping
 
 
@@ -175,7 +175,7 @@ def test_dsv4_segment_b_corruption_is_not_detected() -> None:
     # Step 1: build the FULL group using mock buffers.
     page_size = 128
     pool = _make_pool(page_size=page_size)
-    group = _build_full_group(pool=pool, device=CPU_DEVICE, read_bytes=32)
+    group = _build_full_group(pool=pool, device=DEFAULT_DEVICE, read_bytes=32)
     c4_source = group.real_kv_sources_k[0]
 
     # Step 2: compute the byte window the canary reads for every slot in a page.
