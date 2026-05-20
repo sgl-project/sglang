@@ -46,15 +46,16 @@ def try_run_ds_step(
     error_state: Dict[str, Any],
     layer_id: Optional[int] = None,
     selector_id: Optional[str] = None,
+    record_error_on_failure: bool = True,
 ) -> Tuple[bool, Optional[Any]]:
     """Run a single DS attention step under containment.
 
     Catches the DS-typed exception families plus generic RuntimeError
     (which covers placeholder-guard runtime errors), classifies into
-    one of `DS_ERROR_CLASSES`, increments the Prometheus counter, and
-    writes ``error_state`` so the scheduler clears partial per-request
-    state. Non-typed exceptions still propagate so they are not silently
-    swallowed.
+    one of `DS_ERROR_CLASSES`, optionally increments the Prometheus
+    counter, and writes ``error_state`` so the scheduler clears partial
+    per-request state. Non-typed exceptions still propagate so they are
+    not silently swallowed.
 
     Args:
         fn: a no-arg callable that performs the DS step for one request.
@@ -62,6 +63,11 @@ def try_run_ds_step(
         error_state: per-request mutable dict the caller owns.
         layer_id: attention layer index (for structured logs).
         selector_id: stable selector identifier (for structured logs).
+        record_error_on_failure: when True (default), call
+            ``record_error`` on failure. Callers that will emit per-row
+            ``record_error`` calls themselves (e.g. the production
+            batch-wrapper in ``_select_topk_indices``) pass False to
+            avoid overcounting the cls-labelled counter.
 
     Returns:
         ``(success, value)``. On success ``value`` is whatever ``fn``
@@ -75,11 +81,12 @@ def try_run_ds_step(
         error_state["ds_error_message"] = str(exc)
         error_state["ds_original_exception"] = exc
         error_state.setdefault("clear_per_request_summary", True)
-        _ds_metrics.record_error(
-            cls,
-            message=str(exc),
-            request_id=request_id,
-            layer_id=layer_id,
-            selector_id=selector_id,
-        )
+        if record_error_on_failure:
+            _ds_metrics.record_error(
+                cls,
+                message=str(exc),
+                request_id=request_id,
+                layer_id=layer_id,
+                selector_id=selector_id,
+            )
         return False, None

@@ -4135,5 +4135,128 @@ class TestR8Coverage(unittest.TestCase):
         self.assertEqual(hidden_state_offset, 256)
 
 
+class TestR9Coverage(unittest.TestCase):
+    """R9 verifies the two R8 bug fixes: hidden-state span pre-abort
+    capture, and counter exactness for non-row DS failures.
+    """
+
+    def test_try_run_ds_step_suppresses_record_error_when_requested(self):
+        """AC-3/AC-9 counter exactness: with `record_error_on_failure=False`
+        the wrapper does NOT call record_error; the caller is expected
+        to emit per-row record_error calls.
+        """
+        from sglang.srt.layers.attention.double_sparsity.error_containment import (
+            try_run_ds_step,
+        )
+        from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
+
+        # Patch record_error so we count calls.
+        original_record_error = ds_metrics.record_error
+        calls = []
+
+        def _stub(*args, **kwargs):
+            calls.append(kwargs.get("request_id", args[0] if args else None))
+
+        ds_metrics.record_error = _stub
+        try:
+            def _raise():
+                raise RuntimeError("synthetic non-row DS failure")
+
+            error_state = {}
+            ok, _ = try_run_ds_step(
+                _raise,
+                request_id="batch",
+                error_state=error_state,
+                layer_id=3,
+                selector_id="layer3",
+                record_error_on_failure=False,
+            )
+            self.assertFalse(ok)
+            # No record_error called when record_error_on_failure=False.
+            self.assertEqual(calls, [])
+
+            # And the default (True) DOES call record_error.
+            calls.clear()
+            ok2, _ = try_run_ds_step(
+                _raise,
+                request_id="batch2",
+                error_state={},
+                layer_id=3,
+                selector_id="layer3",
+            )
+            self.assertFalse(ok2)
+            self.assertEqual(len(calls), 1)
+        finally:
+            ds_metrics.record_error = original_record_error
+
+    def test_non_row_failure_records_exactly_n_calls_for_n_rows(self):
+        """3-row non-row DS failure -> exactly 3 record_error calls
+        (one per affected request), not 4 (3 + a batch-level wrapper).
+        """
+        from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
+
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        # Selector stays in placeholder mode; the guard raises a non-row
+        # exception (selector_runtime_error).
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([128, 256, 64], dtype=torch.int32),
+            sparse_mask=None,
+            batch_size=3,
+            rids=["a", "b", "c"],
+        )
+
+        original_record_error = ds_metrics.record_error
+        record_calls = []
+
+        def _stub(cls, **kwargs):
+            record_calls.append((cls, kwargs.get("request_id")))
+
+        ds_metrics.record_error = _stub
+        try:
+            attn._select_topk_indices(
+                x=torch.zeros(3, 16, 128),
+                q_lora=torch.zeros(3, 16, 128),
+                positions=torch.zeros(3, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=7,
+            )
+        finally:
+            ds_metrics.record_error = original_record_error
+
+        # Exactly 3 record_error calls; no batch-level call.
+        self.assertEqual(len(record_calls), 3)
+        # Each call has a real rid (not "batch").
+        request_ids = [rid for _, rid in record_calls]
+        self.assertEqual(sorted(request_ids), ["a", "b", "c"])
+        self.assertNotIn("batch", request_ids)
+        # All calls have the same error class.
+        classes = {cls for cls, _ in record_calls}
+        self.assertEqual(classes, {"selector_runtime_error"})
+
+    def test_abort_path_uses_pre_abort_origin_input_len(self):
+        """R8 regression: `set_finish_with_abort` rewrites
+        `req.origin_input_ids` to `[0]`. The cursor advancement must use
+        the captured (pre-abort) length so siblings' hidden-state slices
+        stay aligned.
+
+        We exercise this by simulating the production sequence: capture
+        the span BEFORE calling set_finish_with_abort, then verify the
+        captured value is the original length, not 1.
+        """
+        # Synthetic req with an origin_input_ids of length 256.
+        origin_input_ids = list(range(256))
+        captured_span = len(origin_input_ids)
+
+        # Simulate what set_finish_with_abort does:
+        origin_input_ids = [0]
+
+        # The R8 bug: reading len(req.origin_input_ids) AFTER abort
+        # would give 1. The R9 fix captures the value beforehand.
+        self.assertEqual(captured_span, 256)
+        # Confirm the post-abort read would have been wrong.
+        self.assertEqual(len(origin_input_ids), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

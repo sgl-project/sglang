@@ -2056,12 +2056,17 @@ class DeepseekV2AttentionMLA(
                 return topk_out
 
             error_state: Dict[str, Any] = {}
+            # `record_error_on_failure=False`: the production
+            # batch-wrapper suppresses the cls-only counter increment
+            # here so the per-row loop below can emit exactly one
+            # record_error per affected row without overcounting.
             ok, result = try_run_ds_step(
                 _run,
                 request_id="batch",
                 error_state=error_state,
                 layer_id=layer_id,
                 selector_id=f"layer{layer_id}",
+                record_error_on_failure=False,
             )
             if not ok:
                 # Non-row-level DS exception (selector RuntimeError /
