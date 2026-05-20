@@ -7,7 +7,6 @@ from typing import List, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
@@ -208,25 +207,6 @@ def make_dsv4_pool(
         swa_kv_pool=swa,
         full_to_swa_index_mapping=lut,
         page_size=page_size,
-    )
-
-
-def make_real_kv_source(
-    device: torch.device = CPU_DEVICE,
-    *,
-    num_slots: int = 16,
-    num_bytes_per_token: int = 32,
-    read_bytes: int = 16,
-    page_size: int = 1,
-) -> RealKvSource:
-    tensor = torch.zeros(
-        num_slots, num_bytes_per_token, dtype=torch.uint8, device=device
-    )
-    return RealKvSource(
-        tensor=tensor,
-        page_size=page_size,
-        num_bytes_per_token=num_bytes_per_token,
-        read_bytes=read_bytes,
     )
 
 
