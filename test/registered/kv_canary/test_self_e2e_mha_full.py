@@ -44,21 +44,22 @@ class TestNoPerturbNoViolation(_MhaFullBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
+    # Override base --kv-canary "raise" → "on" so the perturb-triggered violation
+    # is captured in server stderr without SIGQUIT killing the process mid-flush
+    # (extra_server_args is appended after base --kv-canary, argparse last wins).
+    extra_server_args: ClassVar[List[str]] = [
+        "--json-model-override-args",
+        _NUM_LAYERS_OVERRIDE,
+        "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+        "--kv-canary",
+        "on",
+    ]
     perturb_prob: ClassVar[float] = 0.05
-    allow_launch_failure: ClassVar[bool] = True
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
-        # Step 1: warmup itself may already trigger a violation under raise mode.
-        if self.launch_failed:
-            self.assert_violation_kind_logged(
-                ["per_forward_", "sweep_"], flush_wait_seconds=2.0
-            )
-            return
-
-        # Step 2: drive traffic to give the perturb knob a chance to fire.
+        # Drive traffic; perturb fires per-step at perturb_prob, canary logs.
         self.send_parallel_requests(n=64, max_new_tokens=32, timeout=30.0)
-
-        # Step 3: confirm a violation surfaced in captured server output.
         self.assert_violation_kind_logged(
             ["per_forward_", "sweep_"], flush_wait_seconds=2.0
         )
