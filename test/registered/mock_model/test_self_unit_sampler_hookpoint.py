@@ -22,22 +22,6 @@ register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
 
 class TestInstallOracleSampler(CustomTestCase):
-    def test_install_oracle_sampler_registers_oracle_backend(self) -> None:
-        oracle = HashOracle(seed=1, vocab_size=100)
-
-        hook = install_oracle_sampler(oracle=oracle)
-
-        self.assertIn("oracle", _CUSTOM_SAMPLER_FACTORIES)
-        self.assertIn("oracle", SAMPLING_BACKEND_CHOICES)
-        self.assertIs(hook.oracle, oracle)
-
-    def test_install_oracle_sampler_returns_hook_owning_the_oracle(self) -> None:
-        oracle = HashOracle(seed=2, vocab_size=100)
-
-        hook = install_oracle_sampler(oracle=oracle)
-
-        self.assertIs(hook.oracle, oracle)
-
     def test_install_oracle_sampler_twice_returns_distinct_hooks_with_replaced_oracle(
         self,
     ) -> None:
@@ -45,6 +29,8 @@ class TestInstallOracleSampler(CustomTestCase):
         oracle_b = HashOracle(seed=99, vocab_size=100)
 
         hook_a = install_oracle_sampler(oracle=oracle_a)
+        self.assertIn("oracle", _CUSTOM_SAMPLER_FACTORIES)
+        self.assertIn("oracle", SAMPLING_BACKEND_CHOICES)
         factory_a = _CUSTOM_SAMPLER_FACTORIES["oracle"]
         self.assertIs(hook_a.oracle, oracle_a)
 
