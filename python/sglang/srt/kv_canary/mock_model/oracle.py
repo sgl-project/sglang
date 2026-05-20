@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Protocol, Sequence
+from typing import Protocol
 
 
 class Oracle(Protocol):
@@ -13,13 +13,6 @@ class Oracle(Protocol):
     """
 
     def expected_token(self, *, req_id: int, position: int) -> int: ...
-
-    def expected_tokens_batch(
-        self,
-        *,
-        req_ids: Sequence[int],
-        positions: Sequence[int],
-    ) -> List[int]: ...
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -36,21 +29,6 @@ class HashOracle:
     def expected_token(self, *, req_id: int, position: int) -> int:
         mixed = (self.seed ^ req_id ^ position) & _U64_MASK
         return _splitmix64(mixed) % self.vocab_size
-
-    def expected_tokens_batch(
-        self,
-        *,
-        req_ids: Sequence[int],
-        positions: Sequence[int],
-    ) -> List[int]:
-        if len(req_ids) != len(positions):
-            raise ValueError(
-                f"req_ids ({len(req_ids)}) and positions ({len(positions)}) must have equal length"
-            )
-        return [
-            self.expected_token(req_id=r, position=p)
-            for r, p in zip(req_ids, positions)
-        ]
 
 
 _U64_MASK = (1 << 64) - 1
