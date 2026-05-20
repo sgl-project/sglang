@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import uuid
+import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
@@ -183,8 +184,6 @@ class EmbeddingData:
         )
         for key, value in self.__dict__.items():
             # cached_embedding is a GPU tensor used only by mooncake's in-process
-            # /send sharing; it must never appear in serialized data (would trigger
-            # a 67 MB D2H copy per ack).
             if key.startswith("_") or key in ("embedding", "cached_embedding"):
                 continue
             setattr(new_data, key, value)
@@ -675,7 +674,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         dtype,
         gpu_id=0,
         model_type: Optional[str] = None,
-        landing_pool=None,
+        embedding_pool=None,
     ):
         super().__init__(
             rid,
@@ -690,9 +689,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.dtype = dtype
         self.gpu_id = gpu_id
         self.embeddings_buffer = None
-        # Pre-registered landing pool (MooncakeLandingPool). When set, skip per-request
-        # register/deregister so encoder's openSegment cache hits across requests.
-        self.landing_pool = landing_pool
+        self.embedding_pool = embedding_pool
         self._buffer_from_pool = False
         self._pool_slot_id: Optional[int] = None
 
@@ -783,13 +780,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             # Phase 2: Pre-allocate GPU landing buffer.
             # Prefer the pre-registered persistent pool when available; this avoids
             # per-request register/deregister and keeps the encoder's openSegment
-            # cache warm (cold open costs ~7s on first call). When the pool is
-            # full alloc() blocks on a Condition until a peer releases a slot;
-            # see MooncakeLandingPool.
             if total_bytes > 0:
-                if self.landing_pool is not None:
+                if self.embedding_pool is not None:
                     alloc_result = await asyncio.to_thread(
-                        self.landing_pool.alloc, total_bytes
+                        self.embedding_pool.alloc, total_bytes
                     )
                     if alloc_result is None:
                         # Either the request exceeds pool capacity outright, or
@@ -797,7 +791,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                         # — fall through to error handling.
                         self.status = WaitingImageRequestStatus.FAIL
                         self.error_msg = (
-                            f"MooncakeLandingPool could not allocate "
+                            f"MooncakeEmbeddingPool could not allocate "
                             f"{total_bytes // (1024 * 1024)}MB (oversize or "
                             f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
                         )
@@ -831,9 +825,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 self.embeddings_buffer = None
                 buffer_address = 0
 
-            # Phase 2 cont: POST /send with RDMA info. Scheduler owns the ZMQ
-            # ack endpoint (per-TP-rank), so embedding_port / prefill_host are
-            # filled in here, not on the master.
+            # Phase 2 cont: POST /send with RDMA info.
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
@@ -843,8 +835,6 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     {
                         "session_id": self.embeddings_engine.session_id,
                         "buffer_address": offset + buffer_address,
-                        "embedding_port": self.embedding_port,
-                        "prefill_host": self.host_name,
                     }
                 )
                 send_tasks.append(
@@ -943,31 +933,34 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        # Slice pre-registered GPU buffer into per-part tensors; no H2D copy needed
-        # (encode server wrote embeddings directly into this buffer via Mooncake GPU-direct transfer)
+        # Zero-copy: build per-modality views directly from the pre-registered
+        # GPU buffer. Skips the per-part split + torch.cat round-trip — both
+        # the extra GPU allocation and the D2D copy — so mm_item.precomputed_
+        # embeddings ends up referencing the pool buffer. Slot lifetime is
+        # bound to mm_inputs GC via weakref.finalize below.
         if self.embeddings_buffer is not None:
-            _slice_embedding_buffer(
+            recv_embedding = _view_pool_buffer_by_modality(
                 self.embeddings_buffer, self.recv_embedding_data, self.dtype
             )
-
-        recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+        else:
+            recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         mm_inputs = self.mm_processor.get_mm_data(
             self.recv_req.input_text,
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
-        # Mark mm_items as pool-owned so mm_utils chunked-prefill offload skips
-        # the precomputed_embeddings.to("cpu") round-trip. The slices reference
-        # the persistent MooncakeLandingPool and stay valid for the lifetime of
-        # the request; CPU offload+reload would burn ~1GB PCIe per chunk × N
-        # chunks × N items without freeing any real memory (pool is allocated
-        # regardless).
+        # Bind slot release to mm_inputs GC
         if self._buffer_from_pool and mm_inputs is not None:
+            weakref.finalize(mm_inputs, self.embedding_pool.release, self._pool_slot_id)
             for item in getattr(mm_inputs, "mm_items", []) or []:
                 try:
-                    setattr(item, "pool_owned", True)
+                    setattr(item, "_keep_device_embedding", True)
                 except Exception:
                     pass
+            # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
+            self._pool_slot_id = None
+            self.embeddings_buffer = None
+            self._buffer_from_pool = False
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
@@ -980,8 +973,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             # Pool-backed views share the pre-registered backing tensor; just
             # release the slot back to the pool so a queued alloc can proceed.
             if self._buffer_from_pool:
-                if self._pool_slot_id is not None and self.landing_pool is not None:
-                    self.landing_pool.release(self._pool_slot_id)
+                if self._pool_slot_id is not None and self.embedding_pool is not None:
+                    self.embedding_pool.release(self._pool_slot_id)
                     self._pool_slot_id = None
                 self.embeddings_buffer = None
                 return
@@ -1004,12 +997,8 @@ def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts)
     return embedding_sizes, response_sorted, total_bytes
 
 
-class MooncakeLandingPool:
+class MooncakeEmbeddingPool:
     """Persistent GPU buffer pool registered once with the Mooncake engine.
-
-    Eliminates per-request register/deregister and keeps the encoder's
-    openSegment cache warm — first openSegment costs ~7s, subsequent
-    transfers reuse the same pool address and hit cache.
 
     Allocator: first-fit on a free-segment list with 256-byte alignment.
     `alloc()` blocks on a Condition when the pool is full and resumes once
@@ -1036,7 +1025,7 @@ class MooncakeLandingPool:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         logger.info(
-            f"MooncakeLandingPool registered: gpu={gpu_id}, "
+            f"MooncakeEmbeddingPool registered: gpu={gpu_id}, "
             f"size={size_bytes // (1024 * 1024)}MB, base=0x{self.base:x}"
         )
 
@@ -1047,16 +1036,18 @@ class MooncakeLandingPool:
 
         Returns ``(tensor_view, gpu_addr, slot_id)`` on success, or ``None``
         when (a) the request is bigger than the pool itself or (b) the wait
-        for a free slot exceeds ``timeout`` seconds. On (a) this is a
-        permanent configuration error — bump ``SGLANG_EMBEDDING_POOL_SIZE_MB``.
+        for a free slot exceeds ``timeout`` seconds.
 
         When the pool is full of in-flight slots, this call blocks the
         calling thread on a Condition until a peer ``release()`` opens
         enough contiguous space.
+
+        NOTE: no ordering guarantee — notify_all + lock race means
+        large requests can starve behind small ones, plus thundering-herd.
         """
         if nbytes > self.size_bytes:
             logger.error(
-                f"MooncakeLandingPool: requested {nbytes // (1024 * 1024)}MB "
+                f"MooncakeEmbeddingPool: requested {nbytes // (1024 * 1024)}MB "
                 f"exceeds pool capacity {self.size_bytes // (1024 * 1024)}MB. "
                 f"Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
             )
@@ -1073,7 +1064,7 @@ class MooncakeLandingPool:
                     inflight_mb = self._total_inflight // (1024 * 1024)
                     cap_mb = self.size_bytes // (1024 * 1024)
                     logger.warning(
-                        f"MooncakeLandingPool full: "
+                        f"MooncakeEmbeddingPool full: "
                         f"{inflight_mb}/{cap_mb}MB in-flight across "
                         f"{len(self._inflight)} requests; queueing a "
                         f"{nbytes // (1024 * 1024)}MB request. Raise "
@@ -1083,7 +1074,7 @@ class MooncakeLandingPool:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     logger.error(
-                        f"MooncakeLandingPool alloc timed out after "
+                        f"MooncakeEmbeddingPool alloc timed out after "
                         f"{timeout}s waiting for {nbytes // (1024 * 1024)}MB."
                     )
                     return None
@@ -1148,6 +1139,44 @@ def _slice_embedding_buffer(raw_buffer, embedding_data, dtype):
         byte_offset += part_bytes
 
 
+def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
+    """Zero-copy view of raw_buffer as {modality: [total_tokens, hidden]}.
+
+    Replaces _slice_embedding_buffer + get_embedding(is_concat=True): parts of
+    the same modality are contiguous in raw_buffer (encoder writes them
+    modality-outer in _send_encode_and_rdma_request), so we can reshape the
+    byte range directly — no per-part split, no torch.cat copy.
+
+    Caller must keep raw_buffer's storage alive while the returned views are
+    in use. The pool path binds slot release to mm_inputs GC via finalize.
+    """
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    # mod -> [byte_start, byte_end, total_tokens, hidden]
+    mod_info: Dict[Modality, List[int]] = {}
+    off = 0
+    for i in range(embedding_data.num_parts):
+        shape = embedding_data.embedding_shape_list[i]
+        if shape is None:
+            continue
+        nbytes = shape[0] * shape[1] * elem_size
+        mod = embedding_data.modality_list[i]
+        info = mod_info.get(mod)
+        if info is None:
+            mod_info[mod] = [off, off + nbytes, shape[0], shape[1]]
+        else:
+            assert (
+                info[3] == shape[1]
+            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            assert info[1] == off, f"non-contiguous parts in modality {mod}"
+            info[1] = off + nbytes
+            info[2] += shape[0]
+        off += nbytes
+    return {
+        mod: raw_buffer[s:e].view(dtype).reshape(tokens, hidden)
+        for mod, (s, e, tokens, hidden) in mod_info.items()
+    }
+
+
 def _determine_tensor_transport_mode(server_args):
     is_cross_node = server_args.dist_init_addr
 
@@ -1205,22 +1234,20 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
-            # Persistent landing pool: register once, reuse across requests so
-            # the encoder's openSegment lookup hits cache (~7s -> ~0ms).
-            self.landing_pool = None
+            self.embedding_pool = None
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
                 gpu_id = getattr(scheduler, "gpu_id", 0)
                 try:
-                    self.landing_pool = MooncakeLandingPool(
+                    self.embedding_pool = MooncakeEmbeddingPool(
                         self.embeddings_engine, gpu_id, pool_mb * 1024 * 1024
                     )
                 except Exception:
                     logger.exception(
-                        "Failed to allocate MooncakeLandingPool, "
+                        "Failed to allocate MooncakeEmbeddingPool, "
                         "falling back to per-request register"
                     )
-                    self.landing_pool = None
+                    self.embedding_pool = None
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
@@ -1717,7 +1744,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=gpu_id,
-                landing_pool=self.landing_pool,
+                embedding_pool=self.embedding_pool,
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 

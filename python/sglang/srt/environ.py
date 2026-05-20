@@ -659,22 +659,9 @@ class Envs:
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
-    # Persistent receiver-side GPU landing pool size for mooncake EPD transport.
+    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
-    # rank — sized to hold one 4×4k embedding (~1.07 GB) safely without
-    # triggering the per-request register fallback (the fallback adds ~7s
-    # openSegment cold-open per /send). Multiplies by TP size — for 4-rank
-    # prefill on 95GB GPUs this adds ~16GB total. Lower it if model + pool
-    # exceeds GPU capacity; the fallback path still works correctness-wise.
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
-    # Opt-in: skip the chunked-prefill CPU offload for mooncake-pool-owned
-    # mm_items. Saves ~1GB PCIe per chunk transition × N items × N chunks.
-    # Default off because keeping mm_items on GPU through prefill requires
-    # extra GPU budget — at high concurrency or large embeddings (4×4k) the
-    # concat in _get_precomputed_embedding can OOM. Enable only when pool is
-    # sized comfortably and mem-fraction-static leaves room.
-    SGLANG_MOONCAKE_KEEP_DEVICE = EnvBool(False)
-
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 

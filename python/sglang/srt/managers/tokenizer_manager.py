@@ -537,7 +537,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
-            await self._handle_epd_disaggregation_encode_request(obj)
+            self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -2658,7 +2658,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         return total_mm_items >= envs.SGLANG_ENCODER_DISPATCH_MIN_ITEMS.get()
 
-    async def _handle_epd_disaggregation_encode_request(
+    def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""
