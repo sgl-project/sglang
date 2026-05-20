@@ -119,38 +119,47 @@ fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
   return acc;
 }
 
-// Append a violation row to the ring (fill-once) and bump the monotonic counter unconditionally.
+// Kernel-wide sink for violation rows. ``ring`` / ``write_index`` are device pointers, ``ring_capacity``
+// caps how many rows physically land in the ring (overflow rows bump ``write_index`` but are not stored),
+// and ``kernel_kind`` is stamped into every row so a host observer can attribute it to its source launch.
+struct ViolationSink {
+  int64_t* __restrict__ ring;
+  int32_t* __restrict__ write_index;
+  int32_t ring_capacity;
+  int32_t kernel_kind;
+};
+
+// One violation row's payload. Field order is meaning-only (not the on-ring column order — that is set by
+// kViolationField* in consts.cuh). ``expected_aux`` is reason-agnostic: verify launches pass
+// expected_chain_hash, write launches pass expected_position. ``stored_chain_hash`` carries
+// running_prev_hash on the write path.
+struct ViolationRow {
+  int64_t slot_idx;
+  int64_t position;
+  int64_t stored_token;
+  int64_t expected_token;
+  int64_t stored_chain_hash;
+  int64_t expected_aux;
+  int64_t fail_reason_bits;
+};
+
+// Append a violation row to the sink's ring (fill-once) and bump the monotonic counter unconditionally.
 //
-// Ordering of columns must match kViolationField* in consts.cuh exactly. The "ExpectedAux"
-// column (index 6) is reason-agnostic: verify launches pass expected_chain_hash, write launches pass
-// expected_position. The "StoredChainHash" column (index 5) carries running_prev_hash on the write path.
-//
-// atomicAdd on violation_write_index serializes arrivals; only writers with idx < ring_capacity store a
-// row. The __threadfence_system after the store guarantees any host observer that reads the post-increment
+// atomicAdd on ``sink.write_index`` serializes arrivals; only writers with idx < ring_capacity store a row.
+// The __threadfence_system after the store guarantees any host observer that reads the post-increment
 // counter also sees the committed row.
-SGL_DEVICE void record_violation(
-    int64_t* __restrict__ violation_ring,
-    int32_t* __restrict__ violation_write_index,
-    int32_t ring_capacity,
-    int32_t kernel_kind,
-    int64_t slot_idx,
-    int64_t position,
-    int64_t stored_token,
-    int64_t expected_token,
-    int64_t stored_chain_hash,
-    int64_t expected_aux,
-    int64_t fail_reason_bits) {
-  const int32_t seq = atomicAdd(violation_write_index, 1);
-  if (seq < ring_capacity) {
-    int64_t* row = violation_ring + static_cast<int64_t>(seq) * kViolationFields;
-    row[kViolationFieldKernelKind] = static_cast<int64_t>(kernel_kind);
-    row[kViolationFieldSlotIdx] = slot_idx;
-    row[kViolationFieldPosition] = position;
-    row[kViolationFieldStoredToken] = stored_token;
-    row[kViolationFieldExpectedToken] = expected_token;
-    row[kViolationFieldStoredChainHash] = stored_chain_hash;
-    row[kViolationFieldExpectedAux] = expected_aux;
-    row[kViolationFieldFailReasonBits] = fail_reason_bits;
+SGL_DEVICE void record_violation(const ViolationSink& sink, const ViolationRow& row) {
+  const int32_t seq = atomicAdd(sink.write_index, 1);
+  if (seq < sink.ring_capacity) {
+    int64_t* dst = sink.ring + static_cast<int64_t>(seq) * kViolationFields;
+    dst[kViolationFieldKernelKind] = static_cast<int64_t>(sink.kernel_kind);
+    dst[kViolationFieldSlotIdx] = row.slot_idx;
+    dst[kViolationFieldPosition] = row.position;
+    dst[kViolationFieldStoredToken] = row.stored_token;
+    dst[kViolationFieldExpectedToken] = row.expected_token;
+    dst[kViolationFieldStoredChainHash] = row.stored_chain_hash;
+    dst[kViolationFieldExpectedAux] = row.expected_aux;
+    dst[kViolationFieldFailReasonBits] = row.fail_reason_bits;
     __threadfence_system();
   }
 }
