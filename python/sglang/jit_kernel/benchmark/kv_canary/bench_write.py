@@ -15,6 +15,7 @@ from sglang.jit_kernel.benchmark.kv_canary.bench_helpers import (
     build_fast_matrix_cases,
     build_full_matrix_cases,
     cases_to_x_vals,
+    make_real_kv_sources,
     naive_slot_copy_fn,
 )
 from sglang.jit_kernel.benchmark.utils import (
@@ -34,7 +35,15 @@ register_cuda_ci(est_time=180, suite="base-b-kernel-benchmark-1-gpu-large")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-_X_NAMES = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
+_X_NAMES = [
+    "bs",
+    "prefix_len",
+    "mode",
+    "extend_len",
+    "pool_kind",
+    "real_kv_kind",
+    "hash_mode",
+]
 _X_VALS = cases_to_x_vals(
     get_benchmark_range(
         full_range=build_full_matrix_cases(),
@@ -42,12 +51,29 @@ _X_VALS = cases_to_x_vals(
     )
 )
 
+_KERNEL_KIND_X_NAMES = ["kernel_kind_name", "pseudo_mode_name"]
+_KERNEL_KIND_X_VALS = [
+    (tag.name, pseudo.name)
+    for tag in CanaryLaunchTag
+    for pseudo in consts.CanaryPseudoMode
+]
+
 
 def _write_entry_count(case: BenchCase) -> int:
     return case.bs * case.extend_len
 
 
-def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
+def _write_num_slots(case: BenchCase) -> int:
+    per_req_slots = max(
+        SWA_WINDOW if case.pool_kind == "swa_window_128" else 1,
+        case.prefix_len + case.extend_len,
+    )
+    return max(2, case.bs * per_req_slots + 1)
+
+
+def _build_write_inputs(
+    case: BenchCase, *, device: torch.device, mirror_pseudo: bool = False
+) -> dict:
     total_entries = _write_entry_count(case)
     num_tokens_padded = max(1, total_entries)
 
@@ -55,7 +81,7 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
         SWA_WINDOW if case.pool_kind == "swa_window_128" else 1,
         case.prefix_len + case.extend_len,
     )
-    num_slots = max(2, case.bs * per_req_slots + 1)
+    num_slots = _write_num_slots(case)
 
     canary_buf = torch.zeros(
         num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
@@ -109,12 +135,16 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
         full_to_swa[-1] = -1
         fb_out_cache_loc = full_to_swa[fb_out_cache_loc.to(torch.int64)].to(torch.int32)
 
-    pseudo_expected_tokens = torch.zeros(
-        num_tokens_padded, dtype=torch.int32, device=device
-    )
-    pseudo_expected_positions = torch.zeros(
-        num_tokens_padded, dtype=torch.int32, device=device
-    )
+    if mirror_pseudo:
+        pseudo_expected_tokens = fb_input_ids.clone()
+        pseudo_expected_positions = fb_positions.clone()
+    else:
+        pseudo_expected_tokens = torch.zeros(
+            num_tokens_padded, dtype=torch.int32, device=device
+        )
+        pseudo_expected_positions = torch.zeros(
+            num_tokens_padded, dtype=torch.int32, device=device
+        )
 
     violation_ring = torch.zeros(
         RING_CAPACITY, consts.VIOLATION_FIELDS, dtype=torch.int64, device=device
@@ -122,6 +152,10 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
     violation_write_index = torch.zeros(1, dtype=torch.int32, device=device)
     slot_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
     kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
+
+    real_kv_sources = make_real_kv_sources(
+        kind=case.real_kv_kind, num_slots=num_slots, device=device
+    )
 
     return dict(
         canary_buf=canary_buf,
@@ -135,6 +169,7 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
         violation_write_index=violation_write_index,
         slot_run_counter=slot_run_counter,
         kernel_run_counter=kernel_run_counter,
+        real_kv_sources=real_kv_sources,
     )
 
 
@@ -157,6 +192,8 @@ def benchmark(
     mode: str,
     extend_len: int,
     pool_kind: str,
+    real_kv_kind: str,
+    hash_mode: str,
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
@@ -165,11 +202,14 @@ def benchmark(
         mode=mode,
         extend_len=extend_len,
         pool_kind=pool_kind,
+        real_kv_kind=real_kv_kind,
+        hash_mode=hash_mode,
     )
     device = torch.device(DEFAULT_DEVICE)
 
     if provider == "canary":
         inputs = _build_write_inputs(case, device=device)
+        hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
 
         def fn() -> None:
             canary_write_step(
@@ -186,8 +226,8 @@ def benchmark(
                 violation_write_index=inputs["violation_write_index"],
                 slot_run_counter=inputs["slot_run_counter"],
                 kernel_run_counter=inputs["kernel_run_counter"],
-                real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_sources=inputs["real_kv_sources"],
+                real_kv_hash_mode=hash_mode_enum,
             )
 
     else:
@@ -196,5 +236,63 @@ def benchmark(
     return run_benchmark(fn)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=_KERNEL_KIND_X_NAMES,
+        x_vals=_KERNEL_KIND_X_VALS,
+        line_arg="provider",
+        line_vals=["canary"],
+        line_names=["canary_write_step"],
+        styles=[("blue", "-")],
+        ylabel="us",
+        plot_name="kv-canary-write-kernel-kind-perf",
+        args={},
+    )
+)
+def benchmark_kernel_kind(
+    kernel_kind_name: str,
+    pseudo_mode_name: str,
+    provider: str,
+) -> Tuple[float, float, float]:
+    case = BenchCase(
+        bs=32,
+        prefix_len=4096,
+        mode="extend",
+        extend_len=128,
+        pool_kind="full",
+        real_kv_kind="none",
+        hash_mode="off",
+    )
+    device = torch.device(DEFAULT_DEVICE)
+
+    pseudo_mode = consts.CanaryPseudoMode[pseudo_mode_name]
+    mirror_pseudo = pseudo_mode == consts.CanaryPseudoMode.ON
+    inputs = _build_write_inputs(case, device=device, mirror_pseudo=mirror_pseudo)
+    kernel_kind = CanaryLaunchTag[kernel_kind_name]
+    hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+
+    def fn() -> None:
+        canary_write_step(
+            canary_buf=inputs["canary_buf"],
+            plan=inputs["plan"],
+            fb_input_ids=inputs["fb_input_ids"],
+            fb_positions=inputs["fb_positions"],
+            fb_out_cache_loc=inputs["fb_out_cache_loc"],
+            kernel_kind=kernel_kind,
+            pseudo_mode=pseudo_mode,
+            pseudo_expected_tokens=inputs["pseudo_expected_tokens"],
+            pseudo_expected_positions=inputs["pseudo_expected_positions"],
+            violation_ring=inputs["violation_ring"],
+            violation_write_index=inputs["violation_write_index"],
+            slot_run_counter=inputs["slot_run_counter"],
+            kernel_run_counter=inputs["kernel_run_counter"],
+            real_kv_sources=inputs["real_kv_sources"],
+            real_kv_hash_mode=hash_mode_enum,
+        )
+
+    return run_benchmark(fn)
+
+
 if __name__ == "__main__":
     benchmark.run(print_data=True)
+    benchmark_kernel_kind.run(print_data=True)

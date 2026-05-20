@@ -15,6 +15,7 @@ from sglang.jit_kernel.benchmark.kv_canary.bench_helpers import (
     build_fast_matrix_cases,
     build_full_matrix_cases,
     cases_to_x_vals,
+    make_real_kv_sources,
     naive_slot_copy_fn,
 )
 from sglang.jit_kernel.benchmark.utils import (
@@ -26,6 +27,7 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
+    RealKvSource,
     VerifyPlan,
     canary_verify_step,
 )
@@ -35,13 +37,24 @@ register_cuda_ci(est_time=180, suite="base-b-kernel-benchmark-1-gpu-large")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-_X_NAMES = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
+_X_NAMES = [
+    "bs",
+    "prefix_len",
+    "mode",
+    "extend_len",
+    "pool_kind",
+    "real_kv_kind",
+    "hash_mode",
+]
 _X_VALS = cases_to_x_vals(
     get_benchmark_range(
         full_range=build_full_matrix_cases(),
         ci_range=build_fast_matrix_cases(),
     )
 )
+
+_KERNEL_KIND_X_NAMES = ["kernel_kind_name"]
+_KERNEL_KIND_X_VALS = [(tag.name,) for tag in CanaryLaunchTag]
 
 
 def _verify_entry_count(case: BenchCase) -> int:
@@ -52,19 +65,26 @@ def _verify_entry_count(case: BenchCase) -> int:
     return case.bs * per_req
 
 
-def _build_verify_inputs(
-    case: BenchCase, *, device: torch.device
-) -> Tuple[
-    torch.Tensor, VerifyPlan, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    total_entries = _verify_entry_count(case)
-    capacity = max(1, total_entries)
-
+def _verify_num_slots(case: BenchCase) -> int:
     if case.pool_kind == "swa_window_128":
         per_req_slots = SWA_WINDOW
     else:
         per_req_slots = max(1, case.prefix_len)
-    num_slots = max(2, case.bs * per_req_slots + 1)
+    return max(2, case.bs * per_req_slots + 1)
+
+
+def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
+    torch.Tensor,
+    VerifyPlan,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    tuple[RealKvSource, ...],
+]:
+    total_entries = _verify_entry_count(case)
+    capacity = max(1, total_entries)
+    num_slots = _verify_num_slots(case)
 
     canary_buf = torch.zeros(
         num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
@@ -105,6 +125,10 @@ def _build_verify_inputs(
     slot_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
     kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
 
+    real_kv_sources = make_real_kv_sources(
+        kind=case.real_kv_kind, num_slots=num_slots, device=device
+    )
+
     return (
         canary_buf,
         plan,
@@ -112,6 +136,7 @@ def _build_verify_inputs(
         violation_write_index,
         slot_run_counter,
         kernel_run_counter,
+        real_kv_sources,
     )
 
 
@@ -134,6 +159,8 @@ def benchmark(
     mode: str,
     extend_len: int,
     pool_kind: str,
+    real_kv_kind: str,
+    hash_mode: str,
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
@@ -142,6 +169,8 @@ def benchmark(
         mode=mode,
         extend_len=extend_len,
         pool_kind=pool_kind,
+        real_kv_kind=real_kv_kind,
+        hash_mode=hash_mode,
     )
     device = torch.device(DEFAULT_DEVICE)
 
@@ -153,7 +182,9 @@ def benchmark(
             violation_write_index,
             slot_run_counter,
             kernel_run_counter,
+            real_kv_sources,
         ) = _build_verify_inputs(case, device=device)
+        hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
 
         def fn() -> None:
             canary_verify_step(
@@ -164,8 +195,8 @@ def benchmark(
                 violation_write_index=violation_write_index,
                 slot_run_counter=slot_run_counter,
                 kernel_run_counter=kernel_run_counter,
-                real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=hash_mode_enum,
             )
 
     else:
@@ -174,5 +205,62 @@ def benchmark(
     return run_benchmark(fn)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=_KERNEL_KIND_X_NAMES,
+        x_vals=_KERNEL_KIND_X_VALS,
+        line_arg="provider",
+        line_vals=["canary"],
+        line_names=["canary_verify_step"],
+        styles=[("blue", "-")],
+        ylabel="us",
+        plot_name="kv-canary-verify-kernel-kind-perf",
+        args={},
+    )
+)
+def benchmark_kernel_kind(
+    kernel_kind_name: str,
+    provider: str,
+) -> Tuple[float, float, float]:
+    case = BenchCase(
+        bs=32,
+        prefix_len=4096,
+        mode="extend",
+        extend_len=128,
+        pool_kind="full",
+        real_kv_kind="none",
+        hash_mode="off",
+    )
+    device = torch.device(DEFAULT_DEVICE)
+
+    (
+        canary_buf,
+        plan,
+        violation_ring,
+        violation_write_index,
+        slot_run_counter,
+        kernel_run_counter,
+        real_kv_sources,
+    ) = _build_verify_inputs(case, device=device)
+    kernel_kind = CanaryLaunchTag[kernel_kind_name]
+    hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+
+    def fn() -> None:
+        canary_verify_step(
+            canary_buf=canary_buf,
+            plan=plan,
+            kernel_kind=kernel_kind,
+            violation_ring=violation_ring,
+            violation_write_index=violation_write_index,
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            real_kv_sources=real_kv_sources,
+            real_kv_hash_mode=hash_mode_enum,
+        )
+
+    return run_benchmark(fn)
+
+
 if __name__ == "__main__":
     benchmark.run(print_data=True)
+    benchmark_kernel_kind.run(print_data=True)
