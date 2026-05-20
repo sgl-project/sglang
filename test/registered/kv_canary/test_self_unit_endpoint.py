@@ -96,6 +96,8 @@ class TestSelfUnitEndpoint(CustomTestCase):
             )
         self.assertEqual(calls[0], "verify")
         self.assertEqual(calls[2], "write")
+        self.assertIs(calls[1]["plan"], args.verify_plan)
+        self.assertIs(calls[3]["plan"], args.write_plan)
 
     def test_launch_per_forward_passes_kernel_kind(self):
         captured: List = []
