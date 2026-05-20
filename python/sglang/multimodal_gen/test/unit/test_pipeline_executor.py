@@ -39,6 +39,8 @@ def test_execute_group_with_profiling_uses_inference_mode():
     executor = _RecordingExecutor()
 
     with torch.inference_mode(False):
-        executor.execute_group_with_profiling([], [_batch(), _batch()], SimpleNamespace())
+        executor.execute_group_with_profiling(
+            [], [_batch(), _batch()], SimpleNamespace()
+        )
 
     assert executor.group_inference_mode is True
