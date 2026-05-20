@@ -164,8 +164,12 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self.is_moe_layer_skipped(prefix):
+                return None
             layer.scheme = self.get_moe_scheme(layer, prefix)
-            return ModelSlimFusedMoEMethod(self)
+            if layer.scheme is None:
+                return None
+            return ModelSlimLinearMethod(self)
         return None
 
     def get_linear_scheme(
