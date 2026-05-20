@@ -422,6 +422,28 @@ class TritonAttnBackend(AttentionBackend):
                 )
             )
             kv_indices = kv_indices.to(torch.int64)
+
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                # SWA target models need window_kv_indices populated even in
+                # the draft_extend path; the kernel dispatches on it when
+                # layer.sliding_window_size > -1. custom_mask is None here so
+                # window_kv_offsets is unused and can stay None.
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool_allocator,
+                )
+
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
             # `max(spec_info.num_accept_tokens_cpu)`.
@@ -711,6 +733,28 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                # Same rationale as the is_target_verify() branch above, but
+                # for draft_extend. custom_mask is None here so window_kv_offsets
+                # is unused; we still populate the graph-captured buffer for
+                # shape consistency.
+                window_kv_indices = self.cuda_graph_window_kv_indices
+                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                window_kv_offsets = self.cuda_graph_window_kv_offsets
+                window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
+                )
+
             custom_mask = None
             mask_indptr = None
             max_extend_len = num_tokens_per_bs
@@ -866,6 +910,28 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                # Same rationale as the is_target_verify() branch above.
+                # seq_lens is already sliced to [:bs] at the top of this
+                # branch, so pass it directly. Unlike the capture path, we do
+                # not construct a new ForwardMetadata here, so only the
+                # graph-captured buffers actually read by the kernel
+                # (window_kv_indices, window_kv_offsets) need to be updated.
+                window_kv_indices = self.cuda_graph_window_kv_indices
+                window_kv_offsets = self.cuda_graph_window_kv_offsets
+                _, _, _, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens,
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
+                )
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
