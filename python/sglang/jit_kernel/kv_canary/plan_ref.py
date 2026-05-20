@@ -83,113 +83,35 @@ def canary_plan_step_torch_reference(
     write_lens = torch.clamp(write_lens, min=0)
 
     # Materialize verify entries.
-    verify_offsets = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int64, device=work_device),
-            torch.cumsum(verify_lens, dim=0),
-        ]
+    total_verify = _materialize_verify_entries(
+        verify_plan_out=verify_plan_out,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        req_to_token_host=req_to_token_host,
+        not_padding=not_padding,
+        swa_window_size=swa_window_size,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=verify_capacity,
+        work_device=work_device,
+        verify_lens=verify_lens,
+        window_starts=window_starts,
+        bs=bs,
     )
-    total_verify = int(verify_offsets[bs].item())
-
-    if total_verify > 0:
-        flat_req_idx = torch.repeat_interleave(
-            torch.arange(bs, dtype=torch.int64, device=work_device), verify_lens
-        )
-        within_req = torch.arange(
-            total_verify, dtype=torch.int64, device=work_device
-        ) - verify_offsets[:-1].repeat_interleave(verify_lens)
-        positions = window_starts[flat_req_idx] + within_req
-        rp = req_pool_indices[flat_req_idx]
-        slot_full = req_to_token_host[rp, positions]
-        prev_pos = positions - 1
-        safe_prev_pos = torch.clamp(prev_pos, min=0)
-        prev_slot_full = req_to_token_host[rp, safe_prev_pos]
-
-        if full_to_swa_index_mapping is not None:
-            lut = full_to_swa_index_mapping.detach().to(
-                device=work_device, dtype=torch.int64
-            )
-            slot = _swa_translate_simple(slot=slot_full, lut=lut)
-            prev_slot_translated = _swa_translate_simple(slot=prev_slot_full, lut=lut)
-        else:
-            slot = slot_full
-            prev_slot_translated = prev_slot_full
-
-        chain_head_mask = prev_pos < 0
-        prev_slot = torch.where(
-            chain_head_mask,
-            torch.full_like(prev_slot_translated, -1),
-            prev_slot_translated,
-        )
-
-        capped = min(total_verify, verify_capacity)
-        verify_plan_out.verify_slot_indices[:capped].copy_(
-            slot[:capped]
-            .to(verify_plan_out.verify_slot_indices.dtype)
-            .to(verify_plan_out.verify_slot_indices.device)
-        )
-        verify_plan_out.verify_positions[:capped].copy_(
-            positions[:capped]
-            .to(verify_plan_out.verify_positions.dtype)
-            .to(verify_plan_out.verify_positions.device)
-        )
-        verify_plan_out.verify_prev_slot_indices[:capped].copy_(
-            prev_slot[:capped]
-            .to(verify_plan_out.verify_prev_slot_indices.dtype)
-            .to(verify_plan_out.verify_prev_slot_indices.device)
-        )
 
     # Materialize write metadata: write_offsets cumsum + per-req seed slot.
-    write_offsets = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int64, device=work_device),
-            torch.cumsum(write_lens, dim=0),
-        ]
+    _materialize_write_metadata(
+        write_plan_out=write_plan_out,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        req_to_token_host=req_to_token_host,
+        not_padding=not_padding,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        write_req_capacity=write_req_capacity,
+        work_device=work_device,
+        bs=bs,
+        write_lens=write_lens,
     )
-    # write_offsets out tensor shape is [write_req_capacity + 1]; only the active [0..bs] prefix is meaningful.
-    out_write_offsets_len = int(write_plan_out.write_offsets.shape[0])
-    copy_len = min(bs + 1, out_write_offsets_len)
-    write_plan_out.write_offsets[:copy_len].copy_(
-        write_offsets[:copy_len]
-        .to(write_plan_out.write_offsets.dtype)
-        .to(write_plan_out.write_offsets.device)
-    )
-    if copy_len < out_write_offsets_len:
-        write_plan_out.write_offsets[copy_len:].zero_()
-
-    # Padding rows (rpi == 0) may carry sentinel prefix_lens larger than req_to_token's seq-len dimension.
-    # Clamp the gather index to the table width so the gather itself is in-bounds; the torch.where below
-    # discards the padding-row values anyway via the (prefix_lens > 0) AND not_padding mask.
-    max_seq_len = int(req_to_token_host.shape[1])
-    safe_seed_pos = torch.clamp(prefix_lens - 1, min=0, max=max(max_seq_len - 1, 0))
-    seed_slot_full = torch.where(
-        (prefix_lens > 0) & not_padding,
-        req_to_token_host[req_pool_indices, safe_seed_pos],
-        torch.full_like(prefix_lens, -1),
-    )
-    if full_to_swa_index_mapping is not None:
-        lut = full_to_swa_index_mapping.detach().to(
-            device=work_device, dtype=torch.int64
-        )
-        seed_slot = _swa_translate_simple(slot=seed_slot_full, lut=lut)
-    else:
-        seed_slot = seed_slot_full
-
-    # Reqs that contribute no write entries: leave seed slot as -1 (so downstream skipping is unambiguous).
-    seed_slot = torch.where(write_lens > 0, seed_slot, torch.full_like(seed_slot, -1))
-
-    capped_reqs = min(bs, write_req_capacity)
-    write_plan_out.write_seed_slot_indices[:capped_reqs].copy_(
-        seed_slot[:capped_reqs]
-        .to(write_plan_out.write_seed_slot_indices.dtype)
-        .to(write_plan_out.write_seed_slot_indices.device)
-    )
-
-    # Active write-req count: number of leading reqs with write_lens > 0. Plan kernel writes bs (or smaller
-    # when trailing rows are padding) — we treat "trailing padding rows do not contribute" by counting reqs
-    # whose write_lens > 0 OR rpi != 0; for simplicity report bs (matches the kernel's "or smaller if padding
-    # rows trail" clause when no padding).
-    write_plan_out.write_num_valid_reqs.fill_(int(bs))
 
     # Append extras at base_idx = total_verify.
     _append_extras(
@@ -273,3 +195,143 @@ def _append_extras(
         .to(verify_plan_out.verify_prev_slot_indices.dtype)
         .to(verify_plan_out.verify_prev_slot_indices.device)
     )
+
+
+def _materialize_verify_entries(
+    *,
+    verify_plan_out: VerifyPlan,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    req_to_token_host: torch.Tensor,
+    not_padding: torch.Tensor,
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    verify_capacity: int,
+    work_device: torch.device,
+    verify_lens: torch.Tensor,
+    window_starts: torch.Tensor,
+    bs: int,
+) -> int:
+    verify_offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=work_device),
+            torch.cumsum(verify_lens, dim=0),
+        ]
+    )
+    total_verify = int(verify_offsets[bs].item())
+
+    if total_verify > 0:
+        flat_req_idx = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int64, device=work_device), verify_lens
+        )
+        within_req = torch.arange(
+            total_verify, dtype=torch.int64, device=work_device
+        ) - verify_offsets[:-1].repeat_interleave(verify_lens)
+        positions = window_starts[flat_req_idx] + within_req
+        rp = req_pool_indices[flat_req_idx]
+        slot_full = req_to_token_host[rp, positions]
+        prev_pos = positions - 1
+        safe_prev_pos = torch.clamp(prev_pos, min=0)
+        prev_slot_full = req_to_token_host[rp, safe_prev_pos]
+
+        if full_to_swa_index_mapping is not None:
+            lut = full_to_swa_index_mapping.detach().to(
+                device=work_device, dtype=torch.int64
+            )
+            slot = _swa_translate_simple(slot=slot_full, lut=lut)
+            prev_slot_translated = _swa_translate_simple(slot=prev_slot_full, lut=lut)
+        else:
+            slot = slot_full
+            prev_slot_translated = prev_slot_full
+
+        chain_head_mask = prev_pos < 0
+        prev_slot = torch.where(
+            chain_head_mask,
+            torch.full_like(prev_slot_translated, -1),
+            prev_slot_translated,
+        )
+
+        capped = min(total_verify, verify_capacity)
+        verify_plan_out.verify_slot_indices[:capped].copy_(
+            slot[:capped]
+            .to(verify_plan_out.verify_slot_indices.dtype)
+            .to(verify_plan_out.verify_slot_indices.device)
+        )
+        verify_plan_out.verify_positions[:capped].copy_(
+            positions[:capped]
+            .to(verify_plan_out.verify_positions.dtype)
+            .to(verify_plan_out.verify_positions.device)
+        )
+        verify_plan_out.verify_prev_slot_indices[:capped].copy_(
+            prev_slot[:capped]
+            .to(verify_plan_out.verify_prev_slot_indices.dtype)
+            .to(verify_plan_out.verify_prev_slot_indices.device)
+        )
+
+    return total_verify
+
+
+def _materialize_write_metadata(
+    *,
+    write_plan_out: WritePlan,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token_host: torch.Tensor,
+    not_padding: torch.Tensor,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    write_req_capacity: int,
+    work_device: torch.device,
+    bs: int,
+    write_lens: torch.Tensor,
+) -> None:
+    write_offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=work_device),
+            torch.cumsum(write_lens, dim=0),
+        ]
+    )
+    # write_offsets out tensor shape is [write_req_capacity + 1]; only the active [0..bs] prefix is meaningful.
+    out_write_offsets_len = int(write_plan_out.write_offsets.shape[0])
+    copy_len = min(bs + 1, out_write_offsets_len)
+    write_plan_out.write_offsets[:copy_len].copy_(
+        write_offsets[:copy_len]
+        .to(write_plan_out.write_offsets.dtype)
+        .to(write_plan_out.write_offsets.device)
+    )
+    if copy_len < out_write_offsets_len:
+        write_plan_out.write_offsets[copy_len:].zero_()
+
+    # Padding rows (rpi == 0) may carry sentinel prefix_lens larger than req_to_token's seq-len dimension.
+    # Clamp the gather index to the table width so the gather itself is in-bounds; the torch.where below
+    # discards the padding-row values anyway via the (prefix_lens > 0) AND not_padding mask.
+    max_seq_len = int(req_to_token_host.shape[1])
+    safe_seed_pos = torch.clamp(prefix_lens - 1, min=0, max=max(max_seq_len - 1, 0))
+    seed_slot_full = torch.where(
+        (prefix_lens > 0) & not_padding,
+        req_to_token_host[req_pool_indices, safe_seed_pos],
+        torch.full_like(prefix_lens, -1),
+    )
+    if full_to_swa_index_mapping is not None:
+        lut = full_to_swa_index_mapping.detach().to(
+            device=work_device, dtype=torch.int64
+        )
+        seed_slot = _swa_translate_simple(slot=seed_slot_full, lut=lut)
+    else:
+        seed_slot = seed_slot_full
+
+    # Reqs that contribute no write entries: leave seed slot as -1 (so downstream skipping is unambiguous).
+    seed_slot = torch.where(write_lens > 0, seed_slot, torch.full_like(seed_slot, -1))
+
+    capped_reqs = min(bs, write_req_capacity)
+    write_plan_out.write_seed_slot_indices[:capped_reqs].copy_(
+        seed_slot[:capped_reqs]
+        .to(write_plan_out.write_seed_slot_indices.dtype)
+        .to(write_plan_out.write_seed_slot_indices.device)
+    )
+
+    # Active write-req count: number of leading reqs with write_lens > 0. Plan kernel writes bs (or smaller
+    # when trailing rows are padding) — we treat "trailing padding rows do not contribute" by counting reqs
+    # whose write_lens > 0 OR rpi != 0; for simplicity report bs (matches the kernel's "or smaller if padding
+    # rows trail" clause when no padding).
+    write_plan_out.write_num_valid_reqs.fill_(int(bs))

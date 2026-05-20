@@ -11,6 +11,8 @@ indexing positionally.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
@@ -61,17 +63,92 @@ def canary_verify_step_torch_reference(
     Vectorised across active verify entries. Violations are emitted in a deterministic order (entry index
     ascending) so the CUDA kernel can match by sorting its atomic-order outputs.
     """
+    work_device = torch.device("cpu")
+
+    kernel_run_counter.add_(1)
+    result = _load_active_verify_entries(
+        plan=plan,
+        work_device=work_device,
+        pad_sentinel_slot=pad_sentinel_slot,
+        slot_run_counter=slot_run_counter,
+    )
+    if result is None:
+        return
+    slot_indices, expected_positions, prev_slot_indices, active = result
+
+    (
+        stored_tokens,
+        stored_positions,
+        stored_chain_hashes,
+        stored_real_kv_hashes,
+        prev_tokens,
+        prev_positions,
+        prev_chain_hashes,
+        prev_real_kv_hashes,
+        is_chain_head,
+    ) = _load_stored_and_prev_fields(
+        canary_buf=canary_buf,
+        slot_indices=slot_indices,
+        prev_slot_indices=prev_slot_indices,
+        work_device=work_device,
+    )
+
+    expected_chain_hashes = _compute_expected_chain_hashes(
+        prev_chain_hashes=prev_chain_hashes,
+        prev_tokens=prev_tokens,
+        prev_positions=prev_positions,
+        prev_real_kv_hashes=prev_real_kv_hashes,
+        is_chain_head=is_chain_head,
+    )
+
+    # real-KV hash mixin. Mode dispatch handles OFF (always 0), BIT (one bit per byte XOR-folded), and ALL
+    # (splitmix64-fold of every byte). When no sources are supplied the mixin is also disabled.
+    expected_real_kv_hashes = _compute_real_kv_hash_vec(
+        slot_indices=slot_indices,
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+        work_device=work_device,
+    )
+
+    fail_bits = _compute_verify_fail_bits(
+        stored_chain_hashes=stored_chain_hashes,
+        expected_chain_hashes=expected_chain_hashes,
+        stored_positions=stored_positions,
+        expected_positions=expected_positions,
+        stored_real_kv_hashes=stored_real_kv_hashes,
+        expected_real_kv_hashes=expected_real_kv_hashes,
+    )
+
+    _emit_verify_violations(
+        fail_bits=fail_bits,
+        slot_indices=slot_indices,
+        stored_positions=stored_positions,
+        stored_tokens=stored_tokens,
+        stored_chain_hashes=stored_chain_hashes,
+        expected_chain_hashes=expected_chain_hashes,
+        kernel_kind=kernel_kind,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        work_device=work_device,
+    )
+
+
+def _load_active_verify_entries(
+    *,
+    plan: VerifyPlan,
+    work_device: torch.device,
+    pad_sentinel_slot: int,
+    slot_run_counter: torch.Tensor,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
     num_valid = int(
-        violation_write_index.new_empty(()).copy_(plan.verify_num_valid[0]).item()
+        plan.verify_slot_indices.new_empty(()).copy_(plan.verify_num_valid[0]).item()
     )
     capacity = int(plan.verify_slot_indices.shape[0])
     active = max(0, min(num_valid, capacity))
 
-    kernel_run_counter.add_(1)
     if active <= 0:
-        return
+        return None
 
-    work_device = torch.device("cpu")
     slot_indices = plan.verify_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
@@ -96,8 +173,28 @@ def canary_verify_step_torch_reference(
         prev_slot_indices = prev_slot_indices[keep_mask]
         active = int(slot_indices.shape[0])
         if active <= 0:
-            return
+            return None
 
+    return slot_indices, expected_positions, prev_slot_indices, active
+
+
+def _load_stored_and_prev_fields(
+    *,
+    canary_buf: torch.Tensor,
+    slot_indices: torch.Tensor,
+    prev_slot_indices: torch.Tensor,
+    work_device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
     slot_stride_i64 = (
         int(buf_i64.shape[1]) // 1
@@ -123,6 +220,27 @@ def canary_verify_step_torch_reference(
     prev_chain_hashes = buf_i64[safe_prev, _FIELD_PREV_HASH]
     prev_real_kv_hashes = buf_i64[safe_prev, _FIELD_REAL_KV_HASH]
 
+    return (
+        stored_tokens,
+        stored_positions,
+        stored_chain_hashes,
+        stored_real_kv_hashes,
+        prev_tokens,
+        prev_positions,
+        prev_chain_hashes,
+        prev_real_kv_hashes,
+        is_chain_head,
+    )
+
+
+def _compute_expected_chain_hashes(
+    *,
+    prev_chain_hashes: torch.Tensor,
+    prev_tokens: torch.Tensor,
+    prev_positions: torch.Tensor,
+    prev_real_kv_hashes: torch.Tensor,
+    is_chain_head: torch.Tensor,
+) -> torch.Tensor:
     chain_anchor_hash = _splitmix64_python(CANARY_CHAIN_ANCHOR)
     chain_anchor_signed = _to_signed_int64(chain_anchor_hash)
     expected_from_prev = _splitmix64_mix4_vec(
@@ -133,16 +251,18 @@ def canary_verify_step_torch_reference(
         torch.full_like(prev_chain_hashes, chain_anchor_signed),
         expected_from_prev,
     )
+    return expected_chain_hashes
 
-    # real-KV hash mixin. Mode dispatch handles OFF (always 0), BIT (one bit per byte XOR-folded), and ALL
-    # (splitmix64-fold of every byte). When no sources are supplied the mixin is also disabled.
-    expected_real_kv_hashes = _compute_real_kv_hash_vec(
-        slot_indices=slot_indices,
-        real_kv_sources=real_kv_sources,
-        real_kv_hash_mode=real_kv_hash_mode,
-        work_device=work_device,
-    )
 
+def _compute_verify_fail_bits(
+    *,
+    stored_chain_hashes: torch.Tensor,
+    expected_chain_hashes: torch.Tensor,
+    stored_positions: torch.Tensor,
+    expected_positions: torch.Tensor,
+    stored_real_kv_hashes: torch.Tensor,
+    expected_real_kv_hashes: torch.Tensor,
+) -> torch.Tensor:
     fail_bits = torch.zeros_like(stored_chain_hashes, dtype=torch.int64)
     fail_bits |= torch.where(
         stored_chain_hashes != expected_chain_hashes,
@@ -159,7 +279,22 @@ def canary_verify_step_torch_reference(
         torch.full_like(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH),
         torch.zeros_like(fail_bits),
     )
+    return fail_bits
 
+
+def _emit_verify_violations(
+    *,
+    fail_bits: torch.Tensor,
+    slot_indices: torch.Tensor,
+    stored_positions: torch.Tensor,
+    stored_tokens: torch.Tensor,
+    stored_chain_hashes: torch.Tensor,
+    expected_chain_hashes: torch.Tensor,
+    kernel_kind: CanaryLaunchTag,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    work_device: torch.device,
+) -> None:
     violation_mask = fail_bits != 0
     num_new_violations = int(violation_mask.sum().item())
     if num_new_violations == 0:
