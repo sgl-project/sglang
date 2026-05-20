@@ -41,8 +41,15 @@ class FullComponent(TreeComponent):
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
-        # HiCache: evicted + backuped nodes are valid match boundaries
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
+        if match_device_only:
+            return (
+                lambda node: node.component_data[self.component_type].value is not None
+            )
+
+        # HiCache: evicted + backuped nodes are valid match boundaries.
         return lambda node: (
             node.component_data[self.component_type].value is not None or node.backuped
         )
