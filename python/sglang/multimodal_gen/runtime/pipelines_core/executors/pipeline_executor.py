@@ -84,7 +84,7 @@ class PipelineExecutor(ABC):
     ) -> OutputBatch:
 
         with self.profile_execution(batch, dump_rank=0):
-            with self._model_execution_context(server_args):
+            with current_platform.inference_mode():
                 batch = self.execute(stages, batch, server_args)
 
         return batch
@@ -97,20 +97,67 @@ class PipelineExecutor(ABC):
     ):
         """Execute a grouped request under the same profiler as a single request."""
         with self.profile_execution(batches[0], dump_rank=0):
-            with self._model_execution_context(server_args):
+            with current_platform.inference_mode():
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
     @staticmethod
-    def _model_execution_context(server_args: ServerArgs):
-        if (
-            server_args.use_fsdp_inference
-            or server_args.dit_layerwise_offload
-            or server_args.layerwise_offload_components
-        ):
-            # fsdp and layerwise-offload hooks need tensor version counters
-            return torch.no_grad()
-        return current_platform.inference_mode()
+    @contextlib.contextmanager
+    def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
+        if PipelineExecutor._stage_needs_version_counters(stage, server_args):
+            # fsdp and cpu-offload hooks need tensor version counters
+            with torch.inference_mode(False), torch.no_grad():
+                yield
+            return
+        yield
+
+    @staticmethod
+    def _stage_needs_version_counters(
+        stage: "PipelineStage", server_args: ServerArgs
+    ) -> bool:
+        if server_args.use_fsdp_inference:
+            return True
+
+        stage_name = stage._active_component_stage_name()
+        for use in stage.component_uses(server_args, stage_name):
+            component_name = use.component_name
+            if server_args.dit_cpu_offload and component_name in (
+                "transformer",
+                "transformer_2",
+                "video_dit",
+                "audio_dit",
+            ):
+                return True
+            if (
+                server_args.text_encoder_cpu_offload
+                and component_name.startswith("text_encoder")
+            ):
+                return True
+            if server_args.image_encoder_cpu_offload and component_name in (
+                "image_encoder",
+                "condition_image_encoder",
+            ):
+                return True
+            if server_args.vae_cpu_offload and component_name in (
+                "vae",
+                "video_vae",
+                "audio_vae",
+                "vocoder",
+                "spatial_upsampler",
+                "condition_image_encoder",
+            ):
+                return True
+        return False
+
+    def run_stage_with_context(
+        self,
+        stage: "PipelineStage",
+        payload,
+        server_args: ServerArgs,
+        run_stage,
+    ):
+        with self._stage_execution_context(stage, server_args):
+            return run_stage(stage, payload)
 
     @abstractmethod
     def execute(
