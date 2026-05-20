@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_and_assert_plan_byte_equal as _run_both_and_assert_byte_equal,
 )
@@ -13,7 +19,11 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _build_req_to_token,
     _empty_extras,
     _make_extras,
+    derive_plan_capacity,
+    make_lut,
+    make_req_to_token,
 )
+from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_plan_invariants
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -829,3 +839,480 @@ def test_extend_seq_lens_boundary_byte_equal_sweep(extend_val: int) -> None:
         swa_window_size=0,
         full_to_swa_index_mapping=None,
     )
+
+
+def _alloc_for_inputs(
+    *,
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    fb_extend_seq_lens: torch.Tensor,
+    extras_count: int,
+    swa_window_size: int,
+) -> tuple[int, int]:
+    bs = int(fb_req_pool_indices.shape[0])
+    rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
+    pfx_cpu = fb_prefix_lens.detach().cpu().tolist()
+    ext_cpu = fb_extend_seq_lens.detach().cpu().tolist()
+    total_verify = 0
+    for rpi, pfx in zip(rpi_cpu, pfx_cpu):
+        if rpi == 0:
+            continue
+        if swa_window_size > 0:
+            window_start = max(0, pfx - swa_window_size)
+            total_verify += max(0, pfx - window_start)
+        else:
+            total_verify += max(0, pfx)
+    return derive_plan_capacity(
+        kind="loose", total_verify=total_verify, extras_count=extras_count, bs=bs
+    )
+
+
+def _run_label(
+    *,
+    label: str,
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    fb_extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    swa_window_size: int,
+    full_to_swa_index_mapping: torch.Tensor | None,
+    verify_capacity: int,
+    write_req_capacity: int,
+) -> tuple[VerifyPlan, WritePlan]:
+    verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
+    write_plan = WritePlan.allocate(
+        write_req_capacity=write_req_capacity, device=_DEVICE
+    )
+    runner = canary_plan_step if label == "real" else canary_plan_step_torch_reference
+    extra_slots, extra_positions, extra_prevs, extra_num_valid = extras
+    runner(
+        verify_plan_out=verify_plan,
+        write_plan_out=write_plan,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extra_verify_slot_indices=extra_slots,
+        extra_verify_positions=extra_positions,
+        extra_verify_prev_slot_indices=extra_prevs,
+        extra_verify_num_valid=extra_num_valid,
+        swa_window_size=swa_window_size,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+    )
+    torch.cuda.synchronize()
+    return verify_plan, write_plan
+
+
+def test_seed_translated_through_permuted_lut() -> None:
+    """Permuted LUT: seed slot is the LUT-lookup of req_to_token[rp, prefix-1], NOT identity."""
+    rng = random.Random(42)
+    max_seq_len = 16
+    max_reqs = 4
+    pool_size = max_reqs * max_seq_len
+    lut = make_lut(kind="permutation", pool_size=pool_size, device=_DEVICE, rng=rng)
+    rtt = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+
+    rp = 2
+    prefix = 5
+    fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+
+    full_seed_slot = rp * max_seq_len + (prefix - 1)
+    expected_seed = int(lut[full_seed_slot].item())
+
+    extras = _empty_extras()
+    verify_capacity, write_req_capacity = _alloc_for_inputs(
+        fb_req_pool_indices=fb_rpi,
+        fb_prefix_lens=fb_pfx,
+        fb_extend_seq_lens=fb_ext,
+        extras_count=0,
+        swa_window_size=max_seq_len,
+    )
+    plans: dict[str, tuple[VerifyPlan, WritePlan]] = {}
+    for label in ("real", "ref"):
+        plans[label] = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=max_seq_len,
+            full_to_swa_index_mapping=lut,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        v_plan, w_plan = plans[label]
+        actual_seed = int(w_plan.write_seed_slot_indices[0].item())
+        assert (
+            actual_seed == expected_seed
+        ), f"[{label}] permuted-LUT seed expected {expected_seed} got {actual_seed}"
+
+
+def test_per_req_slot_when_req_to_token_is_sparse() -> None:
+    """sparse_permuted rtt: verify_slot_indices read directly from the constructed table."""
+    rng = random.Random(7)
+    max_seq_len = 8
+    max_reqs = 3
+    rtt = make_req_to_token(
+        kind="sparse_permuted",
+        max_reqs=max_reqs,
+        max_seq_len=max_seq_len,
+        device=_DEVICE,
+        rng=rng,
+    )
+    rp = 1
+    prefix = 4
+    fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    extras = _empty_extras()
+    verify_capacity, write_req_capacity = _alloc_for_inputs(
+        fb_req_pool_indices=fb_rpi,
+        fb_prefix_lens=fb_pfx,
+        fb_extend_seq_lens=fb_ext,
+        extras_count=0,
+        swa_window_size=0,
+    )
+
+    expected_slots = [int(rtt[rp, pos].item()) for pos in range(prefix)]
+
+    for label in ("real", "ref"):
+        v_plan, _ = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        actual_slots = v_plan.verify_slot_indices[:prefix].detach().cpu().tolist()
+        assert (
+            actual_slots == expected_slots
+        ), f"[{label}] sparse-rtt slots expected {expected_slots} got {actual_slots}"
+
+
+def test_extras_capacity_just_fits() -> None:
+    """tight_match capacity: all extras land at the tail with no drop."""
+    rp = 1
+    prefix = 4
+    fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+
+    extras_slot_list = [500, 501, 502]
+    extras_position_list = [10, 11, 12]
+    extras_prev_list = [-1, 500, 501]
+    extras_count = len(extras_slot_list)
+    extras = _make_extras(
+        slot_indices=extras_slot_list,
+        positions=extras_position_list,
+        prev_slot_indices=extras_prev_list,
+        capacity=extras_count,
+    )
+
+    total_verify = prefix
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="tight_match",
+        total_verify=total_verify,
+        extras_count=extras_count,
+        bs=1,
+    )
+
+    for label in ("real", "ref"):
+        v_plan, w_plan = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        n = int(v_plan.verify_num_valid[0].item())
+        assert n == total_verify + extras_count, f"[{label}] num_valid {n}"
+        tail = (
+            v_plan.verify_slot_indices[prefix : prefix + extras_count]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        assert tail == extras_slot_list, f"[{label}] extras tail {tail}"
+
+
+def test_extras_capacity_undershoot_by_one() -> None:
+    """under_by_one capacity: the last extra is capped/dropped consistently across real and ref."""
+    rp = 1
+    prefix = 3
+    fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+
+    extras_slot_list = [600, 601, 602]
+    extras_position_list = [20, 21, 22]
+    extras_prev_list = [-1, 600, 601]
+    extras_count = len(extras_slot_list)
+    extras = _make_extras(
+        slot_indices=extras_slot_list,
+        positions=extras_position_list,
+        prev_slot_indices=extras_prev_list,
+        capacity=extras_count,
+    )
+
+    total_verify = prefix
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="under_by_one",
+        total_verify=total_verify,
+        extras_count=extras_count,
+        bs=1,
+    )
+
+    real_v, _ = _run_label(
+        label="real",
+        fb_req_pool_indices=fb_rpi,
+        fb_prefix_lens=fb_pfx,
+        fb_extend_seq_lens=fb_ext,
+        req_to_token=rtt,
+        extras=extras,
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+        verify_capacity=verify_capacity,
+        write_req_capacity=write_req_capacity,
+    )
+    ref_v, _ = _run_label(
+        label="ref",
+        fb_req_pool_indices=fb_rpi,
+        fb_prefix_lens=fb_pfx,
+        fb_extend_seq_lens=fb_ext,
+        req_to_token=rtt,
+        extras=extras,
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+        verify_capacity=verify_capacity,
+        write_req_capacity=write_req_capacity,
+    )
+    n_real = int(real_v.verify_num_valid[0].item())
+    n_ref = int(ref_v.verify_num_valid[0].item())
+    assert n_real == n_ref, f"real {n_real} vs ref {n_ref} diverged under cap"
+    assert (
+        n_real <= verify_capacity
+    ), f"real n_valid {n_real} exceeded cap {verify_capacity}"
+
+
+def test_swa_window_head_prev_slot_is_real_predecessor() -> None:
+    """SWA window with non-zero window_start: head entry's prev_slot != -1; it is the real predecessor."""
+    rng = random.Random(13)
+    max_seq_len = 256
+    max_reqs = 2
+    pool_size = max_reqs * max_seq_len
+    swa_window_size = 128
+    prefix = 200
+    rp = 1
+    lut = make_lut(kind="permutation", pool_size=pool_size, device=_DEVICE, rng=rng)
+    rtt = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+
+    fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    extras = _empty_extras()
+
+    window_start = prefix - swa_window_size
+    full_prev_slot = int(rtt[rp, window_start - 1].item())
+    expected_prev = int(lut[full_prev_slot].item())
+
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="loose", total_verify=swa_window_size, extras_count=0, bs=1
+    )
+
+    for label in ("real", "ref"):
+        v_plan, _ = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=swa_window_size,
+            full_to_swa_index_mapping=lut,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        actual_prev = int(v_plan.verify_prev_slot_indices[0].item())
+        assert (
+            actual_prev != -1
+        ), f"[{label}] SWA window head must have real predecessor, got -1"
+        assert (
+            actual_prev == expected_prev
+        ), f"[{label}] expected prev={expected_prev} got {actual_prev}"
+
+
+def test_replay_same_inputs_yields_same_outputs() -> None:
+    """Two consecutive runs on identical inputs produce byte-equal plans (kernel is pure)."""
+    fb_rpi = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([4, 7, 2], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([2, 1, 3], dtype=torch.int32, device=_DEVICE)
+    rtt = _build_req_to_token(max_reqs=8, max_seq_len=16)
+    extras = _empty_extras()
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="loose", total_verify=13, extras_count=0, bs=3
+    )
+
+    for label in ("real", "ref"):
+        run1_v, run1_w = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        run2_v, run2_w = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        assert torch.equal(
+            run1_v.verify_slot_indices, run2_v.verify_slot_indices
+        ), label
+        assert torch.equal(run1_v.verify_positions, run2_v.verify_positions), label
+        assert torch.equal(
+            run1_v.verify_prev_slot_indices, run2_v.verify_prev_slot_indices
+        ), label
+        assert torch.equal(run1_v.verify_num_valid, run2_v.verify_num_valid), label
+        assert torch.equal(run1_w.write_offsets, run2_w.write_offsets), label
+        assert torch.equal(
+            run1_w.write_seed_slot_indices, run2_w.write_seed_slot_indices
+        ), label
+        assert torch.equal(
+            run1_w.write_num_valid_reqs, run2_w.write_num_valid_reqs
+        ), label
+
+
+def test_padding_row_with_garbage_prefix_does_not_oob() -> None:
+    """rpi==0 padding row with absurd prefix_lens must not OOB-read req_to_token (row is skipped)."""
+    fb_rpi = torch.tensor([1, 0, 2], dtype=torch.int32, device=_DEVICE)
+    fb_pfx = torch.tensor([5, 99999, 3], dtype=torch.int32, device=_DEVICE)
+    fb_ext = torch.tensor([1, 99999, 1], dtype=torch.int32, device=_DEVICE)
+    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    extras = _empty_extras()
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="loose", total_verify=8, extras_count=0, bs=3
+    )
+
+    for label in ("real", "ref"):
+        v_plan, w_plan = _run_label(
+            label=label,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            req_to_token=rtt,
+            extras=extras,
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+            write_req_capacity=write_req_capacity,
+        )
+        assert int(v_plan.verify_num_valid[0].item()) == 8, label
+        assert (
+            int(w_plan.write_seed_slot_indices[1].item()) == -1
+        ), f"[{label}] padding row seed must be -1"
+        assert_all_plan_invariants(
+            verify_plan=v_plan,
+            write_plan=w_plan,
+            fb_req_pool_indices=fb_rpi,
+            fb_prefix_lens=fb_pfx,
+            fb_extend_seq_lens=fb_ext,
+            swa_window_size=0,
+            extras_slot_indices=extras[0],
+            extras_positions=extras[1],
+            extras_prev_slot_indices=extras[2],
+            extras_count=0,
+        )
+
+
+def test_shrink_bs_clears_stale_write_offsets() -> None:
+    """Reusing a WritePlan with smaller bs: write_offsets beyond new bs must be zeroed by the kernel."""
+    rtt = _build_req_to_token(max_reqs=16, max_seq_len=16)
+    extras = _empty_extras()
+    verify_capacity, write_req_capacity = derive_plan_capacity(
+        kind="loose", total_verify=80, extras_count=0, bs=8
+    )
+
+    for label in ("real", "ref"):
+        big_rpi = torch.tensor(
+            [1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int32, device=_DEVICE
+        )
+        big_pfx = torch.tensor([10] * 8, dtype=torch.int32, device=_DEVICE)
+        big_ext = torch.tensor([1] * 8, dtype=torch.int32, device=_DEVICE)
+        small_rpi = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
+        small_pfx = torch.tensor([5, 5, 5], dtype=torch.int32, device=_DEVICE)
+        small_ext = torch.tensor([1, 1, 1], dtype=torch.int32, device=_DEVICE)
+
+        verify_plan = VerifyPlan.allocate(
+            verify_capacity=verify_capacity, device=_DEVICE
+        )
+        write_plan = WritePlan.allocate(
+            write_req_capacity=write_req_capacity, device=_DEVICE
+        )
+        runner = (
+            canary_plan_step if label == "real" else canary_plan_step_torch_reference
+        )
+        runner(
+            verify_plan_out=verify_plan,
+            write_plan_out=write_plan,
+            fb_req_pool_indices=big_rpi,
+            fb_prefix_lens=big_pfx,
+            fb_extend_seq_lens=big_ext,
+            req_to_token=rtt,
+            extra_verify_slot_indices=extras[0],
+            extra_verify_positions=extras[1],
+            extra_verify_prev_slot_indices=extras[2],
+            extra_verify_num_valid=extras[3],
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+        )
+        torch.cuda.synchronize()
+        runner(
+            verify_plan_out=verify_plan,
+            write_plan_out=write_plan,
+            fb_req_pool_indices=small_rpi,
+            fb_prefix_lens=small_pfx,
+            fb_extend_seq_lens=small_ext,
+            req_to_token=rtt,
+            extra_verify_slot_indices=extras[0],
+            extra_verify_positions=extras[1],
+            extra_verify_prev_slot_indices=extras[2],
+            extra_verify_num_valid=extras[3],
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+        )
+        torch.cuda.synchronize()
+        n_active = int(write_plan.write_num_valid_reqs[0].item())
+        tail_offsets = (
+            write_plan.write_offsets[n_active + 1 : 8].detach().cpu().tolist()
+        )
+        assert all(
+            v == 0 for v in tail_offsets
+        ), f"[{label}] stale write_offsets tail not cleared: {tail_offsets}"

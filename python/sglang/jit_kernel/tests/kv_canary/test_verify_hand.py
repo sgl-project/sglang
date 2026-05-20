@@ -1988,3 +1988,470 @@ def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
             real_kv_hash_mode=RealKvHashMode.BIT,
         )
     )
+
+
+def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
+    """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=32)
+    sources_cuda = make_real_kv_sources(
+        count=2,
+        num_bytes_per_token=128,
+        page_size=16,
+        num_slots=32,
+        device=_DEVICE,
+    )
+    sources_ref = tuple(
+        RealKvSource(
+            tensor=s.tensor.clone(),
+            page_size=s.page_size,
+            num_bytes_per_token=s.num_bytes_per_token,
+            read_bytes=s.read_bytes,
+        )
+        for s in sources_cuda
+    )
+
+    slot_indices = [1, 2, 3]
+    tokens = [100, 200, 300]
+    positions = [0, 1, 2]
+
+    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    real_kv_hashes: list[int] = []
+    for slot_idx in slot_indices:
+        rkv = 0
+        for src in sources_cuda:
+            page_id = slot_idx // src.page_size
+            page_off = (slot_idx % src.page_size) * src.num_bytes_per_token
+            row_bytes = (
+                src.tensor[page_id, page_off : page_off + src.read_bytes]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            fold = 0
+            for b in row_bytes:
+                fold = splitmix64(fold ^ int(b))
+            rkv = splitmix64(rkv ^ fold)
+        real_kv_hashes.append(rkv)
+
+    for slot_idx, token, position, rkv in zip(
+        slot_indices, tokens, positions, real_kv_hashes
+    ):
+        signed_prev = to_signed_int64(running)
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=token,
+                position=position,
+                prev_hash=signed_prev,
+                real_kv_hash=to_signed_int64(rkv),
+            )
+        running = splitmix64_mix4(running, token, position, rkv)
+
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 1, 2],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 1, 2],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=RealKvHashMode.ALL,
+    )
+    assert int(cuda_log.write_index[0].item()) == 0
+
+
+def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
+    """BIT mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=8, device=_DEVICE)
+    slot_idx = 3
+    rkv_clean = 0
+    row_bytes = (
+        sources_cuda[0]
+        .tensor[slot_idx, : sources_cuda[0].read_bytes]
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    fold = 0
+    for b in row_bytes:
+        fold ^= int(b) & 1
+    rkv_clean = fold
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=slot_idx,
+            token=42,
+            position=0,
+            prev_hash=chain_anchor_signed(),
+            real_kv_hash=to_signed_int64(rkv_clean),
+        )
+
+    sources_cuda[0].tensor[slot_idx, 0] ^= 1
+    sources_ref = tuple(
+        RealKvSource(
+            tensor=s.tensor.clone(),
+            page_size=s.page_size,
+            num_bytes_per_token=s.num_bytes_per_token,
+            read_bytes=s.read_bytes,
+        )
+        for s in sources_cuda
+    )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[0],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[0],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=RealKvHashMode.BIT,
+    )
+
+    assert int(cuda_log.write_index[0].item()) >= 1
+    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert (
+        bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    ), f"expected REAL_KV_HASH bit, got {bits:#b}"
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+def test_paged_layout_page_size_16() -> None:
+    """page_size=16: slot→page mapping doesn't change verify chain semantics on a clean chain."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=64)
+    sources_cuda = make_real_kv_sources(
+        count=1,
+        num_bytes_per_token=4,
+        page_size=16,
+        num_slots=64,
+        device=_DEVICE,
+    )
+    sources_ref = tuple(
+        RealKvSource(
+            tensor=s.tensor.clone(),
+            page_size=s.page_size,
+            num_bytes_per_token=s.num_bytes_per_token,
+            read_bytes=s.read_bytes,
+        )
+        for s in sources_cuda
+    )
+
+    # Step: cross a page boundary by writing slots [15, 16] which straddle pages 0 and 1.
+    slot_indices = [15, 16]
+    tokens = [77, 88]
+    positions = [0, 1]
+    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    rkv_values: list[int] = []
+    for slot_idx in slot_indices:
+        page_id = slot_idx // sources_cuda[0].page_size
+        page_off = (slot_idx % sources_cuda[0].page_size) * sources_cuda[
+            0
+        ].num_bytes_per_token
+        row_bytes = (
+            sources_cuda[0]
+            .tensor[page_id, page_off : page_off + sources_cuda[0].read_bytes]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        fold = 0
+        for b in row_bytes:
+            fold = splitmix64(fold ^ int(b))
+        rkv_values.append(fold)
+
+    for slot_idx, token, position, rkv in zip(
+        slot_indices, tokens, positions, rkv_values
+    ):
+        signed_prev = to_signed_int64(running)
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=token,
+                position=position,
+                prev_hash=signed_prev,
+                real_kv_hash=to_signed_int64(rkv),
+            )
+        running = splitmix64_mix4(running, token, position, rkv)
+
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 15],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 15],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=RealKvHashMode.ALL,
+    )
+    assert int(cuda_log.write_index[0].item()) == 0
+
+
+def test_violation_ring_atomic_with_many_violations() -> None:
+    """50 simultaneously-corrupted entries → write_index == 50 (no atomicity loss)."""
+    n = 50
+    cuda_buf = make_canary_buf(num_slots=n + 4, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+    slot_indices = list(range(1, n + 1))
+    positions = [0] * n
+
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1] * n,
+        capacity=n,
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1] * n,
+        capacity=n,
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(capacity=128, device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(capacity=128, device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == n
+    assert int(ref_log.write_index[0].item()) == n
+
+
+def test_chain_head_anchored_on_constant() -> None:
+    """prev_slot==-1 + stored prev_hash != splitmix64(ANCHOR) → CHAIN_HASH bit set."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    slot_idx = 5
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=slot_idx,
+            token=42,
+            position=0,
+            prev_hash=to_signed_int64(0xDEADBEEF),
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[0],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[0],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+    assert int(cuda_log.write_index[0].item()) == 1
+    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert bits & _FAIL_REASON_BIT_CHAIN_HASH
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+def test_position_mismatch_sets_position_bit_only() -> None:
+    """Plan.position != stored.position with chain hash correct → only POSITION bit set."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    slot_idx = 5
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=slot_idx,
+            token=42,
+            position=10,
+            prev_hash=chain_anchor_signed(),
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[99],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[slot_idx],
+        positions=[99],
+        prev_slot_indices=[-1],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+    assert int(cuda_log.write_index[0].item()) == 1
+    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert bits & _FAIL_REASON_BIT_POSITION, f"expected POSITION bit, got {bits:#b}"
+    assert (
+        bits & _FAIL_REASON_BIT_CHAIN_HASH
+    ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+def test_replay_does_not_double_count_run_counters() -> None:
+    """Two consecutive runs on same plan: slot_run_counter += 2N, kernel_run_counter += 2."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    slot_indices = [1, 2, 3]
+    tokens = [10, 20, 30]
+    positions = [0, 1, 2]
+    _stamp_chain(
+        cuda_buf=cuda_buf,
+        ref_buf=ref_buf,
+        tokens=tokens,
+        positions=positions,
+        slot_indices=slot_indices,
+    )
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 1, 2],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1, 1, 2],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    for _ in range(2):
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=plan_cuda,
+            plan_ref=plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+        )
+
+    assert int(cuda_log.slot_run_counter[0].item()) == 2 * len(slot_indices)
+    assert int(cuda_log.kernel_run_counter[0].item()) == 2
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
+    """Each violation row's kernel_kind matches the launch tag; slot_idx is one of the plan slots."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    slot_indices = [1, 2, 3, 4]
+    positions = [0, 1, 2, 3]
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1] * 4,
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1] * 4,
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    launch_tag = CanaryLaunchTag.HEAD_V_SWA
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+        kernel_kind=launch_tag,
+    )
+    n_violations = int(cuda_log.write_index[0].item())
+    plan_slot_set = set(slot_indices)
+    for row in range(n_violations):
+        kind = int(cuda_log.ring[row, _VIOLATION_FIELD_KERNEL_KIND].item())
+        assert kind == int(launch_tag), f"row {row} kind {kind} != {int(launch_tag)}"
+        slot = int(cuda_log.ring[row, 1].item())
+        assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)

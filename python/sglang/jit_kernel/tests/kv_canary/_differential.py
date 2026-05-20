@@ -7,7 +7,8 @@ file (``test_plan.py`` / ``test_verify.py`` / ``test_write.py``).
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 
@@ -343,3 +344,125 @@ def _run_both_and_assert_write_buf_and_state_equal(
     )
     assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ShrinkResult:
+    """Outcome of ``shrink_inputs``: minified fuzz inputs + audit trail of accepted mutations."""
+
+    inputs: Any
+    mutations_applied: list[str]
+
+
+def shrink_inputs(
+    inputs: Any,
+    *,
+    check_fn: Callable[[Any], bool],
+    max_iterations: int = 50,
+) -> ShrinkResult:
+    """Greedy 1-step minify for a fuzz inputs dataclass.
+
+    ``check_fn(candidate)`` returns True when ``candidate`` still reproduces the failure. Each round
+    yields candidate-simpler-than-current mutations through ``_yield_simpler``; the first accepted
+    candidate becomes the new current. Iteration stops when no mutation is accepted or ``max_iterations``
+    is reached.
+    """
+    current = inputs
+    applied: list[str] = []
+    for _ in range(max_iterations):
+        improved = False
+        for label, candidate in _yield_simpler(current):
+            try:
+                still_fails = check_fn(candidate)
+            except Exception:
+                still_fails = False
+            if still_fails:
+                current = candidate
+                applied.append(label)
+                improved = True
+                break
+        if not improved:
+            break
+    return ShrinkResult(inputs=current, mutations_applied=applied)
+
+
+def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
+    """Yield (label, simpler_candidate) tuples for generic fuzz-input minifiers.
+
+    The candidates touch only well-known field names; an inputs dataclass that lacks a field will simply
+    have that mutation skipped. No kernel-specific knowledge is encoded here so the same shrinker drives
+    Plan / Verify / Write fuzz failures uniformly.
+    """
+    fields = {
+        f: getattr(inputs, f) for f in inputs.__dataclass_fields__  # type: ignore[attr-defined]
+    }
+
+    def emit(label: str, **overrides: Any) -> Iterator[tuple[str, Any]]:
+        candidate = replace(inputs, **overrides)
+        yield label, candidate
+
+    bs_field = (
+        "fb_req_pool_indices"
+        if "fb_req_pool_indices" in fields
+        else ("fb_input_ids" if "fb_input_ids" in fields else None)
+    )
+    if bs_field is not None and isinstance(fields[bs_field], torch.Tensor):
+        tensor = fields[bs_field]
+        if tensor.numel() > 1:
+            new_len = tensor.numel() - 1
+            related_tensors_overrides: dict[str, Any] = {}
+            for name in (
+                "fb_req_pool_indices",
+                "fb_prefix_lens",
+                "fb_extend_seq_lens",
+                "fb_input_ids",
+                "fb_positions",
+                "fb_out_cache_loc",
+                "pseudo_expected_tokens",
+                "pseudo_expected_positions",
+            ):
+                t = fields.get(name)
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.numel() >= new_len
+                    and t.dim() == 1
+                ):
+                    related_tensors_overrides[name] = t[:new_len].contiguous()
+            if related_tensors_overrides:
+                yield from emit("drop_last_row", **related_tensors_overrides)
+
+    if "swa_window_size" in fields and isinstance(fields["swa_window_size"], int):
+        if fields["swa_window_size"] != 0:
+            yield from emit(
+                "swa_off", swa_window_size=0, full_to_swa_index_mapping=None
+            )
+
+    if "extras_count" in fields and isinstance(fields["extras_count"], int):
+        if fields["extras_count"] > 0:
+            yield from emit("extras_zero", extras_count=0)
+
+    if "real_kv_hash_mode" in fields:
+        cur = fields["real_kv_hash_mode"]
+        if hasattr(cur, "value"):
+            cls = cur.__class__
+            if int(cur) == 2:
+                yield from emit("hash_mode_bit", real_kv_hash_mode=cls(1))
+            elif int(cur) == 1:
+                yield from emit("hash_mode_off", real_kv_hash_mode=cls(0))
+
+    if "real_kv_sources" in fields:
+        srcs = fields["real_kv_sources"]
+        if isinstance(srcs, tuple) and len(srcs) > 1:
+            yield from emit("sources_to_one", real_kv_sources=srcs[:1])
+
+    if "pseudo_mode" in fields:
+        cur = fields["pseudo_mode"]
+        if hasattr(cur, "value") and int(cur) != 0:
+            cls = cur.__class__
+            yield from emit("pseudo_off", pseudo_mode=cls(0))
+
+    for name in ("verify_capacity", "write_req_capacity"):
+        if name in fields and isinstance(fields[name], int):
+            current_value = fields[name]
+            if current_value > 8:
+                yield from emit(f"shrink_{name}", **{name: max(8, current_value // 2)})
