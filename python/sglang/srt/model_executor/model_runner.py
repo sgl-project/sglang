@@ -2291,7 +2291,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+        Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device != "cuda":
             return
@@ -2299,29 +2299,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        self._deepseek_v4_mhc_prewarm()
-
-    def _deepseek_v4_mhc_prewarm(self):
-        if not self.is_hybrid_swa or not self.model_config.is_deepseek_v4_arch:
-            return
-        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            return
-        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            return
-
-        max_num_tokens = self.server_args.chunked_prefill_size
-        if max_num_tokens is None or max_num_tokens <= 0:
-            max_num_tokens = 8192
-
-        token_counts = self.model.prewarm_mhc_token_count_buckets(
-            max_num_tokens, self.device
-        )
-        self.tp_group.barrier()
-
-        logger.info(
-            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
-            token_counts,
-        )
+        # Models may need their own warmup for model-specific kernels or JIT paths.
+        # Register those hooks on the model class so ModelRunner can keep this
+        # warmup entry point generic.
+        model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
+        if model_kernel_warmup is not None:
+            model_kernel_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.

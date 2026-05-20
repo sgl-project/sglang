@@ -1222,6 +1222,28 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> Tuple[int, ...]:
         return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
+    def kernel_warmup(self, model_runner) -> None:
+        if not model_runner.is_hybrid_swa:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+
+        max_num_tokens = model_runner.server_args.chunked_prefill_size
+        if max_num_tokens is None or max_num_tokens <= 0:
+            max_num_tokens = 8192
+
+        token_counts = self.prewarm_mhc_token_count_buckets(
+            max_num_tokens, model_runner.device
+        )
+        model_runner.tp_group.barrier()
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
+            token_counts,
+        )
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
