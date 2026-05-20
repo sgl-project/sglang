@@ -7,20 +7,17 @@ each. The overhead percentage is printed to stdout and appended to the sibling
 
 2 cases:
 
-- ``bench_qwen3_prefill_bs32_isl16384_osl1``
-- ``bench_qwen3_decode_bs256_isl4096_osl1024``
+- ``test_qwen3_prefill_overhead_bs32_isl16384_osl1``
+- ``test_qwen3_decode_overhead_bs256_isl4096_osl1024``
 
 Both registered to ``extra-a`` (label-gated PR) and ``nightly-1-gpu`` (auto
-nightly accumulation). Method prefix ``bench_`` keeps bench cases easily
-grep-able; ``unittest.TestLoader.testMethodPrefix`` is rebound in ``__main__``
-so ``python3 file.py -f`` still discovers them.
+nightly accumulation).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 import unittest
 from pathlib import Path
@@ -163,7 +160,7 @@ def _measure_overhead(
 class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
-    def bench_qwen3_prefill_bs32_isl16384_osl1(self) -> None:
+    def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
         _measure_overhead(
             scenario_key="qwen3-0.6b/prefill_bs32_isl16384_osl1",
             batch_size=32,
@@ -171,7 +168,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=1,
         )
 
-    def bench_qwen3_decode_bs256_isl4096_osl1024(self) -> None:
+    def test_qwen3_decode_overhead_bs256_isl4096_osl1024(self) -> None:
         _measure_overhead(
             scenario_key="qwen3-0.6b/decode_bs256_isl4096_osl1024",
             batch_size=256,
@@ -180,17 +177,5 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
 
-def _main() -> int:
-    # Step 1: rebind the discovery prefix so ``bench_*`` methods become
-    # runnable test methods.
-    unittest.TestLoader.testMethodPrefix = "bench_"
-
-    # Step 2: hand control to the standard CLI so ``python3 file.py -f`` and
-    # any explicit ``bench_*`` selectors work unchanged.
-    return unittest.main(
-        module=__name__, exit=False, argv=sys.argv
-    ).result.wasSuccessful()
-
-
 if __name__ == "__main__":
-    sys.exit(0 if _main() else 1)
+    unittest.main()
