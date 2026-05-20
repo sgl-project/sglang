@@ -858,6 +858,151 @@ class TestNSACrossValidation(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(_CUDA_AVAILABLE, "End-to-end pipeline test requires CUDA + Triton")
+class TestEndToEndPipeline(unittest.TestCase):
+    """Round 3 drift recovery: full DS pipeline composes on synthetic V3.2-shape inputs.
+
+    NSA quantizer → page_signature_write (Triton) → bind_runtime_data →
+    retrieve_topk → m3b_page_stability_fixture. No production code mutation;
+    no model weights required.
+    """
+
+    def _build_fixture(self, *, num_layers=2, num_heads=4, num_pages=8, page_size=64, label_dim=16):
+        from sglang.srt.layers.attention.double_sparsity import (
+            DoubleSparsitySelector,
+            allocate_page_signature_table,
+            parse_double_sparsity_config,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, compute_content_sha256,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            page_signature_write,
+        )
+        from sglang.srt.layers.attention.nsa.quant_k_cache import (
+            quantize_k_cache_separate,
+        )
+
+        device = torch.device("cuda")
+        torch.manual_seed(31)
+
+        all_tokens = num_pages * page_size
+        k_nope = torch.randn(all_tokens, 512, dtype=torch.bfloat16, device=device)
+        k_rope = torch.randn(all_tokens, 64, dtype=torch.bfloat16, device=device)
+        nope_u8_flat, _ = quantize_k_cache_separate(k_nope, k_rope, tile_size=128)
+        nope_parts_u8 = nope_u8_flat.squeeze(1).reshape(num_pages, page_size, 528).contiguous()
+
+        sel = torch.randint(0, 512, (num_layers, num_heads, label_dim), dtype=torch.int32, device=device)
+        w = torch.randn(num_layers, num_heads, label_dim, dtype=torch.float32, device=device)
+        content_hash = compute_content_sha256(sel, w)
+        mask = ChannelMask(
+            channel_selection=sel,
+            channel_weights=w,
+            schema_version="1",
+            dtype="fp8_e4m3",
+            head_dim=512,
+            page_size=page_size,
+            label_dim=label_dim,
+            content_sha256=content_hash,
+        )
+
+        table = allocate_page_signature_table(
+            num_layers_local=num_layers,
+            max_pages=num_pages,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=page_size,
+            dtype=torch.float16,
+            device=device,
+        )
+        for layer in range(num_layers):
+            page_signature_write(
+                table.signatures,
+                table.valid_mask,
+                layer_id=layer,
+                page_ids=list(range(num_pages)),
+                nope_parts_u8=nope_parts_u8,
+                channel_selection_layer=sel[layer],
+                channel_weights_layer=w[layer],
+            )
+
+        cfg = parse_double_sparsity_config(
+            '{"top_k": 4, "page_size": 64, '
+            '"channel_mask_path": "/tmp/_fixture_only.safetensors", '
+            '"device_buffer_size": 4096}'
+        )
+        selector = DoubleSparsitySelector(
+            config=cfg, num_local_heads=num_heads, head_dim=512, device=device,
+        )
+        selector.bind_runtime_data(table, mask)
+        return selector, table, mask, num_pages
+
+    def test_full_pipeline_on_v32_shape_synthetic(self):
+        selector, table, mask, num_pages = self._build_fixture()
+        self.assertFalse(selector.IS_PLACEHOLDER, "bind_runtime_data should flip placeholder off")
+        self.assertTrue(table.valid_mask.all().item(), "all pages should be populated")
+
+        device = table.signatures.device
+        bs = 2
+        queries = torch.randn(bs, selector.num_local_heads, selector.head_dim, device=device)
+        req_pool = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([num_pages * 64, num_pages * 64], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(bs, num_pages, dtype=torch.int32, device=device)
+
+        indices, lengths = selector.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool, sparse_mask=sparse_mask, seq_lens=seq_lens,
+        )
+
+        self.assertEqual(indices.dtype, torch.int32)
+        self.assertEqual(lengths.dtype, torch.int32)
+        self.assertEqual(tuple(indices.shape), (bs, selector.max_top_k))
+        self.assertEqual(tuple(lengths.shape), (bs,))
+        for row in range(bs):
+            row_indices = indices[row, : int(lengths[row])].tolist()
+            self.assertTrue(
+                all(row_indices[i] < row_indices[i + 1] for i in range(len(row_indices) - 1)),
+                f"row {row} not sequence-ascending: {row_indices}",
+            )
+            for pid in row_indices:
+                self.assertGreaterEqual(pid, 0)
+                self.assertLess(pid, num_pages)
+
+    def test_hot_page_forced_into_selected(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            compute_hot_pages,
+        )
+
+        selector, table, mask, num_pages = self._build_fixture()
+        device = table.signatures.device
+        bs = 1
+        queries = torch.zeros(bs, selector.num_local_heads, selector.head_dim, device=device)
+        req_pool = torch.tensor([0], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([num_pages * 64], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(bs, num_pages, dtype=torch.int32, device=device)
+
+        hot = compute_hot_pages(seq_lens=seq_lens, page_size=64, local_window=1)
+        indices, lengths = selector.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool, sparse_mask=sparse_mask, seq_lens=seq_lens,
+            hot_pages=hot,
+        )
+        row = indices[0, : int(lengths[0])].tolist()
+        self.assertIn(num_pages - 1, row, f"hot page {num_pages - 1} not in {row}")
+
+    def test_m3b_fixture_passes_on_bound_selector(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            m3b_page_stability_fixture,
+        )
+
+        selector, table, mask, num_pages = self._build_fixture()
+        prompt_tokens = torch.zeros(1, num_pages * 64, dtype=torch.int32, device=table.signatures.device)
+        passed = m3b_page_stability_fixture(
+            selector, prompt_tokens=prompt_tokens, page_size=64, num_repeats=3,
+        )
+        self.assertTrue(passed, "DEC-2 page-stability fixture should hold on a real-bound selector")
+
+
 class TestCustomizedInfoIntegration(unittest.TestCase):
     """Round 2: DS stats → tokenizer_manager.customized_info wiring point."""
 
