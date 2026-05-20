@@ -90,7 +90,7 @@ conda activate sglang_npu
 ```
 
 Note on Anaconda repository restrictions
-If you encountered CondaToSNonInteractiveError: Terms of Service have not been accepted during the conda create step above, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
+If you encounter an error like “Terms of Service have not been accepted” during the conda create step, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
 ```bash Command
 # Add Tsinghua mirrors
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
