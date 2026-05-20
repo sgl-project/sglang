@@ -596,7 +596,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     )
     fb_input_ids = torch.tensor([10, 20, 30], dtype=torch.int32, device=_DEVICE)
     fb_positions = torch.tensor([0, 1, 2], dtype=torch.int32, device=_DEVICE)
-    fb_out_cache_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
     # Every actual differs from expected.
     pseudo_tokens = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
@@ -628,9 +628,9 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     from sglang.jit_kernel.tests.kv_canary.canary_helpers import make_verify_plan
 
     verify_plan = make_verify_plan(
-        slot_indices=[0, 1, 2],
+        slot_indices=[1, 2, 3],
         positions=[0, 1, 2],
-        prev_slot_indices=[-1, 0, 1],
+        prev_slot_indices=[-1, 1, 2],
         device=_DEVICE,
     )
     verify_log = FakeViolationLog.allocate(device=_DEVICE)
@@ -1529,6 +1529,7 @@ def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
     """Sweep position boundary values; assert CUDA write vs ref buf + state byte-equal."""
     _run_write_single_slot_byte_equal(_WriteSingleSlotInput(position=position_val))
 
+
 # ---------------------------------------------------------------------------
 
 import random as _random
@@ -1602,7 +1603,9 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
 
         loc_choice = rng.random()
         if loc_choice < 0.5:
-            fb_out_cache_loc_list = [rng.randint(0, num_slots - 1) for _ in range(total_entries)]
+            fb_out_cache_loc_list = [
+                rng.randint(0, num_slots - 1) for _ in range(total_entries)
+            ]
         elif loc_choice < 0.75:
             fb_out_cache_loc_list = [
                 -1 if rng.random() < 0.3 else rng.randint(0, num_slots - 1)
@@ -1631,13 +1634,25 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
         )
         mode = rng.choice([RealKvHashMode.OFF, RealKvHashMode.BIT, RealKvHashMode.ALL])
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
-        fb_input_ids = torch.tensor(fb_input_ids_list, dtype=torch.int32, device=_DEVICE)
-        fb_positions_t = torch.tensor(fb_positions_list, dtype=torch.int32, device=_DEVICE)
-        fb_out_cache_loc = torch.tensor(fb_out_cache_loc_list, dtype=torch.int32, device=_DEVICE)
-        pseudo_tokens = torch.tensor(pseudo_tokens_list, dtype=torch.int32, device=_DEVICE)
-        pseudo_positions = torch.tensor(pseudo_positions_list, dtype=torch.int32, device=_DEVICE)
+        fb_input_ids = torch.tensor(
+            fb_input_ids_list, dtype=torch.int32, device=_DEVICE
+        )
+        fb_positions_t = torch.tensor(
+            fb_positions_list, dtype=torch.int32, device=_DEVICE
+        )
+        fb_out_cache_loc = torch.tensor(
+            fb_out_cache_loc_list, dtype=torch.int32, device=_DEVICE
+        )
+        pseudo_tokens = torch.tensor(
+            pseudo_tokens_list, dtype=torch.int32, device=_DEVICE
+        )
+        pseudo_positions = torch.tensor(
+            pseudo_positions_list, dtype=torch.int32, device=_DEVICE
+        )
         cuda_log = FakeViolationLog.allocate(capacity=256, device=_DEVICE)
         ref_log = FakeViolationLog.allocate(capacity=256, device=_DEVICE)
 
@@ -1676,7 +1691,9 @@ def test_write_random_clean_chain_from_head() -> None:
         positions_list = list(range(chain_len))
         slot_list = list(range(chain_len))
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         plan_cuda = make_write_plan(
             write_offsets=[0, chain_len],
@@ -1733,7 +1750,9 @@ def test_write_random_seed_slot_resume() -> None:
         seed_position = rng.randint(0, 50)
         seed_prev_signed = to_signed_int64(rng.randint(0, (1 << 64) - 1))
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         for buf in (cuda_buf, ref_buf):
             write_slot_fields(
@@ -1801,7 +1820,9 @@ def test_write_random_pseudo_match_no_violation() -> None:
         positions_list = list(range(n))
         slot_list = list(range(n))
 
-        cuda_buf = make_canary_buf(num_slots=n + 4, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=n + 4, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         plan_cuda = make_write_plan(
             write_offsets=[0, n],
@@ -1840,9 +1861,9 @@ def test_write_random_pseudo_match_no_violation() -> None:
                 real_kv_sources_ref=(),
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
-            assert int(cuda_log.write_index[0].item()) == 0, (
-                "expected no violation when pseudo expected == actual"
-            )
+            assert (
+                int(cuda_log.write_index[0].item()) == 0
+            ), "expected no violation when pseudo expected == actual"
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} n={n}: {e}"
@@ -1863,13 +1884,19 @@ def test_write_random_pseudo_mismatch_reports_correct_bit() -> None:
         pseudo_tokens_list = list(tokens_list)
         pseudo_positions_list = list(positions_list)
         if mismatch_type == "token":
-            pseudo_tokens_list[corrupt_idx] = (tokens_list[corrupt_idx] + rng.randint(1, 999)) & 0xFFFF
+            pseudo_tokens_list[corrupt_idx] = (
+                tokens_list[corrupt_idx] + rng.randint(1, 999)
+            ) & 0xFFFF
             expected_bit = _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH
         else:
-            pseudo_positions_list[corrupt_idx] = positions_list[corrupt_idx] + rng.randint(1, 99)
+            pseudo_positions_list[corrupt_idx] = positions_list[
+                corrupt_idx
+            ] + rng.randint(1, 99)
             expected_bit = _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH
 
-        cuda_buf = make_canary_buf(num_slots=n + 4, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=n + 4, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         plan_cuda = make_write_plan(
             write_offsets=[0, n],
@@ -1886,8 +1913,12 @@ def test_write_random_pseudo_mismatch_reports_correct_bit() -> None:
         fb_input_ids = torch.tensor(tokens_list, dtype=torch.int32, device=_DEVICE)
         fb_positions = torch.tensor(positions_list, dtype=torch.int32, device=_DEVICE)
         fb_out_cache_loc = torch.tensor(slot_list, dtype=torch.int32, device=_DEVICE)
-        pseudo_tokens = torch.tensor(pseudo_tokens_list, dtype=torch.int32, device=_DEVICE)
-        pseudo_positions = torch.tensor(pseudo_positions_list, dtype=torch.int32, device=_DEVICE)
+        pseudo_tokens = torch.tensor(
+            pseudo_tokens_list, dtype=torch.int32, device=_DEVICE
+        )
+        pseudo_positions = torch.tensor(
+            pseudo_positions_list, dtype=torch.int32, device=_DEVICE
+        )
         cuda_log = FakeViolationLog.allocate(capacity=64, device=_DEVICE)
         ref_log = FakeViolationLog.allocate(capacity=64, device=_DEVICE)
         try:
@@ -1912,13 +1943,16 @@ def test_write_random_pseudo_mismatch_reports_correct_bit() -> None:
             assert write_idx >= 1, "expected at least one violation"
             corrupt_slot = slot_list[corrupt_idx]
             found = any(
-                (int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item()) & expected_bit)
+                (
+                    int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+                    & expected_bit
+                )
                 and int(cuda_log.ring[r, 1].item()) == corrupt_slot
                 for r in range(min(write_idx, cuda_log.ring.shape[0]))
             )
-            assert found, (
-                f"expected bit {expected_bit:#x} at slot {corrupt_slot} not found"
-            )
+            assert (
+                found
+            ), f"expected bit {expected_bit:#x} at slot {corrupt_slot} not found"
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "
@@ -1934,13 +1968,14 @@ def test_write_random_negative_slot_skip_no_op() -> None:
         num_slots = n + 10
         skip_indices = set(rng.sample(range(n), rng.randint(1, max(1, n // 2))))
         slot_list = [
-            -1 if i in skip_indices else rng.randint(0, num_slots - 1)
-            for i in range(n)
+            -1 if i in skip_indices else rng.randint(0, num_slots - 1) for i in range(n)
         ]
         tokens_list = [rng.randint(1, 0xFFFF) for _ in range(n)]
         positions_list = list(range(n))
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         plan_cuda = make_write_plan(
             write_offsets=[0, n],
@@ -2006,7 +2041,9 @@ def test_write_random_real_kv_modes_byte_equal() -> None:
         positions_list = list(range(n))
         slot_list = list(range(n))
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         plan_cuda = make_write_plan(
             write_offsets=[0, n],
