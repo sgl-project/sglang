@@ -96,7 +96,7 @@ LLAMA4_MODEL_ARCHS = (
     "Llama4ForCausalLM",
 )
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "oracle"}
 
 LOAD_FORMAT_CHOICES = [
     "auto",
