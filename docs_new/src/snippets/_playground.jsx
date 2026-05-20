@@ -1251,14 +1251,22 @@ export const Playground = ({ config }) => {
       borderLeft: `3px solid #ef4444`,
       paddingLeft: "8px", marginLeft: "-8px",
     },
-    badge: {
+    // Two-state badge — same shape and colors as the §3.1 Deployment
+    // widget's verified/unverified badge so the playground can inherit the
+    // base cell's verified status when no overrides are in play.
+    badge: (verified) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px",
-      background: isDark ? "#78350f" : "#fef3c7",
-      color: isDark ? "#fde68a" : "#92400e",
+      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
+                           : (isDark ? "#78350f" : "#fef3c7"),
+      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
+                           : (isDark ? "#fde68a" : "#92400e"),
       fontSize: "11px", fontWeight: 600,
-    },
-    badgeDot: { width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b" },
+    }),
+    badgeDot: (verified) => ({
+      width: "8px", height: "8px", borderRadius: "50%",
+      background: verified ? "#10b981" : "#f59e0b",
+    }),
     iconButton: {
       padding: "4px 10px",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -1507,6 +1515,15 @@ export const Playground = ({ config }) => {
     playgroundCommand = renderCommandLines(baseCell, pgFlags, pgEnv, base, env, pdMode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
+  // The playground inherits the base cell's verified status when no overrides
+  // are in play — i.e. when applying every axis's delta produced no added or
+  // removed lines vs base. Any user override (or a derived-but-mismatched
+  // base, like speculative falling back to "current" with no preset match)
+  // flips back to Auto-Estimated.
+  const playgroundVerified =
+    !!(baseCell && baseCell.verified)
+    && diffLines.length > 0
+    && diffLines.every((d) => d.kind === "unchanged");
 
   const curlText = interpolate(config.curl || "", env, modelName);
 
@@ -1666,9 +1683,9 @@ export const Playground = ({ config }) => {
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
             <div style={s.headerLeft}>
-              <div style={s.badge}>
-                <span style={s.badgeDot} />
-                Auto-Estimated
+              <div style={s.badge(playgroundVerified)}>
+                <span style={s.badgeDot(playgroundVerified)} />
+                {playgroundVerified ? "Verified" : "Auto-Estimated"}
               </div>
               <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                 <span
