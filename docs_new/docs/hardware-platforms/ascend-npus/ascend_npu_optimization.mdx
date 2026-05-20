@@ -187,18 +187,18 @@ These arguments and environment variables are critical for tuning prefill perfor
       <td>true</td>
     </tr>
     <tr>
-      <td>`--enable-nsa-prefill-context-parallel`</td>
-      <td><strong>(DeepSeek V3.2 NSA-specific)</strong> Enables context parallelism for the long-sequence prefill phase of DeepSeek V3.2 with NSA (Native Sparse Attention). Distributes the sequence across CP ranks to parallelize the computationally expensive NSA prefill for ultra-long contexts.</td>
+      <td>`--enable-dsa-prefill-context-parallel`</td>
+      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Enables context parallelism for the long-sequence prefill phase of DeepSeek V3.2 with DSA (DeepSeek Sparse Attention). Distributes the sequence across CP ranks to parallelize the computationally expensive DSA prefill for ultra-long contexts.</td>
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--nsa-prefill-cp-mode`</td>
-      <td><strong>(DeepSeek V3.2 NSA-specific)</strong> Controls how the long sequence is split across context parallel ranks: `in-seq-split` divides each sequence uniformly across CP ranks, optimal for single-request prefill. `round-robin-split` (code default) distributes tokens by index mod CP size, supporting multi-batch prefill. Only effective when `--enable-nsa-prefill-context-parallel` is enabled.</td>
+      <td>`--dsa-prefill-cp-mode`</td>
+      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Controls how the long sequence is split across context parallel ranks: `in-seq-split` divides each sequence uniformly across CP ranks, optimal for single-request prefill. `round-robin-split` (code default) distributes tokens by index mod CP size, supporting multi-batch prefill. Only effective when `--enable-dsa-prefill-context-parallel` is enabled.</td>
       <td>`in-seq-split`</td>
     </tr>
     <tr>
       <td>`--attn-cp-size`</td>
-      <td>Specifies the context parallelism group size for attention computation. Larger values distribute the sequence across more ranks, reducing per-rank memory and compute at the cost of increased communication. For models with NSA, this controls the CP size for sparse attention prefill. Set to the number of available devices for maximum parallelization.</td>
+      <td>Specifies the context parallelism group size for attention computation. Larger values distribute the sequence across more ranks, reducing per-rank memory and compute at the cost of increased communication. For models with DSA, this controls the CP size for sparse attention prefill. Set to the number of available devices for maximum parallelization.</td>
       <td>`32`</td>
     </tr>
   </tbody>
@@ -360,7 +360,7 @@ The following environment variables are used in other best practice configuratio
     <tr>
       <td>`HCCL_OP_EXPANSION_MODE=AIV`</td>
       <td>Configures the HCCL communication algorithm scheduling to use AIV (Ascend Intelligent Vision) expansion mode, which can improve communication efficiency for certain collective operations.</td>
-      <td>Used in Qwen MoE and R1 non-NSA configurations</td>
+      <td>Used in Qwen MoE and R1 non-DSA configurations</td>
     </tr>
     <tr>
       <td>`SGLANG_NPU_FUSED_MOE_MODE`</td>

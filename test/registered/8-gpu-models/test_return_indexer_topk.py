@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class TestReturnIndexerTopk(CustomTestCase):
-    """Indexer-topk capture e2e test for DSv3.2 (NSA).
+    """Indexer-topk capture e2e test for DSv3.2 (DSA).
 
     Single server with `--enable-return-indexer-topk` and `index_topk_freq=2`.
     Validates the native `/generate` endpoint only — OpenAI-protocol surface
