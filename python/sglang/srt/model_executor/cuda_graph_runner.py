@@ -617,7 +617,11 @@ class CudaGraphRunner:
                 ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+            self.num_tokens_per_bs = (
+                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.speculative_num_draft_tokens, model_runner.is_draft_worker
+                )
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size

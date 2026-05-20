@@ -377,17 +377,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Target Verify
             # Here we only support topk = 1 for now.
+            tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens)
-            )
+            metadata.cache_seqlens_int32.copy_(seq_lens + tokens_per_req)
 
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                bs * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
+                bs * tokens_per_req + 1,
+                tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
@@ -396,10 +395,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 : (bs + 1)
             ]
 
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
-            metadata.max_seq_len_k = (
-                seq_lens.max().item() + self.speculative_num_draft_tokens
-            )
+            metadata.max_seq_len_q = tokens_per_req
+            metadata.max_seq_len_k = seq_lens.max().item() + tokens_per_req
 
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
@@ -496,13 +493,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens)
-            )
+            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
 
-            metadata.max_seq_len_k = (
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
+            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
             max_len = seq_lens_cpu.max().item()
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -516,7 +509,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -626,18 +618,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ]
         elif forward_batch.forward_mode.is_target_verify():
             # Only support topk = 1 for now.
-            metadata.cache_seqlens_int32 = (
-                forward_batch.seq_lens + self.speculative_num_draft_tokens
-            ).to(torch.int32)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
+            tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
+            metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
+                torch.int32
+            )
+            metadata.max_seq_len_q = tokens_per_req
             metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item()
-                + self.speculative_num_draft_tokens
+                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
             )
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
+                batch_size * tokens_per_req + 1,
+                tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
