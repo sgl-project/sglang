@@ -12,6 +12,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -170,6 +171,8 @@ class Pooler(nn.Module):
     def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
+        if normalize and get_global_server_args().disable_normalize_embedding:
+            normalize = False
         self.normalize = normalize
 
     def forward(
