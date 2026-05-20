@@ -47,8 +47,10 @@ def _create_numactl_executable(numactl_args: str):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     script = f'''#!/bin/sh
 exec numactl {numactl_args} {old_executable} "$@"'''
-    path = Path(
-        f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
+    tmp_dir = os.environ.get("SGLANG_TMP") or os.environ.get("TMPDIR") or "/tmp"
+    Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(tmp_dir) / (
+        f"sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
     )
     path.write_text(script)
     path.chmod(0o777)
