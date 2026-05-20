@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -231,7 +232,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if kv_last_page_len_buf is None:
             self.kv_last_page_len = torch.ones(
-                (max_bs,), dtype=torch.int32, device=model_runner.device
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
         else:
             assert self.num_wrappers == 1
@@ -442,6 +443,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
+            num_tokens = forward_batch.input_ids.shape[0]
+            attn_tp_size = get_attention_tp_size()
+            padded_tokens = ceil_align(num_tokens, attn_tp_size)
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -452,6 +456,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                extend_num_tokens=padded_tokens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, False, False
@@ -1459,6 +1464,33 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
             bs_eff = bs
+
+            # DP-attention padding: input_ids may be padded beyond qo_indptr[-1]
+            fwd_ctx = get_forward_context()
+            padded_num_tokens = (
+                fwd_ctx.forward_batch.extend_num_tokens
+                if fwd_ctx is not None
+                else extend_num_tokens
+            )
+            if padded_num_tokens is not None:
+                real_qo_tokens = qo_indptr[-1].item()
+                if padded_num_tokens > real_qo_tokens:
+                    pad_tokens = padded_num_tokens - real_qo_tokens
+                    num_dummy_pages = (
+                        (pad_tokens + self.page_size - 1) // self.page_size
+                    )
+                    kv_start = kv_indptr[-1].item()
+                    extra_kv = torch.zeros(
+                        num_dummy_pages, dtype=torch.int32, device=kv_indices.device
+                    )
+                    kv_indices = torch.cat([kv_indices, extra_kv])
+                    qo_indptr = torch.cat(
+                        [qo_indptr, qo_indptr.new_tensor([padded_num_tokens])]
+                    )
+                    kv_indptr = torch.cat(
+                        [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+                    )
+                    bs_eff = bs + 1
 
         # extend part
         if use_ragged:
