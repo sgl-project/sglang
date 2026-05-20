@@ -55,7 +55,9 @@ def canary_verify_step_torch_reference(
     kept_prev_slots: list[int] = []
     for k in range(active):
         s = int(slot_indices_host[k].item())
-        if s != 0:
+        # Skip the reserved padding sentinel (see consts.CANARY_RESERVED_SLOT) so unfilled req_to_token
+        # entries (zero-initialized) do not produce spurious chain_hash / position violations.
+        if s != consts.CANARY_RESERVED_SLOT:
             kept_slots.append(s)
             kept_expected_positions.append(int(expected_positions_host[k].item()))
             kept_prev_slots.append(int(prev_slot_indices_host[k].item()))

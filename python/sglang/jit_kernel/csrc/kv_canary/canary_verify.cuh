@@ -77,7 +77,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 
   // Skip the reserved padding sentinel so unfilled req_to_token positions (zero-initialized) do not
   // produce spurious chain_hash/position violations from an untouched slot.
-  if (slot_idx == 0) {
+  if (slot_idx == kCanaryReservedSlot) {
     return;
   }
 
