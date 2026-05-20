@@ -83,12 +83,10 @@ impl BlockSizeOracle {
                 candidate,
             });
         }
-        match self.value.compare_exchange(
-            0,
-            candidate,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match self
+            .value
+            .compare_exchange(0, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => Ok(candidate),
             Err(existing) if existing == candidate => Ok(existing),
             Err(existing) => Err(BlockSizeMismatch {

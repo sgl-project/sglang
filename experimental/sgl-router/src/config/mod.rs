@@ -239,7 +239,10 @@ decode_selector = "app=sglang,role=decode"
         match &c.discovery.backend {
             DiscoveryBackend::K8s(k) => {
                 assert_eq!(k.namespace, "default");
-                assert_eq!(k.prefill_selector.as_deref(), Some("app=sglang,role=prefill"));
+                assert_eq!(
+                    k.prefill_selector.as_deref(),
+                    Some("app=sglang,role=prefill")
+                );
                 assert_eq!(k.decode_selector.as_deref(), Some("app=sglang,role=decode"));
                 assert!(k.label_selector.is_none());
             }

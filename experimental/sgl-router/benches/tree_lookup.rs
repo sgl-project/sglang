@@ -18,8 +18,8 @@
 //! See `BENCHMARKS.md` for the SMG↔sgl-router comparison table.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use sgl_router::policies::kv_events::tree::{HashTree, KvWorkerId};
 
 fn build_tree(num_workers: usize, blocks_per_worker: usize, seed: u64) -> HashTree {
