@@ -133,9 +133,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens_tensor = torch.tensor(
             last_tokens, dtype=torch.int64, device=self.device
         )
-        # No kernel reads batch.input_ids before the next iter's verify
-        # rewrites it (V1 prepare_for_verify / V2 prepare_for_v2_verify);
-        # [bs] last-token layout here keeps filter / merge clean.
+        # Non-spec decode forward consumes input_ids directly; spec path
+        # overrides it via verify (V1 prepare_for_verify / V2
+        # prepare_for_v2_verify) before any kernel read. [bs] last-token
+        # is the right shape for both, and keeps filter / merge clean.
         self.input_ids = last_tokens_tensor
 
         # Simulate the eagle run.
