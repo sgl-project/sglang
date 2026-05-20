@@ -42,48 +42,56 @@ SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t
   return h;
 }
 
-// Read one byte from a source following the RealKvSource access invariant. The invariant (from
-// kv_canary/verify.py docstring) is:
+// Read 16 aligned bytes from a source as two uint64 little-endian words, following the RealKvSource access
+// invariant. The invariant (from kv_canary/verify.py docstring) is:
 //
 //     tensor[slot_idx // page_size,
 //            (slot_idx % page_size) * num_bytes_per_token + byte_offset]
 //
 // row_stride_bytes is the dim-1 size of the underlying tensor in bytes (which may exceed
 // page_size * num_bytes_per_token; trailing bytes are skipped).
-SGL_DEVICE uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset) {
+//
+// 16B-alignment precondition (enforced host-side in kv_canary/verify.py::RealKvSource.__post_init__):
+// num_bytes_per_token, row_stride_bytes, and read_bytes are all multiples of 16, and byte_offset is always a
+// multiple of 16. Combined with PyTorch's CUDA-allocator alignment (>= 256B) of src.tensor, every flat_index
+// computed here is 16B-aligned, so the uint4 load below is a single coalesced LDG.E.128.
+SGL_DEVICE void real_kv_load_uint4(
+    const RealKvSourceHandle& src,
+    int64_t slot_idx,
+    int64_t byte_offset,
+    uint64_t& word_lo,
+    uint64_t& word_hi) {
   const int64_t row = slot_idx / src.page_size;
   const int64_t col_within_page = slot_idx % src.page_size;
   const int64_t col = col_within_page * src.num_bytes_per_token + byte_offset;
   const int64_t flat_index = row * static_cast<int64_t>(src.row_stride_bytes) + col;
-  return src.tensor[flat_index];
+  const uint4 vec = *reinterpret_cast<const uint4*>(src.tensor + flat_index);
+  word_lo = static_cast<uint64_t>(vec.x) | (static_cast<uint64_t>(vec.y) << 32);
+  word_hi = static_cast<uint64_t>(vec.z) | (static_cast<uint64_t>(vec.w) << 32);
 }
 
 // Fold one source's read_bytes into a uint64 hash, mode-dispatching.
 //
 // PARTIAL mode: pack the first min(read_bytes, 16) bytes little-endian into 8-byte words and
 // splitmix64-fold them (at most 2 words). When read_bytes <= 16, PARTIAL produces the same hash as ALL.
-// ALL mode: pack bytes little-endian into 8-byte words (zero-padded if read_bytes is not a multiple of 8)
-// and splitmix64-fold them iteratively.
+// ALL mode: pack bytes little-endian into 8-byte words and splitmix64-fold them iteratively.
+//
+// Loads run in 16B (uint4) chunks; the host-side __post_init__ guarantees read_bytes % 16 == 0 so no
+// tail-padding logic is needed inside the kernel. Output is byte-equal to the Python ref helper
+// _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   if (src.read_bytes <= 0) {
     return 0ULL;
   }
   const int64_t effective_read_bytes =
       (mode == RealKvHashMode::kPartial) ? (src.read_bytes < 16 ? src.read_bytes : 16) : src.read_bytes;
-  // ALL mode (and PARTIAL, which shares the same word-pack + splitmix64 loop with a capped length).
   uint64_t acc = 0ULL;
-  int64_t i = 0;
-  while (i < effective_read_bytes) {
-    uint64_t word = 0ULL;
-    const int64_t take = (effective_read_bytes - i) >= 8 ? 8 : (effective_read_bytes - i);
-#pragma unroll
-    for (int b = 0; b < 8; ++b) {
-      if (b < take) {
-        word |= static_cast<uint64_t>(real_kv_load_byte(src, slot_idx, i + b)) << (b * 8);
-      }
-    }
-    acc = splitmix64(acc ^ word);
-    i += 8;
+  for (int64_t i = 0; i < effective_read_bytes; i += 16) {
+    uint64_t word_lo;
+    uint64_t word_hi;
+    real_kv_load_uint4(src, slot_idx, i, word_lo, word_hi);
+    acc = splitmix64(acc ^ word_lo);
+    acc = splitmix64(acc ^ word_hi);
   }
   return acc;
 }

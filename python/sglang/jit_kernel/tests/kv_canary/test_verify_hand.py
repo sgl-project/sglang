@@ -790,9 +790,9 @@ def test_real_kv_source_holey_dim1() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     holey_source = make_real_kv_source(
         num_slots=16,
-        num_bytes_per_token=8,
+        num_bytes_per_token=16,
         page_size=1,
-        read_bytes=8,
+        read_bytes=16,
         pad_dim1=16,  # 16 trailing pad bytes per row; must be skipped.
         device=_DEVICE,
     )
@@ -868,12 +868,12 @@ def test_page_size_gt_1_access_pattern() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=8)
     src = make_real_kv_source(
         num_slots=8,
-        num_bytes_per_token=4,
-        page_size=4,  # 2 rows × 4 slots/page × 4 bytes/slot.
-        read_bytes=4,
+        num_bytes_per_token=16,
+        page_size=4,  # 2 rows × 4 slots/page × 16 bytes/slot.
+        read_bytes=16,
         device=_DEVICE,
     )
-    # Each slot's 4 bytes get a slot-specific signature so kernel mis-indexing would shift the hash.
+    # Each slot's 16 bytes get a slot-specific signature so kernel mis-indexing would shift the hash.
     flat = src.tensor.view(-1)
     for slot_idx in range(8):
         row = slot_idx // src.page_size
@@ -1618,8 +1618,8 @@ def _hand_fold_all(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial, 0xC4C41792E6578644),
-        (consts.RealKvHashMode.ALL, _hand_fold_all, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial, 0x6041580849E6407D),
+        (consts.RealKvHashMode.ALL, _hand_fold_all, 0x6041580849E6407D),
     ],
     ids=["partial", "all"],
 )
@@ -1628,14 +1628,19 @@ def test_real_kv_hash_fold_mode_hardcoded(
     fold_fn: Callable[[bytes], int],
     expected_hash: int,
 ) -> None:
-    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 1.
-    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 1.
+    _PATTERN = bytes(
+        [
+            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+            0x81, 0x82, 0x84, 0x88, 0x90, 0xA0, 0xC0, 0xFF,
+        ]
+    )
 
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     source_cuda = make_real_kv_source(
-        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+        num_slots=16, num_bytes_per_token=16, page_size=1, read_bytes=16, device=_DEVICE
     )
-    source_cuda.tensor[1, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_cuda.tensor[1, :16] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
     source_ref = RealKvSource(
         tensor=source_cuda.tensor.clone(),
         page_size=source_cuda.page_size,
@@ -1982,7 +1987,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
 def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
     """PARTIAL mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
-    sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=8, device=_DEVICE)
+    sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=16, device=_DEVICE)
     slot_idx = 3
     row_bytes = (
         sources_cuda[0]
@@ -2045,7 +2050,7 @@ def test_paged_layout_page_size_16() -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=64)
     sources_cuda = make_real_kv_sources(
         count=1,
-        num_bytes_per_token=4,
+        num_bytes_per_token=16,
         page_size=16,
         num_slots=64,
         device=_DEVICE,

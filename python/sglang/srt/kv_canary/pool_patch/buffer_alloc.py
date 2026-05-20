@@ -13,6 +13,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.srt.kv_canary.config import CanaryConfig
 
 _PARTIAL_REAL_KV_READ_BYTES = 32
+_REAL_KV_READ_ALIGN = 16
 
 
 def resolve_read_bytes(config: CanaryConfig) -> int:
@@ -31,6 +32,14 @@ def alloc_canary_buf(
     return torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
 
 
+def _clip_read_bytes_aligned(*, requested: int, num_bytes_per_token: int) -> int:
+    """Clamp requested read_bytes to ``[0, num_bytes_per_token]`` and round down to a multiple of 16
+    (the CUDA fold kernel issues 128-bit aligned loads).
+    """
+    clipped = max(0, min(int(requested), num_bytes_per_token))
+    return (clipped // _REAL_KV_READ_ALIGN) * _REAL_KV_READ_ALIGN
+
+
 def make_row_source(
     *,
     layer_buffer: torch.Tensor,
@@ -42,7 +51,11 @@ def make_row_source(
         return ()
     flat = contiguous.view(torch.uint8).reshape(num_slots, -1)
     num_bytes_per_token = int(flat.shape[1])
-    clipped = max(0, min(int(read_bytes), num_bytes_per_token))
+    clipped = _clip_read_bytes_aligned(
+        requested=read_bytes, num_bytes_per_token=num_bytes_per_token
+    )
+    if clipped == 0:
+        return ()
     return (
         RealKvSource(
             tensor=flat,
@@ -65,7 +78,11 @@ def make_packed_source(
     flat = page_buffer.contiguous().view(torch.uint8)
     if flat.ndim == 1:
         flat = flat.reshape(1, -1)
-    clipped = max(0, min(int(read_bytes), bytes_per_token))
+    clipped = _clip_read_bytes_aligned(
+        requested=read_bytes, num_bytes_per_token=bytes_per_token
+    )
+    if clipped == 0:
+        return ()
     return (
         RealKvSource(
             tensor=flat,

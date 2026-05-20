@@ -1241,8 +1241,8 @@ def _hand_fold_all_write(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial_write, 0xC4C41792E6578644),
-        (consts.RealKvHashMode.ALL, _hand_fold_all_write, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial_write, 0x6041580849E6407D),
+        (consts.RealKvHashMode.ALL, _hand_fold_all_write, 0x6041580849E6407D),
     ],
     ids=["partial", "all"],
 )
@@ -1251,17 +1251,22 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     fold_fn: Callable[[bytes], int],
     expected_hash: int,
 ) -> None:
-    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
-    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 0.
+    _PATTERN = bytes(
+        [
+            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+            0x81, 0x82, 0x84, 0x88, 0x90, 0xA0, 0xC0, 0xFF,
+        ]
+    )
 
     # Step 2: verify hand-computed fold matches the hex literal.
     assert fold_fn(_PATTERN) == expected_hash
 
     cuda_buf, ref_buf = _setup_pair()
     source_cuda = make_real_kv_source(
-        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+        num_slots=16, num_bytes_per_token=16, page_size=1, read_bytes=16, device=_DEVICE
     )
-    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_cuda.tensor[0, :16] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
     source_ref = RealKvSource(
         tensor=source_cuda.tensor.clone(),
         page_size=source_cuda.page_size,
@@ -1457,7 +1462,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
     cuda_buf, ref_buf = _setup_pair()
     sources_cuda = make_real_kv_sources(
         count=2,
-        num_bytes_per_token=8,
+        num_bytes_per_token=16,
         page_size=1,
         num_slots=16,
         device=_DEVICE,
@@ -1646,7 +1651,7 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
     cuda_buf, ref_buf = _setup_pair()
     sources_cuda = make_real_kv_sources(
         count=1,
-        num_bytes_per_token=4,
+        num_bytes_per_token=16,
         page_size=16,
         num_slots=16,
         device=_DEVICE,
@@ -1700,7 +1705,7 @@ def test_multi_source_real_kv_fold_order_matters() -> None:
     """Two sources folded in reverse order yields a different real_kv_hash (fold is ordered)."""
     cuda_buf, _ = _setup_pair()
     sources_a = make_real_kv_sources(
-        count=2, num_bytes_per_token=4, num_slots=8, device=_DEVICE
+        count=2, num_bytes_per_token=16, num_slots=8, device=_DEVICE
     )
     sources_b = tuple(reversed(sources_a))
 

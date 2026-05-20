@@ -284,9 +284,9 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
 
     garbage_source = make_real_kv_source(
         num_slots=8,
-        num_bytes_per_token=8,
+        num_bytes_per_token=16,
         page_size=1,
-        read_bytes=8,
+        read_bytes=16,
         device=_DEVICE,
         fill=0xDE,
     )

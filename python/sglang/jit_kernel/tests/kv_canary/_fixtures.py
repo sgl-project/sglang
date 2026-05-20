@@ -87,7 +87,7 @@ def make_req_to_token(
 def make_real_kv_source(
     *,
     num_slots: int = DEFAULT_NUM_SLOTS,
-    num_bytes_per_token: int = 8,
+    num_bytes_per_token: int = 16,
     page_size: int = 1,
     read_bytes: Optional[int] = None,
     pad_dim1: int = 0,
@@ -119,7 +119,7 @@ FillStrategy = Literal["constant_per_source", "random_bytes"]
 def make_real_kv_sources(
     *,
     count: int,
-    num_bytes_per_token: int = 8,
+    num_bytes_per_token: int = 16,
     page_size: int = 1,
     num_slots: int = DEFAULT_NUM_SLOTS,
     device: torch.device,
