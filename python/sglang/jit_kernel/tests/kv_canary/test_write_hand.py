@@ -14,7 +14,6 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.write import canary_write_step
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
-    assert_canary_buf_equal,
     assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,

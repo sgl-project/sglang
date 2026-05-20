@@ -18,7 +18,6 @@ from sglang.jit_kernel.kv_canary.write_ref import (
 )
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
-    assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
@@ -1564,7 +1563,6 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
         raise AssertionError(
             "violation_ring row binary layout mismatch:\n" + "\n".join(mismatches)
         )
-
 
 
 @pytest.mark.parametrize(
