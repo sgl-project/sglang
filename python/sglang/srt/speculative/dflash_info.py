@@ -475,9 +475,9 @@ class DFlashVerifyInput(SpecInput):
         batch.seq_lens_cpu.add_(
             torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
         )
-        # seq_lens_sum derived from updated seq_lens_cpu (above); avoids None
-        # from ScheduleBatch's lazy seq_lens_sum maintenance.
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        # Incremental update; seq_lens_sum was materialized by ForwardBatch.init_new
+        # (helper fallback) during the verify forward above.
+        batch.seq_lens_sum += sum(commit_lens_cpu)
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states
