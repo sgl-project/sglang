@@ -39,10 +39,10 @@ OPS = {
 }
 
 
-@marker.mark_args("op_name", ["silu", "gelu", "gelu_tanh"])
-@marker.mark_args("dim", [1024, 4096, 6144, 8192], [4096])
-@marker.mark_args("batch_size", [2**x for x in range(0, 15)], [8, 512])
-@marker.mark_benchmark("impl", ["aot", "jit", "torch"])
+@marker.parametrize("op_name", ["silu", "gelu", "gelu_tanh"])
+@marker.parametrize("dim", [1024, 4096, 6144, 8192], [4096])
+@marker.parametrize("batch_size", [2**x for x in range(0, 15)], [8, 512])
+@marker.benchmark("impl", ["aot", "jit", "torch"])
 def benchmark(op_name: str, dim: int, batch_size: int, impl: str):
     x = create_random(batch_size, dim * 2)
     aot_op, jit_op, torch_op = OPS[op_name]
@@ -58,11 +58,11 @@ def _make_expert_ids(num_tokens: int, skip_ratio: float) -> torch.Tensor:
     return expert_ids
 
 
-@marker.mark_args("op_name", ["silu", "gelu"])
-@marker.mark_args("dim", [1024, 4096, 8192], [4096])
-@marker.mark_args("batch_size", [64, 256, 1024, 4096, 16384], [1024])
-@marker.mark_args("skip_ratio", [0.0, 0.25, 0.5], [0.25])
-@marker.mark_benchmark("impl", ["unfiltered", "filtered"])
+@marker.parametrize("op_name", ["silu", "gelu"])
+@marker.parametrize("dim", [1024, 4096, 8192], [4096])
+@marker.parametrize("batch_size", [64, 256, 1024, 4096, 16384], [1024])
+@marker.parametrize("skip_ratio", [0.0, 0.25, 0.5], [0.25])
+@marker.benchmark("impl", ["unfiltered", "filtered"])
 def benchmark_filter(
     op_name: str, dim: int, batch_size: int, skip_ratio: float, impl: str
 ):
