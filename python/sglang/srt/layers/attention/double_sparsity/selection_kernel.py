@@ -417,7 +417,22 @@ def retrieve_topk_via_signatures(
                 f"per_request_valid shape {tuple(per_request_valid.shape)} must "
                 f"match page_scores shape {tuple(scores.shape)}."
             )
-        scores = scores.masked_fill(
-            ~per_request_valid.to(torch.bool), float("-inf")
-        )
+        pr_bool = per_request_valid.to(torch.bool)
+        scores = scores.masked_fill(~pr_bool, float("-inf"))
+        if hot_pages is not None:
+            # Hot-page forcing in select_topk_sequence_order overwrites scores
+            # with +inf, which would otherwise re-introduce pages this row's
+            # per_request_valid mask just excluded (cross-request leak in
+            # mixed batches). Intersect each row's hot list with that row's
+            # valid set so forced hot pages can only come from the row's
+            # owned page set.
+            pr_rows = pr_bool.detach().cpu().tolist()
+            filtered: List[List[int]] = []
+            for row_idx, row_pages in enumerate(hot_pages):
+                row_valid = pr_rows[row_idx] if row_idx < len(pr_rows) else []
+                filtered.append([
+                    p for p in row_pages
+                    if 0 <= p < len(row_valid) and row_valid[p]
+                ])
+            hot_pages = filtered
     return select_topk_sequence_order(scores, max_top_k, hot_pages=hot_pages)

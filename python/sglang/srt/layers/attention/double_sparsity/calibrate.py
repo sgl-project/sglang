@@ -77,6 +77,12 @@ def _niah_synthetic_prompts(num_samples: int, ctx_len: int, *, seed: int = 0) ->
 def _read_corpus_file(path: str, num_samples: int) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip()]
+    if not lines:
+        raise ValueError(
+            f"calibration corpus {path!r} contains no non-empty lines. "
+            "Provide a corpus with at least one prompt, or omit --dataset "
+            "to fall back to the NIAH-shaped synthetic default."
+        )
     if len(lines) < num_samples:
         logger.warning(
             "calibration corpus %s has %d non-empty lines; requested %d samples will be reused with wrap-around.",

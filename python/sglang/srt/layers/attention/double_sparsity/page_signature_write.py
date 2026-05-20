@@ -439,7 +439,12 @@ def m3b_page_stability_fixture(
     req_pool_indices = torch.tensor([0], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     num_pages = (seq_len + page_size - 1) // page_size
-    sparse_mask = torch.ones(bs, num_pages, dtype=torch.int32, device=device)
+    # sparse_mask must match the bound page-signature table width (per the
+    # retrieve_topk_via_signatures contract), not the prompt length. The
+    # allocator's table is typically wider than any single prompt uses.
+    table_max_pages = int(selector.page_signature_table.max_pages)
+    sparse_mask = torch.zeros(bs, table_max_pages, dtype=torch.int32, device=device)
+    sparse_mask[:, :num_pages] = 1
     queries = torch.zeros(
         bs, selector.num_local_heads, selector.head_dim, device=device
     )

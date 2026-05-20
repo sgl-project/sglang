@@ -758,6 +758,122 @@ class TestSelectorRealMode(unittest.TestCase):
                         f"request 1 selected foreign pages: {row1}")
 
 
+class TestHotPagesIntersectPerRequest(unittest.TestCase):
+    """Round-7 fix [P2]: hot-page forcing must not re-introduce pages that
+    a row's per_request_valid mask excluded.
+    """
+
+    def test_hot_pages_filtered_by_per_request_valid(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_signatures,
+        )
+        bs = 2
+        num_layers, max_pages, num_heads, label_dim = 1, 8, 2, 4
+        head_dim = 16
+        device = torch.device("cpu")
+        # Uniform random signatures + valid_mask all True.
+        signatures = torch.randn(num_layers, max_pages, num_heads, label_dim)
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim,
+                                         dtype=torch.int32)
+        # Make each label-dim slot point at a distinct channel index.
+        for h in range(num_heads):
+            for d in range(label_dim):
+                channel_selection[0, h, d] = (h * label_dim + d) % head_dim
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                      dtype=torch.float32)
+
+        queries = torch.randn(bs, num_heads, head_dim)
+        # Request 0 owns pages [0,1,2,3]; request 1 owns [4,5,6,7].
+        per_request = torch.tensor([
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 1],
+        ], dtype=torch.int32)
+        # Hot pages: in mixed batches, compute_hot_pages may return the same
+        # *logical* page index for both rows. Here we simulate the bad case
+        # where the caller has not yet translated logical -> physical: pass
+        # [[3], [3]] and ensure request 1 still cannot win page 3.
+        hot = [[3], [3]]
+        indices, lengths = retrieve_topk_via_signatures(
+            queries=queries,
+            page_signatures=signatures,
+            valid_mask=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0,
+            max_top_k=4,
+            hot_pages=hot,
+            per_request_valid=per_request,
+        )
+        row0 = [int(v) for v in indices[0].tolist() if v >= 0]
+        row1 = [int(v) for v in indices[1].tolist() if v >= 0]
+        self.assertIn(3, row0, "request 0 should still get its hot page 3")
+        self.assertNotIn(3, row1,
+                          f"hot-page intersection failed for row 1: got {row1}")
+        self.assertTrue(all(p in {4, 5, 6, 7} for p in row1),
+                        f"row 1 contains foreign pages: {row1}")
+
+
+class TestM3BFixtureWiderTable(unittest.TestCase):
+    """Round-7 fix [P2]: M3-B fixture must work when table.max_pages
+    exceeds the prompt page count (the normal allocator case).
+    """
+
+    def test_fixture_passes_when_table_wider_than_prompt(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            m3b_page_stability_fixture,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=32, device=torch.device("cpu"),
+        )
+        # Table is much wider than the test prompt (16 pages vs 4).
+        table = allocate_page_signature_table(
+            num_layers_local=1, max_pages=16, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        table.signatures.uniform_(-1, 1)
+        table.valid_mask[0, :4] = True
+        mask = ChannelMask(
+            channel_selection=torch.zeros(1, 2, 4, dtype=torch.int32),
+            channel_weights=torch.ones(1, 2, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=32, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+        # 4 prompt pages at page_size=64 -> seq_len=256.
+        prompt_tokens = torch.zeros(1, 256, dtype=torch.int32)
+        ok = m3b_page_stability_fixture(
+            sel, prompt_tokens=prompt_tokens, page_size=64, num_repeats=2,
+        )
+        self.assertTrue(ok, "fixture should pass with wider table than prompt")
+
+
+class TestCalibrateCorpusEmpty(unittest.TestCase):
+    """Round-7 fix [P3]: empty corpus must raise a clear ValueError."""
+
+    def test_empty_file_raises_value_error(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _read_corpus_file,
+        )
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("\n  \n\t\n")  # whitespace only
+            path = f.name
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                _read_corpus_file(path, num_samples=4)
+            self.assertIn("no non-empty lines", str(ctx.exception))
+        finally:
+            os.unlink(path)
+
+
 class TestChannelMaskSlicePerRank(unittest.TestCase):
     """Round-2 fix [P2]: TP head sharding helper."""
 
