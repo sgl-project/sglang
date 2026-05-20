@@ -738,52 +738,6 @@ class MooncakeKVManager(CommonKVManager):
             -1
         )
 
-    def send_kvcache_hisparse(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int32],
-        page_index_slice: slice,
-        executor: concurrent.futures.ThreadPoolExecutor,
-        dst_kv_item_len: Optional[int] = None,
-        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-    ):
-        if getattr(self.kv_args, "mla_compression_ratios", None):
-            if dst_kv_item_len is None:
-                raise RuntimeError("DeepSeek V4 HiSparse transfer needs dst item len")
-            return self._send_kvcache_hisparse_dsv4(
-                mooncake_session_id=mooncake_session_id,
-                prefill_kv_indices=prefill_kv_indices,
-                dst_kv_ptrs=dst_kv_ptrs,
-                dst_kv_indices=dst_kv_indices,
-                page_index_slice=page_index_slice,
-                executor=executor,
-                dst_kv_item_len=dst_kv_item_len,
-                dst_device_kv_indices=dst_device_kv_indices,
-            )
-
-        page_size = self.kv_args.page_size
-        per_token_item_lens = [il // page_size for il in self.kv_args.kv_item_lens]
-        expanded_src = self._expand_page_indices(prefill_kv_indices, page_size)
-        token_start = page_index_slice.start * page_size
-        token_end = min(page_index_slice.stop * page_size, len(dst_kv_indices))
-        expanded_dst = dst_kv_indices[token_start:token_end]
-        expanded_src = expanded_src[: len(expanded_dst)]
-
-        logger.debug(
-            f"Send KVCache for hisparse: {expanded_src.shape} -> {expanded_dst.shape}"
-        )
-        return self._send_kvcache_generic(
-            mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
-            dst_data_ptrs=dst_kv_ptrs,
-            item_lens=per_token_item_lens,
-            prefill_data_indices=expanded_src,
-            dst_data_indices=expanded_dst,
-            executor=executor,
-        )
-
     def _send_kvcache_hisparse_dsv4(
         self,
         mooncake_session_id: str,
@@ -1413,8 +1367,13 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            if target_rank_registration_info.enable_hisparse:
-                                ret = self.send_kvcache_hisparse(
+                            if (
+                                target_rank_registration_info.enable_hisparse
+                                and getattr(
+                                    self.kv_args, "mla_compression_ratios", None
+                                )
+                            ):
+                                ret = self._send_kvcache_hisparse_dsv4(
                                     req.mooncake_session_id,
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
