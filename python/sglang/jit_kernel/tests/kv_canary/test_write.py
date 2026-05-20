@@ -1503,3 +1503,81 @@ def test_seed_slot_resume_5_step_hardcoded(hardcoded: bool) -> None:
         assert stored_real_kv_hash == 0
 
     assert int(cuda_log.write_index[0].item()) == 0
+
+
+@pytest.mark.parametrize(
+    "token_val",
+    [0, 1, 0xFFFFFFFF, -1, 0x80000000, 0x7FFFFFFF],
+)
+def test_token_boundary_byte_equal_sweep(token_val: int) -> None:
+    """Sweep token boundary values; assert CUDA write vs ref buf + state byte-equal."""
+    cuda_buf, ref_buf = _setup_pair()
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([token_val], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+
+@pytest.mark.parametrize(
+    "position_val",
+    [0, 1, 127, 128, 129, 0x7FFFFFFF],
+)
+def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
+    """Sweep position boundary values; assert CUDA write vs ref buf + state byte-equal."""
+    cuda_buf, ref_buf = _setup_pair()
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([position_val], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )

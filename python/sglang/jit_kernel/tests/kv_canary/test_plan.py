@@ -922,3 +922,102 @@ def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
         ), f"write_seed_slot_indices[{i}] expected {expected_seed}"
 
     # Also confirm Triton == ref byte-equal.
+
+
+@pytest.mark.parametrize(
+    "bs",
+    [1, 31, 32, 33, 128],
+)
+def test_bs_boundary_byte_equal_sweep(bs: int) -> None:
+    """Sweep bs boundary values around Triton block boundaries; assert Triton vs ref byte-equal."""
+    req_pool_indices = list(range(1, bs + 1))
+    prefix_lens = [10] * bs
+    extend_seq_lens = [1] * bs
+    max_seq_len = 32
+
+    fb_req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32, device=_DEVICE)
+    fb_prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=_DEVICE)
+    fb_extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, device=_DEVICE)
+    req_to_token = _build_req_to_token(max_reqs=bs + 1, max_seq_len=max_seq_len)
+
+    total_verify = sum(min(p, max_seq_len) for p in prefix_lens)
+    triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
+        verify_capacity=max(total_verify + 64, 256),
+        write_req_capacity=bs + 4,
+    )
+    _run_both_and_assert_byte_equal(
+        triton_verify=triton_v,
+        triton_write=triton_w,
+        ref_verify=ref_v,
+        ref_write=ref_w,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extras=_empty_extras(),
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix_val",
+    [0, 1, 127, 128, 129, 4096],
+)
+def test_prefix_lens_boundary_byte_equal_sweep(prefix_val: int) -> None:
+    """Sweep prefix_lens boundary values; assert Triton vs ref byte-equal."""
+    max_seq_len = max(prefix_val + 4, 256)
+    fb_req_pool_indices = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
+    fb_prefix_lens = torch.tensor([prefix_val, 10], dtype=torch.int32, device=_DEVICE)
+    fb_extend_seq_lens = torch.tensor([1, 1], dtype=torch.int32, device=_DEVICE)
+    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+
+    total_verify = prefix_val + 10
+    triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
+        verify_capacity=max(total_verify + 64, 256),
+        write_req_capacity=8,
+    )
+    _run_both_and_assert_byte_equal(
+        triton_verify=triton_v,
+        triton_write=triton_w,
+        ref_verify=ref_v,
+        ref_write=ref_w,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extras=_empty_extras(),
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "extend_val",
+    [1, 128, 4096],
+)
+def test_extend_seq_lens_boundary_byte_equal_sweep(extend_val: int) -> None:
+    """Sweep extend_seq_lens boundary values; assert Triton vs ref byte-equal."""
+    max_seq_len = max(extend_val + 4, 64)
+    fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_extend_seq_lens = torch.tensor([extend_val], dtype=torch.int32, device=_DEVICE)
+    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+
+    triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
+        verify_capacity=64,
+        write_req_capacity=4,
+    )
+    _run_both_and_assert_byte_equal(
+        triton_verify=triton_v,
+        triton_write=triton_w,
+        ref_verify=ref_v,
+        ref_write=ref_w,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extras=_empty_extras(),
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+    )
