@@ -344,7 +344,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer.forward(hidden_states)
+        hidden_states = self.mixer(hidden_states)
         return hidden_states, residual
 
 
@@ -380,7 +380,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer.forward(hidden_states)
+        hidden_states = self.mixer(hidden_states)
         return hidden_states, residual
 
 
@@ -517,7 +517,7 @@ class NemotronHAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn.forward(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -554,7 +554,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer.forward(
+        hidden_states = self.mixer(
             hidden_states=hidden_states, forward_batch=forward_batch
         )
         return hidden_states, residual
@@ -643,7 +643,7 @@ class NemotronHModel(nn.Module):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
-            hidden_states, residual = layer.forward(
+            hidden_states, residual = layer(
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
@@ -864,7 +864,7 @@ class NemotronHForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        hidden_states = self.model.forward(
+        hidden_states = self.model(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
         if self.pp_group.is_last_rank:
