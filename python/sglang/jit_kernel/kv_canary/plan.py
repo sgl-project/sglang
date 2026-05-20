@@ -369,16 +369,12 @@ def _plan_offsets_kernel(
     )
 
     if HAS_SWA_LUT:
-        seed_sentinel = seed_full < 0
-        seed_safe = tl.where(seed_sentinel, 0, seed_full)
-        if swa_lut_len > 0:
-            seed_safe = tl.where(seed_safe >= swa_lut_len, swa_lut_len - 1, seed_safe)
-        seed_xlat = tl.load(
-            full_to_swa_lut_ptr + seed_safe,
-            mask=bs_mask & (prefix_lens > 0) & (~seed_sentinel),
-            other=0,
+        seed_translated = _swa_translate_tile(
+            seed_full,
+            bs_mask & (prefix_lens > 0),
+            full_to_swa_lut_ptr,
+            swa_lut_len,
         )
-        seed_translated = tl.where(seed_sentinel, seed_full, seed_xlat)
     else:
         seed_translated = seed_full
 
