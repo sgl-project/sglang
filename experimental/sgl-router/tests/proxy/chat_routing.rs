@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-mod common;
-
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
@@ -69,7 +67,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
 
 #[tokio::test]
 async fn non_streaming_returns_200() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -140,7 +138,7 @@ async fn streaming_chunks_pass_through() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
-    let worker = common::mock_worker::MockWorker::start(chunks.clone()).await;
+    let worker = crate::common::mock_worker::MockWorker::start(chunks.clone()).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -165,7 +163,7 @@ async fn streaming_chunks_pass_through() {
     );
 
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let data = common::streaming::parse_sse_data(&bytes);
+    let data = crate::common::streaming::parse_sse_data(&bytes);
     assert_eq!(data.len(), 3);
     assert!(data[0].contains("\"Hel\""));
     assert!(data[1].contains("\"lo\""));
@@ -178,7 +176,7 @@ async fn streaming_first_chunk_before_completion() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
-    let worker = common::mock_worker::MockWorker::start(chunks).await;
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -215,8 +213,8 @@ async fn concurrent_streams_are_isolated() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"BBB\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
-    let worker_a = common::mock_worker::MockWorker::start(chunks_a).await;
-    let worker_b = common::mock_worker::MockWorker::start(chunks_b).await;
+    let worker_a = crate::common::mock_worker::MockWorker::start(chunks_a).await;
+    let worker_b = crate::common::mock_worker::MockWorker::start(chunks_b).await;
 
     let ctx_a = build_ctx_with_worker(&worker_a.url);
     let ctx_b = build_ctx_with_worker(&worker_b.url);
@@ -250,7 +248,7 @@ async fn concurrent_streams_are_isolated() {
 
 #[tokio::test]
 async fn streaming_upstream_5xx_preserves_content_type() {
-    let worker = common::mock_worker::MockWorker::start_returning_error(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         serde_json::json!({"error": {"type": "upstream", "message": "boom"}}),
     )
@@ -293,7 +291,7 @@ async fn non_streaming_upstream_429_preserved() {
             "code": "rate_limit_exceeded"
         }
     });
-    let worker = common::mock_worker::MockWorker::start_returning_error(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::TOO_MANY_REQUESTS,
         upstream_body.clone(),
     )
@@ -341,7 +339,7 @@ async fn non_streaming_upstream_500_preserved() {
     let upstream_body = serde_json::json!({
         "error": {"type": "server_error", "message": "internal worker failure"}
     });
-    let worker = common::mock_worker::MockWorker::start_returning_error(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         upstream_body.clone(),
     )
@@ -384,7 +382,7 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
     let upstream_body = serde_json::json!({
         "error": {"type": "invalid_request_error", "message": "bad input"}
     });
-    let worker = common::mock_worker::MockWorker::start_returning_error(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::BAD_REQUEST,
         upstream_body.clone(),
     )
@@ -419,7 +417,7 @@ async fn oversized_request_body_returns_413() {
     // `/v1/chat/completions`. A multi-MiB body from a hostile client must be
     // rejected at the layer BEFORE the handler reads it into memory, and
     // must NOT be forwarded to the upstream worker.
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -452,7 +450,7 @@ async fn chat_rejects_null_body_400() {
     // Regression: a JSON `null` body is syntactically valid JSON but is NOT
     // a chat-completions request shape. The router must reject it with 400
     // BadRequest and NOT forward it to the worker.
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -480,7 +478,7 @@ async fn chat_rejects_null_body_400() {
 async fn chat_rejects_array_body_400() {
     // Regression: a JSON array `[]` body is not a chat-completions request
     // shape (object expected). Router must 400 and not forward.
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -504,7 +502,7 @@ async fn chat_rejects_array_body_400() {
 async fn chat_rejects_string_body_400() {
     // Regression: a JSON string `"hi"` is not a chat-completions request
     // shape. Router must 400 and not forward.
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
@@ -531,7 +529,7 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
     // "upstream_unreachable" (the upstream demonstrably DID reply). It must
     // be classified as `upstream_status` so the operator-visible envelope
     // reflects that the worker partially served the request.
-    let worker = common::mock_worker::MockWorker::start_returning_partial_body(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
         StatusCode::OK,
         b"{\"partial\": ",
     )
@@ -567,7 +565,7 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
 
 #[tokio::test]
 async fn malformed_json_returns_400_bad_request() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
     let req = Request::builder()
@@ -628,7 +626,7 @@ async fn no_healthy_workers_returns_503() {
 /// different model name; an internal_error would mask the misconfiguration.
 #[tokio::test]
 async fn unknown_model_with_no_policy_returns_404_model_not_found() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config_for(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -679,9 +677,11 @@ async fn forward_json_to_records_failure_on_body_drop() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let worker =
-        common::mock_worker::MockWorker::start_returning_partial_body(StatusCode::OK, b"{\"par")
-            .await;
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"{\"par",
+    )
+    .await;
 
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
@@ -721,9 +721,11 @@ async fn forward_json_to_records_success_only_after_body_completes() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let ok_worker =
-        common::mock_worker::MockWorker::start_returning_error(StatusCode::OK, serde_json::json!({}))
-            .await;
+    let ok_worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::OK,
+        serde_json::json!({}),
+    )
+    .await;
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: std::num::NonZeroU32::new(2).unwrap(),
@@ -756,7 +758,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let worker = common::mock_worker::MockWorker::start_returning_partial_body(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
         StatusCode::OK,
         b"data: hi\n\n",
     )
@@ -804,7 +806,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let worker = common::mock_worker::MockWorker::start_returning_error(
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         serde_json::json!({"error": {"type": "x"}}),
     )
@@ -841,7 +843,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: std::num::NonZeroU32::new(1).unwrap(),
@@ -926,8 +928,11 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         "data: [DONE]\n\n",
     ];
     // Each chunk is delayed by 50ms, total ~200ms of streaming.
-    let worker =
-        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(50)).await;
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(50),
+    )
+    .await;
 
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
@@ -1000,7 +1005,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
 /// asserts the round-trip increment → 0 across a single request.
 #[tokio::test]
 async fn non_streaming_active_load_increments_then_returns_to_zero() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let active_load = Arc::clone(&ctx.active_load);
     let app = build_router(ctx);
@@ -1044,11 +1049,11 @@ async fn non_streaming_active_load_increments_then_returns_to_zero() {
     );
 }
 
-/// Task A: the streaming path holds the M4 `ActiveLoadGuard` until the
+/// Task A: the streaming path holds the `ActiveLoadGuard` until the
 /// SSE pump finishes. Mid-stream the registry shows `inflight_count >= 1`;
-/// after the body drains it returns to 0. This is the M4 counterpart
-/// to the existing M2 `streaming_load_guard_persists_for_body_lifetime`
-/// test — both guards must live for the FULL response lifetime.
+/// after the body drains it returns to 0. Counterpart to
+/// `streaming_load_guard_persists_for_body_lifetime` — both guards must
+/// live for the FULL response lifetime.
 #[tokio::test]
 async fn streaming_active_load_persists_for_body_lifetime() {
     let chunks: Vec<&'static str> = vec![
@@ -1057,8 +1062,11 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
-    let worker =
-        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(50)).await;
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(50),
+    )
+    .await;
 
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
@@ -1136,9 +1144,11 @@ async fn streaming_active_load_drops_on_client_disconnect() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
-    let worker =
-        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(100))
-            .await;
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(100),
+    )
+    .await;
     let ctx = build_ctx_with_worker(&worker.url);
     let active_load = Arc::clone(&ctx.active_load);
     let app = build_router(ctx);
@@ -1192,7 +1202,8 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
-    let worker = common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let worker =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
 
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());

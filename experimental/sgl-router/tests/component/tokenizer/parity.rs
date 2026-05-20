@@ -7,7 +7,7 @@
 //!
 //! ## Running
 //!
-//! Plain `cargo test --test tokenizer_parity_test` runs the test.
+//! `cargo test --release --test component tokenizer::parity` runs the test.
 //!
 //! Each fixture cell needs the model's `tokenizer.json` on disk; the test
 //! looks in the local HuggingFace cache (`HF_HOME` or `~/.cache/huggingface`).

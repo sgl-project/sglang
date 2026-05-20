@@ -173,18 +173,18 @@ pub async fn chat_completions(
     }
     let headers = request_headers;
 
-    // M2 per-worker active_requests guard. The M4 ActiveLoadGuard below
-    // sits beside this one: both track in-flight load, but the M4 entry
-    // is per-request (with timeout-based janitor) while the M2 entry is
-    // a worker-scoped counter the cache-aware policy reads. Both must
-    // drop at the same time — when the response stream ends, the client
-    // disconnects, or the handler returns an error. In PD mode the
-    // pair moves into the spawned prefill task so prefill load is
-    // tracked for the full duration of the KV transfer; in plain mode
-    // the pair stays in this handler. Decode-load contribution is 0
-    // here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler (not exercised in M4 — decode
-    // selection is host-affinity only).
+    // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
+    // sits beside this one: both track in-flight load, but the
+    // ActiveLoadGuard entry is per-request (with timeout-based janitor)
+    // while the worker-scoped counter is what the cache-aware policy
+    // reads. Both must drop at the same time — when the response stream
+    // ends, the client disconnects, or the handler returns an error. In
+    // PD mode the pair moves into the spawned prefill task so prefill
+    // load is tracked for the full duration of the KV transfer; in plain
+    // mode the pair stays in this handler. Decode-load contribution is
+    // 0 here: the active-load registry's decode axis is reserved for a
+    // future decode-side scheduler — current decode selection is
+    // host-affinity only.
     let guard = worker.load_guard();
     let prefill_load = estimate_prefill_tokens(&body);
     let active_guard =
@@ -226,15 +226,14 @@ pub async fn chat_completions(
         // tying prefill to the client future opens a cancel-race
         // window where the engine's NIXL RPC teardown can leak KV
         // block refs (NVBugs 5969206 in Dynamo). The detached task
-        // also keeps the M2 LoadGuard + M4 ActiveLoadGuard alive for
-        // the full prefill duration — KV transfer can run for tens of
-        // seconds even when the client gave up.
+        // also keeps the LoadGuard + ActiveLoadGuard alive for the full
+        // prefill duration — KV transfer can run for tens of seconds
+        // even when the client gave up.
         //
-        // No watchdog for fail-fast on prefill 5xx in M4: llm-d /
-        // aibrix both ship without it. On prefill failure the client
-        // experiences the SGLang decode-side bootstrap_room timeout
-        // (~30–60 s by default) instead of an immediate 502. The
-        // tradeoff is acceptable for M4; a follow-up can wire a
+        // No watchdog for fail-fast on prefill 5xx: llm-d / aibrix both
+        // ship without one. On prefill failure the client experiences
+        // the SGLang decode-side bootstrap_room timeout (~30–60 s by
+        // default) instead of an immediate 502. A follow-up can wire a
         // `tokio::sync::watch` channel if telemetry shows it matters.
         //
         // **Scope of the "detached" guarantee.** The spawn protects
@@ -244,8 +243,8 @@ pub async fn chat_completions(
         // tokio runtime cancels all unfinished tasks including this
         // one. A future follow-up could thread a `TaskTracker` /
         // `JoinSet` through `AppContext` for graceful shutdown drain;
-        // M4 ships without one (matching SMG's current shutdown
-        // behaviour).
+        // the current implementation ships without one (matching SMG's
+        // shutdown behaviour).
         let bootstrap_room = generate_room_id();
         let injected_body = inject_bootstrap_fields(
             &body,
@@ -293,9 +292,9 @@ pub async fn chat_completions(
         });
 
         // Synchronously await the decode worker. Its response is what
-        // the client sees. The decode side gets its own M2 LoadGuard
-        // so per-worker `active_requests` reflects decode-pool load
-        // for cache-aware-zmq decisions on the decode side.
+        // the client sees. The decode side gets its own LoadGuard so
+        // per-worker `active_requests` reflects decode-pool load for
+        // cache-aware-zmq decisions on the decode side.
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
@@ -377,9 +376,9 @@ pub async fn chat_completions(
     // Record the dispatch outcome AFTER we know whether the upstream
     // accepted the request. A 504 from the stale-request branch counts as
     // `cancelled` — semantically distinct from upstream errors that bubble
-    // through as `error`. The metric is per-worker so the M4 convergence
-    // tests can scrape `/metrics` and assert that ≥N requests landed on
-    // a single prefill worker.
+    // through as `error`. The metric is per-worker so convergence tests
+    // can scrape `/metrics` and assert that ≥N requests landed on a
+    // single prefill worker.
     let outcome = match &result {
         Ok(_) => RequestOutcome::Success,
         Err(ApiError::StaleRequestExpired { .. }) => {
@@ -428,14 +427,14 @@ pub async fn chat_completions(
 }
 
 /// Estimate prefill-token count from the raw request body for use as
-/// the M4 active-load `prefill_load` counter. Returns 1 at minimum so
+/// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
 /// to zero would hide the request from the cache-aware policy's
 /// load-imbalance fast-path.
 ///
 /// This is a coarse approximation: we count the body length in bytes
-/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future M5+ improvement
-/// is to thread the tokenizer's actual token count through (the
+/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
+/// to thread the tokenizer's actual token count through (the
 /// cache-aware-zmq policy already tokenizes the prompt for tree
 /// matching — that count could be reused here).
 fn estimate_prefill_tokens(body: &Bytes) -> usize {

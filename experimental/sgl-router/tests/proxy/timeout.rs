@@ -9,8 +9,6 @@
 //! would just timeout. We assert here that the router returns a fast,
 //! clean 502 (`upstream_timeout`) instead.
 
-mod common;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -57,7 +55,8 @@ fn config(_worker_url: &str) -> Config {
 #[tokio::test]
 async fn non_streaming_request_times_out_when_worker_hangs() {
     // Worker accepts and then sleeps for 5s; router timeout is 200ms.
-    let worker = common::mock_worker::MockWorker::start_hanging(Duration::from_secs(5)).await;
+    let worker =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(5)).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

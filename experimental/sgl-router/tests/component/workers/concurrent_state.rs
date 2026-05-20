@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Concurrent-state invariants for the M2 worker/registry/breaker layer.
+//! Concurrent-state invariants for the worker/registry/breaker layer.
 //!
 //! These tests stress the lock-free / single-Mutex paths that production
 //! traffic exercises in parallel: many requests calling `breaker.allow()`,

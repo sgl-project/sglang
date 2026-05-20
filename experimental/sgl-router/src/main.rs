@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
         .context("build policy registry")?,
     );
 
-    // M4: shared ActiveLoadRegistry + janitor task. The janitor reaps
+    // Shared ActiveLoadRegistry + janitor task. The janitor reaps
     // request entries whose lifetime exceeded `stale_request_timeout`,
     // so a leaked guard (proxy task panic, etc.) does not inflate a
     // worker's load forever. The registry is built BEFORE the manager

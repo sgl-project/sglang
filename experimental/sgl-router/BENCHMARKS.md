@@ -11,10 +11,9 @@ Criterion harnesses at:
 ## Scope
 
 These are CPU-bound microbenches that don't need GPUs — they target
-routing-decision latency only. The M7 spec's full E2E throughput
-comparison (genai-bench at 4×H200 against a real SGLang fleet) is **not**
-part of this file; it lives in the M7 implementation plan and needs a
-real cluster (`rdxa rx devbox acquire --gpu h200 --count 4`).
+routing-decision latency only. The full E2E throughput comparison
+(genai-bench at 4×H200 against a real SGLang fleet) is **not** part of
+this file; it requires a real GPU cluster and is tracked separately.
 
 ## How to run
 
@@ -40,9 +39,10 @@ comparison stands).
 
 ## Smoke-run data points (M1 MacBook, release profile)
 
-These are NOT the M7 acceptance numbers — they're a sanity check that
-the sgl-router routing primitives are in the same ballpark as the SMG
-ones they replace. Real targets are recorded in the M7 PR per the spec.
+These are NOT the real acceptance numbers — they're a sanity check
+that the sgl-router routing primitives are in the same ballpark as the
+SMG ones they replace. Real targets come from the cluster-scale
+comparison and are tracked separately.
 
 ### Cache-aware lookup (`HashTree` vs SMG `TokenTree`)
 
@@ -54,7 +54,7 @@ ones they replace. Real targets are recorded in the M7 PR per the spec.
 **Read carefully.** The 26× difference at the match step is not the
 end-to-end speedup an operator should expect — `compute_block_hashes`
 upstream dominates in real traffic. The number proves that sgl-router's
-tree walk is no slower than SMG's, which is what M7's `routing-decision
+tree walk is no slower than SMG's, which is what the `routing-decision
 latency p50 ≤ 1.10× SMG` acceptance criterion targets.
 
 ### Policy selection (non-cache-aware)
@@ -69,11 +69,11 @@ The `random` finding (linear in worker count) is a real follow-up — file
 an issue and pair it with a Criterion regression-guard in the same
 bench.
 
-## Pre-M8 calibration runbook
+## Pre-deprecation calibration runbook
 
-Before deleting SMG (M8), every metric in §7.M7 of the slim-design spec
-needs a real-cluster measurement. The bench-harness here is the
+Before deleting SMG, every routing-latency metric in the slim-design
+spec needs a real-cluster measurement. The bench-harness here is the
 small-scale, CPU-only complement; it catches algorithmic regressions in
 the routing primitives without burning GPU time. Pair both: this file
-in pre-commit / CI tier-2, the real-cluster e2e in M7's `pr-test-rust.yml`
-matrix entry.
+in pre-commit / CI tier-2, the real-cluster e2e in the
+`pr-test-rust.yml` matrix entry.

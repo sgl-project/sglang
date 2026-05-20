@@ -3,8 +3,7 @@
 Adapted from SMG's e2e_test/infra/model_specs.py. The same dict-of-dicts
 shape (so test code reads the same) but the entries are narrower —
 sgl-router tests today target small/medium models only; the larger
-function-calling / reasoning models from SMG are out of scope for M4
-acceptance.
+function-calling / reasoning models from SMG are out of scope.
 
 Each entry:
     - model: HuggingFace path or local path (env-resolved)

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-mod common;
-
 use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::{
@@ -22,7 +20,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn forwards_whitelisted_headers_strips_others() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = Config {
         server: ServerConfig {
             host: "0".into(),

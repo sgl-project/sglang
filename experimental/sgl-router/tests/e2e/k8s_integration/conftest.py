@@ -5,8 +5,8 @@ These tests require:
   - The sgl-router:e2e and sgl-router-fake-worker:e2e images loaded into kind
   - kubectl configured to use the kind-sgl-router-kind context
 
-Setup:  ./e2e/k8s_integration/setup.sh
-Teardown: ./e2e/k8s_integration/setup.sh teardown
+Setup:  ./tests/e2e/k8s_integration/setup.sh
+Teardown: ./tests/e2e/k8s_integration/setup.sh teardown
 """
 
 from __future__ import annotations
@@ -216,7 +216,7 @@ def k8s_cluster():
     if CLUSTER_NAME not in result.stdout.splitlines():
         pytest.skip(
             f"kind cluster '{CLUSTER_NAME}' not found — run "
-            f"./e2e/k8s_integration/setup.sh first"
+            f"./tests/e2e/k8s_integration/setup.sh first"
         )
     _kubectl("cluster-info")
     return True

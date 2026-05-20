@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-mod common;
-
 use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::*;
@@ -21,9 +19,9 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn failover_when_one_worker_dies() {
     // Three mock workers.
-    let w1 = common::mock_worker::MockWorker::start(vec![]).await;
-    let w2 = common::mock_worker::MockWorker::start(vec![]).await;
-    let w3 = common::mock_worker::MockWorker::start(vec![]).await;
+    let w1 = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let w2 = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let w3 = crate::common::mock_worker::MockWorker::start(vec![]).await;
 
     // Write a workers.toml with all 3.
     let dir = tempfile::tempdir().unwrap();

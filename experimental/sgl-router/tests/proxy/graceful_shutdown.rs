@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shutdown-under-load gap-closer for M6.
-//!
 //! Pins the contract that `axum::serve(...).with_graceful_shutdown(...)` —
 //! exactly as wired in `src/main.rs` — drains every in-flight streaming
 //! request through the **real** `build_router(ctx)` stack before the
@@ -15,8 +13,6 @@
 //! `bytes_stream_to_body` completion hook, in `chat::chat_completions`'
 //! guards, or in the SSE pump's `tx.send().await` race — all of which
 //! would be silently skipped by a synthetic-handler test.
-
-mod common;
 
 use bytes::Bytes;
 use sgl_router::config::{
@@ -96,7 +92,7 @@ const SLOW_CHUNKS: &[&str] = &[
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_drains_100_inflight_streaming_chat_completions() {
     // 1. Spin up a slow streaming worker.
-    let worker = common::mock_worker::MockWorker::start_slow_stream(
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
         SLOW_CHUNKS.to_vec(),
         Duration::from_millis(60),
     )
@@ -207,7 +203,7 @@ async fn shutdown_with_no_inflight_returns_promptly() {
     // Complement of the load test: when nothing is in flight, the
     // shutdown future resolves quickly. Catches a regression where the
     // server might hang waiting on an idle connection pool.
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

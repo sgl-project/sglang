@@ -4,7 +4,7 @@
 //! Lightweight in-process Prometheus exposition.
 //!
 //! We deliberately do NOT pull in the `metrics` + `metrics-exporter-prometheus`
-//! crates: M4's observability surface is small enough that a hand-written
+//! crates: the observability surface is small enough that a hand-written
 //! counter + histogram + gauge family is cheaper than a new dependency, and
 //! it lets us label/serialise exactly the way the convergence and PD-affinity
 //! tests want.

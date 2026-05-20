@@ -19,7 +19,7 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
-    /// Per-worker active-load bookkeeping (M4). Shared between the proxy
+    /// Per-worker active-load bookkeeping. Shared between the proxy
     /// (which mints guards on the request hot path), the cache-aware
     /// policy (which reads per-worker load when scoring candidates), and
     /// the stale-request janitor (which sweeps expired entries).

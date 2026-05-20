@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! M4 PD-disagg bootstrap-room injection + dual-dispatch — end-to-end
+//! PD-disagg bootstrap-room injection + dual-dispatch — end-to-end
 //! at the HTTP layer using MockWorkers.
 //!
 //! Asserts the router-side contract for SGLang disagg-prefill HTTP mode:
@@ -15,8 +15,6 @@
 //!     - `bootstrap_room` = a random u64 in `[0, i64::MAX]` (63-bit)
 //! * Plain-mode requests do NOT carry any `bootstrap_*` field — the
 //!   injection step is gated on `worker.mode() == Prefill`.
-
-mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -95,7 +93,7 @@ fn chat_request() -> Request<Body> {
 /// when the handler returns. Poll with a short bound rather than
 /// sleeping a fixed duration.
 async fn await_captured_body(
-    mock: &common::mock_worker::MockWorker,
+    mock: &crate::common::mock_worker::MockWorker,
     timeout: Duration,
     label: &str,
 ) -> Bytes {
@@ -137,8 +135,8 @@ fn bootstrap_room(v: &Value) -> Option<u64> {
 /// bootstrap fields injected into both bodies.
 #[tokio::test]
 async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
-    let prefill = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -195,7 +193,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
 /// workers serve the chat route directly without disagg bootstrapping.
 #[tokio::test]
 async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
-    let plain = common::mock_worker::MockWorker::start(vec![]).await;
+    let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
         id: WorkerId("w1".into()),
         url: plain.url.clone(),
@@ -229,9 +227,9 @@ async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
 /// prefill (not e.g. the first registered or a global config value).
 #[tokio::test]
 async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
-    let prefill_a = common::mock_worker::MockWorker::start(vec![]).await;
-    let prefill_b = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("pA".into()),
@@ -284,18 +282,18 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
 /// Pin Pattern B's "prefill failure is invisible to the client"
 /// contract: when the spawned prefill task gets a 5xx (or any other
 /// upstream error), the decode response still reaches the client
-/// unmodified. This documents the M4 choice not to wire fail-fast —
+/// unmodified. The router intentionally does not wire fail-fast here —
 /// the decode side will eventually hang on `bootstrap_room` and time
 /// out, but the chat handler itself doesn't propagate the prefill
 /// error. Matches llm-d / aibrix behaviour.
 #[tokio::test]
 async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
-    let prefill = common::mock_worker::MockWorker::start_returning_error(
+    let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         json!({"error": "simulated prefill failure"}),
     )
     .await;
-    let decode = common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),

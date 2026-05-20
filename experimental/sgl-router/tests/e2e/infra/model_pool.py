@@ -1,21 +1,19 @@
 """Minimal SGLang worker spawner for sgl-router e2e tests.
 
 Adapted from SMG's e2e_test/infra/model_pool.py — the 1200-line original
-manages a pool of long-lived workers across many tests; for M4
-acceptance we only need a thin wrapper around ``sglang.launch_server``
-that:
+manages a pool of long-lived workers across many tests; here we only
+need a thin wrapper around ``sglang.launch_server`` that:
 
   - allocates GPU(s) for the worker (via ``CUDA_VISIBLE_DEVICES``),
   - spawns ``python3 -m sglang.launch_server`` with the right args,
   - waits for ``/health`` to come up,
   - optionally injects ``--kv-events-config`` so the worker exposes
-    the new ``kv_events`` block on ``/server_info`` (the contract
-    introduced by Patch 1).
+    the ``kv_events`` block on ``/server_info``.
 
 A test owns a ``ModelInstance`` for its duration; teardown shuts the
-worker down. No cross-test pooling — the M4 tests are slow enough
-already (model load dominates) that pooling complexity wasn't worth
-porting.
+worker down. No cross-test pooling — the acceptance tests are slow
+enough already (model load dominates) that pooling complexity wasn't
+worth porting.
 """
 
 from __future__ import annotations
