@@ -516,6 +516,8 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
+            # For backward compatibility.
+            "relu2": ActivationType.Relu2,
         }
     else:
         _ACTIVATION_STR_TO_TYPE = {
