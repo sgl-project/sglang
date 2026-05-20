@@ -31,14 +31,33 @@ use crate::policies::kv_events::EventConfig;
 /// payload served by SGLang's HTTP server.
 const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolved per-worker bootstrap state, both halves optional.
+/// Resolved per-worker bootstrap state.
 ///
 /// `served_model_name` populates the registry; `event_config` is handed
-/// to `KvEventIndex::add_worker` (skipping its own fetch).
+/// to `KvEventIndex::add_worker` (skipping its own fetch);
+/// `disaggregation_role` lets the worker manager override the discovery
+/// backend's PD classification (and fill in `WorkerSpec.bootstrap_port`
+/// for prefill workers) — see `manager::register_one`.
 #[derive(Debug, Clone, Default)]
 pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
+    pub disaggregation_role: Option<DisaggregationRole>,
+}
+
+/// PD classification derived from a worker's `/server_info` response.
+///
+/// `Some(_)` means the worker self-disclosed its role and we should trust
+/// it over the discovery backend's classification. `None` (the
+/// `ServerInfo::disaggregation_role` value, not a variant here) means the
+/// worker didn't tell us — older SGLang, missing field, or a partial
+/// response — and the backend's classification wins. See the resolution
+/// table in `resolve_disaggregation_role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisaggregationRole {
+    Plain,
+    Prefill { bootstrap_port: u16 },
+    Decode,
 }
 
 /// Performs the single `/server_info` round-trip and projects the
@@ -122,9 +141,66 @@ impl WorkerIntrospector {
             .kv_events
             .map(|block| resolve_event_config(block, worker_url));
 
+        let disaggregation_role = resolve_disaggregation_role(
+            parsed.disaggregation_mode.as_deref(),
+            parsed.disaggregation_bootstrap_port,
+            worker_url,
+        );
+
         ServerInfo {
             served_model_name,
             event_config,
+            disaggregation_role,
+        }
+    }
+}
+
+/// Map the two `disaggregation_*` fields from `/server_info` into a
+/// `DisaggregationRole`. Returns `None` when the worker hasn't told us
+/// enough to be useful — the caller treats that as "defer to the
+/// discovery backend's classification" instead of forcing Plain, which
+/// preserves backwards compatibility with SGLang versions that predate
+/// the field.
+///
+/// Resolution table:
+///
+/// | `disaggregation_mode`        | `disaggregation_bootstrap_port` | Result                              |
+/// |------------------------------|----------------------------------|-------------------------------------|
+/// | `None` (older SGLang)        | _any_                            | `None` — defer to backend           |
+/// | `Some("null")`               | _any_                            | `Some(Plain)`                       |
+/// | `Some("prefill")`            | `Some(p)`                        | `Some(Prefill { bootstrap_port: p })` |
+/// | `Some("prefill")`            | `None`                           | warn + `None` — defer to backend    |
+/// | `Some("decode")`             | _any_                            | `Some(Decode)`                      |
+/// | `Some(other)`                | _any_                            | warn + `None`                       |
+fn resolve_disaggregation_role(
+    mode: Option<&str>,
+    bootstrap_port: Option<u16>,
+    worker_url: &str,
+) -> Option<DisaggregationRole> {
+    match mode {
+        None => None,
+        Some("null") => Some(DisaggregationRole::Plain),
+        Some("prefill") => match bootstrap_port {
+            Some(p) => Some(DisaggregationRole::Prefill { bootstrap_port: p }),
+            None => {
+                warn!(
+                    worker_url = %worker_url,
+                    "introspect: /server_info reports disaggregation_mode=\"prefill\" but \
+                     disaggregation_bootstrap_port is missing; deferring to the discovery \
+                     backend's classification"
+                );
+                None
+            }
+        },
+        Some("decode") => Some(DisaggregationRole::Decode),
+        Some(other) => {
+            warn!(
+                worker_url = %worker_url,
+                disaggregation_mode = %other,
+                "introspect: /server_info has unknown disaggregation_mode value; \
+                 deferring to the discovery backend's classification"
+            );
+            None
         }
     }
 }
@@ -171,15 +247,25 @@ pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> Ev
     }
 }
 
-/// Projection of `/server_info` used by the introspector.  Both halves
-/// are `#[serde(default)]` so a worker that exposes only one of them
-/// still deserialises; downstream callers handle `None` as "absent".
+/// Projection of `/server_info` used by the introspector. Every field is
+/// `#[serde(default)]` so a worker that exposes only some of them still
+/// deserialises; downstream callers handle `None` as "absent".
 #[derive(Debug, Default, Deserialize)]
 struct ServerInfoBody {
     #[serde(default)]
     served_model_name: Option<String>,
     #[serde(default)]
     kv_events: Option<KvEventsBlock>,
+    /// Carries the value of `ServerArgs.disaggregation_mode`
+    /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
+    /// versions that predate the field.
+    #[serde(default)]
+    disaggregation_mode: Option<String>,
+    /// `ServerArgs.disaggregation_bootstrap_port`. Meaningful only when
+    /// `disaggregation_mode == "prefill"`; the prefill server's
+    /// bootstrap server binds to exactly this port (no internal offset).
+    #[serde(default)]
+    disaggregation_bootstrap_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,5 +408,101 @@ mod tests {
         assert!(got.served_model_name.is_none());
         let cfg = got.event_config.expect("kv_events present");
         assert_eq!(cfg.port_base, 5557);
+    }
+
+    /// `disaggregation_mode=prefill` + a bootstrap port → manager should
+    /// see the worker as a prefill peer with the supplied port. This is
+    /// the happy path that lets PD-on-K8s skip pod annotations entirely.
+    #[tokio::test]
+    async fn fetch_resolves_prefill_role_with_bootstrap_port() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "prefill",
+            "disaggregation_bootstrap_port": 8998,
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(
+            got.disaggregation_role,
+            Some(DisaggregationRole::Prefill {
+                bootstrap_port: 8998
+            }),
+        );
+    }
+
+    /// `disaggregation_mode=decode` → role is Decode regardless of any
+    /// bootstrap-port field value (decode workers don't bind one).
+    #[tokio::test]
+    async fn fetch_resolves_decode_role() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "decode",
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.disaggregation_role, Some(DisaggregationRole::Decode));
+    }
+
+    /// `disaggregation_mode="null"` is SGLang's explicit "not
+    /// disaggregated" value — we trust it and force the worker to Plain
+    /// even if the discovery backend mistakenly classified it as
+    /// prefill/decode.
+    #[tokio::test]
+    async fn fetch_resolves_plain_role_when_mode_is_null() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "null",
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.disaggregation_role, Some(DisaggregationRole::Plain));
+    }
+
+    /// Partial data (`prefill` mode with no bootstrap port) returns
+    /// `None` so the manager keeps the discovery backend's
+    /// classification. The alternative — forcing Plain — would silently
+    /// demote a misconfigured prefill worker to plain dispatch.
+    #[tokio::test]
+    async fn fetch_defers_to_backend_when_prefill_mode_lacks_bootstrap_port() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "prefill",
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert!(
+            got.disaggregation_role.is_none(),
+            "prefill with no bootstrap port must defer to backend, got {:?}",
+            got.disaggregation_role,
+        );
+    }
+
+    /// Older SGLang doesn't expose `disaggregation_mode`. The
+    /// introspector must not invent a classification — the discovery
+    /// backend (K8s labels, static-file TOML) still drives mode for
+    /// these workers.
+    #[tokio::test]
+    async fn fetch_defers_to_backend_when_mode_field_is_absent() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert!(got.disaggregation_role.is_none());
+    }
+
+    /// Unknown `disaggregation_mode` value (future SGLang adds a new
+    /// disaggregation flavor, network garbled the field, etc.) → defer
+    /// to backend rather than guessing.
+    #[tokio::test]
+    async fn fetch_defers_to_backend_when_mode_is_unrecognized() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "encode_only",
+            "disaggregation_bootstrap_port": 8998,
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert!(got.disaggregation_role.is_none());
     }
 }
