@@ -28,6 +28,7 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
+    assert_canary_state_multiset_equal,
     assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
@@ -1577,13 +1578,20 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
         for count in entries_per_req:
             write_offsets.append(write_offsets[-1] + count)
 
+        # Partition slots into write targets and seed candidates so the seed reads can't race a
+        # concurrent block's write to the same slot. Slot 0 is excluded — it's the reserved padding
+        # sentinel for the verify kernel and used as the kv-pool padding sink by sglang.
+        slot_pool = list(range(1, num_slots))
+        rng.shuffle(slot_pool)
+        disjoint_slots = slot_pool[:total_entries]
+        seed_candidate_pool = slot_pool[total_entries:]
+
         seed_slot_indices: list[int] = []
         for _ in range(bs):
-            if rng.random() < 0.5:
+            if rng.random() < 0.5 or not seed_candidate_pool:
                 seed_slot_indices.append(-1)
             else:
-                seed_slot = rng.randint(0, num_slots - 1)
-                seed_slot_indices.append(seed_slot)
+                seed_slot_indices.append(rng.choice(seed_candidate_pool))
 
         plan_cuda = make_write_plan(
             write_offsets=write_offsets,
@@ -1600,16 +1608,12 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
 
         fb_input_ids_list = [rng.randint(0, 0xFFFF) for _ in range(total_entries)]
         fb_positions_list = [rng.randint(0, 0x7FFFFFFF) for _ in range(total_entries)]
-
         loc_choice = rng.random()
         if loc_choice < 0.5:
-            fb_out_cache_loc_list = [
-                rng.randint(0, num_slots - 1) for _ in range(total_entries)
-            ]
+            fb_out_cache_loc_list = list(disjoint_slots)
         elif loc_choice < 0.75:
             fb_out_cache_loc_list = [
-                -1 if rng.random() < 0.3 else rng.randint(0, num_slots - 1)
-                for _ in range(total_entries)
+                -1 if rng.random() < 0.3 else s for s in disjoint_slots
             ]
         else:
             fb_out_cache_loc_list = [-1] * total_entries
@@ -1657,7 +1661,9 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
         ref_log = FakeViolationLog.allocate(capacity=256, device=_DEVICE)
 
         try:
-            _run_both_and_assert_buf_and_state_equal(
+            # Multiset compare: write kernel launches one block per req and atomicAdd-orders violations,
+            # so ring rows are permuted vs the sequential ref. Canary buf and counters must still match.
+            _run_both(
                 cuda_canary_buf=cuda_buf,
                 ref_canary_buf=ref_buf,
                 plan_cuda=plan_cuda,
@@ -1674,6 +1680,8 @@ def test_write_pure_random_fuzz_byte_equal() -> None:
                 real_kv_sources_ref=sources_ref,
                 real_kv_hash_mode=mode,
             )
+            assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
+            assert_canary_state_multiset_equal(log_a=cuda_log, log_b=ref_log)
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "

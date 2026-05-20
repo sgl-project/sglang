@@ -269,10 +269,37 @@ def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None
     assert torch.equal(buf_a, buf_b), "canary_buf diverged (CUDA vs ref)"
 
 
+def assert_canary_state_multiset_equal(
+    *, log_a: FakeViolationLog, log_b: FakeViolationLog
+) -> None:
+    """Like ``assert_canary_state_equal`` but tolerates a permutation of violation_ring rows.
+
+    The CUDA kernel assigns ring slots via ``atomicAdd``, so when violations come from multiple warps or
+    blocks the row order is non-deterministic. Multi-entry random fuzz tests use this variant to compare
+    rings as multisets while still requiring byte-equal counters and write_index.
+    """
+    cuda_ring_sorted, _ = torch.sort(log_a.ring.view(log_a.ring.shape[0], -1), dim=0)
+    ref_ring_sorted, _ = torch.sort(log_b.ring.view(log_b.ring.shape[0], -1), dim=0)
+    assert torch.equal(
+        cuda_ring_sorted, ref_ring_sorted
+    ), "violation_ring diverged as multiset (CUDA vs ref)"
+    assert torch.equal(
+        log_a.write_index, log_b.write_index
+    ), "violation_write_index diverged (CUDA vs ref)"
+    assert torch.equal(
+        log_a.slot_run_counter, log_b.slot_run_counter
+    ), "slot_run_counter diverged (CUDA vs ref)"
+    assert torch.equal(
+        log_a.kernel_run_counter, log_b.kernel_run_counter
+    ), "kernel_run_counter diverged (CUDA vs ref)"
+
+
 def assert_only_bits_set(fail_bits: int, expected_bits: int) -> None:
-    assert (fail_bits & expected_bits) == expected_bits, (
+    assert (
+        fail_bits & expected_bits
+    ) == expected_bits, (
         f"missing expected bits: expected {expected_bits:#b} got {fail_bits:#b}"
     )
-    assert (fail_bits & ~expected_bits) == 0, (
-        f"unexpected extra bits: got {fail_bits:#b} extras {fail_bits & ~expected_bits:#b}"
-    )
+    assert (
+        fail_bits & ~expected_bits
+    ) == 0, f"unexpected extra bits: got {fail_bits:#b} extras {fail_bits & ~expected_bits:#b}"

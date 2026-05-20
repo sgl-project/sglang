@@ -30,6 +30,7 @@ from sglang.jit_kernel.kv_canary.write_ref import (
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
+    assert_canary_state_multiset_equal,
     assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
@@ -2100,13 +2101,15 @@ def _stamp_random_chain(
     num_slots: int,
     chain_len: int,
 ) -> tuple[list[int], list[int], list[int]]:
-    slot_pool = list(range(num_slots))
+    # Skip slot 0 — the verify kernel unconditionally treats it as the reserved padding sentinel.
+    slot_pool = list(range(1, num_slots))
     rng.shuffle(slot_pool)
     slots = slot_pool[:chain_len]
 
     tokens: list[int] = [rng.randint(0, 0xFFFFFFFF) for _ in range(chain_len)]
     positions: list[int] = list(range(chain_len))
-    real_kv_hashes: list[int] = [rng.randint(0, (1 << 64) - 1) for _ in range(chain_len)]
+    # Stamp real_kv_hash=0 so the chain stays consistent with RealKvHashMode.OFF callers (expected=0).
+    real_kv_hashes: list[int] = [0] * chain_len
 
     running = splitmix64(CANARY_CHAIN_ANCHOR)
     for slot_idx, token, position, rkv in zip(slots, tokens, positions, real_kv_hashes):
@@ -2137,7 +2140,8 @@ def test_verify_pure_random_fuzz_byte_equal() -> None:
             entries_per_req = [rng.randint(1, 8) for _ in range(bs)]
         total_entries = sum(entries_per_req)
 
-        slot_pool = list(range(num_slots))
+        # Skip slot 0 — the verify kernel unconditionally treats it as the reserved padding sentinel.
+        slot_pool = list(range(1, num_slots))
         rng.shuffle(slot_pool)
         all_slots = slot_pool[:total_entries]
 
@@ -2160,7 +2164,9 @@ def test_verify_pure_random_fuzz_byte_equal() -> None:
                 used_slots.append(slot_idx)
             offset += n
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         for slot_idx in slot_indices:
             token = rng.randint(0, 0xFFFFFFFF)
@@ -2200,7 +2206,9 @@ def test_verify_pure_random_fuzz_byte_equal() -> None:
         ref_log = FakeViolationLog.allocate(capacity=256, device=_DEVICE)
 
         try:
-            _run_both_and_assert_state_equal(
+            # Use the multiset variant: CUDA atomically assigns ring slots so the row order is
+            # non-deterministic across warps, but the multiset of recorded violations must match ref.
+            _run_both(
                 cuda_canary_buf=cuda_buf,
                 ref_canary_buf=ref_buf,
                 plan_cuda=plan_cuda,
@@ -2212,6 +2220,7 @@ def test_verify_pure_random_fuzz_byte_equal() -> None:
                 real_kv_hash_mode=mode,
                 kernel_kind=tag,
             )
+            assert_canary_state_multiset_equal(log_a=cuda_log, log_b=ref_log)
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "
@@ -2225,7 +2234,9 @@ def test_verify_random_clean_chain_no_violation() -> None:
         seed_snapshot = rng.getstate()
         chain_len = rng.randint(5, 50)
         num_slots = chain_len + 10
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         slots, positions, prev_slots = _stamp_random_chain(
             rng,
@@ -2260,9 +2271,9 @@ def test_verify_random_clean_chain_no_violation() -> None:
                 real_kv_sources_ref=(),
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
-            assert int(cuda_log.write_index[0].item()) == 0, (
-                f"expected no violation, got write_index={int(cuda_log.write_index[0].item())}"
-            )
+            assert (
+                int(cuda_log.write_index[0].item()) == 0
+            ), f"expected no violation, got write_index={int(cuda_log.write_index[0].item())}"
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "
@@ -2276,7 +2287,9 @@ def test_verify_random_token_corruption_reports_chain_bit() -> None:
         seed_snapshot = rng.getstate()
         chain_len = rng.randint(3, 20)
         num_slots = chain_len + 10
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         slots, positions, prev_slots = _stamp_random_chain(
             rng,
@@ -2329,9 +2342,12 @@ def test_verify_random_token_corruption_reports_chain_bit() -> None:
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
             write_idx = int(cuda_log.write_index[0].item())
-            assert write_idx >= 1, "expected at least one violation after token corruption"
+            assert (
+                write_idx >= 1
+            ), "expected at least one violation after token corruption"
             found = any(
-                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item()) & _FAIL_REASON_BIT_CHAIN_HASH
+                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+                & _FAIL_REASON_BIT_CHAIN_HASH
                 for r in range(min(write_idx, cuda_log.ring.shape[0]))
             )
             assert found, "CHAIN_HASH bit not found after token corruption"
@@ -2348,7 +2364,9 @@ def test_verify_random_position_corruption_reports_position_bit() -> None:
         seed_snapshot = rng.getstate()
         chain_len = rng.randint(2, 20)
         num_slots = chain_len + 10
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         slots, positions, prev_slots = _stamp_random_chain(
             rng,
@@ -2399,9 +2417,12 @@ def test_verify_random_position_corruption_reports_position_bit() -> None:
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
             write_idx = int(cuda_log.write_index[0].item())
-            assert write_idx >= 1, "expected at least one violation after position corruption"
+            assert (
+                write_idx >= 1
+            ), "expected at least one violation after position corruption"
             found = any(
-                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item()) & _FAIL_REASON_BIT_POSITION
+                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+                & _FAIL_REASON_BIT_POSITION
                 for r in range(min(write_idx, cuda_log.ring.shape[0]))
             )
             assert found, "POSITION bit not found after position corruption"
@@ -2418,7 +2439,9 @@ def test_verify_random_prev_hash_corruption_reports_chain_bit() -> None:
         seed_snapshot = rng.getstate()
         chain_len = rng.randint(2, 20)
         num_slots = chain_len + 10
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
         slots, positions, prev_slots = _stamp_random_chain(
             rng,
@@ -2432,7 +2455,9 @@ def test_verify_random_prev_hash_corruption_reports_chain_bit() -> None:
         stored_token, stored_pos, stored_prev, stored_rkv = read_slot_fields(
             canary_buf=cuda_buf, slot_idx=corrupt_slot
         )
-        new_prev = to_signed_int64((stored_prev ^ rng.randint(1, (1 << 63))) & ((1 << 64) - 1))
+        new_prev = to_signed_int64(
+            (stored_prev ^ rng.randint(1, (1 << 63))) & ((1 << 64) - 1)
+        )
         for buf in (cuda_buf, ref_buf):
             write_slot_fields(
                 canary_buf=buf,
@@ -2469,9 +2494,12 @@ def test_verify_random_prev_hash_corruption_reports_chain_bit() -> None:
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
             write_idx = int(cuda_log.write_index[0].item())
-            assert write_idx >= 1, "expected at least one violation after prev_hash corruption"
+            assert (
+                write_idx >= 1
+            ), "expected at least one violation after prev_hash corruption"
             found = any(
-                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item()) & _FAIL_REASON_BIT_CHAIN_HASH
+                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+                & _FAIL_REASON_BIT_CHAIN_HASH
                 for r in range(min(write_idx, cuda_log.ring.shape[0]))
             )
             assert found, "CHAIN_HASH bit not found after prev_hash corruption"
@@ -2488,7 +2516,9 @@ def test_verify_random_real_kv_corruption_reports_real_kv_bit() -> None:
         seed_snapshot = rng.getstate()
         chain_len = rng.randint(2, 15)
         num_slots = chain_len + 10
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
 
         read_bytes = rng.randint(1, 8)
@@ -2502,8 +2532,10 @@ def test_verify_random_real_kv_corruption_reports_real_kv_bit() -> None:
         src.tensor.random_()
         mode = rng.choice([RealKvHashMode.BIT, RealKvHashMode.ALL])
 
-        from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
         from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
+        from sglang.jit_kernel.kv_canary.write_ref import (
+            canary_write_step_torch_reference,
+        )
 
         tokens_list = [rng.randint(1, 0xFFFF) for _ in range(chain_len)]
         positions_list = list(range(chain_len))
@@ -2581,9 +2613,12 @@ def test_verify_random_real_kv_corruption_reports_real_kv_bit() -> None:
                 real_kv_hash_mode=mode,
             )
             write_idx = int(cuda_log.write_index[0].item())
-            assert write_idx >= 1, "expected at least one violation after real_kv corruption"
+            assert (
+                write_idx >= 1
+            ), "expected at least one violation after real_kv corruption"
             found = any(
-                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item()) & _FAIL_REASON_BIT_REAL_KV_HASH
+                int(cuda_log.ring[r, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+                & _FAIL_REASON_BIT_REAL_KV_HASH
                 for r in range(min(write_idx, cuda_log.ring.shape[0]))
             )
             assert found, f"REAL_KV_HASH bit not found after corruption (mode={mode})"
@@ -2602,15 +2637,20 @@ def test_verify_random_ring_overflow_counter_consistent() -> None:
         n_violations = ring_capacity + rng.randint(1, ring_capacity + 2)
         num_slots = n_violations + 10
         anchor_signed = chain_anchor_signed()
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
-        slot_indices = list(range(n_violations))
+        # Skip slot 0 — the verify kernel unconditionally treats it as the reserved padding sentinel.
+        slot_indices = list(range(1, n_violations + 1))
         for slot_idx in slot_indices:
+            # Sample once per slot so cuda_buf and ref_buf receive identical bytes.
+            slot_token = rng.randint(1, 0xFFFF)
             for buf in (cuda_buf, ref_buf):
                 write_slot_fields(
                     canary_buf=buf,
                     slot_idx=slot_idx,
-                    token=rng.randint(1, 0xFFFF),
+                    token=slot_token,
                     position=0,
                     prev_hash=anchor_signed,
                     real_kv_hash=0,
@@ -2643,9 +2683,9 @@ def test_verify_random_ring_overflow_counter_consistent() -> None:
                 real_kv_hash_mode=RealKvHashMode.OFF,
             )
             write_idx = int(cuda_log.write_index[0].item())
-            assert write_idx == n_violations, (
-                f"expected write_index=={n_violations} got {write_idx}"
-            )
+            assert (
+                write_idx == n_violations
+            ), f"expected write_index=={n_violations} got {write_idx}"
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "
@@ -2672,14 +2712,18 @@ def test_verify_random_page_size_gt_1_layout() -> None:
         src.tensor.random_()
         mode = rng.choice([RealKvHashMode.BIT, RealKvHashMode.ALL])
 
-        from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
         from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
+        from sglang.jit_kernel.kv_canary.write_ref import (
+            canary_write_step_torch_reference,
+        )
 
         tokens_list = [rng.randint(1, 0xFFFF) for _ in range(chain_len)]
         positions_list = list(range(chain_len))
         slot_list = [i * page_size for i in range(chain_len)]
 
-        cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
+        cuda_buf = make_canary_buf(
+            num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+        )
         ref_buf = cuda_buf.clone()
 
         write_plan = make_write_plan(
@@ -2746,9 +2790,9 @@ def test_verify_random_page_size_gt_1_layout() -> None:
                 real_kv_sources_ref=(src_ref,),
                 real_kv_hash_mode=mode,
             )
-            assert int(cuda_log.write_index[0].item()) == 0, (
-                "expected no violation on clean chain with page_size>1"
-            )
+            assert (
+                int(cuda_log.write_index[0].item()) == 0
+            ), "expected no violation on clean chain with page_size>1"
         except AssertionError as e:
             raise AssertionError(
                 f"iteration={iteration} rng_seed_state_first_int={seed_snapshot[1][0]} "
