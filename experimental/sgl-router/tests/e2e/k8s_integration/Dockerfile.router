@@ -2,10 +2,15 @@
 # Build sgl-router binary for k8s integration E2E.
 # Context root: repo root (one level above experimental/sgl-router/).
 
-FROM rust:1.83-bookworm AS builder
+# Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
+FROM rust:1.90-bookworm AS builder
 
-RUN apt-get update && apt-get install -y libssl-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# Pin to the exact toolchain pre-installed in the base image so rustup
+# doesn't try to sync the channel manifest when it sees rust-toolchain.toml's
+# `channel = "1.90"`.
+ENV RUSTUP_TOOLCHAIN=1.90.0
+
+# libssl-dev + pkg-config ship with rust:1.90-bookworm already; no apt-get needed.
 
 WORKDIR /build
 
@@ -31,4 +36,4 @@ COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/t
 
 EXPOSE 8090
 
-CMD ["sgl-router"]
+ENTRYPOINT ["sgl-router"]
