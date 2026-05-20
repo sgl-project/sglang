@@ -52,6 +52,12 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "attn2.to_k_img": "attn2.add_k_proj",
     "attn2.to_v_img": "attn2.add_v_proj",
     "attn2.norm_k_img": "attn2.norm_added_k",
+    # MXFP4 msmodelslim wraps Linear layers with a `.linear.` subpath;
+    # strip it so keys match the SGLang model parameters.
+    ".linear.": ".",
+    # NonFusionSmoothQuantWrapper exports smooth quant scale as `.div.mul_scale`;
+    # strip `.div.` so it loads as a direct parameter `mul_scale` on the linear layer.
+    ".div.": ".",
 }
 
 SUPPORTED_MODEL_TYPES = ["Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B", "Wan2.2-TI2V-5B"]
@@ -98,13 +104,10 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     candidates = sorted(directory.glob(pattern))
     if not candidates:
         raise FileNotFoundError(f"No file matching '{pattern}' found in {directory}")
-    if len(candidates) > 1:
-        raise FileNotFoundError(
-            f"Multiple files matching '{pattern}' found in {directory}: {candidates}"
-        )
 
     state_dict = {}
-    state_dict.update(load_file(candidates[0]))
+    for f in candidates:
+        state_dict.update(load_file(f))
     return state_dict
 
 

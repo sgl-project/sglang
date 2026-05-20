@@ -432,10 +432,6 @@ def _set_k_and_s_triton(
             assert (
                 page_size % 16 == 0
             ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
-        else:
-            assert (
-                page_size == 1
-            ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
     else:
         assert page_size == 64
 
