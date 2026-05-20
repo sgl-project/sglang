@@ -43,11 +43,11 @@ impl Config {
                 }
             }
             DiscoveryBackend::K8s(k) => {
-                if k.namespace.is_empty() {
-                    return Err(anyhow!("discovery.k8s.namespace must be set"));
-                }
-                // Reject invalid selector combinations at load time (no
-                // selectors, mixed plain+PD, partial PD).
+                // Empty namespace is intentional: triggers `Api::all(client)`
+                // for cluster-wide EndpointSlice watch (see
+                // `discovery::k8s::spawn`). Only validate the selector
+                // combination here.
+                let _ = &k.namespace;
                 k.mode().map_err(|e| anyhow!("{e}"))?;
             }
         }

@@ -222,13 +222,19 @@ def k8s_cluster():
     return True
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def router_port_forward(k8s_cluster):
-    """Port-forward to sgl-router service; yield (router_url,)."""
+    """Per-test port-forward to sgl-router service.
+
+    Function-scoped because some tests (notably
+    test_lifecycle.TestRouterRestart) force-delete the router pod;
+    a session-scoped port-forward would be bound to the deleted pod's
+    network namespace and stay dead for all subsequent tests in the
+    suite. Per-test setup costs ~1-2s.
+    """
     _wait_for_deployment_ready("sgl-router")
     pf = _port_forward_start(NAMESPACE, "sgl-router", 8090, 8090)
     try:
-        # Wait until the router's /healthz is responding
         _poll_until(
             lambda: _router_is_healthy("http://127.0.0.1:8090"),
             "sgl-router /healthz returns 200",
@@ -240,7 +246,6 @@ def router_port_forward(k8s_cluster):
         _cleanup_port_forward("sgl-router", pf)
 
 
-# Alias consumed by test files
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def router_url(router_port_forward):
     return router_port_forward

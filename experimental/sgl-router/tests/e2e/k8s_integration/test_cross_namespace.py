@@ -101,13 +101,23 @@ def _ensure_namespace(name: str) -> None:
 
 
 def _ensure_service_in_ns(namespace: str, selector: str = "app=sglang") -> None:
-    """Create a Service so K8s auto-creates an EndpointSlice for cross-ns workers."""
+    """Create a Service so K8s auto-creates an EndpointSlice for cross-ns workers.
+
+    Service `metadata.labels` propagates to the auto-created EndpointSlice's
+    labels — and the cluster-scoped router filters slices server-side by
+    `app=sglang,cross-ns-test=true`. Without those labels on the Service,
+    its EndpointSlice gets filtered out and the cross-ns worker is invisible.
+    """
     svc_manifest = {
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": "fake-worker", "namespace": namespace},
+        "metadata": {
+            "name": "fake-worker",
+            "namespace": namespace,
+            "labels": {"app": "sglang", "cross-ns-test": "true"},
+        },
         "spec": {
-            "selector": {"app": "sglang"},
+            "selector": {"app": "sglang", "cross-ns-test": "true"},
             "ports": [{"port": 30000, "targetPort": 30000}],
         },
     }
@@ -184,6 +194,15 @@ label_selector = "app=sglang,cross-ns-test=true"
 
     _kubectl("apply", "-f", str(router_manifest))
 
+    # The cluster-scoped router's /readyz blocks on registry-not-empty, so
+    # without at least one matching worker the rollout-status check below
+    # would hang for 180s. Deploy a "bootstrap" worker in EXTRA_NAMESPACE
+    # with the label_selector match (app=sglang,cross-ns-test=true) so the
+    # router's k8s discovery picks it up before the readiness probe runs.
+    # The test body adds a SECOND worker later to verify dynamic discovery.
+    bootstrap_worker = "cross-ns-worker-bootstrap"
+    _deploy_fake_worker_in_ns(bootstrap_worker, EXTRA_NAMESPACE)
+
     pf = None
     try:
         _wait_for_deployment_ready("sgl-router-cluster")
@@ -194,6 +213,7 @@ label_selector = "app=sglang,cross-ns-test=true"
     finally:
         if pf is not None:
             _cleanup_port_forward("cluster_router", pf)
+        _safe_delete_pod(bootstrap_worker, EXTRA_NAMESPACE)
         _kubectl(
             "delete", "-f", str(router_manifest), "--ignore-not-found", check=False
         )

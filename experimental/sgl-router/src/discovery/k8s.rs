@@ -86,9 +86,15 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 /// The worker URL is `http://<addr>:<port>` where port comes from
 /// `EndpointSlice.ports[0].port`, defaulting to `30000` if absent.
 ///
-/// The [`WorkerId`] is `{ns}/{slice_name}/{addr}:{port}` so that pods with
-/// identical IPs in different namespaces (overlay networks, service-mesh
-/// sidecars) never collide on the same key.
+/// The [`WorkerId`] is `{ns}/{uid}` where `uid` is the pod's K8s UID
+/// from `endpoint.target_ref.uid`. Pod UIDs are globally unique per
+/// pod incarnation, so when a pod dies and a new pod gets the same IP
+/// (kubelet IP reuse on a busy podCIDR), the router sees a fresh
+/// `WorkerId` and emits a clean Removed→Added cycle — old breaker /
+/// active-load state is shed instead of being mis-applied to the new
+/// pod. For manually-created EndpointSlices that lack `target_ref`
+/// (rare in real clusters but common in unit tests), falls back to
+/// `{ns}/{slice_name}/{addr}:{port}`.
 ///
 /// `model_ids` is intentionally left empty — model membership is resolved
 /// by the worker manager via `/server_info` introspection after the
@@ -110,9 +116,13 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         if !is_ready {
             continue;
         }
+        let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
         for addr in &ep.addresses {
             let url = format!("http://{addr}:{port}");
-            let id = WorkerId(format!("{ns}/{slice_name}/{addr}:{port}"));
+            let id = match pod_uid {
+                Some(uid) => WorkerId(format!("{ns}/{uid}")),
+                None => WorkerId(format!("{ns}/{slice_name}/{addr}:{port}")),
+            };
             // bootstrap_port stays `None` here on purpose. The final
             // `WorkerMode` and the bootstrap port are both filled in by
             // the worker manager from each worker's `/server_info`
@@ -941,5 +951,106 @@ mod tests {
         // when the producer drops dtx. Both should finish quickly.
         let _ = tokio::time::timeout(Duration::from_secs(1), producer).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle).await;
+    }
+
+    /// Helper: build a slice where every endpoint carries a synthetic
+    /// `target_ref.uid`. The endpoint at position `i` gets `uids[i]`.
+    fn make_slice_with_uids(addrs: &[&str], port: i32, uids: &[&str]) -> EndpointSlice {
+        use k8s_openapi::api::core::v1::ObjectReference;
+        assert_eq!(addrs.len(), uids.len());
+        let endpoints = addrs
+            .iter()
+            .zip(uids.iter())
+            .map(|(addr, uid)| Endpoint {
+                addresses: vec![(*addr).to_string()],
+                conditions: Some(EndpointConditions {
+                    ready: Some(true),
+                    ..Default::default()
+                }),
+                target_ref: Some(ObjectReference {
+                    uid: Some((*uid).to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some("svc".into()),
+                namespace: Some("ns".into()),
+                ..Default::default()
+            },
+            address_type: "IPv4".into(),
+            endpoints,
+            ports: Some(vec![EndpointPort {
+                port: Some(port),
+                ..Default::default()
+            }]),
+        }
+    }
+
+    /// Pod is replaced (same IP, different UID) — router must see this as
+    /// a Removed+Added cycle so the new pod gets fresh CB/active_load
+    /// state. Without UID-keyed WorkerIds, two consecutive
+    /// `process_events` snapshots would dedup by `addr:port` and the
+    /// new pod would inherit the dead pod's state.
+    #[tokio::test]
+    async fn pod_replace_with_same_ip_emits_remove_then_add() {
+        let s_old = with_uid(
+            make_slice_with_uids(&["10.0.0.1"], 30000, &["uid-old"]),
+            "u-1",
+        );
+        let s_new = with_uid(
+            make_slice_with_uids(&["10.0.0.1"], 30000, &["uid-new"]),
+            "u-1",
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(vec![
+                Ok(watcher::Event::Apply(s_old)),
+                Ok(watcher::Event::Apply(s_new)),
+            ]),
+            tx,
+            plain_mode(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        // Expect: Added(uid-old) → Removed(uid-old) + Added(uid-new).
+        // The order of Removed/Added within the second apply depends on
+        // emit_diff's iteration; assert by counting each variant.
+        assert_eq!(events.len(), 3, "got {events:?}");
+        let added: Vec<&WorkerSpec> = events
+            .iter()
+            .filter_map(|e| match e {
+                DiscoveryEvent::Added(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        let removed: Vec<&WorkerId> = events
+            .iter()
+            .filter_map(|e| match e {
+                DiscoveryEvent::Removed { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), 2, "two Added (one per UID): {events:?}");
+        assert_eq!(removed.len(), 1, "one Removed (for uid-old): {events:?}");
+        assert_eq!(
+            added[0].id.0, "ns/uid-old",
+            "first Added is the original pod",
+        );
+        assert_eq!(
+            added[1].id.0, "ns/uid-new",
+            "second Added is the replacement pod with a fresh UID",
+        );
+        assert_eq!(
+            removed[0].0, "ns/uid-old",
+            "Removed targets the original pod's UID, not the IP-keyed id",
+        );
+        // Same URL across both, confirming the IP didn't change.
+        assert_eq!(added[0].url, added[1].url);
     }
 }
