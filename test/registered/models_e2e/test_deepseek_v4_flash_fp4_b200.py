@@ -8,12 +8,11 @@ Registry: base-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,41 +20,25 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="dsv4-4-gpu-b200")
+register_cuda_ci(est_time=700, stage="base-c", runner_config="dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
+DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
-
-_W4A8_MEGAMOE_ENV = {
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
+_DEEPEP_ENV = {
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
 
 
-_W4A4_MEGAMOE_ENV = {
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
-}
+class TestDSV4FlashFP4B200(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
-
-def _gsm8k_check(test_case):
-    args = SimpleNamespace(
-        base_url=test_case.base_url,
-        model=test_case.model,
-        eval_name="gsm8k",
-        api="completion",
-        max_tokens=512,
-        num_examples=200,
-        num_threads=128,
-    )
-    metrics = run_eval(args)
-    print(f"[{type(test_case).__name__}] GSM8K {metrics=}")
-    test_case.assertGreater(metrics["score"], 0.93)
-
-
-class TestDSV4FlashFP4B200W4A8MegaMoE(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, MegaMoE."""
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -69,52 +52,8 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "megamoe",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-            ],
-            env=_W4A8_MEGAMOE_ENV,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _gsm8k_check(self)
-
-
-class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, MegaMoE."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "megamoe",
+                "--moe-runner-backend",
+                "flashinfer_mxfp4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
@@ -123,8 +62,10 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
+                "--chunked-prefill-size",
+                "4096",
+                "--disable-flashinfer-autotune",
             ],
-            env=_W4A4_MEGAMOE_ENV,
         )
 
     @classmethod
@@ -132,8 +73,100 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
-        _gsm8k_check(self)
+
+class TestDSV4FlashFP4B200Balanced(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4B200Balanced_CP(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":

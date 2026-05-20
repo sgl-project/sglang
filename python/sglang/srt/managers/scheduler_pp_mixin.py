@@ -532,6 +532,7 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
             and self.server_args.moe_a2a_backend == "none"
+            not self.server_args.enable_dsa_prefill_context_parallel
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
