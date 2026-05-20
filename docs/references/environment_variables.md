@@ -27,6 +27,8 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_ENABLE_TORCH_INFERENCE_MODE` | Control whether to use torch.inference_mode | `false` |
 | `SGLANG_ENABLE_TORCH_COMPILE` | Enable torch.compile | `false` |
+| `SGLANG_TORCH_COMPILE_CPP_WRAPPER` | Use C++ wrapper for torch.compile-generated code | `false` |
+| `SGLANG_TORCH_COMPILE_REPLAY_PREPARE` | Enable torch.compile for the CUDA graph replay-prepare path (requires combo_kernels support in torch inductor) | `false` |
 | `SGLANG_SET_CPU_AFFINITY` | Enable CPU affinity setting (often set to `1` in Docker builds) | `false` |
 | `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` | Allows the scheduler to overwrite longer context length requests (often set to `1` in Docker builds) | `false` |
 | `SGLANG_IS_FLASHINFER_AVAILABLE` | Control FlashInfer availability check | `true` |

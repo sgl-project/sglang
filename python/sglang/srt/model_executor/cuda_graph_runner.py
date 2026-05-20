@@ -105,11 +105,33 @@ if TYPE_CHECKING:
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
-def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+def _mark_unbacked_dim(
+    tensor: Optional[torch.Tensor],
+    dim: int,
+    *,
+    shape_id: str,
+    max_size: Optional[int] = None,
+) -> None:
+    if tensor is None or tensor.dim() <= dim or tensor.size(dim) == 0:
+        return
+
+    mark_unbacked = getattr(
+        getattr(torch._dynamo, "decorators", None), "mark_unbacked", None
+    )
+    if mark_unbacked is None:
+        torch._dynamo.maybe_mark_dynamic(tensor, dim)
+        return
+
+    mark_unbacked(tensor, dim, min=1, max=max_size, shape_id=shape_id)
+
+
+def _batch_inplace_copy(
+    dsts: List[torch.Tensor], srcs: List[torch.Tensor], use_foreach_copy: bool = True
+) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
     def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-        if _has_foreach_copy:
+        if _has_foreach_copy and use_foreach_copy:
             torch._foreach_copy_(dsts, srcs)
         else:
             for dst, src in zip(dsts, srcs):
@@ -288,8 +310,20 @@ class DecodeInputBuffers(ForwardInputBuffers):
         nsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        use_foreach_copy: bool = True,
+        use_forward_batch_shape: bool = False,
+        always_fill_padding: bool = False,
     ):
-        if bs != raw_bs:
+        copy_bs = forward_batch.seq_lens.shape[0] if use_forward_batch_shape else raw_bs
+        copy_num_token = (
+            forward_batch.input_ids.shape[0]
+            if use_forward_batch_shape
+            else raw_num_token
+        )
+
+        # For the compiled path this create redundant work but the kernel itself
+        # will be absorbed by Inductor combo scheduling in a single fused kernel.
+        if always_fill_padding or bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
             # Padded SWA indices left over from a previous replay would point
@@ -305,11 +339,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
-            self.input_ids[:raw_num_token],
-            self.req_pool_indices[:raw_bs],
-            self.seq_lens[:raw_bs],
-            self.out_cache_loc[:raw_num_token],
-            self.positions[:raw_num_token],
+            self.input_ids[:copy_num_token],
+            self.req_pool_indices[:copy_bs],
+            self.seq_lens[:copy_bs],
+            self.out_cache_loc[:copy_num_token],
+            self.positions[:copy_num_token],
         ]
         srcs = [
             forward_batch.input_ids,
@@ -321,10 +355,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
+            self.ngram_embedding_info.column_starts[:copy_bs].copy_(
                 ngram_embedding_info.column_starts
             )
-            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
+            self.ngram_embedding_info.req_lens[:copy_bs].copy_(
                 ngram_embedding_info.req_lens
             )
 
@@ -332,21 +366,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.mamba_track_indices is not None
             and forward_batch.mamba_track_indices is not None
         ):
-            dsts.append(self.mamba_track_indices[:raw_bs])
+            dsts.append(self.mamba_track_indices[:copy_bs])
             srcs.append(forward_batch.mamba_track_indices)
         if (
             self.mamba_track_mask is not None
             and forward_batch.mamba_track_mask is not None
         ):
-            dsts.append(self.mamba_track_mask[:raw_bs])
+            dsts.append(self.mamba_track_mask[:copy_bs])
             srcs.append(forward_batch.mamba_track_mask)
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            dsts.append(self.encoder_lens[:raw_bs])
+            dsts.append(self.encoder_lens[:copy_bs])
             srcs.append(forward_batch.encoder_lens)
 
         if forward_batch.mrope_positions is not None:
-            dsts.append(self.mrope_positions[:, :raw_num_token])
+            dsts.append(self.mrope_positions[:, :copy_num_token])
             srcs.append(forward_batch.mrope_positions)
 
         if require_gathered_buffer:
@@ -379,17 +413,17 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.out_cache_loc_swa is not None
             and forward_batch.out_cache_loc_swa is not None
         ):
-            dsts.append(self.out_cache_loc_swa[:raw_num_token])
-            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
+            dsts.append(self.out_cache_loc_swa[:copy_num_token])
+            srcs.append(forward_batch.out_cache_loc_swa[:copy_num_token])
 
         # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
+        _batch_inplace_copy(dsts, srcs, use_foreach_copy=use_foreach_copy)
 
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
+            if always_fill_padding or bs != raw_bs:
                 self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            self.seq_lens_cpu[:copy_bs].copy_(forward_batch.seq_lens_cpu)
 
 
 # Detect whether the current forward pass is in capture mode
@@ -700,6 +734,7 @@ class CudaGraphRunner:
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        self._can_compile_replay_prepare_cache: Optional[bool] = None
 
         # Capture
         try:
@@ -1177,6 +1212,225 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _get_replay_attn_backend(self):
+        if self.enable_pdmux:
+            return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
+        return self.attn_backend
+
+    def _get_compiled_replay_metadata(self, attn_backend, bs: int):
+        # Fetch metadata before entering torch.compile. If the compiled region
+        # performs metadata lookup/allocation itself, Dynamo sees changing Python
+        # metadata objects and recompiles frequently.
+        replay_metadata = attn_backend.get_cuda_graph_replay_metadata(bs)
+
+        if replay_metadata is None:
+            raise RuntimeError(
+                "Compiled replay prepare requires attention metadata to be exported "
+                f"before entering the compiled region for capture batch size {bs}. "
+                "Without exporting metadata outside torch.compile, Dynamo observes "
+                "changing metadata objects and recompiles frequently."
+            )
+        return replay_metadata
+
+    def _can_compile_replay_prepare(self):
+        if self._can_compile_replay_prepare_cache is not None:
+            return self._can_compile_replay_prepare_cache
+        result = (
+            envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
+            # We need combo scheduling to achieve good perf
+            and hasattr(torch._inductor.config, "combo_kernels")
+            and self._get_replay_attn_backend().supports_compiled_replay_prepare()
+        )
+        self._can_compile_replay_prepare_cache = result
+        return result
+
+    @contextmanager
+    def _compiled_replay_prepare_config_context(self):
+        # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
+        # by capturing them as unbacked symbolic ints in the FX graph. Keep this
+        # scoped to replay-prepare compilation so other Dynamo users are not
+        # affected by the more permissive cache and scalar-output settings.
+        dynamo_patches = {
+            "capture_scalar_outputs": True,
+            "accumulated_cache_size_limit": max(
+                torch._dynamo.config.accumulated_cache_size_limit, 128
+            ),
+        }
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            dynamo_patches["cache_size_limit"] = max(
+                torch._dynamo.config.cache_size_limit, 128
+            )
+        with torch._dynamo.config.patch(dynamo_patches):
+            yield
+
+    def _populate_from_forward_batch_and_init_attn_backend(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        buffers=None,
+        raw_bs: int = 0,
+        raw_num_token: int = 0,
+        bs: int = 0,
+        replay_metadata=None,
+        use_foreach_copy: bool = True,
+        use_forward_batch_shape: bool = False,
+        always_fill_padding: bool = False,
+    ):
+        """Populate input buffers and initialize attention backend metadata."""
+        copy_bs = forward_batch.seq_lens.shape[0] if use_forward_batch_shape else raw_bs
+        copy_num_token = (
+            forward_batch.input_ids.shape[0]
+            if use_forward_batch_shape
+            else raw_num_token
+        )
+        buffers.populate_from_forward_batch(
+            forward_batch=forward_batch,
+            raw_bs=raw_bs,
+            raw_num_token=raw_num_token,
+            bs=bs,
+            seq_len_fill_value=self.seq_len_fill_value,
+            require_gathered_buffer=self.require_gathered_buffer,
+            num_tokens_per_bs=self.num_tokens_per_bs,
+            nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
+            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
+            pp_proxy_tensors=pp_proxy_tensors,
+            use_foreach_copy=use_foreach_copy,
+            use_forward_batch_shape=use_forward_batch_shape,
+            always_fill_padding=always_fill_padding,
+        )
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and forward_batch.input_embeds is not None
+        ):
+            buffers.input_embeds[:copy_num_token].copy_(forward_batch.input_embeds)
+            # Padded tokens aren't read, so skip zeroing them.
+        if self.enable_two_batch_overlap:
+            self.tbo_plugin.replay_prepare(
+                forward_mode=self.capture_forward_mode,
+                bs=bs,
+                num_token_non_padded=copy_num_token,
+                spec_info=forward_batch.spec_info,
+            )
+        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
+            forward_batch.spec_info.custom_mask = buffers.custom_mask
+        # Attention backend
+        attn_backend = self._get_replay_attn_backend()
+        if replay_metadata is None:
+            # FIXME: implicit channel for backends (dsv4) that need forward_batch
+            # in replay metadata prep. Should become a real param on the interface.
+            attn_backend._replay_forward_batch = forward_batch
+            try:
+                attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    buffers.req_pool_indices[:bs],
+                    buffers.seq_lens[:bs],
+                    forward_batch.seq_lens_sum
+                    + (bs - copy_bs) * self.seq_len_fill_value,
+                    buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                    self.capture_forward_mode,
+                    forward_batch.spec_info,
+                    seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+                )
+            finally:
+                attn_backend._replay_forward_batch = None
+        else:
+            attn_backend.init_forward_metadata_replay_cuda_graph_with_metadata(
+                replay_metadata,
+                buffers.req_pool_indices,
+                buffers.seq_lens,
+                forward_batch.seq_lens_sum + (bs - copy_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+
+    @torch.compile(
+        fullgraph=True,
+        dynamic=True,
+        options={
+            "combo_kernels": True,
+            "cpp_wrapper": bool(
+                envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get()
+                and hasattr(torch._inductor.config, "cpp_wrapper")
+            ),
+        },
+    )
+    def _populate_from_forward_batch_and_init_attn_backend_compiled(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        buffers=None,
+        raw_bs: int = 0,
+        raw_num_token: int = 0,
+        bs: int = 0,
+        replay_metadata=None,
+        use_foreach_copy: bool = False,
+    ):
+        """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
+
+        # Inside the compiled helper, derive real batch/token counts from
+        # forward_batch tensor shapes (use_forward_batch_shape=True) instead of raw_bs/raw_num_token.
+        # Those real request sizes vary within the same captured CUDA
+        # graph bucket; using Python ints for them would make Dynamo
+        # specialize and recompile.
+
+        # We also remove the condition bs != raw_bs (always_fill_padding=True) for the same reason.
+        self._populate_from_forward_batch_and_init_attn_backend(
+            forward_batch=forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            buffers=buffers,
+            raw_bs=raw_bs,
+            raw_num_token=raw_num_token,
+            bs=bs,
+            replay_metadata=replay_metadata,
+            use_foreach_copy=use_foreach_copy,
+            use_forward_batch_shape=True,
+            always_fill_padding=True,
+        )
+
+    def _mark_compiled_replay_prepare_dynamic_dims(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+    ) -> None:
+        # Keep unbacked bounds stable across all captured batch sizes. These
+        # bounds are only Dynamo shape metadata and do not allocate larger
+        # tensors. Only NSA decode currently opts into compiled replay prepare,
+        # so mark the tensors that determine copy_bs/copy_num_token and NSA
+        # decode metadata.
+        max_bs = max(self.capture_bs)
+        max_num_token = max_bs * self.num_tokens_per_bs
+
+        _mark_unbacked_dim(
+            forward_batch.input_ids,
+            0,
+            shape_id="replay_num_token",
+            max_size=max_num_token,
+        )
+        _mark_unbacked_dim(
+            forward_batch.out_cache_loc,
+            0,
+            shape_id="replay_num_token",
+            max_size=max_num_token,
+        )
+        _mark_unbacked_dim(
+            forward_batch.positions,
+            0,
+            shape_id="replay_num_token",
+            max_size=max_num_token,
+        )
+        _mark_unbacked_dim(
+            forward_batch.seq_lens, 0, shape_id="replay_bs", max_size=max_bs
+        )
+        _mark_unbacked_dim(
+            forward_batch.req_pool_indices, 0, shape_id="replay_bs", max_size=max_bs
+        )
+        _mark_unbacked_dim(
+            forward_batch.seq_lens_cpu, 0, shape_id="replay_bs", max_size=max_bs
+        )
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -1203,55 +1457,37 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        buffers.populate_from_forward_batch(
-            forward_batch=forward_batch,
-            raw_bs=raw_bs,
-            raw_num_token=raw_num_token,
-            bs=bs,
-            seq_len_fill_value=self.seq_len_fill_value,
-            require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
-            nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-
         if (
-            self.model_runner.spec_algorithm.is_dflash()
-            and self.model_runner.is_draft_worker
-            and forward_batch.input_embeds is not None
+            self.capture_forward_mode.is_decode_or_idle()
+            and self._can_compile_replay_prepare()
         ):
-            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
-            # Padded tokens aren't read, so skip zeroing them.
-        if self.enable_two_batch_overlap:
-            self.tbo_plugin.replay_prepare(
-                forward_mode=self.capture_forward_mode,
-                bs=bs,
-                num_token_non_padded=len(forward_batch.input_ids),
-                spec_info=forward_batch.spec_info,
-            )
-        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
-        # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+            attn_backend = self._get_replay_attn_backend()
+            replay_metadata = self._get_compiled_replay_metadata(attn_backend, bs)
+            # Mark dynamic dims for the compiled path to avoid runtime recompilation
+            # due to metadata changes.
+            self._mark_compiled_replay_prepare_dynamic_dims(forward_batch, bs)
+            with self._compiled_replay_prepare_config_context():
+                self._populate_from_forward_batch_and_init_attn_backend_compiled(
+                    forward_batch=forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    buffers=buffers,
+                    raw_bs=raw_bs,
+                    raw_num_token=raw_num_token,
+                    bs=bs,
+                    replay_metadata=replay_metadata,
+                    use_foreach_copy=False,
+                )
         else:
-            attn_backend = self.attn_backend
-        # FIXME: implicit channel for backends (dsv4) that need forward_batch
-        # in replay metadata prep. Should become a real param on the interface.
-        attn_backend._replay_forward_batch = forward_batch
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
-        attn_backend._replay_forward_batch = None
+            self._populate_from_forward_batch_and_init_attn_backend(
+                forward_batch=forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                buffers=buffers,
+                raw_bs=raw_bs,
+                raw_num_token=raw_num_token,
+                bs=bs,
+                replay_metadata=None,
+                use_foreach_copy=True,
+            )
 
         # Store fields
         self.raw_bs = raw_bs
