@@ -647,19 +647,23 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         all_content = ""
         all_tc_calls = []
 
+        toolcall_chunks = []
         for chunk in chunks:
             r = reasoning_det.parse_streaming_increment(chunk)
             all_reasoning += r.reasoning_text
             if r.normal_text:
-                tc_result = tc_det.parse_streaming_increment(r.normal_text, self.tools)
-                all_content += tc_result.normal_text
-                all_tc_calls.extend(tc_result.calls)
+                toolcall_chunks.append(r.normal_text)
+
+        tool_calls, all_content = _collect_streaming_tool_calls(
+            tc_det, toolcall_chunks, self.tools
+        )
 
         self.assertEqual("Thinking about it...", all_reasoning)
         self.assertEqual("This is a content:", all_content)
-        name_calls = [c for c in all_tc_calls if c.name]
-        self.assertEqual(len(name_calls), 1)
-        self.assertEqual(name_calls[0].name, "get_weather")
+        self.assertEqual(len(tool_calls), 1)
+        first_call = tool_calls.pop()
+        self.assertEqual(first_call["name"], "get_weather")
+        self.assertEqual(first_call["parameters"], '{"city": "London"}')
 
     def test_e2e_normal_think_close_then_content_overlap_tool_call_multi_token(self):
         """Speculative decoding: a single chunk may contain normal text followed
@@ -673,26 +677,147 @@ class TestKimiK2EndToEnd(unittest.TestCase):
             "<think>",
             "Thinking about it...",
             "</think>This is a ",
-            'content.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>',
+            "content:<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>',
         ]
 
         all_reasoning = ""
         all_content = ""
         all_tc_calls = []
+        toolcall_chunks = []
 
         for chunk in chunks:
             r = reasoning_det.parse_streaming_increment(chunk)
             all_reasoning += r.reasoning_text
             if r.normal_text:
-                tc_result = tc_det.parse_streaming_increment(r.normal_text, self.tools)
-                all_content += tc_result.normal_text
-                all_tc_calls.extend(tc_result.calls)
+                toolcall_chunks.append(r.normal_text)
+
+        tool_calls, all_content = _collect_streaming_tool_calls(
+            tc_det, toolcall_chunks, self.tools
+        )
 
         self.assertEqual("Thinking about it...", all_reasoning)
-        self.assertEqual("This is a content.", all_content)
-        name_calls = [c for c in all_tc_calls if c.name]
-        self.assertEqual(len(name_calls), 1)
-        self.assertEqual(name_calls[0].name, "get_weather")
+        self.assertEqual("This is a content:", all_content)
+        self.assertEqual(len(tool_calls), 1)
+        first_call = tool_calls.pop()
+        self.assertEqual(first_call["name"], "get_weather")
+        self.assertEqual(first_call["parameters"], '{"city": "London"}')
+
+    def test_e2e_normal_think_close_then_content_overlap_tool_call_multi_token_multi_calls(
+        self,
+    ):
+        """Speculative decoding: a single chunk may contain normal text followed
+        by tool-call markers and even the tool_call_begin/id. The normal-text
+        prefix must still be emitted (not stripped) by the tool-call parser.
+        """
+        reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
+        tc_det = KimiK2FuncDetector()
+
+        chunks = [
+            "<think>",
+            "Thinking about it...",
+            "</think>This is a ",
+            'content:<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>'
+            '{"city": "Delhi"}<|tool_call_end|><|tool_calls_section_end|>',
+        ]
+
+        all_reasoning = ""
+        all_content = ""
+        all_tc_calls = []
+        toolcall_chunks = []
+
+        for chunk in chunks:
+            r = reasoning_det.parse_streaming_increment(chunk)
+            all_reasoning += r.reasoning_text
+            if r.normal_text:
+                toolcall_chunks.append(r.normal_text)
+
+        tool_calls, all_content = _collect_streaming_tool_calls(
+            tc_det, toolcall_chunks, self.tools
+        )
+
+        self.assertEqual("Thinking about it...", all_reasoning)
+        self.assertEqual("This is a content:", all_content)
+        self.assertEqual(len(tool_calls), 2)
+        first_call = tool_calls.pop(0)
+        self.assertEqual(first_call["name"], "get_weather")
+        self.assertEqual(first_call["parameters"], '{"city": "London"}')
+        second_call = tool_calls.pop(0)
+        self.assertEqual(second_call["name"], "get_weather")
+        self.assertEqual(second_call["parameters"], '{"city": "Delhi"}')
+
+    def test_e2e_chunk_split_invariance(self):
+        """The detector must produce identical results across a few realistic
+        chunking variants. Special tokens (e.g. ``<|tool_calls_section_begin|>``)
+        are atomic and never split, so cuts only fall on token boundaries or
+        inside JSON args.
+        """
+        prefix = "<think>Thinking about it...</think>This is a content:"
+        call1 = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "London"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        call2 = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:1"
+            '<|tool_call_argument_begin|>{"city": "Delhi"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+
+        expected_reasoning = "Thinking about it..."
+        expected_content = "This is a content:"
+        expected_calls = [
+            {"name": "get_weather", "parameters": '{"city": "London"}'},
+            {"name": "get_weather", "parameters": '{"city": "Delhi"}'},
+        ]
+
+        variants = {
+            # One complete tool call per chunk.
+            "first_complete_then_second_complete": [prefix + call1, call2],
+            # Both tool calls arrive in a single chunk.
+            "both_in_one_chunk": [prefix + call1 + call2],
+            # First call complete + second call partial (cut inside JSON args),
+            # then the rest of the second call.
+            "first_complete_second_partial_then_rest": [
+                prefix
+                + call1
+                + "<|tool_calls_section_begin|>"
+                + "<|tool_call_begin|>functions.get_weather:1"
+                + '<|tool_call_argument_begin|>{"city": "De',
+                'lhi"}<|tool_call_end|><|tool_calls_section_end|>',
+            ],
+            # First call partial (cut inside JSON args), then rest of first +
+            # full second call.
+            "first_partial_then_first_complete_second_complete": [
+                prefix
+                + "<|tool_calls_section_begin|>"
+                + "<|tool_call_begin|>functions.get_weather:0"
+                + '<|tool_call_argument_begin|>{"city": "Lon',
+                'don"}<|tool_call_end|><|tool_calls_section_end|>' + call2,
+            ],
+        }
+
+        for name, chunks in variants.items():
+            with self.subTest(variant=name):
+                reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
+                tc_det = KimiK2FuncDetector()
+                all_reasoning = ""
+                toolcall_chunks = []
+                for chunk in chunks:
+                    r = reasoning_det.parse_streaming_increment(chunk)
+                    all_reasoning += r.reasoning_text
+                    if r.normal_text:
+                        toolcall_chunks.append(r.normal_text)
+                tool_calls, all_content = _collect_streaming_tool_calls(
+                    tc_det, toolcall_chunks, self.tools
+                )
+                self.assertEqual(all_reasoning, expected_reasoning)
+                self.assertEqual(all_content, expected_content)
+                self.assertEqual(tool_calls, expected_calls)
 
     def test_e2e_multiple_tool_calls_without_think_close(self):
         """Multiple tool calls inside <think> without </think>."""
