@@ -145,18 +145,6 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
-    args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
-    kernel_class = f"RMSNormKernel<{args}>"
-    return load_jit(
-        make_name("rmsnorm_head"),
-        *args,
-        cuda_files=["deepseek_v4/rmsnorm.cuh"],
-        cuda_wrappers=[("run_self", f"{kernel_class}::run_self")],
-    )
-
-
-@cache_once
 def _jit_fused_rope_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
@@ -962,16 +950,6 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     module = _jit_metadata_module()
     module.run(seq_lens, metadata)
     return metadata
-
-
-def rmsnorm_self(
-    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    if out is None:
-        out = q.new_empty(q.shape)
-    module.run_self(q, out, eps)
-    return out
 
 
 @cache_once
