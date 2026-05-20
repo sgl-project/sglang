@@ -222,6 +222,12 @@ class DiffGenerator:
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
+            # `dataclasses.replace` drops non-field attrs; restore
+            # `_explicit_fields` so InputValidationStage honors user-supplied
+            # width/height, and mark the keys overridden above as explicit.
+            sampling_params._explicit_fields = getattr(
+                sampling_params_orig, "_explicit_fields", set()
+            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
