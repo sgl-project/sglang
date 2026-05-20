@@ -993,7 +993,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.DSA):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend

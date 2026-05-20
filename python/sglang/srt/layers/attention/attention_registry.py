@@ -105,7 +105,7 @@ def create_dsa_backend(runner):
 
 
 @register_attention_backend("nsa")
-def create_nsa_backend(runner):
+def _create_nsa_compat(runner):
     warnings.warn(
         "attention-backend='nsa' is deprecated; use 'dsa' instead. "
         "The alias will be removed in a future release.",

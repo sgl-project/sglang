@@ -971,7 +971,7 @@ class DecodePreallocQueue:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
+                elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)

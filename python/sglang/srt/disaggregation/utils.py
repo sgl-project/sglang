@@ -612,7 +612,7 @@ def setup_state_kv_args(
                 kv_args.total_kv_layers = total_kv_layers
             else:
                 append_state_component(
-                    kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
+                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
     if (
