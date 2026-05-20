@@ -17,8 +17,15 @@ from typing import Optional
 
 import pytest
 import torch
-import triton.testing
 
+from sglang.jit_kernel.benchmark.kv_canary.bench_helpers import (
+    POOL_AXIS,
+    SWA_WINDOW,
+    BenchCase,
+    baseline_us_cumsum,
+    do_bench,
+    select_matrix_cases,
+)
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
@@ -29,28 +36,8 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-_BS_AXIS = [1, 4, 32, 128, 256, 1024]
-_PREFIX_AXIS = [0, 128, 1024, 4096, 10240, 16384]
-_EXTEND_LEN_AXIS = [128, 512, 4096]
-_POOL_AXIS = ["full", "swa_window_128"]
 _TOTAL_TOKENS_AXIS = [256, 4096, 65536, 262144]
 _TOTAL_TOKENS_BS_AXIS = [1, 32, 256]
-_SWA_WINDOW = 128
-
-_QUANTILES = [0.5, 0.2, 0.8]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _BenchCase:
-    bs: int
-    prefix_len: int
-    mode: str
-    extend_len: int
-    pool_kind: str
-
-    @property
-    def case_id(self) -> str:
-        return f"bs{self.bs}_prefix{self.prefix_len}_{self.mode}{self.extend_len}_{self.pool_kind}"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -64,88 +51,13 @@ class _TotalTokensBenchCase:
         return f"tt_bs{self.bs}_total{self.total_tokens}_{self.pool_kind}"
 
 
-def _build_fast_matrix_params() -> list[_BenchCase]:
-    return [
-        _BenchCase(bs=1, prefix_len=0, mode="decode", extend_len=1, pool_kind="full"),
-        _BenchCase(
-            bs=32, prefix_len=4096, mode="extend", extend_len=128, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=256, prefix_len=4096, mode="decode", extend_len=1, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=1024, prefix_len=1024, mode="decode", extend_len=1, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=32, prefix_len=16384, mode="extend", extend_len=4096, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=128,
-            prefix_len=10240,
-            mode="decode",
-            extend_len=1,
-            pool_kind="swa_window_128",
-        ),
-        _BenchCase(
-            bs=1, prefix_len=128, mode="extend", extend_len=128, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=4, prefix_len=1024, mode="extend", extend_len=512, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=128, prefix_len=4096, mode="decode", extend_len=1, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=32, prefix_len=16384, mode="extend", extend_len=16384, pool_kind="full"
-        ),
-        _BenchCase(
-            bs=256,
-            prefix_len=128,
-            mode="decode",
-            extend_len=1,
-            pool_kind="swa_window_128",
-        ),
-        _BenchCase(
-            bs=4,
-            prefix_len=10240,
-            mode="decode",
-            extend_len=1,
-            pool_kind="swa_window_128",
-        ),
-    ]
-
-
-def _build_slow_matrix_params() -> list[_BenchCase]:
-    fast_keys = {c.case_id for c in _build_fast_matrix_params()}
-    slow: list[_BenchCase] = []
-    for bs in _BS_AXIS:
-        for prefix_len in _PREFIX_AXIS:
-            for pool_kind in _POOL_AXIS:
-                for mode_extend in (
-                    ("decode", 1),
-                    *((("extend", e) for e in _EXTEND_LEN_AXIS)),
-                ):
-                    mode, extend_len = mode_extend
-                    case = _BenchCase(
-                        bs=bs,
-                        prefix_len=prefix_len,
-                        mode=mode,
-                        extend_len=extend_len,
-                        pool_kind=pool_kind,
-                    )
-                    if case.case_id in fast_keys:
-                        continue
-                    slow.append(case)
-    return slow
-
-
 def _build_total_tokens_params() -> list[_TotalTokensBenchCase]:
     cases: list[_TotalTokensBenchCase] = []
     for bs in _TOTAL_TOKENS_BS_AXIS:
         for total_tokens in _TOTAL_TOKENS_AXIS:
             if total_tokens < bs:
                 continue
-            for pool_kind in _POOL_AXIS:
+            for pool_kind in POOL_AXIS:
                 cases.append(
                     _TotalTokensBenchCase(
                         bs=bs, total_tokens=total_tokens, pool_kind=pool_kind
@@ -154,22 +66,13 @@ def _build_total_tokens_params() -> list[_TotalTokensBenchCase]:
     return cases
 
 
-def _matrix_params() -> list:
-    fast = [pytest.param(c, id=c.case_id) for c in _build_fast_matrix_params()]
-    slow = [
-        pytest.param(c, id=c.case_id, marks=pytest.mark.slow)
-        for c in _build_slow_matrix_params()
-    ]
-    return fast + slow
-
-
 def _total_tokens_params() -> list:
     return [pytest.param(c, id=c.case_id) for c in _build_total_tokens_params()]
 
 
 def _verify_entry_count(*, bs: int, prefix_len: int, pool_kind: str) -> int:
     if pool_kind == "swa_window_128":
-        per_req = min(prefix_len, _SWA_WINDOW)
+        per_req = min(prefix_len, SWA_WINDOW)
     else:
         per_req = prefix_len
     return bs * per_req
@@ -183,8 +86,8 @@ def _build_plan_inputs(
     pool_kind: str,
     device: torch.device,
 ) -> dict:
-    swa_window_size = _SWA_WINDOW if pool_kind == "swa_window_128" else 0
-    verify_per_req = min(prefix_len, _SWA_WINDOW) if swa_window_size > 0 else prefix_len
+    swa_window_size = SWA_WINDOW if pool_kind == "swa_window_128" else 0
+    verify_per_req = min(prefix_len, SWA_WINDOW) if swa_window_size > 0 else prefix_len
     verify_capacity = max(1, bs * verify_per_req)
     write_req_capacity = max(1, bs)
 
@@ -247,20 +150,6 @@ def _build_plan_inputs(
     )
 
 
-def _do_bench(fn) -> float:
-    ms_median, _, _ = triton.testing.do_bench(fn, quantiles=_QUANTILES)
-    return float(ms_median) * 1000.0
-
-
-def _baseline_us(*, bs: int, device: torch.device) -> float:
-    counts = torch.zeros(max(bs, 1), dtype=torch.int32, device=device)
-
-    def baseline() -> None:
-        torch.cumsum(counts, dim=0)
-
-    return _do_bench(baseline)
-
-
 def _run_plan(inputs: dict) -> None:
     canary_plan_step(
         verify_plan_out=inputs["verify_plan_out"],
@@ -278,7 +167,7 @@ def _run_plan(inputs: dict) -> None:
     )
 
 
-def _run_matrix_case(case: _BenchCase) -> dict:
+def _run_matrix_case(case: BenchCase) -> dict:
     device = torch.device(DEFAULT_DEVICE)
     inputs = _build_plan_inputs(
         bs=case.bs,
@@ -294,8 +183,8 @@ def _run_matrix_case(case: _BenchCase) -> dict:
     fn()
     torch.cuda.synchronize()
 
-    plan_us = _do_bench(fn)
-    baseline_us = _baseline_us(bs=case.bs, device=device)
+    plan_us = do_bench(fn)
+    baseline_us = baseline_us_cumsum(bs=case.bs, device=device)
     total_entries = _verify_entry_count(
         bs=case.bs, prefix_len=case.prefix_len, pool_kind=case.pool_kind
     )
@@ -327,8 +216,8 @@ def _run_total_tokens_case(case: _TotalTokensBenchCase) -> dict:
     fn()
     torch.cuda.synchronize()
 
-    plan_us = _do_bench(fn)
-    baseline_us = _baseline_us(bs=case.bs, device=device)
+    plan_us = do_bench(fn)
+    baseline_us = baseline_us_cumsum(bs=case.bs, device=device)
     total_entries = _verify_entry_count(
         bs=case.bs, prefix_len=per_req_prefix, pool_kind=case.pool_kind
     )
@@ -352,8 +241,8 @@ def _print_header():
     yield
 
 
-@pytest.mark.parametrize("case", _matrix_params())
-def test_bench_plan_matrix(case: _BenchCase) -> None:
+@pytest.mark.parametrize("case", select_matrix_cases())
+def test_bench_plan_matrix(case: BenchCase) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     result = _run_matrix_case(case)
