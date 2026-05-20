@@ -59,9 +59,7 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         cache = make_radix_cache([[], [1, 2], [3, 4]], device=self.device)
         locked_node = next(iter(cache.root_node.children.values()))
         locked_node.lock_ref = 1
-        slots, _, _ = walk_radix_cache_for_canary(
-            radix_cache=cache, unlocked_only=True
-        )
+        slots, _, _ = walk_radix_cache_for_canary(radix_cache=cache, unlocked_only=True)
         self.assertEqual(slots.tolist(), [3, 4])
 
 
