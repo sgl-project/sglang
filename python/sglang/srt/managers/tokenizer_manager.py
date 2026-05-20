@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadsReqOutput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -377,6 +378,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+        try:
+            self.dp_load_update_coalesce_interval = max(
+                0.0,
+                envs.SGLANG_DP_LOAD_UPDATE_COALESCE_INTERVAL_MS.get(),
+            ) / 1000.0
+        except ValueError:
+            self.dp_load_update_coalesce_interval = 0.001
+        self.latest_dp_load_updates: Dict[int, GetLoadsReqOutput] = {}
+        self.dp_load_update_flush_task: Optional[asyncio.Task] = None
+        if self.server_args.dp_size > 1:
+            logger.info(
+                "DP load update coalescing enabled: interval_ms=%.1f",
+                self.dp_load_update_coalesce_interval * 1000.0,
+            )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -1927,8 +1943,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
             and recv_obj.load is not None
         ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+            self.enqueue_dp_load_update(recv_obj.load)
+
+    def enqueue_dp_load_update(self, load: GetLoadsReqOutput):
+        self.latest_dp_load_updates[load.dp_rank] = load
+        if (
+            self.dp_load_update_flush_task is None
+            or self.dp_load_update_flush_task.done()
+        ):
+            task = asyncio.create_task(
+                print_exception_wrapper(self.flush_dp_load_updates_after_delay)
+            )
+            self.dp_load_update_flush_task = task
+            self.asyncio_tasks.add(task)
+            task.add_done_callback(self.asyncio_tasks.discard)
+
+    async def flush_dp_load_updates_after_delay(self):
+        if self.dp_load_update_coalesce_interval > 0:
+            await asyncio.sleep(self.dp_load_update_coalesce_interval)
+        else:
+            await asyncio.sleep(0)
+
+        self.flush_dp_load_updates()
+        self.dp_load_update_flush_task = None
+
+    def flush_dp_load_updates(self):
+        if not self.latest_dp_load_updates:
+            return
+
+        loads = [
+            self.latest_dp_load_updates[dp_rank]
+            for dp_rank in sorted(self.latest_dp_load_updates)
+        ]
+        self.latest_dp_load_updates = {}
+        self.send_to_scheduler.send_pyobj(WatchLoadUpdateReq(loads=loads))
 
     def add_logprob_to_meta_info(
         self,

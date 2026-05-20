@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.data_parallel_controller import DPBudget
+from sglang.srt.managers.data_parallel_controller import DPBudget, LoadBalanceMethod
 from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -54,7 +54,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_requests, [5, 6])
 
     def test_maps_num_total_tokens_not_num_used_tokens(self):
-        # Reads num_total_tokens (used + pending prefill), NOT num_used_tokens.
+        # Reads num_total_tokens (used + queued prefill), NOT num_used_tokens.
         # A silent swap here would break DP balance for long-prompt workloads.
         budget = DPBudget(dp_size=2)
         budget.update_budget(
@@ -85,6 +85,24 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
+
+    def test_dispatch_rotates_ties_and_accounts_dispatched_load(self):
+        budget = DPBudget(dp_size=3)
+
+        self.assertEqual(
+            [budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS) for _ in range(4)],
+            [0, 1, 2, 0],
+        )
+        self.assertEqual(budget.total_requests, [2, 1, 1])
+
+    def test_total_tokens_dispatch_accounts_estimated_tokens(self):
+        budget = DPBudget(dp_size=2)
+
+        self.assertEqual(
+            budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=32), 0
+        )
+        self.assertEqual(budget.total_requests, [1, 0])
+        self.assertEqual(budget.total_tokens, [32, 0])
 
 
 if __name__ == "__main__":
