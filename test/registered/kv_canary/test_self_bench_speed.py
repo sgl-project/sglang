@@ -1,19 +1,3 @@
-"""Canary on/off overhead self-bench.
-
-Launches a Qwen3-0.6B server twice per case — once with the canary disabled,
-once with ``--kv-canary raise`` — and reports steady-state latency for each.
-The overhead percentage is printed to stdout. A sanity assert catches
-catastrophic regressions (> 200% overhead) but is not a perf gate.
-
-2 cases:
-
-- ``test_qwen3_prefill_overhead_bs32_isl16384_osl1``
-- ``test_qwen3_decode_overhead_bs256_isl4096_osl1024``
-
-Both registered to ``extra-a`` (label-gated PR) and ``nightly-1-gpu`` (auto
-nightly).
-"""
-
 from __future__ import annotations
 
 import argparse
