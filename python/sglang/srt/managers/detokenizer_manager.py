@@ -44,6 +44,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -97,7 +98,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         port_args: PortArgs,
     ):
         # Init inter-process communication
-        self.init_ipc_channels(port_args)
+        self.init_ipc_channels(port_args, server_args)
 
         # Init tokenizer
         self.init_tokenizer(server_args)
@@ -108,14 +109,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init dispatcher
         self.init_request_dispatcher()
 
-    def init_ipc_channels(self, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
+        # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
+        # directly via SocketMapping inside multi_http_worker_event_loop, so the
+        # single send_to_tokenizer socket is unused.
+        if server_args.tokenizer_worker_num == 1:
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
     def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
@@ -205,9 +210,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if n == 0:
             return []
 
-        # Empty token spans decode to "" but tokenizer.batch_decode still pays
-        # per-row overhead; under high-concurrency streaming this adds up.
-        # Filter empties out, decode the rest, then scatter back.
+        # Empty token spans decode to "" but tokenizer.batch_decode (and the
+        # slow per-row decode_without_hf_kwargs path) still pays per-row
+        # overhead; under high-concurrency streaming this adds up. Filter
+        # empties out, decode the rest, then scatter back.
         keep_idx: Optional[List[int]] = None
         if not all(ids_list):
             keep_idx = [i for i, ids in enumerate(ids_list) if ids]
@@ -217,32 +223,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             skip_list = [skip_list[i] for i in keep_idx]
             space_list = [space_list[i] for i in keep_idx]
 
-        # fast path: all rows share the same (skip, space) flags.
-        first_skip, first_space = skip_list[0], space_list[0]
-        if all(
-            s == first_skip and sp == first_space
-            for s, sp in zip(skip_list, space_list)
-        ):
-            decoded = self.tokenizer.batch_decode(
-                ids_list,
-                skip_special_tokens=first_skip,
-                spaces_between_special_tokens=first_space,
-            )
+        if not getattr(self.tokenizer, "is_fast", False):
+            decoded = [
+                decode_without_hf_kwargs(self.tokenizer, ids, skip)
+                for ids, skip in zip(ids_list, skip_list)
+            ]
         else:
-            # Group indices by (skip, space) tuple and decode each group.
-            groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
-            for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
-                groups[(skip, space)].append(idx)
-
-            decoded = [""] * len(ids_list)
-            for (skip, space), indices in groups.items():
-                group_decoded = self.tokenizer.batch_decode(
-                    [ids_list[idx] for idx in indices],
-                    skip_special_tokens=skip,
-                    spaces_between_special_tokens=space,
+            # fast path: all rows share the same (skip, space) flags.
+            first_skip, first_space = skip_list[0], space_list[0]
+            if all(
+                s == first_skip and sp == first_space
+                for s, sp in zip(skip_list, space_list)
+            ):
+                decoded = self.tokenizer.batch_decode(
+                    ids_list,
+                    skip_special_tokens=first_skip,
+                    spaces_between_special_tokens=first_space,
                 )
-                for idx, text in zip(indices, group_decoded):
-                    decoded[idx] = text
+            else:
+                # Group indices by (skip, space) tuple and decode each group.
+                groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
+                for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
+                    groups[(skip, space)].append(idx)
+
+                decoded = [""] * len(ids_list)
+                for (skip, space), indices in groups.items():
+                    group_decoded = self.tokenizer.batch_decode(
+                        [ids_list[idx] for idx in indices],
+                        skip_special_tokens=skip,
+                        spaces_between_special_tokens=space,
+                    )
+                    for idx, text in zip(indices, group_decoded):
+                        decoded[idx] = text
 
         if keep_idx is None:
             return decoded

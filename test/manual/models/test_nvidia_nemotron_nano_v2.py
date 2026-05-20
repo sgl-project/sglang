@@ -1,11 +1,8 @@
 import unittest
 
 from sglang.srt.utils import is_blackwell
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-
-register_cuda_ci(est_time=249, suite="stage-b-test-2-gpu-large")
 
 
 class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):

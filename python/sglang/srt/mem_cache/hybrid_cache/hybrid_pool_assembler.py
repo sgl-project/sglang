@@ -283,7 +283,8 @@ def build_deepseek_v4_hicache_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_num = len(kvcache.compression_ratios)
+    # TODO(hzh0425): Support PP for deepseek v4 with hicache
+    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
     swa_layer_mapping = {
         layer_id: layer_id for layer_id in range(len(kvcache.swa_kv_pool.kv_buffer))
@@ -293,7 +294,9 @@ def build_deepseek_v4_hicache_stack(
     c128_layer_mapping = {}
     c4_state_global_layers = []
     c128_state_global_layers = []
-    for layer_id, layer_item in enumerate(kvcache.layer_mapping):
+    for layer_id, layer_item in enumerate(
+        kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
+    ):
         if layer_item.compress_ratio == 4:
             c4_layer_mapping[layer_id] = layer_item.compress_layer_id
             c4_state_global_layers.append(layer_id)
@@ -322,6 +325,7 @@ def build_deepseek_v4_hicache_stack(
         item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
         num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
+        layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -354,6 +358,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
@@ -365,6 +370,7 @@ def build_deepseek_v4_hicache_stack(
             ),
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -375,6 +381,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -385,6 +392,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
@@ -427,6 +435,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
@@ -437,6 +446,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
@@ -730,7 +740,7 @@ def attach_hybrid_pool_to_unified_cache(
                             indices_from_pool=indices_from_pool,
                         )
                     )
-            transfer_layer_num = len(kvcache.compression_ratios)
+            transfer_layer_num = kvcache.end_layer - kvcache.start_layer
         elif mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
