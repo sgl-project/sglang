@@ -178,9 +178,12 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
-    _MQA_LOGITS_FREE_MEM_FRACTION = 0.5
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+
+    @staticmethod
+    def _mqa_logits_free_mem_fraction() -> float:
+        return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
     def __init__(
         self,
@@ -559,6 +562,7 @@ class Indexer(MultiPlatformOp):
         return topk_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
+        free_mem_fraction = self._mqa_logits_free_mem_fraction()
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
             return cached_budget
@@ -572,7 +576,7 @@ class Indexer(MultiPlatformOp):
         else:
             static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
             static_budget = min(
-                int(static_free_mem * self._MQA_LOGITS_FREE_MEM_FRACTION),
+                int(static_free_mem * free_mem_fraction),
                 total_mem_budget,
             )
         static_budget = max(1, static_budget)
@@ -587,9 +591,7 @@ class Indexer(MultiPlatformOp):
         # torch.cuda.mem_get_info synchronizes the host, so cache the result,
         # capped by the workload-independent serving-memory headroom.
         free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget_bytes = min(
-            int(free_mem * self._MQA_LOGITS_FREE_MEM_FRACTION), static_budget
-        )
+        budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
         budget_bytes = max(1, budget_bytes)
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
