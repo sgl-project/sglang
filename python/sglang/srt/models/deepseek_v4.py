@@ -1113,7 +1113,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
-        get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
+        get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {

@@ -256,15 +256,15 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
-        self.is_nsa = False
+        self.is_dsa = False
 
-    def init_context(self, q_lora_rank, is_nsa):
-        self.is_nsa = is_nsa
+    def init_context(self, q_lora_rank, is_dsa):
+        self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_nsa
+            and not is_dsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -554,7 +554,7 @@ class LayerCommunicator:
                         # When DSA is active, also preserve the unquantized bf16
                         # output as a 3-tuple (fp8, scale, bf16) so the DSA
                         # indexer can skip redundant FP8 dequantization.
-                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
                         hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -565,9 +565,9 @@ class LayerCommunicator:
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
-                            output_unquantized_inp1=_nsa_needs_bf16,
+                            output_unquantized_inp1=_dsa_needs_bf16,
                         )
-                        if _nsa_needs_bf16:
+                        if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
@@ -598,7 +598,7 @@ class LayerCommunicator:
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
                         # with residual addition. When DSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
-                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
                         hidden_states, _unq_bf16, _, residual = (
                             fused_rms_fp8_group_quant(
                                 hidden_states,
@@ -610,10 +610,10 @@ class LayerCommunicator:
                                 group_size=128,
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
-                                output_unquantized_inp1=_nsa_needs_bf16,
+                                output_unquantized_inp1=_dsa_needs_bf16,
                             )
                         )
-                        if _nsa_needs_bf16:
+                        if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
