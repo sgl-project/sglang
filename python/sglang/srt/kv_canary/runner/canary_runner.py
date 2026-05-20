@@ -114,8 +114,6 @@ class CanaryRunner:
             else None
         )
 
-        self._in_forward_pass: bool = False
-
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
             device=device,
@@ -202,11 +200,9 @@ class CanaryRunner:
         same way the model itself is.
         """
         self._before_forward(forward_batch)
-        self._in_forward_pass = True
         try:
             yield
         finally:
-            self._in_forward_pass = False
             self._end_of_step()
 
     def _before_forward(self, forward_batch: "ForwardBatch") -> None:
@@ -215,20 +211,11 @@ class CanaryRunner:
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
         ``model.forward`` - kernels here are captured into the cuda graph.
-
-        Skip when no host-side prep has happened (e.g. torch.compile warmup invokes
-        model.forward directly, bypassing ModelRunner.forward and therefore
-        ``with_forward_pass``). Without prep, the plan/expected-input buffers are
-        uninitialised and would yield OOB slot writes that corrupt adjacent memory.
         """
-        if not self._in_forward_pass:
-            return
         self._per_forward_orchestrator.launch_head_kernels(forward_batch)
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
-        if not self._in_forward_pass:
-            return
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
     def _end_of_step(self) -> None:
