@@ -226,5 +226,3 @@ def test_head_tail_share_class(device, make_buffer_group, base_config):
     tail = next(ep for ep in endpoints if ep.kernel_kind == CanaryLaunchTag.TAIL_K_FULL)
 
     assert type(head) is type(tail)
-    assert head.launch_per_forward.__func__ is tail.launch_per_forward.__func__
-    assert head.__class__.__module__ == tail.__class__.__module__

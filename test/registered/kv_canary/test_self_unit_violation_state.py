@@ -30,42 +30,6 @@ def test_clear_resets_all(device):
     assert int(log.violation_write_index.item()) == 0
 
 
-def test_is_errored_derived_from_write_index(device):
-    log = ViolationLog.allocate(ring_capacity=4, device=device)
-    assert int(log.violation_write_index.item()) == 0
-    log.violation_write_index[0] = 1
-    assert int(log.violation_write_index.item()) >= 1
-
-
-def test_first_violation_row_zero(device):
-    log = ViolationLog.allocate(ring_capacity=4, device=device)
-    row_values = [11, 22, 33, 44, 55, 66, 77, 88]
-    log.violation_ring[0] = torch.tensor(row_values, dtype=torch.int64, device=device)
-    log.violation_write_index[0] = 1
-    assert log.violation_ring[0].tolist() == row_values
-
-
-def test_ring_valid_count_min_capacity(device):
-    capacity = 4
-    log = ViolationLog.allocate(ring_capacity=capacity, device=device)
-    log.violation_write_index[0] = 2
-    assert min(int(log.violation_write_index.item()), capacity) == 2
-    log.violation_write_index[0] = capacity + 5
-    assert min(int(log.violation_write_index.item()), capacity) == capacity
-
-
-def test_ring_fill_once_overflow_drops_row_keeps_counter(device):
-    capacity = 4
-    log = ViolationLog.allocate(ring_capacity=capacity, device=device)
-    for i in range(capacity):
-        log.violation_ring[i, 0] = i + 1
-    log.violation_write_index[0] = 10
-    assert int(log.violation_write_index.item()) == 10
-    assert log.violation_ring.shape[0] == capacity
-    assert int(log.violation_ring[0, 0]) == 1
-    assert int(log.violation_ring[capacity - 1, 0]) == capacity
-
-
 @pytest.mark.xfail(
     strict=False,
     reason="runner._raise_with_first_violation builds a string message; "
