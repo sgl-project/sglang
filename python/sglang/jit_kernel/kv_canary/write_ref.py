@@ -9,6 +9,9 @@ a violation but the chain still advances on the actual values.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
@@ -46,6 +49,19 @@ _FIELD_PREV_HASH: int = 2
 _FIELD_REAL_KV_HASH: int = 3
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WriteEntries:
+    write_offsets: torch.Tensor
+    seed_slot_indices: torch.Tensor
+    slot_indices_all: torch.Tensor
+    tokens_all: torch.Tensor
+    positions_all: torch.Tensor
+    real_kv_hashes_all: torch.Tensor
+    pseudo_mismatch_bits: torch.Tensor
+    active_reqs: int
+    total_entries: int
+
+
 def canary_write_step_torch_reference(
     *,
     canary_buf: torch.Tensor,
@@ -71,15 +87,73 @@ def canary_write_step_torch_reference(
     fields. Violations are emitted in (req, j) order so the CUDA kernel can match by sorting its atomic-order
     outputs.
     """
+    work_device = torch.device("cpu")
+
+    kernel_run_counter.add_(1)
+    entries = _load_active_write_entries(
+        plan=plan,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=pseudo_mode,
+        pseudo_expected_tokens=pseudo_expected_tokens,
+        pseudo_expected_positions=pseudo_expected_positions,
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+        work_device=work_device,
+    )
+    if entries is None:
+        return
+
+    buf_i64, initial_chain_hashes, slot_stride_i64 = _compute_initial_chain_hashes(
+        canary_buf=canary_buf,
+        seed_slot_indices=entries.seed_slot_indices,
+        work_device=work_device,
+    )
+
+    violation_rows, total_slots_written = _run_chain_loop(
+        buf_i64=buf_i64,
+        entries=entries,
+        initial_chain_hashes=initial_chain_hashes,
+        kernel_kind=kernel_kind,
+        pseudo_expected_tokens=pseudo_expected_tokens,
+        pseudo_expected_positions=pseudo_expected_positions,
+    )
+
+    canary_buf.view(torch.int64).copy_(
+        buf_i64.to(canary_buf.device).view(canary_buf.shape[0], slot_stride_i64)
+    )
+
+    slot_run_counter.add_(total_slots_written)
+
+    _emit_write_violations(
+        violation_rows=violation_rows,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        work_device=work_device,
+    )
+
+
+def _load_active_write_entries(
+    *,
+    plan: WritePlan,
+    fb_input_ids: torch.Tensor,
+    fb_positions: torch.Tensor,
+    fb_out_cache_loc: torch.Tensor,
+    pseudo_mode: CanaryPseudoMode,
+    pseudo_expected_tokens: torch.Tensor,
+    pseudo_expected_positions: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: RealKvHashMode,
+    work_device: torch.device,
+) -> Optional[WriteEntries]:
     num_valid_reqs = int(plan.write_num_valid_reqs.detach().to("cpu").item())
     req_capacity = int(plan.write_seed_slot_indices.shape[0])
     active_reqs = max(0, min(num_valid_reqs, req_capacity))
 
-    kernel_run_counter.add_(1)
     if active_reqs <= 0:
-        return
+        return None
 
-    work_device = torch.device("cpu")
     write_offsets = plan.write_offsets.detach().to(
         device=work_device, dtype=torch.int64
     )
@@ -94,14 +168,13 @@ def canary_write_step_torch_reference(
 
     total_entries = int(write_offsets[active_reqs].item())
     if total_entries <= 0:
-        return
+        return None
 
     slot_indices_all = fb_out_cache_loc_host[:total_entries].clone()
 
     tokens_all = fb_input_ids_host[:total_entries]
     positions_all = fb_positions_host[:total_entries]
 
-    # Pre-compute real_kv_hash per write entry vectorised. The chain loop will pick the value up by index.
     real_kv_hashes_all = _compute_real_kv_hash_vec(
         slot_indices=slot_indices_all,
         real_kv_sources=real_kv_sources,
@@ -109,7 +182,6 @@ def canary_write_step_torch_reference(
         work_device=work_device,
     )
 
-    # Pseudo-mode mismatches per entry (only used when pseudo_mode == ON).
     pseudo_mismatch_bits = _compute_pseudo_mismatch_bits(
         pseudo_mode=pseudo_mode,
         tokens_all=tokens_all,
@@ -120,6 +192,25 @@ def canary_write_step_torch_reference(
         work_device=work_device,
     )
 
+    return WriteEntries(
+        write_offsets=write_offsets,
+        seed_slot_indices=seed_slot_indices,
+        slot_indices_all=slot_indices_all,
+        tokens_all=tokens_all,
+        positions_all=positions_all,
+        real_kv_hashes_all=real_kv_hashes_all,
+        pseudo_mismatch_bits=pseudo_mismatch_bits,
+        active_reqs=active_reqs,
+        total_entries=total_entries,
+    )
+
+
+def _compute_initial_chain_hashes(
+    *,
+    canary_buf: torch.Tensor,
+    seed_slot_indices: torch.Tensor,
+    work_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     buf_i64 = (
         canary_buf.detach()
         .to(device=work_device)
@@ -135,8 +226,6 @@ def canary_write_step_torch_reference(
 
     chain_anchor_signed = _to_signed_int64(_splitmix64_python(CANARY_CHAIN_ANCHOR))
 
-    # Vectorised seed-slot prev_hash gather. For seed < 0 use the chain anchor; else load the seed slot's 4
-    # fields and splitmix64-mix4 them.
     seed_is_anchor = seed_slot_indices < 0
     safe_seed = torch.where(
         seed_is_anchor, torch.zeros_like(seed_slot_indices), seed_slot_indices
@@ -154,12 +243,24 @@ def canary_write_step_torch_reference(
         initial_chain_from_seed,
     )
 
+    return buf_i64, initial_chain_hashes, slot_stride_i64
+
+
+def _run_chain_loop(
+    *,
+    buf_i64: torch.Tensor,
+    entries: WriteEntries,
+    initial_chain_hashes: torch.Tensor,
+    kernel_kind: CanaryLaunchTag,
+    pseudo_expected_tokens: torch.Tensor,
+    pseudo_expected_positions: torch.Tensor,
+) -> tuple[list[list[int]], int]:
     violation_rows: list[list[int]] = []
     total_slots_written = 0
 
-    for r in range(active_reqs):
-        entry_start = int(write_offsets[r].item())
-        entry_end = int(write_offsets[r + 1].item())
+    for r in range(entries.active_reqs):
+        entry_start = int(entries.write_offsets[r].item())
+        entry_end = int(entries.write_offsets[r + 1].item())
         entry_count = entry_end - entry_start
         if entry_count <= 0:
             continue
@@ -168,15 +269,15 @@ def canary_write_step_torch_reference(
 
         for j in range(entry_count):
             i = entry_start + j
-            slot = int(slot_indices_all[i].item())
+            slot = int(entries.slot_indices_all[i].item())
             if slot < 0:
                 continue
-            token = int(tokens_all[i].item())
-            position = int(positions_all[i].item())
-            real_kv_hash_signed = int(real_kv_hashes_all[i].item())
+            token = int(entries.tokens_all[i].item())
+            position = int(entries.positions_all[i].item())
+            real_kv_hash_signed = int(entries.real_kv_hashes_all[i].item())
             real_kv_hash_u64 = real_kv_hash_signed & ((1 << 64) - 1)
 
-            mismatch_bits = int(pseudo_mismatch_bits[i].item())
+            mismatch_bits = int(entries.pseudo_mismatch_bits[i].item())
             if mismatch_bits != 0:
                 violation_rows.append(
                     _build_pseudo_violation_row(
@@ -207,12 +308,16 @@ def canary_write_step_torch_reference(
 
             total_slots_written += 1
 
-    canary_buf.view(torch.int64).copy_(
-        buf_i64.to(canary_buf.device).view(canary_buf.shape[0], slot_stride_i64)
-    )
+    return violation_rows, total_slots_written
 
-    slot_run_counter.add_(total_slots_written)
 
+def _emit_write_violations(
+    *,
+    violation_rows: list[list[int]],
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    work_device: torch.device,
+) -> None:
     if len(violation_rows) == 0:
         return
 
