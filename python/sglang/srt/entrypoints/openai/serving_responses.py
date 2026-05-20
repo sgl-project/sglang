@@ -59,6 +59,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -616,6 +617,37 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
+
+        # Extract function tool calls from the assistant text. Mirrors the
+        # FunctionCallParser path in OpenAIServingChat._process_tool_calls so
+        # /v1/responses surfaces native tool-call output as
+        # ResponseFunctionToolCall items instead of leaking the raw markup
+        # back to the client as plain text.
+        chat_tools = self._response_tools_to_chat_tools(request)
+        if (
+            content
+            and chat_tools
+            and self.tool_call_parser
+            and request.tool_choice != "none"
+        ):
+            parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+            if parser.has_tool_call(content):
+                try:
+                    content, call_info_list = parser.parse_non_stream(content)
+                    for call_info in call_info_list:
+                        output_items.append(
+                            ResponseFunctionToolCall(
+                                arguments=call_info.parameters or "",
+                                call_id=f"call_{random_uuid()[:24]}",
+                                type="function_call",
+                                name=call_info.name,
+                                id=f"fc_{random_uuid()[:8]}",
+                                status="completed",
+                            )
+                        )
+                except Exception as e:
+                    logger.error("Tool call parsing error: %s", e)
+
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -759,9 +791,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "content": message.get("output", ""),
             }
         if msg_type not in (None, "message"):
-            raise ValueError(
-                f"Unsupported Responses API input item type: {msg_type!r}"
-            )
+            raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 
         content = message.get("content")
         if not isinstance(content, list):

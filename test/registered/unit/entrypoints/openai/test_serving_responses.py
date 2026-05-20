@@ -22,7 +22,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -461,6 +461,93 @@ class ServingResponsesTestCase(unittest.TestCase):
             tool_call_constraint=("structural_tag", _FakeStructuralTag()),
         )
         self.assertEqual(params["structural_tag"], '{"type": "structural_tag"}')
+
+    def test_function_tool_call_output_items_extracted_via_parser(self):
+        """Tool-call text in the assistant output must surface as
+        ResponseFunctionToolCall items, not leak through as raw markup."""
+        from openai.types.responses.response_function_tool_call import (
+            ResponseFunctionToolCall,
+        )
+
+        from sglang.srt.function_call.core_types import ToolCallItem
+
+        serving = _make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+
+        request = ResponsesRequest(
+            model="x",
+            input="weather?",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        fake_call = ToolCallItem(
+            tool_index=0,
+            name="get_weather",
+            parameters='{"city": "Beijing"}',
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+        ) as parser_cls:
+            instance = parser_cls.return_value
+            instance.has_tool_call.return_value = True
+            instance.parse_non_stream.return_value = (
+                "trailing text",
+                [fake_call],
+            )
+            output_items = serving._make_response_output_items(
+                request, "raw model output with <tool_call>", tokenizer=Mock()
+            )
+
+        tool_calls = [
+            item for item in output_items if isinstance(item, ResponseFunctionToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "get_weather")
+        self.assertEqual(tool_calls[0].arguments, '{"city": "Beijing"}')
+
+        message_items = [
+            item for item in output_items if isinstance(item, ResponseOutputMessage)
+        ]
+        self.assertEqual(len(message_items), 1)
+        self.assertEqual(message_items[0].content[0].text, "trailing text")
+
+    def test_no_tool_call_extraction_when_tool_choice_none(self):
+        serving = _make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            tool_choice="none",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+        ) as parser_cls:
+            output_items = serving._make_response_output_items(
+                request, "just a plain answer", tokenizer=Mock()
+            )
+            parser_cls.assert_not_called()
+
+        self.assertEqual(len(output_items), 1)
+        self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
 
 if __name__ == "__main__":
