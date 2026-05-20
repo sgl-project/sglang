@@ -112,6 +112,7 @@ and any non-literal value crashes with `ReferenceError`.
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). |
 | `dockerImages` | `{[hwId]: string}` | Per-hw image name for `docker run` framing. Falls back to `lmsysorg/sglang:dev` if missing. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
+| `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the value that matches the `model` dropdown in your issue template so it's pre-selected when the issue opens. |
 
 ### 2.2 Author the 5-dim matrix (`cells[]`)
 
