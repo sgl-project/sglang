@@ -3232,11 +3232,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        # Keep num_token_non_padded in the same (DP-local, pre-padding)
+        # semantics as num_token_non_padded_cpu. DP-attention model paths run
+        # attention/Mamba on TP-attn-full replicated local rows and gather only
+        # at the MLP/MoE boundary; slicing this scalar by attention TP rank makes
+        # TP rank 1 see zero real tokens for bs=1 decode under tp=8,dp=4.
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
+            and not self.server_args.enable_dp_attention
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(

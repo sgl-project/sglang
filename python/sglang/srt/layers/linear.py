@@ -1537,8 +1537,41 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
+        emulate_global_tp_chunks = 1
+        if (
+            getattr(self, "emulate_global_tp_chunks", False)
+            and self.quant_method.__class__.__name__ == "UnquantizedLinearMethod"
+        ):
+            global_tp_size = get_tensor_model_parallel_world_size()
+            if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:
+                emulate_global_tp_chunks = global_tp_size // self.tp_size
+
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if emulate_global_tp_chunks > 1:
+                input_chunks = input_parallel.tensor_split(
+                    emulate_global_tp_chunks, dim=-1
+                )
+                weight_chunks = self.weight.tensor_split(
+                    emulate_global_tp_chunks, dim=1
+                )
+                output_parallel = torch.nn.functional.linear(
+                    input_chunks[0],
+                    weight_chunks[0],
+                    bias_,
+                )
+                output_dtype = output_parallel.dtype
+                output_parallel = output_parallel.float()
+                for input_chunk, weight_chunk in zip(
+                    input_chunks[1:], weight_chunks[1:]
+                ):
+                    output_parallel = output_parallel + torch.nn.functional.linear(
+                        input_chunk,
+                        weight_chunk,
+                        None,
+                    ).float()
+                output_parallel = output_parallel.to(output_dtype)
+            else:
+                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:

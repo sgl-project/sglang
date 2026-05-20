@@ -580,13 +580,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
-            ret.original_global_num_tokens_cpu = batch.global_num_tokens
-            ret.global_num_tokens_cpu = global_num_tokens
+            ret.original_global_num_tokens_cpu = list(batch.global_num_tokens)
+            ret.global_num_tokens_cpu = list(global_num_tokens)
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_cpu = list(global_num_tokens_for_logprob)
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
@@ -901,7 +901,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
-        global_num_tokens = self.global_num_tokens_cpu
+        setattr(self, "_original_batch_size", self.batch_size)
+        self.original_global_num_tokens_cpu = list(self.original_global_num_tokens_cpu)
+        self.global_num_tokens_for_logprob_cpu = list(self.global_num_tokens_for_logprob_cpu)
+        global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
 
@@ -959,11 +962,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_start_loc = torch.arange(
                     bs, dtype=torch.int32, device=self.seq_lens.device
                 )
-                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
+                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
-                setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
