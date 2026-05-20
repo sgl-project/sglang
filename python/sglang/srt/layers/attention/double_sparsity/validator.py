@@ -152,14 +152,11 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                     "indexer interface (DEC-6 / DEC-10)."
                 )
 
-    # Channel-mask file existence + content-hash verification.
-    if not os.path.isfile(config.channel_mask_path):
-        raise FileNotFoundError(
-            f"channel mask file required by Double Sparsity not found at "
-            f"{config.channel_mask_path!r}. Produce it via "
-            "'python -m sglang.srt.layers.attention.double_sparsity.calibrate' "
-            "or point --double-sparsity-config['channel_mask_path'] at a valid file."
-        )
+    # Channel-mask file existence + content-hash verification. The loader
+    # raises DoubleSparsityChannelMaskMissing for absent files and
+    # DoubleSparsityChannelMaskCorrupt for hash mismatch, schema drift,
+    # dtype mismatch, NaN / +/-Inf / all-zero per-row weights. Both are
+    # typed so operators get a stable error class at boot.
     from sglang.srt.layers.attention.double_sparsity.channel_mask import (
         load_channel_mask,
     )

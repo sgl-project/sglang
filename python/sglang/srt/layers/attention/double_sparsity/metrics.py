@@ -205,51 +205,95 @@ DS_ERROR_CLASSES = (
 )
 
 
-def record_error(cls: str, *, message: str = "", request_id: str = "") -> None:
+_DS_ERRORS_COUNTER = None
+
+
+def record_error(
+    cls: str,
+    *,
+    message: str = "",
+    request_id: str = "",
+    layer_id: Optional[int] = None,
+    selector_id: Optional[str] = None,
+) -> None:
     """Record a DS production failure.
 
-    Increments the Prometheus counter `sglang_double_sparsity_errors_total{cls}`
-    (best-effort; silent when `prometheus_client` is unavailable) and emits a
-    WARNING-level structured log line so operators see the failure class,
-    request_id, and message.
-
-    Raises:
-        ValueError: when `cls` is not one of `DS_ERROR_CLASSES`. Callers
-        must use the named classes to keep the label set bounded.
+    Increments `sglang_double_sparsity_errors_total{cls}` (best-effort
+    with `prometheus_client`) and emits a WARNING-level structured log
+    line. `layer_id` and `selector_id` are surfaced both in the log
+    message and as structured ``extra`` fields so operators can filter.
     """
     if cls not in DS_ERROR_CLASSES:
         raise ValueError(
             f"Unknown DS error class {cls!r}; must be one of {DS_ERROR_CLASSES!r}."
         )
+    global _DS_ERRORS_COUNTER
     try:
         from prometheus_client import Counter as _Counter
-        global _DS_ERRORS_COUNTER
-        try:
-            counter = _DS_ERRORS_COUNTER
-        except NameError:
-            counter = None
-        if counter is None:
+        if _DS_ERRORS_COUNTER is None:
             try:
-                counter = _Counter(
+                _DS_ERRORS_COUNTER = _Counter(
                     "sglang_double_sparsity_errors_total",
                     "Double Sparsity production failures by class.",
                     ["cls"],
                 )
-                _DS_ERRORS_COUNTER = counter
             except ValueError:
-                # Already registered in another import path.
-                counter = None
-        if counter is not None:
-            counter.labels(cls=cls).inc()
+                _DS_ERRORS_COUNTER = None
+        if _DS_ERRORS_COUNTER is not None:
+            _DS_ERRORS_COUNTER.labels(cls=cls).inc()
     except ImportError:
         pass
 
     import logging as _logging
     _logger = _logging.getLogger(__name__)
     _logger.warning(
-        "double_sparsity error cls=%s request_id=%s message=%s",
+        "double_sparsity error cls=%s request_id=%s layer_id=%s selector_id=%s message=%s",
         cls,
         request_id,
+        layer_id if layer_id is not None else "",
+        selector_id if selector_id is not None else "",
         message,
+        extra={
+            "ds_error_cls": cls,
+            "ds_request_id": request_id,
+            "ds_layer_id": layer_id,
+            "ds_selector_id": selector_id,
+        },
     )
+
+
+_TYPED_EXC_TO_CLASS = None
+
+
+def _resolve_typed_exc_to_class():
+    global _TYPED_EXC_TO_CLASS
+    if _TYPED_EXC_TO_CLASS is not None:
+        return _TYPED_EXC_TO_CLASS
+    from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+        DoubleSparsityChannelMaskCorrupt,
+        DoubleSparsityChannelMaskMissing,
+    )
+    from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+        DSAdapterError,
+    )
+    from sglang.srt.layers.attention.double_sparsity.selector import (
+        DoubleSparsityTPMisconfigured,
+    )
+
+    _TYPED_EXC_TO_CLASS = (
+        (DoubleSparsityChannelMaskMissing, "bad_mask"),
+        (DoubleSparsityChannelMaskCorrupt, "bad_mask"),
+        (DSAdapterError, "bad_adapter_input"),
+        (DoubleSparsityTPMisconfigured, "rank_mismatch"),
+    )
+    return _TYPED_EXC_TO_CLASS
+
+
+def classify_ds_exception(exc: BaseException) -> str:
+    """Map a DS typed exception to one of `DS_ERROR_CLASSES`. Unknown
+    exceptions fall through to ``"selector_runtime_error"``."""
+    for exc_cls, label in _resolve_typed_exc_to_class():
+        if isinstance(exc, exc_cls):
+            return label
+    return "selector_runtime_error"
 

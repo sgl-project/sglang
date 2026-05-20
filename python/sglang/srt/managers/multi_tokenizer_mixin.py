@@ -216,6 +216,9 @@ def _handle_output_by_index(output, i):
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
+            per_request_summary=_extract_field_by_index(
+                output, "per_request_summary", i, check_length=False
+            ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
         )
     elif isinstance(output, BatchEmbeddingOutput):
@@ -296,6 +299,9 @@ def _handle_output_by_index(output, i):
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
+            ),
+            per_request_summary=_extract_field_by_index(
+                output, "per_request_summary", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,

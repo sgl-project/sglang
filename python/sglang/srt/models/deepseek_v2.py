@@ -1474,6 +1474,13 @@ class DeepseekV2AttentionMLA(
                     head_dim=self.qk_head_dim,
                 )
                 self.use_double_sparsity = True
+                self._bind_double_sparsity_runtime_data(
+                    server_args=_global_server_args,
+                    ds_parsed=ds_parsed,
+                    config=config,
+                    attn_tp_rank=attn_tp_rank,
+                    attn_tp_size=attn_tp_size,
+                )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1758,6 +1765,103 @@ class DeepseekV2AttentionMLA(
         else:
             raise NotImplementedError
 
+    def _bind_double_sparsity_runtime_data(
+        self,
+        *,
+        server_args,
+        ds_parsed,
+        config,
+        attn_tp_rank: int,
+        attn_tp_size: int,
+    ) -> None:
+        """Wire the DS selector out of placeholder mode at attention init.
+
+        Reads the validator-loaded channel mask off ``server_args``,
+        slices it for this rank's heads, allocates a shared per-model
+        PageSignatureTable on first use, calls
+        ``bind_runtime_data`` exactly once, and runs the TP-misconfig
+        fail-fast check. After this method returns, the selector reports
+        ``IS_PLACEHOLDER == False``.
+        """
+        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            slice_per_rank,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selector import (
+            assert_tp_configured,
+        )
+
+        full_mask = getattr(server_args, "_double_sparsity_channel_mask", None)
+        if full_mask is None:
+            # The validator loads the mask before attention construction; if it
+            # is missing the validator should have raised. Surface as a typed
+            # error class for consistency with the other AC-1 cases.
+            raise RuntimeError(
+                "Double Sparsity attention init: server_args has no "
+                "_double_sparsity_channel_mask. validate_double_sparsity must "
+                "run before model construction."
+            )
+
+        # Per-rank head slice of the calibrated mask. Production safe even at
+        # attn_tp_size == 1 because slice_per_rank accepts tp_size=1.
+        local_mask = slice_per_rank(
+            full_mask,
+            num_local_heads=self.num_local_heads,
+            rank=attn_tp_rank,
+            tp_size=max(attn_tp_size, 1),
+        )
+
+        # Shared per-rank PageSignatureTable: one allocator-owned object
+        # across all DS attention layers in the same model+rank. Stored on
+        # server_args so the second layer's init reuses it.
+        table = getattr(server_args, "_double_sparsity_page_signature_table", None)
+        if table is None:
+            num_layers_local = int(getattr(config, "num_hidden_layers", 1))
+            max_pages = int(getattr(ds_parsed, "device_buffer_size", 4096))
+            label_dim = int(local_mask.label_dim)
+            page_size = int(ds_parsed.page_size)
+            try:
+                table = allocate_page_signature_table(
+                    num_layers_local=num_layers_local,
+                    max_pages=max_pages,
+                    num_heads_local=self.num_local_heads,
+                    label_dim=label_dim,
+                    page_size=page_size,
+                    dtype=torch.float16,
+                    device=self.double_sparsity_selector.device,
+                )
+            except Exception as exc:
+                _ds_metrics.record_error(
+                    "bad_mask",
+                    message=f"PageSignatureTable allocation failed: {exc}",
+                    selector_id=f"layer{self.layer_id}-tp_rank{attn_tp_rank}",
+                    layer_id=self.layer_id,
+                )
+                raise
+            setattr(server_args, "_double_sparsity_page_signature_table", table)
+
+        # Pick the attn TP process group when world > 1; otherwise leave None.
+        process_group = None
+        if attn_tp_size > 1:
+            try:
+                from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+                process_group = get_attention_tp_group().device_group
+            except Exception:
+                process_group = None
+
+        self.double_sparsity_selector.bind_runtime_data(
+            page_signature_table=table,
+            channel_mask=local_mask,
+            process_group=process_group,
+        )
+        assert_tp_configured(
+            self.double_sparsity_selector, tp_world_size=max(attn_tp_size, 1)
+        )
+
     def _select_topk_indices(
         self,
         x: torch.Tensor,
@@ -1785,6 +1889,9 @@ class DeepseekV2AttentionMLA(
         """
 
         if self.use_double_sparsity:
+            from sglang.srt.layers.attention.double_sparsity.error_containment import (
+                try_run_ds_step,
+            )
             from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
                 expand_ds_selection_to_topk_indices,
             )
@@ -1792,32 +1899,62 @@ class DeepseekV2AttentionMLA(
                 assert_real_selector_or_placeholder_allowed,
             )
 
-            assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
-
-            selected_indices, valid_lengths = (
-                self.double_sparsity_selector.retrieve_topk(
-                    queries=q_lora,
-                    layer_id=layer_id,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    sparse_mask=getattr(forward_batch, "sparse_mask", None),
+            def _run() -> torch.Tensor:
+                assert_real_selector_or_placeholder_allowed(
+                    self.double_sparsity_selector
+                )
+                selected_indices, valid_lengths = (
+                    self.double_sparsity_selector.retrieve_topk(
+                        queries=q_lora,
+                        layer_id=layer_id,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        sparse_mask=getattr(forward_batch, "sparse_mask", None),
+                        seq_lens=getattr(forward_batch, "seq_lens", None),
+                    )
+                )
+                req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+                req_to_token = (
+                    req_to_token_pool.req_to_token
+                    if req_to_token_pool is not None
+                    else None
+                )
+                return expand_ds_selection_to_topk_indices(
+                    selected_indices=selected_indices,
+                    valid_lengths=valid_lengths,
+                    page_size=self.double_sparsity_selector.page_size,
+                    req_to_token=req_to_token,
+                    req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
                     seq_lens=getattr(forward_batch, "seq_lens", None),
                 )
-            )
 
-            req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
-            req_to_token = (
-                req_to_token_pool.req_to_token
-                if req_to_token_pool is not None
-                else None
+            # Run under the containment primitive so DS-typed exceptions
+            # increment the Prometheus error counter and emit structured
+            # logs. The primitive returns (success, value); on failure we
+            # still re-raise to preserve the current batch semantics
+            # (full per-request abort plumbing through the scheduler is a
+            # follow-up — this seam at least makes the failure observable).
+            error_state: Dict[str, Any] = {}
+            ok, result = try_run_ds_step(
+                _run,
+                request_id="batch",
+                error_state=error_state,
+                layer_id=layer_id,
+                selector_id=f"layer{layer_id}",
             )
-            return expand_ds_selection_to_topk_indices(
-                selected_indices=selected_indices,
-                valid_lengths=valid_lengths,
-                page_size=self.double_sparsity_selector.page_size,
-                req_to_token=req_to_token,
-                req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
-                seq_lens=getattr(forward_batch, "seq_lens", None),
-            )
+            if not ok:
+                # Preserve the original typed exception so AC-2 negative
+                # tests still see e.g. DSAdapterPageOutOfRange; the
+                # counter / log have already been recorded by
+                # try_run_ds_step.
+                original = error_state.get("ds_original_exception")
+                if original is not None:
+                    raise original
+                raise RuntimeError(
+                    f"Double Sparsity step failed: "
+                    f"{error_state.get('ds_error_cls')}: "
+                    f"{error_state.get('ds_error_message')}"
+                )
+            return result
 
         return self.indexer(
             x=x,

@@ -1054,6 +1054,7 @@ class SchedulerOutputProcessorMixin:
         routed_experts = None
         indexer_topk = None
         customized_info = {}
+        per_request_summary = {}
 
         time_stats = []
 
@@ -1251,6 +1252,19 @@ class SchedulerOutputProcessorMixin:
                             v[send_token_offset : len(output_ids_)]
                         )
 
+                # Per-request summary (one dict per request; the latest
+                # value the model emitted for this request wins).
+                if req.per_request_summary is not None:
+                    for k, v in req.per_request_summary.items():
+                        per_request_summary.setdefault(k, []).append(v)
+                else:
+                    # Keep the per-key list shape consistent across the batch:
+                    # if other reqs in the batch have summaries, append a
+                    # None placeholder so list indices match. The tokenizer
+                    # hook treats None entries as absent.
+                    for k in per_request_summary:
+                        per_request_summary[k].append(None)
+
             if (
                 req.finished()
                 and self.ps.attn_tp_rank == 0
@@ -1300,6 +1314,7 @@ class SchedulerOutputProcessorMixin:
                     routed_experts=routed_experts,
                     indexer_topk=indexer_topk,
                     customized_info=customized_info,
+                    per_request_summary=per_request_summary or None,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,

@@ -20,19 +20,23 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
     DSAdapterError,
 )
+from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+    DoubleSparsityChannelMaskCorrupt,
+    DoubleSparsityChannelMaskMissing,
+)
+from sglang.srt.layers.attention.double_sparsity.selector import (
+    DoubleSparsityTPMisconfigured,
+)
 from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
 
 
-_EXCEPTION_TO_CLASS = {
-    DSAdapterError: "bad_adapter_input",
-}
-
-
-def _classify(exc: BaseException) -> str:
-    for exc_cls, label in _EXCEPTION_TO_CLASS.items():
-        if isinstance(exc, exc_cls):
-            return label
-    return "selector_runtime_error"
+_CONTAINED_EXCEPTIONS = (
+    DSAdapterError,
+    DoubleSparsityChannelMaskCorrupt,
+    DoubleSparsityChannelMaskMissing,
+    DoubleSparsityTPMisconfigured,
+    RuntimeError,  # selector runtime errors (e.g. placeholder guard)
+)
 
 
 def try_run_ds_step(
@@ -40,19 +44,24 @@ def try_run_ds_step(
     *,
     request_id: str,
     error_state: Dict[str, Any],
+    layer_id: Optional[int] = None,
+    selector_id: Optional[str] = None,
 ) -> Tuple[bool, Optional[Any]]:
     """Run a single DS attention step under containment.
 
+    Catches the DS-typed exception families plus generic RuntimeError
+    (which covers placeholder-guard runtime errors), classifies into
+    one of `DS_ERROR_CLASSES`, increments the Prometheus counter, and
+    writes ``error_state`` so the scheduler clears partial per-request
+    state. Non-typed exceptions still propagate so they are not silently
+    swallowed.
+
     Args:
         fn: a no-arg callable that performs the DS step for one request.
-            It may raise any exception. DS-typed exceptions are caught;
-            non-DS exceptions are re-raised because they indicate a bug
-            that is not safely contained.
-        request_id: the request identifier used in observability output.
-        error_state: a per-request mutable dict the caller owns. On
-            failure, this function writes ``error_state["ds_error_cls"]``
-            and ``error_state["ds_error_message"]`` so the scheduler can
-            mark the request failed and clear partial state.
+        request_id: per-request identifier for observability.
+        error_state: per-request mutable dict the caller owns.
+        layer_id: attention layer index (for structured logs).
+        selector_id: stable selector identifier (for structured logs).
 
     Returns:
         ``(success, value)``. On success ``value`` is whatever ``fn``
@@ -60,12 +69,17 @@ def try_run_ds_step(
     """
     try:
         return True, fn()
-    except DSAdapterError as exc:
-        cls = _classify(exc)
+    except _CONTAINED_EXCEPTIONS as exc:
+        cls = _ds_metrics.classify_ds_exception(exc)
         error_state["ds_error_cls"] = cls
         error_state["ds_error_message"] = str(exc)
-        _ds_metrics.record_error(cls, message=str(exc), request_id=request_id)
-        # Caller is responsible for clearing partial per_request_summary
-        # state for this request_id (the scheduler glue owns that map).
+        error_state["ds_original_exception"] = exc
         error_state.setdefault("clear_per_request_summary", True)
+        _ds_metrics.record_error(
+            cls,
+            message=str(exc),
+            request_id=request_id,
+            layer_id=layer_id,
+            selector_id=selector_id,
+        )
         return False, None
