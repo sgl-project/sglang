@@ -40,9 +40,7 @@ def test_format_violation_verify_path_labels_each_bit() -> None:
             FailReason.CHAIN_HASH | FailReason.POSITION | FailReason.REAL_KV_HASH
         ),
     )
-    out = _format_violation(
-        row=row, total=1, ring_overflow=False, step_when_pumped=7
-    )
+    out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=7)
     assert "chain_hash" in out
     assert "position" in out
     assert "real_kv_hash" in out
@@ -64,9 +62,7 @@ def test_format_violation_write_token_mismatch_labels_and_position() -> None:
         expected_aux=43,
         fail_reason_bits=int(FailReason.WRITE_TOKEN_MISMATCH),
     )
-    out = _format_violation(
-        row=row, total=1, ring_overflow=False, step_when_pumped=0
-    )
+    out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
     assert "write_token" in out
     assert "fail_reasons: none" not in out
     assert "actual:" in out
@@ -77,7 +73,9 @@ def test_format_violation_write_token_mismatch_labels_and_position() -> None:
     assert "prev_hash=0x000000000000002b" not in out
 
 
-def test_format_violation_write_position_mismatch_uses_expected_aux_as_position() -> None:
+def test_format_violation_write_position_mismatch_uses_expected_aux_as_position() -> (
+    None
+):
     row = _make_row(
         position=42,
         stored_token=111,
@@ -85,9 +83,7 @@ def test_format_violation_write_position_mismatch_uses_expected_aux_as_position(
         expected_aux=99,
         fail_reason_bits=int(FailReason.WRITE_POSITION_MISMATCH),
     )
-    out = _format_violation(
-        row=row, total=1, ring_overflow=False, step_when_pumped=0
-    )
+    out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
     assert "write_position" in out
     assert "position=42" in out
     assert "position=99" in out
@@ -99,9 +95,7 @@ def test_format_violation_combined_write_bits_render_both_labels() -> None:
             FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
         ),
     )
-    out = _format_violation(
-        row=row, total=1, ring_overflow=False, step_when_pumped=0
-    )
+    out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
     assert "write_token" in out
     assert "write_position" in out
 
@@ -109,7 +103,5 @@ def test_format_violation_combined_write_bits_render_both_labels() -> None:
 def test_format_violation_unknown_kernel_kind_renders_unknown_label() -> None:
     row = _make_row(fail_reason_bits=int(FailReason.CHAIN_HASH))
     row[consts.VIOLATION_FIELD_KERNEL_KIND] = 9999
-    out = _format_violation(
-        row=row, total=1, ring_overflow=False, step_when_pumped=0
-    )
+    out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
     assert "unknown(9999)" in out
