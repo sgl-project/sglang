@@ -26,6 +26,7 @@ from sglang.srt.steppable_engine.messages import (
     LastWritePlanResp,
     OutputHistoryReq,
     OutputHistoryResp,
+    _ApplyPrFixTogglesReq,
 )
 from sglang.srt.steppable_engine.views import (
     CanaryViolationView,
@@ -57,6 +58,7 @@ def install_steppable_handlers(scheduler: "Scheduler") -> None:
         (LastWritePlanReq, _handle_last_write_plan),
         (CanaryOverheadPctReq, _handle_canary_overhead_pct),
         (InjectPerturbationReq, _handle_inject_perturbation),
+        (_ApplyPrFixTogglesReq, _handle_apply_pr_fix_toggles),
     ]
 
     bound_pairs = [
@@ -245,3 +247,10 @@ def _handle_inject_perturbation(self: "Scheduler", req: InjectPerturbationReq) -
     from sglang.srt.steppable_engine.perturb import arm_one_shot
 
     arm_one_shot(self, channel=req.channel, kind=req.kind, rank=req.rank)
+
+
+def _handle_apply_pr_fix_toggles(self: "Scheduler", req: _ApplyPrFixTogglesReq) -> None:
+    from sglang.srt.steppable_engine.pr_fix_toggle import apply_pr_fix_toggles
+
+    choices = pickle.loads(req.choices_pickled)
+    apply_pr_fix_toggles(self, choices=choices)

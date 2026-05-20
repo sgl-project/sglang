@@ -64,6 +64,11 @@ class InjectPerturbationReq(BaseReq):
 
 
 @dataclass(slots=True, kw_only=True)
+class _ApplyPrFixTogglesReq(BaseReq):
+    choices_pickled: bytes  # Dict[int, Optional[bool]]
+
+
+@dataclass(slots=True, kw_only=True)
 class CanaryViolationsResp(BaseReq):
     violations_pickled: bytes
 

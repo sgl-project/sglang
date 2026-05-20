@@ -30,6 +30,7 @@ from sglang.srt.steppable_engine.messages import (
     OutputHistoryReq,
     OutputHistoryResp,
     StepReq,
+    _ApplyPrFixTogglesReq,
 )
 from sglang.srt.steppable_engine.views import (
     AllocatorStats,
@@ -128,11 +129,6 @@ class SteppableEngine:
             raise NotImplementedError("multimodal=True is not supported")
         if config.disagg_prefill_decode:
             raise NotImplementedError("disagg_prefill_decode=True is not supported")
-        if any(
-            getattr(config, f"apply_pr_{n}_fix") is not None
-            for n in (25015, 22819, 24230, 24401, 20711)
-        ):
-            raise NotImplementedError("apply_pr_<N>_fix toggle is not supported yet")
 
     @staticmethod
     def _validate_server_args(engine: Engine) -> None:
@@ -189,7 +185,27 @@ class SteppableEngine:
         return handler
 
     def _enter_stepping_mode(self) -> None:
+        self._apply_pr_fix_toggles()
         self._send_to_scheduler(EnterSteppingModeReq())
+
+    def _apply_pr_fix_toggles(self) -> None:
+        choices: Dict[int, Optional[bool]] = {
+            25015: self._config.apply_pr_25015_fix,
+            22819: self._config.apply_pr_22819_fix,
+            24230: self._config.apply_pr_24230_fix,
+            24401: self._config.apply_pr_24401_fix,
+            20711: self._config.apply_pr_20711_fix,
+        }
+        if all(c is None for c in choices.values()):
+            return
+        for pr_num, choice in choices.items():
+            if choice is not None and pr_num != 25015:
+                raise NotImplementedError(
+                    f"apply_pr_{pr_num}_fix toggle is not supported yet"
+                )
+        self._send_to_scheduler(
+            _ApplyPrFixTogglesReq(choices_pickled=pickle.dumps(choices))
+        )
 
     def __enter__(self) -> "SteppableEngine":
         return self
