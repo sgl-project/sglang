@@ -16,7 +16,7 @@ from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
 
 BS_AXIS: list[int] = [1, 4, 32, 128, 256, 1024]
 PREFIX_AXIS: list[int] = [0, 128, 1024, 4096, 10240, 16384]
-EXTEND_LEN_AXIS: list[int] = [128, 512, 4096]
+EXTEND_LEN_AXIS: list[int] = [128, 512, 4096, 16384]
 POOL_AXIS: list[str] = ["full", "swa_window_128"]
 SWA_WINDOW: int = 128
 RING_CAPACITY: int = 256
@@ -93,7 +93,7 @@ def build_fast_matrix_cases() -> list[BenchCase]:
 
 
 def build_full_matrix_cases() -> list[BenchCase]:
-    """Full cartesian product (~288 cases); superset of build_fast_matrix_cases."""
+    """Full cartesian product (~360 cases); superset of build_fast_matrix_cases."""
     fast = build_fast_matrix_cases()
     fast_keys = {c.case_id for c in fast}
     full: list[BenchCase] = list(fast)
@@ -124,10 +124,10 @@ def cases_to_x_vals(cases: list[BenchCase]) -> list[tuple[int, int, str, int, st
 
 def naive_slot_copy_fn(*, total: int, device: torch.device) -> Callable[[], None]:
     """Return a no-arg callable that does a naive ``kv_buf[slot] = payload`` of ``total`` slots."""
-    total = max(total, 1)
-    payload = torch.zeros(total, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+    n_slots = max(total, 1)
+    payload = torch.zeros(n_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     sink = torch.zeros_like(payload)
-    indices = torch.arange(total, device=device, dtype=torch.int64) % sink.shape[0]
+    indices = torch.arange(n_slots, device=device, dtype=torch.int64) % sink.shape[0]
 
     def baseline() -> None:
         sink.index_copy_(0, indices, payload)

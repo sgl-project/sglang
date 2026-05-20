@@ -95,11 +95,13 @@ class CanaryEndpoint:
         )
         # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
         # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". FULL endpoints pass
-        # fb_out_cache_loc through unchanged.
+        # fb_out_cache_loc through unchanged. Under cuda-graph capture the two implicit allocations
+        # (int64 cast of fb_out_cache_loc + the gather output) are routed through PyTorch's private
+        # mempool — addresses are pinned on first capture and reused on replay.
         if self.full_to_swa_index_mapping is not None:
             fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
                 fb_out_cache_loc.to(torch.int64)
-            ].to(torch.int32)
+            ]
         else:
             fb_out_cache_loc_for_canary = fb_out_cache_loc
 
