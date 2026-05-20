@@ -227,4 +227,4 @@ class CanaryRunner:
         self._perturb_hook.undo_after_step()
 
         if any_rank_errored and not self._violation_reporter.is_raised:
-            self._violation_reporter.raise_violation()
+            self._violation_reporter.log_or_raise_violation()

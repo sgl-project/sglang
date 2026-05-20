@@ -9,8 +9,6 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
 
-_LOG_MODE_VERBOSE_LIMIT: int = 10
-
 
 class ViolationReporter:
     def __init__(
@@ -23,14 +21,13 @@ class ViolationReporter:
         self._config = config
         self._device_state = device_state
         self._pump_and_allreduce = pump_and_allreduce
-        self._log_mode_violations_logged: int = 0
         self._raised: bool = False
 
     @property
     def is_raised(self) -> bool:
         return self._raised
 
-    def raise_violation(self) -> None:
+    def log_or_raise_violation(self) -> None:
         violation_log = self._device_state.violation_log
         write_index = int(violation_log.violation_write_index.cpu().item())
         if write_index == 0:
@@ -43,12 +40,11 @@ class ViolationReporter:
             ring_overflow=ring_overflow,
             step_when_pumped=self._pump_and_allreduce.step_counter,
         )
+        # log mode: always surface every violation as WARNING. Never rate-limit or demote to
+        # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever
+        # is producing them, not a reason to hide them.
         if self._config.mode == "log":
-            self._log_mode_violations_logged += 1
-            if self._log_mode_violations_logged <= _LOG_MODE_VERBOSE_LIMIT:
-                logger.warning(message)
-            else:
-                logger.debug(message)
+            logger.warning(message)
             return
         self._raised = True
         raise RuntimeError(message)
