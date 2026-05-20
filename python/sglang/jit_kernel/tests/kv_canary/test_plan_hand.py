@@ -679,11 +679,8 @@ def test_byte_equal_python_reference() -> None:
     )
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
+def test_byte_equal_python_reference_hardcoded() -> None:
     """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots."""
-    assert hardcoded
-
     # Step 1: pin (prefix, extend) per req.
     prefixes = [0, 4, 7]
     extends = [3, 1, 1]

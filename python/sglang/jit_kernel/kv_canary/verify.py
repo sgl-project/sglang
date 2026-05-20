@@ -16,12 +16,27 @@ if TYPE_CHECKING:
 # rejects longer tuples.
 _MAX_REAL_KV_SOURCES: Final[int] = 4
 
+# Per-source ABI fields packed into a length-(_MAX_REAL_KV_SOURCES * _REAL_KV_SOURCE_FIELDS_PER_ENTRY) int32
+# tensor. Mirrors kRealKvSourceField* / kRealKvSourceFieldsPerEntry in canary_common.cuh.
+_REAL_KV_SOURCE_FIELDS_PER_ENTRY: Final[int] = 3
+_REAL_KV_SOURCE_FIELD_PAGE_SIZE: Final[int] = 0
+_REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN: Final[int] = 1
+_REAL_KV_SOURCE_FIELD_READ_BYTES: Final[int] = 2
+
 # Chain hash anchor. Hardcoded at the jit_kernel layer; no runtime seed parameter exists. Mirrored in C++ as
 # kCanaryChainAnchor; const-sync test pins them together.
 CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
 
-# Bytes per canary slot. 4 int64 fields (token_id, position, prev_hash, real_kv_hash).
-CANARY_SLOT_BYTES: Final[int] = 32
+# Canary slot layout: 4 int64 fields per slot (token_id, position, prev_hash, real_kv_hash). Mirrors
+# kCanaryFieldsPerSlot / kCanaryField* in canary_common.cuh.
+_CANARY_FIELDS_PER_SLOT: Final[int] = 4
+_FIELD_TOKEN: Final[int] = 0
+_FIELD_POSITION: Final[int] = 1
+_FIELD_PREV_HASH: Final[int] = 2
+_FIELD_REAL_KV_HASH: Final[int] = 3
+
+# Bytes per canary slot. Derived from the int64 field count above.
+CANARY_SLOT_BYTES: Final[int] = _CANARY_FIELDS_PER_SLOT * 8
 
 # Width of one violation_ring row in int64 fields.
 VIOLATION_FIELDS: Final[int] = 8
@@ -70,7 +85,7 @@ class RealKvHashMode(IntEnum):
     """Selector for the real-KV hash mixin.
 
     Mirrored in C++ (canary_common.cuh) as kRealKvHashMode*; value parity enforced by
-    test_unit_const_sync.py.
+    test_const_sync.py.
     """
 
     OFF = 0  # mixin disabled; real_kv_hash field is always 0 in the canary slot.
@@ -150,7 +165,7 @@ class VerifyPlan:
     Each row is a self-contained (slot_idx, position, prev_slot_idx) triple, so the verify kernel makes no
     assumption about the entry's source — per-forward derivation, sweep over running reqs, and sweep over
     radix-cache orphan slots all populate the same schema. prev_slot_idx == -1 flags a chain-seed entry (kernel
-    anchors on the hardcoded CANARY_CHAIN_ANCHOR constant instead of reading a predecessor; see §6.1).
+    anchors on the hardcoded CANARY_CHAIN_ANCHOR constant instead of reading a predecessor).
 
     Sized to a cuda-graph-captured capacity; active prefix is verify_num_valid[0]. Padding tail entries are
     unspecified — kernel skips tid >= verify_num_valid[0].
@@ -160,7 +175,7 @@ class VerifyPlan:
             for the SWA group.
         verify_positions: Expected sequence position per entry, shape [verify_capacity], int32.
         verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int32. -1 = chain
-            head (anchor on CANARY_CHAIN_ANCHOR; §6.1). Explicit (not derived from verify_slot_indices[i-1])
+            head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
             "predecessor == previous array entry" assumption.
         verify_num_valid: Active entry count, shape [1], int32.
@@ -218,7 +233,7 @@ def canary_verify_step(
     Canary slot layout: each slot is canary_buf.shape[1] bytes holding 4 int64 fields (token_id, position,
     prev_hash, real_kv_hash). Chain link: next.prev_hash == splitmix64(this.prev_hash XOR this.token_id XOR
     this.position XOR this.real_kv_hash); chain head anchors on splitmix64(CANARY_CHAIN_ANCHOR), where
-    CANARY_CHAIN_ANCHOR is a hardcoded module-level constant (§6.1; no runtime seed parameter — the canary is
+    CANARY_CHAIN_ANCHOR is a hardcoded module-level constant (no runtime seed parameter — the canary is
     for bug detection, not adversarial security, so a fixed anchor is sufficient).
 
     Args:
@@ -338,7 +353,11 @@ def _build_real_kv_source_abi(
             num_bytes_per_token = 1 to keep the device-side address arithmetic well-defined.
     """
     padded_bufs: list[torch.Tensor] = []
-    params = torch.zeros((_MAX_REAL_KV_SOURCES, 3), dtype=torch.int32, device="cpu")
+    params = torch.zeros(
+        (_MAX_REAL_KV_SOURCES, _REAL_KV_SOURCE_FIELDS_PER_ENTRY),
+        dtype=torch.int32,
+        device="cpu",
+    )
 
     for i, source in enumerate(real_kv_sources):
         _assert_contiguous(source.tensor, f"real_kv_sources[{i}].tensor")
@@ -349,15 +368,15 @@ def _build_real_kv_source_abi(
                 f"got {source_u8.dim()}-D"
             )
         padded_bufs.append(source_u8)
-        params[i, 0] = source.page_size
-        params[i, 1] = source.num_bytes_per_token
-        params[i, 2] = source.read_bytes
+        params[i, _REAL_KV_SOURCE_FIELD_PAGE_SIZE] = source.page_size
+        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = source.num_bytes_per_token
+        params[i, _REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
     dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
     for i in range(len(real_kv_sources), _MAX_REAL_KV_SOURCES):
         padded_bufs.append(dummy)
-        params[i, 0] = 1  # page_size
-        params[i, 1] = 1  # num_bytes_per_token
-        params[i, 2] = 0  # read_bytes -> kernel skips this slot
+        params[i, _REAL_KV_SOURCE_FIELD_PAGE_SIZE] = 1
+        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = 1
+        params[i, _REAL_KV_SOURCE_FIELD_READ_BYTES] = 0  # kernel skips this slot
 
     return padded_bufs, params

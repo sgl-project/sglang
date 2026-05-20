@@ -984,10 +984,8 @@ def test_padding_block_skipped() -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
+def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     """5-step write chain with hand-computed splitmix64 expected fields per slot."""
-    assert hardcoded
     cuda_buf, ref_buf = _setup_pair()
     plan_cuda = make_write_plan(
         write_offsets=[0, 5], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
@@ -1129,9 +1127,7 @@ def test_mock_violation_bit_injection_position_matrix(
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
+def test_chain_link_byte_equal_100_step_hardcoded() -> None:
     import json
     from pathlib import Path
 
@@ -1319,9 +1315,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_seed_slot_resume_5_step_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
+def test_seed_slot_resume_5_step_hardcoded() -> None:
     cuda_buf = make_canary_buf(num_slots=50, slot_stride_bytes=32, device=_DEVICE)
     ref_buf = cuda_buf.clone()
 

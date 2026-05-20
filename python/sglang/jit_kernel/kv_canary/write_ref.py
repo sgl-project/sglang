@@ -3,6 +3,10 @@ from __future__ import annotations
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
+    _FIELD_POSITION,
+    _FIELD_PREV_HASH,
+    _FIELD_REAL_KV_HASH,
+    _FIELD_TOKEN,
     _VIOLATION_FIELD_EXPECTED_AUX,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
@@ -30,12 +34,6 @@ from sglang.jit_kernel.kv_canary.write import (
 )
 
 _U64_MASK: int = (1 << 64) - 1
-
-# Canary slot field offsets within the 4-int64 layout. Kept in sync with the verify ref.
-_FIELD_TOKEN: int = 0
-_FIELD_POSITION: int = 1
-_FIELD_PREV_HASH: int = 2
-_FIELD_REAL_KV_HASH: int = 3
 
 
 def canary_write_step_torch_reference(

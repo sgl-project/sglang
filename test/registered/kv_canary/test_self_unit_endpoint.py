@@ -190,9 +190,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
             lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
         ):
             # LUT maps full slot i → swa slot (i + 100) so we can verify the gather happened.
-            lut = (torch.arange(8, dtype=torch.int32, device=self.device) + 100).to(
-                torch.int32
-            )
+            lut = torch.arange(8, dtype=torch.int64, device=self.device) + 100
             swa_ep = _make_endpoint(
                 device=self.device,
                 kernel_kind=CanaryLaunchTag.HEAD_K_SWA,
@@ -228,7 +226,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
         # SWA call: fb_out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
-        expected_swa = lut[args.fb_out_cache_loc.to(torch.int64)].to(torch.int32)
+        expected_swa = lut[args.fb_out_cache_loc.to(torch.int64)]
         self.assertTrue(torch.equal(captured[0], expected_swa))
         # FULL call: fb_out_cache_loc passed through unchanged.
         self.assertIs(captured[1], args.fb_out_cache_loc)
@@ -250,9 +248,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
             lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
         ):
             # 8 in-window rows + 1 trailing sentinel row at index 8.
-            lut = torch.arange(8, dtype=torch.int32, device=self.device)
+            lut = torch.arange(8, dtype=torch.int64, device=self.device)
             lut = torch.cat(
-                [lut, torch.tensor([-1], dtype=torch.int32, device=self.device)]
+                [lut, torch.tensor([-1], dtype=torch.int64, device=self.device)]
             )
             swa_ep = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.HEAD_K_SWA, swa_lut=lut
@@ -278,7 +276,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 captured[0],
-                torch.tensor([-1], dtype=torch.int32, device=self.device),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
             )
         )
 

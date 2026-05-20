@@ -38,9 +38,10 @@ class _PlanScratch:
     Fields:
         verify_offsets: Exclusive prefix sum of per-req verify counts, shape [_PLAN_BS_BLOCK_SIZE + 1], int32.
             Slot ``[bs]`` carries the total verify entry count (= base index for extras append).
-        swa_lut_sentinel: One-element int32 zero tensor used as a stable LUT pointer when the caller passes
+        swa_lut_sentinel: One-element int64 zero tensor used as a stable LUT pointer when the caller passes
             ``full_to_swa_index_mapping=None``. Cached so the wrapper never allocates per call; its data_ptr()
             is pinned into any cuda-graph capture and the kernel never dereferences it (HAS_SWA_LUT is False).
+            Dtype matches the production LUT (int64) so Triton ``tl.load`` element typing stays consistent.
     """
 
     verify_offsets: torch.Tensor
@@ -108,8 +109,10 @@ def canary_plan_step(
         extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for per-forward and running-sweep
             callers.
         swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
-        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int32, or None. Required (non-None) iff
+        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. Required (non-None) iff
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
+            Loaded element-typed via Triton ``tl.load``; intermediate translated slot values are int64 inside the
+            kernel and narrowed back to int32 at the final ``tl.store``.
 
     Implementation:
         - Three sub-kernels with action-named identifiers, launched in sequence:
@@ -295,7 +298,7 @@ def _get_plan_scratch(*, device: torch.device) -> _PlanScratch:
         verify_offsets=torch.zeros(
             _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
         ),
-        swa_lut_sentinel=torch.zeros(1, dtype=torch.int32, device=device),
+        swa_lut_sentinel=torch.zeros(1, dtype=torch.int64, device=device),
     )
     _PLAN_SCRATCH_CACHE[device] = scratch
     return scratch

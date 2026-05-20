@@ -1239,10 +1239,8 @@ def test_empty_plan_no_op() -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
+def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     """5-step chain with hand-computed splitmix64 expected sequence; defends against ref + CUDA co-drift."""
-    assert hardcoded
     tokens = [101, 202, 303, 404, 505]
     positions = [0, 1, 2, 3, 4]
     slot_indices = [1, 2, 3, 4, 5]
@@ -1310,9 +1308,7 @@ def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
+def test_chain_link_byte_equal_100_step_hardcoded() -> None:
     import json
     from pathlib import Path
 
@@ -1753,9 +1749,7 @@ def test_chain_advance_formula_matches_spec() -> None:
         )
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_violation_ring_row_byte_layout_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
+def test_violation_ring_row_byte_layout_hardcoded() -> None:
     import struct
 
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()

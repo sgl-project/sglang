@@ -10,10 +10,6 @@ from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
     make_row_source,
 )
-from sglang.srt.kv_canary.pool_patch.swa_lut_mirror import (
-    ensure_swa_lut_int32,
-    swa_index_lut,
-)
 
 
 def attach_swa(
@@ -27,8 +23,6 @@ def attach_swa(
 
     FULL group splices into ``get_contiguous_buf_infos``; SWA group splices into ``get_state_buf_infos``.
     """
-    ensure_swa_lut_int32(pool=pool, allocator=allocator)
-
     full_group = _build_subpool_group(
         sub_pool=pool.full_kv_pool,
         kind=PoolKind.FULL,
@@ -41,7 +35,7 @@ def attach_swa(
         kind=PoolKind.SWA,
         device=device,
         read_bytes=read_bytes,
-        swa_lut=swa_index_lut(pool),
+        swa_lut=pool.full_to_swa_index_mapping,
     )
 
     patch_buf_info_method(

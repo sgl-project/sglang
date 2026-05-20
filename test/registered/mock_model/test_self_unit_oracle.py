@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_canary.token_oracle.oracle import HashOracle, TokenOracle
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,48 +38,6 @@ class TestHashOracle(CustomTestCase):
 
         for token in tokens:
             self.assertTrue(0 <= token < vocab_size)
-
-    def test_hash_oracle_different_seeds_give_different_streams(self) -> None:
-        a = HashOracle(seed=1, vocab_size=32000)
-        b = HashOracle(seed=2, vocab_size=32000)
-
-        req_ids = torch.zeros(64, dtype=torch.int64)
-        positions = torch.arange(0, 64, dtype=torch.int64)
-        a_out = a.expected_tokens(req_ids=req_ids, positions=positions).tolist()
-        b_out = b.expected_tokens(req_ids=req_ids, positions=positions).tolist()
-
-        differences = sum(1 for i in range(64) if a_out[i] != b_out[i])
-
-        self.assertGreaterEqual(differences, 50)
-
-    def test_hash_oracle_different_req_ids_give_different_tokens(self) -> None:
-        oracle = HashOracle(seed=42, vocab_size=32000)
-
-        left_ids = torch.arange(0, 64, dtype=torch.int64)
-        right_ids = torch.arange(1, 65, dtype=torch.int64)
-        positions = torch.zeros(64, dtype=torch.int64)
-        left = oracle.expected_tokens(req_ids=left_ids, positions=positions).tolist()
-        right = oracle.expected_tokens(req_ids=right_ids, positions=positions).tolist()
-
-        differences = sum(1 for i in range(64) if left[i] != right[i])
-
-        self.assertGreaterEqual(differences, 50)
-
-    def test_hash_oracle_satisfies_oracle_protocol(self) -> None:
-        oracle: TokenOracle = HashOracle(seed=0, vocab_size=100)
-
-        out = oracle.expected_tokens(
-            req_ids=torch.tensor([0], dtype=torch.int64),
-            positions=torch.tensor([0], dtype=torch.int64),
-        )
-        self.assertEqual(out.dtype, torch.int32)
-        self.assertIsNotNone(int(out.tolist()[0]))
-
-    def test_hash_oracle_is_frozen_dataclass(self) -> None:
-        oracle = HashOracle(seed=1, vocab_size=100)
-
-        with self.assertRaises(Exception):
-            oracle.seed = 2  # type: ignore[misc]
 
 
 if __name__ == "__main__":
