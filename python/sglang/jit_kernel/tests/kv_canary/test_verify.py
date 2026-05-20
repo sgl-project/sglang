@@ -27,6 +27,7 @@ from sglang.jit_kernel.kv_canary.write_ref import (
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
+    assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
     make_real_kv_source,
@@ -322,7 +323,7 @@ def test_violation_token_mismatch() -> None:
 
     assert int(cuda_log.write_index[0].item()) == 1
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_CHAIN_HASH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -364,7 +365,7 @@ def test_violation_position_mismatch() -> None:
 
     assert int(cuda_log.write_index[0].item()) == 1
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_POSITION
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -405,7 +406,7 @@ def test_violation_position_diverges_from_plan() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_POSITION
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -463,7 +464,7 @@ def test_violation_prev_hash_mismatch() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_CHAIN_HASH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -553,7 +554,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -1789,7 +1790,7 @@ def test_real_kv_hash_bit_mode_hardcoded(hardcoded: bool) -> None:
     )
 
     fail_bits = int(cuda_log2.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
 
 
@@ -1877,7 +1878,7 @@ def test_real_kv_hash_all_mode_hardcoded(hardcoded: bool) -> None:
     )
 
     fail_bits = int(cuda_log2.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
 
 

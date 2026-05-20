@@ -267,3 +267,12 @@ def assert_canary_state_equal(
 def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None:
     """Byte-equal check on two canary buffers (uint8 [num_slots, slot_stride_bytes])."""
     assert torch.equal(buf_a, buf_b), "canary_buf diverged (CUDA vs ref)"
+
+
+def assert_only_bits_set(fail_bits: int, expected_bits: int) -> None:
+    assert (fail_bits & expected_bits) == expected_bits, (
+        f"missing expected bits: expected {expected_bits:#b} got {fail_bits:#b}"
+    )
+    assert (fail_bits & ~expected_bits) == 0, (
+        f"unexpected extra bits: got {fail_bits:#b} extras {fail_bits & ~expected_bits:#b}"
+    )

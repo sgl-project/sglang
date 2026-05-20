@@ -25,6 +25,7 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
+    assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
     make_real_kv_source,
@@ -478,7 +479,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH)
     # Chain advances on actual (42), not expected (99). Stored token should be 42.
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_token == 42
@@ -522,7 +523,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert fail_bits & _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH
+    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH)
     _, stored_position, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_position == 7
     assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
