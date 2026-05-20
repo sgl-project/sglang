@@ -31,6 +31,7 @@ import threading
 import time
 
 import requests
+import tabulate
 
 _FWD_OCCUPANCY_RE = re.compile(
     r"^sglang:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
@@ -184,8 +185,18 @@ class FwdOccupancyMixin:
         peak = samples_sorted[-1]
         p10 = samples_sorted[max(0, len(samples_sorted) // 10 - 1)]
         print(
-            f"fwd_occupancy samples (n={len(samples)}): "
-            f"median={median:.2f} peak={peak:.2f} p10={p10:.2f}"
+            "\n"
+            + tabulate.tabulate(
+                [
+                    ["samples (n)", len(samples)],
+                    ["median", f"{median:.2f}"],
+                    ["peak", f"{peak:.2f}"],
+                    ["p10", f"{p10:.2f}"],
+                    ["threshold", f"{self.fwd_occupancy_threshold:.2f}"],
+                ],
+                headers=["fwd_occupancy", "value"],
+                tablefmt="github",
+            )
         )
 
         self.assertGreater(
