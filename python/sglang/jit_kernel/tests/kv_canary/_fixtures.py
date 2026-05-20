@@ -5,7 +5,6 @@ from typing import Literal, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,
