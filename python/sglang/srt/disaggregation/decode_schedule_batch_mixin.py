@@ -177,8 +177,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
-                # Local import: top-level would close the
-                # schedule_batch -> overlap_utils -> spec_utils -> schedule_batch cycle.
                 from sglang.srt.managers.overlap_utils import FutureIndices
 
                 spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
