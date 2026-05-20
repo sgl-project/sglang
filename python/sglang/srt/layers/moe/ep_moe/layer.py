@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -23,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -379,6 +382,26 @@ class NpuFuseEPMoE(DeepEPMoE):
             self._process_weights_after_loading
         )
 
+        self._decode_only = envs.SGLANG_NPU_FUSEEP_DECODE_ONLY.get()
+        if self._decode_only:
+            self.fuseep_dispatcher = self.dispatcher
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPDispatcher,
+            )
+
+            self.dispatcher = DeepEPDispatcher(
+                group=get_tp_group().device_group,
+                router_topk=top_k,
+                permute_fusion=True,
+                num_experts=num_experts,
+                num_local_experts=self.num_local_experts,
+                hidden_size=hidden_size,
+                params_dtype=params_dtype,
+                deepep_mode=self.deepep_mode,
+                async_finish=True,
+                return_recv_hook=True,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -387,14 +410,29 @@ class NpuFuseEPMoE(DeepEPMoE):
         alt_stream=None,
         disable_sbo=False,
     ):
-        return self.dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-            gmm1_permuted_weight=self.w13_weight,
-            gmm1_permuted_weight_scale=self.w13_weight_scale,
-            gmm2_weight=self.w2_weight,
-            gmm2_weight_scale=self.w2_weight_scale,
-        ).hidden_state
+        if not self._decode_only:
+            return self.dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                gmm1_permuted_weight=self.w13_weight,
+                gmm1_permuted_weight_scale=self.w13_weight_scale,
+                gmm2_weight=self.w2_weight,
+                gmm2_weight_scale=self.w2_weight_scale,
+            ).hidden_state
+
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
+            return super().forward(hidden_states, topk_output)
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
+            return self.fuseep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                gmm1_permuted_weight=self.w13_weight,
+                gmm1_permuted_weight_scale=self.w13_weight_scale_fuseep,
+                gmm2_weight=self.w2_weight,
+                gmm2_weight_scale=self.w2_weight_scale_fuseep,
+            ).hidden_state
 
     def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
         if tile_n % 2 != 0:
@@ -471,12 +509,20 @@ class NpuFuseEPMoE(DeepEPMoE):
                 w2_scale.to(torch.float32), requires_grad=False
             )
 
-            layer.w13_weight_scale = self.scale_from_float_to_int64(
-                layer.w13_weight_scale.data
-            )
-            layer.w2_weight_scale = self.scale_from_float_to_int64(
-                layer.w2_weight_scale.data
-            )
+            if self._decode_only:
+                layer.w13_weight_scale_fuseep = self.scale_from_float_to_int64(
+                    layer.w13_weight_scale.data
+                )
+                layer.w2_weight_scale_fuseep = self.scale_from_float_to_int64(
+                    layer.w2_weight_scale.data
+                )
+            else:
+                layer.w13_weight_scale = self.scale_from_float_to_int64(
+                    layer.w13_weight_scale.data
+                )
+                layer.w2_weight_scale = self.scale_from_float_to_int64(
+                    layer.w2_weight_scale.data
+                )
         else:
             cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
             layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
