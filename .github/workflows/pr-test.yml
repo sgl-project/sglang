@@ -563,3 +563,31 @@ jobs:
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+  # =============================================== notify pr-states ====================================================
+  # Dispatches pr-states.yml after every attempt (initial + every rerun).
+  # workflow_run.completed only fires on the initial completion (one
+  # workflow_run record across attempts), so we explicitly dispatch —
+  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
+  #
+  # Fork PRs are excluded: their pull_request GITHUB_TOKEN is forced
+  # read-only regardless of declared `actions: write`, so dispatch 403s.
+  # Fork PRs get pr-states updates via the workflow_run subscription
+  # there (initial completion) and pull_request_target (push / label).
+  notify-pr-states:
+    needs: [pr-test-finish]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"

@@ -238,7 +238,7 @@ class DecodeKVCacheOffloadManager:
         kv_committed_len = req.pop_committed_kv_cache()
         start = start_offset
         end = kv_committed_len
-        # Free the incremental part of the request (NSA-aware)
+        # Free the incremental part of the request (DSA-aware)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
