@@ -1,5 +1,5 @@
-# Adapted from qwen2.py
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -28,7 +28,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2Model, Qwen2MoelEngram
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -449,6 +449,23 @@ class Qwen3Model(Qwen2Model):
         )
 
 
+class Qwen3ModelEngram(Qwen2MoelEngram):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=Qwen3DecoderLayer,
+            alt_stream=alt_stream,
+        )
+
+
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -479,7 +496,9 @@ class Qwen3ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen3Model(
+        use_engram = os.getenv("ENABLE_ENGRAM", "0").lower() in ("1", "true")
+        model_cls = Qwen3ModelEngram if use_engram else Qwen3Model
+        self.model = model_cls(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
