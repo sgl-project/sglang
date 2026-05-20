@@ -80,6 +80,7 @@ class ModelImpl(str, Enum):
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
     MINDSPORE = "mindspore"
+    ATOM = "atom"
 
 
 def _hf_arch(config) -> Optional[str]:
