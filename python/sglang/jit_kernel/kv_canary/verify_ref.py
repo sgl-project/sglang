@@ -247,5 +247,3 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
         acc = splitmix64(acc ^ word)
 
     return acc
-
-
