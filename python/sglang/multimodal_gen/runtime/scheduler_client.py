@@ -7,9 +7,9 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.cancellation import (
     CLIENT_CANCELLED_REASON,
-    CancelGenerationReq,
     mark_request_cancelled,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import CancelGenerationReq
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

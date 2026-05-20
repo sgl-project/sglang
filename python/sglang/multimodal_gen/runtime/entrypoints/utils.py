@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.cancellation import CLIENT_CANCELLED_REASON
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -70,6 +71,12 @@ class ListLorasReq:
 @dataclass
 class ShutdownReq:
     pass
+
+
+@dataclass
+class CancelGenerationReq:
+    request_id: str
+    reason: str = CLIENT_CANCELLED_REASON
 
 
 @dataclass

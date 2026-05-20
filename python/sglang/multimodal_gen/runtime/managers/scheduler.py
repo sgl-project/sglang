@@ -18,7 +18,6 @@ import zmq
 
 from sglang.multimodal_gen.runtime.cancellation import (
     CLIENT_CANCELLED_MESSAGE,
-    CancelGenerationReq,
     first_cancelled_request_id,
     get_cancel_reason,
     is_payload_cancelled,
@@ -40,6 +39,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    CancelGenerationReq,
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,

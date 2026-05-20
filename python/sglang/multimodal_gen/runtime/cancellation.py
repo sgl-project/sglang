@@ -9,18 +9,11 @@ import json
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 CLIENT_CANCELLED_REASON = "client_cancelled"
 CLIENT_CANCELLED_MESSAGE = "Generation cancelled by client"
-
-
-@dataclass
-class CancelGenerationReq:
-    request_id: str
-    reason: str = CLIENT_CANCELLED_REASON
 
 
 class RequestCancelledError(RuntimeError):
