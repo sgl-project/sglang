@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import pytest
 import torch
@@ -55,8 +55,12 @@ def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
     )
 
 
-def _run_pipeline_real(
+def _run_pipeline(
     *,
+    plan_fn: Callable[..., None],
+    write_fn: Callable[..., None],
+    verify_fn: Callable[..., None],
+    synchronize: bool,
     fb_req_pool_indices: torch.Tensor,
     fb_prefix_lens: torch.Tensor,
     fb_extend_seq_lens: torch.Tensor,
@@ -81,7 +85,8 @@ def _run_pipeline_real(
     extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
-    canary_plan_step(
+
+    plan_fn(
         verify_plan_out=plan_v,
         write_plan_out=plan_w,
         fb_req_pool_indices=fb_req_pool_indices,
@@ -95,7 +100,7 @@ def _run_pipeline_real(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
-    canary_write_step(
+    write_fn(
         canary_buf=canary_buf,
         plan=plan_w,
         fb_input_ids=fb_input_ids,
@@ -112,7 +117,7 @@ def _run_pipeline_real(
         real_kv_sources=real_kv_sources,
         real_kv_hash_mode=real_kv_hash_mode,
     )
-    canary_verify_step(
+    verify_fn(
         canary_buf=canary_buf,
         plan=plan_v,
         kernel_kind=kernel_kind,
@@ -123,78 +128,9 @@ def _run_pipeline_real(
         real_kv_sources=real_kv_sources,
         real_kv_hash_mode=real_kv_hash_mode,
     )
-    torch.cuda.synchronize()
-    return plan_v, plan_w
 
-
-def _run_pipeline_ref(
-    *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
-    req_to_token: torch.Tensor,
-    canary_buf: torch.Tensor,
-    log: FakeViolationLog,
-    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    swa_window_size: int,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-    kernel_kind: CanaryLaunchTag,
-    pseudo_mode: CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
-    verify_capacity: int,
-    write_req_capacity: int,
-) -> tuple[VerifyPlan, WritePlan]:
-    extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
-    plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
-    plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
-    canary_plan_step_torch_reference(
-        verify_plan_out=plan_v,
-        write_plan_out=plan_w,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    canary_write_step_torch_reference(
-        canary_buf=canary_buf,
-        plan=plan_w,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
-        violation_ring=log.ring,
-        violation_write_index=log.write_index,
-        slot_run_counter=log.slot_run_counter,
-        kernel_run_counter=log.kernel_run_counter,
-        real_kv_sources=real_kv_sources,
-        real_kv_hash_mode=real_kv_hash_mode,
-    )
-    canary_verify_step_torch_reference(
-        canary_buf=canary_buf,
-        plan=plan_v,
-        kernel_kind=kernel_kind,
-        violation_ring=log.ring,
-        violation_write_index=log.write_index,
-        slot_run_counter=log.slot_run_counter,
-        kernel_run_counter=log.kernel_run_counter,
-        real_kv_sources=real_kv_sources,
-        real_kv_hash_mode=real_kv_hash_mode,
-    )
+    if synchronize:
+        torch.cuda.synchronize()
     return plan_v, plan_w
 
 
@@ -247,7 +183,7 @@ def _run_both_and_assert_pipeline_equal(
     log_real = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
     log_ref = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
 
-    plan_v_real, plan_w_real = _run_pipeline_real(
+    shared: dict[str, Any] = dict(
         fb_req_pool_indices=fb_req_pool_indices,
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
@@ -255,8 +191,6 @@ def _run_both_and_assert_pipeline_equal(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         req_to_token=req_to_token,
-        canary_buf=buf_real,
-        log=log_real,
         extras=extras,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
@@ -264,32 +198,30 @@ def _run_both_and_assert_pipeline_equal(
         pseudo_mode=pseudo_mode,
         pseudo_expected_tokens=pseudo_expected_tokens,
         pseudo_expected_positions=pseudo_expected_positions,
-        real_kv_sources=real_kv_sources_real,
         real_kv_hash_mode=real_kv_hash_mode,
         verify_capacity=verify_capacity,
         write_req_capacity=write_req_capacity,
     )
-    plan_v_ref, plan_w_ref = _run_pipeline_ref(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        req_to_token=req_to_token,
+
+    plan_v_real, plan_w_real = _run_pipeline(
+        plan_fn=canary_plan_step,
+        write_fn=canary_write_step,
+        verify_fn=canary_verify_step,
+        synchronize=True,
+        canary_buf=buf_real,
+        log=log_real,
+        real_kv_sources=real_kv_sources_real,
+        **shared,
+    )
+    plan_v_ref, plan_w_ref = _run_pipeline(
+        plan_fn=canary_plan_step_torch_reference,
+        write_fn=canary_write_step_torch_reference,
+        verify_fn=canary_verify_step_torch_reference,
+        synchronize=False,
         canary_buf=buf_ref,
         log=log_ref,
-        extras=extras,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-        kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
         real_kv_sources=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
-        verify_capacity=verify_capacity,
-        write_req_capacity=write_req_capacity,
+        **shared,
     )
 
     assert_canary_buf_equal(buf_a=buf_real, buf_b=buf_ref)
