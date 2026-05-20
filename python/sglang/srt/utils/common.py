@@ -103,7 +103,7 @@ torch_release = pkg_version.parse(torch.__version__).release
 
 
 def flatten_arrays_to_int64_tensor(
-    parts: List[array], device, pin: bool
+    parts: List[array[int]], device, pin: bool
 ) -> torch.Tensor:
     """Flatten a list of array.array('q') buffers into one int64 tensor.
 

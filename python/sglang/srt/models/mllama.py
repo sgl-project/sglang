@@ -823,7 +823,9 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
         pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 

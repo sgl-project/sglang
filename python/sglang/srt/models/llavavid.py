@@ -58,7 +58,9 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: array[int], image_inputs: MultimodalInputs
+    ) -> array[int]:
         pad_values = array("q", (item.pad_value for item in image_inputs.mm_items))
         new_image_feature_len = self.image_feature_len
 

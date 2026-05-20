@@ -1123,7 +1123,7 @@ class MossVLForConditionalGeneration(nn.Module):
 
         return total_len
 
-    def _build_encoder_prefix_pad_ids(self, mm_inputs: MultimodalInputs) -> array:
+    def _build_encoder_prefix_pad_ids(self, mm_inputs: MultimodalInputs) -> array[int]:
         encoder_len = self._get_encoder_len(mm_inputs)
         if encoder_len == 0 or not mm_inputs.mm_items:
             return array("q")
@@ -1131,7 +1131,9 @@ class MossVLForConditionalGeneration(nn.Module):
         pad_value = mm_inputs.mm_items[0].pad_value
         return array("q", [pad_value]) * encoder_len
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         encoder_len = self._get_encoder_len(mm_inputs)
         mm_inputs.num_image_tokens = encoder_len
         if encoder_len == 0:
