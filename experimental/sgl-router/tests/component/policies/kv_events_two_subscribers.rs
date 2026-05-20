@@ -206,12 +206,16 @@ async fn two_subscribers_merge_events_from_two_publishers() {
 
     let payload_x = encode_event_batch(
         0.0,
-        vec![encode_block_stored_event(&hashes_x, None, &tokens_x, block_size)],
+        vec![encode_block_stored_event(
+            &hashes_x, None, &tokens_x, block_size,
+        )],
         Some(0),
     );
     let payload_y = encode_event_batch(
         0.0,
-        vec![encode_block_stored_event(&hashes_y, None, &tokens_y, block_size)],
+        vec![encode_block_stored_event(
+            &hashes_y, None, &tokens_y, block_size,
+        )],
         Some(0),
     );
     pub_x

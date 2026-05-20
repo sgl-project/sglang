@@ -314,7 +314,7 @@ mod tests {
     fn registry(specs: &[WorkerSpec]) -> Arc<WorkerRegistry> {
         let r = Arc::new(WorkerRegistry::default());
         for s in specs {
-            r.add(s.clone());
+            let _ = r.add(s.clone());
         }
         r
     }

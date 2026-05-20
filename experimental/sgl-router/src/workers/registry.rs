@@ -187,8 +187,8 @@ mod tests {
     #[test]
     fn add_then_query_by_model() {
         let r = WorkerRegistry::default();
-        r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
-        r.add(spec("w2", WorkerMode::Plain, &["m1"]));
+        let _ = r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
+        let _ = r.add(spec("w2", WorkerMode::Plain, &["m1"]));
         let m1 = r.workers_for(&ModelId("m1".into()));
         let m2 = r.workers_for(&ModelId("m2".into()));
         let m_missing = r.workers_for(&ModelId("missing".into()));
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn remove_drops_from_all_models() {
         let r = WorkerRegistry::default();
-        r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
+        let _ = r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
         r.remove(&WorkerId("w1".into()));
         assert!(r.workers_for(&ModelId("m1".into())).is_empty());
         assert!(r.workers_for(&ModelId("m2".into())).is_empty());
@@ -209,8 +209,8 @@ mod tests {
     #[test]
     fn healthy_subset_filters_via_breaker() {
         let r = WorkerRegistry::default();
-        r.add(spec("ok", WorkerMode::Plain, &["m"]));
-        r.add(spec("bad", WorkerMode::Plain, &["m"]));
+        let _ = r.add(spec("ok", WorkerMode::Plain, &["m"]));
+        let _ = r.add(spec("bad", WorkerMode::Plain, &["m"]));
         // Force "bad" worker's breaker to deny.
         // (We need to inject breaker state; the easiest path is the
         // CircuitBreaker stub returning false after record_failure. Task 6
@@ -249,7 +249,7 @@ mod tests {
         );
         assert!(r
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
-                .is_empty());
+            .is_empty());
     }
 
     #[test]
@@ -304,10 +304,10 @@ mod tests {
     #[test]
     fn re_add_with_shrunken_model_set_drops_stale_indexes() {
         let r = WorkerRegistry::default();
-        r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
+        let _ = r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
         assert_eq!(r.workers_for(&ModelId("m2".into())).len(), 1);
 
-        r.add(spec("w1", WorkerMode::Plain, &["m1"]));
+        let _ = r.add(spec("w1", WorkerMode::Plain, &["m1"]));
         assert_eq!(
             r.workers_for(&ModelId("m2".into())).len(),
             0,
@@ -325,8 +325,8 @@ mod tests {
     #[test]
     fn re_add_with_different_mode_updates_mode_filter() {
         let r = WorkerRegistry::default();
-        r.add(spec("w1", WorkerMode::Prefill, &["m"]));
-        r.add(spec("w1", WorkerMode::Decode, &["m"]));
+        let _ = r.add(spec("w1", WorkerMode::Prefill, &["m"]));
+        let _ = r.add(spec("w1", WorkerMode::Decode, &["m"]));
         assert_eq!(
             r.workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
                 .len(),

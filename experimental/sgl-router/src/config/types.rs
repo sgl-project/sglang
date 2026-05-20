@@ -530,7 +530,10 @@ mod k8s_discovery_config_tests {
         assert!(
             matches!(
                 err,
-                ConfigError::UnsupportedSelectorGrammar { selector: "prefill", .. },
+                ConfigError::UnsupportedSelectorGrammar {
+                    selector: "prefill",
+                    ..
+                },
             ),
             "expected UnsupportedSelectorGrammar(prefill), got {err:?}",
         );
@@ -544,7 +547,10 @@ mod k8s_discovery_config_tests {
         assert!(
             matches!(
                 err,
-                ConfigError::UnsupportedSelectorGrammar { selector: "decode", .. },
+                ConfigError::UnsupportedSelectorGrammar {
+                    selector: "decode",
+                    ..
+                },
             ),
             "expected UnsupportedSelectorGrammar(decode), got {err:?}",
         );
@@ -567,7 +573,9 @@ mod k8s_discovery_config_tests {
         // anything else (presence tests, set-based ops, inequality) silently
         // returns false at runtime, so zero pods match and discovery emits
         // an empty worker set with no diagnostic. Validate up front.
-        let err = cfg(Some("app in (sglang, vllm)"), None, None).mode().unwrap_err();
+        let err = cfg(Some("app in (sglang, vllm)"), None, None)
+            .mode()
+            .unwrap_err();
         assert!(
             matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
             "expected UnsupportedSelectorGrammar, got {err:?}"
@@ -595,7 +603,9 @@ mod k8s_discovery_config_tests {
     #[test]
     fn mode_accepts_comma_separated_equality_terms() {
         // The canonical Plain-mode selector form: `key1=v1,key2=v2`.
-        let m = cfg(Some("app=sglang,zone=us-east"), None, None).mode().unwrap();
+        let m = cfg(Some("app=sglang,zone=us-east"), None, None)
+            .mode()
+            .unwrap();
         assert_eq!(
             m,
             K8sDiscoveryMode::Plain {

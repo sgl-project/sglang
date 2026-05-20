@@ -92,9 +92,7 @@ async fn diff_and_emit(
                 })
                 .await?;
             }
-            if p.url != n.url
-                || p.model_ids != n.model_ids
-                || p.bootstrap_port != n.bootstrap_port
+            if p.url != n.url || p.model_ids != n.model_ids || p.bootstrap_port != n.bootstrap_port
             {
                 // URL, model set, or bootstrap_port change: treat as
                 // Removed+Added so the registry rebuilds cleanly. Without
@@ -315,13 +313,16 @@ mod tests {
         };
         let mut prev: HashMap<WorkerId, WorkerSpec> =
             [(id.clone(), prev_spec)].into_iter().collect();
-        let next: HashMap<WorkerId, WorkerSpec> =
-            [(id.clone(), next_spec)].into_iter().collect();
+        let next: HashMap<WorkerId, WorkerSpec> = [(id.clone(), next_spec)].into_iter().collect();
 
         let (tx, mut rx) = mpsc::channel(4);
         diff_and_emit(&mut prev, next, &tx).await.unwrap();
-        let first = rx.try_recv().expect("port change must emit at least one event");
-        let second = rx.try_recv().expect("port change must emit Remove+Added pair");
+        let first = rx
+            .try_recv()
+            .expect("port change must emit at least one event");
+        let second = rx
+            .try_recv()
+            .expect("port change must emit Remove+Added pair");
         assert!(matches!(first, DiscoveryEvent::Removed { .. }), "{first:?}");
         assert!(matches!(second, DiscoveryEvent::Added(_)), "{second:?}");
     }

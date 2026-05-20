@@ -146,13 +146,13 @@ impl Clock for SystemTimeClock {
 /// type is `Send + Sync` so it can be stored behind `Arc<dyn Clock>`.
 #[derive(Debug)]
 pub struct MockClock {
-    now: parking_lot::Mutex<Instant>,
+    now: Mutex<Instant>,
 }
 
 impl MockClock {
     pub fn new(start: Instant) -> Self {
         Self {
-            now: parking_lot::Mutex::new(start),
+            now: Mutex::new(start),
         }
     }
 
@@ -838,7 +838,7 @@ mod tests {
     /// `sgl_router_active_load` permanently at 0 in production.
     #[test]
     fn metrics_gauge_tracks_active_load_on_register_and_drop() {
-        use crate::server::metrics::{ActiveLoadKind, MetricsRegistry};
+        use crate::server::metrics::MetricsRegistry;
 
         let (registry, _) = registry_with_mock_clock(Duration::from_secs(60));
         let metrics = MetricsRegistry::new();

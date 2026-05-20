@@ -71,7 +71,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
         let model = model.clone();
         handles.push(std::thread::spawn(move || {
             for _ in 0..200 {
-                r.add(WorkerSpec {
+                let _ = r.add(WorkerSpec {
                     id: WorkerId(format!("w{i}")),
                     url: format!("http://w{i}:30000"),
                     mode: WorkerMode::Plain,
