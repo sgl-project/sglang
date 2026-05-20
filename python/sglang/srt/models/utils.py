@@ -28,7 +28,6 @@ from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_q
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -277,9 +276,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and forward_batch.kv_cache_dtype is not None
+        and forward_batch.kv_cache_dtype == torch.bfloat16
+        and not forward_batch.is_swa
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
