@@ -667,6 +667,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 ),
             )
 
+        # Piecewise CUDA graph looks for hasattr(model, "model"). Kimi VLMs only
+        # expose language_model; same pattern as internvl.py (sgl-project/sglang#20747).
+        if self.language_model is not None:
+            self.model = self.language_model.model
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if self.language_model is not None and hasattr(self.language_model, "dtype"):

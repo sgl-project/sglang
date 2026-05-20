@@ -1,6 +1,9 @@
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
@@ -149,6 +152,9 @@ def handle_attention_tokenspeed_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
+    # BCG/PCG capture: aiter fp8 MLA prefill lacks capture kernels; use MHA (attn_mha).
+    if is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+        return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA
     else:
