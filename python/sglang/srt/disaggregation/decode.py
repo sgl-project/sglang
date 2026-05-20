@@ -961,8 +961,13 @@ class DecodePreallocQueue:
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
+                state_page_size = (
+                    self.token_to_kv_pool.swa_page_size
+                    if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    else page_size
+                )
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, state_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -972,7 +977,7 @@ class DecodePreallocQueue:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), state_page_size
                 )
 
             def _nsa_payload():
@@ -1002,7 +1007,10 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
-            if device_kv_page_indices is not None:
+            is_fake_transfer = _is_fake_transfer(
+                decode_req.req, self.scheduler.server_args
+            )
+            if device_kv_page_indices is not None and not is_fake_transfer:
                 if self.transfer_backend != TransferBackend.MOONCAKE:
                     raise NotImplementedError(
                         "DeepSeek V4 HiSparse PD direct-to-host currently "
