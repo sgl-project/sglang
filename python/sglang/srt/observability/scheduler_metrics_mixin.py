@@ -998,17 +998,27 @@ class SchedulerMetricsMixin:
         num_running_reqs = len(self.running_batch.reqs)
 
         waiting_queues = [self.waiting_queue]
+        pending_token_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            prefill_bootstrap_queue = self.disagg_prefill_bootstrap_queue.queue
+            waiting_queues.append(prefill_bootstrap_queue)
+            pending_token_queues.append(prefill_bootstrap_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+            decode_prealloc_queue = self.disagg_decode_prealloc_queue.queue
+            decode_transfer_queue = self.disagg_decode_transfer_queue.queue
+            decode_retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+            waiting_queues.append(decode_prealloc_queue)
+            waiting_queues.append(decode_transfer_queue)
+            waiting_queues.append(decode_retracted_queue)
+            # In disaggregated decode, transfer-queue requests and transferred
+            # waiting-queue requests have already pre-allocated decode-side KV
+            # slots, so they are already included in num_used_tokens.
+            pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
         num_total_tokens = num_used_tokens + sum(
-            req.seqlen for queue in waiting_queues for req in queue
+            req.seqlen for queue in pending_token_queues for req in queue
         )
 
         memory = None
