@@ -1,28 +1,17 @@
-"""GPU forward-pass occupancy sanity kit (single-batch decode).
+"""Single-batch decode GPU occupancy sanity kit.
 
-Probes the ``sglang:fwd_occupancy`` Prometheus gauge while a single
-long ``/generate`` request is in flight (batch_size = 1 decode) and
-asserts the steady-state value clears a threshold.
+Probes ``sglang:fwd_occupancy`` (a 0-100 percentage averaged over the
+last ``decode_log_interval`` batches; resets to NaN at window
+boundaries) under one long single-batch ``/generate`` request, and
+asserts median above a threshold. Single-batch is where CPU overhead
+dominates -- overlap scheduler / cuda graph regressions surface here
+before batched throughput moves.
 
-Single-batch decode is the worst case for CPU overhead: each decode
-step produces just one token, so per-step host-side work (kernel
-dispatch, sampling, metadata bookkeeping) competes with a single tiny
-forward pass. If the overlap scheduler or cuda graph capture stalls,
-GPU idle ratio shoots up here before anything shows in batched
-throughput numbers.
-
-The gauge is a percentage in [0, 100] -- ``gpu_busy / wall_clock * 100``
-over the most recent ``decode_log_interval`` batches. It cycles back to
-NaN on every window reset, so the probe filters NaN samples.
-
-Prerequisites on the server launched by the consuming test class:
+Prerequisites on the consuming server:
     env:          SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
     server flag:  --enable-metrics
 
-Without both, ``sglang:fwd_occupancy`` is either not exposed or
-permanently NaN, and the probe fails fast with a clear message.
-
-Mix into any ``CustomTestCase`` subclass that exposes ``self.base_url``.
+Mix into a ``CustomTestCase`` subclass exposing ``self.base_url``.
 """
 
 import re
@@ -41,34 +30,25 @@ _METRICS_REQUEST_TIMEOUT = 10
 
 
 class FwdOccupancyMixin:
-    """Assert steady-state ``sglang:fwd_occupancy`` for single-batch decode.
+    """Assert single-batch ``sglang:fwd_occupancy`` median > threshold."""
 
-    Threshold is a percentage in [0, 100]. Default 95.0 -- single-batch
-    decode with overlap scheduler + cuda graph on a healthy GPU should
-    hold steady-state 95+; falling below this points at CPU-side
-    regressions even when batched throughput still looks fine.
-    """
-
-    # Threshold + detection
     fwd_occupancy_threshold: float = 95.0
     fwd_occupancy_min_samples: int = 5
     fwd_occupancy_scrape_interval: float = 0.5
 
-    # Warmup phase -- one short request to fill cuda graphs and let the
-    # device-timer window emit its first non-NaN sample.
+    # Warmup: one short request to fill cuda graphs + get the
+    # device-timer past its first NaN window.
     fwd_occupancy_warmup_max_new_tokens: int = 64
     fwd_occupancy_warmup_settle_seconds: float = 1.0
 
-    # Measurement load -- one long single-batch request. max_new_tokens
-    # must cover many decode_log_interval windows worth of decode steps
-    # so the scraper collects enough samples.
+    # Measurement: one long single-batch request -- max_new_tokens must
+    # span several decode_log_interval windows for enough samples.
     fwd_occupancy_max_new_tokens: int = 2048
     fwd_occupancy_prompt: str = "Write a long, detailed, multi-paragraph story about "
 
     def _scrape_fwd_occupancy(self):
-        """Return the max non-NaN ``sglang:fwd_occupancy`` value across
-        exposed labels (e.g. dp ranks); None on transient scrape failure
-        or no non-NaN sample."""
+        """Max non-NaN gauge value across exposed labels (e.g. dp ranks);
+        None on transient scrape failure."""
         try:
             resp = requests.get(
                 self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
@@ -88,9 +68,8 @@ class FwdOccupancyMixin:
         return max(vals) if vals else None
 
     def _assert_metrics_device_timer_enabled(self):
-        """Fail loudly if --enable-metrics or
-        SGLANG_ENABLE_METRICS_DEVICE_TIMER aren't in effect; otherwise
-        a missing gauge would look like a real occupancy regression."""
+        """Fail loudly on missing flag/env -- otherwise a NaN-only gauge
+        looks like a real occupancy regression."""
         resp = requests.get(
             self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
         )
@@ -105,9 +84,8 @@ class FwdOccupancyMixin:
         )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Synchronously fire one /generate request. Single batch_size=1
-        decode -- this method must never be called concurrently if the
-        probe's single-batch invariant is to hold."""
+        """Fire one /generate. Must not be called concurrently -- that
+        would break the single-batch invariant."""
         try:
             requests.post(
                 self.base_url + "/generate",
@@ -121,14 +99,13 @@ class FwdOccupancyMixin:
                 timeout=_GENERATE_REQUEST_TIMEOUT,
             )
         except requests.RequestException:
-            # Individual fire failure is not the probe's concern; the
-            # final stats-vs-threshold check is the signal.
+            # Final stats-vs-threshold is the signal; individual fire
+            # failure isn't.
             pass
 
     def _fwd_occupancy_warmup(self):
-        """Fire one short request synchronously to fill cuda graphs and
-        let the device-timer window emit its first non-NaN sample before
-        measurement starts."""
+        """Fill cuda graphs + step the device-timer past its first NaN
+        window before measurement starts."""
         self._fwd_occupancy_fire(
             "warmup " + self.fwd_occupancy_prompt,
             self.fwd_occupancy_warmup_max_new_tokens,
@@ -136,9 +113,8 @@ class FwdOccupancyMixin:
         time.sleep(self.fwd_occupancy_warmup_settle_seconds)
 
     def _fwd_occupancy_measure(self):
-        """Fire one long single-batch request in a background thread and
-        scrape /metrics from the main thread while it's in flight;
-        return the list of non-NaN occupancy samples observed."""
+        """Background-fire one long single-batch request, scrape
+        /metrics on the foreground; return non-NaN samples."""
         samples = []
         samples_lock = threading.Lock()
         request_done = threading.Event()

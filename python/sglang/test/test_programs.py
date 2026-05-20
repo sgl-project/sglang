@@ -584,10 +584,7 @@ def test_hellaswag_select():
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
     print(f"{accuracy=}, {accuracy_gen=} {latency=:.2f}s {latency_gen=:.2f}s")
     assert np.abs(accuracy_gen - accuracy) < 0.1
-    # Note: latency comparison removed -- the second run hits the radix
-    # prefix cache populated by the first run, so its wall-clock is
-    # consistently a small fraction of the first run regardless of
-    # generator_style.
+    # No latency assert: the 2nd run hits the radix cache the 1st filled.
 
     return accuracy, latency
 

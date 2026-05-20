@@ -56,11 +56,8 @@ class TestBasicSanity(
         kill_process_tree(cls.process.pid)
 
     def test_accuracy_floor(self):
-        # Stage-a-private accuracy guard: hellaswag via the frontend DSL
-        # bound to this server. Catches systematic regressions that pass
-        # every cheap probe in the mixed-in kits but tank multi-choice
-        # reasoning. Not part of any reusable mixin -- accuracy gating
-        # is the gate test's own responsibility.
+        # Stage-a's own accuracy gate -- catches systematic regressions
+        # that pass every cheap probe but tank multi-choice reasoning.
         import sglang as sgl
         from sglang.test.test_programs import test_hellaswag_select
 
