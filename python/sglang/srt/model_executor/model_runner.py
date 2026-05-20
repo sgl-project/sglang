@@ -139,6 +139,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
     set_torch_compile_config,
+    torch_compile,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -443,9 +444,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eagle_aux_hidden_state_layer_ids = None
 
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                parse_dflash_draft_config,
-            )
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building DFlash context features.
             draft_model_config = ModelConfig.from_server_args(
@@ -753,6 +752,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called BEFORE init_device_graphs() so CUDA graph capture
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
+
+        # Collect attention/moe layer references for downstream consumers
+        # (e.g. CUDA graph runner, piecewise CUDA graph capture, torch.compile fusion passes).
+        # Must run before init_device_graphs(), since CudaGraphRunner reads
+        # model_runner.attention_layers in its constructor.
+        self.collect_attention_and_moe_layers()
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -2311,9 +2316,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            pre_initialize_workspaces,
-        )
+        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
@@ -2748,6 +2751,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            if self.server_args.enable_torch_compile:
+                torch_compile(self.model, self.server_args, self.model_config)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -2787,52 +2792,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-    def init_piecewise_cuda_graphs(self):
-        """Initialize piecewise CUDA graph runner."""
-        self.piecewise_cuda_graph_runner = None
+    def collect_attention_and_moe_layers(self) -> bool:
+        """Populate ``self.attention_layers``, ``self.moe_layers`` and
+        ``self.moe_fusions`` by walking the model's transformer layers.
 
-        if self.server_args.disable_piecewise_cuda_graph:
-            logger.info(
-                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
-            )
-            return
+        Returns ``True`` if collection succeeded, ``False`` otherwise.
+        On failure the three lists are still initialised (empty) so callers
+        can safely reference them.
+        """
+        self.attention_layers = []
+        self.moe_layers = []
+        self.moe_fusions = []
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
-            return
-
-        # Disable piecewise CUDA graph for non-language models
+        # Non-language models don't expose a ``model`` attribute we can walk.
         if not hasattr(self.model, "model"):
-            logger.warning(
-                "Disable piecewise CUDA graph because the model is not a language model"
-            )
-            return
-
-        # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.piecewise_cuda_graph_tokens:
-            logger.warning(
-                "Disable piecewise CUDA graph because the capture size is not set"
-            )
-            return
+            return False
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
+        # Resolve model with layers: handle CausalLM wrapper (.model.layers)
+        # and direct TextModel (.layers).
         if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
             layer_model = language_model.model
         elif hasattr(language_model, "layers"):
             layer_model = language_model
         else:
             logger.warning(
-                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+                "Could not collect attention/moe layers: model does not have a 'layers' attribute"
             )
-            return
+            return False
 
-        self.attention_layers = []
-        self.moe_layers = []
-        self.moe_fusions = []
         for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -2885,6 +2876,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+
+        return True
+
+    def init_piecewise_cuda_graphs(self):
+        """Initialize piecewise CUDA graph runner."""
+        self.piecewise_cuda_graph_runner = None
+
+        if self.server_args.disable_piecewise_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
+            )
+            return
+
+        # Draft models use decode CUDA graphs, not PCG
+        if self.is_draft_worker:
+            return
+
+        # Disable piecewise CUDA graph for non-language models
+        if not hasattr(self.model, "model"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model is not a language model"
+            )
+            return
+
+        # Disable piecewise CUDA graph for non capture size
+        if not self.server_args.piecewise_cuda_graph_tokens:
+            logger.warning(
+                "Disable piecewise CUDA graph because the capture size is not set"
+            )
+            return
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA

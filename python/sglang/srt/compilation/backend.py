@@ -22,6 +22,7 @@ from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
+from sglang.srt.compilation.pass_config import PassConfig
 from sglang.srt.compilation.pass_manager import PostGradPassManager
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
@@ -382,12 +383,13 @@ class SGLangBackend:
     def __init__(
         self,
         config: CompilationConfig,
+        pass_config: PassConfig,
         graph_pool: Any,
     ):
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
-        self.post_grad_pass_manager = PostGradPassManager()
+        self.post_grad_pass_manager = PostGradPassManager(pass_config)
         self.sym_tensor_indices = []
         self.input_buffers = []
 

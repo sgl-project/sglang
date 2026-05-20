@@ -31,6 +31,7 @@ import tqdm
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -446,10 +447,25 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             _to_torch(sub, reverse, num_tokens)
 
 
+def _torch_compile_wrapper(forward):
+    return torch.compile(
+        torch.no_grad()(forward),
+        mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
+        dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
+        fullgraph=True,
+    )
+
+
+def torch_compile(model: torch.nn.Module, server_args, model_config):
+    set_torch_compile_config(server_args, model_config)
+    model.forward = _torch_compile_wrapper(model.forward)
+
+
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
+    enable_fusion: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
@@ -458,34 +474,42 @@ def patch_model(
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            if not enable_fusion:
+                _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
-            )
+            yield _torch_compile_wrapper(model.forward)
         else:
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            if not enable_fusion:
+                _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config():
+def set_torch_compile_config(server_args, model_config):
     import torch._dynamo.config
     import torch._inductor.config
 
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    if server_args.enable_torch_compile_fusion:
+        from sglang.srt.compilation.pass_config import PassConfig
+        from sglang.srt.compilation.pass_manager import PostGradPassManager
+
+        pass_config = PassConfig.from_server_args_and_model_config(
+            server_args, model_config
+        )
+        pass_manager = PostGradPassManager(pass_config)
+        pass_manager.configure()
+
+        torch._inductor.config.post_grad_custom_post_pass = pass_manager
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -563,6 +587,9 @@ class CudaGraphRunner:
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile_fusion = (
+            model_runner.server_args.enable_torch_compile_fusion
+        )
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -659,7 +686,9 @@ class CudaGraphRunner:
         )
 
         if self.enable_torch_compile:
-            set_torch_compile_config()
+            set_torch_compile_config(
+                self.model_runner.server_args, self.model_runner.model_config
+            )
 
         if self.model_runner.server_args.enable_lora:
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
@@ -704,6 +733,19 @@ class CudaGraphRunner:
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+        # Forward context for unified attention op
+        self.attention_layers = model_runner.attention_layers
+        self.quant_config = getattr(model_runner.model, "quant_config", None)
+        self.moe_layers = model_runner.moe_layers
+        self.moe_fusions = model_runner.moe_fusions
+
+        # Speculative_inference
+        if (
+            model_runner.spec_algorithm.is_eagle3()
+            and model_runner.eagle_use_aux_hidden_state
+        ):
+            self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
         try:
@@ -849,6 +891,7 @@ class CudaGraphRunner:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
+                    self.enable_torch_compile_fusion,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
@@ -1113,12 +1156,19 @@ class CudaGraphRunner:
             ):
                 kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
 
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
+            with set_forward_context(
                 forward_batch,
-                **kwargs,
-            )
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ):
+                logits_output_or_pp_proxy_tensors = forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1293,6 +1343,7 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={

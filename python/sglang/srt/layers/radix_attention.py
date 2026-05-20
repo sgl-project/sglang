@@ -134,6 +134,22 @@ class RadixAttention(nn.Module):
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
             return output
+        elif (
+            forward_batch.forward_mode.is_decode() and get_forward_context() is not None
+        ):
+            if self.qk_head_dim != self.v_head_dim:
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+            else:
+                output = torch.empty_like(q)
+            if is_in_breakable_cuda_graph():
+                bcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            else:
+                unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            return output
         else:
             return forward_batch.attn_backend.forward(
                 q,
@@ -146,7 +162,22 @@ class RadixAttention(nn.Module):
             )
 
 
-@register_custom_op(mutates_args=["output"])
+def _unified_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    return
+
+
+@register_custom_op(fake_impl=_unified_attention_fake)
 @register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
