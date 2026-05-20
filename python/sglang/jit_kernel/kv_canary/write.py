@@ -27,7 +27,7 @@ class CanaryPseudoMode(IntEnum):
     pseudo_expected_positions tensors (computed by whatever oracle the caller chose) and the kernel
     compares actuals against them per chain step; mismatch → violation, chain still advances on actuals.
 
-    Mirrored in C++ as kCanaryPseudoMode*; value parity enforced by test_unit_const_sync.py.
+    Mirrored in C++ as kCanaryPseudoMode*; value parity enforced by test_const_sync.py.
     """
 
     OFF = 0  # No comparison; pseudo_expected_* tensors ignored (may be unallocated / cuda-graph dummies).
@@ -46,7 +46,7 @@ class WritePlan:
     is SWA-translated by the plan kernel and lives in write_seed_slot_indices.
 
     Req r's write entries occupy flat indices [write_offsets[r], write_offsets[r+1]). seed_slot_idx == -1 means
-    K_req_old == 0 (anchor on CANARY_CHAIN_ANCHOR; §6.1).
+    K_req_old == 0 (anchor on CANARY_CHAIN_ANCHOR).
 
     Sweep callers fill an "empty" WritePlan (write_num_valid_reqs = 0) and skip canary_write_step entirely —
     plan kernel always produces both VerifyPlan and WritePlan in one launch, so an unused WritePlan is the
@@ -57,7 +57,7 @@ class WritePlan:
             out_cache_loc, shape [write_req_capacity + 1], int32. write_offsets[0] == 0;
             write_offsets[write_num_valid_reqs[0]] == total_write_entries.
         write_seed_slot_indices: Chain-seed slot per write req, shape [write_req_capacity], int32. Already
-            SWA-translated. -1 = no prefix (chain anchors on CANARY_CHAIN_ANCHOR; §6.1).
+            SWA-translated. -1 = no prefix (chain anchors on CANARY_CHAIN_ANCHOR).
         write_num_valid_reqs: Active write-req count, shape [1], int32. canary_write_step skips blocks with
             block_id >= write_num_valid_reqs[0].
     """
@@ -134,9 +134,9 @@ def canary_write_step(
     ``canary_buf[plan.write_seed_slot_indices[r]]`` and set
     ``running_prev_hash = splitmix64(seed.prev_hash XOR seed.token XOR seed.position XOR seed.real_kv_hash)``
     (i.e. apply the same advance step that produced ``seed``'s successor — this keeps slot[0]'s stored
-    ``prev_hash`` consistent with §6.1's chain link). Else
+    ``prev_hash`` consistent with the chain link). Else
     ``running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)``. ``write_seed_slot_indices`` is already
-    SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (§6.1, no runtime seed).
+    SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (no runtime seed).
 
     Pseudo-mode (caller-driven, kernel is oracle-agnostic): when ``pseudo_mode == ON`` the kernel additionally
     compares ``fb_input_ids[i]`` against ``pseudo_expected_tokens[i]`` and ``fb_positions[i]`` against

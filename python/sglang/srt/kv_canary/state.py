@@ -72,7 +72,7 @@ class CanaryDeviceState:
             CanaryLaunchTag into each violation row.
         kernel_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. The
             kernel itself does NOT index this array; runner takes a 1-element view at tag's slot (via
-            CanaryEndpoint.kernel_run_counter_view, §2.4) and hands a shape [1] tensor to the kernel,
+            CanaryEndpoint.kernel_run_counter_view) and hands a shape [1] tensor to the kernel,
             which atomicAdds 1 regardless of whether the plan had any active entry. Health watchdog
             reads this array to confirm "canary path actually ran".
         slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
