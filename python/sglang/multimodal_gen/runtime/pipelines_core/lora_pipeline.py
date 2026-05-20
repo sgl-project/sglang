@@ -2,12 +2,16 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
-import torch
-import torch.distributed as dist
 from collections import defaultdict
 from collections.abc import Hashable
 from contextlib import contextmanager, nullcontext
+from typing import Any
+
+import torch
+import torch.distributed as dist
 from safetensors.torch import load_file
+from torch.distributed.tensor import DTensor
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -15,9 +19,6 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    is_layerwise_offloaded_module,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
@@ -30,8 +31,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from torch.distributed.tensor import DTensor
-from typing import Any
 
 # to avoid deadlocks when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -828,9 +827,7 @@ class LoRAPipeline(ComposedPipelineBase):
             tgt_strengths = [strengths[i] for i in idx_list]
 
             merged_name = (
-                ",".join(tgt_nicknames)
-                if len(tgt_nicknames) > 1
-                else tgt_nicknames[0]
+                ",".join(tgt_nicknames) if len(tgt_nicknames) > 1 else tgt_nicknames[0]
             )
 
             # Skip if LoRA configuration matches exactly (including order and strength)
