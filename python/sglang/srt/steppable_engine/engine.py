@@ -65,26 +65,11 @@ class SteppableEngine:
         **engine_kwargs: Any,
     ) -> "SteppableEngine":
         engine = Engine(**engine_kwargs)
-        cls._validate_server_args(engine)
 
         config = SteppableEngineConfig(apply_pr_25015_fix=apply_pr_25015_fix)
         instance = cls(config=config, engine=engine)
         instance._enter_stepping_mode()
         return instance
-
-    @staticmethod
-    def _validate_server_args(engine: Engine) -> None:
-        server_args = engine.server_args
-        if server_args.tp_size != 1 or server_args.pp_size != 1:
-            raise NotImplementedError(
-                "tp_size>1 / pp_size>1 is not supported (single-GPU only)"
-            )
-        if server_args.attn_cp_size != 1:
-            raise NotImplementedError(
-                "attn_cp_size>1 is not supported (single-GPU only)"
-            )
-        if server_args.enable_dp_attention:
-            raise NotImplementedError("enable_dp_attention=True is not supported")
 
     def _enter_stepping_mode(self) -> None:
         self._apply_pr_fix_toggles()
