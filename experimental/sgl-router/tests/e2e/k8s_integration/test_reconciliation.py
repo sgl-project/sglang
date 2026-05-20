@@ -28,19 +28,6 @@ from conftest import (
     logger,
 )
 
-# TODO: re-enable once the router gains chat-handler retry on
-# UpstreamUnreachable (or moves WorkerId off ip:port to pod UID).
-# These tests fail when run as part of the full suite because
-# accumulated worker churn from earlier tests (test_cross_namespace,
-# test_lifecycle) leaves breakers open and registry entries pointing
-# at terminating pod IPs. Each test passes in isolation; the router's
-# single-shot dispatch can't absorb the brief connection-refused
-# window after scale events. Locally verified with `pytest
-# test_reconciliation.py` (no other files) → 3 passed.
-_FLAKY_UNTIL_RETRY_LANDS = pytest.mark.skip(
-    reason="flaky under full-suite churn; needs router-side dispatch retry — see TODO above"
-)
-
 
 def _scale_fake_worker(replicas: int) -> None:
     _kubectl(
@@ -66,7 +53,6 @@ def _can_route(router_url: str) -> bool:
 class TestWatcherDiscovery:
     """The EndpointSlice watcher discovers new endpoints on Deployment scale-up."""
 
-    @_FLAKY_UNTIL_RETRY_LANDS
     def test_watcher_discovers_new_endpoints_on_scale_up(self, router_url):
         """Scale from 1 to 3 replicas; router must continue routing successfully."""
         _scale_fake_worker(1)
@@ -96,7 +82,6 @@ class TestStaleEndpointRemoval:
     that scaling back to 2 restores routing), then restore.
     """
 
-    @_FLAKY_UNTIL_RETRY_LANDS
     def test_routing_restores_after_scale_down_and_back_up(self, router_url):
         """Scale to 0 (no workers → expect non-200), then restore to 2.
         After restore the router must route again within the reconciliation window.
@@ -151,7 +136,6 @@ class TestReconciliationConsistency:
     worker state — no spurious deregistrations or duplicate registrations."""
 
     @pytest.mark.slow
-    @_FLAKY_UNTIL_RETRY_LANDS
     def test_routing_stable_over_multiple_reconciliation_cycles(self, router_url):
         """Deploy 3 workers, sample routing success over ~150s (2 reconciliation
         cycles + margin), assert no interruptions."""
