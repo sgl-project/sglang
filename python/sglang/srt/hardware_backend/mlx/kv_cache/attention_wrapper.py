@@ -19,7 +19,9 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
     get_num_heads,
     get_num_kv_heads,
 )
-from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import ContiguousKVCache
+from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
+    ContiguousAttentionKVCache,
+)
 
 _thread_local = threading.local()
 
@@ -31,8 +33,9 @@ class BatchedDecodeContext:
 
     batch_size: int
     seq_lens: list[int]  # per-request token count before the new token
-    # layer_caches[layer_idx][req_idx] = ContiguousKVCache
-    layer_caches: list[list[ContiguousKVCache]]
+    # attention_layer_caches[attention_pool_idx][req_idx] = ContiguousAttentionKVCache
+    attention_layer_caches: list[list[ContiguousAttentionKVCache]]
+    attention_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
 
     # Optional AOT kernel state. Keep kernel-specific fields out of the regular
     # MLX decode path so future AOT kernels can be added without growing this
@@ -56,36 +59,48 @@ class BatchedDecodeContext:
         self.needs_padding = min(seq_lens) < max_seq_len
         self.pad_sizes = [max_seq_len - s for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
+        if not self.attention_pool_index_by_layer:
+            self.attention_pool_index_by_layer = {
+                idx: idx for idx in range(len(self.attention_layer_caches))
+            }
 
     @classmethod
     def from_decode(
         cls,
         *,
-        caches: list[list[ContiguousKVCache]],
+        caches: list[list[Any]],
         num_layers: int,
         req_ids: list[str],
         aot_kernels: MlxAOTKernelSet,
         kv_pool: Any | None,
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
+        attention_layer_indices: list[int] | None = None,
+        attention_pool_index_by_layer: dict[int, int] | None = None,
     ) -> "BatchedDecodeContext":
+        del num_layers
         batch_size = len(req_ids)
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
-        layer_caches = [
+        if attention_layer_indices is None:
+            attention_layer_indices = list(range(len(caches[0])))
+        seq_lens = [
+            caches[i][attention_layer_indices[0]].offset for i in range(batch_size)
+        ]
+        attention_layer_caches = [
             [caches[i][layer_idx] for i in range(batch_size)]
-            for layer_idx in range(num_layers)
+            for layer_idx in attention_layer_indices
         ]
         return cls(
             batch_size=batch_size,
             seq_lens=seq_lens,
-            layer_caches=layer_caches,
+            attention_layer_caches=attention_layer_caches,
+            attention_pool_index_by_layer=attention_pool_index_by_layer or {},
             aot=MlxAOTKernelContext.from_decode(
                 aot_kernels=aot_kernels,
                 kv_pool=kv_pool,
                 req_ids=req_ids,
                 req_pool_idx=req_pool_idx,
                 req_to_token_pool=req_to_token_pool,
-                layer_caches=layer_caches,
+                layer_caches=attention_layer_caches,
             ),
         )
 
@@ -168,6 +183,7 @@ class MLXAttentionWrapper(nn.Module):
 
         # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
+        attention_pool_idx = ctx.attention_pool_index_by_layer[layer_idx]
 
         if ctx.aot.rope is not None:
             # AOT path: real .metallib RoPE + fused KV pool scatter.
@@ -176,7 +192,7 @@ class MLXAttentionWrapper(nn.Module):
                 keys,
                 values,
                 offsets,
-                layer_idx,
+                attention_pool_idx,
                 ctx.aot.rope,
             )
         else:
@@ -185,7 +201,7 @@ class MLXAttentionWrapper(nn.Module):
             queries = inner.rope(queries, offset=offsets)
             keys = inner.rope(keys, offset=offsets)
 
-        layer_caches = ctx.layer_caches[layer_idx]
+        layer_caches = ctx.attention_layer_caches[attention_pool_idx]
         pad_sizes = ctx.pad_sizes
 
         # TODO: replace per-request loop with native batched/ragged
@@ -236,7 +252,7 @@ class MLXAttentionWrapper(nn.Module):
         keys: mx.array,
         values: mx.array,
         positions: mx.array,
-        layer_idx: int,
+        attention_pool_idx: int,
         rope_ctx: MlxAOTRoPEContext,
     ) -> tuple[mx.array, mx.array]:
         """AOT path: rotate Q/K and scatter K/V into the shared pool.
@@ -260,8 +276,8 @@ class MLXAttentionWrapper(nn.Module):
         else:
             slots = rope_ctx.new_token_slots.astype(mx.int32)
 
-        k_pool = rope_ctx.kv_pool.k_buffer[layer_idx]
-        v_pool = rope_ctx.kv_pool.v_buffer[layer_idx]
+        k_pool = rope_ctx.kv_pool.k_buffer[attention_pool_idx]
+        v_pool = rope_ctx.kv_pool.v_buffer[attention_pool_idx]
 
         q_rot, k_rot, k_pool_new, v_pool_new = rope_ctx.kernel.rope_pool_fused(
             q_flat,
@@ -277,8 +293,8 @@ class MLXAttentionWrapper(nn.Module):
             rope_base=rope_ctx.kernel.base,
         )
         # Rebind pool buffers (zero-copy donation result).
-        rope_ctx.kv_pool.k_buffer[layer_idx] = k_pool_new
-        rope_ctx.kv_pool.v_buffer[layer_idx] = v_pool_new
+        rope_ctx.kv_pool.k_buffer[attention_pool_idx] = k_pool_new
+        rope_ctx.kv_pool.v_buffer[attention_pool_idx] = v_pool_new
 
         # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
         return q_rot[:, :, None, :], k_rot[:, :, None, :]
