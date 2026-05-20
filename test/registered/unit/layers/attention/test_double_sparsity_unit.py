@@ -1597,9 +1597,9 @@ class TestBenchmarkCompareReader(unittest.TestCase):
         self.assertIn("No-op detector:** unknown", md)
         self.assertNotIn("No-op detector:** clean", md)
 
-    def test_strict_gpu_rejects_when_both_missing(self):
-        """Round-6 fix [P2]: --strict-gpu must reject when GPU IDs are
-        absent on both sides, not silently accept None==None.
+    def test_gpu_check_rejects_when_both_missing_by_default(self):
+        """Round-6/12 fix [P2]: gpu_id is part of the default required
+        context (no flags needed); two missing GPU IDs are a mismatch.
         """
 
         bc = self._import_compare()
@@ -1607,13 +1607,13 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             gpu_id=None, tp_size=8, page_size=64,
             disable_radix_cache=True, concurrency=32,
         )
-        reasons = bc._match_or_refuse(empty, empty, strict_gpu=True)
+        reasons = bc._match_or_refuse(empty, empty)
         self.assertTrue(
             any("gpu_id missing" in r for r in reasons),
             f"expected gpu_id missing reason; got {reasons}",
         )
 
-    def test_strict_gpu_rejects_when_one_missing(self):
+    def test_gpu_check_rejects_when_one_missing_by_default(self):
         bc = self._import_compare()
         base = bc.RunContext(
             gpu_id="H200", tp_size=8, page_size=64,
@@ -1623,14 +1623,49 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             gpu_id=None, tp_size=8, page_size=64,
             disable_radix_cache=True, concurrency=32,
         )
-        reasons = bc._match_or_refuse(base, ds, strict_gpu=True)
+        reasons = bc._match_or_refuse(base, ds)
         self.assertTrue(
             any("gpu_id missing" in r for r in reasons),
             f"expected gpu_id missing reason; got {reasons}",
         )
 
-    def test_strict_gpu_accepts_when_both_match(self):
-        """Sanity: strict-GPU still publishes when GPU IDs match."""
+    def test_gpu_check_rejects_mismatch_by_default(self):
+        """Round-12 fix [P2]: comparing runs on different GPU IDs must
+        fail by default, not require the operator to remember a flag.
+        """
+
+        bc = self._import_compare()
+        base = bc.RunContext(
+            gpu_id="H200", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        ds = bc.RunContext(
+            gpu_id="A100", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(base, ds)
+        self.assertTrue(
+            any("gpu_id mismatch" in r for r in reasons),
+            f"expected gpu_id mismatch reason; got {reasons}",
+        )
+
+    def test_gpu_check_skipped_with_allow_gpu_mismatch(self):
+        """The opt-out flag lets deliberate cross-hardware reports publish."""
+
+        bc = self._import_compare()
+        base = bc.RunContext(
+            gpu_id="H200", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        ds = bc.RunContext(
+            gpu_id="A100", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(base, ds, allow_gpu_mismatch=True)
+        self.assertEqual(reasons, [])
+
+    def test_default_path_accepts_when_all_fields_match(self):
+        """Sanity: matching contexts (including gpu_id) still publish."""
 
         bc = self._import_compare()
         base = bc.RunContext(
@@ -1641,7 +1676,7 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             gpu_id="H200", tp_size=8, page_size=64,
             disable_radix_cache=True, concurrency=32,
         )
-        reasons = bc._match_or_refuse(base, ds, strict_gpu=True)
+        reasons = bc._match_or_refuse(base, ds)
         self.assertEqual(reasons, [])
 
     def test_no_op_status_clean_when_metrics_present_and_zero(self):

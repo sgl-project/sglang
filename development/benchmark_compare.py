@@ -11,10 +11,12 @@ concurrency context disagree. The match-enforcement contract from AC-7:
 
     {GPU id, TP size, page size, radix-cache setting, concurrency}
 
-must be identical between the two columns. Bench_serving currently records
-some of these as run-level metadata; missing fields are best-effort matched
-against the filename tags (e.g. ``native_nsa_gsp_isl4096_osl512_c64.jsonl``
-implies concurrency=64).
+must be identical between the two columns. All five are enforced by
+default; pass ``--allow-gpu-mismatch`` only for deliberate cross-hardware
+comparison reports. Bench_serving currently records most of these as
+run-level metadata; missing fields are best-effort matched against the
+filename tags (e.g. ``native_nsa_gsp_isl4096_osl512_c64.jsonl`` implies
+concurrency=64).
 
 SLO gate per AC-8: each row is annotated with `pass` / `fail` against
 ``per_request_output_tps_p50 >= 30`` and ``ttft_p99_s <= 22``.
@@ -208,42 +210,38 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
 
 
 def _match_or_refuse(
-    baseline: RunContext, ds: RunContext, *, strict_gpu: bool = False
+    baseline: RunContext, ds: RunContext, *, allow_gpu_mismatch: bool = False
 ) -> List[str]:
     """Return a list of human-readable mismatch reasons (empty = match).
 
-    Required context fields (``tp_size``, ``page_size``, ``disable_radix_cache``,
-    ``concurrency``) must be present and equal on both sides. A field that is
-    ``None`` on either side counts as a mismatch — ``None == None`` is not a
-    valid match because the runs were never verified to share that setting.
+    The AC-7 required-match set is ``{gpu_id, tp_size, page_size,
+    disable_radix_cache, concurrency}``. All five are checked by default
+    using the same rule: a field that is ``None`` on either side counts as
+    a mismatch (``None == None`` is not a verified match) and unequal
+    non-None values are a mismatch.
+
+    ``allow_gpu_mismatch=True`` opts out of the ``gpu_id`` check for the
+    rare deliberate cross-hardware comparison report.
     """
 
     reasons: List[str] = []
-    if strict_gpu:
-        if baseline.gpu_id is None or ds.gpu_id is None:
-            reasons.append(
-                "gpu_id missing from one or both runs (strict-gpu requires "
-                f"a verified match): native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
-            )
-        elif baseline.gpu_id != ds.gpu_id:
-            reasons.append(
-                f"gpu_id mismatch: native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
-            )
-    required = (
+    required = [
         ("tp_size", baseline.tp_size, ds.tp_size),
         ("page_size", baseline.page_size, ds.page_size),
         ("disable_radix_cache", baseline.disable_radix_cache, ds.disable_radix_cache),
         ("concurrency", baseline.concurrency, ds.concurrency),
-    )
+    ]
+    if not allow_gpu_mismatch:
+        required.insert(0, ("gpu_id", baseline.gpu_id, ds.gpu_id))
     for name, b, d in required:
         if b is None or d is None:
             reasons.append(
                 f"{name} missing from one or both runs (None is not a match): "
-                f"native_nsa={b} ds={d}"
+                f"native_nsa={b!r} ds={d!r}"
             )
             continue
         if b != d:
-            reasons.append(f"{name} mismatch: native_nsa={b} ds={d}")
+            reasons.append(f"{name} mismatch: native_nsa={b!r} ds={d!r}")
     return reasons
 
 
@@ -341,9 +339,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--json-output", default=None, help="Write JSON report to this path."
     )
     parser.add_argument(
-        "--strict-gpu",
+        "--allow-gpu-mismatch",
         action="store_true",
-        help="Enforce gpu_id match (default: TP/page/radix/concurrency only).",
+        help=(
+            "Skip the gpu_id match check. By default gpu_id is required to "
+            "agree between the two runs (per AC-7's match-enforcement "
+            "contract); use this only for deliberate cross-hardware "
+            "comparison reports."
+        ),
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Verbose logging."
@@ -357,7 +360,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     baseline_ctx, baseline_m = _read_bench_jsonl(args.baseline)
     ds_ctx, ds_m = _read_bench_jsonl(args.ds)
 
-    reasons = _match_or_refuse(baseline_ctx, ds_ctx, strict_gpu=args.strict_gpu)
+    reasons = _match_or_refuse(
+        baseline_ctx, ds_ctx, allow_gpu_mismatch=args.allow_gpu_mismatch,
+    )
     if reasons:
         logger.error(
             "Refusing to publish two-column report — context disagrees:\n  %s",
