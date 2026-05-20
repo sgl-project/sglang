@@ -475,7 +475,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 embedding_start : embedding_start + num_tokens
             ]
             consumed_per_modality[modality] = embedding_start + num_tokens
-            logger.info(f"Get embedding slice for {modality}, num_tokens={num_tokens}")
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
