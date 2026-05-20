@@ -207,30 +207,34 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
 def _match_or_refuse(
     baseline: RunContext, ds: RunContext, *, strict_gpu: bool = False
 ) -> List[str]:
-    """Return a list of human-readable mismatch reasons (empty = match)."""
+    """Return a list of human-readable mismatch reasons (empty = match).
+
+    Required context fields (``tp_size``, ``page_size``, ``disable_radix_cache``,
+    ``concurrency``) must be present and equal on both sides. A field that is
+    ``None`` on either side counts as a mismatch — ``None == None`` is not a
+    valid match because the runs were never verified to share that setting.
+    """
 
     reasons: List[str] = []
     if strict_gpu and baseline.gpu_id != ds.gpu_id:
         reasons.append(
             f"gpu_id mismatch: native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
         )
-    if baseline.tp_size != ds.tp_size:
-        reasons.append(
-            f"tp_size mismatch: native_nsa={baseline.tp_size} ds={ds.tp_size}"
-        )
-    if baseline.page_size != ds.page_size:
-        reasons.append(
-            f"page_size mismatch: native_nsa={baseline.page_size} ds={ds.page_size}"
-        )
-    if baseline.disable_radix_cache != ds.disable_radix_cache:
-        reasons.append(
-            f"disable_radix_cache mismatch: "
-            f"native_nsa={baseline.disable_radix_cache} ds={ds.disable_radix_cache}"
-        )
-    if baseline.concurrency != ds.concurrency:
-        reasons.append(
-            f"concurrency mismatch: native_nsa={baseline.concurrency} ds={ds.concurrency}"
-        )
+    required = (
+        ("tp_size", baseline.tp_size, ds.tp_size),
+        ("page_size", baseline.page_size, ds.page_size),
+        ("disable_radix_cache", baseline.disable_radix_cache, ds.disable_radix_cache),
+        ("concurrency", baseline.concurrency, ds.concurrency),
+    )
+    for name, b, d in required:
+        if b is None or d is None:
+            reasons.append(
+                f"{name} missing from one or both runs (None is not a match): "
+                f"native_nsa={b} ds={d}"
+            )
+            continue
+        if b != d:
+            reasons.append(f"{name} mismatch: native_nsa={b} ds={d}")
     return reasons
 
 
@@ -242,16 +246,29 @@ def _slo_verdict(m: RunMetrics) -> str:
     return "fail"
 
 
-def _no_op_flag(m: RunMetrics) -> str:
-    if m.dense_fallback_total is not None and m.dense_fallback_total != 0:
-        return f"dense_fallback={m.dense_fallback_total}"
-    if (
-        m.selected_pages_mean is not None
-        and m.total_pages_mean is not None
-        and m.selected_pages_mean == m.total_pages_mean
-    ):
-        return "selected_pages == total_pages"
-    return ""
+def _no_op_status(m: RunMetrics) -> Tuple[str, str]:
+    """Return ``(status, reason)`` where status is ``clean`` / ``triggered`` / ``unknown``.
+
+    Returning ``unknown`` when the DS observability fields are absent means
+    the report surfaces "we cannot evaluate" instead of falsely printing
+    "clean". ``bench_serving`` does NOT emit these fields by default — they
+    come from a separate observability path the deploying team must wire.
+    """
+
+    missing: List[str] = []
+    if m.dense_fallback_total is None:
+        missing.append("dense_fallback_total")
+    if m.selected_pages_mean is None:
+        missing.append("selected_pages_mean")
+    if m.total_pages_mean is None:
+        missing.append("total_pages_mean")
+    if missing:
+        return ("unknown", "no-op inputs missing: " + ", ".join(missing))
+    if m.dense_fallback_total != 0:
+        return ("triggered", f"dense_fallback={m.dense_fallback_total}")
+    if m.selected_pages_mean == m.total_pages_mean:
+        return ("triggered", "selected_pages == total_pages")
+    return ("clean", "")
 
 
 def render_markdown_report(
@@ -291,11 +308,13 @@ def render_markdown_report(
 
     rows.append("")
     rows.append(f"**DS SLO verdict (per-request P50 ≥ {SLO_PER_REQUEST_TPS_P50} tok/s, P99 TTFT ≤ {SLO_TTFT_P99_S} s):** {_slo_verdict(ds_metrics)}")
-    ds_no_op = _no_op_flag(ds_metrics)
-    if ds_no_op:
-        rows.append(f"**No-op detector:** triggered ({ds_no_op})")
-    else:
+    ds_status, ds_reason = _no_op_status(ds_metrics)
+    if ds_status == "clean":
         rows.append("**No-op detector:** clean")
+    elif ds_status == "triggered":
+        rows.append(f"**No-op detector:** triggered ({ds_reason})")
+    else:
+        rows.append(f"**No-op detector:** unknown ({ds_reason})")
     return "\n".join(rows) + "\n"
 
 
@@ -347,6 +366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         sys.stdout.write(md)
     if args.json_output:
+        ds_status, ds_reason = _no_op_status(ds_m)
         payload = {
             "baseline_path": args.baseline,
             "ds_path": args.ds,
@@ -355,7 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "baseline_metrics": asdict(baseline_m),
             "ds_metrics": asdict(ds_m),
             "ds_slo_verdict": _slo_verdict(ds_m),
-            "ds_no_op_flag": _no_op_flag(ds_m),
+            "ds_no_op_flag": {"status": ds_status, "reason": ds_reason},
         }
         with open(args.json_output, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)

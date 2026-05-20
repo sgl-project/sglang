@@ -1040,6 +1040,84 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             self.assertAlmostEqual(m.ttft_p50_s, 0.8, places=3)
             self.assertAlmostEqual(m.ttft_p99_s, 21.0, places=3)
 
+    def test_match_refuse_treats_none_context_as_missing(self):
+        """Round-5 fix [P2]: required-context field that is None on either
+        side must be reported as a mismatch, not silently accepted via
+        ``None == None``.
+        """
+
+        bc = self._import_compare()
+        # Both contexts have server_info entirely missing.
+        empty = bc.RunContext(
+            gpu_id="", tp_size=None, page_size=None,
+            disable_radix_cache=None, concurrency=None,
+        )
+        reasons = bc._match_or_refuse(empty, empty)
+        joined = " ".join(reasons).lower()
+        self.assertIn("tp_size missing", joined)
+        self.assertIn("page_size missing", joined)
+        self.assertIn("disable_radix_cache missing", joined)
+        self.assertIn("concurrency missing", joined)
+
+    def test_no_op_status_unknown_when_metrics_absent(self):
+        """Round-5 fix [P2]: ``_no_op_status`` must return ``unknown`` when
+        DS observability fields are absent, so the report does not falsely
+        print "clean".
+        """
+
+        bc = self._import_compare()
+        m = bc.RunMetrics(
+            concurrency=32, num_prompts=4, isl=4096, osl=512,
+            output_tps_p50=42.0, output_tps_p99=80.0,
+            ttft_p50_s=0.5, ttft_p99_s=2.0,
+            tpot_p50_ms=4.0, tpot_p99_ms=12.0,
+            goodput_under_slo=0.9,
+            selected_pages_mean=None,
+            dense_fallback_total=None,
+            total_pages_mean=None,
+        )
+        status, reason = bc._no_op_status(m)
+        self.assertEqual(status, "unknown")
+        self.assertIn("dense_fallback_total", reason)
+        self.assertIn("selected_pages_mean", reason)
+        self.assertIn("total_pages_mean", reason)
+        # And the rendered report uses "unknown", not "clean".
+        baseline = bc.RunMetrics(
+            concurrency=32, num_prompts=4, isl=4096, osl=512,
+            output_tps_p50=50.0, output_tps_p99=80.0,
+            ttft_p50_s=0.4, ttft_p99_s=1.8,
+            tpot_p50_ms=4.0, tpot_p99_ms=10.0,
+            goodput_under_slo=0.95,
+            selected_pages_mean=None,
+            dense_fallback_total=None,
+            total_pages_mean=None,
+        )
+        md = bc.render_markdown_report(
+            baseline, m, baseline_path="b.jsonl", ds_path="d.jsonl",
+        )
+        self.assertIn("No-op detector:** unknown", md)
+        self.assertNotIn("No-op detector:** clean", md)
+
+    def test_no_op_status_clean_when_metrics_present_and_zero(self):
+        """Sanity-check the new ``clean`` path: all observability fields
+        present, fallback zero, selected != total → ``clean``.
+        """
+
+        bc = self._import_compare()
+        m = bc.RunMetrics(
+            concurrency=32, num_prompts=4, isl=4096, osl=512,
+            output_tps_p50=42.0, output_tps_p99=80.0,
+            ttft_p50_s=0.5, ttft_p99_s=2.0,
+            tpot_p50_ms=4.0, tpot_p99_ms=12.0,
+            goodput_under_slo=0.9,
+            selected_pages_mean=128.0,
+            dense_fallback_total=0,
+            total_pages_mean=2048.0,
+        )
+        status, reason = bc._no_op_status(m)
+        self.assertEqual(status, "clean")
+        self.assertEqual(reason, "")
+
     def test_refuses_mismatch_when_server_info_disagrees(self):
         bc = self._import_compare()
         import tempfile
