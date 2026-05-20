@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.kv_canary.pool_patch.utils import wrap_method
+from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
 
 
 class _FakeObj:
