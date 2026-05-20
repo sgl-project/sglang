@@ -193,25 +193,36 @@ def _sync_ai_analyses(conn: sqlite3.Connection, s3) -> int:
 
 
 def _list_result_keys(s3, cursor: str | None) -> list[tuple[str, datetime]]:
-    """Return (key, last_modified) for every result_concurrency_*.json in the bucket.
+    """Return (key, last_modified) for every result_concurrency_*.json newer than cursor.
 
-    `cursor` is the last-ingested-key's lexicographic value. We skip anything
-    whose key is <= cursor. This is imperfect (not strictly time-sorted) but
-    adequate for our append-only bucket layout where tag-prefixed paths
-    monotonically grow.
+    `cursor` is the ISO timestamp of the latest LastModified we processed.
+    LastModified filtering is robust across trigger prefixes (lex ordering
+    broke when `cron/` < `manual/` and a later cron run got skipped because
+    its keys lex-sorted before the manual cursor).
+
+    Old-format cursors (S3 keys, not timestamps) are treated as None — the
+    next pass does a full rescan, then writes the new timestamp format.
     """
+    cutoff: datetime | None = None
+    if cursor:
+        try:
+            cutoff = datetime.fromisoformat(cursor)
+        except ValueError:
+            cutoff = None  # legacy key-format cursor; rescan once.
+
     paginator = s3.get_paginator("list_objects_v2")
     results: list[tuple[str, datetime]] = []
     for page in paginator.paginate(Bucket=settings.minio_bucket):
         for obj in page.get("Contents") or []:
             key = obj["Key"]
-            if cursor is not None and key <= cursor:
-                continue
             if not key.endswith(".json"):
                 continue
             if "/results_concurrency_" not in key:
                 continue
-            results.append((key, obj["LastModified"]))
+            lm = obj["LastModified"]
+            if cutoff is not None and lm <= cutoff:
+                continue
+            results.append((key, lm))
     return results
 
 
@@ -390,22 +401,28 @@ def run_once() -> dict[str, Any]:
         keys = _list_result_keys(s3, cursor)
         stats["listed"] = len(keys)
 
-        # Sort lex so we can advance the cursor monotonically.
-        keys.sort(key=lambda kv: kv[0])
-        latest_cursor = cursor
+        # Sort by LastModified ascending so the cursor advances monotonically
+        # with upload time, independent of key prefix (cron/ vs manual/ etc).
+        keys.sort(key=lambda kv: kv[1])
+        latest_lm: datetime | None = None
+
+        def _advance(lm: datetime) -> None:
+            nonlocal latest_lm
+            if latest_lm is None or lm > latest_lm:
+                latest_lm = lm
 
         for key, last_modified in keys:
             parsed = parse_result_key(key)
             if parsed is None:
                 stats["skipped"] += 1
-                latest_cursor = key
+                _advance(last_modified)
                 continue
             stats["parsed"] += 1
 
             payload = _read_json(s3, key)
             if payload is None:
                 stats["errors"] += 1
-                latest_cursor = key
+                _advance(last_modified)
                 continue
 
             commit: CommitInfo | None = None
@@ -428,7 +445,7 @@ def run_once() -> dict[str, Any]:
             run_id = _insert_run(conn, parsed, commit, pr, started_at, s3_log_prefix)
             if run_id is None:
                 stats["errors"] += 1
-                latest_cursor = key
+                _advance(last_modified)
                 continue
 
             metrics = _extract_metrics(payload)
@@ -438,7 +455,7 @@ def run_once() -> dict[str, Any]:
 
             stats["inserted"] += 1
             newly_inserted_run_ids.append(run_id)
-            latest_cursor = key
+            _advance(last_modified)
 
         # Run anomaly detection for each new run. Do this after everything
         # is inserted so history queries include the freshest data.
@@ -454,8 +471,8 @@ def run_once() -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("regression resolution failed: %s", exc)
 
-        if latest_cursor != cursor and latest_cursor is not None:
-            _set_cursor(conn, latest_cursor)
+        if latest_lm is not None:
+            _set_cursor(conn, latest_lm.isoformat())
         _set_heartbeat(conn)
         conn.commit()
 

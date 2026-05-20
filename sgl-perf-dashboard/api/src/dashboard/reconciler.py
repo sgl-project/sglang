@@ -222,6 +222,9 @@ def _discover_orphan_workflows(s3: Any) -> list[dict]:
     orphans: list[dict] = []
     paginator = s3.get_paginator("list_objects_v2")
 
+    now = datetime.now(UTC)
+    cutoff_inflight = now - INFLIGHT_GRACE
+
     for trigger in ("cron", "manual"):
         resp = s3.list_objects_v2(
             Bucket=settings.minio_bucket, Prefix=f"{trigger}/", Delimiter="/"
@@ -230,17 +233,29 @@ def _discover_orphan_workflows(s3: Any) -> list[dict]:
             prefix = p["Prefix"]  # e.g. "manual/24803056480-1/"
             has_result = False
             earliest: datetime | None = None
+            latest: datetime | None = None
             # Paginated scan — a workflow's log upload can exceed 1000 keys.
+            # Don't break early on has_result: we still need MAX(LastModified)
+            # to apply the inflight grace correctly.
             for page in paginator.paginate(Bucket=settings.minio_bucket, Prefix=prefix):
                 for obj in page.get("Contents") or []:
                     if "/results_concurrency_" in obj["Key"]:
                         has_result = True
                     lm = obj.get("LastModified")
-                    if lm and (earliest is None or lm < earliest):
-                        earliest = lm
-                if has_result:
-                    break
+                    if lm:
+                        if earliest is None or lm < earliest:
+                            earliest = lm
+                        if latest is None or lm > latest:
+                            latest = lm
             if has_result:
+                continue
+
+            # Inflight guard: the workflow may still be uploading. Wait until
+            # the most recent S3 write is older than INFLIGHT_GRACE before
+            # declaring this an orphan. Mirrors the per-workflow reconciler's
+            # rule and prevents the bug where logs land minutes before JSONs
+            # and we'd race the upload.
+            if latest is not None and latest >= cutoff_inflight:
                 continue
 
             # Parse "<trigger>/<run_id>-<attempt>/"
@@ -258,7 +273,7 @@ def _discover_orphan_workflows(s3: Any) -> list[dict]:
                     "trigger": trigger,
                     "github_run_id": run_id,
                     "github_run_attempt": attempt,
-                    "started_at": (earliest or datetime.now(UTC)).isoformat(),
+                    "started_at": (earliest or now).isoformat(),
                 }
             )
 
