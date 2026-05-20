@@ -57,13 +57,6 @@ class CanaryOverheadPctReq(BaseReq):
 
 
 @dataclass(slots=True, kw_only=True)
-class InjectPerturbationReq(BaseReq):
-    channel: str
-    kind: str
-    rank: Optional[int] = None
-
-
-@dataclass(slots=True, kw_only=True)
 class _ApplyPrFixTogglesReq(BaseReq):
     choices_pickled: bytes  # Dict[int, Optional[bool]]
 

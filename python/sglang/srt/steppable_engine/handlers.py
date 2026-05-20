@@ -20,7 +20,6 @@ from sglang.srt.steppable_engine.messages import (
     CanaryOverheadPctResp,
     CanaryViolationsReq,
     CanaryViolationsResp,
-    InjectPerturbationReq,
     IsActiveReq,
     IsActiveResp,
     LastWritePlanReq,
@@ -58,7 +57,6 @@ def install_steppable_handlers(scheduler: "Scheduler") -> None:
         (ActiveReqsReq, _handle_active_reqs),
         (LastWritePlanReq, _handle_last_write_plan),
         (CanaryOverheadPctReq, _handle_canary_overhead_pct),
-        (InjectPerturbationReq, _handle_inject_perturbation),
         (_ApplyPrFixTogglesReq, _handle_apply_pr_fix_toggles),
     ]
 
@@ -259,12 +257,6 @@ def _handle_canary_overhead_pct(
     return CanaryOverheadPctResp(
         pct=float(getattr(self, "_last_canary_overhead_pct", 0.0))
     )
-
-
-def _handle_inject_perturbation(self: "Scheduler", req: InjectPerturbationReq) -> None:
-    from sglang.srt.steppable_engine.perturb import arm_one_shot
-
-    arm_one_shot(self, channel=req.channel, kind=req.kind, rank=req.rank)
 
 
 def _handle_apply_pr_fix_toggles(self: "Scheduler", req: _ApplyPrFixTogglesReq) -> None:

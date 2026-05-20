@@ -25,7 +25,6 @@ from sglang.srt.steppable_engine.messages import (
     CanaryViolationsReq,
     CanaryViolationsResp,
     EnterSteppingModeReq,
-    InjectPerturbationReq,
     IsActiveReq,
     IsActiveResp,
     LastWritePlanReq,
@@ -196,19 +195,6 @@ class SteppableEngine:
         self._check_alive()
         resp: CanaryOverheadPctResp = self._rpc(CanaryOverheadPctReq())
         return resp.pct
-
-    def inject_perturbation(
-        self,
-        *,
-        channel: str = "default",
-        kind: str,
-        rank: Optional[int] = None,
-    ) -> None:
-        self._check_alive()
-        from sglang.srt.steppable_engine.perturb import validate_channel_kind
-
-        validate_channel_kind(channel=channel, kind=kind)
-        self._rpc(InjectPerturbationReq(channel=channel, kind=kind, rank=rank))
 
     def _rpc(self, msg: Any) -> Any:
         sock = self._engine.send_to_rpc
