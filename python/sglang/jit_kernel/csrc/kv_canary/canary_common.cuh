@@ -1,8 +1,8 @@
 // Shared device helpers for the KV cache canary verify + write kernels.
 //
 // Mirrors module-level constants and helpers from
-// python/sglang/jit_kernel/kv_canary_verify.py and
-// python/sglang/jit_kernel/kv_canary_write.py. Value parity is enforced by test_unit_const_sync.py.
+// python/sglang/jit_kernel/kv_canary/verify.py and
+// python/sglang/jit_kernel/kv_canary/write.py. Value parity is enforced by test_unit_const_sync.py.
 //
 // Real-KV source ABI (tvm-ffi cannot pass tuple[RealKvSource, ...] directly): the host wrapper unpacks the
 // tuple into a fixed-size array of 4 sources and passes 4 separate uint8 tensors plus a single int32 array
@@ -18,7 +18,7 @@
 namespace canary {
 
 // Frozen chain anchor used wherever a slot has no predecessor. Mirror of the Python CANARY_CHAIN_ANCHOR
-// in kv_canary_verify.py.
+// in kv_canary/verify.py.
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 
 // Canary slot field offsets within the 4-int64 layout.
@@ -28,7 +28,7 @@ constexpr int kCanaryFieldPosition = 1;
 constexpr int kCanaryFieldPrevHash = 2;
 constexpr int kCanaryFieldRealKvHash = 3;
 
-// Violation-row column layout. Mirrors _VIOLATION_FIELD_* in kv_canary_verify.py. Column 6
+// Violation-row column layout. Mirrors _VIOLATION_FIELD_* in kv_canary/verify.py. Column 6
 // (ExpectedAux) is reason-agnostic: verify launches store expected_chain_hash there, write launches store
 // expected_position.
 constexpr int kViolationFields = 8;
@@ -42,22 +42,22 @@ constexpr int kViolationFieldExpectedAux = 6;
 constexpr int kViolationFieldFailReasonBits = 7;
 
 // Fail-reason bit positions. Bitfield (not enum) because a single verify entry may set multiple reasons.
-// Verify-launch bits mirror _FAIL_REASON_BIT_* in kv_canary_verify.py; write-launch bits mirror
-// _FAIL_REASON_BIT_WRITE_* in kv_canary_write.py.
+// Verify-launch bits mirror _FAIL_REASON_BIT_* in kv_canary/verify.py; write-launch bits mirror
+// _FAIL_REASON_BIT_WRITE_* in kv_canary/write.py.
 constexpr int64_t kFailReasonChainHash = 1LL << 0;
 constexpr int64_t kFailReasonPosition = 1LL << 1;
 constexpr int64_t kFailReasonRealKvHash = 1LL << 2;
 constexpr int64_t kFailReasonWriteTokenMismatch = 1LL << 3;
 constexpr int64_t kFailReasonWritePositionMismatch = 1LL << 4;
 
-// Mirror of the Python RealKvHashMode IntEnum in kv_canary_verify.py. Values must match exactly.
+// Mirror of the Python RealKvHashMode IntEnum in kv_canary/verify.py. Values must match exactly.
 enum class RealKvHashMode : int32_t {
   kOff = 0,
   kBit = 1,
   kAll = 2,
 };
 
-// Mirror of the Python CanaryPseudoMode IntEnum in kv_canary_write.py.
+// Mirror of the Python CanaryPseudoMode IntEnum in kv_canary/write.py.
 enum class CanaryPseudoMode : int32_t {
   kOff = 0,
   kOn = 1,
@@ -83,7 +83,7 @@ struct RealKvSourceHandle {
 };
 
 // Standard splitmix64 finalizer. Bit-equivalent to the Python _splitmix64_python in
-// kv_canary_verify_ref.py.
+// kv_canary/verify_ref.py.
 SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
@@ -91,13 +91,13 @@ SGL_DEVICE uint64_t splitmix64(uint64_t x) {
 }
 
 // 4-arg chain step: XOR all four uint64 inputs, then splitmix64-finalize. Matches the Python helper
-// _splitmix64_mix4_vec in kv_canary_verify_ref.py.
+// _splitmix64_mix4_vec in kv_canary/verify_ref.py.
 SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   return splitmix64(a ^ b ^ c ^ d);
 }
 
 // Read one byte from a source following the RealKvSource access invariant. The invariant (from
-// kv_canary_verify.py docstring) is:
+// kv_canary/verify.py docstring) is:
 //
 //     tensor[slot_idx // page_size,
 //            (slot_idx % page_size) * num_bytes_per_token + byte_offset]
@@ -148,13 +148,13 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
 
 // Fold all configured real-KV sources for a given slot. Iterates sequentially and combines each source's
 // contribution via acc = splitmix64(acc XOR source_hash); matches _compute_real_kv_hash_vec in
-// kv_canary_verify_ref.py.
+// kv_canary/verify_ref.py.
 //
 // In OFF mode the function returns 0 unconditionally (the running real_kv_hash field is always 0). Sources
 // with read_bytes == 0 contribute nothing (their source_hash is 0 and acc = splitmix64(acc ^ 0)).
 //
 // IMPORTANT: the Python ref ONLY enters the fold loop when read_bytes > 0 (see _compute_real_kv_hash_vec
-// in kv_canary_verify_ref.py: `if source.read_bytes <= 0: continue`). To stay byte-equal, this
+// in kv_canary/verify_ref.py: `if source.read_bytes <= 0: continue`). To stay byte-equal, this
 // helper must skip the splitmix64 step entirely for read_bytes == 0 sources rather than treating them as
 // "fold 0".
 SGL_DEVICE uint64_t
@@ -175,7 +175,7 @@ fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
 
 // Append a violation row to the ring (fill-once) and bump the monotonic counter unconditionally.
 //
-// Ordering of columns must match _VIOLATION_FIELD_* in kv_canary_verify.py exactly. The "ExpectedAux"
+// Ordering of columns must match _VIOLATION_FIELD_* in kv_canary/verify.py exactly. The "ExpectedAux"
 // column (index 6) is reason-agnostic: verify launches pass expected_chain_hash, write launches pass
 // expected_position. The "StoredChainHash" column (index 5) carries running_prev_hash on the write path.
 //

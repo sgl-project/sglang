@@ -4,7 +4,7 @@ import argparse
 
 import pytest
 
-from sglang.jit_kernel.kv_canary_verify import RealKvHashMode
+from sglang.jit_kernel.kv_canary.verify import RealKvHashMode
 from sglang.srt.environ import EnvField, EnvFloat, EnvInt, Envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci

@@ -6,7 +6,7 @@ This module defines the public API surface for the write kernel:
 - the WritePlan dataclass consumed by canary_write_step,
 - the canary_write_step host wrapper itself.
 
-RealKvSource is owned by kv_canary_verify.py (the verify path defines it first); we re-import it here so
+RealKvSource is owned by kv_canary/verify.py (the verify path defines it first); we re-import it here so
 the write module's API surface is self-contained for callers.
 """
 
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _MAX_REAL_KV_SOURCES,
     CanaryLaunchTag,
     RealKvHashMode,
@@ -104,7 +104,7 @@ class WritePlan:
 
 
 # Write-launch fail-reason bits. Distinct from the verify-launch bits in
-# kv_canary_verify (CHAIN_HASH=1<<0, POSITION=1<<1, REAL_KV_HASH=1<<2) because
+# kv_canary.verify (CHAIN_HASH=1<<0, POSITION=1<<1, REAL_KV_HASH=1<<2) because
 # both launches share the same violation ring; a single bit must unambiguously
 # identify the failing field across kernel kinds.
 _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH: int = 1 << 3
@@ -227,7 +227,7 @@ def canary_write_step(
           in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary_write_ref.canary_write_step_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.write_ref.canary_write_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
     if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:

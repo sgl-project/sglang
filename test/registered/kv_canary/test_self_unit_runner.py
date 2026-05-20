@@ -6,7 +6,7 @@ from typing import List
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvHashMode,

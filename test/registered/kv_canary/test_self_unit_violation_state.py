@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import VIOLATION_FIELDS
+from sglang.jit_kernel.kv_canary.verify import VIOLATION_FIELDS
 from sglang.srt.kv_canary.violation_state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
 

@@ -7,12 +7,12 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary_plan import canary_plan_step
-from sglang.jit_kernel.kv_canary_plan_ref import (
+from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan_ref import (
     canary_plan_step_torch_reference,
 )
-from sglang.jit_kernel.kv_canary_verify import VerifyPlan
-from sglang.jit_kernel.kv_canary_write import WritePlan
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")

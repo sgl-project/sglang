@@ -5,13 +5,13 @@ from typing import List
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvHashMode,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary_write import CanaryPseudoMode, WritePlan
+from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,

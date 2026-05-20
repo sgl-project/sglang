@@ -18,7 +18,7 @@ import torch
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     VIOLATION_FIELDS,
     CanaryLaunchTag,

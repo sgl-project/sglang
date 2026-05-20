@@ -2,7 +2,7 @@
 
 Vectorised CPU reference for the single-launch plan kernel. Pinned
 byte-for-byte against the Triton implementation in
-:mod:`sglang.jit_kernel.kv_canary_plan`.
+:mod:`sglang.jit_kernel.kv_canary.plan`.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import VerifyPlan
-from sglang.jit_kernel.kv_canary_write import WritePlan
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
 def canary_plan_step_torch_reference(

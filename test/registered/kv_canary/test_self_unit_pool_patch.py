@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _MAX_REAL_KV_SOURCES,
     CANARY_SLOT_BYTES,
     RealKvSource,
@@ -68,7 +68,7 @@ def test_real_kv_sources_below_4(device):
 
 
 def test_real_kv_sources_above_4_raises(device):
-    from sglang.jit_kernel.kv_canary_verify import (
+    from sglang.jit_kernel.kv_canary.verify import (
         CanaryLaunchTag,
         RealKvHashMode,
         VerifyPlan,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _FAIL_REASON_BIT_CHAIN_HASH,
     _FAIL_REASON_BIT_POSITION,
     _FAIL_REASON_BIT_REAL_KV_HASH,
@@ -17,11 +17,11 @@ from sglang.jit_kernel.kv_canary_verify import (
     RealKvSource,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary_verify_ref import (
+from sglang.jit_kernel.kv_canary.verify_ref import (
     canary_verify_step_torch_reference,
 )
-from sglang.jit_kernel.kv_canary_write import CanaryPseudoMode
-from sglang.jit_kernel.kv_canary_write_ref import (
+from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
+from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
 from sglang.jit_kernel.tests.canary_helpers import (
@@ -1394,7 +1394,7 @@ def test_chain_advance_formula_matches_spec() -> None:
             (prev_hash ^ token ^ position ^ real_kv_hash) & ((1 << 64) - 1)
         )
         # Step 3: compute through ref-impl helper splitmix64_mix4 (same logic, alternate entry point).
-        from sglang.jit_kernel.kv_canary_verify_ref import _splitmix64_mix4_vec
+        from sglang.jit_kernel.kv_canary.verify_ref import _splitmix64_mix4_vec
 
         prev_t = torch.tensor([to_signed_int64(prev_hash)], dtype=torch.int64)
         token_t = torch.tensor([to_signed_int64(token)], dtype=torch.int64)

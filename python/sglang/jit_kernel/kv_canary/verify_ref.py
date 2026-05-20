@@ -5,7 +5,7 @@ eventually lands must reproduce this output byte-for-byte (violation_ring conten
 counter increments).
 
 The violation row schema (8 int64 fields in fixed order) is documented at module scope in
-kv_canary_verify.py via the _VIOLATION_FIELD_* constants; readers should consume those names rather than
+kv_canary/verify.py via the _VIOLATION_FIELD_* constants; readers should consume those names rather than
 indexing positionally.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _FAIL_REASON_BIT_CHAIN_HASH,
     _FAIL_REASON_BIT_POSITION,
     _FAIL_REASON_BIT_REAL_KV_HASH,

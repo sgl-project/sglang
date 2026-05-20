@@ -53,7 +53,7 @@ def _splitmix64(value: int) -> int:
     """Standard splitmix64 finalizer over a single uint64.
 
     Byte-equal mirror of the kernel-side splitmix64_finalize (also mirrored in
-    sglang.jit_kernel.kv_canary_verify_ref._splitmix64_python).
+    sglang.jit_kernel.kv_canary.verify_ref._splitmix64_python).
     """
     x = value & _U64_MASK
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK

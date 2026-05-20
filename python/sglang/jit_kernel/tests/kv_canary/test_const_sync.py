@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _FAIL_REASON_BIT_CHAIN_HASH,
     _FAIL_REASON_BIT_POSITION,
     _FAIL_REASON_BIT_REAL_KV_HASH,
@@ -21,13 +21,13 @@ from sglang.jit_kernel.kv_canary_verify import (
     VIOLATION_FIELDS,
     RealKvHashMode,
 )
-from sglang.jit_kernel.kv_canary_verify_ref import (
+from sglang.jit_kernel.kv_canary.verify_ref import (
     _FIELD_POSITION,
     _FIELD_PREV_HASH,
     _FIELD_REAL_KV_HASH,
     _FIELD_TOKEN,
 )
-from sglang.jit_kernel.kv_canary_write import (
+from sglang.jit_kernel.kv_canary.write import (
     _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
     _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
     CanaryPseudoMode,

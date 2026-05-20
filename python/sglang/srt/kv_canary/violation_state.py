@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import VIOLATION_FIELDS
+from sglang.jit_kernel.kv_canary.verify import VIOLATION_FIELDS
 from sglang.srt.kv_canary.config import CanaryConfig
 
 

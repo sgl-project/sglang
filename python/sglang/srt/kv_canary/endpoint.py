@@ -5,15 +5,15 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvHashMode,
     RealKvSource,
     VerifyPlan,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary_write import CanaryPseudoMode as CanaryInputCheckMode
-from sglang.jit_kernel.kv_canary_write import (
+from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputCheckMode
+from sglang.jit_kernel.kv_canary.write import (
     WritePlan,
     canary_write_step,
 )

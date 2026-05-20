@@ -6,13 +6,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.jit_kernel.kv_canary_plan import canary_plan_step
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary_write import CanaryPseudoMode as CanaryInputCheckMode
-from sglang.jit_kernel.kv_canary_write import (
+from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputCheckMode
+from sglang.jit_kernel.kv_canary.write import (
     WritePlan,
 )
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind

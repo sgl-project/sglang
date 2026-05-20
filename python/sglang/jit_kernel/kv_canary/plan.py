@@ -1,12 +1,12 @@
 """Triton host wrapper for the canary plan accumulator.
 
 Defines :func:`canary_plan_step` — the single-launch Triton plan kernel
-that fills a :class:`~sglang.jit_kernel.kv_canary_verify.VerifyPlan`
-and a :class:`~sglang.jit_kernel.kv_canary_write.WritePlan` from
+that fills a :class:`~sglang.jit_kernel.kv_canary.verify.VerifyPlan`
+and a :class:`~sglang.jit_kernel.kv_canary.write.WritePlan` from
 ForwardBatch primitives plus optional pre-walked flat verify extras.
 
 Byte-equal pinned by
-:func:`sglang.jit_kernel.kv_canary_plan_ref.canary_plan_step_torch_reference`.
+:func:`sglang.jit_kernel.kv_canary.plan_ref.canary_plan_step_torch_reference`.
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     VerifyPlan,
     _assert_contiguous,
 )
-from sglang.jit_kernel.kv_canary_write import WritePlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 
 # Upper bound on bs for the phase-1 block-level cumsum. Reqs larger than this exceed Triton's single-program
 # tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally generous so the
@@ -155,7 +155,7 @@ def canary_plan_step(
         - Padding rows contribute zero entries.
 
     Pinned by Python reference
-    :func:`sglang.jit_kernel.kv_canary_plan_ref.canary_plan_step_torch_reference`; Triton must match
+    :func:`sglang.jit_kernel.kv_canary.plan_ref.canary_plan_step_torch_reference`; Triton must match
     byte-for-byte.
     """
     bs = int(fb_req_pool_indices.shape[0])

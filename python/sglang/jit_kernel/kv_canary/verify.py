@@ -9,7 +9,7 @@ This module defines the public API surface for the verify kernel:
 - the canary_verify_step host wrapper itself.
 
 The CUDA kernel is not wired up yet; the host wrapper raises NotImplementedError until that lands. Pin the
-behaviour through canary_verify_step_torch_reference in kv_canary_verify_ref.py.
+behaviour through canary_verify_step_torch_reference in kv_canary/verify_ref.py.
 """
 
 from __future__ import annotations
@@ -278,7 +278,7 @@ def canary_verify_step(
         - Safe in cuda-graph capture; caller refills plan in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary_verify_ref.canary_verify_step_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.verify_ref.canary_verify_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
     if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:

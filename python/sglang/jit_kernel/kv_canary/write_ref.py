@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     _VIOLATION_FIELD_EXPECTED_AUX,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
@@ -27,13 +27,13 @@ from sglang.jit_kernel.kv_canary_verify import (
     RealKvHashMode,
     RealKvSource,
 )
-from sglang.jit_kernel.kv_canary_verify_ref import (
+from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_vec,
     _splitmix64_finalize_vec,
     _splitmix64_python,
     _to_signed_int64,
 )
-from sglang.jit_kernel.kv_canary_write import (
+from sglang.jit_kernel.kv_canary.write import (
     _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
     _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
     CanaryPseudoMode,

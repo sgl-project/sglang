@@ -66,7 +66,7 @@ struct WriteKernelParams {
   RealKvHashMode real_kv_hash_mode;
 };
 
-// SWA translation matching _swa_translate in kv_canary_write_ref.py. Negative slot_full passes
+// SWA translation matching _swa_translate in kv_canary/write_ref.py. Negative slot_full passes
 // through unchanged; out-of-bounds indices clamp to lut_len - 1 (the trailing sentinel row).
 SGL_DEVICE int64_t swa_translate_one(int64_t slot_full, const int32_t* lut, int32_t lut_len, int32_t mapping_present) {
   if (mapping_present == kSwaMappingAbsent) {
@@ -190,7 +190,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
 }  // namespace
 
-// API source of truth: docstring of canary_write_step in python/sglang/jit_kernel/kv_canary_write.py.
+// API source of truth: docstring of canary_write_step in python/sglang/jit_kernel/kv_canary/write.py.
 //
 // ABI notes (same as verify):
 // - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots.
