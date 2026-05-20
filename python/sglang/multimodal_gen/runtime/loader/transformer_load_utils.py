@@ -88,12 +88,12 @@ def _merge_modelopt_fp4_configs(
     inferred_config.packed_modules_mapping = getattr(
         existing_config, "packed_modules_mapping", {}
     )
-    inferred_config.swap_weight_nibbles = getattr(
-        existing_config, "swap_weight_nibbles", True
-    )
     inferred_config.checkpoint_uses_packed_qkv = getattr(
         inferred_config, "checkpoint_uses_packed_qkv", False
     ) or getattr(existing_config, "checkpoint_uses_packed_qkv", False)
+    inferred_config.swap_weight_nibbles = getattr(
+        inferred_config, "swap_weight_nibbles", False
+    ) or getattr(existing_config, "swap_weight_nibbles", False)
     if getattr(inferred_config, "group_size", None) is None:
         inferred_config.group_size = getattr(existing_config, "group_size", None)
 
@@ -368,6 +368,12 @@ def resolve_transformer_quant_load_spec(
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
     )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -479,14 +485,26 @@ def _resolve_quant_config(
     resolve quant config from checkpoints' metadata
     priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
-    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4, modelslim)
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4_npu, modelslim)
     if server_args.quantization is not None:
         from sglang.multimodal_gen.runtime.layers.quantization import (
             get_quantization_config,
         )
 
+        # modelslim requires a per-layer quant description file; load it from
+        # the component directory rather than returning an empty config.
+        if server_args.quantization == "modelslim":
+            return get_quant_config(hf_config, component_model_path)
+
         quant_cls = get_quantization_config(server_args.quantization)
         return quant_cls.from_config({})
+
+    quant_config = get_quant_config(hf_config, component_model_path)
+    if quant_config is None and server_args.transformer_weights_path:
+        for safetensors_file in safetensors_list:
+            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
+            if quant_config is not None:
+                return quant_config
 
     arch_config = server_args.pipeline_config.dit_config.arch_config
     param_names_mapping_dict = arch_config.param_names_mapping
