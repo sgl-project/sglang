@@ -83,15 +83,15 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
       chain_advance_from_slot(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
   int32_t entries_written = 0;
-  for (int32_t j = 0; j < entry_count; ++j) {
-    const int32_t i = entry_start + j;
-    const int64_t slot = static_cast<int64_t>(p.fb_out_cache_loc[i]);
+  for (int32_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
+    const int32_t fb_idx = entry_start + entry_offset;
+    const int64_t slot = static_cast<int64_t>(p.fb_out_cache_loc[fb_idx]);
     if (slot < 0) {
       continue;
     }
     ++entries_written;
-    const int64_t token = static_cast<int64_t>(p.fb_input_ids[i]);
-    const int64_t position = static_cast<int64_t>(p.fb_positions[i]);
+    const int64_t token = static_cast<int64_t>(p.fb_input_ids[fb_idx]);
+    const int64_t position = static_cast<int64_t>(p.fb_positions[fb_idx]);
 
     const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
@@ -99,8 +99,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     // Pseudo-mode comparison. Mismatch records a single violation row carrying both bits OR'd together;
     // chain still advances on the actual (token, position) below so a downstream verify won't cascade.
     if (p.pseudo_mode == CanaryPseudoMode::kOn) {
-      const int64_t expected_token = static_cast<int64_t>(p.pseudo_expected_tokens[i]);
-      const int64_t expected_position = static_cast<int64_t>(p.pseudo_expected_positions[i]);
+      const int64_t expected_token = static_cast<int64_t>(p.pseudo_expected_tokens[fb_idx]);
+      const int64_t expected_position = static_cast<int64_t>(p.pseudo_expected_positions[fb_idx]);
       FailReason mismatch_bits{};
       if (token != expected_token) {
         mismatch_bits |= FailReason::kWriteTokenMismatch;

@@ -82,10 +82,10 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
   const int64_t effective_read_bytes =
       (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
-  for (int64_t i = 0; i < effective_read_bytes; i += 16) {
+  for (int64_t byte_offset = 0; byte_offset < effective_read_bytes; byte_offset += 16) {
     uint64_t word_lo;
     uint64_t word_hi;
-    real_kv_load_uint4(src, slot_idx, i, word_lo, word_hi);
+    real_kv_load_uint4(src, slot_idx, byte_offset, word_lo, word_hi);
     acc = splitmix64(acc ^ word_lo);
     acc = splitmix64(acc ^ word_hi);
   }

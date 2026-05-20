@@ -94,13 +94,13 @@ def canary_write_step_torch_reference(
         seed_slot = int(seed_slot_indices_host[r].item())
         running_prev_hash = chain_advance_from_slot(buf_i64, seed_slot)
 
-        for j in range(entry_count):
-            i = entry_start + j
-            slot = int(fb_out_cache_loc_host[i].item())
+        for entry_offset in range(entry_count):
+            fb_idx = entry_start + entry_offset
+            slot = int(fb_out_cache_loc_host[fb_idx].item())
             if slot < 0:
                 continue
-            token = int(fb_input_ids_host[i].item())
-            position = int(fb_positions_host[i].item())
+            token = int(fb_input_ids_host[fb_idx].item())
+            position = int(fb_positions_host[fb_idx].item())
 
             real_kv_hash_u64 = _compute_real_kv_hash_scalar(
                 slot_idx=slot,
@@ -111,8 +111,8 @@ def canary_write_step_torch_reference(
 
             if pseudo_mode_on:
                 mismatch_bits = consts.FailReason(0)
-                expected_token = int(pseudo_expected_tokens_host[i].item())
-                expected_position = int(pseudo_expected_positions_host[i].item())
+                expected_token = int(pseudo_expected_tokens_host[fb_idx].item())
+                expected_position = int(pseudo_expected_positions_host[fb_idx].item())
                 if token != expected_token:
                     mismatch_bits |= consts.FailReason.WRITE_TOKEN_MISMATCH
                 if position != expected_position:
