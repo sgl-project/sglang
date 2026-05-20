@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
+    DSAIndexerPoolHost,
     MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -15,12 +15,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestNSAHiCacheTransfer(unittest.TestCase):
+class TestDSAHiCacheTransfer(unittest.TestCase):
     def setUp(self):
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for NSA host transfer tests.")
+            self.skipTest("CUDA is required for DSA host transfer tests.")
         if is_npu() or is_xpu():
-            self.skipTest("NSA host transfer tests only support CUDA/ROCm.")
+            self.skipTest("DSA host transfer tests only support CUDA/ROCm.")
         if not (is_cuda() or is_hip()):
             self.skipTest("CUDA/ROCm not available.")
 
@@ -42,7 +42,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
         layer_num = 2
         size = page_size * 4
 
-        device_pool = NSATokenToKVPool(
+        device_pool = DSATokenToKVPool(
             size=size,
             page_size=page_size,
             kv_lora_rank=128,
@@ -70,7 +70,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
                 allocator_type="default",
                 override_kv_cache_dim=device_pool.kv_cache_dim,
             )
-            indexer_host = NSAIndexerPoolHost(
+            indexer_host = DSAIndexerPoolHost(
                 device_pool=device_pool,
                 anchor_host=mla_host,
                 layout="layer_first",
