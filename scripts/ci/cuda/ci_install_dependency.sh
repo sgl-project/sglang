@@ -335,22 +335,6 @@ download_flashinfer_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-purge_cutlass_libs_base() {
-    # nvidia-cutlass-dsl[cu13] extras are additive on PyPI: requires_dist always
-    # pulls -libs-base AND -libs-cu13 when [cu13] is requested. Both wheels write
-    # to the same site-packages paths with different content, leaving the wrapper
-    # (cutlass.py, cu13 style) mismatched with the binding (_gpu_ops_gen.py, base
-    # style) -> GPUModuleOp signature TypeError. See vllm-project/vllm#40082.
-    # Uninstall -libs-base, then force-reinstall -libs-cu13 so its files win.
-    $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    if [ -n "$CUTLASS_DSL_VERSION" ]; then
-        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
-    fi
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 stabilize_flashinfer_jit_paths() {
     # In venv mode, FlashInfer JIT writes build.ninja with hardcoded -isystem
     # paths. Per-job venvs get unique paths, but the JIT cache is shared on the
@@ -504,7 +488,6 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
-    purge_cutlass_libs_base
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
