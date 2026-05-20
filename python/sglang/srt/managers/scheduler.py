@@ -2834,6 +2834,10 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                # Refresh BEFORE _overlap_forward_isolation so snapshot
+                # captures fresh values and restore preserves them.
+                batch.refresh_seq_lens_cpu()
+
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
