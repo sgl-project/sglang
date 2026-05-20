@@ -707,8 +707,6 @@ class VisionAscendAttention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
             output = torch.empty_like(q)
             seq_len_arg = seq_lens.to(torch.int32)
 
