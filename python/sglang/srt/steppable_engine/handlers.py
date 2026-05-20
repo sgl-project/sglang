@@ -80,7 +80,8 @@ def _wrap_steppable_handler(
         resp = bound(req)
         if resp is None:
             resp = RpcReqOutput(success=True, message="")
-        scheduler.recv_from_rpc.send_pyobj(resp)
+        if scheduler.recv_from_rpc is not None:
+            scheduler.recv_from_rpc.send_pyobj(resp)
         return None
 
     return wrapper
