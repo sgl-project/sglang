@@ -565,15 +565,6 @@ class MQALayer(nn.Module):
                 qkv_a[..., self.q_lora_rank :]
                 if qkv_a is not None
                 else self.wkv(x_linear)[0]
-        if use_cp:
-            # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
             )
 
             from sglang.srt.layers.fused_qk_norm_rope_store import (
