@@ -360,6 +360,41 @@ class LoRAMemoryPool:
             input_dim,
         )
 
+    def _column_parallel_lora_b_per_rank_dim(
+        self,
+        module_name: str,
+        total_output_dim: int,
+        effective_tp_size: int,
+    ) -> int:
+        """Per-rank LoRA B output dim for column-parallel modules.
+
+        For most modules this is just an even split. For ``qkv_proj`` when
+        ``effective_tp_size > num_key_value_heads``, the underlying
+        :class:`QKVParallelLinear` *replicates* each KV head across
+        ``tp_size // num_kv_heads`` ranks instead of dividing further, so
+        each rank owns ``head_dim`` of K/V (not ``head_dim * num_kv_heads
+        / tp_size``). A naive ``divide(total, tp_size)`` undersizes the
+        buffer and produces a shape mismatch when the
+        :meth:`QKVParallelLinearWithLoRA.slice_lora_b_weights` slice runs.
+        """
+        if module_name != "qkv_proj":
+            return divide(total_output_dim, effective_tp_size)
+
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        num_kv_heads = getattr(cfg, "num_key_value_heads", None)
+        if num_kv_heads is None or num_kv_heads >= effective_tp_size:
+            return divide(total_output_dim, effective_tp_size)
+
+        head_dim = getattr(cfg, "head_dim", None) or (
+            cfg.hidden_size // cfg.num_attention_heads
+        )
+        kv_dim_total = 2 * num_kv_heads * head_dim
+        q_dim_total = total_output_dim - kv_dim_total
+        q_per_rank = divide(q_dim_total, effective_tp_size)
+        return q_per_rank + 2 * head_dim
+
     def get_lora_B_shape(
         self,
         module_name: str,
@@ -386,7 +421,9 @@ class LoRAMemoryPool:
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = divide(output_dim, effective_tp_size)
+            output_dim = self._column_parallel_lora_b_per_rank_dim(
+                module_name, output_dim, effective_tp_size
+            )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):

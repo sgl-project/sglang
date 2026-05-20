@@ -236,6 +236,7 @@ def reference_embedding_lora_a_shrink(
     weight_indices: torch.Tensor,
     seq_lengths: torch.Tensor,
     lora_ranks: torch.Tensor,
+    lora_scalings: torch.Tensor,
     vocab_size: int,
 ) -> torch.Tensor:
     """
@@ -247,6 +248,7 @@ def reference_embedding_lora_a_shrink(
         weight_indices: LoRA idx for each sequence
         seq_lengths: Length of each sequence
         lora_ranks: LoRA rank for each LoRA adapters
+        lora_scalings: LoRA scaling for each LoRA adapters
         vocab_size: Base vocabulary size
 
     Returns:
@@ -264,10 +266,11 @@ def reference_embedding_lora_a_shrink(
     )
 
     token_offset = 0
-    for lora_idx, seq_len, rank in zip(
+    for lora_idx, seq_len, rank, scaling in zip(
         weight_indices,
         seq_lengths,
         lora_ranks[weight_indices],
+        lora_scalings[weight_indices],
     ):
         if seq_len == 0:
             continue
@@ -284,7 +287,7 @@ def reference_embedding_lora_a_shrink(
             lora_weights = weights[lora_idx, :rank, :]  # (rank, vocab_size)
             embeddings = lora_weights[:, clamped_ids].t()  # (seq_len, rank)
 
-            output[token_offset : token_offset + seq_len, :rank] = embeddings
+            output[token_offset : token_offset + seq_len, :rank] = scaling * embeddings
 
         token_offset += seq_len
 

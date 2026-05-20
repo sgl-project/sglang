@@ -55,6 +55,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         self.free_group = []
 
+    @property
+    def size_full(self):
+        return self.size
+
     def debug_print(self) -> str:
         return ""
 

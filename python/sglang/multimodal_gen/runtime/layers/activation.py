@@ -82,6 +82,15 @@ class GeluAndMul(CustomOp):
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, _ = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
+        return y_npu
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2

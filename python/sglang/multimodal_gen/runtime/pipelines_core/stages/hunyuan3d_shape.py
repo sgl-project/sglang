@@ -519,7 +519,8 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
 
         if return_path.endswith(".glb"):
             return_path = obj_path
-        return OutputBatch(output_file_paths=[return_path], timings=batch.timings)
+        # Preserve request metrics/perf-dump data on the shape-only save path.
+        return OutputBatch(output_file_paths=[return_path], metrics=batch.metrics)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
