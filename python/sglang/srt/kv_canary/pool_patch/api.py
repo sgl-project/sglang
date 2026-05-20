@@ -15,7 +15,7 @@ import torch
 from sglang.jit_kernel.kv_canary_verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.pool_patch.helpers import (
+from sglang.srt.kv_canary.pool_patch.utils import (
     _CANARY_ATTACHED_ATTR,
     _CANARY_BUFFER_GROUPS_ATTR,
     _build_buffer_group,

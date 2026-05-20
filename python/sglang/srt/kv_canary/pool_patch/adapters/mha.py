@@ -5,7 +5,7 @@ from typing import Literal
 from sglang.jit_kernel.kv_canary_verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patch.api import register_canary_adapter
-from sglang.srt.kv_canary.pool_patch.helpers import (
+from sglang.srt.kv_canary.pool_patch.utils import (
     _make_row_source,
     _patch_buf_info_method,
 )

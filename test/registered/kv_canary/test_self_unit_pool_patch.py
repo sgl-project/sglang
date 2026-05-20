@@ -14,7 +14,7 @@ from sglang.srt.kv_canary.pool_patch.api import (
     attach_canary_buffers,
     get_canary_buffer_groups,
 )
-from sglang.srt.kv_canary.pool_patch.helpers import _make_row_source
+from sglang.srt.kv_canary.pool_patch.utils import _make_row_source
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,

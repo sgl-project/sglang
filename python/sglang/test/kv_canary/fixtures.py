@@ -22,7 +22,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.api import register_canary_adapter
-from sglang.srt.kv_canary.pool_patch.helpers import (
+from sglang.srt.kv_canary.pool_patch.utils import (
     _make_row_source,
     _patch_buf_info_method,
 )
@@ -474,7 +474,7 @@ class _FakeDsv4Adapter:
 @contextmanager
 def patch_fake_pool_helpers() -> Iterator[None]:
     """Patch _slot_count / _swa_index_lut helpers in pool_patch to recognize Fake pools."""
-    from sglang.srt.kv_canary.pool_patch import helpers as pp
+    from sglang.srt.kv_canary.pool_patch import utils as pp
 
     original_slot_count = pp._slot_count
     original_swa_lut = pp._swa_index_lut

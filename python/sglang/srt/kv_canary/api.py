@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
-from sglang.srt.kv_canary.pool_patch.helpers import _wrap_method
+from sglang.srt.kv_canary.pool_patch.utils import _wrap_method
 from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
