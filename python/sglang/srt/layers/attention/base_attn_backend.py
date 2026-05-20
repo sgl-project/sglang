@@ -18,6 +18,19 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    def __init__(self, model_runner=None) -> None:
+        if model_runner is not None:
+            self.req_to_token_pool = model_runner.req_to_token_pool
+            self.token_to_kv_pool = model_runner.token_to_kv_pool
+            # Pool-static properties: belong on the backend, not on ForwardBatch.
+            self.kv_cache_dtype = getattr(model_runner.token_to_kv_pool, "dtype", None)
+            if model_runner.is_hybrid_swa:
+                from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+                self.is_swa_pool = isinstance(model_runner.token_to_kv_pool, SWAKVPool)
+            else:
+                self.is_swa_pool = False
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

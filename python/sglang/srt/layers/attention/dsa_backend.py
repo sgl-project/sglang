@@ -581,7 +581,7 @@ class DeepseekSparseAttnBackend(
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
                 self.use_mha
-                and forward_batch.token_to_kv_pool.dtype == torch.float8_e4m3fn
+                and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
@@ -2221,7 +2221,7 @@ class DeepseekSparseAttnBackend(
                 )  # SM90/SM100 only
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
-                and forward_batch.token_to_kv_pool.dtype
+                and self.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
