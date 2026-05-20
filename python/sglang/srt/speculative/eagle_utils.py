@@ -41,7 +41,7 @@ def apply_eagle_prefill_input_rotation(
     seg_ends = extend_lens.cumsum(0) - 1
     rotated = torch.empty_like(batch.input_ids)
     rotated[:-1] = batch.input_ids[1:]
-    rotated[seg_ends] = next_token_ids
+    rotated[seg_ends] = next_token_ids.to(batch.input_ids.dtype)
     batch.input_ids = rotated
 
 
