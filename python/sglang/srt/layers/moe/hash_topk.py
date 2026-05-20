@@ -50,6 +50,8 @@ class HashTopK(nn.Module):
         if topk == 0:
             return
 
+        # DummyModelLoader only initializes floating tensors, so keep this int
+        # lookup table valid until real checkpoints overwrite it.
         token_ids = torch.arange(
             self.tid2eid.shape[0], dtype=torch.int64, device=self.tid2eid.device
         ).unsqueeze(1)

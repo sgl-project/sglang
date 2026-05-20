@@ -1209,6 +1209,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             and orig_out_cache_loc.numel()
             == forward_batch.batch_size * self.topk * self.speculative_num_steps
         ):
+            # EAGLE allocates cache locations for all draft steps up front, but
+            # each DSV4 decode metadata plan expects only this step's locations.
             step_out_cache_locs = (
                 orig_out_cache_loc.reshape(
                     forward_batch.batch_size, self.topk, self.speculative_num_steps
