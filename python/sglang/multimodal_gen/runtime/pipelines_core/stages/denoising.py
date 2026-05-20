@@ -7,47 +7,81 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
+import os
 import time
 import weakref
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
 
 import torch
-from einops import rearrange
+import torch.nn as nn
 from tqdm.auto import tqdm
 
+from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_dual_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
-    cfg_model_parallel_all_reduce,
     get_local_torch_device,
-    get_sp_parallel_rank,
+    get_sp_group,
     get_sp_world_size,
+    get_tp_group,
     get_world_group,
+    get_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+    run_two_branch_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGPolicy,
+    _unwrap,
+    _wrap,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
+    blend_wan_ti2v_latents,
+    expand_wan_ti2v_timestep,
+    prepare_wan_ti2v_latents,
+    prepare_wan_ti2v_sp_inputs,
+    should_apply_wan_ti2v,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -55,45 +89,74 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    RolloutDenoisingMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
-        SlidingTileAttentionBackend,
-    )
-
-    st_attn_available = True
-except ImportError:
-    st_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
-        VMOBAAttentionBackend,
-    )
-    from sglang.multimodal_gen.utils import is_vmoba_available
-
-    vmoba_attn_available = is_vmoba_available()
-except ImportError:
-    vmoba_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
-        VideoSparseAttentionBackend,
-    )
-
-    vsa_available = True
-except ImportError:
-    vsa_available = False
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
+from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
 
-class DenoisingStage(PipelineStage):
+@dataclass(slots=True)
+class DenoisingContext:
+    """Loop-scoped state shared across the denoising skeleton and its hooks."""
+
+    scheduler: Any
+    extra_step_kwargs: dict[str, Any]
+    target_dtype: torch.dtype
+    autocast_enabled: bool
+    timesteps: torch.Tensor
+    num_inference_steps: int
+    num_warmup_steps: int
+    image_kwargs: dict[str, Any]
+    pos_cond_kwargs: dict[str, Any]
+    neg_cond_kwargs: dict[str, Any]
+    latents: torch.Tensor
+    boundary_timestep: float | None
+    z: torch.Tensor | None
+    reserved_frames_mask: torch.Tensor | None
+    seq_len: int | None
+    guidance: torch.Tensor
+    is_warmup: bool
+    cfg_policy: CFGPolicy | None = None
+    trajectory_timesteps: list[torch.Tensor] = field(default_factory=list)
+    trajectory_latents: list[torch.Tensor] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_kwargs(self) -> dict[str, Any]:
+        """Return a shallow field mapping for derived context construction."""
+        return {item.name: getattr(self, item.name) for item in fields(self)}
+
+
+@dataclass(slots=True)
+class DenoisingStepState:
+    """Per-step hot-path state computed once and reused within a denoising step."""
+
+    step_index: int
+    t_host: torch.Tensor
+    t_device: torch.Tensor
+    t_int: int
+    current_model: Any
+    current_guidance_scale: Any
+    attn_metadata: Any | None
+
+
+class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """
     Stage for running the denoising loop in diffusion pipelines.
 
@@ -101,12 +164,20 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._torch_compiled_module_ids: set[int] = set()
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -115,34 +186,18 @@ class DenoisingStage(PipelineStage):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
-        if self.server_args.enable_torch_compile:
-            full_graph = False
-            self.transformer = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
-            )
-            self.transformer_2 = (
-                torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
-                )
-                if transformer_2 is not None
-                else None
-            )
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
+        selected_attention_backend = self._infer_transformer_attention_backend()
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,  # TODO(will): hack
-            supported_attention_backends={
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_THREE,
-            },  # hack
+            dtype=torch.float16,
+            selected_attention_backend=selected_attention_backend,
         )
 
         # cfg
@@ -150,12 +205,140 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
+        self._is_warmed_up = False
+        self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
-        # cache-dit state (for delayed mounting and idempotent control)
-        self._cache_dit_enabled = False
-        self._cached_num_steps = None
+    def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
+        backends = {
+            backend
+            for transformer in (self.transformer, self.transformer_2)
+            if transformer is not None
+            for module in transformer.modules()
+            if isinstance(
+                (backend := getattr(module, "backend", None)), AttentionBackendEnum
+            )
+        }
+        if not backends:
+            return None
+        if len(backends) > 1:
+            logger.warning(
+                "Multiple transformer attention backends detected: %s. "
+                "Using one backend for denoising metadata.",
+                sorted(backend.name.lower() for backend in backends),
+            )
+        return sorted(backends, key=lambda backend: backend.name)[0]
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
+        if self.vae is not None:
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="vae",
+                    target_dtype=vae_dtype,
+                )
+            )
+        for default_name, module in (
+            ("transformer", self.transformer),
+            ("transformer_2", self.transformer_2),
+        ):
+            if module is None:
+                continue
+            component_name = self._component_name_for_stage_module(module, default_name)
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name=component_name,
+                    phase=component_name,
+                    preferred_ready_after_request=component_name == "transformer",
+                    memory_intensive=True,
+                )
+            )
+        return uses
+
+    def _component_name_for_stage_module(
+        self, module: nn.Module | None, default_name: str
+    ) -> str:
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is None or module is None:
+            return default_name
+        for name, candidate in pipeline.modules.items():
+            if candidate is module:
+                return name
+        return default_name
+
+    def _maybe_enable_torch_compile(self, module: object) -> None:
+        """
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
+        """
+        if not self.server_args.enable_torch_compile or not isinstance(
+            module, nn.Module
+        ):
+            return
+        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+            logger.debug("Deferring torch.compile until cache-dit is enabled")
+            return
+        module_id = id(module)
+        if module_id in self._torch_compiled_module_ids:
+            return
+
+        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
+
+        if current_platform.is_npu():
+            backend = get_compiler_backend()
+            compile_kwargs["backend"] = backend
+            compile_kwargs["dynamic"] = False
+            logger.info("Compiling transformer with torchair backend on NPU")
+        else:
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            compile_kwargs["mode"] = mode
+            logger.info(f"Compiling transformer with mode: {mode}")
+
+        if self._needs_nvfp4_jit_prewarm(module):
+            logger.info(
+                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
+                "Dynamo tracing JIT initialization."
+            )
+            prewarm_nvfp4_jit_modules()
+
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(**compile_kwargs)
+        self._torch_compiled_module_ids.add(module_id)
+
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
+
+    @staticmethod
+    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
+        for submodule in module.modules():
+            quant_method = getattr(submodule, "quant_method", None)
+            if quant_method is None:
+                continue
+            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
+                return True
+        return False
+
+    def _maybe_enable_cache_dit(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
 
         This method should be called after the transformer is fully loaded
@@ -165,35 +348,60 @@ class DenoisingStage(PipelineStage):
         transformers with (potentially) different configurations.
 
         """
+        if isinstance(num_inference_steps, tuple):
+            num_high_noise_steps, num_low_noise_steps = num_inference_steps
+
+        # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            if self._cached_num_steps != num_inference_steps:
-                logger.warning(
-                    "num_inference_steps changed from %d to %d after cache-dit was enabled. "
-                    "Continuing with initial configuration (steps=%d).",
-                    self._cached_num_steps,
+            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+            scm_preset = None if scm_preset == "none" else scm_preset
+            if isinstance(num_inference_steps, tuple):
+                refresh_context_on_dual_transformer(
+                    self.transformer,
+                    self.transformer_2,
+                    num_high_noise_steps,
+                    num_low_noise_steps,
+                    scm_preset=scm_preset,
+                )
+            else:
+                refresh_context_on_transformer(
+                    self.transformer,
                     num_inference_steps,
-                    self._cached_num_steps,
+                    scm_preset=scm_preset,
                 )
             return
-        # check if cache-dit is enabled in config
+
+        # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
+        # warmup to mount cache-dit before Dynamo traces the transformer.
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
-
-        from sglang.multimodal_gen.runtime.distributed import get_world_size
-        from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
-            CacheDitConfig,
-            enable_cache_on_dual_transformer,
-            enable_cache_on_transformer,
-            get_scm_mask,
-        )
-
-        if get_world_size() > 1:
-            logger.warning(
-                "cache-dit is disabled in distributed environment (world_size=%d). "
-                "Distributed support will be added in a future version.",
-                get_world_size(),
-            )
+        if batch.is_warmup and not self.server_args.enable_torch_compile:
             return
+
+        world_size = get_world_size()
+        parallelized = world_size > 1
+
+        sp_group = None
+        tp_group = None
+        if parallelized:
+            sp_group_candidate = get_sp_group()
+            tp_group_candidate = get_tp_group()
+
+            sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
+            tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
+
+            has_sp = sp_world_size > 1
+            has_tp = tp_world_size > 1
+
+            sp_group = sp_group_candidate.device_group if has_sp else None
+            tp_group = tp_group_candidate.device_group if has_tp else None
+
+            logger.info(
+                "cache-dit enabled in distributed environment (world_size=%d, has_sp=%s, has_tp=%s)",
+                world_size,
+                has_sp,
+                has_tp,
+            )
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
         scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
@@ -227,10 +435,22 @@ class DenoisingStage(PipelineStage):
         # cache-dit handles step count validation and scaling internally
         steps_computation_mask = get_scm_mask(
             preset=scm_preset,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             compute_bins=scm_compute_bins,
             cache_bins=scm_cache_bins,
         )
+
+        if isinstance(num_inference_steps, tuple):
+            steps_computation_mask_2 = get_scm_mask(
+                preset=scm_preset,
+                num_inference_steps=num_low_noise_steps,
+                compute_bins=scm_compute_bins,
+                cache_bins=scm_cache_bins,
+            )
 
         # build config for primary transformer (high-noise expert)
         primary_config = CacheDitConfig(
@@ -242,7 +462,11 @@ class DenoisingStage(PipelineStage):
             max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
             enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
             taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             # SCM fields
             steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_policy,
@@ -261,9 +485,9 @@ class DenoisingStage(PipelineStage):
                 max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
                 enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
                 taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=num_low_noise_steps,
                 # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask,
+                steps_computation_mask=steps_computation_mask_2,
                 steps_computation_policy=scm_policy,
             )
 
@@ -275,10 +499,13 @@ class DenoisingStage(PipelineStage):
                 primary_config,
                 secondary_config,
                 model_name="wan2.2",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
-                "cache-dit enabled on dual transformers (steps=%d)",
-                num_inference_steps,
+                "cache-dit enabled on dual transformers (steps=%d, %d)",
+                num_high_noise_steps,
+                num_low_noise_steps,
             )
         else:
             # single transformer
@@ -286,6 +513,8 @@ class DenoisingStage(PipelineStage):
                 self.transformer,
                 primary_config,
                 model_name="transformer",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -301,14 +530,15 @@ class DenoisingStage(PipelineStage):
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
-        return (
-            torch.full(
-                (batch_size,),
-                guidance_val,
-                dtype=torch.float32,
-                device=device,
-            ).to(target_dtype)
-            * 1000.0
+        if isinstance(
+            self.server_args.pipeline_config, FluxPipelineConfig
+        ) and not isinstance(self.server_args.pipeline_config, Flux2PipelineConfig):
+            guidance_val = guidance_val * 1000.0
+        return torch.full(
+            (batch_size,),
+            guidance_val,
+            dtype=target_dtype,
+            device=device,
         )
 
     def get_or_build_guidance(self, bsz: int, dtype, device):
@@ -331,122 +561,11 @@ class DenoisingStage(PipelineStage):
         # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
         return StageParallelismType.REPLICATED
 
-    def _preprocess_latents_for_ti2v(
-        self, latents, target_dtype, batch, server_args: ServerArgs
-    ):
-        # FIXME: should probably move to latent preparation stage, to handle with offload
-        # Wan2.2 TI2V directly replaces the first frame of the latent with
-        # the image latent instead of appending along the channel dim
-        assert batch.image_latent is None, "TI2V task should not have image latents"
-        assert self.vae is not None, "VAE is not provided for TI2V task"
-        self.vae = self.vae.to(batch.condition_image.device)
-        z = self.vae.encode(batch.condition_image).mean.float()
-        if self.vae.device != "cpu" and server_args.vae_cpu_offload:
-            self.vae = self.vae.to("cpu")
-        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
-            if isinstance(self.vae.shift_factor, torch.Tensor):
-                z -= self.vae.shift_factor.to(z.device, z.dtype)
-            else:
-                z -= self.vae.shift_factor
-
-        if isinstance(self.vae.scaling_factor, torch.Tensor):
-            z = z * self.vae.scaling_factor.to(z.device, z.dtype)
-        else:
-            z = z * self.vae.scaling_factor
-        # z: [B, C, 1, H, W]
-        latent_model_input = latents.to(target_dtype)
-        # Keep as [B, C, T, H, W] for proper broadcasting
-        assert latent_model_input.ndim == 5
-
-        # Create mask with proper shape [B, C, T, H, W]
-        latent_for_mask = latent_model_input.squeeze(0)  # [C, T, H, W]
-        _, reserved_frames_masks = masks_like([latent_for_mask], zero=True)
-        reserved_frames_mask = reserved_frames_masks[0].unsqueeze(0)  # [1, C, T, H, W]
-
-        # replace GLOBAL first frame with image - proper broadcasting
-        # z: [B, C, 1, H, W], reserved_frames_mask: [1, C, T, H, W]
-        # Both will broadcast correctly
-        latents = (
-            1.0 - reserved_frames_mask
-        ) * z + reserved_frames_mask * latent_model_input
-        assert latents.ndim == 5
-        latents = latents.to(get_local_torch_device())
-        batch.latents = latents
-
-        F = batch.num_frames
-        temporal_scale = (
-            server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
-        )
-        spatial_scale = (
-            server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
-        )
-        patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
-        seq_len = (
-            ((F - 1) // temporal_scale + 1)
-            * (batch.height // spatial_scale)
-            * (batch.width // spatial_scale)
-            // (patch_size[1] * patch_size[2])
-        )
-        seq_len = int(math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
-        return seq_len, z, reserved_frames_masks
-
-    def _postprocess_latents_for_ti2v(self, z, reserved_frames_masks, batch):
-        rank_in_sp_group = get_sp_parallel_rank()
-        sp_world_size = get_sp_world_size()
-
-        if getattr(batch, "did_sp_shard_latents", False):
-            # Shard z (image latent) along time dimension
-            # z shape: [1, C, 1, H, W] - only first frame
-            # Only rank 0 has the first frame after sharding
-            if z.shape[2] == 1:
-                # z is single frame, only rank 0 needs it
-                if rank_in_sp_group == 0:
-                    z_sp = z
-                else:
-                    # Other ranks don't have the first frame
-                    z_sp = None
-            else:
-                # Should not happen for TI2V
-                z_sp = z
-
-            # Shard reserved_frames_mask along time dimension to match sharded latents
-            # reserved_frames_mask is a list from masks_like, extract reserved_frames_mask[0] first
-            # reserved_frames_mask[0] shape: [C, T, H, W]
-            # All ranks need their portion of reserved_frames_mask for timestep calculation
-            if reserved_frames_masks is not None:
-                reserved_frames_mask = reserved_frames_masks[
-                    0
-                ]  # Extract tensor from list
-                time_dim = reserved_frames_mask.shape[1]  # [C, T, H, W]
-                if time_dim > 0 and time_dim % sp_world_size == 0:
-                    reserved_frames_mask_sp_tensor = rearrange(
-                        reserved_frames_mask,
-                        "c (n t) h w -> c n t h w",
-                        n=sp_world_size,
-                    ).contiguous()
-                    reserved_frames_mask_sp_tensor = reserved_frames_mask_sp_tensor[
-                        :, rank_in_sp_group, :, :, :
-                    ]
-                    reserved_frames_mask_sp = (
-                        reserved_frames_mask_sp_tensor  # Store as tensor, not list
-                    )
-                else:
-                    reserved_frames_mask_sp = reserved_frames_mask
-            else:
-                reserved_frames_mask_sp = None
-        else:
-            # SP not enabled or latents not sharded
-            z_sp = z
-            reserved_frames_mask_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            )  # Extract tensor
-
-        return reserved_frames_mask_sp, z_sp
-
     def _handle_boundary_ratio(
         self,
         server_args,
         batch,
+        scheduler,
     ):
         """
         (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
@@ -461,7 +580,10 @@ class DenoisingStage(PipelineStage):
             boundary_ratio = batch.boundary_ratio
 
         if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+            if num_train_timesteps is None:
+                num_train_timesteps = scheduler.config.num_train_timesteps
+            boundary_timestep = boundary_ratio * num_train_timesteps
         else:
             boundary_timestep = None
 
@@ -471,51 +593,59 @@ class DenoisingStage(PipelineStage):
         """
         Prepare all necessary invariant variables for the denoising loop.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
         Returns:
-            A dictionary containing all the prepared variables for the denoising loop.
+            A context object containing the invariant state for the denoising loop.
         """
+        assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
-        if not server_args.model_loaded["transformer"]:
+        scheduler = batch.scheduler
+        assert scheduler is not None
+
+        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        # Get timesteps and calculate warmup steps
+        timesteps = batch.timesteps
+        num_inference_steps = batch.num_inference_steps
+        num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
+
+        if self.transformer_2 is not None:
+            assert boundary_timestep is not None, "boundary_timestep must be provided"
+            num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
+            num_low_noise_steps = num_inference_steps - num_high_noise_steps
+            cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
+        else:
+            cache_dit_num_inference_steps = num_inference_steps
+
+        transformer_was_loaded = server_args.model_loaded["transformer"]
+        if not transformer_was_loaded:
+            # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args
+                server_args.model_paths["transformer"], server_args, "transformer"
             )
 
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+        self._maybe_enable_cache_dit_and_torch_compile(
+            cache_dit_num_inference_steps, batch
+        )
 
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+        if not transformer_was_loaded:
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-        else:
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta},
+            scheduler.step,
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
-        target_dtype = torch.bfloat16
+        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
-
-        # Get timesteps and calculate warmup steps
-        timesteps = batch.timesteps
-        if timesteps is None:
-            raise ValueError("Timesteps must be provided")
-        num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
@@ -525,33 +655,36 @@ class DenoisingStage(PipelineStage):
             ]
 
         # Prepare STA parameters
-        if st_attn_available and self.attn_backend == SlidingTileAttentionBackend:
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
         # Get latents and embeddings
         latents = batch.latents
-        prompt_embeds = batch.prompt_embeds
         # Removed Tensor truthiness assert to avoid GPU sync
-        neg_prompt_embeds = None
         if batch.do_classifier_free_guidance:
-            neg_prompt_embeds = batch.negative_prompt_embeds
-            assert neg_prompt_embeds is not None
+            assert batch.negative_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
-
-        # specifically for Wan2_2_TI2V_5B_Config, not applicable for FastWan2_2_TI2V_5B_Config
-        should_preprocess_for_wan_ti2v = (
-            server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.condition_image is not None
-            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
-        )
+        should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            seq_len, z, reserved_frames_masks = self._preprocess_latents_for_ti2v(
-                latents, target_dtype, batch, server_args
-            )
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                target_dtype=vae_dtype,
+            ) as vae:
+                assert vae is not None
+                self.vae = vae
+                seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
+                    self.vae,
+                    latents,
+                    target_dtype,
+                    vae_dtype,
+                    batch,
+                    server_args,
+                )
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -565,7 +698,7 @@ class DenoisingStage(PipelineStage):
 
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
         if should_preprocess_for_wan_ti2v:
-            reserved_frames_mask_sp, z_sp = self._postprocess_latents_for_ti2v(
+            reserved_frames_mask_sp, z_sp = prepare_wan_ti2v_sp_inputs(
                 z, reserved_frames_masks, batch
             )
         else:
@@ -581,7 +714,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -590,56 +723,283 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": batch.prompt_attention_mask,
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                self._get_transformer_attr("rotary_emb"),
                 dtype=target_dtype,
+            )
+            | dict(
+                encoder_hidden_states=server_args.pipeline_config.get_pos_prompt_embeds(
+                    batch
+                )
             ),
         )
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                self.transformer.forward,
+                getattr(self.transformer, "forward", self.transformer),
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": batch.negative_attention_mask,
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    self._get_transformer_attr("rotary_emb"),
                     dtype=target_dtype,
+                )
+                | dict(
+                    encoder_hidden_states=server_args.pipeline_config.get_neg_prompt_embeds(
+                        batch
+                    )
                 ),
             )
         else:
             neg_cond_kwargs = {}
 
-        return {
-            "extra_step_kwargs": extra_step_kwargs,
-            "target_dtype": target_dtype,
-            "autocast_enabled": autocast_enabled,
-            "timesteps": timesteps,
-            "num_inference_steps": num_inference_steps,
-            "num_warmup_steps": num_warmup_steps,
-            "image_kwargs": image_kwargs,
-            "pos_cond_kwargs": pos_cond_kwargs,
-            "neg_cond_kwargs": neg_cond_kwargs,
-            "latents": latents,
-            "prompt_embeds": prompt_embeds,
-            "neg_prompt_embeds": neg_prompt_embeds,
-            "boundary_timestep": boundary_timestep,
-            "z": z_sp,  # Use SP-sharded version
-            # ndim == 5
-            "reserved_frames_mask": reserved_frames_mask_sp,  # Use SP-sharded version
-            "seq_len": seq_len,
-            "guidance": guidance,
-        }
+        cfg_policy = server_args.pipeline_config.cfg_policy.build(
+            batch, image_kwargs, pos_cond_kwargs, neg_cond_kwargs
+        )
+
+        return DenoisingContext(
+            scheduler=scheduler,
+            extra_step_kwargs=extra_step_kwargs,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            timesteps=timesteps,
+            num_inference_steps=num_inference_steps,
+            num_warmup_steps=num_warmup_steps,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs,
+            latents=latents,
+            boundary_timestep=boundary_timestep,
+            z=z_sp,
+            reserved_frames_mask=reserved_frames_mask_sp,
+            seq_len=seq_len,
+            guidance=guidance,
+            is_warmup=batch.is_warmup,
+            cfg_policy=cfg_policy,
+        )
+
+    def _before_denoising_loop(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Prepare scheduler state before entering the shared denoising loop."""
+        self._reset_scheduler_loop_state(ctx.scheduler)
+        ctx.scheduler.set_begin_index(0)
+
+    def _reset_scheduler_loop_state(self, scheduler) -> None:
+        if hasattr(scheduler, "_step_index"):
+            scheduler._step_index = None
+        if hasattr(scheduler, "_begin_index"):
+            scheduler._begin_index = None
+        if hasattr(scheduler, "lower_order_nums"):
+            scheduler.lower_order_nums = 0
+        if hasattr(scheduler, "last_sample"):
+            scheduler.last_sample = None
+        if hasattr(scheduler, "this_order"):
+            scheduler.this_order = 0
+
+        solver_order = getattr(getattr(scheduler, "config", None), "solver_order", 0)
+        if solver_order:
+            if hasattr(scheduler, "model_outputs"):
+                scheduler.model_outputs = [None] * solver_order
+            if hasattr(scheduler, "timestep_list"):
+                scheduler.timestep_list = [None] * solver_order
+
+    def _get_transformer_attr(self, name: str) -> Any:
+        seen: set[int] = set()
+        stack = [self.transformer]
+        while stack:
+            module = stack.pop()
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+
+            value = getattr(module, name, None)
+            if value is not None:
+                return value
+
+            for wrapper_attr in ("_fsdp_wrapped_module", "module", "_orig_mod"):
+                wrapped = getattr(module, wrapper_attr, None)
+                if wrapped is not None:
+                    stack.append(wrapped)
+        return None
+
+    def _prepare_step_state(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_host: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+    ) -> DenoisingStepState:
+        """Build the per-step state shared by the loop and model-specific hooks."""
+        t_int = int(t_host.item())
+        t_device = ctx.timesteps[step_index]
+        current_model, current_guidance_scale = self._select_and_manage_model(
+            t_int=t_int,
+            boundary_timestep=ctx.boundary_timestep,
+            server_args=server_args,
+            batch=batch,
+        )
+        attn_metadata = self._prepare_step_attn_metadata(
+            ctx=ctx,
+            batch=batch,
+            server_args=server_args,
+            step_index=step_index,
+            t_int=t_int,
+            timesteps_cpu=timesteps_cpu,
+        )
+        return DenoisingStepState(
+            step_index=step_index,
+            t_host=t_host,
+            t_device=t_device,
+            t_int=t_int,
+            current_model=current_model,
+            current_guidance_scale=current_guidance_scale,
+            attn_metadata=attn_metadata,
+        )
+
+    def _prepare_step_attn_metadata(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_int: int,
+        timesteps_cpu: torch.Tensor,
+    ) -> Any | None:
+        """Build attention metadata for the current denoising step."""
+        # Keep attention metadata preparation overridable so model-specific stages
+        # can preserve their original semantics without duplicating step state setup.
+        return self._build_attn_metadata(
+            step_index,
+            batch,
+            server_args,
+            timestep_value=t_int,
+            timesteps=timesteps_cpu,
+        )
+
+    def _get_prompt_embeds_validator(
+        self, batch: Req
+    ) -> Callable[[Any], bool] | list[Callable[[Any], bool]]:
+        """Return the prompt-embedding validator used by verify_input."""
+        return V.list_not_empty
+
+    def _get_negative_prompt_embeds_validator(
+        self, batch: Req
+    ) -> Callable[[Any], bool] | list[Callable[[Any], bool]]:
+        """Return the negative-prompt validator used by verify_input."""
+        return lambda x: not batch.do_classifier_free_guidance or V.list_not_empty(x)
+
+    def _run_denoising_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        """Run one scheduler-backed denoising step in the shared base path.
+
+        Model-specific stages should override this instead of the whole loop whenever possible to achieve better performance
+        """
+        # 1. Prepare latent inputs in the model's compute dtype.
+        latent_model_input = ctx.latents.to(ctx.target_dtype)
+        if batch.image_latent is not None:
+            assert (
+                not server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            ), "image latents should not be provided for TI2V task"
+            latent_model_input = torch.cat(
+                [latent_model_input, batch.image_latent], dim=1
+            ).to(ctx.target_dtype)
+
+        # 2. Expand the timestep to the shape expected by the current model.
+        timestep = self.expand_timestep_before_forward(
+            batch,
+            server_args,
+            step.t_device,
+            ctx.target_dtype,
+            ctx.seq_len,
+            ctx.reserved_frames_mask,
+        )
+
+        # 3. Apply scheduler-side input scaling before the model forward.
+        latent_model_input = ctx.scheduler.scale_model_input(
+            latent_model_input, step.t_device
+        )
+
+        # 4. Run the model prediction path, including CFG when enabled.
+        noise_pred = self._predict_noise_with_cfg(
+            current_model=step.current_model,
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            batch=batch,
+            timestep_index=step.step_index,
+            attn_metadata=step.attn_metadata,
+            target_dtype=ctx.target_dtype,
+            current_guidance_scale=step.current_guidance_scale,
+            cfg_policy=ctx.cfg_policy,
+            server_args=server_args,
+            guidance=ctx.guidance,
+            latents=ctx.latents,
+        )
+        if server_args.comfyui_mode:
+            batch.noise_pred = noise_pred
+
+        # 5. Advance the scheduler state with the predicted noise.
+        ctx.latents = ctx.scheduler.step(
+            model_output=noise_pred,
+            timestep=step.t_device,
+            sample=ctx.latents,
+            **ctx.extra_step_kwargs,
+            return_dict=False,
+        )[0]
+
+        # 6. Re-apply any model-specific latent constraints after the update.
+        ctx.latents = self.post_forward_for_ti2v_task(
+            batch,
+            server_args,
+            ctx.reserved_frames_mask,
+            ctx.latents,
+            ctx.z,
+        )
+
+    def _record_trajectory(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        """Append the current step to the returned latent trajectory, if requested."""
+        if not batch.return_trajectory_latents:
+            return
+        ctx.trajectory_timesteps.append(step.t_host)
+        ctx.trajectory_latents.append(ctx.latents)
+
+    def _finalize_denoising_loop(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Finalize the shared loop by handing state to post-denoising processing."""
+        self._post_denoising_loop(
+            batch=batch,
+            latents=ctx.latents,
+            trajectory_latents=ctx.trajectory_latents,
+            trajectory_timesteps=ctx.trajectory_timesteps,
+            server_args=server_args,
+            is_warmup=ctx.is_warmup,
+        )
 
     def _post_denoising_loop(
         self,
@@ -648,6 +1008,9 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list,
         trajectory_timesteps: list,
         server_args: ServerArgs,
+        is_warmup: bool = False,
+        *args,
+        **kwargs,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -662,6 +1025,19 @@ class DenoisingStage(PipelineStage):
             batch, latents, trajectory_tensor
         )
 
+        # Gather noise_pred if using sequence parallelism
+        # noise_pred has the same shape as latents (sharded along sequence dimension)
+        if (
+            get_sp_world_size() > 1
+            and getattr(batch, "did_sp_shard_latents", False)
+            and server_args.comfyui_mode
+            and hasattr(batch, "noise_pred")
+            and batch.noise_pred is not None
+        ):
+            batch.noise_pred = server_args.pipeline_config.gather_noise_pred_for_sp(
+                batch, batch.noise_pred
+            )
+
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
             batch.trajectory_latents = trajectory_tensor.cpu()
@@ -673,15 +1049,15 @@ class DenoisingStage(PipelineStage):
 
         # Save STA mask search results if needed
         if (
-            st_attn_available
-            and self.attn_backend == SlidingTileAttentionBackend
-            and server_args.STA_mode == STA_Mode.STA_SEARCHING
+            not is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            and server_args.attention_backend_config.STA_mode == "STA_SEARCHING"
         ):
             self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_available() and not is_warmup:
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -709,15 +1085,24 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, the image_latent (input image) should be
-        # replicated on all SP ranks, not sharded, as it provides global context.
-        if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2I
-            and batch.image_latent is not None
-        ):
+        # image_latent must be sharded consistently with latents when it is
+        # concatenated along the sequence dimension in the denoising loop.
+        if batch.image_latent is not None:
+            sp_video_metadata = {
+                name: getattr(batch, name)
+                for name in (
+                    "sp_video_latent_num_frames",
+                    "sp_video_start_frame",
+                    "sp_video_tokens_per_frame",
+                    "sp_video_valid_token_count",
+                )
+                if hasattr(batch, name)
+            }
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )
+            for name, value in sp_video_metadata.items():
+                setattr(batch, name, value)
 
     def _postprocess_sp_latents(
         self,
@@ -727,20 +1112,29 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = self.server_args.pipeline_config.gather_latents_for_sp(latents)
+            latents = self.server_args.pipeline_config.gather_latents_for_sp(
+                latents, batch=batch
+            )
             if trajectory_tensor is not None:
                 # trajectory_tensor shapes:
                 # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3
                 # - image: [b, num_steps, s_local, d] -> gather on dim=2
                 trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
-                gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
-                trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=gather_dim
-                )
-                if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
-                    orig_s = batch.raw_latent_shape[1]
-                    if trajectory_tensor.shape[2] > orig_s:
-                        trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
+                if isinstance(self.server_args.pipeline_config, ZImagePipelineConfig):
+                    trajectory_tensor = (
+                        self.server_args.pipeline_config.gather_latents_for_sp(
+                            trajectory_tensor, batch=batch
+                        )
+                    )
+                else:
+                    gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
+                    trajectory_tensor = sequence_model_parallel_all_gather(
+                        trajectory_tensor, dim=gather_dim
+                    )
+                    if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
+                        orig_s = batch.raw_latent_shape[1]
+                        if trajectory_tensor.shape[2] > orig_s:
+                            trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
     def step_profile(self):
@@ -748,31 +1142,32 @@ class DenoisingStage(PipelineStage):
         if profiler:
             profiler.step_denoising_step()
 
-    def _manage_device_placement(
+    def _manage_dit_use_site(
         self,
-        model_to_use: torch.nn.Module,
-        model_to_offload: torch.nn.Module | None,
-        server_args: ServerArgs,
-    ):
+        current_model: nn.Module,
+        current_phase: str,
+        batch: Req,
+    ) -> None:
         """
-        Manages the offload / load behavior of dit
+        manage dit's residency by reporting the active sequential use
+
+        only applicable for dual-dit architecture like Wan
+
+        Args:
+            current_model: the next active dit, transformer_1 or transformer_2
         """
-        if not server_args.dit_cpu_offload:
-            return
+        manager = self._component_residency_manager
 
-        # Offload the unused model if it's on CUDA
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        # Load the model to use if it's on CPU
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
+        component_name = manager.component_name_for_module(current_model, current_phase)
+        phase = str(batch.extra.get("ltx2_phase", current_phase))
+        use = ComponentUse(
+            stage_name=self._active_component_stage_name(),
+            component_name=component_name,
+            phase=phase,
+            preferred_ready_after_request=component_name == "transformer",
+            memory_intensive=True,
+        )
+        manager.begin_use(use)
 
     def _select_and_manage_model(
         self,
@@ -784,15 +1179,15 @@ class DenoisingStage(PipelineStage):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer
-            model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
+            current_phase = "transformer"
         else:
             # Low-noise stage
             current_model = self.transformer_2
-            model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
+            current_phase = "transformer_2"
 
-        self._manage_device_placement(current_model, model_to_offload, server_args)
+        self._manage_dit_use_site(current_model, current_phase, batch)
 
         assert current_model is not None, "The model for the current step is not set."
         return current_model, current_guidance_scale
@@ -807,45 +1202,18 @@ class DenoisingStage(PipelineStage):
         reserved_frames_mask,
     ):
         bsz = batch.raw_latent_shape[0]
-        should_preprocess_for_wan_ti2v = (
-            server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.condition_image is not None
-            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
-        )
+        should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
 
         # expand timestep
         if should_preprocess_for_wan_ti2v:
-            # Explicitly cast t_device to the target float type at the beginning.
-            # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
-            # is applied consistently *before* it's used by any rank.
-            t_device_rounded = t_device.to(target_dtype)
-
-            local_seq_len = seq_len
-            if get_sp_world_size() > 1 and getattr(
-                batch, "did_sp_shard_latents", False
-            ):
-                local_seq_len = seq_len // get_sp_world_size()
-
-            if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
-                # Rank 0 has the first frame, create a special timestep tensor
-                # NOTE: The spatial downsampling in the next line is suspicious but kept
-                # to match original model's potential training configuration.
-                temp_ts = (
-                    reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
-                ).flatten()
-
-                # Pad to full local sequence length
-                temp_ts = torch.cat(
-                    [
-                        temp_ts,
-                        temp_ts.new_ones(local_seq_len - temp_ts.size(0))
-                        * t_device_rounded,
-                    ]
-                )
-                timestep = temp_ts.unsqueeze(0).repeat(bsz, 1)
-            else:
-                # Other ranks get a uniform timestep tensor of the correct shape [B, local_seq_len]
-                timestep = t_device.repeat(bsz, local_seq_len)
+            assert seq_len is not None, "Wan TI2V requires a token sequence length."
+            timestep = expand_wan_ti2v_timestep(
+                batch,
+                t_device,
+                target_dtype,
+                seq_len,
+                reserved_frames_mask,
+            )
         else:
             timestep = t_device.repeat(bsz)
         return timestep
@@ -853,27 +1221,10 @@ class DenoisingStage(PipelineStage):
     def post_forward_for_ti2v_task(
         self, batch: Req, server_args: ServerArgs, reserved_frames_mask, latents, z
     ):
-        """
-        For Wan2.2 ti2v task, global first frame should be replaced with encoded image after each timestep
-        """
-        should_preprocess_for_wan_ti2v = (
-            server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.condition_image is not None
-            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
-        )
+        """Re-apply Wan TI2V first-frame conditioning after each denoising step."""
+        should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
         if should_preprocess_for_wan_ti2v:
-            # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
-            # This ensures the first frame is always the condition image after each step.
-            # This is only applied on rank 0, where z is not None.
-            if z is not None and reserved_frames_mask is not None:
-                # z: [1, C, 1, H, W]
-                # latents: [1, C, T_local, H, W]
-                # reserved_frames_mask: [C, T_local, H, W]
-                # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
-                # z will broadcast along the time dimension.
-                latents = (
-                    1.0 - reserved_frames_mask.unsqueeze(0)
-                ) * z + reserved_frames_mask.unsqueeze(0) * latents
+            latents = blend_wan_ti2v_latents(latents, reserved_frames_mask, z)
 
         return latents
 
@@ -885,165 +1236,96 @@ class DenoisingStage(PipelineStage):
     ) -> Req:
         """
         Run the denoising loop.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with denoised latents.
         """
-        # Prepare variables for the denoising loop
-
-        prepared_vars = self._prepare_denoising_loop(batch, server_args)
-        extra_step_kwargs = prepared_vars["extra_step_kwargs"]
-        target_dtype = prepared_vars["target_dtype"]
-        autocast_enabled = prepared_vars["autocast_enabled"]
-        timesteps = prepared_vars["timesteps"]
-        num_inference_steps = prepared_vars["num_inference_steps"]
-        num_warmup_steps = prepared_vars["num_warmup_steps"]
-        image_kwargs = prepared_vars["image_kwargs"]
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
-        latents = prepared_vars["latents"]
-        boundary_timestep = prepared_vars["boundary_timestep"]
-        z = prepared_vars["z"]
-        reserved_frames_mask = prepared_vars["reserved_frames_mask"]
-        seq_len = prepared_vars["seq_len"]
-        guidance = prepared_vars["guidance"]
-
-        # Initialize lists for ODE trajectory
-        trajectory_timesteps: list[torch.Tensor] = []
-        trajectory_latents: list[torch.Tensor] = []
-
-        # Run denoising loop
+        ctx = self._prepare_denoising_loop(batch, server_args)
+        if batch.rollout:
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs=ctx.image_kwargs,
+                pos_cond_kwargs=ctx.pos_cond_kwargs,
+                neg_cond_kwargs=ctx.neg_cond_kwargs,
+                guidance=ctx.guidance,
+            )
         denoising_start_time = time.time()
-
+        self._before_denoising_loop(ctx, batch, server_args)
         # to avoid device-sync caused by timestep comparison
-        timesteps_cpu = timesteps.cpu()
+        timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
-            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
-            dtype=target_dtype,
-            enabled=autocast_enabled,
+            device_type=current_platform.device_type,
+            dtype=ctx.target_dtype,
+            enabled=ctx.autocast_enabled,
         ):
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t_host in enumerate(timesteps_cpu):
-                    # Skip if interrupted
-                    if hasattr(self, "interrupt") and self.interrupt:
-                        continue
-
+            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+                for step_index, t_host in enumerate(timesteps_cpu):
                     with StageProfiler(
-                        f"denoising_step_{i}", logger=logger, timings=batch.timings
+                        f"denoising_step_{step_index}",
+                        logger=logger,
+                        metrics=batch.metrics,
+                        perf_dump_path_provided=batch.perf_dump_path is not None,
+                        record_as_step=True,
                     ):
-                        t_int = int(t_host.item())
-                        t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
-                        )
-
-                        # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
-                        if batch.image_latent is not None:
-                            assert (
-                                not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
-                            ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
-
-                        timestep = self.expand_timestep_before_forward(
+                        step = self._prepare_step_state(
+                            ctx,
                             batch,
                             server_args,
-                            t_device,
-                            target_dtype,
-                            seq_len,
-                            reserved_frames_mask,
+                            step_index,
+                            t_host,
+                            timesteps_cpu,
                         )
+                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
+                        # x_{t_i} for rollout trajectory collection. Must run
+                        # BEFORE _run_denoising_step so ctx.latents is still the
+                        # pre-step value. Gated on batch.rollout to keep the
+                        # non-rollout path strictly untouched.
+                        if batch.rollout:
+                            batch._rollout_loop_step_index = step_index
+                            self._maybe_append_dit_trajectory_step(
+                                batch=batch,
+                                latents=ctx.latents,
+                                timestep_value=step.t_host,
+                                step_index=step_index,
+                            )
+                        self._run_denoising_step(ctx, step, batch, server_args)
+                        self._record_trajectory(ctx, step, batch, server_args)
 
-                        latent_model_input = self.scheduler.scale_model_input(
-                            latent_model_input, t_device
-                        )
-
-                        # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(i, batch, server_args)
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
-                        )
-
-                        # Compute the previous noisy sample
-                        latents = self.scheduler.step(
-                            model_output=noise_pred,
-                            timestep=t_device,
-                            sample=latents,
-                            **extra_step_kwargs,
-                            return_dict=False,
-                        )[0]
-
-                        latents = self.post_forward_for_ti2v_task(
-                            batch, server_args, reserved_frames_mask, latents, z
-                        )
-
-                        # save trajectory latents if needed
-                        if batch.return_trajectory_latents:
-                            trajectory_timesteps.append(t_host)
-                            trajectory_latents.append(latents)
-
-                        # Update progress bar
-                        if i == num_timesteps - 1 or (
-                            (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
+                        if step_index == num_timesteps - 1 or (
+                            (step_index + 1) > ctx.num_warmup_steps
+                            and (step_index + 1) % ctx.scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
+                        if not ctx.is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 
-        if num_timesteps > 0:
+        if num_timesteps > 0 and not ctx.is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
-                (denoising_end_time - denoising_start_time) / len(timesteps),
+                (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
-        self._post_denoising_loop(
-            batch=batch,
-            latents=latents,
-            trajectory_latents=trajectory_latents,
-            trajectory_timesteps=trajectory_timesteps,
-            server_args=server_args,
-        )
+        self._finish_active_component_use()
+
+        # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
+        # the final scheduler.step output (ctx.latents) is still SP-sharded and
+        # can be gathered uniformly alongside the per-step dit_trajectory via
+        # gather_stacked_latents_for_sp.
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=ctx.latents,
+                num_inference_steps=num_timesteps,
+                final_timestep=timesteps_cpu.new_zeros(()),
+                server_args=server_args,
+            )
+        self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 
-    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
-    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
-        """
-        Prepare extra kwargs for the scheduler step / denoise step.
-
-        Args:
-            func: The function to prepare kwargs for.
-            kwargs: The kwargs to prepare.
-        """
+    def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:
         import functools
 
         # Handle cache-dit's partial wrapping logic.
@@ -1055,90 +1337,239 @@ class DenoisingStage(PipelineStage):
 
         # Unwrap any decorators (e.g. functools.wraps)
         target_func = inspect.unwrap(func)
+        cache_target = (
+            target_func.__func__ if inspect.ismethod(target_func) else target_func
+        )
+        cache_key = id(cache_target)
+        cached = self._extra_func_kwarg_names_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # Filter kwargs based on the signature
         params = inspect.signature(target_func).parameters
-        return {k: v for k, v in kwargs.items() if k in params}
+        result = (
+            any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            ),
+            frozenset(params),
+        )
+        self._extra_func_kwarg_names_cache[cache_key] = result
+        return result
+
+    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
+    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
+        """
+        Prepare extra kwargs for the scheduler step / denoise step.
+
+        Args:
+            func: The function to prepare kwargs for.
+            kwargs: The kwargs to prepare.
+        """
+        accepts_var_kwargs, param_names = self._get_extra_func_kwarg_names(func)
+        if accepts_var_kwargs:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in param_names}
 
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
     ) -> tqdm:
         """
         Create a progress bar for the denoising process.
-
-        Args:
-            iterable: The iterable to iterate over.
-            total: The total number of items.
-
-        Returns:
-            A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
-        if local_rank == 0:
-            return tqdm(iterable=iterable, total=total)
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
+
+    def _predict_noise_with_cfg(
+        self,
+        current_model: nn.Module,
+        latent_model_input: torch.Tensor,
+        timestep,
+        batch: Req,
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        current_guidance_scale,
+        cfg_policy: CFGPolicy,
+        server_args: ServerArgs,
+        guidance: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+        """Run all CFG branch forward passes and combine into the final noise estimate."""
+        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
+            batch, current_guidance_scale
+        )
+
+        def predict_fn(branch):
+            branch.configure_batch(batch)
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ):
+                raw = self._predict_noise(
+                    current_model=current_model,
+                    latent_model_input=latent_model_input,
+                    timestep=timestep,
+                    target_dtype=target_dtype,
+                    guidance=guidance,
+                    **branch.kwargs,
+                )
+            pred_t = _wrap(raw)
+            if len(pred_t) == 1:
+                pred_t = (
+                    server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
+                )
+            return _unwrap(pred_t)
+
+        if server_args.enable_cfg_parallel:
+            if (
+                len(cfg_policy.branches) == 2
+                and get_classifier_free_guidance_world_size() == 2
+            ):
+                return run_two_branch_cfg_parallel(
+                    cfg_policy,
+                    predict_fn,
+                    cfg_scale,
+                    batch,
+                    server_args.pipeline_config,
+                )
+            # perform cfg branches in parallel, following the cfg policy
+            predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
-            return tqdm(iterable=iterable, total=total, disable=True)
+            # perform cfg branches one-by-one locally
+            predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
-    def rescale_noise_cfg(
-        self, noise_cfg, noise_pred_text, guidance_rescale=0.0
-    ) -> torch.Tensor:
-        """
-        Rescale noise prediction according to guidance_rescale.
-
-        Based on findings of "Common Diffusion Noise Schedules and Sample Steps are Flawed"
-        (https://arxiv.org/pdf/2305.08891.pdf), Section 3.4.
-
-        Args:
-            noise_cfg: The noise prediction with guidance.
-            noise_pred_text: The text-conditioned noise prediction.
-            guidance_rescale: The guidance rescale factor.
-
-        Returns:
-            The rescaled noise prediction.
-        """
-        std_text = noise_pred_text.std(
-            dim=list(range(1, noise_pred_text.ndim)), keepdim=True
+        return cfg_policy.combine(
+            predictions,
+            batch,
+            cfg_scale,
+            server_args.pipeline_config,
+            cfg_parallel=server_args.enable_cfg_parallel,
         )
-        std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-        # Rescale the results from guidance (fixes overexposure)
-        noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-        # Mix with the original results from guidance by factor guidance_rescale
-        noise_cfg = (
-            guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-        )
-        return noise_cfg
 
     def _build_attn_metadata(
-        self, i: int, batch: Req, server_args: ServerArgs
+        self,
+        i: int,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        timestep_value: int | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> Any | None:
         """
         Build attention metadata for custom attention backends.
 
         Args:
             i: The current timestep index.
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The attention metadata, or None if not applicable.
         """
         attn_metadata = None
-        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        self.attn_metadata_builder = None
+        try:
+            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        except NotImplementedError:
+            self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
-        if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
-            vsa_available and self.attn_backend == VideoSparseAttentionBackend
+        if (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.VSA_sparsity,
+                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
                 device=get_local_torch_device(),
             )
-        elif vmoba_attn_available and self.attn_backend == VMOBAAttentionBackend:
-            moba_params = server_args.moba_config.copy()
+        elif (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+        ):
+            if timestep_value is None or timesteps is None:
+                raise ValueError(
+                    "timestep_value and timesteps must be provided for SVG2 attention metadata"
+                )
+
+            svg2_cfg = server_args.attention_backend_config or {}
+            num_layers = server_args.pipeline_config.dit_config.num_layers
+            if (
+                server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan"
+                and hasattr(server_args.pipeline_config.dit_config, "num_single_layers")
+            ):
+                num_layers += server_args.pipeline_config.dit_config.num_single_layers
+            first_layers_fp = svg2_cfg.get("svg2_first_layers_fp", 0.03)
+            if first_layers_fp <= 1.0:
+                first_layers_fp = math.floor(first_layers_fp * num_layers)
+            first_layers_fp = max(0, min(int(first_layers_fp), num_layers))
+
+            first_times_fp = svg2_cfg.get("svg2_first_times_fp", 0.2)
+            if first_times_fp <= 1.0:
+                num_fp_steps = math.floor(first_times_fp * len(timesteps))
+                if num_fp_steps > 0:
+                    first_times_fp = float(timesteps[num_fp_steps - 1].item() - 1)
+                else:
+                    first_times_fp = float(timesteps.max().item() + 1)
+
+            current_timestep = int(timestep_value)
+
+            cache = batch.extra.get("svg2_cache")
+            if cache is None:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (
+                    Svg2Cache,
+                )
+
+                cache = Svg2Cache()
+                batch.extra["svg2_cache"] = cache
+
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            if isinstance(patch_size, list):
+                patch_size = tuple(patch_size)
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+
+            context_length = 0
+            prompt_length = None
+            if server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan":
+                prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+                if isinstance(prompt_embeds, list):
+                    text_embeds = prompt_embeds[0] if prompt_embeds else None
+                else:
+                    text_embeds = prompt_embeds
+                if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim >= 2:
+                    context_length = int(text_embeds.shape[1])
+                if context_length > 0 and batch.prompt_attention_mask:
+                    mask = batch.prompt_attention_mask[0]
+                    if isinstance(mask, torch.Tensor):
+                        if mask.shape[-1] > context_length:
+                            mask = mask[:, -context_length:]
+                        prompt_length = int(mask[0].sum().item())
+                if prompt_length is None:
+                    prompt_length = context_length
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                raw_latent_shape=batch.raw_latent_shape,
+                patch_size=patch_size,
+                num_q_centroids=svg2_cfg.get("svg2_num_q_centroids", 300),
+                num_k_centroids=svg2_cfg.get("svg2_num_k_centroids", 1000),
+                top_p_kmeans=svg2_cfg.get("svg2_top_p_kmeans", 0.9),
+                min_kc_ratio=svg2_cfg.get("svg2_min_kc_ratio", 0.1),
+                kmeans_iter_init=svg2_cfg.get("svg2_kmeans_iter_init", 50),
+                kmeans_iter_step=svg2_cfg.get("svg2_kmeans_iter_step", 2),
+                zero_step_kmeans_init=svg2_cfg.get("svg2_zero_step_kmeans_init", False),
+                first_layers_fp=first_layers_fp,
+                first_times_fp=first_times_fp,
+                context_length=context_length,
+                prompt_length=prompt_length,
+                cache=cache,
+                calculate_density=False,  # only need density when doing head load balancing
+            )
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
+            moba_params = server_args.attention_backend_config.moba_config.copy()
             moba_params.update(
                 {
                     "current_timestep": i,
@@ -1147,14 +1578,13 @@ class DenoisingStage(PipelineStage):
                     "device": get_local_torch_device(),
                 }
             )
-        elif self.attn_backend == FlashAttentionBackend:
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 
@@ -1163,169 +1593,32 @@ class DenoisingStage(PipelineStage):
         current_model,
         latent_model_input,
         timestep,
-        prompt_embeds,
         target_dtype,
         guidance: torch.Tensor,
         **kwargs,
     ):
+        guidance_kwargs = self.prepare_extra_func_kwargs(
+            getattr(current_model, "forward", current_model),
+            {"guidance": guidance},
+        )
         return current_model(
             hidden_states=latent_model_input,
-            encoder_hidden_states=prompt_embeds,
             timestep=timestep,
-            guidance=guidance,
+            **guidance_kwargs,
             **kwargs,
         )
-
-    def _predict_noise_with_cfg(
-        self,
-        current_model: torch.nn.Module,
-        latent_model_input: torch.Tensor,
-        timestep,
-        batch: Req,
-        timestep_index: int,
-        attn_metadata,
-        target_dtype,
-        current_guidance_scale,
-        image_kwargs: dict[str, Any],
-        pos_cond_kwargs: dict[str, Any],
-        neg_cond_kwargs: dict[str, Any],
-        server_args,
-        guidance,
-        latents,
-    ):
-        """
-        Predict the noise residual with classifier-free guidance.
-
-        Args:
-            current_model: The transformer model to use for the current step.
-            latent_model_input: The input latents for the model.
-            timestep: The expanded timestep tensor.
-            batch: The current batch information.
-            timestep_index: The current timestep index.
-            attn_metadata: Attention metadata for custom backends.
-            target_dtype: The target data type for autocasting.
-            current_guidance_scale: The guidance scale for the current step.
-            image_kwargs: Keyword arguments for image conditioning.
-            pos_cond_kwargs: Keyword arguments for positive prompt conditioning.
-            neg_cond_kwargs: Keyword arguments for negative prompt conditioning.
-
-        Returns:
-            The predicted noise.
-        """
-        noise_pred_cond: torch.Tensor | None = None
-        noise_pred_uncond: torch.Tensor | None = None
-        cfg_rank = get_classifier_free_guidance_rank()
-        # positive pass
-        if not (server_args.enable_cfg_parallel and cfg_rank != 0):
-            batch.is_cfg_negative = False
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ):
-                noise_pred_cond = self._predict_noise(
-                    current_model=current_model,
-                    latent_model_input=latent_model_input,
-                    timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_pos_prompt_embeds(
-                        batch
-                    ),
-                    target_dtype=target_dtype,
-                    guidance=guidance,
-                    **image_kwargs,
-                    **pos_cond_kwargs,
-                )
-                # TODO: can it be moved to after _predict_noise_with_cfg?
-                noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
-                    noise_pred_cond, latents
-                )
-        if not batch.do_classifier_free_guidance:
-            # If CFG is disabled, we are done. Return the conditional prediction.
-            return noise_pred_cond
-
-        # negative pass
-        if not server_args.enable_cfg_parallel or cfg_rank != 0:
-            batch.is_cfg_negative = True
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ):
-                noise_pred_uncond = self._predict_noise(
-                    current_model=current_model,
-                    latent_model_input=latent_model_input,
-                    timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_neg_prompt_embeds(
-                        batch
-                    ),
-                    target_dtype=target_dtype,
-                    guidance=guidance,
-                    **image_kwargs,
-                    **neg_cond_kwargs,
-                )
-                noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
-                    noise_pred_uncond, latents
-                )
-
-        # Combine predictions
-        if server_args.enable_cfg_parallel:
-            # Each rank computes its partial contribution and we sum via all-reduce:
-            #   final = s*cond + (1-s)*uncond
-            if cfg_rank == 0:
-                assert noise_pred_cond is not None
-                partial = current_guidance_scale * noise_pred_cond
-            else:
-                assert noise_pred_uncond is not None
-                partial = (1 - current_guidance_scale) * noise_pred_uncond
-
-            noise_pred = cfg_model_parallel_all_reduce(partial)
-
-            # Guidance rescale: broadcast std(cond) from rank 0, compute std(cfg) locally
-            if batch.guidance_rescale > 0.0:
-                std_cfg = noise_pred.std(
-                    dim=list(range(1, noise_pred.ndim)), keepdim=True
-                )
-                if cfg_rank == 0:
-                    assert noise_pred_cond is not None
-                    std_text = noise_pred_cond.std(
-                        dim=list(range(1, noise_pred_cond.ndim)), keepdim=True
-                    )
-                else:
-                    std_text = torch.empty_like(std_cfg)
-                # Broadcast std_text from local src=0 to all ranks in CFG group
-                std_text = get_cfg_group().broadcast(std_text, src=0)
-                noise_pred_rescaled = noise_pred * (std_text / std_cfg)
-                noise_pred = (
-                    batch.guidance_rescale * noise_pred_rescaled
-                    + (1 - batch.guidance_rescale) * noise_pred
-                )
-            return noise_pred
-        else:
-            # Serial CFG: both cond and uncond are available locally
-            assert noise_pred_cond is not None and noise_pred_uncond is not None
-            noise_pred = noise_pred_uncond + current_guidance_scale * (
-                noise_pred_cond - noise_pred_uncond
-            )
-
-            if batch.guidance_rescale > 0.0:
-                noise_pred = self.rescale_noise_cfg(
-                    noise_pred,
-                    noise_pred_cond,
-                    guidance_rescale=batch.guidance_rescale,
-                )
-            return noise_pred
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
         Prepare Sliding Tile Attention (STA) parameters and settings.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
-        STA_mode = server_args.STA_mode
-        skip_time_steps = server_args.skip_time_steps
+        try:
+            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+        except Exception as e:
+            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            raise e
+        skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
             raise ValueError("Timesteps must be provided")
         timesteps_num = batch.timesteps.shape[0]
@@ -1473,7 +1766,11 @@ class DenoisingStage(PipelineStage):
         result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
         # disable temporarily for image-generation models
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
-        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            self._get_prompt_embeds_validator(batch),
+        )
         result.add_check("image_embeds", batch.image_embeds, V.is_list)
         # result.add_check(
         #     "image_latent", batch.image_latent, V.none_or_tensor_with_dims(5)
@@ -1492,7 +1789,7 @@ class DenoisingStage(PipelineStage):
         result.add_check(
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
-            lambda x: not batch.do_classifier_free_guidance or V.list_not_empty(x),
+            self._get_negative_prompt_embeds_validator(batch),
         )
         return result
 

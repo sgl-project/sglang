@@ -30,10 +30,10 @@ using namespace cute;
 struct PerfConfigLowMH20 {
   // Swap A/B
   using ElementA = cutlass::float_e4m3_t;
-  using MmaTileShape = Shape<_128, _32, _128>;
+  using MmaTileShape = Shape<_256, _32, _128>;
   using ClusterShape = Shape<_2, _1, _1>;
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8Blockwise;
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8Blockwise;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
   using ScaleConfig =
       cutlass::detail::Sm90BlockwiseScaleConfig<128, 1, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());

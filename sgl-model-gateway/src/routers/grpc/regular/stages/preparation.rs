@@ -7,17 +7,23 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use super::{
+    chat::ChatPreparationStage, embedding::preparation::EmbeddingPreparationStage,
+    generate::GeneratePreparationStage,
+};
+use crate::routers::{
     error as grpc_error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+    },
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)
-pub struct PreparationStage {
+pub(crate) struct PreparationStage {
     chat_stage: ChatPreparationStage,
     generate_stage: GeneratePreparationStage,
+    embedding_stage: EmbeddingPreparationStage,
 }
 
 impl PreparationStage {
@@ -25,6 +31,7 @@ impl PreparationStage {
         Self {
             chat_stage: ChatPreparationStage,
             generate_stage: GeneratePreparationStage,
+            embedding_stage: EmbeddingPreparationStage::new(),
         }
     }
 }
@@ -41,12 +48,16 @@ impl PipelineStage for PreparationStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            // Classify reuses the embedding preparation (tokenization)
+            RequestType::Classify(_) => self.embedding_stage.execute(ctx).await,
             RequestType::Responses(_) => {
                 error!(
                     function = "PreparationStage::execute",
                     "RequestType::Responses reached regular preparation stage"
                 );
                 Err(grpc_error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular preparation stage",
                 ))
             }

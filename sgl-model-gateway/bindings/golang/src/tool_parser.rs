@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 
-use sgl_model_gateway::tool_parser::{ParserFactory, ToolParser};
-use sgl_model_gateway::protocols::common::Tool;
+use smg::tool_parser::{ParserFactory, ToolParser};
+use smg::protocols::common::Tool;
 
 use super::error::{SglErrorCode, set_error_message, clear_error_message};
 use super::utils::generate_tool_call_id;

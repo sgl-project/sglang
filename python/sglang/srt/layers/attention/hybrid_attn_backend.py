@@ -111,6 +111,34 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
+    def forward(
+        self,
+        q: Optional[torch.Tensor] = None,  # For full attention
+        k: Optional[torch.Tensor] = None,  # For full attention
+        v: Optional[torch.Tensor] = None,  # For full attention
+        layer: Optional[RadixAttention] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+        save_kv_cache: bool = True,
+        *,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
+        **kwargs,
+    ):
+        """Forward method that supports both regular attention (q, k, v) and linear attention (mixed_qkv, a, b)."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        if mixed_qkv is not None:
+            return backend.forward(
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
+            )
+        return backend.forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -145,3 +173,25 @@ class HybridAttnBackend(AttentionBackend):
     ) -> Optional[BaseIndexerMetadata]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
+
+    def forward(
+        self,
+        q: torch.Tensor = None,
+        k: torch.Tensor = None,
+        v: torch.Tensor = None,
+        layer: RadixAttention = None,
+        forward_batch: ForwardBatch = None,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Delegate forward to the appropriate backend based on forward mode."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )

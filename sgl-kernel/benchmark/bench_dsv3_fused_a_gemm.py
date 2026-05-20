@@ -1,17 +1,14 @@
 import argparse
-import os
-
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm
+
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 # CI environment uses simplified parameters
 if IS_CI:

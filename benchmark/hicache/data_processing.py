@@ -11,13 +11,13 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-
-from sglang.bench_serving import (
-    download_and_cache_file,
+from sglang.benchmark.datasets.common import (
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
     gen_prompt,
-    get_gen_prefix_cache_path,
 )
+from sglang.benchmark.datasets.generated_shared_prefix import get_gen_prefix_cache_path
+from sglang.benchmark.utils import download_and_cache_hf_file
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
@@ -104,7 +104,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -367,7 +370,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_hf_file(
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -436,7 +442,15 @@ def sample_generated_shared_prefix_requests(
     disable_shuffle: bool = False,
 ) -> SampleOutput:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    cache_path = get_gen_prefix_cache_path(
+        args.seed,
+        num_groups,
+        prompts_per_group,
+        system_prompt_len,
+        question_len,
+        output_len,
+        tokenizer,
+    )
 
     # Try to load from cache first
     if cache_path.exists():

@@ -1,0 +1,470 @@
+---
+title: "Ascend NPU Accuracy Evaluation"
+metatags:
+  description: "Complete guide for SGLang model accuracy evaluation on Ascend NPU using EvalScope and AISBench, covering text/multimodal scenarios."
+---
+
+# Ascend NPU Accuracy Evaluation
+
+This document describes how to perform accuracy evaluation for SGLang models running on Ascend NPU using two tools: **EvalScope** and **AISBench**. The following scenarios are covered:
+
+- **Online Testing**: Evaluate via API interface after starting SGLang server
+- **Text Models**: Using Qwen2.5-7B-Instruct as example
+- **Multimodal Models**: Using Qwen2.5-VL-7B-Instruct as example
+
+---
+
+## Environment Setup
+
+First, launch the SGLang environment using the provided container image:
+
+```shell Command
+# Atlas 800I A3 environment
+export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
+
+docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
+    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin \
+    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule \
+    --volume ~/.cache/:/root/.cache/ \
+    --entrypoint=bash \
+    $IMAGE
+```
+
+**For Atlas 800I A2 users**: Replace the image tag with `main-cann8.5.0-910b` and adjust device mappings from `/dev/davinci[8-15]` to `/dev/davinci[0-7]`.
+
+---
+
+## Using EvalScope
+
+[EvalScope](https://github.com/modelscope/evalscope) is a comprehensive model evaluation framework from ModelScope, supporting both accuracy evaluation and performance stress testing.
+
+### Install EvalScope
+
+```shell Command
+# Method1 Installing via pip
+pip install evalscope
+
+# Method2 Installing from source
+git clone https://github.com/modelscope/evalscope.git
+cd evalscope/
+pip install -e .
+```
+
+### Online Text Model Testing
+
+This section covers online evaluation scenarios where the SGLang server is already running.
+
+#### Start SGLang Server
+
+```shell Command
+# Set HuggingFace mirror (if network access is restricted)
+export HF_ENDPOINT=https://hf-mirror.com
+
+# Start text model server
+sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
+```
+For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
+
+#### Execute Accuracy Evaluation
+
+EvalScope connects to the SGLang server via OpenAI-compatible API. The following example uses the GSM8K dataset:
+
+```shell Command
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets gsm8k \
+ --limit 10
+```
+
+Upon completion, results similar to the following will be displayed:
+
+```
++---------------------+-----------+----------+----------+-------+---------+---------+
+| Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
++=====================+===========+==========+==========+=======+=========+=========+
+| Qwen2.5-7B-Instruct | gsm8k     | mean_acc | main     |     5 |     1.0 | default |
++---------------------+-----------+----------+----------+-------+---------+---------+
+```
+
+> **Note**: Output format may vary slightly across different EvalScope versions. The above example is from EvalScope 1.6.x. Ensure the `--model` parameter matches the model name returned by the SGLang server's `/v1/models` endpoint. When starting the server with an HF path (e.g., `Qwen/Qwen2.5-7B-Instruct`), use that path directly. For local paths, pass the full path or the model name returned by `/v1/models`.
+
+#### Common Datasets for Online Evaluation
+
+```shell Command
+# MMLU
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets mmlu
+
+# CEval (Chinese evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets ceval
+
+# MATH-500
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets math
+
+# HumanEval (code generation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets humaneval
+```
+
+### Online Multimodal Model Testing
+
+#### Start Multimodal Model Server
+
+```shell Command
+# Start multimodal model server (Qwen2.5-VL-7B-Instruct)
+# Multimodal models require both --attention-backend and --mm-attention-backend
+sglang serve --model-path /home/weights/Qwen2.5-VL-7B-Instruct \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --host 0.0.0.0 --port 30000 &
+```
+
+#### Execute Multimodal Accuracy Evaluation
+
+```shell Command
+# MMBench (multimodal evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets mmbench
+
+# MMMU (multimodal comprehensive understanding)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets mmmu
+
+# HallusionBench (hallucination evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type server \
+ --datasets hallusionbench
+```
+
+For more details, refer to the [EvalScope documentation](https://evalscope.readthedocs.io/).
+
+---
+
+## Using AISBench
+
+[AISBench](https://github.com/AISBench/benchmark) is an official benchmark testing tool from Ascend, supporting accuracy and performance evaluation across multiple datasets.
+
+### Install AISBench
+
+```shell Command
+# Install from source (recommended to use Gitee mirror)
+git clone https://github.com/AISBench/benchmark.git
+cd benchmark/
+
+# Install core package (use Aliyun mirror if network access is restricted)
+pip3 install -e ./ --use-pep517
+
+# If dependency installation times out, use Aliyun mirror:
+# pip3 install -r requirements/runtime.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# Verify installation
+ais_bench -h
+```
+
+> **Note**: When using `pip install -e` (development mode), the `ais_bench` command may not be in PATH. Use `python3 -m ais_bench.benchmark.cli.main` as an alternative.
+
+### Configuration File Setup
+
+Each model task, dataset task, and result presentation task corresponds to a configuration file. You need to modify the content of these configuration files before running the command. The paths of these configuration files can be queried by adding `--search` to the original AISBench command. For example:
+```
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds --search
+```
+Executing the query command will yield the following results:
+```
+╒═════════════╤══════════════════════════════════╤═════════════════════════════════════════════════════════════════════════════════════════════════════════╕
+│ Task Type   │ Task Name                        │ Config File Path                                                                                        │
+╞═════════════╪══════════════════════════════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════╡
+│ --models    │ vllm_api_general_chat            │ /home/code/benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py           │
+├─────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ --datasets  │ gsm8k_gen_0_shot_cot_chat_prompt │ /home/code/benchmark/ais_bench/benchmark/configs/datasets/gsm8k/gsm8k_gen_0_shot_cot_chat_prompt.py │
+╘═════════════╧══════════════════════════════════╧═════════════════════════════════════════════════════════════════════════════════════════════════════════╛
+```
+For online text models, edit `benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py`:
+
+```python
+from ais_bench.benchmark.models import VLLMCustomAPIChat
+from ais_bench.benchmark.utils.model_postprocessors import extract_non_reasoning_content
+
+models = [
+    dict(
+        attr="service",  # Backend type identifier
+        type=VLLMCustomAPIChat,
+        abbr='vllm-api-general-chat',
+        path="/home/weights/Qwen2.5-7B-Instruct",  # Path to model vocabulary file (usually not required for accuracy testing)
+        model="/home/weights/Qwen2.5-7B-Instruct",  # Model name on server (empty string auto-detects)
+        request_rate=0,  # Request frequency; sends all at once if <0.1
+        retry=2,  # Maximum retry attempts per request
+        host_ip="localhost",  # Inference service IP
+        host_port=30000,  # Inference service port
+        max_out_len=512,  # Maximum output tokens
+        batch_size=1,  # Maximum request concurrency
+        trust_remote_code=False,  # Whether tokenizer trusts remote code
+        generation_kwargs=dict(  # Inference parameters (passed directly to requests)
+            temperature=0.6,
+            top_k=10,
+            top_p=0.95,
+            seed=None,
+            repetition_penalty=1.03,
+        ),
+        pred_postprocessor=dict(type=extract_non_reasoning_content)
+    )
+]
+```
+
+> **Note**: SGLang server defaults to port `30000` and is compatible with OpenAI API format, so AISBench's `VLLMCustomAPIChat` can connect directly to SGLang.
+>
+> **Important**: The sum of `max_out_len` and input token count must not exceed the SGLang server's `max_model_len` (default 32768 for Qwen2.5-7B). We recommend setting `max_out_len` to `512` or `1024` to avoid `400` errors caused by exceeding the context window.
+
+### Download Datasets
+
+AISBench supports multiple common datasets that must be downloaded to a specified path before use.
+
+```shell Command
+# C-Eval
+cd ais_bench/datasets
+mkdir ceval/ && mkdir ceval/formal_ceval
+cd ceval/formal_ceval
+wget https://www.modelscope.cn/datasets/opencompass/ceval-exam/resolve/master/ceval-exam.zip
+unzip ceval-exam.zip && rm ceval-exam.zip
+cd ../../..
+
+# MMLU
+cd ais_bench/datasets
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/mmlu.zip
+unzip mmlu.zip && rm mmlu.zip
+cd ../..
+
+# GSM8K
+cd ais_bench/datasets
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip
+unzip gsm8k.zip && rm gsm8k.zip
+cd ../..
+
+# GPQA
+cd ais_bench/datasets
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gpqa.zip
+unzip gpqa.zip && rm gpqa.zip
+cd ../..
+
+# MATH-500
+cd ais_bench/datasets
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/math.zip
+unzip math.zip && rm math.zip
+cd ../..
+
+# AIME 2024
+cd ais_bench/datasets
+mkdir aime/ && cd aime/
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/aime.zip
+unzip aime.zip && rm aime.zip
+cd ../../..
+
+# MMStar
+cd ais_bench/datasets
+mkdir mmstar
+cd mmstar
+wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+cd ../..
+
+# MMMU
+cd ais_bench/datasets
+git lfs install
+git clone https://www.modelscope.cn/datasets/AI-ModelScope/MMMU.git mmmu
+cd ../..
+```
+
+### Online Text Model Testing
+
+#### Start SGLang Server
+
+```shell Command
+sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct \
+    --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 &
+```
+
+#### Execute Accuracy Evaluation
+
+```shell Command
+# Run C-Eval dataset
+ais_bench --models vllm_api_general_chat --datasets ceval_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
+# Run MMLU dataset
+ais_bench --models vllm_api_general_chat --datasets mmlu_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
+# Run GSM8K dataset
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
+# Run GPQA dataset
+ais_bench --models vllm_api_general_chat --datasets gpqa_gen_0_shot_str.py --mode all --dump-eval-details --merge-ds
+
+# Run MATH-500 dataset
+ais_bench --models vllm_api_general_chat --datasets math500_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
+# Run AIME 2024 dataset
+ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+```
+
+After execution, results are saved in `outputs/default/<timestamp>/` with the following structure:
+
+```
+outputs/default/20250628_151326/
+├── configs       # Configuration files
+├── logs          # Execution logs
+│   ├── eval      # Accuracy evaluation logs
+│   └── infer     # Inference process logs
+├── predictions   # Inference results (JSON)
+├── results       # Raw accuracy scores (JSON)
+└── summary       # Final result summary
+    ├── summary_20250628_151326.csv
+    ├── summary_20250628_151326.md
+    └── summary_20250628_151326.txt
+```
+
+### Online Multimodal Model Testing
+
+#### Configuration File
+
+Edit multimodal model configuration file (e.g., `vllm_api_stream_chat_mutiturn.py`):
+
+```python
+from ais_bench.benchmark.models import VLLMCustomAPIChat
+from ais_bench.benchmark.utils.postprocess.model_postprocessors import extract_non_reasoning_content
+
+models = [
+    dict(
+        attr="service",
+        type=VLLMCustomAPIChat,
+        abbr="vllm-multiturn-api-chat-stream",
+        path="/home/weights/Qwen2.5-VL-7B-Instruct",
+        model="/home/weights/Qwen2.5-VL-7B-Instruct",
+        stream=True,
+        request_rate=0,
+        retry=2,
+        api_key="",
+        host_ip="localhost",
+        host_port=30000,
+        url="",
+        max_out_len=512,
+        batch_size=1,
+        trust_remote_code=False,
+        generation_kwargs=dict(
+            temperature=0.01,
+            ignore_eos=False,
+        ),
+        pred_postprocessor=dict(type=extract_non_reasoning_content),
+    )
+]
+```
+
+#### Start Multimodal Server and Execute Evaluation
+
+```shell Command
+# Start multimodal server
+sglang serve --model-path Qwen/Qwen2.5-VL-7B-Instruct \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --host 0.0.0.0 --port 30000 &
+
+# Run MMStar dataset
+ais_bench --models vllm_api_stream_chat_mutiturn --datasets mmstar_gen --mode all --dump-eval-details --merge-ds
+
+# Run MMMU dataset
+ais_bench --models vllm_api_stream_chat_mutiturn --datasets mmmu_gen --mode all --dump-eval-details --merge-ds
+```
+
+For more details, refer to the [AISBench documentation](https://yh-ais-bench-benchmark.readthedocs.io).
+
+---
+
+## Troubleshooting
+
+### SGLang Server Startup Failure
+
+1. Verify device mapping: A2 uses `davinci[0-7]`, A3 uses `davinci[0-15]`
+2. Confirm image tag matches device type: A2 uses `...-910b`, A3 uses `...-a3`
+3. Check NPU status with `npu-smi info`
+4. First run requires model download; set `HF_ENDPOINT=https://hf-mirror.com` if network access is restricted
+
+### EvalScope Connection Failure to Server
+
+1. Confirm SGLang server started successfully (look for `Application startup complete` in logs)
+2. Verify `--api-url` points to the correct port (SGLang defaults to `30000`)
+3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
+
+### EvalScope SSL certificate verification failed
+When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
+```
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
+    return self.request("GET", url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 592, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 706, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/adapters.py", line 676, in send
+    raise SSLError(e, request=request)
+requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
+[ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
+```
+You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
+
+### Download Dataset Error
+For this error
+```
+root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+--2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+Connecting to 141.5.152.215:6688... connected.
+ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web Secure Internet Gateway CA V2,OU=IT,O=Huawei,L=Shenzhen,ST=GuangDong,C=CN’:
+  Self-signed certificate encountered.
+To connect to www.modelscope.cn insecurely, use `--no-check-certificate'.
+```
+You can add `--no-check-certificate'
+```
+wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
+```
+
+For additional assistance, refer to [SGLang GitHub Issues](https://github.com/sgl-project/sglang/issues).

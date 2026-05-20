@@ -26,11 +26,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -46,39 +50,52 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
+    apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_qk_norm_rope
+    from sglang.jit_kernel.fused_qknorm_rope import (
+        can_use_fused_qk_norm_rope,
+        fused_qk_norm_rope,
+    )
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -111,12 +128,19 @@ def compute_yarn_parameters(
         attention_factor: float, the post-processing scaling factor applied to the computed cos/sin
     """
 
-    # The config does not contain rope_scaling, which means the model is not using yarn
-    rope_scaling = getattr(config, "rope_scaling", None)
+    # The config does not contain rope_scaling, which means the model is not using yarn.
+    # In transformers v5, rope_parameters is never None (even for default rope), so also
+    # check rope_type to distinguish actual yarn configs from plain rotary embeddings.
+    rope_scaling = getattr(config, "rope_parameters", None)
+    if rope_scaling is None:
+        rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling is None:
         return 1.0, 0, 0, 1.0
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
+    if rope_type == "default":
+        return 1.0, 0, 0, 1.0
 
-    base = config.rope_theta
+    base = rope_scaling.get("rope_theta") or getattr(config, "rope_theta", 10000)
     partial_rotary_factor = (
         config.partial_rotary_factor
         if hasattr(config, "partial_rotary_factor")
@@ -126,7 +150,7 @@ def compute_yarn_parameters(
         config, "head_dim", config.hidden_size // config.num_attention_heads
     )
     dim = int(head_dim * partial_rotary_factor)
-    factor = getattr(rope_scaling, "factor", 1.0)
+    factor = rope_scaling.get("factor", 1.0)
     attention_factor = rope_scaling.get("attention_factor")
     mscale = rope_scaling.get("mscale")
     mscale_all_dim = rope_scaling.get("mscale_all_dim")
@@ -215,7 +239,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
         self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -223,10 +248,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+        norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        if isinstance(quant_config, GGUFConfig):
+            norm_topk_prob = False
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            renormalize=norm_topk_prob,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -280,6 +312,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward_normal(
@@ -295,13 +330,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+
+        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -475,12 +519,20 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
-        self.compatible_with_fused_qk_norm_rope = (
-            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        self.compatible_with_fused_qk_norm_rope = not isinstance(
+            self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
+        _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
+            and _is_cuda
+            and can_use_fused_qk_norm_rope(
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+                _yarn_factor != 1.0,
+            )
         )
         self._used_fused_qk_norm_rope_last_call = False
 
@@ -496,31 +548,6 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-            q = q_by_head.view(q.shape)
-            k = k_by_head.view(k.shape)
-            return q, k
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -541,18 +568,18 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
-            self.q_norm.weight,
-            self.k_norm.weight,
             self.q_size,
             self.kv_size,
             self.head_dim,
-            self.q_norm.variance_epsilon,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
             q_bias=getattr(self.q_norm, "bias", None),
             k_bias=getattr(self.k_norm, "bias", None),
         )
@@ -576,7 +603,7 @@ class Qwen3MoeAttention(nn.Module):
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
-            theta = getattr(self.config, "rope_theta", 10000.0)
+            theta = self.rope_theta
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
             )
@@ -603,7 +630,14 @@ class Qwen3MoeAttention(nn.Module):
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
             q, k = self.rotary_emb(
                 positions,
                 q,
@@ -630,7 +664,10 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        if not _is_npu:
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -691,8 +728,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
+        self.rope_theta = rope_theta
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -728,12 +765,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -771,6 +810,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = (
@@ -779,6 +819,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
             )
         )
 
@@ -892,9 +933,22 @@ class Qwen3MoeModel(Qwen2MoeModel):
             alt_stream=alt_stream,
         )
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -919,6 +973,15 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+        self.attn_cp_rank = get_attn_context_model_parallel_rank()
+        self.moe_dp_size = get_moe_data_parallel_world_size()
+
+        assert self.attn_cp_size % self.moe_dp_size == 0, (
+            f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
+            f"moe_dp_size ({self.moe_dp_size})"
+        )
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -931,6 +994,15 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if is_prefill_context_parallel_enabled():
+            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.attn_cp_rank,
+                    self.attn_cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
         hidden_states = self.model(
             input_ids,
             positions,
@@ -944,9 +1016,10 @@ class Qwen3MoeForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            return logits_output
         else:
             return hidden_states
 
@@ -1021,6 +1094,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1038,10 +1123,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -1126,14 +1210,16 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
         if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-            }
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(self.start_layer, self.end_layer)
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
+                    )
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

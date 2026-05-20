@@ -1,0 +1,601 @@
+---
+title: "DeepSeek V3.2/GLM-5 Usage"
+metatags:
+    description: "Deploy DeepSeek V3.2/GLM-5 with SGLang: DeepSeek Sparse Attention (DSA), long-context optimization, MTP speculative decoding, function calling. Supports H200, B200, MI300X, MI350."
+---
+DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
+
+
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA (DeepSeek Sparse Attention) structure, so it can share most of the usage here, except for the reasoning parser and tool call parser.
+
+
+## Installation
+
+### Docker
+
+```bash Command
+# H200/B200
+docker pull lmsysorg/sglang:latest
+
+# MI350/MI355
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
+
+# MI300
+# v0.5.8-rocm700-mi30x does not include PR #17504. Prefer the newest MI30x ROCm
+# image tag from Docker Hub when available, or build from source (below).
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
+
+
+# NPUs
+docker pull lmsysorg/sglang:dsv32-a2
+docker pull lmsysorg/sglang:dsv32-a3
+```
+
+### Build From Source
+
+```bash Command
+# Install SGLang
+git clone https://github.com/sgl-project/sglang
+cd sglang
+pip3 install pip --upgrade
+pip3 install -e "python"
+```
+
+## Launch DeepSeek V3.2/GLM-5 with SGLang
+
+To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
+
+```bash Command
+# Launch with TP + DP (Recommended)
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention
+
+# Launch with EP + DP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep 8 --dp 8 --enable-dp-attention
+
+# Launch with Pure TP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
+
+# Launch with TP on MI30x/MI35x
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
+```
+
+To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
+
+### Configuration Tips
+- **DP Attention**: To enable [DP Attention](../advanced_features/dp_dpa_smg_guide), please include `--enable-dp-attention --dp <dp-size>` in command. DP Attention is better for large concurrency scenarios.
+- **TP Attention**: Launching with TP attention is also supported. TP attention is better for low latency scenarios.
+- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance, which computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **MHA prefill threshold relaxation**: To apply MHA attention to requests longer than 2048 tokens, please set the flag `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a value larger than 2048. As threshold grows larger, the prefill performance can be improved, but at the cost of potential accuracy drop.
+- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
+  - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
+  - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
+  - `flashmla_auto`: enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. With BF16 KV cache, `flashmla_sparse` is always used on both Hopper and Blackwell. With FP8 KV cache: On Hopper (SM90), it unconditionally uses `flashmla_kv`; On Blackwell (SM100), it uses `flashmla_sparse` when `total_kv_tokens < total_q_tokens * 512`, otherwise falls back to `flashmla_kv`. The heuristics may need to be tuned if the performance of either kernel changes significantly.
+  - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
+  - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
+  - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
+  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires q,k,v to be uniformly bf16 or fp8_e4m3 format.
+  - On the basis of performance benchmarks, the default configuration of DSA kernels on Hopper and Blackwell are set as follows :
+    - Bfloat 16 kv cache: On Hopper, `flashmla_sparse` prefill attention, `fa3` decode attention; On Blackwell, `flashmla_sparse` prefill attention, `trtllm` decode attention
+    - Float8_e4m3fn KV cache: On Hopper, `flashmla_kv` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
+- **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  For **GLM-5** model, we recommend appending `--json-model-override-args '&#123;"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"&#125;'` to command for better tradeoff between speedup and performance.
+
+## Multi-token Prediction
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](../advanced_features/speculative_decoding#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
+
+Example usage with DP Attention:
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+Example usage with Pure TP:
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+- The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
+- The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
+
+<Tip>
+To enable overlap scheduler for EAGLE speculative decoding, we recommend setting the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+</Tip>
+
+
+## Function Calling and Reasoning Parser
+The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](../advanced_features/separate_reasoning) and [Tool Parser](../advanced_features/tool_parser) documents.
+
+To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
+> Note: It is recommended to specify the chat-template, ensuring that you are within the sglang's root directory.
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv31 \
+  --reasoning-parser deepseek-v3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv32.jinja
+```
+
+To launch `DeepSeek-V3.2` with function calling and reasoning parser:
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv32 \
+  --reasoning-parser deepseek-v3
+```
+
+`DeepSeek-V3.2-Speciale` does not support tool calling, so it can only be launched with the reasoning parser:
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --reasoning-parser deepseek-v3
+```
+
+To launch `GLM-5` with function calling and reasoning parser:
+```bash Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-5-FP8 \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+```
+
+## NVFP4 Checkpoint
+
+To launch deepseek v3.2 [NVFP4 checkpoint](https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4) on Blackwell devices, the user needs to specify the quantization method as `modelopt_fp4`, and moe runner backend as one of `flashinfer_trtllm`(recommended), `flashinfer_cutlass` and `flashinfer_cutedsl`. Any other usage (parallelism, reasoning parser, ...) is the same as FP8 checkpoint.
+
+An example launching command can be:
+```bash Command
+python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm --tool-call-parser deepseekv32  --reasoning-parser deepseek-v3
+```
+
+## PD Disaggregation
+
+Prefill Command:
+```bash Command
+python -m sglang.launch_server \
+        --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+        --disaggregation-mode prefill \
+        --host $LOCAL_IP \
+        --port $PORT \
+        --tp 8 \
+        --dp 8 \
+        --enable-dp-attention \
+        --dist-init-addr ${HOST}:${DIST_PORT} \
+        --trust-remote-code \
+        --disaggregation-bootstrap-port 8998 \
+        --mem-fraction-static 0.9 \
+```
+
+Decode command:
+```bash Command
+python -m sglang.launch_server \
+        --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+        --disaggregation-mode decode \
+        --host $LOCAL_IP \
+        --port $PORT \
+        --tp 8 \
+        --dp 8 \
+        --enable-dp-attention \
+        --dist-init-addr ${HOST}:${DIST_PORT} \
+        --trust-remote-code \
+        --mem-fraction-static 0.9 \
+```
+
+Router command:
+```bash Command
+python -m sglang_router.launch_router --pd-disaggregation \
+  --prefill $PREFILL_ADDR 8998 \
+  --decode $DECODE_ADDR \
+  --host 127.0.0.1 \
+  --port 8000 \
+```
+
+If you need more advanced deployment methods or production-ready deployment methods, such as RBG or LWS-based deployment, please refer to [references/multi_node_deployment/rbg_pd/deepseekv32_pd.md](../references/multi_node_deployment/rbg_pd/deepseekv32_pd). Additionally, you can also find startup commands for DeepEP-based EP parallelism in the aforementioned documentation.
+
+
+## Benchmarking Results
+
+### Accuracy Test with `gsm8k`
+A simple accuracy benchmark can be tested with `gsm8k` dataset:
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
+```
+
+The result is 0.956, which matches our expectation:
+```bash Command
+Accuracy: 0.956
+Invalid: 0.000
+Latency: 25.109 s
+Output throughput: 5226.235 token/s
+```
+
+To test long-context accuracy, run gsm8k with `--num-shots 20`. The results are very close to the 8 shots results:
+```text Output
+Accuracy: 0.956
+Invalid: 0.000
+Latency: 29.545 s
+Output throughput: 4418.617 token/s
+```
+
+
+### Accuracy Test with `gpqa-diamond`
+
+Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
+```bash Command
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --thinking-mode deepseek-v3
+```
+
+The mean accuracy over 8 runs shows 0.797, which matches the number 0.799 in official tech report.
+```bash Command
+Repeat: 8, mean: 0.797
+Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
+```
+
+For DeepSeek V3.2, DeepSeek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
+
+```bash Command
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
+
+Repeat: 8, mean: 0.840
+Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
+```
+which matches the official score, 0.824, as reported in the [DeepSeek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
+
+### Accuracy Test with `aime 2025`
+
+Prepare the environment by installing NeMo-Skills in the docker or your own virtual environment:
+
+  ```
+  pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+  ```
+
+Then launch the SGLang server:
+```text Output
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention
+```
+
+**For `DeepSeek-V3.2` and `DeepSeek-V3.2-Speciale`**:
+
+```text Output
+python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
+```
+
+Run the following script to evaluate AIME 2025:
+```text Output
+#! /bin/bash
+export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
+
+ns prepare_data aime25
+
+PORT=30000
+BACKEND=sglang
+MODEL="deepseek-ai/DeepSeek-V3.2-Exp" # Should be changed to the model name
+MODEL_NAME="dsv32-fp8"
+
+echo "Starting AIME25 evaluation with model $MODEL on port $PORT using backend $BACKEND..."
+ns eval \
+  --benchmarks=aime25:4 \
+  --server_type=$BACKEND \
+  --model=$MODEL \
+  --server_address=http://localhost:${PORT}/v1 \
+  --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
+  ++chat_template_kwargs.thinking=true \
+  ++inference.temperature=1.0 \
+  ++inference.top_p=0.95 \
+  ++inference.tokens_to_generate=64000
+  # ++inference.tokens_to_generate=120000 for Speciale model
+```
+
+Test results (8*B200):
+
+DeepSeek-V3.2-Exp:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "16%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>evaluation_mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>num_entries</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>avg_tokens</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>gen_seconds</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>symbolic_correct</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>no_answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1[avg-of-4]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>15040</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1673</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>87.50% ± 1.67%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>majority@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>15040</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1673</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>90.00%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>15040</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1673</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>90.00%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+
+DeepSeek-V3.2:
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "16%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>evaluation_mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>num_entries</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>avg_tokens</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>gen_seconds</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>symbolic_correct</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>no_answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1[avg-of-4]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>13550</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1632</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>92.50% ± 1.67%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>majority@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>13550</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1632</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>94.71%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>13550</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1632</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>96.67%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+
+DeepSeek-V3.2-Speciale:
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "16%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>evaluation_mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>num_entries</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>avg_tokens</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>gen_seconds</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>symbolic_correct</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>no_answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1[avg-of-4]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>24155</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3583</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>95.00% ± 1.92%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>majority@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>24155</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3583</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>95.83%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>24155</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3583</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>100.00%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+
+## DSA long sequence context parallel optimization(experimental)
+
+**Note: This feature is only verified on Hopper machines**
+
+For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
+
+### In sequence splitting
+
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
+
+Note that the in-sequence splitting mode has the following restrictions:
+- The batch size is restricted to 1 for prefill batches
+- `moe_dense_tp_size=1`, `moe_a2a_backend = "deepep"`
+- To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
+
+For more details, please refer to PR https://github.com/sgl-project/sglang/pull/12065.
+
+Example:
+```bash Command
+# In-seq splitting mode launched with EP + DP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+```
+
+### Round robin splitting (default setting)
+
+This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
+
+In this scenario, compared to the in-sequence splitting method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. However, it cannot be enabled with DP attention together.
+
+For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
+
+Example usage:
+```bash Command
+# Launch with FusedMoe + CP8
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+```
+### Pipeline Parallel + Context Parallel (PP + CP)
+
+This mode combines Pipeline Parallelism (PP) and Context Parallelism (CP) to scale across multiple nodes, which can achieve better throughput and Time To First Token (TTFT). Note that this method has only been tested on H20 96G.
+
+#### Standard Usage
+
+To launch with PP=2 and CP (via `round-robin-split` mode) on 2 nodes. This configuration uses the fused MoE kernel by default, which generally provides better performance.
+
+For related development details, please refer to:
+- Fused MoE + CP support: [PR #13959](https://github.com/sgl-project/sglang/pull/13959)
+- PP + CP support: [Issue #15358](https://github.com/sgl-project/sglang/issues/15358) and [PR #16380](https://github.com/sgl-project/sglang/pull/16380)
+
+Node 0:
+```bash Command
+export SGLANG_PP_LAYER_PARTITION=30,31
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr <HEAD_NODE_IP>:62001 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-max-bs 8 \
+  --page-size 64 \
+  --watchdog-timeout 3600 \
+  --host 0.0.0.0 --port 8000 \
+  --tool-call-parser deepseekv32
+```
+
+Node 1:
+```bash Command
+export SGLANG_PP_LAYER_PARTITION=30,31
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --nnodes 2 --node-rank 1 \
+  --dist-init-addr <HEAD_NODE_IP>:62001 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-max-bs 8 \
+  --page-size 64 \
+  --watchdog-timeout 3600 \
+  --host 0.0.0.0 --port 8000 \
+  --tool-call-parser deepseekv32
+```
+
+#### PD Disaggregation with PP + CP
+
+If using PD (Prefill-Decode) Disaggregation, the Prefill nodes can be configured with PP + CP as follows.
+
+Prefill Node 0:
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --served-model-name deepseek-v32 \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr <PREFILL_HEAD_IP>:20102 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split  \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --max-running-requests 512 \
+  --chunked-prefill-size 4096 \
+  --context-length 131072 \
+  --mem-fraction-static 0.9 \
+  --page-size 64 \
+  --enable-metrics \
+  --collect-tokens-histogram \
+  --tokenizer-worker-num 8 \
+  --host 0.0.0.0 --port 30000
+```
+
+Prefill Node 1:
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --served-model-name deepseek-v32-prefill \
+  --nnodes 2 --node-rank 1 \
+  --dist-init-addr <PREFILL_HEAD_IP>:20102 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split  \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --max-running-requests 512 \
+  --chunked-prefill-size 4096 \
+  --context-length 131072 \
+  --mem-fraction-static 0.9 \
+  --page-size 64 \
+  --enable-metrics \
+  --collect-tokens-histogram \
+  --tokenizer-worker-num 8 \
+  --host 0.0.0.0 --port 30000
+```
+
+For the Decode nodes, it is recommended to use the **EP mode**.
+
+## HiSparse: Hierarchical Sparse Attention for DSA (experimental)
+
+HiSparse reduces per-request GPU memory during decode by keeping only a small "hot" KV buffer on GPU while storing complete KV data in CPU pinned memory. A CUDA kernel dynamically swaps in the top-k most relevant KV entries from host memory on each decode step. This enables significantly higher decode concurrency for long-context DSA models.
+
+HiSparse currently requires PD disaggregation mode and is enabled on the decode instance only. For detailed design, configuration, and deployment instructions, see the [HiSparse Guide](../advanced_features/hisparse_guide).

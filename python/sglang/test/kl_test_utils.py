@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import random
 
 import numpy as np
 import requests
@@ -79,8 +80,9 @@ def get_input_ids(
             break
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
-        # Truncate to max_tokens
-        input_ids.append(tokens[:max_prompt_tokens])
+        # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
+        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
+        input_ids.append(tokens[:truncate_len])
 
     # Save to local cache
     with open(cache_file, "w") as f:
@@ -116,18 +118,28 @@ def compare_kl_divergence(
 
 
 # Common request helpers
-def _flush_cache(base_url):
-    requests.post(base_url + "/flush_cache")
+def _flush_cache(base_url, timeout_s=30):
+    response = requests.post(
+        base_url + "/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 10,
+    )
+    response.raise_for_status()
 
 
 def _generate(
-    base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
+    base_url,
+    input_ids,
+    max_new_tokens,
+    return_logprob=False,
+    logprob_start_len=-1,
+    temperature=0.0,
 ):
     """Send generate request and return results."""
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 1,
+            "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": True,
         },
@@ -144,7 +156,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -153,6 +165,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
         max_new_tokens=0,
         return_logprob=True,
         logprob_start_len=0,
+        temperature=temperature,
     )
     assert len(results) == len(new_input_ids)
 
@@ -206,7 +219,7 @@ def test_input_output_logprobs_match_helper(
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return
@@ -259,7 +272,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 def test_input_output_logprobs_match_decode_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return

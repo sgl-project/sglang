@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,10 +54,17 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
+
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
 class LlamaMLP(nn.Module):
@@ -67,6 +76,9 @@ class LlamaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -75,6 +87,8 @@ class LlamaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -83,6 +97,9 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -185,15 +202,48 @@ class LlamaAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def forward_prepare_native(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+        )
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if (
+            not _is_npu
+            or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
+            or forward_batch.forward_mode.is_extend()
+        ):
+            q, k, v = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -209,8 +259,13 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", 10000)
+            rope_scaling = rope_parameters
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
@@ -711,8 +766,12 @@ class LlamaForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -726,8 +785,12 @@ class LlamaForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
@@ -746,6 +809,18 @@ class LlamaForCausalLM(nn.Module):
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
 
 class Phi3ForCausalLM(LlamaForCausalLM):
     pass
@@ -755,4 +830,13 @@ class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
+class IQuestCoderForCausalLM(LlamaForCausalLM):
+    pass
+
+
+EntryClass = [
+    LlamaForCausalLM,
+    Phi3ForCausalLM,
+    InternLM3ForCausalLM,
+    IQuestCoderForCausalLM,
+]

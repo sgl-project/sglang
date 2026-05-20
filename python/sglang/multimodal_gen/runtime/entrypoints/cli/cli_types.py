@@ -13,7 +13,9 @@ class CLISubcommand:
 
     name: str
 
-    def cmd(self, args: argparse.Namespace) -> None:
+    def cmd(
+        self, args: argparse.Namespace, unknown_args: list[str] | None = None
+    ) -> None:
         """Execute the command with the given arguments"""
         raise NotImplementedError
 

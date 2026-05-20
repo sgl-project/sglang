@@ -1,0 +1,143 @@
+---
+title: "Inference Batching"
+description: "Batch compatible native SGLang-Diffusion requests during serving."
+mode: wide
+---
+Dynamic batching is an opt-in SGLang-Diffusion serving mode that merges compatible queued requests into one native pipeline batch. It is separate from LLM continuous batching and tokenizer batching.
+
+Use it for concurrent T2I or T2V traffic with the same model and sampling shape. Keep singleton serving for latency-sensitive or highly mixed traffic.
+
+## Enable
+
+Dynamic batching is disabled by default with `--batching-max-size 1`.
+
+```bash Command
+sglang serve \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --port 30010 \
+  --batching-mode dynamic \
+  --batching-max-size 8 \
+  --batching-delay-ms 5 \
+  --enable-batching-metrics
+```
+
+For request formats, see the [OpenAI-Compatible API](./api/openai_api).
+
+Use `--batching-config /path/to/batching_config.json` to load JSON rules when a model or resolution needs a lower cap than `--batching-max-size`:
+
+```json Config
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "model_contains": "Qwen-Image",
+      "resolution": "1024x1024",
+      "max_batch_size": 1
+    }
+  ]
+}
+```
+
+## Compatibility
+
+An initial implementation of dynamic batching for T2I and T2V models can be found in [#18764](https://github.com/sgl-project/sglang/pull/18764). The current compatibility grid is below and will be updated as more coverage is added. See [Supported Models](./compatibility_matrix) for full model IDs.
+
+`✅` means supported, `❌` means not currently supported, `?` means untested, and `-` means not applicable.
+
+### Image
+
+<table style={{display: "table", width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "60%"}} />
+    <col style={{width: "20%"}} />
+    <col style={{width: "20%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{width: "60%", textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{width: "20%", textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>T2I</th>
+      <th style={{width: "20%", textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>I2I</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.1-dev</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-dev</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-dev-NVFP4</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-Klein-4B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.2-Klein-9B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image-Turbo</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image 2512</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2509</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2511</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Layered</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3 Medium</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3.5 Medium</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SD3.5 Large</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan3D-2</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1.5 1.6B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1.5 4.8B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1600M 1024px</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 600M 1024px</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 1600M 512px</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA 600M 512px</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FireRed-Image-Edit 1.0</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FireRed-Image-Edit 1.1</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ERNIE-Image</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ERNIE-Image-Turbo</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+  </tbody>
+</table>
+
+### Video
+
+<table style={{display: "table", width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "74%"}} />
+    <col style={{width: "26%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{width: "65%", textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{width: "35%", textAlign: "center", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Support</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastWan2.1 T2V 1.3B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastWan2.2 TI2V 5B Full Attn</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2 TI2V 5B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2 T2V A14B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2 I2V A14B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HunyuanVideo</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastHunyuan</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1 T2V 1.3B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1 T2V 14B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1 I2V 480P</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1 I2V 720P</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TurboWan2.1 T2V 1.3B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TurboWan2.1 T2V 14B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TurboWan2.1 T2V 14B 720P</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TurboWan2.2 I2V A14B</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1 Fun 1.3B InP</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Helios Base</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Helios Mid</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Helios Distilled</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2.3</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td></tr>
+  </tbody>
+</table>
+
+## Notes
+
+- Requests batch only when model inputs, sampling parameters, output handling, and any configured rules are compatible.
+- There is no startup probing, runtime learning, OOM retry, or automatic fallback to singletons. If a merged batch fails or cannot be split, every request in that batch receives an error.
+- Batch shape can change kernels, so singleton and dynamic outputs are not expected to be bit-exact.
+- Use `--enable-batching-metrics` to inspect realized batches:
+
+```text
+Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
+Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
+Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
+```

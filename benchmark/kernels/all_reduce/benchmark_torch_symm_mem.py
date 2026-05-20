@@ -44,12 +44,9 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:

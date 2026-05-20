@@ -6,10 +6,10 @@ use super::{
     model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerType,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
-use crate::routers::grpc::client::GrpcClient;
+use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -131,7 +131,7 @@ impl BasicWorkerBuilder {
             Arc, RwLock as StdRwLock,
         };
 
-        use tokio::sync::RwLock;
+        use tokio::sync::OnceCell;
 
         let bootstrap_host = match url::Url::parse(&self.url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
@@ -176,16 +176,32 @@ impl BasicWorkerBuilder {
             default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
 
-        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
+        // Use OnceCell for lock-free gRPC client access after initialization
+        let grpc_client = Arc::new(match self.grpc_client {
+            Some(client) => {
+                let cell = OnceCell::new();
+                // Pre-set the client if provided (blocking set is fine during construction)
+                cell.set(Arc::new(client)).ok();
+                cell
+            }
+            None => OnceCell::new(),
+        });
+
+        let healthy = true;
+        Metrics::set_worker_health(&self.url, healthy);
 
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(true)),
+            healthy: Arc::new(AtomicBool::new(healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            circuit_breaker: CircuitBreaker::with_config_and_label(
+                self.circuit_breaker_config,
+                self.url.clone(),
+            ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
@@ -352,8 +368,8 @@ mod tests {
         let worker = BasicWorkerBuilder::new("http://localhost:8080").build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -364,8 +380,8 @@ mod tests {
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -381,6 +397,7 @@ mod tests {
             check_interval_secs: 60,
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -403,13 +420,13 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080");
         assert_eq!(
             worker.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: None
             }
         );
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(worker.metadata().labels, labels);
         assert_eq!(
@@ -459,7 +476,7 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080@2");
         assert_eq!(worker.dp_rank(), Some(2));
         assert_eq!(worker.dp_size(), Some(8));
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -473,6 +490,7 @@ mod tests {
             check_interval_secs: 45,
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: false,
         };
 
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 3, 16)
@@ -522,10 +540,10 @@ mod tests {
         assert_eq!(worker.url(), "grpc://cluster.local@1");
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(
             worker.metadata().labels.get("transport"),

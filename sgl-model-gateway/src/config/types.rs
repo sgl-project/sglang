@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 
+// Re-export storage config types from data_connector
+pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use super::ConfigResult;
 use crate::core::ConnectionMode;
+
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +33,14 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
@@ -58,12 +72,21 @@ pub struct RouterConfig {
     /// Required when history_backend = "postgres"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresConfig>,
+    /// Required when history_backend = "redis"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis: Option<RedisConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// Server TLS certificate (PEM)
+    #[serde(skip)]
+    pub server_cert: Option<Vec<u8>>,
+    /// Server TLS private key (PEM)
+    #[serde(skip)]
+    pub server_key: Option<Vec<u8>>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -72,7 +95,7 @@ pub struct RouterConfig {
     pub ca_certificates: Vec<Vec<u8>>,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
-    pub mcp_config: Option<crate::mcp::McpConfig>,
+    pub mcp_config: Option<smg_mcp::McpConfig>,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
@@ -109,6 +132,34 @@ fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
 }
 
+fn default_pool_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT_SECS
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    DEFAULT_POOL_MAX_IDLE_PER_HOST
+}
+
+fn default_tcp_keepalive_secs() -> u64 {
+    DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+impl TokenizerCacheConfig {
+    /// Returns Some(self) if any caching is enabled, None otherwise.
+    /// Use this when passing cache config to tokenizer registration workflow.
+    pub fn to_option(&self) -> Option<Self> {
+        if self.enable_l0 || self.enable_l1 {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for TokenizerCacheConfig {
     fn default() -> Self {
         Self {
@@ -122,121 +173,6 @@ impl Default for TokenizerCacheConfig {
 
 fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
-}
-
-/// History backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum HistoryBackend {
-    Memory,
-    None,
-    Oracle,
-    Postgres,
-}
-
-/// Oracle history backend configuration
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct OracleConfig {
-    /// ATP wallet or TLS config files directory
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_path: Option<String>,
-    /// DSN (e.g. `tcps://host:port/service`)
-    pub connect_descriptor: String,
-    pub username: String,
-    pub password: String,
-    #[serde(default = "default_pool_min")]
-    pub pool_min: usize,
-    #[serde(default = "default_pool_max")]
-    pub pool_max: usize,
-    #[serde(default = "default_pool_timeout_secs")]
-    pub pool_timeout_secs: u64,
-}
-
-impl OracleConfig {
-    pub fn default_pool_min() -> usize {
-        default_pool_min()
-    }
-
-    pub fn default_pool_max() -> usize {
-        default_pool_max()
-    }
-
-    pub fn default_pool_timeout_secs() -> u64 {
-        default_pool_timeout_secs()
-    }
-}
-
-fn default_pool_min() -> usize {
-    1
-}
-
-fn default_pool_max() -> usize {
-    16
-}
-
-fn default_pool_timeout_secs() -> u64 {
-    30
-}
-
-impl std::fmt::Debug for OracleConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OracleConfig")
-            .field("wallet_path", &self.wallet_path)
-            .field("connect_descriptor", &self.connect_descriptor)
-            .field("username", &self.username)
-            .field("pool_min", &self.pool_min)
-            .field("pool_max", &self.pool_max)
-            .field("pool_timeout_secs", &self.pool_timeout_secs)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PostgresConfig {
-    // Database connection URL,
-    // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
-    pub db_url: String,
-    // Database pool max size
-    pub pool_max: usize,
-}
-
-impl PostgresConfig {
-    pub fn default_pool_max() -> usize {
-        16
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        let s = self.db_url.trim();
-        if s.is_empty() {
-            return Err("is it db-url should be not empty".to_string());
-        }
-
-        let url = Url::parse(s).map_err(|e| format!("invalid db_url: {}", e))?;
-
-        let scheme = url.scheme();
-        if scheme != "postgres" && scheme != "postgresql" {
-            return Err(format!("don't support URL scheme: {}", scheme));
-        }
-
-        if url.host().is_none() {
-            return Err("db_url must need host".to_string());
-        }
-
-        let path = url.path();
-        let dbname = path
-            .strip_prefix('/')
-            .filter(|p| !p.is_empty())
-            .map(|s| s.to_string());
-        if dbname.is_none() {
-            return Err("db_url must need database name".to_string());
-        }
-
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater 1, default is 16".to_string());
-        }
-
-        Ok(())
-    }
 }
 
 /// Routing mode configuration
@@ -299,6 +235,19 @@ impl RoutingMode {
     }
 }
 
+/// Assignment mode for manual policy when encountering a new routing key
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualAssignmentMode {
+    /// Random selection (default)
+    #[default]
+    Random,
+    /// Select worker with minimum running requests
+    MinLoad,
+    /// Select worker with minimum active routing keys
+    MinGroup,
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -330,6 +279,63 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+
+    /// Manual routing policy with sticky sessions using DashMap.
+    /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
+    /// - Provides true sticky sessions with zero key redistribution on worker add
+    /// - Falls back to random selection if no routing key is provided
+    /// - Supports LRU eviction when cache size exceeds max_entries
+    #[serde(rename = "manual")]
+    Manual {
+        /// Interval between TTL eviction cycles (seconds, default: 60)
+        #[serde(default = "default_manual_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        #[serde(default = "default_manual_max_idle_secs")]
+        max_idle_secs: u64,
+        /// Assignment mode for new routing keys (default: random)
+        #[serde(default)]
+        assignment_mode: ManualAssignmentMode,
+    },
+
+    /// Consistent hashing policy using hash ring for session affinity:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
+    #[serde(rename = "consistent_hashing")]
+    ConsistentHashing,
+
+    /// Prefix hash policy for KV cache-aware load balancing.
+    /// A lightweight alternative to cache_aware radix tree.
+    /// Routes requests based on prefix token hash for cache locality.
+    /// - Uses consistent hash ring with bounded load balancing
+    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    #[serde(rename = "prefix_hash")]
+    PrefixHash {
+        /// Number of prefix tokens to hash (default: 256)
+        #[serde(default = "default_prefix_token_count")]
+        prefix_token_count: usize,
+        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        #[serde(default = "default_load_factor")]
+        load_factor: f64,
+    },
+}
+
+fn default_prefix_token_count() -> usize {
+    256
+}
+
+fn default_load_factor() -> f64 {
+    1.25
+}
+
+fn default_manual_eviction_interval_secs() -> u64 {
+    60
+}
+
+fn default_manual_max_idle_secs() -> u64 {
+    4 * 3600
 }
 
 impl PolicyConfig {
@@ -340,6 +346,9 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
+            PolicyConfig::Manual { .. } => "manual",
+            PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
     }
 }
@@ -359,6 +368,16 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
+    /// Router node discovery for HA (Kubernetes label selector)
+    #[serde(default)]
+    pub router_selector: HashMap<String, String>,
+    /// Annotation key to read mesh port from Router Pods
+    #[serde(default = "default_router_mesh_port_annotation")]
+    pub router_mesh_port_annotation: String,
+}
+
+fn default_router_mesh_port_annotation() -> String {
+    "sglang.ai/mesh-port".to_string()
 }
 
 impl Default for DiscoveryConfig {
@@ -372,6 +391,8 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: default_router_mesh_port_annotation(),
         }
     }
 }
@@ -412,6 +433,7 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     pub check_interval_secs: u64,
     pub endpoint: String,
+    pub disable_health_check: bool,
 }
 
 impl Default for HealthCheckConfig {
@@ -422,6 +444,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            disable_health_check: false,
         }
     }
 }
@@ -498,6 +521,10 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
@@ -516,6 +543,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,
+            redis: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
@@ -523,6 +551,8 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            server_cert: None,
+            server_key: None,
         }
     }
 }
@@ -616,6 +646,16 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert_eq!(
+            config.pool_idle_timeout_secs,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(config.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert_eq!(
+            config.pool_max_idle_per_host,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(config.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]
@@ -663,6 +703,33 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_router_config_http_client_deserialization_defaults() {
+        let config = RouterConfig::default();
+        let mut json = serde_json::to_value(&config).unwrap();
+        let json_object = json.as_object_mut().unwrap();
+        json_object.remove("pool_idle_timeout_secs");
+        json_object.remove("connect_timeout_secs");
+        json_object.remove("pool_max_idle_per_host");
+        json_object.remove("tcp_keepalive_secs");
+
+        let deserialized: RouterConfig = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            deserialized.pool_idle_timeout_secs,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            deserialized.connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            deserialized.pool_max_idle_per_host,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(deserialized.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]
@@ -875,6 +942,8 @@ mod tests {
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
         };
 
         assert!(config.enabled);
@@ -1151,6 +1220,8 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")

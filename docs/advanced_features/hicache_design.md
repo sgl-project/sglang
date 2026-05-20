@@ -152,4 +152,6 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
 
-- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: JSON string containing extra configuration for the storage backend, e.g., `--hicache-storage-backend-extra-config '{"prefetch_threshold":512, "prefetch_timeout_base": 0.5, "prefetch_timeout_per_ki_token": 0.25}' `
+- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: the extra config can be either
+  - a JSON string containing extra configuration for the storage backend, e.g., `--hicache-storage-backend-extra-config '{"prefetch_threshold":512, "prefetch_timeout_base": 0.5, "prefetch_timeout_per_ki_token": 0.25}' `, or
+  - a TOML or JSON or YAML file specifying the extra configuration for the storage backend (to differentiate from the JSON string input, prepend a `@` in front of the file name), e.g., `--hicache-storage-backend-extra-config "@config.toml"` where `config.toml` is the config file containing the complex configurations. This can be useful when the configuration consists of many or complex key-value pairs (for instance, it is preferred to use a config file for NIXL backend as its configurations can be complex).

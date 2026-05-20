@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # Copyright 2024 xDiT team.
@@ -16,14 +18,18 @@ import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_stdout,
+)
+from sglang.srt.utils import is_shm_available
 
 try:
     import torch_musa  # noqa: F401
@@ -41,13 +47,8 @@ _group_name_counter: dict[str, int] = {}
 
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
-    from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    return (
-        torch.device(f"cuda:{envs.LOCAL_RANK}")
-        if current_platform.is_cuda_alike()
-        else torch.device("mps")
-    )
+    return current_platform.get_local_torch_device()
 
 
 def _get_unique_name(name: str) -> str:
@@ -172,7 +173,8 @@ class GroupCoordinator:
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            with suppress_stdout():
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -186,10 +188,7 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
 
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
         self.use_device_communicator = use_device_communicator
-
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
@@ -283,9 +282,6 @@ class GroupCoordinator:
 
     @contextmanager
     def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
-        # Platform-aware graph capture
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
         if current_platform.is_cuda_alike():
             if graph_capture_context is None:
                 stream = torch.cuda.Stream()
@@ -330,9 +326,19 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+            if (
+                current_platform.is_cpu()
+                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+                and op is torch.distributed.ReduceOp.SUM
+            ):
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, int(torch.distributed.ReduceOp.SUM)
+                )
+            else:
+                torch.distributed.all_reduce(
+                    input_, op=op, group=self.device_group, async_op=async_op
+                )
         return input_
 
     def all_gather(
@@ -354,10 +360,17 @@ class GroupCoordinator:
         output_tensor = torch.empty(
             input_size, dtype=input_.dtype, device=input_.device
         )
+
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        if current_platform.is_cpu() and is_shm_available(
+            input_.dtype, self.world_size, len(self.ranks)
+        ):
+            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -424,6 +437,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
         torch.distributed.broadcast(
             input_,
             src=self.ranks[src],
@@ -441,9 +456,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
-        if self.shm_broadcaster is not None:
+        if self.mq_broadcaster is not None:
             assert src == 0, "Shared memory broadcaster only supports src=0"
-            return self.shm_broadcaster.broadcast_object(obj)
+            return self.mq_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
             torch.distributed.broadcast_object_list(
                 [obj], src=self.ranks[src], group=self.cpu_group
@@ -803,7 +818,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -826,8 +842,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
-                cpu_group_0_1 = torch.distributed.new_group(ranks, backend="gloo")
-                cpu_group_1_0 = torch.distributed.new_group(ranks, backend="gloo")
+                with suppress_stdout():
+                    cpu_group_0_1 = torch.distributed.new_group(ranks, backend="gloo")
+                    cpu_group_1_0 = torch.distributed.new_group(ranks, backend="gloo")
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -840,7 +857,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        self.device = envs.get_device(local_rank)
+        self.device = current_platform.get_device(local_rank)
 
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: List[Tuple[str, int]] = []

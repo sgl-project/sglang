@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only HunYuan model compatible with HuggingFace weights."""
+
 import re
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -40,7 +41,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,6 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -150,6 +152,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=True if top_k > 1 else False,
         )
 
@@ -400,8 +403,7 @@ class HunYuanDecoderLayer(nn.Module):
             if isinstance(config.intermediate_size, int)
             else config.intermediate_size[layer_id]
         )
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
@@ -603,7 +605,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
-        self.sampler = Sampler()
+        self.sampler = create_sampler()
 
     def forward(
         self,

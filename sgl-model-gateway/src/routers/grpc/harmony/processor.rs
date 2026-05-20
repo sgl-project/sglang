@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_grpc_client::sglang_proto::generate_complete::MatchedStop::{
+    MatchedStopStr, MatchedTokenId,
+};
 use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{CompletionTokensDetails, ToolCall, Usage},
@@ -16,10 +18,12 @@ use crate::{
             ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+    routers::{
         error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+        },
     },
 };
 
@@ -27,7 +31,7 @@ use crate::{
 ///
 /// Collects all output tokens from execution and parses them using
 /// HarmonyParserAdapter to extract the complete response.
-pub struct HarmonyResponseProcessor;
+pub(crate) struct HarmonyResponseProcessor;
 
 impl HarmonyResponseProcessor {
     /// Create a new Harmony response processor
@@ -45,7 +49,10 @@ impl HarmonyResponseProcessor {
         // Collect all completed responses (one per choice)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
-            return Err(error::internal_error("No responses from server"));
+            return Err(error::internal_error(
+                "no_responses_from_server",
+                "No responses from server",
+            ));
         }
 
         // Build choices by parsing output with HarmonyParserAdapter
@@ -70,7 +77,10 @@ impl HarmonyResponseProcessor {
                     error = %e,
                     "Failed to create Harmony parser"
                 );
-                error::internal_error(format!("Failed to create Harmony parser: {}", e))
+                error::internal_error(
+                    "create_harmony_parser_failed",
+                    format!("Failed to create Harmony parser: {}", e),
+                )
             })?;
 
             // Parse Harmony channels with finish_reason and matched_stop
@@ -86,7 +96,10 @@ impl HarmonyResponseProcessor {
                         error = %e,
                         "Harmony parsing failed on complete response"
                     );
-                    error::internal_error(format!("Harmony parsing failed: {}", e))
+                    error::internal_error(
+                        "harmony_parsing_failed",
+                        format!("Harmony parsing failed: {}", e),
+                    )
                 })?;
 
             // Build response message (assistant)
@@ -144,7 +157,7 @@ impl Default for HarmonyResponseProcessor {
 ///
 /// Used by the MCP tool loop to determine whether to continue
 /// executing tools or return the final response.
-pub enum ResponsesIterationResult {
+pub(crate) enum ResponsesIterationResult {
     /// Tool calls found in commentary channel - continue MCP loop
     ToolCallsFound {
         tool_calls: Vec<ToolCall>,
@@ -185,13 +198,16 @@ impl HarmonyResponseProcessor {
         // Collect all completed responses
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
-            return Err(error::internal_error("No responses from server"));
+            return Err(error::internal_error(
+                "no_responses_from_server",
+                "No responses from server",
+            ));
         }
 
         // For Responses API, we only process the first response (n=1)
         let complete = all_responses
             .first()
-            .ok_or_else(|| error::internal_error("No complete response"))?;
+            .ok_or_else(|| error::internal_error("no_complete_response", "No complete response"))?;
 
         // Parse Harmony channels
         let mut parser = HarmonyParserAdapter::new().map_err(|e| {
@@ -200,7 +216,10 @@ impl HarmonyResponseProcessor {
                 error = %e,
                 "Failed to create Harmony parser"
             );
-            error::internal_error(format!("Failed to create Harmony parser: {}", e))
+            error::internal_error(
+                "create_harmony_parser_failed",
+                format!("Failed to create Harmony parser: {}", e),
+            )
         })?;
 
         // Convert matched_stop from proto to JSON
@@ -225,7 +244,10 @@ impl HarmonyResponseProcessor {
                     error = %e,
                     "Harmony parsing failed on complete response"
                 );
-                error::internal_error(format!("Harmony parsing failed: {}", e))
+                error::internal_error(
+                    "harmony_parsing_failed",
+                    format!("Harmony parsing failed: {}", e),
+                )
             })?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
