@@ -460,7 +460,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def alloc_extend(
-        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         self,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
@@ -469,6 +468,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
+        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         assert self.page_size > 1
 
         num_new_pages = get_num_new_pages(
@@ -512,7 +512,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def alloc_extend_swa_tail(
-        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         self,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
@@ -522,6 +521,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
+        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         """Allocate full KV for the whole extend and SWA KV only for the tail.
 
         This is used by disaggregated decode preallocation: decode receives full
@@ -578,12 +578,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def alloc_decode(
-        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         self,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         assert self.page_size > 1
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
