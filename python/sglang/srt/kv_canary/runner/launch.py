@@ -46,6 +46,7 @@ def invoke_plan(
         extra_verify_num_valid=plan_input.extra_verify_num_valid,
         swa_window_size=window,
         full_to_swa_index_mapping=group.swa_index_lut,
+        verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
     )
 
 

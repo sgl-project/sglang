@@ -45,6 +45,7 @@ def _run_both_plan(
     full_to_swa_index_mapping: Optional[torch.Tensor],
 ) -> None:
     extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
+    verify_capacity = int(triton_verify.verify_slot_indices.shape[0])
     canary_plan_step(
         verify_plan_out=triton_verify,
         write_plan_out=triton_write,
@@ -58,6 +59,7 @@ def _run_both_plan(
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=verify_capacity,
     )
     canary_plan_step_torch_reference(
         verify_plan_out=ref_verify,
@@ -72,6 +74,7 @@ def _run_both_plan(
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
     )
     torch.cuda.synchronize()
 

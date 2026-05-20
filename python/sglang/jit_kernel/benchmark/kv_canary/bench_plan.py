@@ -144,6 +144,7 @@ def _build_plan_inputs(
         extra_verify_num_valid=extra_verify_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa,
+        verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
     )
 
 
@@ -162,6 +163,7 @@ def _make_plan_callable(inputs: dict):
             extra_verify_num_valid=inputs["extra_verify_num_valid"],
             swa_window_size=inputs["swa_window_size"],
             full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
+            verify_capacity=inputs["verify_capacity"],
         )
 
     return fn

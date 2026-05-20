@@ -30,6 +30,10 @@ def canary_verify_step_torch_reference(
 
     kernel_run_counter.add_(1)
 
+    enable = int(plan.enable.detach().to("cpu").item())
+    if enable == 0:
+        return
+
     num_valid = int(
         plan.verify_slot_indices.new_empty(()).copy_(plan.verify_num_valid[0]).item()
     )

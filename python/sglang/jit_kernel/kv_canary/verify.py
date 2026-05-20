@@ -156,17 +156,22 @@ class VerifyPlan:
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
             "predecessor == previous array entry" assumption.
-        verify_num_valid: Active entry count, shape [1], int32.
+        verify_num_valid: Active entry count, shape [1], int32. Clamped by the plan kernel to
+            min(total_requested, verify_capacity) so the verify kernel grid never reads past the buffer.
+        enable: Run-this-step flag, shape [1], int32. 1 = verify kernel runs as usual; 0 = the plan kernel
+            detected overflow (requested > verify_capacity) and the entire verify launch is skipped this step.
+            Allocated as 1 by default; the plan kernel rewrites it every step.
     """
 
     verify_slot_indices: torch.Tensor
     verify_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
+    enable: torch.Tensor
 
     @classmethod
     def allocate(cls, *, verify_capacity: int, device: torch.device) -> "VerifyPlan":
-        """Allocate a fresh VerifyPlan, all zeros."""
+        """Allocate a fresh VerifyPlan, all zeros except enable which defaults to 1 (run verify)."""
         if verify_capacity <= 0:
             raise ValueError(
                 f"kv-canary: VerifyPlan verify_capacity must be positive, got {verify_capacity}"
@@ -182,6 +187,7 @@ class VerifyPlan:
                 verify_capacity, dtype=torch.int32, device=device
             ),
             verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
+            enable=torch.ones(1, dtype=torch.int32, device=device),
         )
 
 
@@ -272,6 +278,7 @@ def canary_verify_step(
     _assert_contiguous(plan.verify_positions, "plan.verify_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
+    _assert_contiguous(plan.enable, "plan.enable")
     _assert_contiguous(violation_ring, "violation_ring")
     _assert_contiguous(violation_write_index, "violation_write_index")
     _assert_contiguous(slot_run_counter, "slot_run_counter")
@@ -288,6 +295,7 @@ def canary_verify_step(
         plan.verify_positions,
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,
+        plan.enable,
         int(kernel_kind),
         violation_ring,
         violation_write_index,

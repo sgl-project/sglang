@@ -109,11 +109,13 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
         prev_slots[total_entries:] = -1
 
     num_valid = torch.tensor([total_entries], dtype=torch.int32, device=device)
+    enable = torch.ones(1, dtype=torch.int32, device=device)
     plan = VerifyPlan(
         verify_slot_indices=slot_indices,
         verify_positions=positions,
         verify_prev_slot_indices=prev_slots,
         verify_num_valid=num_valid,
+        enable=enable,
     )
 
     violation_ring = torch.zeros(

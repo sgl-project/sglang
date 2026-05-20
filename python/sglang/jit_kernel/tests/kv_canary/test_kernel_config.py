@@ -248,6 +248,7 @@ def _run_plan_both(
         extra_verify_num_valid=extra_num,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=int(triton_verify.verify_slot_indices.shape[0]),
     )
     canary_plan_step_torch_reference(
         verify_plan_out=ref_verify,
@@ -262,6 +263,7 @@ def _run_plan_both(
         extra_verify_num_valid=extra_num,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
     )
     torch.cuda.synchronize()
 

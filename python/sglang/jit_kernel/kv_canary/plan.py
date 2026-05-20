@@ -54,6 +54,7 @@ def canary_plan_step(
     extra_verify_num_valid: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
+    verify_capacity: int,
 ) -> None:
     """Fill verify_plan_out + write_plan_out from ForwardBatch primitives + optional pre-walked flat verify
     entries. Single Triton launch.
@@ -159,6 +160,7 @@ def canary_plan_step(
     _assert_contiguous(
         verify_plan_out.verify_num_valid, "verify_plan_out.verify_num_valid"
     )
+    _assert_contiguous(verify_plan_out.enable, "verify_plan_out.enable")
     _assert_contiguous(write_plan_out.write_offsets, "write_plan_out.write_offsets")
     _assert_contiguous(
         write_plan_out.write_seed_slot_indices, "write_plan_out.write_seed_slot_indices"
@@ -182,7 +184,12 @@ def canary_plan_step(
         _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
     )
 
-    verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
+    plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
+    if verify_capacity != plan_verify_capacity:
+        raise ValueError(
+            f"kv-canary: canary_plan_step verify_capacity={verify_capacity} does not match "
+            f"verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
+        )
     write_req_capacity_plus_one = int(write_plan_out.write_offsets.shape[0])
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
     extras_capacity = int(extra_verify_slot_indices.shape[0])
@@ -211,6 +218,7 @@ def canary_plan_step(
         write_plan_out.write_offsets,
         write_plan_out.write_seed_slot_indices,
         verify_plan_out.verify_num_valid,
+        verify_plan_out.enable,
         write_plan_out.write_num_valid_reqs,
         bs,
         req_to_token_stride0,
@@ -220,6 +228,7 @@ def canary_plan_step(
         HAS_SWA_LUT=has_swa_lut,
         WRITE_OFFSETS_LEN=write_req_capacity_plus_one,
         WRITE_REQ_CAPACITY=write_req_capacity,
+        VERIFY_CAPACITY=verify_capacity,
     )
 
     # Entries kernel: per-(req, j-tile) verify entry materialization. The j-axis upper bound is
@@ -282,6 +291,7 @@ def _plan_offsets_kernel(
     out_write_offsets_ptr,
     out_write_seed_slot_indices_ptr,
     out_verify_num_valid_ptr,
+    out_verify_enable_ptr,
     out_write_num_valid_reqs_ptr,
     # Runtime sizes.
     bs,
@@ -293,6 +303,7 @@ def _plan_offsets_kernel(
     HAS_SWA_LUT: tl.constexpr,
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
+    VERIFY_CAPACITY: tl.constexpr,
 ):
     """Offsets kernel: per-req counts, seeds, exclusive-prefix-sum offsets, scalar totals.
 
@@ -395,10 +406,17 @@ def _plan_offsets_kernel(
         mask=write_tail_in_range,
     )
 
-    # Scalar writes: verify_num_valid = total_verify + extras_count; write_num_valid_reqs = bs.
+    # Scalar writes: verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
+    # never indexes past the buffer; enable carries the overflow bit (0 when requested > capacity) so the
+    # verify kernel skips the whole launch and the host can warn-log this step.
     extras_count = tl.load(extra_verify_num_valid_ptr)  # scalar
     extras_count = tl.where(extras_count > 0, extras_count, 0)
-    tl.store(out_verify_num_valid_ptr, (total_verify + extras_count).to(tl.int32))
+    requested = total_verify + extras_count  # scalar
+    overflow = requested > VERIFY_CAPACITY  # scalar bool
+    enable = tl.where(overflow, 0, 1)  # scalar
+    clamped = tl.where(overflow, VERIFY_CAPACITY, requested)  # scalar
+    tl.store(out_verify_num_valid_ptr, clamped.to(tl.int32))
+    tl.store(out_verify_enable_ptr, tl.full((), enable, tl.int32))
     tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
 
 
