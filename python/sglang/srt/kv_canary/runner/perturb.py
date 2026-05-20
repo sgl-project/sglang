@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 class PerturbHook:
@@ -77,6 +80,13 @@ class PerturbHook:
         new_value = int(torch.randint(0, slot_upper, (1,)).item())
         if new_value == original:
             new_value = (original + 1) % slot_upper
+        logger.info(
+            "kv_canary perturb req_to_token: req_pool_idx=%d position=%d original_slot=%d new_slot=%d",
+            req_pool_idx,
+            position,
+            original,
+            new_value,
+        )
         table[req_pool_idx, position] = new_value
         self._perturb_undo = (req_pool_idx, position, original)
 
@@ -122,12 +132,31 @@ class PerturbHook:
 
         flat = source.tensor
         original_byte = int(flat[row, col].item())
-        flat[row, col] = original_byte ^ 0xFF
+        new_byte = original_byte ^ 0xFF
+        logger.info(
+            "kv_canary perturb real_kv: group_kind=%s source_idx=%d slot=%d row=%d col=%d "
+            "byte_offset=%d original_byte=0x%02X new_byte=0x%02X",
+            group.kind.name,
+            source_pick,
+            slot_idx,
+            row,
+            col,
+            byte_offset,
+            original_byte,
+            new_byte,
+        )
+        flat[row, col] = new_byte
 
     def undo_after_step(self) -> None:
         if self._perturb_undo is not None:
             row, col, original = self._perturb_undo
             self._req_to_token_pool.req_to_token[row, col] = original
+            logger.info(
+                "kv_canary perturb undo req_to_token: req_pool_idx=%d position=%d restored_slot=%d",
+                row,
+                col,
+                original,
+            )
             self._perturb_undo = None
 
     def _collect_real_kv_perturb_candidates(
