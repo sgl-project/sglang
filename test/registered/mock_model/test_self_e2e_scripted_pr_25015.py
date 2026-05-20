@@ -36,10 +36,8 @@ def _spec_eagle_server_args() -> List[str]:
         "raise",
         "--speculative-algorithm",
         "EAGLE",
-        # Cap canary's per-forward + sweep capacities under the cuda-grid-safe
-        # ceiling (4M, see capacities.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
-        # max_bs = max(cuda_graph_max_bs, max_running_requests); both must be
-        # capped or the pool sizing blows past the ceiling.
+        # Caps kept small to keep the e2e test cheap (run time + device memory budget for the
+        # canary buffers). Not load-bearing on canary's overflow behavior.
         "--cuda-graph-max-bs",
         "8",
         "--max-running-requests",
