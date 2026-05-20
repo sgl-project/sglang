@@ -66,7 +66,7 @@ def install_canary(
         pool=model_runner.token_to_kv_pool,
         config=config,
         device=device,
-        allocator=getattr(model_runner, "token_to_kv_pool_allocator", None),
+        allocator=model_runner.token_to_kv_pool_allocator,
     )
     runner = CanaryRunner(
         config=config,
