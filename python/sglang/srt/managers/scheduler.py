@@ -3050,6 +3050,11 @@ class Scheduler(
                             req.pipelined_state_indices if is_last else None
                         ),
                     )
+                # Mark KV as fully sent so send_kv_chunk won't resend
+                if is_last_group:
+                    req.start_send_idx = min(
+                        len(req.fill_ids), len(req.origin_input_ids)
+                    )
 
         # Sample next tokens
         assert (

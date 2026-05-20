@@ -397,41 +397,58 @@ class SchedulerDisaggregationPrefillMixin:
         the result on req.pipelined_state_indices so that run_batch_pipelined
         can pass it through the last send_layer call.
         """
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
 
         for req in batch.reqs:
             state_indices = None
-            if isinstance(kvcache, HybridLinearKVPool):
-                state_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
+            if state_types:
+                seq_len = len(req.fill_ids)
+
+                def _mamba_payload():
+                    return [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                        .cpu()
+                        .numpy()
                     ]
-                    .cpu()
-                    .numpy()
-                ]
-            elif isinstance(kvcache, BaseSWAKVPool):
-                seq_len = len(req.fill_ids)
-                window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
+
+                def _swa_payload():
+                    window_size = self.sliding_window_size
+                    window_start = max(0, seq_len - window_size)
+                    window_start = (window_start // page_size) * page_size
+                    window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, window_start:seq_len
+                    ]
+                    window_kv_indices_swa = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            window_kv_indices_full
+                        )
                     )
-                )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(kvcache, NSATokenToKVPool):
-                seq_len = len(req.fill_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                    return kv_to_page_indices(
+                        window_kv_indices_swa.cpu().numpy(), page_size
+                    )
+
+                def _nsa_payload():
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :seq_len
+                    ]
+                    return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+                state_indices = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.NSA:
+                        state_indices.append(_nsa_payload())
+                    else:
+                        state_indices.append(None)
+
             req.pipelined_state_indices = state_indices
 
     def _get_pipeline_group_size(self: Scheduler, batch) -> int:
@@ -444,6 +461,12 @@ class SchedulerDisaggregationPrefillMixin:
             TransferBackend.MOONCAKE,
             TransferBackend.FAKE,
         ):
+            return 0
+
+        # PP (pipeline parallelism) is not yet supported — send_kvcache_layer
+        # indexes kv_data_ptrs with global layer_id which is incompatible with
+        # PP's per-stage pointer slicing.
+        if self.ps.pp_size > 1:
             return 0
 
         # Universal guard: model must implement forward_split_prefill to use
@@ -466,7 +489,17 @@ class SchedulerDisaggregationPrefillMixin:
         if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
             return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
-        # Adaptive: control iterations in [6, 10] based on prompt length
+        # Adaptive group_size: balance pipeline parallelism vs overhead.
+        #
+        # Fewer iterations (larger groups) → less pipeline overlap but lower
+        # per-group dispatch overhead. More iterations (smaller groups) → better
+        # overlap of transfer with GPU compute but more RDMA doorbell calls.
+        #
+        # For short prompts (<4096 tokens), prefill compute per group is small,
+        # so we use more groups (10 iterations) to maximize overlap opportunity.
+        # For long prompts (>=8192), each group already has enough compute to
+        # fully overlap transfer, so fewer groups (6 iterations) suffice and
+        # reduce dispatch overhead.
         num_layers = self.model_config.num_hidden_layers
         if avg_tokens < 4096:
             target_iters = 10
