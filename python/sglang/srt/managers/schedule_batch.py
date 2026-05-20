@@ -2420,7 +2420,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2454,6 +2456,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.wait()
+
+    def refresh_seq_lens_cpu(self, sync: bool = True):
+        # sync=True: D2H from seq_lens (needed when seq_lens_cpu is stale
+        # relative to seq_lens, i.e. spec v2's mid-forward GPU rebind).
+        # sync=False: caller asserts seq_lens_cpu already fresh — skip D2H,
+        # only recompute the cached sum.
+        if sync and self.is_spec_v2:
+            self.seq_lens_cpu = self.seq_lens.cpu()
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
     def filter_batch(
         self,
@@ -2505,7 +2516,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
 
         if self.input_ids is not None:
             self.input_ids = self.input_ids[keep_indices_device]
@@ -2565,7 +2578,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         self.mamba_track_indices = None
