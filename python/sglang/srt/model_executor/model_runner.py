@@ -2307,7 +2307,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if self.server_args.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -2891,6 +2891,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             log_info_on_rank0(
                 logger,
                 "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+            )
+            return
+
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_mnnvl_allreduce_fusion_enabled,
+        )
+
+        # TODO(wenscarl): remove this constraint once
+        # https://github.com/flashinfer-ai/flashinfer/pull/3304 is merged
+        # (kernel-side FTZ-safe sentinel check removes the PCG-replay hang).
+        if flashinfer_mnnvl_allreduce_fusion_enabled(self.server_args):
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph because MNNVL allreduce fusion is enabled",
             )
             return
 
