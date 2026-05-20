@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
@@ -18,7 +16,6 @@ def attach_nsa(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to an NSA pool (MLA-style ``kv_buffer`` + a packed index buffer)."""
     num_slots = int(pool.kv_buffer[0].shape[0])

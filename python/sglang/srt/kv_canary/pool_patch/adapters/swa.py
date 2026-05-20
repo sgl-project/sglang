@@ -17,7 +17,6 @@ def attach_swa(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to an SWA pool with both FULL and SWA sub-pools.
 

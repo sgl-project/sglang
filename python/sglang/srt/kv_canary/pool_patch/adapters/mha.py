@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
@@ -17,7 +15,6 @@ def attach_mha(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     num_slots = int(pool.k_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)

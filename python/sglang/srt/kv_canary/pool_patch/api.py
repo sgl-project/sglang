@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Type
+from typing import Callable, Dict, Type
 
 import torch
 
@@ -48,7 +48,6 @@ def attach_canary_buffers(
     pool: KVCache,
     config: CanaryConfig,
     device: torch.device,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple
     (1 entry per pool sub-group: FULL only, or FULL + SWA). Patches the pool's
@@ -60,10 +59,6 @@ def attach_canary_buffers(
     test fakes) register via :func:`register_pool_attacher`.
 
     Idempotent: calling twice on the same pool raises. To re-attach, detach first.
-
-    allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Forwarded
-    to per-pool attachers for any allocator-level integration; canary kernels consume the SWA LUT
-    directly in its native int64 dtype.
     """
     if getattr(pool, _CANARY_ATTACHED_ATTR, False):
         raise RuntimeError(
@@ -78,9 +73,7 @@ def attach_canary_buffers(
         )
 
     read_bytes = resolve_read_bytes(config)
-    groups = attacher(
-        pool=pool, device=device, read_bytes=read_bytes, allocator=allocator
-    )
+    groups = attacher(pool=pool, device=device, read_bytes=read_bytes)
 
     setattr(pool, _CANARY_ATTACHED_ATTR, True)
     setattr(pool, _CANARY_BUFFER_GROUPS_ATTR, {group.kind: group for group in groups})

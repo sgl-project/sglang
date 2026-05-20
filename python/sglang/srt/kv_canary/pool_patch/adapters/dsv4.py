@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 
@@ -22,7 +22,6 @@ def attach_dsv4(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to a DSV4 packed pool.
 
