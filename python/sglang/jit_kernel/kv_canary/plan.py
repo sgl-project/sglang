@@ -304,8 +304,12 @@ def _plan_offsets_kernel(
 
     # Per-req inputs (int32 loads matching the dtype of fb_* / req_to_token).
     rpi = tl.load(req_pool_indices_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
-    prefix_lens = tl.load(prefix_lens_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
-    extend_lens = tl.load(extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
+    prefix_lens = tl.load(
+        prefix_lens_ptr + bs_offs, mask=bs_mask, other=0
+    )  # [BS_BLOCK]
+    extend_lens = tl.load(
+        extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0
+    )  # [BS_BLOCK]
 
     is_active = (rpi != 0) & bs_mask  # [BS_BLOCK] bool
     has_prefix = is_active & (prefix_lens > 0)  # [BS_BLOCK] bool
@@ -343,7 +347,9 @@ def _plan_offsets_kernel(
 
     # Reqs with no write contribution should expose seed = -1 (ref's _seed_slot is masked by write_lens > 0).
     minus_one = tl.full((BS_BLOCK,), -1, dtype=seed_translated.dtype)  # [BS_BLOCK]
-    seed_slot = tl.where(has_write_contribution, seed_translated, minus_one)  # [BS_BLOCK]
+    seed_slot = tl.where(
+        has_write_contribution, seed_translated, minus_one
+    )  # [BS_BLOCK]
 
     # Inclusive cumsum → exclusive offsets via subtraction.
     verify_inclusive = tl.cumsum(verify_lens, axis=0)  # [BS_BLOCK]
@@ -457,7 +463,9 @@ def _plan_entries_kernel(
 
     prev_pos_valid = (positions > 0) & j_mask  # [INNER_BLOCK] bool
     prev_positions_i64 = (positions - 1).to(tl.int64)  # [INNER_BLOCK]
-    safe_prev_positions_i64 = tl.where(prev_pos_valid, prev_positions_i64, 0)  # [INNER_BLOCK]
+    safe_prev_positions_i64 = tl.where(
+        prev_pos_valid, prev_positions_i64, 0
+    )  # [INNER_BLOCK]
     prev_slot_full = tl.load(  # [INNER_BLOCK]
         req_to_token_ptr + rpi_i64 * stride_i64 + safe_prev_positions_i64,
         mask=prev_pos_valid,
@@ -465,7 +473,9 @@ def _plan_entries_kernel(
     )
 
     if HAS_SWA_LUT:
-        slot = _swa_translate_tile(slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len)  # [INNER_BLOCK]
+        slot = _swa_translate_tile(
+            slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len
+        )  # [INNER_BLOCK]
         prev_translated = _swa_translate_tile(  # [INNER_BLOCK]
             prev_slot_full,
             prev_pos_valid,
@@ -477,7 +487,9 @@ def _plan_entries_kernel(
         prev_translated = prev_slot_full
 
     chain_head_tile = tl.full((INNER_BLOCK,), -1, dtype=slot.dtype)  # [INNER_BLOCK]
-    prev_slot = tl.where(prev_pos_valid, prev_translated, chain_head_tile)  # [INNER_BLOCK]
+    prev_slot = tl.where(
+        prev_pos_valid, prev_translated, chain_head_tile
+    )  # [INNER_BLOCK]
 
     out_offs = verify_start + j_offs  # [INNER_BLOCK]
     cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
@@ -558,9 +570,15 @@ def _plan_extras_kernel(
 
     base_idx = tl.load(verify_offsets_ptr + bs)  # scalar
 
-    slots = tl.load(extra_slot_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
-    positions = tl.load(extra_positions_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
-    prevs = tl.load(extra_prev_slot_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
+    slots = tl.load(
+        extra_slot_ptr + k_offs, mask=in_range_mask, other=0
+    )  # [INNER_BLOCK]
+    positions = tl.load(
+        extra_positions_ptr + k_offs, mask=in_range_mask, other=0
+    )  # [INNER_BLOCK]
+    prevs = tl.load(
+        extra_prev_slot_ptr + k_offs, mask=in_range_mask, other=0
+    )  # [INNER_BLOCK]
 
     out_offs = base_idx + k_offs  # [INNER_BLOCK]
     cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
