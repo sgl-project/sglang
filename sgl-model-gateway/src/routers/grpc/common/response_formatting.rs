@@ -27,8 +27,9 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use smg_grpc_client::sglang_proto;
+
+    use super::*;
 
     fn complete(
         prompt_tokens: i32,
