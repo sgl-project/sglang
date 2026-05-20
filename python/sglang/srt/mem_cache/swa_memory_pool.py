@@ -55,7 +55,6 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
-        self.swa_loc = None
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
@@ -159,9 +158,6 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
-    def set_swa_loc(self, loc: torch.Tensor):
-        self.swa_loc = loc
-
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
 
@@ -177,25 +173,12 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        swa_loc: Optional[torch.Tensor] = None,
     ):
 
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            # Prefer swa_loc from piecewise forward context (already narrowed by
-            # radix_attention.unified_attention_with_output). Fall back to self.swa_loc
-            # which is set in model_runner / cuda_graph_runner prepare phase for
-            # non-piecewise paths (eager decode, full cuda graph).
-            from sglang.srt.compilation.piecewise_context_manager import (
-                get_forward_context,
-            )
-
-            _ctx = get_forward_context()
-            swa_loc = (
-                _ctx.forward_batch.out_cache_loc_swa
-                if _ctx is not None and _ctx.forward_batch is not None
-                else self.swa_loc
-            )
             if swa_loc is not None:
                 loc = swa_loc
             elif self.full_to_swa_index_mapping is not None:
