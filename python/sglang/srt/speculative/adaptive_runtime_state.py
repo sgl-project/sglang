@@ -136,35 +136,17 @@ class AdaptiveController:
     ) -> list[int]:
         """Return the cuda_graph_bs values that need to be *captured* for *step*.
 
-        A cuda_graph_bs entry *v* covers actual batch sizes in (prev_v, v].  We
-        include *v* for *step* when that coverage interval overlaps with at least
-        one BS slot whose candidate_steps contains *step*.
-
+        For each CUDA graph batch size *v*, we check which BS config slot *v*
+        maps to at runtime (via ``_find_closest_bs``), and include *v* only if
+        that slot's candidate_steps contains *step*.  This matches the runtime
+        lookup path (pad → find_closest_bs → get step) exactly, so we never
+        capture graphs that can't be reached.
         """
-        relevant_ranges: list[tuple] = []
-        for i, slot_key in enumerate(self._bs_list):
-            if step in self._bs_params[slot_key].candidate_steps:
-                lo = slot_key
-                hi = (
-                    self._bs_list[i + 1] if i + 1 < len(self._bs_list) else float("inf")
-                )
-                relevant_ranges.append((lo, hi))
-
-        if not relevant_ranges:
-            return []
-
-        result: list[int] = []
-        prev = 0
-        for v in sorted(all_cuda_graph_bs):
-            lo_actual = prev + 1
-            hi_actual = v
-            for r_lo, r_hi in relevant_ranges:
-                if lo_actual < r_hi and hi_actual >= r_lo:
-                    result.append(v)
-                    break
-            prev = v
-
-        return result
+        return [
+            v
+            for v in sorted(all_cuda_graph_bs)
+            if step in self._bs_params[self._find_closest_bs(v)].candidate_steps
+        ]
 
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps.
