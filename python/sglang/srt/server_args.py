@@ -682,9 +682,6 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    kv_canary: str = "off"
-    kv_canary_real_data: str = "off"
-    kv_canary_sweep_interval: int = 0
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -750,6 +747,9 @@ class ServerArgs:
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "off"
+    kv_canary_real_data: str = "off"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -6130,9 +6130,8 @@ class ServerArgs:
             help=(
                 "KV cache canary mode. 'off' disables the canary (default). 'log' "
                 "records mismatches to a violation buffer and logs them while the "
-                "server keeps running (production-safe). 'raise' performs a "
-                "cross-rank allreduce of the error flag and raises on every rank "
-                "to avoid TP deadlocks (CI lane)."
+                "server keeps running (production-safe). 'raise' fails the server "
+                "on the first detected mismatch (CI lane)."
             ),
         )
         parser.add_argument(
@@ -6142,19 +6141,16 @@ class ServerArgs:
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
-                "chain hash. Choices are derived from the ``RealKvHashMode`` "
-                "enum (kv_canary/consts.py) so the CLI surface and the "
-                "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
+                "chain hash. 'off' (default) "
                 "leaves the real_kv_hash slot field at zero. 'partial' "
-                "splitmix64-folds the first min(16, read_bytes) bytes of "
+                "splitmix64-folds the first 16 bytes of "
                 "each real-KV slot; useful when corruption is suspected but "
-                "overhead must stay tiny (max 16B read per slot). 'all' "
+                "overhead must stay tiny. 'all' "
                 "splitmix64-folds the full real-KV slot stride for maximum "
                 "coverage at higher cost. Catches "
                 "corruption that the pure-canary path misses because the "
                 "canary slot itself is intact but the real KV got written "
-                "wrong (attn-kernel idle-logic misconfig; PD transfer "
-                "bit-rot)."
+                "wrong."
             ),
         )
         parser.add_argument(

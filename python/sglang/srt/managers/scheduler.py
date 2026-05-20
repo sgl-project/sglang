@@ -705,7 +705,7 @@ class Scheduler(
         )
 
         if pr_num := envs.SGLANG_DEBUG_REVERT_PR.get():
-            revert_pr_fix(int(pr_num))
+            revert_pr_fix(pr_num)
 
         self.is_initializing = False
 

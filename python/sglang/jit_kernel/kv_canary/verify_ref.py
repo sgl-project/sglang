@@ -171,10 +171,11 @@ def _compute_real_kv_hash_scalar(
 ) -> int:
     """Compute one uint64 real-KV fingerprint for a single slot index.
 
-    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold first min(16, read_bytes) bytes
-    (little-endian word-pack, at most 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian
-    word (zero-padded). Each source's contribution is mixed into the running accumulator via
-    splitmix64(acc ^ source_hash). When read_bytes <= 16, PARTIAL and ALL produce identical hashes.
+    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold exactly the first 16 bytes
+    (little-endian word-pack, 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian word.
+    Each source's contribution is mixed into the running accumulator via splitmix64(acc ^ source_hash).
+    With the 16B-aligned contract, read_bytes is always >= 16 when non-zero, so PARTIAL collapses to a
+    constant 16B prefix.
     """
     mode = int(real_kv_hash_mode)
     if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
@@ -198,9 +199,7 @@ def _compute_real_kv_hash_scalar(
         col_start = col_within_page * num_bytes_per_token
 
         effective_read_bytes = (
-            min(16, read_bytes)
-            if mode == int(consts.RealKvHashMode.PARTIAL)
-            else read_bytes
+            16 if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
         )
         raw_bytes: list[int] = []
         for b in range(effective_read_bytes):
@@ -227,66 +226,5 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
             word |= padded[w * 8 + k] << (8 * k)
         word &= _U64_MASK
         acc = splitmix64(acc ^ word)
-
-    return acc
-
-
-def _splitmix64_finalize_vec(words: torch.Tensor) -> torch.Tensor:
-    x = words
-    x = _xor_shift_mul(x, 30, _to_signed_int64(0xBF58476D1CE4E5B9))
-    x = _xor_shift_mul(x, 27, _to_signed_int64(0x94D049BB133111EB))
-    x = x ^ _logical_shr(x, 31)
-    return x
-
-
-def _xor_shift_mul(x: torch.Tensor, shift: int, multiplier_signed: int) -> torch.Tensor:
-    shifted = _logical_shr(x, shift)
-    mixed = x ^ shifted
-    return mixed * multiplier_signed
-
-
-def _logical_shr(x: torch.Tensor, shift: int) -> torch.Tensor:
-    if shift == 0:
-        return x
-    mask = (1 << (64 - shift)) - 1
-    return (x >> shift) & mask
-
-
-def _splitmix64_mix4_vec(
-    prev_hash: torch.Tensor,
-    token: torch.Tensor,
-    position: torch.Tensor,
-    real_kv_hash: torch.Tensor,
-) -> torch.Tensor:
-    """Chained 4-input splitmix64 over int64 tensors. Byte-equal to the scalar ``splitmix64_mix4``."""
-    h = _splitmix64_finalize_vec(prev_hash)
-    h = _splitmix64_finalize_vec(h ^ token)
-    h = _splitmix64_finalize_vec(h ^ position)
-    h = _splitmix64_finalize_vec(h ^ real_kv_hash)
-    return h
-
-
-def _compute_real_kv_hash_vec(
-    *,
-    slot_indices: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-    work_device: torch.device,
-) -> torch.Tensor:
-    num_entries = int(slot_indices.shape[0])
-    acc = torch.zeros(num_entries, dtype=torch.int64, device=work_device)
-    mode = int(real_kv_hash_mode)
-    if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
-        return acc
-
-    for k in range(num_entries):
-        slot_idx = int(slot_indices[k].item())
-        hash_u64 = _compute_real_kv_hash_scalar(
-            slot_idx=slot_idx,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
-            work_device=work_device,
-        )
-        acc[k] = _to_signed_int64(hash_u64)
 
     return acc

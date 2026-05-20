@@ -24,8 +24,8 @@ def test_resolve_read_bytes_off_returns_zero() -> None:
     assert resolve_read_bytes(_config(RealKvHashMode.OFF)) == 0
 
 
-def test_resolve_read_bytes_partial_returns_32() -> None:
-    assert resolve_read_bytes(_config(RealKvHashMode.PARTIAL)) == 32
+def test_resolve_read_bytes_partial_returns_16() -> None:
+    assert resolve_read_bytes(_config(RealKvHashMode.PARTIAL)) == 16
 
 
 def test_resolve_read_bytes_all_returns_sentinel_so_full_stride_used() -> None:
