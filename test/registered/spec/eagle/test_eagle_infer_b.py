@@ -11,6 +11,7 @@ import numpy as np
 import requests
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.abort_timeout_kit import (
     AbortAllMixin,
@@ -346,6 +347,12 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic):
 
     @classmethod
     def setUpClass(cls):
+        # Use triton attention backend for XPU devices
+        if is_xpu():
+            for i, arg in enumerate(cls.extra_args):
+                if arg == "--attention-backend=flashinfer":
+                    cls.extra_args[i] = "--attention-backend=triton"
+                    break
         # Runtime check only supported for topk=1, and can help to find a leak.
         with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             super().setUpClass()
