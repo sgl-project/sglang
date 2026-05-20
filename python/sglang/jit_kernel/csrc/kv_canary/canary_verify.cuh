@@ -91,7 +91,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   // Expected chain hash: advance the chain one step from prev_slot_idx (or anchor on
   // splitmix64(kCanaryChainAnchor) when prev_slot_idx < 0 = chain head).
   const int64_t expected_chain_hash =
-      static_cast<int64_t>(chain_advance_from_slot(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
+      static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
 
   const uint64_t expected_real_kv_hash_u64 =
       real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);

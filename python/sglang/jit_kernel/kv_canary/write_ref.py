@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     _to_signed_int64,
-    chain_advance_from_slot,
+    compute_slot_hash,
     splitmix64_mix4,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
@@ -92,7 +92,7 @@ def canary_write_step_torch_reference(
             continue
 
         seed_slot = int(seed_slot_indices_host[r].item())
-        running_prev_hash = chain_advance_from_slot(buf_i64, seed_slot)
+        running_prev_hash = compute_slot_hash(buf_i64, seed_slot)
 
         for entry_offset in range(entry_count):
             fb_idx = entry_start + entry_offset

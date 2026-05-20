@@ -175,14 +175,14 @@ canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, in
   p[field] = value;
 }
 
-// Advance the canary chain one step starting from ``source_slot_idx``: load that slot's four stored fields
-// (token, position, prev_hash, real_kv_hash) and fold them through splitmix64_mix4. The result is the
-// chain hash that the slot immediately following ``source_slot_idx`` should store as its prev_hash.
+// Compute the chain-step hash of ``source_slot_idx``: load that slot's four stored fields (token, position,
+// prev_hash, real_kv_hash) and fold them through splitmix64_mix4. The result is the chain hash that the slot
+// immediately following ``source_slot_idx`` should store as its prev_hash.
 //
 // ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on splitmix64(kCanaryChainAnchor).
 // Shared by the verify path (recompute expected prev_hash from a slot's predecessor) and the write path
 // (seed running_prev_hash from a chain-prefix slot).
-SGL_DEVICE uint64_t chain_advance_from_slot(
+SGL_DEVICE uint64_t compute_slot_hash(
     const uint8_t* canary_buf, int64_t slot_stride_bytes, int64_t source_slot_idx) {
   if (source_slot_idx < 0) {
     return splitmix64(kCanaryChainAnchor);

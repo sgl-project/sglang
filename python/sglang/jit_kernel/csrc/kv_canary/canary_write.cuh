@@ -80,7 +80,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   // written slot's stored prev_hash consistent with the chain link the verify kernel will recompute.
   // seed_slot_idx < 0 anchors on splitmix64(kCanaryChainAnchor).
   uint64_t running_prev_hash =
-      chain_advance_from_slot(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
+      compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
   int32_t entries_written = 0;
   for (int32_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
