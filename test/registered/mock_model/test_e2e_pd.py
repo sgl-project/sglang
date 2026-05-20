@@ -6,17 +6,13 @@ import time
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-except ImportError:
-    MockEngine = None
-
+from sglang.srt.steppable_engine import SteppableEngine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, suite="extra-a-2-gpu")
 
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires PD disagg support which is not currently implemented"
 )
 
 
@@ -25,7 +21,7 @@ def _fake_prompt(length: int) -> list[int]:
 
 
 def test_pd_transfer_canary_clean() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         disagg_prefill_decode=True,
@@ -42,7 +38,7 @@ def test_pd_transfer_canary_clean() -> None:
 
 
 def test_pd_transfer_checksum_full_real_data() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         disagg_prefill_decode=True,
@@ -60,7 +56,7 @@ def test_pd_transfer_checksum_full_real_data() -> None:
 
 
 def test_pd_transfer_corrupted_byte_detected() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         disagg_prefill_decode=True,

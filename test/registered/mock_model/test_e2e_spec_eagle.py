@@ -7,17 +7,13 @@ import time
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-except ImportError:
-    MockEngine = None
-
+from sglang.srt.steppable_engine import SteppableEngine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="extra-a-1-gpu")
 
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires EAGLE v2 spec decoding support which is not currently implemented"
 )
 
 
@@ -25,9 +21,9 @@ def _fake_prompt(length: int) -> list[int]:
     return list(range(1, length + 1))
 
 
-def _launch_eagle_v2(**kwargs) -> "MockEngine":
+def _launch_eagle_v2(**kwargs) -> "SteppableEngine":
     os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
-    return MockEngine.launch(
+    return SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         speculative_algorithm="EAGLE",

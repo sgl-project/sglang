@@ -6,17 +6,13 @@ import time
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-except ImportError:
-    MockEngine = None
-
+from sglang.srt.steppable_engine import SteppableEngine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="extra-a-1-gpu")
 
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires Mamba state mirror which is not currently implemented"
 )
 
 
@@ -25,7 +21,7 @@ def _fake_prompt(length: int) -> list[int]:
 
 
 def test_mamba_extra_buffer_overlap_canary_clean() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="state-spaces/mamba-130m",
         num_hidden_layers=1,
         enable_overlap=True,
@@ -41,7 +37,7 @@ def test_mamba_extra_buffer_overlap_canary_clean() -> None:
 
 
 def test_mamba_state_kv_layout_real_data_all() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="state-spaces/mamba-130m",
         num_hidden_layers=1,
         canary_real_data="all",
