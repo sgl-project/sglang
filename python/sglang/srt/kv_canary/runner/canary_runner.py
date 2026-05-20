@@ -15,7 +15,6 @@ from sglang.srt.kv_canary.endpoint import (
     build_endpoints_from_group,
 )
 from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
-from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
@@ -27,7 +26,7 @@ from sglang.srt.kv_canary.violation_state import CanaryDeviceState
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -67,38 +66,20 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pool: Optional["KVCache"] = None,
+        buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: "ReqToTokenPool",
         radix_cache: Optional["BasePrefixCache"] = None,
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
-        buffer_groups: Optional[tuple[CanaryBufferGroup, ...]] = None,
-        token_to_kv_pool_allocator: Optional[object] = None,
     ) -> None:
         self.config = config
         self._device = device
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = int(swa_window_size)
 
-        if buffer_groups is not None:
-            if pool is not None:
-                raise ValueError(
-                    "kv-canary: pass either pool or buffer_groups, not both"
-                )
-            self._groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
-        else:
-            if pool is None:
-                raise ValueError(
-                    "kv-canary: either pool or buffer_groups must be provided"
-                )
-            self._groups = attach_canary_buffers(
-                pool=pool,
-                config=config,
-                device=device,
-                allocator=token_to_kv_pool_allocator,
-            )
+        self._groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)

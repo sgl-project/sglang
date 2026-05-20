@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
@@ -60,18 +61,22 @@ def install_canary(
     if config.mode == "off":
         return None
 
+    device = torch.device(model_runner.device)
+    buffer_groups = attach_canary_buffers(
+        pool=model_runner.token_to_kv_pool,
+        config=config,
+        device=device,
+        allocator=getattr(model_runner, "token_to_kv_pool_allocator", None),
+    )
     runner = CanaryRunner(
         config=config,
-        pool=model_runner.token_to_kv_pool,
-        device=torch.device(model_runner.device),
+        buffer_groups=buffer_groups,
+        device=device,
         tp_group=_resolve_tp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
         swa_window_size=int(model_runner.sliding_window_size or 0),
-        token_to_kv_pool_allocator=getattr(
-            model_runner, "token_to_kv_pool_allocator", None
-        ),
     )
 
     model_runner.canary_runner = runner
