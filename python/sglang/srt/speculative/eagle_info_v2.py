@@ -236,7 +236,8 @@ class EagleDraftInputV2Mixin:
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += extend_num_tokens
+        # seq_lens_sum derived from seq_lens_cpu in ForwardBatch.init_new.
+        batch.seq_lens_sum = None
         batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
@@ -289,7 +290,7 @@ class EagleVerifyInputV2Mixin:
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
             # TBO's split_spec_info can slice the custom_mask correctly.
             self.seq_lens_cpu = batch.seq_lens_cpu
-            self.seq_lens_sum = batch.seq_lens_sum
+            self.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         # Get a forward batch
         batch.forward_mode = (

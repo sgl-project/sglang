@@ -2839,12 +2839,10 @@ class Scheduler(
                     bs = len(batch.seq_lens)
                     future_indices = self.future_map.alloc_future_indices(bs)
 
-                    # Last-minute D2H sync for spec_v2 seq_lens_cpu/sum.
-                    # Moved from prepare_for_decode so schedule path doesn't
-                    # block early; equivalent to the prior verify_done sync.
+                    # Last-minute D2H to refresh seq_lens_cpu for spec_v2 overlap;
+                    # ForwardBatch.init_new derives seq_lens_sum from seq_lens_cpu.
                     if batch.is_spec_v2:
                         batch.seq_lens_cpu = batch.seq_lens.cpu()
-                        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)

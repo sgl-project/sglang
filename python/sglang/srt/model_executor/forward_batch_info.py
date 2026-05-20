@@ -521,7 +521,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_sum=(
+                batch.seq_lens_sum
+                if batch.seq_lens_sum is not None
+                else int(batch.seq_lens_cpu.sum())
+            ),
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,

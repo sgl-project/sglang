@@ -2425,7 +2425,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2510,12 +2511,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        if self.is_spec_v2 and self.enable_overlap:
-            # spec_v2 overlap: seq_lens_cpu is one iter stale here; mark None
-            # so accidental reads fail loudly. Refreshed at forward_stream entry.
-            self.seq_lens_sum = None
-        else:
-            self.seq_lens_sum = int(self.seq_lens_cpu.sum())
+        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        self.seq_lens_sum = None
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2575,10 +2572,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        if self.seq_lens_sum is None or other.seq_lens_sum is None:
-            self.seq_lens_sum = None  # refreshed at forward_stream entry
-        else:
-            self.seq_lens_sum += other.seq_lens_sum
+        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        self.seq_lens_sum = None
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
