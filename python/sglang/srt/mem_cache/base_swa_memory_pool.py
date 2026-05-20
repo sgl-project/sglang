@@ -30,3 +30,12 @@ class BaseSWAKVPool(KVCache):
     @abc.abstractmethod
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         raise NotImplementedError()
+
+    def invalidate_loc_cache(self) -> None:
+        """Invalidate any cached full→SWA location translation.
+
+        Default is a no-op; subclasses that maintain a location-translation
+        cache (e.g. SWAKVPool) override this to discard the cached result.
+        Called by SWATokenToKVPoolAllocator before every alloc/free/clear that
+        modifies full_to_swa_index_mapping.
+        """

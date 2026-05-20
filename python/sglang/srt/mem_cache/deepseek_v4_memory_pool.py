@@ -497,6 +497,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def invalidate_loc_cache(self) -> None:
         self.cached_loc = None
 
+    def invalidate_loc_cache(self) -> None:
+        """Discard the cached SWA location translation (cached_loc)."""
+        self.cached_loc = None
+
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
         is_speculative = server_args.speculative_algorithm is not None
