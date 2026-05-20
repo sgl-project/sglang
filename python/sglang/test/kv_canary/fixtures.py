@@ -302,7 +302,9 @@ def make_buffer_group(
 
 
 def make_base_config() -> CanaryConfig:
-    return CanaryConfig(mode=CanaryMode.RAISE, real_kv_hash_mode=consts.RealKvHashMode.OFF)
+    return CanaryConfig(
+        mode=CanaryMode.RAISE, real_kv_hash_mode=consts.RealKvHashMode.OFF
+    )
 
 
 def make_req_to_token_pool(

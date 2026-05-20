@@ -98,10 +98,18 @@ def canary_write_step_torch_reference(
         if seed_slot < 0:
             running_prev_hash = chain_anchor_u64
         else:
-            seed_prev_hash_signed = int(buf_i64[seed_slot, consts.CANARY_FIELD_PREV_HASH].item())
-            seed_token_signed = int(buf_i64[seed_slot, consts.CANARY_FIELD_TOKEN].item())
-            seed_position_signed = int(buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item())
-            seed_real_kv_signed = int(buf_i64[seed_slot, consts.CANARY_FIELD_REAL_KV_HASH].item())
+            seed_prev_hash_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_PREV_HASH].item()
+            )
+            seed_token_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_TOKEN].item()
+            )
+            seed_position_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
+            )
+            seed_real_kv_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_REAL_KV_HASH].item()
+            )
             seed_combined = (
                 (seed_prev_hash_signed & _U64_MASK)
                 ^ (seed_token_signed & _U64_MASK)
@@ -149,8 +157,12 @@ def canary_write_step_torch_reference(
 
             buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token
             buf_i64[slot, consts.CANARY_FIELD_POSITION] = position
-            buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = _to_signed_int64(running_prev_hash)
-            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = _to_signed_int64(real_kv_hash_u64)
+            buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = _to_signed_int64(
+                running_prev_hash
+            )
+            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = _to_signed_int64(
+                real_kv_hash_u64
+            )
 
             combined = (
                 running_prev_hash

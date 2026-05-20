@@ -4,10 +4,10 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.consts import (
-    CanaryPseudoMode as CanaryInputCheckMode,
+    RealKvHashMode,
 )
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,

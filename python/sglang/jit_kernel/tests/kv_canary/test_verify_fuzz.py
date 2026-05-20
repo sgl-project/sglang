@@ -54,7 +54,11 @@ class VerifyFuzzInputs:
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
     hash_mode = rng.choice(
-        [consts.RealKvHashMode.OFF, consts.RealKvHashMode.PARTIAL, consts.RealKvHashMode.ALL]
+        [
+            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])

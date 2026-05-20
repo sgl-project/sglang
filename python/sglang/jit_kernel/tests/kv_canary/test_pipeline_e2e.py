@@ -384,7 +384,11 @@ def test_pipeline_sweep_no_write() -> None:
 
 @pytest.mark.parametrize(
     "real_kv_hash_mode",
-    [consts.RealKvHashMode.OFF, consts.RealKvHashMode.PARTIAL, consts.RealKvHashMode.ALL],
+    [
+        consts.RealKvHashMode.OFF,
+        consts.RealKvHashMode.PARTIAL,
+        consts.RealKvHashMode.ALL,
+    ],
 )
 def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None:
     """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""

@@ -13,9 +13,8 @@
 
 #include <sgl_kernel/utils.cuh>  // For SGL_DEVICE
 
-#include <cstdint>
-
 #include "consts.cuh"
+#include <cstdint>
 
 namespace canary {
 

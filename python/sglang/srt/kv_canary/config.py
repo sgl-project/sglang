@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
+from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.consts import (
-    CanaryPseudoMode as CanaryInputCheckMode,
+    RealKvHashMode,
 )
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

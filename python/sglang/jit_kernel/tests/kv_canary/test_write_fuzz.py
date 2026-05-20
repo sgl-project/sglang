@@ -60,7 +60,11 @@ class WriteFuzzInputs:
 def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     pseudo_mode = rng.choice([consts.CanaryPseudoMode.OFF, consts.CanaryPseudoMode.ON])
     hash_mode = rng.choice(
-        [consts.RealKvHashMode.OFF, consts.RealKvHashMode.PARTIAL, consts.RealKvHashMode.ALL]
+        [
+            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])

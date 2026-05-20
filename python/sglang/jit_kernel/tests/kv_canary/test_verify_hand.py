@@ -1107,7 +1107,9 @@ def test_violation_ring_fill_once_first_row() -> None:
 
     assert int(cuda_log.write_index[0].item()) == 3
     # row 0 is filled (slot 1 → POSITION bit).
-    first_row_fail = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    first_row_fail = int(
+        cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
+    )
     assert first_row_fail & consts.FAIL_REASON_POSITION
 
 

@@ -27,9 +27,7 @@ def _decode(expr: str) -> int:
 
 
 def _parse_constexpr_ints(source: str) -> dict[str, int]:
-    pattern = re.compile(
-        r"constexpr\s+(?:[\w:]+)\s+(k[A-Za-z]\w*)\s*=\s*([^;]+);"
-    )
+    pattern = re.compile(r"constexpr\s+(?:[\w:]+)\s+(k[A-Za-z]\w*)\s*=\s*([^;]+);")
     return {name: _decode(rhs) for name, rhs in pattern.findall(source)}
 
 
@@ -58,6 +56,8 @@ def test_enums_sync() -> None:
     for enum_name in ("RealKvHashMode", "CanaryPseudoMode"):
         cpp_members = _parse_enum_class(cuh, enum_name)
         py_enum = getattr(consts, enum_name)
-        cpp_normalized = {_camel_to_upper_snake(n[1:]): v for n, v in cpp_members.items()}
+        cpp_normalized = {
+            _camel_to_upper_snake(n[1:]): v for n, v in cpp_members.items()
+        }
         py_normalized = {m.name: int(m.value) for m in py_enum}
         assert cpp_normalized == py_normalized

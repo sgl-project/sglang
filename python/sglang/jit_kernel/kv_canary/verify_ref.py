@@ -84,7 +84,9 @@ def canary_verify_step_torch_reference(
         stored_token = int(buf_i64[slot_idx, consts.CANARY_FIELD_TOKEN].item())
         stored_position = int(buf_i64[slot_idx, consts.CANARY_FIELD_POSITION].item())
         stored_chain_hash = int(buf_i64[slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
-        stored_real_kv_hash = int(buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item())
+        stored_real_kv_hash = int(
+            buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
+        )
 
         if prev_slot < 0:
             expected_chain_hash = chain_anchor_signed
@@ -138,7 +140,9 @@ def canary_verify_step_torch_reference(
     )
     ring_capacity = int(violation_ring.shape[0])
 
-    new_rows = torch.zeros((num_new_violations, consts.VIOLATION_FIELDS), dtype=torch.int64)
+    new_rows = torch.zeros(
+        (num_new_violations, consts.VIOLATION_FIELDS), dtype=torch.int64
+    )
     for v, row in enumerate(violation_rows):
         for f in range(consts.VIOLATION_FIELDS):
             new_rows[v, f] = row[f]
@@ -204,7 +208,9 @@ def _compute_real_kv_hash_scalar(
         col_start = col_within_page * num_bytes_per_token
 
         effective_read_bytes = (
-            min(16, read_bytes) if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
+            min(16, read_bytes)
+            if mode == int(consts.RealKvHashMode.PARTIAL)
+            else read_bytes
         )
         raw_bytes: list[int] = []
         for b in range(effective_read_bytes):
