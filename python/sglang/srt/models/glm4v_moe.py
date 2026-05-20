@@ -16,6 +16,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -281,5 +282,12 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+            num_groups=None,
+        )
 
 EntryClass = [Glm4vMoeForConditionalGeneration]
