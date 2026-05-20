@@ -43,6 +43,7 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     read_slot_fields,
     splitmix64,
     splitmix64_mix4,
+    stamp_clean_chain,
     to_signed_int64,
     write_slot_fields,
 )
@@ -70,45 +71,6 @@ def _setup_pair_with_canned_chain(
     )
 
 
-def _stamp_chain(
-    *,
-    cuda_buf: torch.Tensor,
-    ref_buf: torch.Tensor,
-    tokens: list[int],
-    positions: list[int],
-    slot_indices: list[int],
-    real_kv_hashes: list[int] | None = None,
-) -> list[int]:
-    """Pre-stamp a real chain into the buffers; return the expected stored prev_hash per slot (signed)."""
-    n = len(tokens)
-    real_kv_hashes = real_kv_hashes or [0] * n
-    running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)
-    stored_prev_hashes: list[int] = []
-    for slot_idx, token, position, real_kv_hash in zip(
-        slot_indices, tokens, positions, real_kv_hashes
-    ):
-        signed_prev = to_signed_int64(running_prev_hash)
-        write_slot_fields(
-            canary_buf=cuda_buf,
-            slot_idx=slot_idx,
-            token=token,
-            position=position,
-            prev_hash=signed_prev,
-            real_kv_hash=to_signed_int64(real_kv_hash),
-        )
-        write_slot_fields(
-            canary_buf=ref_buf,
-            slot_idx=slot_idx,
-            token=token,
-            position=position,
-            prev_hash=signed_prev,
-            real_kv_hash=to_signed_int64(real_kv_hash),
-        )
-        stored_prev_hashes.append(signed_prev)
-        running_prev_hash = splitmix64_mix4(
-            running_prev_hash, token, position, real_kv_hash
-        )
-    return stored_prev_hashes
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -208,7 +170,7 @@ def test_chain_link_byte_equal_5_step() -> None:
     slot_indices = [1, 2, 3, 4, 5]
     tokens = [11, 22, 33, 44, 55]
     positions = [0, 1, 2, 3, 4]
-    _stamp_chain(
+    stamp_clean_chain(
         cuda_buf=cuda_buf,
         ref_buf=ref_buf,
         tokens=tokens,
@@ -256,7 +218,7 @@ def test_violation_token_mismatch() -> None:
     slot_indices = [1, 2, 3]
     tokens = [100, 200, 300]
     positions = [0, 1, 2]
-    _stamp_chain(
+    stamp_clean_chain(
         cuda_buf=cuda_buf,
         ref_buf=ref_buf,
         tokens=tokens,
@@ -404,7 +366,7 @@ def test_violation_prev_hash_mismatch() -> None:
     slot_indices = [1, 2]
     tokens = [10, 20]
     positions = [0, 1]
-    _stamp_chain(
+    stamp_clean_chain(
         cuda_buf=cuda_buf,
         ref_buf=ref_buf,
         tokens=tokens,
@@ -1070,7 +1032,7 @@ def test_slot_run_counter_per_entry() -> None:
     slot_indices = [1, 2, 3, 4]
     tokens = [10, 11, 12, 13]
     positions = [0, 1, 2, 3]
-    _stamp_chain(
+    stamp_clean_chain(
         cuda_buf=cuda_buf,
         ref_buf=ref_buf,
         tokens=tokens,
@@ -1491,7 +1453,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
         real_kv_sources_ref = sources_ref
     else:
         cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=16)
-        _stamp_chain(
+        stamp_clean_chain(
             cuda_buf=cuda_buf,
             ref_buf=ref_buf,
             tokens=tokens,
@@ -2304,7 +2266,7 @@ def test_replay_does_not_double_count_run_counters() -> None:
     slot_indices = [1, 2, 3]
     tokens = [10, 20, 30]
     positions = [0, 1, 2]
-    _stamp_chain(
+    stamp_clean_chain(
         cuda_buf=cuda_buf,
         ref_buf=ref_buf,
         tokens=tokens,

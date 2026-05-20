@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_CHAIN_ANCHOR,
     CanaryLaunchTag,
     RealKvHashMode,
     RealKvSource,
@@ -27,10 +26,7 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
     make_verify_plan,
-    splitmix64,
-    splitmix64_mix4,
-    to_signed_int64,
-    write_slot_fields,
+    stamp_clean_chain,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -56,29 +52,6 @@ class VerifyFuzzInputs:
     real_kv_sources_ref: tuple[RealKvSource, ...]
     real_kv_hash_mode: RealKvHashMode
     ring_capacity: int
-
-
-def _stamp_clean_chain(
-    *,
-    cuda_buf: torch.Tensor,
-    ref_buf: torch.Tensor,
-    slot_indices: list[int],
-    tokens: list[int],
-    positions: list[int],
-) -> None:
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
-    for slot_idx, token, position in zip(slot_indices, tokens, positions):
-        signed_prev = to_signed_int64(running)
-        for buf in (cuda_buf, ref_buf):
-            write_slot_fields(
-                canary_buf=buf,
-                slot_idx=slot_idx,
-                token=token,
-                position=position,
-                prev_hash=signed_prev,
-                real_kv_hash=0,
-            )
-        running = splitmix64_mix4(running, token, position, 0)
 
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
@@ -121,7 +94,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
             prev_slot_indices.append(slot_indices[i - 1])
 
     if hash_mode == RealKvHashMode.OFF and plan_size > 0:
-        _stamp_clean_chain(
+        stamp_clean_chain(
             cuda_buf=cuda_buf,
             ref_buf=ref_buf,
             slot_indices=slot_indices,
