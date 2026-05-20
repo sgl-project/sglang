@@ -21,7 +21,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -109,9 +108,7 @@ class TestCacheKeyDataPtr(CustomTestCase):
         t = torch.arange(20, device=get_device())
         a, b = t[0:10], t[5:15]
         # Same storage base — old key would collide.
-        self.assertEqual(
-            a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr()
-        )
+        self.assertEqual(a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr())
         self.assertEqual(a.numel(), b.numel())
         # But data_ptr differs — new key is safe.
         self.assertNotEqual(a.data_ptr(), b.data_ptr())
