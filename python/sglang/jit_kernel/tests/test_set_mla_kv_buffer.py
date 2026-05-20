@@ -75,7 +75,7 @@ def test_set_mla_kv_buffer_loc_dtypes(loc_dtype):
 
 
 def test_set_mla_kv_buffer_uint8_byte_layout():
-    """FP8 NSA byte-layout: cache_k_nope is uint8 with [fp8(512) | scales(16)] = 528,
+    """FP8 DSA byte-layout: cache_k_nope is uint8 with [fp8(512) | scales(16)] = 528,
     cache_k_rope is uint8 [128]; total payload = 656 bytes."""
     nope_bytes, rope_bytes = 528, 128
     batch_size = 64

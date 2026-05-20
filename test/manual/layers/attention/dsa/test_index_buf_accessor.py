@@ -1,5 +1,5 @@
 """
-Correctness tests for NSA Indexer K/S Buffer Access with Fused Triton Kernels.
+Correctness tests for DSA Indexer K/S Buffer Access with Fused Triton Kernels.
 
 This test verifies that the optimized Triton implementations (GetK, GetS, GetKAndS)
 produce identical results to the torch_fast baseline implementations.
@@ -13,11 +13,11 @@ Test coverage:
 import pytest
 import torch
 
-from sglang.srt.layers.attention.nsa.index_buf_accessor import GetK, GetKAndS, GetS
+from sglang.srt.layers.attention.dsa.index_buf_accessor import GetK, GetKAndS, GetS
 
 
-class MockNSATokenToKVPool:
-    """Mock pool object that mimics NSATokenToKVPool for testing."""
+class MockDSATokenToKVPool:
+    """Mock pool object that mimics DSATokenToKVPool for testing."""
 
     def __init__(
         self,
@@ -78,7 +78,7 @@ class TestGetK:
         seq_len = min(seq_len, max_seq_len)
 
         # Create mock pool
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
 
@@ -119,7 +119,7 @@ class TestGetK:
         num_pages = 10
         seq_len = 320  # 5 pages
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -140,7 +140,7 @@ class TestGetK:
         num_pages = 5
         seq_len = 192  # 3 pages
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -171,7 +171,7 @@ class TestGetS:
         seq_len = min(seq_len, max_seq_len)
 
         # Create mock pool
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
 
@@ -212,7 +212,7 @@ class TestGetS:
         num_pages = 10
         seq_len = 320  # 5 pages
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -233,7 +233,7 @@ class TestGetS:
         num_pages = 5
         seq_len = 192  # 3 pages
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -267,7 +267,7 @@ class TestGetKAndS:
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         # Create mock pool
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
 
@@ -326,7 +326,7 @@ class TestGetKAndS:
         seq_len = 320  # 5 pages
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -356,7 +356,7 @@ class TestGetKAndS:
         seq_len = 192  # 3 pages
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -386,7 +386,7 @@ class TestGetKAndS:
         seq_len = 100  # Not a multiple of 64
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -422,7 +422,7 @@ class TestEdgeCases:
         seq_len = 1
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -455,7 +455,7 @@ class TestEdgeCases:
         seq_len = 192  # Exactly 3 pages
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -488,7 +488,7 @@ class TestEdgeCases:
         seq_len = 4096  # 64 pages
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
-        pool = MockNSATokenToKVPool(
+        pool = MockDSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
@@ -520,7 +520,7 @@ class TestEdgeCases:
 def print_test_summary():
     """Print a summary message about the test suite."""
     print("\n" + "=" * 80)
-    print("NSA Indexer K/S Buffer Accessor Correctness Tests")
+    print("DSA Indexer K/S Buffer Accessor Correctness Tests")
     print("=" * 80)
     print("Testing Triton implementations against torch_fast baseline:")
     print("  - GetK.triton() vs GetK.torch_fast()")

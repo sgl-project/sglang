@@ -152,8 +152,8 @@ export const GLM51Deployment = () => {
 
     if (isAMD) {
       cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --nsa-prefill-backend tilelang';
-      cmd += ' \\\n  --nsa-decode-backend tilelang';
+      cmd += ' \\\n  --dsa-prefill-backend tilelang';
+      cmd += ' \\\n  --dsa-decode-backend tilelang';
       cmd += ' \\\n  --chunked-prefill-size 131072';
       cmd += ' \\\n  --watchdog-timeout 1200';
     }
