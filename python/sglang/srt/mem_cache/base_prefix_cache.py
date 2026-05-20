@@ -64,6 +64,11 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # CP-resharding (v4): int8 tensor of length len(key) // page_size, where
+    # entry i is the CP rank that owns page i's KV bytes. Mirrored across CP
+    # ranks. None when CP resharding is disabled.
+    cp_owner_per_page: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class InsertResult:
