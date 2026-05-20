@@ -258,6 +258,12 @@ class PiecewiseCudaGraphRunner:
         # beyond live bs are padded with seg_lens=0 / weight_indices=0
         # (handled by triton_backend.prepare_lora_batch).
         if model_runner.server_args.enable_lora:
+            # Empirically [1, 16] gives the best speedup vs eager at bs<=16;
+            # wider buckets (e.g. [1, 16, 256, 2048]) trigger a sharp PCG
+            # slowdown (~30x) — likely guard-checking cost growing with cache
+            # entry count under allow_unspec_int_on_nn_module=True. Beyond
+            # max_capture_bs we fall back to eager (still correct, and faster
+            # than wide-bucket PCG anyway).
             self.capture_bs_buckets = sorted(set([1, 16]))
         else:
             self.capture_bs_buckets = [1]
@@ -539,9 +545,22 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
-        if num_tokens <= self.max_num_tokens:
-            return True
-        return False
+        if num_tokens > self.max_num_tokens:
+            return False
+        # A-Lite: refuse (token_bucket, bs_bucket) combos that were skipped at
+        # capture (bs_bucket > num_tokens_bucket). Without this guard, replay
+        # would either trigger Inductor recompile (assert on missing capture
+        # stream) or use a stale specialization for the wrong shape.
+        if self.model_runner.server_args.enable_lora and hasattr(
+            self, "_captured_combos"
+        ):
+            token_idx = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+            token_bucket = self.capture_num_tokens[token_idx]
+            bs_idx = bisect.bisect_left(self.capture_bs_buckets, forward_batch.batch_size)
+            bs_bucket = self.capture_bs_buckets[bs_idx]
+            if (token_bucket, bs_bucket) not in self._captured_combos:
+                return False
+        return True
 
     def capture(self) -> None:
         # Trigger CUDA graph capture for specific shapes.
@@ -561,13 +580,15 @@ class PiecewiseCudaGraphRunner:
                 # Reverse the order to enable better memory sharing across cuda graphs.
                 # A-Lite: nested (num_tokens, bs_bucket) so each bs bucket gets its own
                 # cuda graph capture. Skip combos where bs > num_tokens (can't represent
-                # bs sequences each >=1 token within num_tokens).
+                # bs sequences each >=1 token within num_tokens). Track captured combos
+                # so can_run can refuse buckets that were skipped.
                 capture_pairs = [
                     (n, b)
                     for n in reversed(self.capture_num_tokens)
                     for b in reversed(self.capture_bs_buckets)
                     if b <= n
                 ]
+                self._captured_combos = {pair for pair in capture_pairs}
                 capture_range = (
                     tqdm.tqdm(capture_pairs)
                     if get_tensor_model_parallel_rank() == 0
