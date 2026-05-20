@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.pool_context import get_req_to_token_pool
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -490,7 +491,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     forward_batch.batch_size,
                     self.step,
                     forward_batch.req_pool_indices,
-                    forward_batch.req_to_token_pool.req_to_token,
+                    get_req_to_token_pool().req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
             forward_batch.out_cache_loc = output_cache_loc_backup
