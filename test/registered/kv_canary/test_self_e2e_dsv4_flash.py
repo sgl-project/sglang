@@ -68,7 +68,7 @@ class TestNoPerturbNoViolation(_DSV4FlashBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_DSV4FlashBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.5
+    perturb_prob: ClassVar[float] = 0.1
     allow_launch_failure: ClassVar[bool] = True
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
@@ -140,7 +140,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_DSV4FlashBase, unittest.Test
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.1"
         super().setUpClass()
 
     @classmethod
@@ -172,7 +172,7 @@ class TestSweepOrphanRadixDetectsViolation(_DSV4FlashBase, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
+        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.1"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN"] = "1"
         super().setUpClass()
 
