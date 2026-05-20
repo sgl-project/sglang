@@ -583,11 +583,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 # 1. free node kv indices, evict full and swa tokens
                 self._record_remove_event(x)
-                self.token_to_kv_pool_allocator.free(x.value)
+                actual_swa_freed = self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
                 if not x.swa_tombstone:
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += actual_swa_freed
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -621,8 +621,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(
+                        x.value
+                    )
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -634,8 +635,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
                     # tombstoned leaf. Treat it like an internal tombstone.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(
+                        x.value
+                    )
 
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
                     self.swa_lru_list.remove_node(x)
@@ -648,9 +650,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
                     self._record_remove_event(x)
-                    self.token_to_kv_pool_allocator.free(x.value)
+                    actual_swa_freed = self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += actual_swa_freed
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
