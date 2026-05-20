@@ -510,6 +510,9 @@ class Scheduler(
         # steppable_engine stepping mode (see SOT §3.3)
         self._stepping_mode: bool = False
         self._stepping_queue: List[Any] = []
+        from sglang.srt.steppable_engine.handlers import install_steppable_handlers
+
+        install_steppable_handlers(self)
 
         self.is_initializing = False
 
@@ -1880,6 +1883,16 @@ class Scheduler(
 
     def _handle_enter_stepping_mode(self, req: EnterSteppingModeReq) -> None:
         self._stepping_mode = True
+
+    def _steppable_lookup_req(self, rid: str) -> Optional[Req]:
+        for r in self.waiting_queue:
+            if r.rid == rid:
+                return r
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            for r in self.running_batch.reqs:
+                if r.rid == rid:
+                    return r
+        return None
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [
