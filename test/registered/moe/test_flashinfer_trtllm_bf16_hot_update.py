@@ -1,16 +1,20 @@
 import math
 import unittest
-from unittest.mock import patch
+from contextlib import ExitStack
 
 import torch
 
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(
+    est_time=20,
+    stage="base-b-kernel-unit",
+    runner_config="4-gpu-b200",
+)
 
 
 class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
@@ -33,12 +37,20 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         except ImportError as err:
             self.skipTest(f"FlashInfer TRTLLM MoE helpers are unavailable: {err}")
 
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_runner_backend="flashinfer_trtllm",
+        overrides = ExitStack()
+        self.addCleanup(overrides.close)
+        overrides.enter_context(
+            get_context().override_server_args(
+                moe_a2a_backend="none",
+                moe_runner_backend="flashinfer_trtllm",
+            )
         )
-        set_global_server_args_for_scheduler(server_args)
-        initialize_moe_config(server_args)
+        overrides.enter_context(
+            get_flags().moe.override(
+                a2a_backend=MoeA2ABackend.NONE,
+                runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
+            )
+        )
 
     def _make_weight(self, shape, offset):
         values = torch.arange(
@@ -53,21 +65,12 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
         use_weight_loader_fused=False,
         intermediate_size=None,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
-        from sglang.srt.layers.moe.token_dispatcher import standard
-
         intermediate_size = intermediate_size or self.intermediate_size
-        fm = fused_moe_layer
-        std = standard
-        with (
-            patch.object(fm, "get_moe_expert_parallel_world_size", return_value=1),
-            patch.object(fm, "get_moe_expert_parallel_rank", return_value=0),
-            patch.object(
-                fm, "get_moe_tensor_parallel_world_size", return_value=tp_size
-            ),
-            patch.object(fm, "get_moe_tensor_parallel_rank", return_value=tp_rank),
-            patch.object(std, "get_moe_expert_parallel_world_size", return_value=1),
-            patch.object(std, "get_moe_expert_parallel_rank", return_value=0),
+        with get_parallel().override(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=tp_size,
+            moe_tp_rank=tp_rank,
         ):
             layer = FusedMoE(
                 num_experts=self.num_experts,
@@ -210,9 +213,7 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
                         padded_per_rank_size : padded_per_rank_size + per_rank_size,
                         :,
                     ],
-                    full_w13[
-                        :, first_half_start : first_half_start + per_rank_size, :
-                    ],
+                    full_w13[:, first_half_start : first_half_start + per_rank_size, :],
                 )
 
     def test_tp_padded_load_uses_unpadded_source_shard(self):
