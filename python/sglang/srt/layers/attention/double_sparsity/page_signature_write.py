@@ -31,7 +31,7 @@ must be forced for each request.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Sequence, Tuple
+from typing import Sequence
 
 import torch
 
