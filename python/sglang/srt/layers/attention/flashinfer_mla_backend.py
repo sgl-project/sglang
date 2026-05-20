@@ -583,7 +583,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             # mla paged prefill
             if (
                 forward_batch.attn_dcp_metadata is not None
-                and forward_batch.attn_dcp_metadta.dcp_kv_buffer is not None
+                and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
