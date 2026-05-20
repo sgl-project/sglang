@@ -13,6 +13,8 @@
 # ==============================================================================
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
+from __future__ import annotations
+
 from array import array
 from typing import Iterable, Optional, Tuple
 
