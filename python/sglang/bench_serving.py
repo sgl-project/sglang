@@ -1936,7 +1936,7 @@ class LoRAPathAction(argparse.Action):
             getattr(namespace, self.dest).append(lora_name)
 
 
-if __name__ == "__main__":
+def get_args_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
@@ -2397,5 +2397,11 @@ if __name__ == "__main__":
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = get_args_parser()
     args = parser.parse_args()
     run_benchmark(args)
