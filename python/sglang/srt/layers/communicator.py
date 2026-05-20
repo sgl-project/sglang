@@ -379,7 +379,7 @@ class LayerScatterModes:
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
             ):
                 return ScatterMode.SCATTERED
-            # NSA CP doesn't support MOE_FULL yet; fall back to FULL
+            # DSA CP doesn't support MOE_FULL yet; fall back to FULL
             if is_enable_moe_cp_allgather() and not is_dsa_enable_prefill_cp():
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
@@ -551,8 +551,8 @@ class LayerCommunicator:
                         )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
-                        # When NSA is active, also preserve the unquantized bf16
-                        # output as a 3-tuple (fp8, scale, bf16) so the NSA
+                        # When DSA is active, also preserve the unquantized bf16
+                        # output as a 3-tuple (fp8, scale, bf16) so the DSA
                         # indexer can skip redundant FP8 dequantization.
                         _nsa_needs_bf16 = get_attn_tp_context().is_nsa
                         hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
@@ -596,7 +596,7 @@ class LayerCommunicator:
                         )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
-                        # with residual addition. When NSA is active, pack
+                        # with residual addition. When DSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
                         _nsa_needs_bf16 = get_attn_tp_context().is_nsa
                         hidden_states, _unq_bf16, _, residual = (

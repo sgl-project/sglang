@@ -925,7 +925,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
-    This entrypoint is currently intended only for HiRadixCache's NSA path.
+    This entrypoint is currently intended only for HiRadixCache's DSA path.
     """
     try:
         kv = radix_cache.kv_cache

@@ -78,7 +78,7 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
-# Reuse this workspace buffer across all NSA backend instances
+# Reuse this workspace buffer across all DSA backend instances
 global_workspace_buffer = None
 
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
@@ -127,7 +127,7 @@ class DSAMetadata:
     # 2. sparse decode/prefill, indexer need real_page_table to compute the score
     real_page_table: torch.Tensor
 
-    # NSA metadata (nsa prefill are expanded)
+    # DSA metadata (dsa prefill are expanded)
     dsa_cache_seqlens_int32: torch.Tensor  # this seqlens is clipped to `topk`
     dsa_cu_seqlens_q: torch.Tensor  # must be arange(0, len(dsa_cu_seqlens_k))
     dsa_cu_seqlens_k: torch.Tensor  # cumsum of `dsa_cache_seqlens_int32`
@@ -1119,7 +1119,7 @@ class DeepseekSparseAttnBackend(
         metadata.dsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
             torch.cumsum(dsa_cache_seqlens, dim=0, dtype=torch.int32)
         )
-        # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
+        # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
@@ -1276,7 +1276,7 @@ class DeepseekSparseAttnBackend(
                     precomputed.dsa_cache_seqlens
                 )
 
-            # Copy NSA cu_seqlens
+            # Copy DSA cu_seqlens
             size = precomputed.seqlens_expanded_size
             metadata.dsa_cu_seqlens_k[1 : 1 + size].copy_(
                 precomputed.dsa_cu_seqlens_k[1 : 1 + size]
@@ -1343,7 +1343,7 @@ class DeepseekSparseAttnBackend(
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
-        assert causal, "NSA is causal only"
+        assert causal, "DSA is causal only"
 
         nsa_impl = (
             self.dsa_decode_impl
@@ -1553,7 +1553,7 @@ class DeepseekSparseAttnBackend(
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
-        assert causal, "NSA is causal only"
+        assert causal, "DSA is causal only"
 
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(

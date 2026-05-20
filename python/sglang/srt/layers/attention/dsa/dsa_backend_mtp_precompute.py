@@ -36,7 +36,7 @@ class PrecomputedMetadata:
     page_indices: torch.Tensor  # int32, [bs, max_len] or [expanded_bs, max_len]
     real_page_table: Optional[torch.Tensor]  # int32, transformed version
 
-    # NSA seqlens
+    # DSA seqlens
     seqlens_expanded: torch.Tensor  # int32, [expanded_size]
     dsa_cache_seqlens: torch.Tensor  # int32, [expanded_size]
     dsa_cu_seqlens_k: torch.Tensor  # int32, [expanded_size+1]
@@ -129,14 +129,14 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         # Get page indices from cache
         page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
 
-        # Compute NSA seqlens
+        # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(
             cache_seqlens, dsa_index_topk=self.dsa_index_topk
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # Compute NSA cumsum
+        # Compute DSA cumsum
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table if needed
@@ -211,11 +211,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             ]
         )
 
-        # Compute NSA seqlens
+        # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # NSA cumsum
+        # DSA cumsum
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table
@@ -289,11 +289,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             ]
         )
 
-        # Compute NSA seqlens
+        # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # NSA cumsum
+        # DSA cumsum
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table

@@ -376,7 +376,7 @@ class ModelRunnerKVCacheMixin:
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
-                PoolCls = current_platform.get_nsa_kv_pool_cls()
+                PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,

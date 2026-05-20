@@ -27,7 +27,7 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
     the aiter wheel/image). Otherwise aiter asserts ``KVBlockSize == 1`` and
     refuses ``Preshuffle=True``.
 
-    sglang's NSA indexer uses this single decision to pick:
+    sglang's DSA indexer uses this single decision to pick:
       * ``page_size``: 64 (preshuffle) vs 1 (legacy) on ROCm
       * ``Preshuffle`` / ``preshuffle`` flags on the aiter MQA + cache kernels
       * ``get_page_table_64`` vs ``get_page_table_1`` on the metadata

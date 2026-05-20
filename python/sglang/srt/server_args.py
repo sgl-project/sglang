@@ -1772,7 +1772,7 @@ class ServerArgs:
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force DSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
                 else:
                     if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
@@ -1836,7 +1836,7 @@ class ServerArgs:
                     )
 
                     if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
-                        # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
+                        # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
                         self.page_size = 1

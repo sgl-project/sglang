@@ -1,5 +1,5 @@
 """
-Verification utilities for NSA backend fused metadata copy operations.
+Verification utilities for DSA backend fused metadata copy operations.
 
 This module contains verification code to ensure that fused metadata copy kernels
 produce the same results as individual copy operations.
@@ -22,7 +22,7 @@ def verify_single_backend_fused_metadata_copy(
     Verify that the fused metadata copy kernel produces the same results as individual copies.
 
     Args:
-        metadata: The NSA metadata object containing destination tensors
+        metadata: The DSA metadata object containing destination tensors
         precomputed: The precomputed metadata containing source tensors
         forward_mode: The forward mode (decode, target_verify, or draft_extend)
         bs: Batch size
@@ -92,7 +92,7 @@ def verify_single_backend_fused_metadata_copy(
         ref_dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
         ref_dsa_cache_seqlens[:size].copy_(precomputed.dsa_cache_seqlens)
 
-    # Copy NSA cu_seqlens
+    # Copy DSA cu_seqlens
     size = precomputed.seqlens_expanded_size
     ref_dsa_cu_seqlens_k[1 : 1 + size].copy_(precomputed.dsa_cu_seqlens_k[1 : 1 + size])
 
@@ -218,9 +218,9 @@ def verify_multi_backend_fused_metadata_copy(
     as individual copies for all three backends.
 
     Args:
-        metadata0: The NSA metadata object for backend 0
-        metadata1: The NSA metadata object for backend 1
-        metadata2: The NSA metadata object for backend 2
+        metadata0: The DSA metadata object for backend 0
+        metadata1: The DSA metadata object for backend 1
+        metadata2: The DSA metadata object for backend 2
         precomputed: The precomputed metadata containing source tensors
         bs: Batch size
         flashmla_num_splits_src: Source FlashMLA num_splits tensor (optional)
@@ -295,7 +295,7 @@ def verify_multi_backend_fused_metadata_copy(
         ref_page_table_1[:, : precomputed.max_len].copy_(precomputed.page_indices)
         ref_dsa_cache_seqlens.copy_(precomputed.dsa_cache_seqlens)
 
-        # Copy NSA cu_seqlens
+        # Copy DSA cu_seqlens
         size = precomputed.seqlens_expanded_size
         ref_dsa_cu_seqlens_k[1 : 1 + size].copy_(
             precomputed.dsa_cu_seqlens_k[1 : 1 + size]

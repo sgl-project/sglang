@@ -33,7 +33,7 @@ def create_test_metadata(
     has_flashmla: bool = False,
     device: str = "cuda",
 ):
-    """Create test metadata tensors matching NSA backend structure."""
+    """Create test metadata tensors matching DSA backend structure."""
     # Basic tensors (always present)
     cache_seqlens_src = torch.randint(
         1, max_len, (bs,), dtype=torch.int32, device=device

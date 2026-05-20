@@ -39,13 +39,13 @@ def _jit_nsa_fused_store_module(
     return load_jit(
         "fused_store_index_k_cache",
         *args,
-        cuda_files=["nsa/fused_store_index_cache.cuh"],
+        cuda_files=["dsa/fused_store_index_cache.cuh"],
         cuda_wrappers=[
             (
                 "fused_store_index_k_cache",
                 # - Float  = bf16_t (sgl_kernel/type.cuh)
                 # - IndicesT = int64_t (out_cache_loc is int64 in SGLang SetKAndS)
-                # - kPageSize = 64 (CUDA NSA)
+                # - kPageSize = 64 (CUDA DSA)
                 f"FusedStoreCacheIndexerKernel<{args}>::run",
             )
         ],
@@ -61,7 +61,7 @@ def can_use_dsa_fused_store(
         _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
         return True
     except Exception as e:
-        logger.warning(f"Failed to load nsa fused store JIT kernel: {e}")
+        logger.warning(f"Failed to load dsa fused store JIT kernel: {e}")
         return False
 
 

@@ -2013,7 +2013,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
+        # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
         if _is_hip:
@@ -2024,7 +2024,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             else:
                 assert (
                     self.page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (
@@ -2133,11 +2133,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices):
-        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
-        # NSA attention reads garbage at those token positions.
+        # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices)
 
         page_indices = indices[:: self.page_size] // self.page_size

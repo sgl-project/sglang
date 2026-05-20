@@ -96,7 +96,7 @@ class HiRadixCache(RadixCache):
             )
         else:
             raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
+                "HiRadixCache only supports MHA, MLA, and DSA models"
             )
 
         self.tp_group = params.tp_cache_group

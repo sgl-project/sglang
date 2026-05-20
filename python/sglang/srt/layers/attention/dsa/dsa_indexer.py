@@ -50,7 +50,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 if _use_aiter and not _use_aiter_preshuffle:
     logger.warning(
-        "ROCm NSA indexer: aiter preshuffle paged-MQA path is unavailable "
+        "ROCm DSA indexer: aiter preshuffle paged-MQA path is unavailable "
         "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
@@ -458,7 +458,7 @@ class Indexer(MultiPlatformOp):
             else:
                 assert (
                     page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -635,7 +635,7 @@ class Indexer(MultiPlatformOp):
             else:
                 assert (
                     page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
 
