@@ -10,12 +10,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
+    DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    DSAIndexerPoolHost,
     PoolEntry,
 )
 
@@ -656,9 +656,9 @@ def attach_hybrid_pool_to_unified_cache(
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
         HybridLinearKVPool,
         MLATokenToKVPool,
-        DSATokenToKVPool,
     )
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType

@@ -8,8 +8,8 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAl
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
-    FlashAttentionAdaptor,
     DSABackendAdaptor,
+    FlashAttentionAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,

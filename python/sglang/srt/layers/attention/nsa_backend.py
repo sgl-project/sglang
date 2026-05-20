@@ -10,14 +10,14 @@ warnings.warn(
 )
 from sglang.srt.layers.attention.dsa_backend import *  # noqa: F401, F403
 from sglang.srt.layers.attention.dsa_backend import (  # noqa: F401
+    DeepseekSparseAttnBackend,
+    DeepseekSparseAttnMultiStepBackend,
     DSAFlashMLAMetadata,
     DSAIndexerMetadata,
     DSAMetadata,
-    DeepseekSparseAttnBackend,
-    DeepseekSparseAttnMultiStepBackend,
+    NativeSparseAttnBackend,
+    NativeSparseAttnMultiStepBackend,
     NSAFlashMLAMetadata,
     NSAIndexerMetadata,
     NSAMetadata,
-    NativeSparseAttnBackend,
-    NativeSparseAttnMultiStepBackend,
 )
