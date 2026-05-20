@@ -21,6 +21,11 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.pool_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+    set_kv_pools,
+)
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftExtendInput,
@@ -38,14 +43,15 @@ def frozen_kv_target_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPCo
             "bind the frozen KV context first."
         )
     saved_spec_info = forward_batch.spec_info
-    saved_kv_pool = forward_batch.token_to_kv_pool
+    saved_req_pool = get_req_to_token_pool()
+    saved_token_pool = get_token_to_kv_pool()
     forward_batch.spec_info = None
-    forward_batch.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    set_kv_pools(saved_req_pool, kv_context.target_token_to_kv_pool)
     try:
         yield
     finally:
         forward_batch.spec_info = saved_spec_info
-        forward_batch.token_to_kv_pool = saved_kv_pool
+        set_kv_pools(saved_req_pool, saved_token_pool)
 
 
 @contextmanager
@@ -55,12 +61,13 @@ def target_kv_pool_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPCont
             "Frozen-KV MTP target KV pool view called before the model was bound; "
             "bind the frozen KV context first."
         )
-    saved_kv_pool = forward_batch.token_to_kv_pool
-    forward_batch.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    saved_req_pool = get_req_to_token_pool()
+    saved_token_pool = get_token_to_kv_pool()
+    set_kv_pools(saved_req_pool, kv_context.target_token_to_kv_pool)
     try:
         yield
     finally:
-        forward_batch.token_to_kv_pool = saved_kv_pool
+        set_kv_pools(saved_req_pool, saved_token_pool)
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
