@@ -4,7 +4,7 @@ Qwen3-0.6B with ``num_hidden_layers=1`` baked into ``--json-model-override-args`
 gives the cheapest possible "real attention + real KV pool + canary attached"
 e2e configuration so PR CI catches integration regressions in 1-2 minutes.
 
-7 cases, all registered to ``extra-a`` / ``1-gpu-large``.
+8 cases, all registered to ``extra-a`` / ``1-gpu-large``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import ClassVar, List
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.utils import CanaryE2EBase
 
-register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
@@ -149,6 +149,37 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         self.assert_violation_kind_logged(
             ["per_forward_", "sweep_"], flush_wait_seconds=2.0
         )
+
+
+class TestLogModeKeepsServerAlive(_MhaFullBase, unittest.TestCase):
+    perturb_prob: ClassVar[float] = 0.05
+    kv_canary_mode: ClassVar[str] = "log"
+
+    def test_log_mode_keeps_server_alive(self) -> None:
+        # Step 1: log mode never fails warmup — violations log, do not raise.
+        self.assertFalse(
+            self.launch_failed,
+            f"Server failed to launch under --kv-canary log: {self.launch_exception!r}",
+        )
+
+        # Step 2: clients keep getting 200s even while violations fire on the server side.
+        results = self.send_parallel_requests(n=64, max_new_tokens=32, timeout=30.0)
+        success_count = sum(1 for r in results if r.get("status_code") == 200)
+        self.assertGreater(
+            success_count,
+            0,
+            f"Expected >=1 successful response under log mode, got 0. results={results}",
+        )
+
+        # Step 3: server still alive + violation surfaced in server stderr/stdout.
+        self.assertIsNone(
+            self.process.poll(),
+            "Server process died during the test under --kv-canary log",
+        )
+        self.assert_violation_kind_logged(
+            ["per_forward_", "sweep_"], flush_wait_seconds=2.0
+        )
+        self.assert_health_ok()
 
 
 class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
