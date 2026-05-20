@@ -37,6 +37,14 @@ class _StubForwardBatch:
     extend_seq_lens: object
 
 
+def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) -> int:
+    out = oracle.expected_tokens(
+        req_ids=torch.tensor([req_id], dtype=torch.int64),
+        positions=torch.tensor([position], dtype=torch.int64),
+    )
+    return int(out.tolist()[0])
+
+
 def test_fill_expected_inputs_decode_one_token_per_req() -> None:
     oracle = HashOracle(seed=1, vocab_size=32000)
     hook = install_oracle_sampler(oracle=oracle)
@@ -56,8 +64,8 @@ def test_fill_expected_inputs_decode_one_token_per_req() -> None:
     )
 
     assert expected_inputs.tokens[:2].tolist() == [
-        oracle.expected_token(req_id=5, position=10),
-        oracle.expected_token(req_id=7, position=20),
+        _scalar_expected_token(oracle, req_id=5, position=10),
+        _scalar_expected_token(oracle, req_id=7, position=20),
     ]
     assert expected_inputs.positions[:2].tolist() == [10, 20]
 
@@ -81,10 +89,10 @@ def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
     )
 
     assert expected_inputs.tokens[:4].tolist() == [
-        oracle.expected_token(req_id=5, position=0),
-        oracle.expected_token(req_id=5, position=1),
-        oracle.expected_token(req_id=5, position=2),
-        oracle.expected_token(req_id=7, position=0),
+        _scalar_expected_token(oracle, req_id=5, position=0),
+        _scalar_expected_token(oracle, req_id=5, position=1),
+        _scalar_expected_token(oracle, req_id=5, position=2),
+        _scalar_expected_token(oracle, req_id=7, position=0),
     ]
     assert expected_inputs.positions[:4].tolist() == [0, 1, 2, 0]
 
@@ -106,7 +114,8 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
         expected_inputs_out=expected_inputs,
     )
 
-    assert hook._req_pool_indices_per_row == [5, 7]
+    assert hook._req_pool_indices_per_row is not None
+    assert hook._req_pool_indices_per_row.tolist() == [5, 7]
 
 
 def test_mock_model_engine_kwargs_returns_defaults() -> None:
