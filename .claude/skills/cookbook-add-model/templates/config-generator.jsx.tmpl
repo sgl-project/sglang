@@ -1,0 +1,677 @@
+// Template: unified SGLang autoregressive cookbook config generator for
+// Mintlify /src/snippets/.
+//
+// Usage: copy this file to
+//   docs_new/src/snippets/autoregressive/<name>-deployment.jsx
+// and edit only the CONFIG block + `export const` name unless every cookbook
+// generator needs the behavior change.
+//
+// HARD RULES for Mintlify /src/snippets/ jsx:
+//   1. No bare React or package imports. Mintlify only
+//      permits local imports; `useState` and `useEffect` are globals.
+//   2. Exactly one top-level export:
+//        `export const __COMPONENT_NAME__ = () => { ... }`
+//      CONFIG, helpers, styles, and render code must stay inside the component.
+//   3. JSX only. Avoid TypeScript and avoid optional chaining inside JSX.
+//
+// Placeholders:
+//   __COMPONENT_NAME__   e.g. "GLM46Deployment"
+//   __MODEL_DISPLAY__    e.g. "GLM-4.6"
+
+export const __COMPONENT_NAME__ = () => {
+  // -------------------------------------------------------------------------
+  // CONFIG - edit per model.
+  // -------------------------------------------------------------------------
+  const CONFIG = {
+    model: {
+      displayName: "__MODEL_DISPLAY__",
+      isMoE: false,          // true -> paramsB is TOTAL params across experts
+      supportsSpec: false,   // true only when MTP/EAGLE is confirmed
+      supportsKVFP8: false,  // true only when KV FP8 is confirmed
+      hasMamba: false,       // true only when Mamba cache flags are relevant
+      toolCallParser: "",    // e.g. "qwen3_coder"; empty -> button hidden
+      reasoningParser: "",   // e.g. "qwen3"; empty -> button hidden
+      chatTemplatePath: "",  // empty -> button hidden
+      specFlags:
+        "--speculative-algorithm EAGLE \\\n" +
+        "  --speculative-num-steps 3 \\\n" +
+        "  --speculative-eagle-topk 1 \\\n" +
+        "  --speculative-num-draft-tokens 4",
+    },
+
+    // Row 1 - Hardware. All 11 GPUs are rendered. maxTP is single-node only;
+    // GB systems default to 4 GPUs per node.
+    hardware: {
+      title: "Hardware Platform",
+      groups: [
+        {
+          vendor: "NVIDIA",
+          items: [
+            { id: "a100",  label: "A100",  vramGB: 80,  maxTP: 8 },
+            { id: "h100",  label: "H100",  vramGB: 80,  maxTP: 8 },
+            { id: "h200",  label: "H200",  vramGB: 141, maxTP: 8 },
+            { id: "b200",  label: "B200",  vramGB: 180, maxTP: 8 },
+            { id: "b300",  label: "B300",  vramGB: 275, maxTP: 8 },
+            { id: "gb200", label: "GB200", vramGB: 192, maxTP: 4 },
+            { id: "gb300", label: "GB300", vramGB: 275, maxTP: 4 },
+          ],
+        },
+        {
+          vendor: "AMD",
+          items: [
+            { id: "mi300x", label: "MI300X", vramGB: 192, maxTP: 8 },
+            { id: "mi325x", label: "MI325X", vramGB: 256, maxTP: 8 },
+            { id: "mi350x", label: "MI350X", vramGB: 288, maxTP: 8 },
+            { id: "mi355x", label: "MI355X", vramGB: 288, maxTP: 8 },
+          ],
+        },
+      ],
+    },
+
+    // Row 2 + 3 - Model Variant and Quantization are separate.
+    // Quantization choices come from the HuggingFace model card / linked repos.
+    // Each quantization must include a parsed reference command. The builder
+    // derives unverified single-node commands from that reference and only
+    // adjusts hardware-sensitive values such as TP, mem, and platform flags.
+    modelVariants: [
+      // {
+      //   id: "<variant-slug>",
+      //   label: "<Model Variant>",
+      //   paramsB: 0,
+      //   isMoE: false,
+      //   supportsSpec: false,
+      //   hasMamba: false,
+      //   quantizations: [
+      //     {
+      //       id: "bf16",
+      //       label: "BF16",
+      //       default: true,
+      //       hfPath: "<org>/<repo>",
+      //       bytesPerParam: 2, // BF16/FP16=2, FP8=1, FP4/NVFP4=0.5
+      //       reference: {
+      //         hardware: "h200",
+      //         env: ["SGLANG_USE_AITER=1"],
+      //         tp: 8,
+      //         ep: 0,
+      //         mem: 0.9,
+      //         flags: [],
+      //         strategies: ["tp"],
+      //         features: ["reasoning", "toolCall"],
+      //         command: "sglang serve \\\n  --model-path <org>/<repo> \\\n  --tp 8",
+      //       },
+      //     },
+      //   ],
+      // },
+    ],
+
+    // Verified matrix. Missing combo -> reference-derived single-node estimate.
+    // optimizedCommands is author-provided verbatim and is never rewritten.
+    verified: {
+      // "<variantId>": {
+      //   "<quantizationId>": {
+      //     h200: {
+      //       env: ["SGLANG_USE_AITER=1"],
+      //       tp: 8,
+      //       ep: 8,
+      //       mem: 0.85,
+      //       flags: [],
+      //       strategies: ["tp", "ep"],
+      //       features: ["reasoning", "toolCall"],
+      //       optimizedCommands: {
+      //         default: "sglang serve \\\n  --model-path <hf> \\\n  ...",
+      //         mtp: "SGLANG_ENABLE_SPEC_V2=1 sglang serve \\\n  --model-path <hf> \\\n  ...",
+      //       },
+      //     },
+      //   },
+      // },
+    },
+
+    strategy: {
+      title: "Deployment Strategy",
+      items: [
+        { id: "tp",  label: "TP",  subtitle: "Tensor Parallel",              default: true, required: true },
+        { id: "ep",  label: "EP",  subtitle: "Expert Parallel",              defaultFromReference: true,
+          showWhen: (ctx) => capability(ctx, "isMoE") },
+        { id: "dp",  label: "DP",  subtitle: "Data Parallel + DP-Attention", defaultFromReference: true },
+        { id: "mtp", label: "MTP / EAGLE", subtitle: "Speculative decoding", defaultFromReference: true,
+          showWhen: (ctx) => capability(ctx, "supportsSpec") },
+        { id: "optimized", label: "Optimized", subtitle: "Author-provided", kind: "optimized" },
+      ],
+    },
+
+    features: {
+      title: "Features",
+      items: [
+        { id: "toolCall",   label: "Tool Call Parser", default: true,
+          showWhen: (ctx) => Boolean(ctx.model.toolCallParser),
+          emit: (ctx) => `--tool-call-parser ${ctx.model.toolCallParser}` },
+        { id: "reasoning",  label: "Reasoning Parser", default: true,
+          showWhen: (ctx) => Boolean(ctx.model.reasoningParser),
+          emit: (ctx) => `--reasoning-parser ${ctx.model.reasoningParser}` },
+        { id: "mambaCache", label: "Mamba Radix Cache V2", defaultFromReference: true,
+          showWhen: (ctx) => capability(ctx, "hasMamba"),
+          emit: () => "--mamba-scheduler-strategy extra_buffer \\\n  --page-size 64" },
+        { id: "kvCacheFP8", label: "FP8 KV Cache", defaultFromReference: true,
+          showWhen: (ctx) => capability(ctx, "supportsKVFP8"),
+          emit: () => "--kv-cache-dtype fp8_e4m3" },
+        { id: "chatTemplate", label: "Chat Template", defaultFromReference: true,
+          showWhen: (ctx) => Boolean(ctx.model.chatTemplatePath),
+          emit: (ctx) => `--chat-template ${ctx.model.chatTemplatePath}` },
+      ],
+    },
+  };
+
+  // -------------------------------------------------------------------------
+  // Helpers (closure-scoped - keep inside the component).
+  // -------------------------------------------------------------------------
+  const nextPow2 = (n) => {
+    let p = 1;
+    while (p < n) p *= 2;
+    return p;
+  };
+
+  const arrayHas = (arr, id) => Array.isArray(arr) && arr.indexOf(id) >= 0;
+  const cloneEnv = (env) => (Array.isArray(env) ? [...env] : []);
+  const sameArray = (a, b) => {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  };
+
+  const capability = (ctx, key) => {
+    if (ctx.quantization && typeof ctx.quantization[key] === "boolean") return ctx.quantization[key];
+    if (ctx.variant && typeof ctx.variant[key] === "boolean") return ctx.variant[key];
+    return Boolean(ctx.model[key]);
+  };
+
+  const findVariant = (id) => CONFIG.modelVariants.find((v) => v.id === id);
+
+  const defaultQuantizationId = (variantId) => {
+    const variant = findVariant(variantId);
+    if (!variant || !Array.isArray(variant.quantizations) || variant.quantizations.length === 0) return "";
+    const bf16 = variant.quantizations.find((q) => q.id === "bf16");
+    const defaultQuant = variant.quantizations.find((q) => q.default);
+    return (bf16 || defaultQuant || variant.quantizations[0]).id;
+  };
+
+  const findQuantization = (variantId, quantizationId) => {
+    const variant = findVariant(variantId);
+    if (!variant || !Array.isArray(variant.quantizations)) return null;
+    return variant.quantizations.find((q) => q.id === quantizationId) || null;
+  };
+
+  const findHardware = (id) => {
+    for (const g of CONFIG.hardware.groups) {
+      const h = g.items.find((x) => x.id === id);
+      if (h) return { ...h, vendor: g.vendor };
+    }
+    return null;
+  };
+
+  const verifiedEntry = (variantId, quantizationId, hwId) => {
+    const variantRow = CONFIG.verified[variantId];
+    const quantRow = variantRow && variantRow[quantizationId] ? variantRow[quantizationId] : null;
+    return quantRow && quantRow[hwId] ? quantRow[hwId] : null;
+  };
+
+  const contextFor = (variantId, quantizationId, hwId) => {
+    const variant = findVariant(variantId);
+    const quantization = findQuantization(variantId, quantizationId);
+    const hw = findHardware(hwId);
+    const verified = variant && quantization && hw ? verifiedEntry(variantId, quantizationId, hwId) : null;
+    const reference = quantization && quantization.reference ? quantization.reference : {};
+    return { model: CONFIG.model, variant, quantization, hardware: hw, verified, reference };
+  };
+
+  const sourceForContext = (ctx) => {
+    if (!ctx || !ctx.quantization) return {};
+    const estimates = ctx.quantization.estimates || {};
+    return ctx.verified || estimates[ctx.hardware.id] || ctx.reference || {};
+  };
+
+  const isVisible = (item, ctx) => {
+    if (typeof item.showWhen === "function") return item.showWhen(ctx);
+    return true;
+  };
+
+  const isEnabled = (item, ctx) => {
+    if (typeof item.enableWhen === "function") return item.enableWhen(ctx);
+    return true;
+  };
+
+  const visibleStrategyItems = (ctx) => CONFIG.strategy.items.filter((item) => isVisible(item, ctx));
+
+  const visibleFeatureItems = (ctx) => CONFIG.features.items.filter((item) => isVisible(item, ctx));
+
+  const defaultStrategyIds = (variantId, quantizationId, hwId) => {
+    const ctx = contextFor(variantId, quantizationId, hwId);
+    const source = sourceForContext(ctx);
+    return visibleStrategyItems(ctx)
+      .filter((item) => item.kind !== "optimized")
+      .filter((item) => item.default || (item.defaultFromReference && arrayHas(source.strategies, item.id)))
+      .map((item) => item.id);
+  };
+
+  const defaultFeatureIds = (variantId, quantizationId, hwId) => {
+    const ctx = contextFor(variantId, quantizationId, hwId);
+    const source = sourceForContext(ctx);
+    return visibleFeatureItems(ctx)
+      .filter((item) => item.default || (item.defaultFromReference && arrayHas(source.features, item.id)))
+      .map((item) => item.id);
+  };
+
+  const notAvailable = () => ({
+    cmd:
+      "# Not available: estimated deployment requires multiple nodes.\n" +
+      "# Please provide a verified multi-node deployment command.",
+    unavailable: true,
+    optimized: false,
+  });
+
+  const unsupported = () => ({
+    cmd:
+      "# Not available: this variant or quantization is not supported on the selected hardware.\n" +
+      "# Please provide a verified deployment command for this combination.",
+    unavailable: true,
+    optimized: false,
+  });
+
+  const autoEstimate = (variant, quantization, hw) => {
+    if (
+      Array.isArray(quantization.availableHardware) &&
+      quantization.availableHardware.indexOf(hw.id) < 0
+    ) {
+      return { unsupported: true };
+    }
+
+    if (quantization.estimates && quantization.estimates[hw.id]) {
+      const estimate = quantization.estimates[hw.id];
+      if (estimate.tp && estimate.tp > hw.maxTP) return { unavailable: true };
+      return {
+        env: cloneEnv(estimate.env),
+        tp: estimate.tp,
+        ep: estimate.ep || 0,
+        mem: estimate.mem || 0.9,
+        flags: Array.isArray(estimate.flags) ? [...estimate.flags] : [],
+        strategies: Array.isArray(estimate.strategies) ? [...estimate.strategies] : ["tp"],
+        features: Array.isArray(estimate.features) ? [...estimate.features] : ["reasoning", "toolCall"],
+        unavailable: false,
+      };
+    }
+
+    const reference = quantization.reference ? quantization.reference : {};
+    const paramsB = quantization.paramsB || variant.paramsB || 0;
+    const bytesPerParam = quantization.bytesPerParam || 2;
+    const vramMin = Math.ceil(paramsB * bytesPerParam * 1.2);
+    const gpusNeeded = Math.max(1, Math.ceil(vramMin / hw.vramGB));
+    const neededTP = Math.max(1, nextPow2(gpusNeeded));
+    const cap = hw.maxTP ? hw.maxTP : 8;
+    if (neededTP > cap) return { unavailable: true, vramMin, neededTP, maxTP: cap };
+
+    const isAMD = hw.vendor === "AMD";
+    const referenceTP = reference.tp ? reference.tp : 1;
+    const tp = Math.min(cap, Math.max(neededTP, Math.min(referenceTP, cap)));
+    const referenceEP = reference.ep ? reference.ep : 0;
+    let ep = referenceEP;
+    if (capability({ model: CONFIG.model, variant, quantization }, "isMoE") && isAMD && referenceEP === referenceTP) ep = tp;
+
+    const mem = reference.mem ? reference.mem : isAMD && bytesPerParam >= 2 ? 0.85 : 0.9;
+    const flags = Array.isArray(reference.flags) ? [...reference.flags] : [];
+    if (isAMD && flags.indexOf("--attention-backend triton") < 0) flags.push("--attention-backend triton");
+
+    return {
+      env: cloneEnv(reference.env),
+      tp,
+      ep,
+      mem,
+      flags,
+      strategies: Array.isArray(reference.strategies) ? [...reference.strategies] : ["tp"],
+      features: Array.isArray(reference.features) ? [...reference.features] : [],
+      vramMin,
+      unavailable: false,
+    };
+  };
+
+  const optimizedCommandsFor = (entry) => {
+    if (!entry || !entry.optimizedCommands) return {};
+    return entry.optimizedCommands;
+  };
+
+  const optimizedProfile = (strategy) => (strategy.indexOf("mtp") >= 0 ? "mtp" : "default");
+
+  const hasOptimized = (variantId, quantizationId, hwId, strategy) => {
+    const entry = verifiedEntry(variantId, quantizationId, hwId);
+    const cmds = optimizedCommandsFor(entry);
+    const profile = optimizedProfile(strategy);
+    return Boolean(cmds[profile]);
+  };
+
+  const appendFeatureFlags = (cmd, ctx, selectedFeatures) => {
+    for (const feat of visibleFeatureItems(ctx)) {
+      if (selectedFeatures.indexOf(feat.id) < 0) continue;
+      if (!isEnabled(feat, ctx)) continue;
+      if (typeof feat.emit === "function") {
+        const emitted = feat.emit(ctx);
+        if (emitted) cmd += ` \\\n  ${emitted}`;
+      }
+    }
+    return cmd;
+  };
+
+  const buildCommand = (variantId, quantizationId, hwId, selectedStrategy, selectedFeatures) => {
+    const ctx = contextFor(variantId, quantizationId, hwId);
+    const variant = ctx.variant;
+    const quantization = ctx.quantization;
+    const hw = ctx.hardware;
+    if (!variant || !quantization || !hw) return { cmd: "", optimized: false };
+
+    const verified = ctx.verified;
+    const optimizedSelected = selectedStrategy.indexOf("optimized") >= 0;
+    if (optimizedSelected) {
+      const cmds = optimizedCommandsFor(verified);
+      const profile = optimizedProfile(selectedStrategy);
+      if (cmds[profile]) return { cmd: cmds[profile], optimized: true };
+      return {
+        cmd: "# Not available: no optimized command supplied for this strategy profile.",
+        optimized: true,
+        unavailable: true,
+      };
+    }
+
+    const resolved = verified ? verified : autoEstimate(variant, quantization, hw);
+    if (resolved.unsupported) return unsupported();
+    if (resolved.unavailable) return notAvailable();
+
+    const tp = resolved.tp ? resolved.tp : 1;
+    const ep = resolved.ep ? resolved.ep : 0;
+    const mem = resolved.mem;
+    const env = cloneEnv(resolved.env);
+    const flags = Array.isArray(resolved.flags) ? resolved.flags : [];
+
+    let cmd = "sglang serve \\\n";
+    cmd += `  --model-path ${quantization.hfPath}`;
+    if (selectedStrategy.indexOf("tp") >= 0 && tp > 1) cmd += ` \\\n  --tp ${tp}`;
+    if (selectedStrategy.indexOf("ep") >= 0 && ep > 0) cmd += ` \\\n  --ep ${ep}`;
+    if (selectedStrategy.indexOf("dp") >= 0) cmd += ` \\\n  --dp ${tp} \\\n  --enable-dp-attention`;
+    if (mem) cmd += ` \\\n  --mem-fraction-static ${mem}`;
+    for (const f of flags) cmd += ` \\\n  ${f}`;
+    cmd = appendFeatureFlags(cmd, ctx, selectedFeatures);
+
+    if (selectedStrategy.indexOf("mtp") >= 0) {
+      if (env.indexOf("SGLANG_ENABLE_SPEC_V2=1") < 0) env.unshift("SGLANG_ENABLE_SPEC_V2=1");
+      if (CONFIG.model.specFlags) cmd += ` \\\n  ${CONFIG.model.specFlags}`;
+    }
+    if (env.length > 0) cmd = `${env.join(" ")} ${cmd}`;
+    return { cmd, optimized: false };
+  };
+
+  // -------------------------------------------------------------------------
+  // State
+  // -------------------------------------------------------------------------
+  const initialVariant = CONFIG.modelVariants[0] ? CONFIG.modelVariants[0].id : "";
+  const initialQuantization = defaultQuantizationId(initialVariant);
+  const initialHardware = "h200";
+  const [variantId, setVariantId] = useState(initialVariant);
+  const [quantizationId, setQuantizationId] = useState(initialQuantization);
+  const [hwId, setHwId] = useState(initialHardware);
+  const [strategy, setStrategy] = useState(() => defaultStrategyIds(initialVariant, initialQuantization, initialHardware));
+  const [features, setFeatures] = useState(() => defaultFeatureIds(initialVariant, initialQuantization, initialHardware));
+  const [isDark, setIsDark] = useState(false);
+
+  useEffect(() => {
+    const check = () => {
+      const html = document.documentElement;
+      const dark =
+        html.classList.contains("dark") ||
+        html.getAttribute("data-theme") === "dark" ||
+        html.style.colorScheme === "dark";
+      setIsDark(dark);
+    };
+    check();
+    const obs = new MutationObserver(check);
+    obs.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "data-theme", "style"],
+    });
+    return () => obs.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const variant = findVariant(variantId);
+    const quantization = findQuantization(variantId, quantizationId);
+    if (variant && !quantization) {
+      setQuantizationId(defaultQuantizationId(variantId));
+    }
+  }, [variantId, quantizationId]);
+
+  useEffect(() => {
+    const ctx = contextFor(variantId, quantizationId, hwId);
+    const visibleStrategy = visibleStrategyItems(ctx).map((item) => item.id);
+    const visibleFeatures = visibleFeatureItems(ctx).map((item) => item.id);
+    setStrategy((prev) => {
+      const defaults = defaultStrategyIds(variantId, quantizationId, hwId);
+      let kept = prev.filter((id) => visibleStrategy.indexOf(id) >= 0);
+      for (const id of defaults) {
+        if (kept.indexOf(id) < 0) kept.push(id);
+      }
+      if (kept.indexOf("tp") < 0) kept.unshift("tp");
+      if (kept.indexOf("optimized") >= 0 && !hasOptimized(variantId, quantizationId, hwId, kept)) {
+        kept = kept.filter((id) => id !== "optimized");
+      }
+      return sameArray(prev, kept) ? prev : kept;
+    });
+    setFeatures((prev) => {
+      const defaults = defaultFeatureIds(variantId, quantizationId, hwId);
+      const kept = prev.filter((id) => visibleFeatures.indexOf(id) >= 0);
+      for (const id of defaults) {
+        if (kept.indexOf(id) < 0) kept.push(id);
+      }
+      return sameArray(prev, kept) ? prev : kept;
+    });
+  }, [variantId, quantizationId, hwId, strategy]);
+
+  const toggleStrategy = (id) => {
+    const ctx = contextFor(variantId, quantizationId, hwId);
+    const item = CONFIG.strategy.items.find((x) => x.id === id);
+    if (item && item.required) return;
+    if (item && !isEnabled(item, ctx)) return;
+    if (item && item.kind === "optimized" && !hasOptimized(variantId, quantizationId, hwId, strategy)) return;
+    setStrategy((prev) => (prev.indexOf(id) >= 0 ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const toggleFeature = (id) => {
+    setFeatures((prev) => (prev.indexOf(id) >= 0 ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const { cmd, optimized } = buildCommand(variantId, quantizationId, hwId, strategy, features);
+  const locked = optimized;
+  const currentCtx = contextFor(variantId, quantizationId, hwId);
+  const selectedVariant = findVariant(variantId);
+  const currentQuantizations = selectedVariant && Array.isArray(selectedVariant.quantizations) ? selectedVariant.quantizations : [];
+
+  // -------------------------------------------------------------------------
+  // Styles
+  // -------------------------------------------------------------------------
+  const containerStyle = { maxWidth: "1160px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" };
+  const cardStyle = {
+    padding: "8px 12px",
+    border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+    borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+    borderRadius: "4px",
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    background: isDark ? "#1f2937" : "#fff",
+  };
+  const titleStyle = { fontSize: "13px", fontWeight: "600", minWidth: "140px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" };
+  const itemsStyle = { display: "flex", rowGap: "2px", columnGap: "6px", flexWrap: "wrap", alignItems: "center", flex: 1 };
+  const labelBase = {
+    padding: "4px 10px",
+    border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
+    borderRadius: "3px",
+    cursor: "pointer",
+    display: "inline-flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    fontWeight: "500",
+    fontSize: "13px",
+    userSelect: "none",
+    minWidth: "54px",
+    textAlign: "center",
+    background: isDark ? "#374151" : "#fff",
+    color: isDark ? "#e5e7eb" : "inherit",
+  };
+  const checkedStyle = { background: "#D45D44", color: "white", borderColor: "#D45D44" };
+  const disabledStyle = { cursor: "not-allowed", opacity: 0.5 };
+  const subtitleStyle = { display: "block", fontSize: "9px", marginTop: "1px", lineHeight: "1.1", opacity: 0.7 };
+  const vendorLabelStyle = {
+    fontSize: "10px",
+    color: isDark ? "#9ca3af" : "#6b7280",
+    marginRight: "4px",
+    alignSelf: "center",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+  };
+  const commandDisplayStyle = {
+    flex: 1,
+    padding: "12px 16px",
+    background: isDark ? "#111827" : "#f5f5f5",
+    borderRadius: "6px",
+    fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+    fontSize: "12px",
+    lineHeight: "1.5",
+    color: isDark ? "#e5e7eb" : "#374151",
+    whiteSpace: "pre-wrap",
+    overflowX: "auto",
+    margin: 0,
+    border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+  };
+  const verifiedDotStyle = {
+    width: "7px",
+    height: "7px",
+    borderRadius: "50%",
+    background: "#22c55e",
+    boxShadow: "0 0 4px rgba(34,197,94,0.6)",
+    position: "absolute",
+    top: "3px",
+    right: "3px",
+  };
+
+  const pill = (label, active, disabled, onClick, title, subtitle, showDot) => (
+    <label
+      key={label + (subtitle || "")}
+      title={title || ""}
+      onClick={() => !disabled && onClick && onClick()}
+      style={{
+        ...labelBase,
+        ...(active ? checkedStyle : {}),
+        ...(disabled ? disabledStyle : {}),
+        position: "relative",
+      }}
+    >
+      {showDot && <span style={verifiedDotStyle} />}
+      {label}
+      {subtitle && (
+        <small style={{ ...subtitleStyle, color: active ? "rgba(255,255,255,0.85)" : "inherit" }}>
+          {subtitle}
+        </small>
+      )}
+    </label>
+  );
+
+  return (
+    <div style={containerStyle} className="not-prose">
+      <div style={{ ...cardStyle, alignItems: "flex-start" }}>
+        <div style={{ ...titleStyle, paddingTop: "4px", display: "flex", flexDirection: "column", gap: "2px" }}>
+          <span>{CONFIG.hardware.title}</span>
+          <span
+            style={{
+              fontSize: "10px",
+              fontWeight: 400,
+              color: isDark ? "#9ca3af" : "#6b7280",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "4px",
+            }}
+          >
+            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#22c55e", display: "inline-block" }} />
+            verified
+          </span>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "4px", flex: 1 }}>
+          {CONFIG.hardware.groups.map((g) => (
+            <div key={g.vendor} style={{ display: "flex", alignItems: "center", gap: "6px", width: "100%" }}>
+              <span style={{ ...vendorLabelStyle, width: "44px", flexShrink: 0 }}>{g.vendor}</span>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", flex: 1 }}>
+                {g.items.map((h) => {
+                  const isVerified = Boolean(verifiedEntry(variantId, quantizationId, h.id));
+                  return pill(
+                    h.label,
+                    hwId === h.id,
+                    locked && hwId !== h.id,
+                    () => setHwId(h.id),
+                    isVerified ? `${h.label} - verified by contributor` : h.label,
+                    h.vramGB ? `${h.vramGB}GB` : undefined,
+                    isVerified,
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={titleStyle}>Model Variant</div>
+        <div style={itemsStyle}>
+          {CONFIG.modelVariants.map((v) =>
+            pill(v.label, variantId === v.id, locked && variantId !== v.id, () => setVariantId(v.id), v.label),
+          )}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={titleStyle}>Quantization</div>
+        <div style={itemsStyle}>
+          {currentQuantizations.map((q) =>
+            pill(q.label, quantizationId === q.id, locked && quantizationId !== q.id, () => setQuantizationId(q.id), q.hfPath),
+          )}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={titleStyle}>{CONFIG.strategy.title}</div>
+        <div style={itemsStyle}>
+          {visibleStrategyItems(currentCtx).map((item) => {
+            const active = strategy.indexOf(item.id) >= 0;
+            const isOpt = item.kind === "optimized";
+            const available = isOpt ? hasOptimized(variantId, quantizationId, hwId, strategy) : isEnabled(item, currentCtx);
+            const disabled = Boolean(item.required) || !available || (locked && !isOpt);
+            const title = isOpt && !available ? "No optimized command supplied for this strategy profile" : item.subtitle;
+            return pill(item.label, active, disabled, () => toggleStrategy(item.id), title, item.subtitle);
+          })}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={titleStyle}>{CONFIG.features.title}</div>
+        <div style={itemsStyle}>
+          {visibleFeatureItems(currentCtx).map((f) => {
+            const active = features.indexOf(f.id) >= 0;
+            const disabled = locked || !isEnabled(f, currentCtx);
+            return pill(f.label, active, disabled, () => toggleFeature(f.id), f.label);
+          })}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={titleStyle}>Run this Command:</div>
+        <pre style={commandDisplayStyle}>{cmd}</pre>
+      </div>
+    </div>
+  );
+};
