@@ -72,7 +72,7 @@ class CanaryConfig:
 
         input_check_mode = (
             CanaryInputCheckMode.ON
-            if server_args.kv_canary_input_check
+            if envs.SGLANG_KV_CANARY_INPUT_CHECK.get()
             else CanaryInputCheckMode.OFF
         )
 

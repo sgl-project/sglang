@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 
 import torch
 
@@ -101,13 +102,15 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
 
 
 def test_mock_model_engine_kwargs_returns_defaults() -> None:
+    os.environ.pop("SGLANG_KV_CANARY_INPUT_CHECK", None)
+
     kwargs = mock_model_engine_kwargs()
 
     assert kwargs["load_format"] == "dummy"
     assert json.loads(kwargs["json_model_override_args"]) == {"num_hidden_layers": 1}
     assert kwargs["sampling_backend"] == "oracle"
     assert kwargs["kv_canary"] == "raise"
-    assert kwargs["kv_canary_input_check"] is True
+    assert os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] == "1"
 
 
 def test_mock_model_engine_kwargs_overrides_win() -> None:

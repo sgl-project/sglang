@@ -679,7 +679,6 @@ class ServerArgs:
     kv_canary: str = "off"
     kv_canary_real_data: str = "off"
     kv_canary_sweep_interval: int = 0
-    kv_canary_input_check: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -6088,17 +6087,6 @@ class ServerArgs:
                 "aren't actively being verified per step. Requires "
                 "--kv-canary-real-data in {bit, all} and "
                 "--kv-canary in {log, raise}."
-            ),
-        )
-        parser.add_argument(
-            "--kv-canary-input-check",
-            action="store_true",
-            default=ServerArgs.kv_canary_input_check,
-            help=(
-                "Enable comparison of forward_batch.input_ids/positions against "
-                "caller-supplied expected_input_tokens/positions inside the canary "
-                "write kernel. Requires an oracle (mock_model) to populate the "
-                "expected_* placeholders per forward."
             ),
         )
         parser.add_argument(
