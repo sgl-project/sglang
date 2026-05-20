@@ -343,16 +343,19 @@ def _plan_offsets_kernel(
     prefix_lens = tl.load(prefix_lens_ptr + bs_offs, mask=bs_mask, other=0)
     extend_lens = tl.load(extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0)
 
-    not_padding = (rpi != 0) & bs_mask
+    is_active = (rpi != 0) & bs_mask
+    has_prefix = is_active & (prefix_lens > 0)
 
     window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)
 
     verify_lens = prefix_lens - window_starts
     verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
-    verify_lens = tl.where(not_padding, verify_lens, 0)
+    verify_lens = tl.where(is_active, verify_lens, 0)
 
     write_lens = tl.where(extend_lens > 0, extend_lens, 0)
-    write_lens = tl.where(not_padding, write_lens, 0)
+    write_lens = tl.where(is_active, write_lens, 0)
+
+    has_write_contribution = has_prefix & (write_lens > 0)
 
     # Seed slot per req. prefix_lens == 0 means no prefix → -1 sentinel. Padding row → no write contribution
     # → -1 sentinel either way; we also mask write_lens onto seed below to match the ref's "no write → -1".
@@ -360,14 +363,14 @@ def _plan_offsets_kernel(
     stride_i64 = req_to_token_stride0.to(tl.int64)
     seed_full = tl.load(
         req_to_token_ptr + rpi.to(tl.int64) * stride_i64 + safe_prefix_pos.to(tl.int64),
-        mask=bs_mask & (prefix_lens > 0),
+        mask=has_prefix,
         other=0,
     )
 
     if HAS_SWA_LUT:
         seed_translated = _swa_translate_tile(
             seed_full,
-            bs_mask & (prefix_lens > 0),
+            has_prefix,
             full_to_swa_lut_ptr,
             swa_lut_len,
         )
@@ -376,9 +379,7 @@ def _plan_offsets_kernel(
 
     # Reqs with no write contribution should expose seed = -1 (ref's _seed_slot is masked by write_lens > 0).
     minus_one = tl.full((BS_BLOCK,), -1, dtype=seed_translated.dtype)
-    seed_slot = tl.where(
-        (prefix_lens > 0) & (write_lens > 0), seed_translated, minus_one
-    )
+    seed_slot = tl.where(has_write_contribution, seed_translated, minus_one)
 
     # Inclusive cumsum → exclusive offsets via subtraction.
     verify_inclusive = tl.cumsum(verify_lens, axis=0)
