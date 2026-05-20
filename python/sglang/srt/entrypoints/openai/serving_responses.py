@@ -274,12 +274,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         self.default_sampling_params,
                         stop=(
                             processed_messages.stop
-                            if processed_messages is not None
+                            if processed_messages
                             else request.stop
                         ),
                         tool_call_constraint=(
                             processed_messages.tool_call_constraint
-                            if processed_messages is not None
+                            if processed_messages
                             else None
                         ),
                     )
@@ -303,22 +303,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                         **prompt_kwargs,
                         image_data=(
                             processed_messages.image_data
-                            if processed_messages is not None
+                            if processed_messages
                             else None
                         ),
                         video_data=(
                             processed_messages.video_data
-                            if processed_messages is not None
+                            if processed_messages
                             else None
                         ),
                         audio_data=(
                             processed_messages.audio_data
-                            if processed_messages is not None
+                            if processed_messages
                             else None
                         ),
                         modalities=(
                             processed_messages.modalities
-                            if processed_messages is not None
+                            if processed_messages
                             else None
                         ),
                         sampling_params=sampling_params,
@@ -510,19 +510,19 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
+            meta_info = None
             if isinstance(final_res, dict) and isinstance(
                 final_res.get("meta_info"), dict
             ):
                 meta_info = final_res["meta_info"]
+            elif hasattr(final_res, "meta_info"):
+                meta_info = final_res.meta_info
+
+            if meta_info is not None:
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
-            elif hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
             elif isinstance(final_res, dict) and (
                 final_res.get("prompt_token_ids") is not None
                 or final_res.get("output_ids") is not None
