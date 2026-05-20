@@ -66,9 +66,7 @@ def canary_plan_step_torch_reference(
 
     lut: Optional[torch.Tensor] = None
     if full_to_swa_index_mapping is not None:
-        lut = full_to_swa_index_mapping.detach().to(
-            device=work_device, dtype=torch.int64
-        )
+        lut = full_to_swa_index_mapping.detach().to(device=work_device)
 
     total_verify = _materialize_verify_entries(
         verify_plan_out=verify_plan_out,
