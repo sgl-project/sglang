@@ -101,6 +101,13 @@ class TextEncodingStage(PipelineStage):
             for i in range(len(self.text_encoders))
         ]
 
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # Mirror ``component_uses`` naming so trace labels stay consistent.
+        return [
+            (enc, "text_encoder" if i == 0 else f"text_encoder_{i + 1}")
+            for i, enc in enumerate(self.text_encoders or [])
+        ]
+
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
@@ -180,6 +187,7 @@ class TextEncodingStage(PipelineStage):
         assert len(self.text_encoders) == len(
             server_args.pipeline_config.text_encoder_configs
         )
+        self._apply_nvtx_gate(batch.is_warmup)
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None
