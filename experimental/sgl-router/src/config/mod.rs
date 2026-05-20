@@ -94,12 +94,20 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Write `body` to a temp file with the given extension and load it
+    /// through `Config::from_path`. Failures still surface the offending
+    /// config because each call site passes its body inline.
+    fn load(ext: &str, body: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(format!("c.{ext}"));
+        std::fs::write(&p, body).unwrap();
+        Config::from_path(&p)
+    }
+
     #[test]
     fn loads_minimal_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "yaml",
             r#"
 server:
   host: "0.0.0.0"
@@ -115,7 +123,6 @@ discovery:
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
         match &c.discovery.backend {
@@ -128,10 +135,8 @@ discovery:
 
     #[test]
     fn loads_minimal_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "toml",
             r#"
 [server]
 host = "0.0.0.0"
@@ -146,7 +151,6 @@ urls = ["http://10.0.0.1:30000"]
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         match &c.discovery.backend {
             DiscoveryBackend::StaticUrls(s) => {
@@ -158,36 +162,28 @@ urls = ["http://10.0.0.1:30000"]
 
     #[test]
     fn rejects_missing_discovery_section() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "yaml",
             "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\n",
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
+        .unwrap_err();
+        let msg = err.to_string().to_lowercase();
         assert!(
-            err.to_string().to_lowercase().contains("discovery")
-                || err.to_string().to_lowercase().contains("missing"),
+            msg.contains("discovery") || msg.contains("missing"),
             "got: {err}"
         );
     }
 
     #[test]
     fn rejects_unknown_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.txt");
-        std::fs::write(&p, "").unwrap();
-        let err = Config::from_path(&p).unwrap_err();
+        let err = load("txt", "").unwrap_err();
         assert!(err.to_string().contains("yaml") && err.to_string().contains("toml"));
     }
 
     #[test]
     fn loads_static_urls_discovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -203,7 +199,6 @@ urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
         match &c.discovery.backend {
             DiscoveryBackend::StaticUrls(s) => {
                 assert_eq!(
@@ -221,10 +216,8 @@ urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
 
     #[test]
     fn rejects_static_urls_with_empty_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -238,17 +231,15 @@ backend = "static_urls"
 urls = []
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("non-empty"), "got: {err}");
     }
 
     #[test]
     fn rejects_static_urls_with_duplicate_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -262,17 +253,15 @@ backend = "static_urls"
 urls = ["http://x:30000", "http://x:30000"]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[test]
     fn rejects_static_urls_with_empty_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -286,8 +275,8 @@ backend = "static_urls"
 urls = ["http://x:30000", ""]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
 
@@ -296,10 +285,8 @@ urls = ["http://x:30000", ""]
     /// `   /server_info` failed" at runtime. Catch at load.
     #[test]
     fn rejects_static_urls_with_whitespace_only_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -313,8 +300,8 @@ backend = "static_urls"
 urls = ["http://x:30000", "   "]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("whitespace"), "got: {err}");
     }
 
@@ -324,10 +311,8 @@ urls = ["http://x:30000", "   "]
     /// introspect time. Reject at load.
     #[test]
     fn rejects_static_urls_with_schemeless_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -341,8 +326,8 @@ backend = "static_urls"
 urls = ["10.0.0.1:30000"]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("not a valid URL") || err.contains("unsupported scheme"),
             "got: {err}"
@@ -354,10 +339,8 @@ urls = ["10.0.0.1:30000"]
     /// operator typo.
     #[test]
     fn rejects_static_urls_with_non_http_scheme() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -371,8 +354,8 @@ backend = "static_urls"
 urls = ["ws://x:30000"]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unsupported scheme"), "got: {err}");
     }
 
@@ -381,10 +364,8 @@ urls = ["ws://x:30000"]
     /// pointers at the same SGLang surface as a config error.
     #[test]
     fn rejects_static_urls_with_trailing_slash_near_duplicate() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -398,17 +379,15 @@ backend = "static_urls"
 urls = ["http://x:30000", "http://x:30000/"]
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[test]
     fn loads_k8s_discovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -425,7 +404,6 @@ label_selector = "app=sglang"
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
         match &c.discovery.backend {
             DiscoveryBackend::K8s(k) => {
                 assert_eq!(k.namespace, "default");
@@ -437,18 +415,14 @@ label_selector = "app=sglang"
         }
     }
 
+    /// K8s PD selectors drive slice-classification only; per-worker
+    /// bootstrap_port comes from `/server_info` post-discovery
+    /// (`crate::workers::introspect`). This test pins the wire-shape;
+    /// the selector grammar itself is covered in `types.rs`.
     #[test]
     fn loads_k8s_pd_discovery_with_prefill_and_decode_selectors() {
-        // K8s PD: selectors drive slice-classification; the actual
-        // bootstrap_port for each prefill worker comes from
-        // `/server_info` post-discovery (see
-        // `crate::workers::introspect`). The config layer only validates
-        // the selector combination here — successful load means PD on
-        // K8s is wired through to the manager.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -464,8 +438,7 @@ prefill_selector = "app=sglang,role=prefill"
 decode_selector = "app=sglang,role=decode"
 "#,
         )
-        .unwrap();
-        let c = Config::from_path(&p).expect("k8s PD config must load");
+        .expect("k8s PD config must load");
         match &c.discovery.backend {
             DiscoveryBackend::K8s(k) => {
                 assert_eq!(k.namespace, "default");
@@ -482,10 +455,8 @@ decode_selector = "app=sglang,role=decode"
 
     #[test]
     fn rejects_k8s_config_with_no_selector() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -499,122 +470,20 @@ backend = "k8s"
 namespace = "default"
 "#,
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
+        .unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("selector"), "got: {err}");
     }
 
-    fn k8s_cfg(
-        label: Option<&str>,
-        prefill: Option<&str>,
-        decode: Option<&str>,
-    ) -> K8sDiscoveryConfig {
-        K8sDiscoveryConfig {
-            namespace: "default".into(),
-            label_selector: label.map(str::to_string),
-            prefill_selector: prefill.map(str::to_string),
-            decode_selector: decode.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn k8s_mode_rejects_when_no_selector_is_set() {
-        let err = k8s_cfg(None, None, None).mode().unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("selector"),
-            "expected selector error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn k8s_mode_rejects_mixed_plain_and_pd_selectors() {
-        let err = k8s_cfg(
-            Some("app=sglang"),
-            Some("role=prefill"),
-            Some("role=decode"),
-        )
-        .mode()
-        .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("label_selector") && msg.contains("prefill"),
-            "expected mixed-mode error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn k8s_mode_rejects_partial_pd_selectors() {
-        let err = k8s_cfg(None, Some("role=prefill"), None)
-            .mode()
-            .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("prefill_selector") && msg.contains("decode_selector"),
-            "expected partial-PD error, got: {err}"
-        );
-
-        let err = k8s_cfg(None, None, Some("role=decode")).mode().unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("prefill_selector") && msg.contains("decode_selector"),
-            "expected partial-PD error, got: {err}"
-        );
-    }
-
-    /// Plain `label_selector = Some("")` STAYS valid — empty selector
-    /// matches every EndpointSlice in the namespace, which is a documented
-    /// k8s behavior and the user explicitly opts in to "match all" by
-    /// setting plain mode. The empty-rejection is a PD-mode-only safeguard.
-    #[test]
-    fn k8s_mode_accepts_empty_plain_label_selector() {
-        let mode = k8s_cfg(Some(""), None, None)
-            .mode()
-            .expect("plain mode valid");
-        match mode {
-            K8sDiscoveryMode::Plain { label_selector } => {
-                assert_eq!(label_selector, "");
-            }
-            other => panic!("expected Plain, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn k8s_mode_accepts_plain_with_label_selector() {
-        let mode = k8s_cfg(Some("app=sglang"), None, None).mode().unwrap();
-        match mode {
-            K8sDiscoveryMode::Plain { label_selector } => {
-                assert_eq!(label_selector, "app=sglang")
-            }
-            other => panic!("expected Plain, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn k8s_mode_constructs_pd_disaggregation() {
-        // Selectors drive slice-classification only; the per-worker
-        // bootstrap_port is filled from `/server_info` by the worker
-        // manager. K8s PD is fully supported as of the
-        // /server_info-derived-disaggregation-role commit.
-        let mode = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
-            .mode()
-            .expect("PD mode is valid");
-        assert_eq!(
-            mode,
-            K8sDiscoveryMode::PdDisaggregation {
-                prefill_selector: "role=prefill".to_string(),
-                decode_selector: "role=decode".to_string(),
-            }
-        );
-    }
+    // Direct `K8sDiscoveryConfig::mode()` unit tests live alongside the
+    // type in `src/config/types.rs::k8s_discovery_config_tests`.
+    // The tests in this module exercise the `Config::from_path` ↔ K8s
+    // selector wiring, not the selector grammar itself.
 
     #[test]
     fn rejects_unknown_policy_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
+        let err = load(
+            "yaml",
             "
 server:
   host: 0.0.0.0
@@ -630,21 +499,18 @@ models:
     policy: bogus_policy
 ",
         )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
+        .unwrap_err();
+        let msg = err.to_string().to_lowercase();
         assert!(
-            err.to_string().to_lowercase().contains("bogus_policy")
-                || err.to_string().to_lowercase().contains("policy"),
+            msg.contains("bogus_policy") || msg.contains("policy"),
             "got: {err}"
         );
     }
 
     #[test]
     fn defaults_policy_to_round_robin() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
+        let c = load(
+            "toml",
             r#"
 [server]
 host = "127.0.0.1"
@@ -659,7 +525,6 @@ urls = ["http://x:30000"]
 "#,
         )
         .unwrap();
-        let c = Config::from_path(&p).unwrap();
         assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
     }
 }
