@@ -475,8 +475,7 @@ class DFlashVerifyInput(SpecInput):
         batch.seq_lens_cpu.add_(
             torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
         )
-        # Incremental update; seq_lens_sum was materialized by ForwardBatch.init_new
-        # (helper fallback) during the verify forward above.
+        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
         batch.seq_lens_sum += sum(commit_lens_cpu)
 
         # Build next-step context features from the committed verify-input tokens.
