@@ -246,9 +246,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert server_args.api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
+    assert (
+        server_args.api_key is None
+    ), "API key is not supported in multi-tokenizer mode"
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -705,9 +705,9 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[
-        Dict[Any, Any]
-    ] = await _global_state.tokenizer_manager.get_internal_state()
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
 
     # server_args.model_config is not serializable but should be excluded by asdict.
     return {
