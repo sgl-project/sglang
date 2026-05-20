@@ -160,7 +160,7 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
             backend = "flashinfer_cudnn"
         elif is_sm100_supported():
             backend = "flashinfer_cutedsl"
-        elif is_cuda() and get_device_capability() >= (8, 0):
+        elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"
         else:
             backend = "flashinfer_cutlass"

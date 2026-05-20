@@ -37,7 +37,10 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                     f"{model_arch}"
                 )
             elif (
-                model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
+                (
+                    model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
+                    or server_args.quantization == "modelopt_fp4"
+                )
                 and is_cuda()
                 and (8, 0) <= get_device_capability() < (10, 0)
             ):
