@@ -181,7 +181,7 @@ def unified_attention_with_output(
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
     token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
+    original_swa_loc = forward_batch.swa_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
@@ -189,6 +189,7 @@ def unified_attention_with_output(
         forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+            forward_batch.swa_loc = forward_batch.out_cache_loc_swa
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_num_tokens to match the narrowed query shape —
@@ -210,6 +211,7 @@ def unified_attention_with_output(
         token_to_kv_pool, "set_swa_loc"
     ):
         token_to_kv_pool.set_swa_loc(original_swa_loc)
+        forward_batch.swa_loc = original_swa_loc
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
