@@ -12,6 +12,9 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -104,6 +107,19 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def image_path_to_list(image_path: Union[str, List[str]]) -> List[str]:
+    return image_path if isinstance(image_path, list) else [image_path]
+
+
+def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
+    pooler_output = getattr(image_features, "pooler_output", None)
+    if pooler_output is not None:
+        image_features = pooler_output
+    if isinstance(image_features, torch.Tensor):
+        return image_features
+    return torch.cat(tuple(image_features), dim=0)
 
 
 class GlmImageAR(PipelineStage):
@@ -219,13 +235,29 @@ class GlmImageAR(PipelineStage):
 
         prior_token_image_ids = None
         if image is not None:
-            prior_token_image_embed = self.vision_language_encoder.get_image_features(
-                inputs["pixel_values"], image_grid_thw[:-1]
+            source_grids = image_grid_thw[:-1]
+            prior_token_image_embed = pooled_image_features_to_tensor(
+                self.vision_language_encoder.get_image_features(
+                    inputs["pixel_values"], source_grids
+                )
             )
-            prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
-            prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
-                prior_token_image_embed, image_grid_thw[:-1]
+            prior_token_image_ids_d32 = self.vision_language_encoder.get_image_tokens(
+                prior_token_image_embed, source_grids
             )
+            prior_token_image_ids = []
+            prior_ids_per_source = torch.split(
+                prior_token_image_ids_d32,
+                source_grids.prod(dim=-1).tolist(),
+            )
+            for prior_ids, source_grid in zip(prior_ids_per_source, source_grids):
+                _, source_h, source_w = source_grid.tolist()
+                prior_token_image_ids.append(
+                    self._upsample_token_ids(
+                        prior_ids,
+                        int(source_h),
+                        int(source_w),
+                    ).squeeze(0)
+                )
 
         # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
         # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
@@ -257,12 +289,24 @@ class GlmImageAR(PipelineStage):
         prompt = batch.prompt
         height = batch.height
         width = batch.width
+        if batch.image_path is not None:
+            ar_condition_images = [
+                load_image(img_path)
+                for img_path in image_path_to_list(batch.image_path)
+            ]
+        else:
+            ar_condition_images = None
 
         device = get_local_torch_device()
+
+        if ar_condition_images is not None:
+            height = height or ar_condition_images[0].height
+            width = width or ar_condition_images[0].width
 
         time_start = time.time()
         prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
+            image=ar_condition_images,
             height=height,
             width=width,
         )
@@ -272,6 +316,8 @@ class GlmImageAR(PipelineStage):
 
         batch.prior_token_id = prior_token_id
         batch.prior_token_image_ids = prior_token_image_ids
+        batch.height = height
+        batch.width = width
 
         return batch
 
@@ -340,6 +386,22 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             and hasattr(self.transformer.config, "sample_size")
             else 128
         )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
+        if self.transformer is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="transformer",
+                    phase="reference_image",
+                    memory_intensive=True,
+                )
+            )
+        return uses
 
     def _parse_and_expand_shape_info(
         self, prompt: str
@@ -656,7 +718,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path) for img_path in batch.image_path
+                load_image(img_path)
+                for img_path in image_path_to_list(batch.image_path)
             ]
         else:
             ar_condition_images = None
@@ -675,8 +738,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self._guidance_scale = guidance_scale
         self._current_timestep = None
         self._interrupt = False
-
-        batch_size = 1
 
         device = get_local_torch_device()
 
@@ -758,25 +819,32 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 # Do not remove.
                 # It would be use to run the reference image through a
                 # forward pass at timestep 0 and keep the KV cache.
-                with set_forward_context(current_timestep=1, attn_metadata=None):
-                    _ = self.transformer(
-                        hidden_states=condition_latent,
-                        encoder_hidden_states=torch.zeros_like(prompt_embeds)[
-                            :1, :0, ...
-                        ],
-                        prior_token_id=condition_image_prior_token_id,
-                        prior_token_drop=torch.full_like(
-                            condition_image_prior_token_id, False, dtype=torch.bool
-                        ),
-                        timestep=torch.zeros((1,), device=device),
-                        target_size=torch.tensor(
-                            [condition_image.shape[-2:]], device=device
-                        ),
-                        crop_coords=torch.zeros((1, 2), device=device),
-                        attention_kwargs=attention_kwargs,
-                        kv_caches=kv_caches,
-                        kv_caches_mode="write",
-                    )
+                with self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="reference_image",
+                ) as transformer:
+                    assert transformer is not None
+                    self.transformer = transformer
+                    with set_forward_context(current_timestep=1, attn_metadata=None):
+                        _ = transformer(
+                            hidden_states=condition_latent,
+                            encoder_hidden_states=torch.zeros_like(prompt_embeds)[
+                                :1, :0, ...
+                            ],
+                            prior_token_id=condition_image_prior_token_id,
+                            prior_token_drop=torch.full_like(
+                                condition_image_prior_token_id, False, dtype=torch.bool
+                            ),
+                            timestep=torch.zeros((1,), device=device),
+                            target_size=torch.tensor(
+                                [condition_image.shape[-2:]], device=device
+                            ),
+                            crop_coords=torch.zeros((1, 2), device=device),
+                            attention_kwargs=attention_kwargs,
+                            kv_caches=kv_caches,
+                            kv_caches_mode="write",
+                        )
 
         # 6. Prepare additional timestep conditions
         target_size = (height, width)
