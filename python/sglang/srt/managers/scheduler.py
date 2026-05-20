@@ -507,7 +507,7 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
-        if envs.SGLANG_DEBUG_REVERT_PR_25015_FIX.get():
+        if envs.SGLANG_DEBUG_REVERT_PR.get() == "25015":
             from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
 
             revert_pr_fix(25015)

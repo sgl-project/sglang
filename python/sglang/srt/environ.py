@@ -201,7 +201,7 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
-    SGLANG_DEBUG_REVERT_PR_25015_FIX = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvStr("")
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -660,79 +660,49 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
-    # KV cache canary perturbation (testing only).
-    # When >0, the canary install hooks corrupt ``req_to_token_pool`` rows
-    # with this per-write probability so the canary should fire. Combined
-    # with ``--kv-canary=raise`` this gives a fault-injection harness
-    # for regression-testing the canary itself.
-    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
-    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
-    # Real-KV-byte perturbation (testing only).
-    # When >0, the canary self-test hook flips one byte of the real KV pool
-    # at an alive-but-not-verified-this-step slot with this probability per
-    # forward, proving the periodic sweep's independent detection value.
-    # Requires --kv-canary-sweep-interval > 0.
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
-
-    # Pseudo-mode sampler-override perturbation (testing only).
-    # When >0, the pseudo-mode sampler override writes the WRONG token
-    # into ``batch_next_token_ids`` with this per-element probability so
-    # the canary's ``INPUT_TOKEN_MISMATCH`` detection fires on the next
-    # forward. Combined with ``--enable-pseudo-mode`` + ``--kv-cache-
-    # canary=raise`` this provides the fault-injection harness used by
-    # the pseudo-mode canary self-test.
-    SGLANG_PSEUDO_INPUT_PERTURB_PROB = EnvFloat(0.0)
-    SGLANG_PSEUDO_INPUT_PERTURB_SEED = EnvInt(0)
-    # Position-side counterpart: when >0 perturb ``forward_batch.positions``
-    # so the canary's ``INPUT_POSITION_MISMATCH`` detection fires. Positions
-    # are computed by sglang scheduler internals; the current install path
-    # leaves this unwired with a TODO (see install.py).
-    SGLANG_PSEUDO_INPUT_POSITION_PERTURB_PROB = EnvFloat(0.0)
-    SGLANG_PSEUDO_INPUT_POSITION_PERTURB_SEED = EnvInt(0)
-
-    # Canary perturb / mock perturb env vars. Primitive float / int values (no
-    # compound types) so the registry reflection self-unit test can assert
-    # declared types are primitive.
-    # Per-write probability the canary self-unit perturb hook flips a
-    # ``req_to_token_pool`` slot to force INPUT_TOKEN_MISMATCH / chain hash
-    # violations. Counterpart of ``SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB``;
-    # this alias is consumed by the testing harness.
-    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN = EnvFloat(0.0)
-    # KV cache canary runtime config. All canary tunables are read once by
-    # ``CanaryConfig.from_env`` at server start; deeper modules must not read
-    # env vars directly.
-    SGLANG_KV_CANARY_MODE = EnvStr("off")
+    # ===================================================================
+    # KV-Canary / Mock-Model (testing-only)
+    # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
-    SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS = EnvInt(64)
-    SGLANG_KV_CANARY_REAL_KV_HASH_MODE = EnvStr("BIT")
-    SGLANG_KV_CANARY_INPUT_CHECK_MODE = EnvStr("OFF")
-    SGLANG_KV_CANARY_PERTURB_REAL_KV = EnvFloat(0.0)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
     SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
-    # Timing-jitter fuzzer (testing only). When enabled the canary runner
-    # launches a single-thread spin-wait kernel at 4 fixed slots inside
-    # the monkey-patched ``model.forward`` to perturb the relative timing
-    # between canary HEAD/TAIL and real attention launches. Cycles are
-    # sampled log-uniformly over ``[1, MAX_CYCLES]`` and gated by
-    # ``PER_SLOT_FIRE_PROB``; off by default and never installed when
-    # ``--kv-canary=off``.
-    SGLANG_KV_CANARY_JITTER_ENABLED = EnvBool(False)
-    SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB = EnvFloat(0.5)
-    SGLANG_KV_CANARY_JITTER_MAX_CYCLES = EnvInt(100_000)
-    SGLANG_KV_CANARY_JITTER_SEED = EnvInt(0)
     # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
     # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
     # (default 1.5x). Override via env var when runner jitter or temporary
     # debugging needs a wider window.
     SGLANG_KV_CANARY_BENCH_OVERHEAD_THRESHOLD_RATIO = EnvFloat(1.5)
+    # KV cache canary perturbation. When >0, the canary install hooks corrupt
+    # ``req_to_token_pool`` rows with this per-write probability so the canary
+    # should fire. Combined with ``--kv-canary=raise`` this gives a fault-injection
+    # harness for regression-testing the canary itself.
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
+    # Real-KV-byte perturbation. When >0, the canary self-test hook flips one
+    # byte of the real KV pool at an alive-but-not-verified-this-step slot with
+    # this probability per forward, proving the periodic sweep's independent
+    # detection value. Requires --kv-canary-sweep-interval > 0.
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
+    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
+    # Timing-jitter fuzzer. When enabled the canary runner launches a single-thread
+    # spin-wait kernel at 4 fixed slots inside the monkey-patched ``model.forward``
+    # to perturb the relative timing between canary HEAD/TAIL and real attention
+    # launches. Cycles are sampled log-uniformly over ``[1, MAX_CYCLES]`` and gated
+    # by ``PER_SLOT_FIRE_PROB``; off by default and never installed when
+    # ``--kv-canary=off``.
+    SGLANG_KV_CANARY_JITTER_ENABLED = EnvBool(False)
+    SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB = EnvFloat(0.5)
+    SGLANG_KV_CANARY_JITTER_MAX_CYCLES = EnvInt(100_000)
+    SGLANG_KV_CANARY_JITTER_SEED = EnvInt(0)
     # Mock-engine sampler-override per-element probability for writing the
     # wrong input token so the canary's ``INPUT_TOKEN_MISMATCH`` fires on
     # the next forward. Used by the canary <-> mock-oracle wiring tests in
     # ``test/registered/mock_model/test_self_unit_canary_mock_wiring.py``.
     SGLANG_MOCK_INPUT_PERTURB_PROB = EnvFloat(0.0)
     SGLANG_MOCK_MODEL_ORACLE_SEED = EnvInt(0)
+    # ===================================================================
+    # /KV-Canary / Mock-Model
+    # ===================================================================
 
 
 envs = Envs()

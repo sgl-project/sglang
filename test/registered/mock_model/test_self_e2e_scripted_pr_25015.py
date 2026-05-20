@@ -17,7 +17,7 @@ def _fake_prompt(length: int) -> list[int]:
 
 
 def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
-    monkeypatch.setenv("SGLANG_DEBUG_REVERT_PR_25015_FIX", "1")
+    monkeypatch.setenv("SGLANG_DEBUG_REVERT_PR", "25015")
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         **mock_model_engine_kwargs(speculative_algorithm="EAGLE"),
