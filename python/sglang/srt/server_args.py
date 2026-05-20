@@ -641,6 +641,10 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # Double Sparsity (standalone; mutually exclusive with HiSparse at runtime)
+    enable_double_sparsity: bool = False
+    double_sparsity_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -5912,6 +5916,29 @@ class ServerArgs:
             'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
         )
 
+        # Double Sparsity (standalone path, mutually exclusive with --enable-hisparse)
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help=(
+                "Enable standalone Double Sparsity selection for DeepSeek-V3.2 (FP8). "
+                "Mutually exclusive with --enable-hisparse and does NOT require PD disaggregation."
+            ),
+        )
+        parser.add_argument(
+            "--double-sparsity-config",
+            dest="double_sparsity_config",
+            type=str,
+            default=ServerArgs.double_sparsity_config,
+            help=(
+                "JSON string for Double Sparsity. Required fields: top_k, page_size, "
+                "channel_mask_path, device_buffer_size. Example: "
+                '\'{"top_k": 2048, "page_size": 64, '
+                '"channel_mask_path": "/models/dsv32-fp8-channel-mask.safetensors", '
+                '"device_buffer_size": 4096}\'.'
+            ),
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
@@ -6942,6 +6969,13 @@ class ServerArgs:
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
         validate_hisparse(self)
+
+        # Check double sparsity (standalone path; mutually exclusive with hisparse)
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+
+        validate_double_sparsity(self)
 
         assert (
             self.schedule_conservativeness >= 0

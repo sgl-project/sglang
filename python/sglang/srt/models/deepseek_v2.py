@@ -1446,6 +1446,35 @@ class DeepseekV2AttentionMLA(
                     else:
                         self.next_skip_topk = False
 
+        self.double_sparsity_selector = None
+        self.use_double_sparsity = False
+        if self.use_nsa:
+            _global_server_args = get_global_server_args()
+            if getattr(_global_server_args, "enable_double_sparsity", False):
+                from sglang.srt.layers.attention.double_sparsity import (
+                    DoubleSparsityConfig,
+                    DoubleSparsitySelector,
+                    parse_double_sparsity_config,
+                )
+
+                ds_config_raw = getattr(
+                    _global_server_args, "double_sparsity_config", None
+                )
+                if ds_config_raw is None:
+                    raise ValueError(
+                        "--enable-double-sparsity requires --double-sparsity-config; "
+                        "the server-args validator should have rejected this earlier."
+                    )
+                ds_parsed: DoubleSparsityConfig = parse_double_sparsity_config(
+                    ds_config_raw
+                )
+                self.double_sparsity_selector = DoubleSparsitySelector(
+                    config=ds_parsed,
+                    num_local_heads=self.num_local_heads,
+                    head_dim=self.qk_head_dim,
+                )
+                self.use_double_sparsity = True
+
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1728,6 +1757,62 @@ class DeepseekV2AttentionMLA(
             return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
+
+    def _select_topk_indices(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ):
+        """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
+
+        When ``self.use_double_sparsity`` is true, dispatch to the standalone
+        Double Sparsity selector and return its
+        ``(selected_indices, valid_lengths)`` tuple. Otherwise call the existing
+        NSA ``Indexer`` and return its token-level ``topk_indices`` tensor (or
+        ``None`` when the backend skips selection for this batch).
+
+        The two return shapes are intentionally distinct so that downstream
+        code can not silently mix them. Production deployments must either
+        keep DS disabled (and consume the indexer tensor) or land the real
+        DS selection kernels + page-table adapter (a later milestone) that
+        unwrap the DS tuple into a FlashMLA-compatible page table.
+        """
+
+        if self.use_double_sparsity:
+            from sglang.srt.layers.attention.double_sparsity.selector import (
+                assert_real_selector_or_placeholder_allowed,
+            )
+
+            assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
+
+            req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "Double Sparsity selector requires forward_batch.req_pool_indices."
+                )
+            seq_lens = getattr(forward_batch, "seq_lens", None)
+            sparse_mask = getattr(forward_batch, "sparse_mask", None)
+            queries = q_lora if q_lora is not None else x
+            return self.double_sparsity_selector.retrieve_topk(
+                queries=queries,
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                seq_lens=seq_lens,
+            )
+
+        return self.indexer(
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            return_indices=return_indices,
+        )
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch

@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# bench_serving sweep — gsp, 4096 ISL / 512 OSL, ~55% prefix cache hit
+# bench_serving sweep — native_nsa baseline (DeepSeek-V3.2 FP8, single-instance)
 #
-# MODE=double_sparsity (default) tags output files for the DS column of the
-# two-column comparison report. Pair with development/benchmark_baseline.sh
-# (MODE=native_nsa) on the same hardware and workload to populate both
-# columns. The downstream two-column report is wired in task15 once a real
-# DS run is feasible; until then this script only emits the DS rows.
+# Mirrors development/benchmark.sh exactly except for the output file tagging
+# so a downstream two-column report can pair the same workload (ISL, OSL,
+# prefix-cache hit, concurrency, seed) across the native_nsa baseline and the
+# double_sparsity run without diff churn on every column.
 #
-# Server must already be running on PORT (default 30000) with Double
-# Sparsity enabled — see development/serve_double_sparsity.sh for the
-# exact server invocation.
+# Pair with development/benchmark.sh (set MODE=double_sparsity there) for the
+# eventual side-by-side report. The two columns must agree on:
+#   { GPU id, TP size, page size, radix-cache setting, concurrency, seed,
+#     dataset shape (ISL/OSL/cache-hit), model revision }
+#
+# Server must already be running on PORT (default 30000) with **NSA enabled
+# and Double Sparsity disabled** — see development/serve_native_nsa.sh for
+# the exact server invocation.
+
 set -euo pipefail
 
 PORT="${PORT:-30000}"
-MODE="${MODE:-double_sparsity}"
+MODE="${MODE:-native_nsa}"
 
 # ISL = sys + q = 2253 + 1843 = 4096; cache_hit = 2253/4096 ≈ 0.550
 SYS_LEN=2253
@@ -22,11 +27,10 @@ OUT_LEN=512
 NUM_PROMPTS=$(( 5 * 64 ))
 NUM_GROUPS=1
 
-# Per-concurrency seeds, mirroring the reference sweep pattern.
 declare -A SEEDS=( [16]=213 [32]=431 [64]=31234 )
 
-# Default sweep: conc 64 only. Override by setting CONCURRENCIES,
-# e.g. CONCURRENCIES="16 32 64".
+# Default sweep matches development/benchmark.sh: conc 64 only. Override by
+# setting CONCURRENCIES, e.g. CONCURRENCIES="16 32 64".
 CONCURRENCIES="${CONCURRENCIES:-64}"
 
 for CONCURRENCY in ${CONCURRENCIES}; do
