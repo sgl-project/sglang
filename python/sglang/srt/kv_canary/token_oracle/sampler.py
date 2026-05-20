@@ -15,14 +15,7 @@ if TYPE_CHECKING:
 
 
 def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
-    """Register an oracle-driven sampler backend with sglang's sampler registry. Returns the
-    TokenOracleManager so the caller can attach it to a CanaryRunner for the input-check path.
-
-    sglang's main Sampler has a single-line dispatch at the top of its sample() that, when the
-    'token_oracle' backend is selected, delegates to _OracleSampler — which forwards to the
-    manager instance bound at registration. No monkey-patching — relies on the existing
-    sampler-backend mechanism. Calling twice replaces the previously registered manager.
-    """
+    """Calling twice replaces the previously registered manager."""
     manager = TokenOracleManager(oracle=oracle)
     register_sampler_backend(
         _TOKEN_ORACLE_BACKEND_NAME,
@@ -32,14 +25,6 @@ def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
 
 
 class _OracleSampler(Sampler):
-    """Sampler subclass that bypasses logits and returns oracle-driven token ids per row.
-
-    Constructed by the factory closure register_sampler_backend installs in
-    install_oracle_sampler; the closure captures a single TokenOracleManager so every sampler
-    instance dispatched for the "token_oracle" backend shares the same stash filled by
-    canary's before_forward.
-    """
-
     def __init__(self, *, token_oracle_manager: TokenOracleManager) -> None:
         super().__init__()
         self._token_oracle_manager = token_oracle_manager

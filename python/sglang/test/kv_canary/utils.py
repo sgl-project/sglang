@@ -1,10 +1,3 @@
-"""Shared base class for canary e2e tests.
-
-Server-launch / teardown / parallel-burst boilerplate factored out of
-``test_e2e_qwen3.py`` and ``test_e2e_dsv4_flash.py`` so each test only
-declares its model + extra server args + the actual assertions.
-"""
-
 from __future__ import annotations
 
 import io

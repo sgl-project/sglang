@@ -235,11 +235,8 @@ class TestSelfUnitEndpoint(CustomTestCase):
 
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
         """LUT trailing-row sentinel (-1) propagates through the host gather to the kernel as a skip
-        signal. Regression for the post-write-SWA-decouple contract: the endpoint must turn a
-        pre-cleanup "kernel-side LUT[full_pool_size] = -1 → skip" path into "host gather → -1 → skip"
-        without losing the sentinel semantics. (Replaces the kernel-side coverage of the deleted
-        test_full_to_swa_lut_sentinel_skips_entry; the kernel-side -1 → skip path itself is covered by
-        test_negative_slot_skips_entry in test_write_hand.py.)
+        signal. The endpoint must turn a pre-cleanup "kernel-side LUT[full_pool_size] = -1 → skip"
+        path into "host gather → -1 → skip" without losing the sentinel semantics.
         """
         captured: List[torch.Tensor] = []
         with patch.object(

@@ -1,10 +1,3 @@
-"""Property/invariant tests for the kv_canary jit_kernel.
-
-Each test runs many varied inputs in a loop and asserts an invariant holds
-across all iterations, catching accumulation bugs and cross-call state bugs
-that single-shot differential tests miss.
-"""
-
 from __future__ import annotations
 
 import random

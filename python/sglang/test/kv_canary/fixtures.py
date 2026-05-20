@@ -1,9 +1,3 @@
-"""Shared helpers for canary srt-integration self-unit tests.
-
-Plain module-level functions and dataclasses; importers use
-``from sglang.test.kv_canary.fixtures import ...``.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

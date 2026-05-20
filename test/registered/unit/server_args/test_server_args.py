@@ -91,11 +91,9 @@ class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_with_nccl_port_none(self, mock_temp_file, mock_get_free_port):
-        """Test that get_free_port() is called when nccl_port is None"""
         mock_temp_file.return_value.name = "temp_file"
         mock_get_free_port.return_value = 45678  # Mock ephemeral port
 
-        # Use MagicMock here to verify get_free_port is called
         server_args = MagicMock()
         server_args.nccl_port = None
         server_args.enable_dp_attention = False
@@ -103,10 +101,8 @@ class TestPortArgs(unittest.TestCase):
 
         port_args = PortArgs.init_new(server_args)
 
-        # Verify get_free_port was called
         mock_get_free_port.assert_called_once()
 
-        # Verify the returned port is used
         self.assertEqual(port_args.nccl_port, 45678)
 
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

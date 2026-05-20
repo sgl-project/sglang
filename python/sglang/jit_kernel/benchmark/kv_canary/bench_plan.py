@@ -1,9 +1,3 @@
-"""Sweep-matrix benchmark for canary_plan_step (triton.testing.perf_report style).
-
-Two reports: the (bs × prefix × mode × pool) matrix shared with verify / write, plus a separate
-total_tokens axis to expose how the plan kernel scales with (bs, total_tokens) rather than chunk_size.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

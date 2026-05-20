@@ -17,9 +17,9 @@ _GEMMA3_MODEL = "google/gemma-3-4b-it"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 5}'
 
 # DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
-# canary e2e test. user-instruction.md b section requires the canary kernel to
-# run inside the cuda graph alongside the real attn kernel; disabling the graph
-# silently bypasses the only path that exercises that invariant end-to-end.
+# canary e2e test. The canary kernel must run inside the cuda graph alongside
+# the real attn kernel; disabling the graph silently bypasses the only path
+# that exercises that invariant end-to-end.
 
 # Gemma 3 4B-it sliding_window = 4096; any prompt tokenising to >4096 tokens
 # will force the SWA sub-pool to clip to the last window, which is the scenario

@@ -30,9 +30,9 @@ _DSV4_BASE_ARGS: List[str] = [
     "--json-model-override-args",
     _NUM_LAYERS_OVERRIDE,
     # DO NOT add --disable-cuda-graph or --disable-piecewise-cuda-graph here.
-    # user-instruction.md b 段 requires the canary kernel to run inside the cuda
-    # graph alongside the real attn kernel; disabling the graph silently bypasses
-    # the only path that exercises that invariant end-to-end.
+    # The canary kernel must run inside the cuda graph alongside the real attn
+    # kernel; disabling the graph silently bypasses the only path that
+    # exercises that invariant end-to-end.
     "--page-size",
     "128",
     "--moe-runner-backend",

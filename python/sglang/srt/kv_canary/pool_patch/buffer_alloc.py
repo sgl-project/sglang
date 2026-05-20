@@ -28,7 +28,6 @@ def alloc_canary_buf(
     num_slots: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Allocate one canary buffer (head or tail) of shape ``[num_slots, CANARY_SLOT_BYTES]``."""
     return torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
 
 

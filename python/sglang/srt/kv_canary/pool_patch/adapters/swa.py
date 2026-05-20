@@ -18,10 +18,6 @@ def attach_swa(
     device: torch.device,
     read_bytes: int,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an SWA pool with both FULL and SWA sub-pools.
-
-    FULL group splices into ``get_contiguous_buf_infos``; SWA group splices into ``get_state_buf_infos``.
-    """
     full_group = _build_subpool_group(
         sub_pool=pool.full_kv_pool,
         kind=PoolKind.FULL,
