@@ -68,6 +68,34 @@ class PlanInput:
     extra_verify_prev_slot_indices: torch.Tensor
     extra_verify_num_valid: torch.Tensor
 
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        bs_capacity: int,
+        extra_verify_capacity: int,
+        device: torch.device,
+    ) -> "PlanInput":
+        return cls(
+            fb_req_pool_indices=torch.zeros(
+                bs_capacity, dtype=torch.int64, device=device
+            ),
+            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
+            fb_extend_seq_lens=torch.zeros(
+                bs_capacity, dtype=torch.int32, device=device
+            ),
+            extra_verify_slot_indices=torch.zeros(
+                extra_verify_capacity, dtype=torch.int32, device=device
+            ),
+            extra_verify_positions=torch.zeros(
+                extra_verify_capacity, dtype=torch.int32, device=device
+            ),
+            extra_verify_prev_slot_indices=torch.zeros(
+                extra_verify_capacity, dtype=torch.int32, device=device
+            ),
+            extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+
 
 def fill_plan_input_per_forward(
     *,

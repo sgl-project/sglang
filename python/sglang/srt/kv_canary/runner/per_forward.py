@@ -79,20 +79,10 @@ class PerForwardOrchestrator:
         )
 
         bs_capacity = max(1, per_forward_write_req_capacity)
-        self._plan_input_per_forward = PlanInput(
-            fb_req_pool_indices=torch.zeros(
-                bs_capacity, dtype=torch.int64, device=device
-            ),
-            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
-            fb_extend_seq_lens=torch.zeros(
-                bs_capacity, dtype=torch.int32, device=device
-            ),
-            extra_verify_slot_indices=torch.zeros(0, dtype=torch.int32, device=device),
-            extra_verify_positions=torch.zeros(0, dtype=torch.int32, device=device),
-            extra_verify_prev_slot_indices=torch.zeros(
-                0, dtype=torch.int32, device=device
-            ),
-            extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
+        self._plan_input_per_forward = PlanInput.allocate(
+            bs_capacity=bs_capacity,
+            extra_verify_capacity=0,
+            device=device,
         )
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
