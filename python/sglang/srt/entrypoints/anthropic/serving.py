@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
@@ -318,6 +317,29 @@ class AnthropicServing:
             tool_text = str(content) if content else ""
             return tool_text, tool_text
 
+        def _convert_assistant_thinking_blocks(
+            blocks: list[AnthropicContentBlock],
+        ) -> Optional[str]:
+            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+
+            ``redacted_thinking`` carries encrypted bytes that no local
+            parser can interpret, so we raise rather than silently drop it.
+            """
+            if any(block.type == "redacted_thinking" for block in blocks):
+                raise ValueError("Anthropic redacted_thinking history is not supported")
+
+            thinking_parts = [
+                block.thinking
+                for block in blocks
+                if block.type == "thinking" and block.thinking
+            ]
+            if not thinking_parts:
+                return None
+
+            return self.openai_serving_chat.wrap_reasoning_history(
+                "\n".join(thinking_parts)
+            )
+
         # Add system message if provided
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
@@ -343,7 +365,18 @@ class AnthropicServing:
             content_parts = []
             tool_calls = []
 
+            if msg.role == "assistant":
+                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                if reasoning_history is not None:
+                    content_parts.append({"type": "text", "text": reasoning_history})
+
             for block in msg.content:
+                # ``thinking``/``redacted_thinking`` blocks are surfaced via
+                # the reasoning-history reconstruction above; skip them here
+                # to avoid double-injecting their text into the prompt.
+                if block.type in ("thinking", "redacted_thinking"):
+                    continue
+
                 if block.type == "text" and block.text:
                     content_parts.append({"type": "text", "text": block.text})
 
@@ -436,6 +469,20 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
+        if anthropic_request.thinking is not None:
+            # ``budget_tokens`` is a hard cap that the OpenAI backend has no
+            # equivalent for. Rejecting is safer than silently ignoring —
+            # otherwise users requesting bounded thinking would get
+            # unbounded reasoning and inflated bills.
+            if anthropic_request.thinking.budget_tokens is not None:
+                raise ValueError(
+                    "Anthropic thinking.budget_tokens is not supported yet"
+                )
+            self.openai_serving_chat.apply_reasoning_enabled(
+                chat_request,
+                anthropic_request.thinking.type == "enabled",
+            )
+
         # Convert tools. Deferred tools stay in the list with defer_loading=True;
         # the chat template hides them from the initial <tools> block and renders
         # them on demand when a tool_reference block names them.
@@ -502,8 +549,10 @@ class AnthropicServing:
         raw_request: Request,
     ) -> JSONResponse:
         """Handle non-streaming Anthropic request by delegating to OpenAI handler."""
+        # ``monotonic_time`` is ``time.perf_counter`` under the hood; the
+        # downstream stats layer subtracts other ``perf_counter`` samples
+        # from this, so they must come from the same clock.
         received_time = monotonic_time()
-        received_time_perf = time.perf_counter()
 
         # Validate
         error_msg = self.openai_serving_chat._validate_request(chat_request)
@@ -516,15 +565,12 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            validation_time = time.perf_counter() - received_time_perf
             adapted_request, processed_request = (
                 self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
-            adapted_request.validation_time = validation_time
             adapted_request.received_time = received_time
-            adapted_request.received_time_perf = received_time_perf
 
             # Get response from OpenAI handler
             response = await self.openai_serving_chat._handle_non_streaming_request(
@@ -558,7 +604,6 @@ class AnthropicServing:
     ) -> Union[StreamingResponse, JSONResponse]:
         """Handle streaming Anthropic request."""
         received_time = monotonic_time()
-        received_time_perf = time.perf_counter()
 
         # Validate
         error_msg = self.openai_serving_chat._validate_request(chat_request)
@@ -570,15 +615,12 @@ class AnthropicServing:
             )
 
         try:
-            validation_time = time.perf_counter() - received_time_perf
             adapted_request, processed_request = (
                 self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
-            adapted_request.validation_time = validation_time
             adapted_request.received_time = received_time
-            adapted_request.received_time_perf = received_time_perf
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1055,6 +1097,7 @@ class AnthropicServing:
                 messages=request.messages,
                 max_tokens=1,  # dummy, not used for counting
                 system=request.system,
+                thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
             )

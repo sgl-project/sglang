@@ -25,6 +25,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _FakeOpenAIServingChat:
     def __init__(self, stream_lines=None):
         self.stream_lines = stream_lines or []
+        self.apply_reasoning_calls: list[bool] = []
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
@@ -32,6 +33,12 @@ class _FakeOpenAIServingChat:
                 yield line
 
         return _gen()
+
+    def apply_reasoning_enabled(self, chat_request, enabled):
+        self.apply_reasoning_calls.append(enabled)
+
+    def wrap_reasoning_history(self, text):
+        return f"<think>\n{text}\n</think>"
 
 
 class _FakeNonStreamingErrorOpenAI:
@@ -643,6 +650,82 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[0].thinking, "2 + 2 = 4")
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
+
+    def test_request_thinking_enabled_invokes_apply_reasoning_enabled(self):
+        """``thinking={"type": "enabled"}`` must flip the reasoning toggle on."""
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
+    def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
+        """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "disabled"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
+
+    def test_request_thinking_budget_tokens_is_rejected(self):
+        """``budget_tokens`` is not yet supported and must fail loudly."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "enabled", "budget_tokens": 1024}, stream=False
+        )
+        with self.assertRaises(ValueError):
+            serving._convert_to_chat_completion_request(request)
+
+    def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
+        """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(
+            m for m in chat_request.messages if m["role"] == "assistant"
+        )
+        content = assistant_msg["content"]
+        # Reasoning history sits in front; the thinking block itself is dropped
+        # from the prompt so its text is not duplicated.
+        if isinstance(content, list):
+            texts = [
+                part.get("text", "") if isinstance(part, dict) else ""
+                for part in content
+            ]
+        else:
+            texts = [content]
+        joined = "\n".join(texts)
+        self.assertIn("<think>", joined)
+        self.assertIn("ponder", joined)
+        self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+
+    def test_redacted_thinking_history_is_rejected(self):
+        """``redacted_thinking`` cannot be rendered by local parsers."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque"},
+                    ],
+                },
+            ],
+        )
+        with self.assertRaises(ValueError):
+            serving._convert_to_chat_completion_request(request)
 
     def test_stream_text_then_thinking_closes_text_block(self):
         """Text deltas followed by reasoning_content must close the text block before opening thinking."""

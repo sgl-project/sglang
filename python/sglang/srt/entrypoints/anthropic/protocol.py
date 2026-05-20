@@ -251,12 +251,26 @@ class AnthropicToolChoice(BaseModel):
     name: Optional[str] = None
 
 
+class AnthropicThinkingParam(BaseModel):
+    """Anthropic extended-thinking control on the request.
+
+    ``budget_tokens`` is accepted for SDK compatibility but the OpenAI
+    backend has no equivalent hard budget knob; the serving layer rejects
+    requests that set it so callers do not silently get an unbounded
+    thinking budget.
+    """
+
+    type: Literal["enabled", "disabled"]
+    budget_tokens: Optional[int] = None
+
+
 class AnthropicCountTokensRequest(BaseModel):
     """Anthropic count_tokens API request."""
 
     model: str
     messages: list[AnthropicMessage]
     system: Optional[Union[str, list[AnthropicContentBlock]]] = None
+    thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
 
@@ -278,6 +292,7 @@ class AnthropicMessagesRequest(BaseModel):
     stream: Optional[bool] = False
     system: Optional[Union[str, list[AnthropicContentBlock]]] = None
     temperature: Optional[float] = None
+    thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
