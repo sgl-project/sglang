@@ -40,13 +40,6 @@ WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 class NegotiateCall:
     prefillable: List[bool]
     token_usage: List[float]
-    # Optional scheduler state; when None, the delayer falls back to default behavior
-    running_batch: Optional[List[int]] = None
-    max_prefill_bs: Optional[List[int]] = None
-    waiting_queue_len: Optional[List[int]] = None
-    max_running_requests: Optional[int] = None
-    # Inter-call sleep (seconds) for wall-clock timeout tests
-    sleep_before_s: float = 0.0
 
 
 @dataclass
@@ -57,9 +50,6 @@ class NegotiateTestCase:
     calls: List[NegotiateCall]
     expected_allow: bool
     expected_reason: str
-    # Queue-trigger knobs (new in the queue-based delayer)
-    queue_min_ratio: Optional[float] = None
-    max_delay_ms: Optional[float] = None
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -75,31 +65,15 @@ def _run_negotiate_test(rank, test_cases):
                 enable_dp_attention=True,
                 disaggregation_mode="null",
                 disable_overlap_schedule=False,
-                prefill_delayer_queue_min_ratio=case.queue_min_ratio,
-                prefill_delayer_max_delay_ms=case.max_delay_ms,
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
         )
 
         for call in case.calls:
-            if call.sleep_before_s > 0:
-                time.sleep(call.sleep_before_s)
-
-            extra_kwargs = {}
-            if call.running_batch is not None:
-                extra_kwargs["running_batch"] = call.running_batch[rank]
-            if call.max_prefill_bs is not None:
-                extra_kwargs["max_prefill_bs"] = call.max_prefill_bs[rank]
-            if call.waiting_queue_len is not None:
-                extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
-            if call.max_running_requests is not None:
-                extra_kwargs["max_running_requests"] = call.max_running_requests
-
             result = delayer._negotiate_should_allow_prefill(
                 local_prefillable=call.prefillable[rank],
                 token_usage=call.token_usage[rank],
-                **extra_kwargs,
             )
 
         assert (result.output_allow, result.output_reason) == (
@@ -109,7 +83,6 @@ def _run_negotiate_test(rank, test_cases):
 
 
 _NEGOTIATE_TEST_CASES = [
-    # Original slot-based tests
     NegotiateTestCase(
         name="all_prefillable",
         max_delay_passes=100,
@@ -226,108 +199,6 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="wait_timeout",
     ),
-    # New queue-based trigger tests
-    NegotiateTestCase(
-        name="queue_trigger_delay",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        queue_min_ratio=0.5,
-        max_delay_ms=5000,
-        calls=[
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=1024,
-            ),
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=1024,
-            ),
-        ],
-        expected_allow=False,
-        expected_reason="delay",
-    ),
-    NegotiateTestCase(
-        name="queue_trigger_above_threshold",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        queue_min_ratio=0.5,
-        max_delay_ms=5000,
-        calls=[
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[64, 64, 64, 64],
-                max_running_requests=1024,
-            )
-        ],
-        expected_allow=True,
-        expected_reason="no_wait",
-    ),
-    NegotiateTestCase(
-        name="queue_trigger_disabled_when_ratio_unset",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        queue_min_ratio=None,
-        max_delay_ms=None,
-        calls=[
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[1, 1, 1, 1],
-                max_running_requests=1024,
-            )
-        ],
-        expected_allow=True,
-        expected_reason="no_wait",
-    ),
-    NegotiateTestCase(
-        name="queue_trigger_wall_clock_timeout",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        queue_min_ratio=0.5,
-        max_delay_ms=50,
-        calls=[
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=1024,
-            ),
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=1024,
-            ),
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=1024,
-                sleep_before_s=0.2,  # > max_delay_ms (50ms)
-            ),
-        ],
-        expected_allow=True,
-        expected_reason="wait_success",
-    ),
 ]
 
 
@@ -345,6 +216,13 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
+    """Testcase: Online serving scenario: Verify that throughput is improved by at least 5%
+    when PrefillDelayer is enabled, compared with disabled.
+
+    [Test Category] Parameter
+    [Test Target] --enable-prefill-delayer
+    """
+
     def test_throughput_comparison(self):
         _run_throughput_comparison(
             self,
@@ -362,13 +240,18 @@ class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
                 random_output_len=256,
                 request_rate=32,
             ),
-            # Temporarily disabled throughput assertion due to run-to-run noise,
-            # aligned with upstream GPU behavior.
-            min_improvement_pct=None,
+            min_improvement_pct=5,
         )
 
 
 class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
+    """Testcase: Offline generation scenario: Verify that throughput is improved by at least 20%
+    when PrefillDelayer is enabled, compared with disabled.
+
+    [Test Category] Parameter
+    [Test Target] --enable-prefill-delayer; --prefill-delayer-token-usage-low-watermark
+    """
+
     def test_throughput_comparison(self):
         _run_throughput_comparison(
             self,
@@ -395,7 +278,7 @@ def _run_throughput_comparison(
     test_name: str,
     other_launch_args,
     other_benchmark_args,
-    min_improvement_pct: Optional[float],
+    min_improvement_pct: float,
     token_usage_low_watermark: float = None,
 ):
     common_kwargs = dict(
@@ -460,7 +343,7 @@ def _assert_throughput_improvement(
     test_name: str,
     res_enabled: dict,
     res_disabled: dict,
-    min_improvement_pct: Optional[float],
+    min_improvement_pct: float,
 ):
     test_case.assertEqual(
         WORLD_SIZE,
@@ -477,10 +360,6 @@ def _assert_throughput_improvement(
         f"Total: enabled={enabled:.2f}, disabled={disabled:.2f}, improvement={improvement_pct:.2f}%"
     )
 
-    if min_improvement_pct is None:
-        # Functionality-only mode: skip the perf assertion.
-        return
-
     test_case.assertGreaterEqual(
         improvement_pct,
         min_improvement_pct,
@@ -489,6 +368,14 @@ def _assert_throughput_improvement(
 
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
+    """Testcase: Verify PrefillDelayer memory low watermark protection mechanism
+        1.With token_usage_low_watermark=0.5: When memory usage is low, force allow requests, short request latency < 5s
+        2.Without watermark configured: Long request blocks one NPU, short requests on other cards are forced to wait, latency > 5s
+
+    [Test Category] Parameter
+    [Test Target] --enable-prefill-delayer; --prefill-delayer-max-delay-passes; --prefill-delayer-token-usage-low-watermark
+    """
+
     def test_1_with_low_watermark(self):
         # The kv cache size here is deliberately small, thus we use smaller token usage
         self._run(token_usage_low_watermark=0.5)
@@ -575,6 +462,13 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
+    """Testcase: Verify that model accuracy on mgsm_en dataset ≥ 87%
+    both when PrefillDelayer is enabled and disabled.
+
+    [Test Category] Parameter
+    [Test Target] --enable-prefill-delayer
+    """
+
     def test_1_mgsm_en_has_prefill_delayer(self):
         self._run_accuracy_test(prefill_delayer=True)
 
@@ -641,6 +535,9 @@ def _launch_server(
             "131072",
             "--mem-fraction-static",
             "0.6",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
             "--enable-metrics",
             *(["--enable-prefill-delayer"] if prefill_delayer else []),
             "--prefill-delayer-max-delay-passes",
