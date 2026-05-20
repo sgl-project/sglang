@@ -45,10 +45,6 @@ class _TotalTokensBenchCase:
     total_tokens: int
     pool_kind: str
 
-    @property
-    def case_id(self) -> str:
-        return f"tt_bs{self.bs}_total{self.total_tokens}_{self.pool_kind}"
-
 
 def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
     cases: list[_TotalTokensBenchCase] = []

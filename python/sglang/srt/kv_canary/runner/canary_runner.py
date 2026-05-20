@@ -166,14 +166,6 @@ class CanaryRunner:
     def active_tag_count(self) -> int:
         return len(self._active_tags)
 
-    @property
-    def step_counter(self) -> int:
-        return self._pump_and_allreduce.step_counter
-
-    @property
-    def sweep_passes(self) -> int:
-        return self._sweep_orchestrator.sweep_passes
-
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_hook.attach_radix_cache(radix_cache)
