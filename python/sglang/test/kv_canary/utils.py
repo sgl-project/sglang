@@ -35,7 +35,7 @@ class CanaryE2EBase(CustomTestCase):
     """Common scaffold for canary server-launch e2e tests.
 
     Subclasses set ``model`` and (optionally) ``extra_server_args``,
-    ``perturb_prob``, ``perturb_seed``. ``setUpClass`` launches the server
+    ``perturb_prob``. ``setUpClass`` launches the server
     with ``--kv-canary=raise`` and ``--mem-fraction-static=0.65``
     (canary K/V tensors need headroom); subclasses can layer more args on
     via ``extra_server_args``.
@@ -53,7 +53,6 @@ class CanaryE2EBase(CustomTestCase):
     model: ClassVar[str] = ""
     extra_server_args: ClassVar[List[str]] = []
     perturb_prob: ClassVar[float] = 0.0
-    perturb_seed: ClassVar[int] = 0
     allow_launch_failure: ClassVar[bool] = False
 
     base_url: ClassVar[str] = ""
@@ -81,10 +80,8 @@ class CanaryE2EBase(CustomTestCase):
         env = os.environ.copy()
         if cls.perturb_prob > 0:
             env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB"] = str(cls.perturb_prob)
-            env["SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED"] = str(cls.perturb_seed)
         else:
             env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB", None)
-            env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED", None)
 
         other_args: List[str] = [
             "--kv-canary",

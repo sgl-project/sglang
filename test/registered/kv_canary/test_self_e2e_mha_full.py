@@ -12,8 +12,8 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar, List
 
-from sglang.test.kv_canary.utils import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.utils import CanaryE2EBase
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
 
@@ -130,7 +130,6 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         import os
 
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "1"
         super().setUpClass()
 
     @classmethod
@@ -138,7 +137,6 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         import os
 
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB", None)
-        os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED", None)
         super().tearDownClass()
 
     def test_real_data_all_perturb_kv_byte_detects_violation(self) -> None:
@@ -171,7 +169,6 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
         import os
 
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED"] = "2"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN"] = "1"
         super().setUpClass()
 
@@ -180,7 +177,6 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
         import os
 
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB", None)
-        os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED", None)
         os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN", None)
         super().tearDownClass()
 

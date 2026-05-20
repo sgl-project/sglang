@@ -666,29 +666,17 @@ class Envs:
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
     SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
-    # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
-    # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
-    # (default 1.5x). Override via env var when temporary debugging needs a
-    # wider window.
-    SGLANG_KV_CANARY_BENCH_OVERHEAD_THRESHOLD_RATIO = EnvFloat(1.5)
     # KV cache canary perturbation. When >0, the canary install hooks corrupt
     # ``req_to_token_pool`` rows with this per-write probability so the canary
     # should fire. Combined with ``--kv-canary=raise`` this gives a fault-injection
     # harness for regression-testing the canary itself.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
-    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
     # Real-KV-byte perturbation. When >0, the canary self-test hook flips one
     # byte of the real KV pool at an alive-but-not-verified-this-step slot with
     # this probability per forward, proving the periodic sweep's independent
     # detection value. Requires --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
-    # Mock-engine sampler-override per-element probability for writing the
-    # wrong input token so the canary's ``INPUT_TOKEN_MISMATCH`` fires on
-    # the next forward. Used by the canary <-> mock-oracle wiring tests in
-    # ``test/registered/mock_model/test_self_unit_canary_mock_wiring.py``.
-    SGLANG_MOCK_INPUT_PERTURB_PROB = EnvFloat(0.0)
     SGLANG_MOCK_MODEL_ORACLE_SEED = EnvInt(0)
     # ===================================================================
     # /KV-Canary / Mock-Model
