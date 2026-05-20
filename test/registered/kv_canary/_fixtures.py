@@ -1,12 +1,19 @@
-"""Shared fixtures for canary srt-integration self-unit tests."""
+"""Shared helpers for canary srt-integration self-unit tests.
+
+This module replaces the previous pytest conftest.py. Tests in this directory
+use unittest + CustomTestCase; helpers here are plain module-level functions
+and classes, plus a patch_fake_pool_helpers() context manager that takes the
+place of the old autouse fixture. The underscore prefix keeps this module
+out of run_suite.py's test discovery.
+"""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Literal, Optional
+from typing import Iterator, List, Literal, Optional
 
-import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
@@ -22,10 +29,7 @@ from sglang.srt.kv_canary.pool_patch.helpers import (
     _patch_buf_info_method,
 )
 
-
-@pytest.fixture
-def device() -> torch.device:
-    return torch.device("cpu")
+CPU_DEVICE: torch.device = torch.device("cpu")
 
 
 @dataclass
@@ -105,239 +109,226 @@ class FakeDsv4SubPool:
     kv_buffer: List[torch.Tensor]
 
 
-@pytest.fixture
-def make_mha_pool(device):
-    def _make(num_slots: int = 16, dim: int = 8, layer_num: int = 2) -> FakeMHAPool:
-        k_layers = [
-            torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
+def make_mha_pool(
+    device: torch.device = CPU_DEVICE,
+    *,
+    num_slots: int = 16,
+    dim: int = 8,
+    layer_num: int = 2,
+) -> FakeMHAPool:
+    k_layers = [
+        torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
+        for _ in range(layer_num)
+    ]
+    v_layers = [
+        torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
+        for _ in range(layer_num)
+    ]
+    return FakeMHAPool(layer_num=layer_num, k_buffer=k_layers, v_buffer=v_layers)
+
+
+def make_mla_pool(
+    device: torch.device = CPU_DEVICE,
+    *,
+    num_slots: int = 16,
+    dim: int = 16,
+    layer_num: int = 2,
+) -> FakeMLAPool:
+    kv_layers = [
+        torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
+        for _ in range(layer_num)
+    ]
+    return FakeMLAPool(layer_num=layer_num, kv_buffer=kv_layers)
+
+
+def make_swa_pool(
+    device: torch.device = CPU_DEVICE,
+    *,
+    full_slots: int = 16,
+    swa_slots: int = 8,
+    dim: int = 8,
+    layer_num: int = 1,
+) -> FakeSWAPool:
+    full = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    swa = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
+    return FakeSWAPool(
+        full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
+    )
+
+
+def make_dsv4_pool(
+    device: torch.device = CPU_DEVICE,
+    *,
+    full_slots: int = 16,
+    swa_slots: int = 8,
+    dim: int = 32,
+    layer_num: int = 1,
+    page_size: int = 128,
+) -> FakeDsv4Pool:
+    full = FakeDsv4SubPool(
+        kv_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
             for _ in range(layer_num)
         ]
-        v_layers = [
-            torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
+    )
+    swa = FakeDsv4SubPool(
+        kv_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
             for _ in range(layer_num)
         ]
-        return FakeMHAPool(layer_num=layer_num, k_buffer=k_layers, v_buffer=v_layers)
-
-    return _make
-
-
-@pytest.fixture
-def make_mla_pool(device):
-    def _make(num_slots: int = 16, dim: int = 16, layer_num: int = 2) -> FakeMLAPool:
-        kv_layers = [
-            torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
-            for _ in range(layer_num)
-        ]
-        return FakeMLAPool(layer_num=layer_num, kv_buffer=kv_layers)
-
-    return _make
+    )
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
+    return FakeDsv4Pool(
+        full_kv_pool=full,
+        swa_kv_pool=swa,
+        full_to_swa_index_mapping=lut,
+        page_size=page_size,
+    )
 
 
-@pytest.fixture
-def make_swa_pool(device):
-    def _make(
-        full_slots: int = 16, swa_slots: int = 8, dim: int = 8, layer_num: int = 1
-    ) -> FakeSWAPool:
-        full = FakeSwaSubPool(
-            k_buffer=[
-                torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ],
-            v_buffer=[
-                torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ],
-        )
-        swa = FakeSwaSubPool(
-            k_buffer=[
-                torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ],
-            v_buffer=[
-                torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ],
-        )
-        lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
-        lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
-        return FakeSWAPool(
-            full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
-        )
-
-    return _make
+def make_real_kv_source(
+    device: torch.device = CPU_DEVICE,
+    *,
+    num_slots: int = 16,
+    num_bytes_per_token: int = 8,
+    read_bytes: int = 4,
+    page_size: int = 1,
+) -> RealKvSource:
+    tensor = torch.zeros(
+        num_slots, num_bytes_per_token, dtype=torch.uint8, device=device
+    )
+    return RealKvSource(
+        tensor=tensor,
+        page_size=page_size,
+        num_bytes_per_token=num_bytes_per_token,
+        read_bytes=read_bytes,
+    )
 
 
-@pytest.fixture
-def make_dsv4_pool(device):
-    def _make(
-        full_slots: int = 16,
-        swa_slots: int = 8,
-        dim: int = 32,
-        layer_num: int = 1,
-        page_size: int = 128,
-    ) -> FakeDsv4Pool:
-        full = FakeDsv4SubPool(
-            kv_buffer=[
-                torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ]
-        )
-        swa = FakeDsv4SubPool(
-            kv_buffer=[
-                torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
-                for _ in range(layer_num)
-            ]
-        )
-        lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
-        lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
-        return FakeDsv4Pool(
-            full_kv_pool=full,
-            swa_kv_pool=swa,
-            full_to_swa_index_mapping=lut,
-            page_size=page_size,
-        )
-
-    return _make
-
-
-@pytest.fixture
-def make_real_kv_source(device):
-    def _make(
-        num_slots: int = 16,
-        num_bytes_per_token: int = 8,
-        read_bytes: int = 4,
-        page_size: int = 1,
-    ) -> RealKvSource:
-        tensor = torch.zeros(
-            num_slots, num_bytes_per_token, dtype=torch.uint8, device=device
-        )
-        return RealKvSource(
-            tensor=tensor,
-            page_size=page_size,
-            num_bytes_per_token=num_bytes_per_token,
-            read_bytes=read_bytes,
-        )
-
-    return _make
+def make_buffer_group(
+    device: torch.device = CPU_DEVICE,
+    *,
+    kind: PoolKind = PoolKind.FULL,
+    num_slots: int = 16,
+    has_v_half: bool = True,
+    real_kv_sources_k: tuple = (),
+    real_kv_sources_v: tuple = (),
+    swa_index_lut: Optional[torch.Tensor] = None,
+) -> CanaryBufferGroup:
+    k_head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+    k_tail = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+    v_head = (
+        torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+        if has_v_half
+        else None
+    )
+    v_tail = (
+        torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+        if has_v_half
+        else None
+    )
+    return CanaryBufferGroup(
+        kind=kind,
+        k_head=k_head,
+        k_tail=k_tail,
+        v_head=v_head,
+        v_tail=v_tail,
+        real_kv_sources_k=real_kv_sources_k,
+        real_kv_sources_v=real_kv_sources_v,
+        swa_index_lut=swa_index_lut,
+    )
 
 
-@pytest.fixture
-def make_buffer_group(device):
-    def _make(
-        *,
-        kind: PoolKind = PoolKind.FULL,
-        num_slots: int = 16,
-        has_v_half: bool = True,
-        real_kv_sources_k: tuple = (),
-        real_kv_sources_v: tuple = (),
-        swa_index_lut: Optional[torch.Tensor] = None,
-    ) -> CanaryBufferGroup:
-        k_head = torch.zeros(
-            num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
-        )
-        k_tail = torch.zeros(
-            num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
-        )
-        v_head = (
-            torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v_half
-            else None
-        )
-        v_tail = (
-            torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v_half
-            else None
-        )
-        return CanaryBufferGroup(
-            kind=kind,
-            k_head=k_head,
-            k_tail=k_tail,
-            v_head=v_head,
-            v_tail=v_tail,
-            real_kv_sources_k=real_kv_sources_k,
-            real_kv_sources_v=real_kv_sources_v,
-            swa_index_lut=swa_index_lut,
-        )
-
-    return _make
-
-
-@pytest.fixture
-def base_config():
+def make_base_config() -> CanaryConfig:
     return CanaryConfig(mode=CanaryMode.RAISE, real_kv_hash_mode=RealKvHashMode.OFF)
 
 
-@pytest.fixture
-def make_req_to_token_pool(device):
-    def _make(max_reqs: int = 8, max_seq_len: int = 32) -> SimpleNamespace:
-        table = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
-        pool = SimpleNamespace(req_to_token=table, size=max_reqs)
-        return pool
-
-    return _make
-
-
-@pytest.fixture
-def make_forward_batch(device):
-    def _make(
-        *,
-        req_pool_indices: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        extend_prefix_lens: Optional[torch.Tensor] = None,
-        extend_seq_lens: Optional[torch.Tensor] = None,
-        is_extend: bool = False,
-        input_ids: Optional[torch.Tensor] = None,
-        positions: Optional[torch.Tensor] = None,
-        out_cache_loc: Optional[torch.Tensor] = None,
-    ) -> SimpleNamespace:
-        mode = SimpleNamespace(
-            is_extend=lambda: is_extend,
-            is_mixed=lambda: False,
-        )
-        return SimpleNamespace(
-            forward_mode=mode,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            positions=positions,
-            out_cache_loc=out_cache_loc,
-        )
-
-    return _make
+def make_req_to_token_pool(
+    device: torch.device = CPU_DEVICE,
+    *,
+    max_reqs: int = 8,
+    max_seq_len: int = 32,
+) -> SimpleNamespace:
+    table = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
+    return SimpleNamespace(req_to_token=table, size=max_reqs)
 
 
-@pytest.fixture
-def make_radix_cache(device):
-    """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path."""
+def make_forward_batch(
+    device: torch.device = CPU_DEVICE,
+    *,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    extend_prefix_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens: Optional[torch.Tensor] = None,
+    is_extend: bool = False,
+    input_ids: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+) -> SimpleNamespace:
+    mode = SimpleNamespace(
+        is_extend=lambda: is_extend,
+        is_mixed=lambda: False,
+    )
+    return SimpleNamespace(
+        forward_mode=mode,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        extend_prefix_lens=extend_prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+    )
 
+
+def make_radix_cache(slot_lists: List[List[int]], device: torch.device = CPU_DEVICE):
+    """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path.
+
+    slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.
+    """
     from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
-    def _make(slot_lists: List[List[int]]) -> RadixCache:
-        """slot_lists[0] = root.value (usually empty), [1+] = children chained linearly."""
-        cache = RadixCache.__new__(RadixCache)
-        cache.device = device
-        cache.page_size = 1
-        cache.disable = False
+    cache = RadixCache.__new__(RadixCache)
+    cache.device = device
+    cache.page_size = 1
+    cache.disable = False
 
-        root = TreeNode()
-        root.value = torch.tensor(
-            slot_lists[0] if slot_lists else [], dtype=torch.int32, device=device
-        )
-        cache.root_node = root
+    root = TreeNode()
+    root.value = torch.tensor(
+        slot_lists[0] if slot_lists else [], dtype=torch.int32, device=device
+    )
+    cache.root_node = root
 
-        current = root
-        for child_slots in slot_lists[1:]:
-            child = TreeNode()
-            child.value = torch.tensor(child_slots, dtype=torch.int32, device=device)
-            child.parent = current
-            current.children[child.id] = child
-            current = child
+    current = root
+    for child_slots in slot_lists[1:]:
+        child = TreeNode()
+        child.value = torch.tensor(child_slots, dtype=torch.int32, device=device)
+        child.parent = current
+        current.children[child.id] = child
+        current = child
 
-        return cache
-
-    return _make
+    return cache
 
 
 @register_canary_adapter(FakeMHAPool)
@@ -482,8 +473,8 @@ class _FakeDsv4Adapter:
         )
 
 
-@pytest.fixture(autouse=True)
-def _patch_fake_pool_helpers(monkeypatch):
+@contextmanager
+def patch_fake_pool_helpers() -> Iterator[None]:
     """Patch _slot_count / _swa_index_lut helpers in pool_patch to recognize Fake pools."""
     from sglang.srt.kv_canary.pool_patch import helpers as pp
 
@@ -508,5 +499,10 @@ def _patch_fake_pool_helpers(monkeypatch):
             return pool.full_to_swa_index_mapping
         return original_swa_lut(pool)
 
-    monkeypatch.setattr(pp, "_slot_count", patched_slot_count)
-    monkeypatch.setattr(pp, "_swa_index_lut", patched_swa_lut)
+    pp._slot_count = patched_slot_count
+    pp._swa_index_lut = patched_swa_lut
+    try:
+        yield
+    finally:
+        pp._slot_count = original_slot_count
+        pp._swa_index_lut = original_swa_lut
