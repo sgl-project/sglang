@@ -92,6 +92,7 @@ class CanaryEndpoint:
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
         )
+
         # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
         # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". Under cuda-graph capture the
         # implicit casts/gather below are routed through PyTorch's private mempool — addresses are pinned on
