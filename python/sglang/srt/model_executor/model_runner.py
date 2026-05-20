@@ -3189,19 +3189,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
-    def maybe_invalidate_swa_loc_cache(self) -> None:
-        """Invalidate the SWA loc translation cache before each forward/graph entry.
-
-        Must be called once per forward pass so translate_loc_from_full_to_swa
-        recomputes on the first SWA layer rather than returning a stale result from
-        the previous batch (allocator address reuse, CUDA graph warmup, etc.).
-        """
-        if self.is_hybrid_swa:
-            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
-                self.token_to_kv_pool.invalidate_loc_cache()
-
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3257,9 +3244,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
-        # Invalidate SWA loc translation cache before any translate call in this
-        # forward; closes the allocator-address-reuse window between batches.
-        self.maybe_invalidate_swa_loc_cache()
+        # Invalidate SWA loc translation cache so the first translate call in this
+        # forward computes fresh results. Called here once per batch to close the
+        # allocator-address-reuse window between batches.
+        if self.is_hybrid_swa:
+            self.token_to_kv_pool.invalidate_loc_cache()
 
         # Hisparse coordinator
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
