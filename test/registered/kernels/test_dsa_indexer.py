@@ -425,7 +425,9 @@ class TestDSAIndexer(CustomTestCase):
             "Output should have padding or exact topk size",
         )
 
-    def _make_tie_free_logits(self, batch_size: int, max_score_len: int) -> torch.Tensor:
+    def _make_tie_free_logits(
+        self, batch_size: int, max_score_len: int
+    ) -> torch.Tensor:
         perm = torch.argsort(
             torch.randn(
                 batch_size, max_score_len, dtype=torch.float32, device=self.device
