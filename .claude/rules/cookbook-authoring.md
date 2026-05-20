@@ -312,7 +312,7 @@ Template:
   // initState returned. The `fc` argument is config.playgroundFeatures[axisId].
   // The `sel` argument is the current base cell selection. The `h`
   // argument is the helpers bundle (strip/insert primitives + anchors).
-  apply: ({ flags, env, value, fc, sel, h }) => {
+  apply: ({ flags, env, value, fc, sel, h, derived }) => {
     if (/* value is the inherit-base sentinel */) return { flags, env };
     flags = h.stripFlagsByFirstToken(flags, [/* prefixes this axis owns */]);
     if (/* an option is picked */) {
@@ -325,6 +325,17 @@ Template:
     return { flags, env };
   },
 
+  // Optional: read the base cell's flag array back into the same shape
+  // initState/apply use. Render shows this as the default dropdown
+  // selection when the state slot is the inherit sentinel — so the user
+  // sees the cell's actual --tp / MoE backend / spec preset instead of an
+  // opaque "auto." When derive returns a real value, the inherit-sentinel
+  // option is hidden from the dropdown. Apply also receives the derived
+  // value (as `derived`) and may use it as a no-op shortcut when the
+  // user's pick matches base. Skip when your axis owns flags that never
+  // appear in base cells (PD-Disagg / HiCache / MegaMoE).
+  // deriveFromBase: (cell, fc, h) => ({ ... }) | null,
+
   // Optional: hints for the renderer. Currently only pdDisagg uses this
   // to report its role banner. Omit if not needed.
   // getRenderHints: (value, fc) => ({ pdMode: ... }) | null,
@@ -333,7 +344,7 @@ Template:
   // React can track it in the engine's map loop. Return null for
   // axis-level gating (e.g. MegaMoE on Hopper). Lay out as a single
   // compact horizontal row: title on the left, fields after.
-  render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
+  render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
     if (/* axis-level gating fails */) return null;
     return (
       <div key={axisId} style={s.card}>
@@ -369,11 +380,20 @@ Template:
   compound axes, do `setValue({ ...value, [k]: nextK })`.
 - Layout: one `s.compactRow` per axis card, `s.axisTitle` for the
   leading label, one `s.field` per (label + input) pair. Use
-  `renderSelect(current, entries, onPick, base, labelFor?)` for any
-  field with more than two options; reserve `renderChip` for pure
+  `renderSelect(current, entries, onPick, base, labelFor?, opts?)` for
+  any field with more than two options; reserve `renderChip` for pure
   on/off toggles. `renderSelect` filters hidden chips and disables
   greyed-out ones internally — no per-chip `evaluateChip` loop needed
-  in the render body.
+  in the render body. Pass `{ hideValues: [<sentinel>] }` when your
+  `deriveFromBase` resolved to a real value, so the inherit-sentinel
+  ("auto" / "Inherited" / "current") doesn't clutter the dropdown.
+- Default-from-base: if your axis can be read out of base cells'
+  flags, implement `deriveFromBase` and have your render show the
+  derived value when state is the sentinel (e.g.
+  `const eff = value.tp !== null ? value.tp : (derived && derived.tp)`).
+  This is what makes a fresh playground load show the user's actual
+  recipe instead of "auto." Flag-parsing helpers on `h`:
+  `parseIntFlag`, `hasFlag`, `findFlagArg`.
 - **Avoid the `in` operator wrapped in unary** (`!(x in y)`). Mintlify's
   AST walker crashes on it (`TypeError: this[e] is not a function`). Use
   `obj.key === undefined` or `obj.id !== undefined` instead. Bare
