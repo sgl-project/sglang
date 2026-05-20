@@ -156,7 +156,6 @@ def _router_triton_kernel(
         selected_idx = tl.where(slot, win_lane, selected_idx)
         cur = tl.where(offs_n == win_lane, -float("inf"), cur)
 
-    # Sum routed weights (excludes fused shared experts) ??? used for renorm + shared weight.
     routed_sum = tl.sum(tl.where(mask_k_routed, selected_vals, 0.0), axis=0)
 
     # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,

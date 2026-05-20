@@ -74,8 +74,6 @@ def _torch_reference(
     return weights, indices
 
 
-# Power-of-two num_experts that the CUDA reference supports; 128-512 is the
-# sweet-spot range for big MoEs (DeepSeek V3/V4 = 256, Kimi K2 ??? 384/512).
 _NUM_EXPERTS_FULL = [128, 256, 384, 512]
 _NUM_EXPERTS_CI = [128, 256, 512]
 _M_FULL = [1, 7, 64, 256, 1024]
