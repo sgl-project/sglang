@@ -453,6 +453,48 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertLess(text_stop_idx, tool_start_idx)
 
+    def test_stream_tool_use_without_arguments_is_not_empty_completion(self):
+        """A zero-argument tool call is valid content even without input_json_delta."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "ping", "arguments": ""},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "ping")
+        message_delta = next(
+            event for event in events if event["type"] == "message_delta"
+        )
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
     def test_stream_no_usage_chunk_emits_error_event(self):
         """Stream that yields only [DONE] (no content delta) must surface as an error event."""
         serving = self._serving(["data: [DONE]\n\n"])

@@ -847,6 +847,10 @@ class AnthropicServing:
                             ),
                         ):
                             yield _emit(event)
+                        # A zero-argument tool call may never emit an
+                        # input_json_delta; the tool_use start block itself is
+                        # still meaningful content because it carries id/name.
+                        had_content_delta = True
 
                         if tc_func.arguments:
                             yield _emit(
