@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +32,7 @@ from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_pp_indices,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -598,6 +601,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -605,6 +609,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.start_layer = start_layer
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
@@ -745,10 +750,16 @@ class Qwen2MoeModel(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,

@@ -37,9 +37,20 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    cpu_offload_flags_for_layerwise_components,
+    layerwise_component_matches_any_selection,
+    normalize_layerwise_offload_components,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.server_args_auto_tune import (
+    PERFORMANCE_MODES,
+    ServerArgsAutoTuner,
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
@@ -62,21 +73,11 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-# Derived from single-H200 benchmarking (~140.4 GiB total) at the maximum
-# supported 720p workloads with dit_layerwise_offload=False and
-# num_inference_steps=1:
-# - Wan-AI/Wan2.2-T2V-A14B-Diffusers, 1280x720, 81 frames:
-#   peak_reserved=108076 MB (~105.5 GiB), peak_allocated=97665 MB (~95.4 GiB)
-# - OpenMOSS-Team/MOVA-720p, 1280x720, 193 frames:
-#   peak_reserved=130264 MB (~127.2 GiB), peak_allocated=108819 MB (~106.3 GiB)
-# Also, on H200, enabling dit_layerwise_offload regressed latency noticeably on
-# our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
-# GPUs on the faster no-offload default while preserving some headroom.
-WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -148,6 +149,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
+    performance_mode: str = "auto"
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -179,6 +181,7 @@ class ServerArgs(DisaggArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
@@ -186,20 +189,29 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
+    # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
+    layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
-    use_fsdp_inference: bool = False
+    use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -320,8 +332,16 @@ class ServerArgs(DisaggArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
-        self._adjust_offload()
+        auto_tuner = ServerArgsAutoTuner(self)
+        auto_tuner.adjust_based_on_performance_mode()
+        if auto_tuner.could_override_server_args():
+            self._adjust_offload()
+            auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
+        if auto_tuner.could_override_server_args():
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
+            auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -330,7 +350,9 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
+        self._adjust_layerwise_offload_components()
         self._adjust_autocast()
+        auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
 
     def _validate_parameters(self):
@@ -475,6 +497,24 @@ class ServerArgs(DisaggArgsMixin):
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
             self._is_ltx23_model_path(self.model_path)
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
+
+    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
+        return (
+            self.ltx2_two_stage_device_mode == "snapshot"
+            and self._is_ltx23_two_stage_pipeline()
+        )
+
+    def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
+        if (
+            self.ltx2_two_stage_device_mode != "resident"
+            or not self._is_ltx23_two_stage_pipeline()
+            or not current_platform.is_cuda()
+        ):
+            return False
+        return (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
         )
 
     def _adjust_attention_backend(self):
@@ -652,28 +692,45 @@ class ServerArgs(DisaggArgsMixin):
         )
 
         if self.strict_ports:
+            requested_ports = []
             if needs_http:
-                self._require_port(self.port, "HTTP")
-            self._require_port(self.scheduler_port, "Scheduler")
+                requested_ports.append((self.port, "HTTP"))
+            requested_ports.append((self.scheduler_port, "Scheduler"))
             if self.master_port is not None:
-                self._require_port(self.master_port, "Master")
+                requested_ports.append((self.master_port, "Master"))
+            seen_ports: dict[int, str] = {}
+            for port, name in requested_ports:
+                if port in seen_ports:
+                    raise RuntimeError(
+                        f"{name} port {port} duplicates {seen_ports[port]} port and "
+                        "--strict-ports is enabled."
+                    )
+                seen_ports[port] = name
+                self._require_port(port, name)
         else:
+            settled_ports: set[int] = set()
             if needs_http:
                 self.port = self.settle_port(self.port)
+                settled_ports.add(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
-            self.scheduler_port = self.settle_port(initial_scheduler_port)
-            self.master_port = self.settle_port(self.master_port, 37)
+            self.scheduler_port = self.settle_port(
+                initial_scheduler_port, avoid=settled_ports
+            )
+            settled_ports.add(self.scheduler_port)
+            if self.master_port is not None:
+                self.master_port = self.settle_port(
+                    self.master_port, 37, avoid=settled_ports
+                )
 
     def _adjust_parallelism(self):
-        tp_unspecified = self.tp_size is None
         sp_unspecified = self.sp_degree is None
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
-        if current_platform.is_cpu() and self.tp_size > 1:
+        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
@@ -698,7 +755,8 @@ class ServerArgs(DisaggArgsMixin):
         if cfg_unspecified:
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
-                self.num_gpus >= 2
+                self.performance_mode != "manual"
+                and self.num_gpus >= 2
                 and self.num_gpus % cfg_group_size == 0
                 and sp_unspecified
                 and ulysses_unspecified
@@ -786,38 +844,93 @@ class ServerArgs(DisaggArgsMixin):
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
+            self.layerwise_offload_components = None
 
-        # automatically enable dit_layerwise_offload for Wan/MOVA models if appropriate
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
-            if (
-                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
-            ) and self.dit_layerwise_offload is None:
-                auto_enable_layerwise_offload = (
-                    current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-                )
-                if auto_enable_layerwise_offload and current_platform.is_cuda():
-                    device_total_memory_gb = (
-                        current_platform.get_device_total_memory() / BYTES_PER_GB
-                    )
-                    if (
-                        device_total_memory_gb
-                        >= WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB
-                    ):
-                        logger.info(
-                            "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
-                            self.pipeline_config.__class__.__name__,
-                            device_total_memory_gb,
-                        )
-                        auto_enable_layerwise_offload = False
-                        self.dit_layerwise_offload = False
+    def is_arg_explicitly_set(self, arg_name: str) -> bool:
+        return arg_name in self._explicit_arg_names
 
-                if auto_enable_layerwise_offload:
-                    logger.info(
-                        f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
-                        "for low memory and performance balance"
-                    )
-                    self.dit_layerwise_offload = True
+    def should_configure_layerwise_offload_for_lazy_component(
+        self, component_name: str
+    ) -> bool:
+        """Return whether a lazy-loaded component should try layerwise offload.
+
+        Lazy components are loaded after the normal pipeline-wide configuration
+        pass, so they should only attempt layerwise configuration when their
+        component name is covered by the selected layerwise scope.
+        """
+        component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if not component_names:
+            return False
+        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+            return True
+        return layerwise_component_matches_any_selection(
+            component_name, component_names
+        )
+
+    @property
+    def is_dit_layerwise_offload_selected(self) -> bool:
+        """returns if dit is selected to be layerwise-offload"""
+        component_names = self.layerwise_offload_components
+        return bool(
+            component_names
+            and "dit_cpu_offload"
+            in cpu_offload_flags_for_layerwise_components(component_names)
+        )
+
+    def _adjust_layerwise_offload_components(self):
+        explicitly_set_component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if self.dit_layerwise_offload:
+            if explicitly_set_component_names is None:
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
+                explicitly_set_component_names = [
+                    LAYERWISE_OFFLOAD_DIT_GROUP,
+                    *explicitly_set_component_names,
+                ]
+
+        if explicitly_set_component_names is not None:
+            self.layerwise_offload_components = explicitly_set_component_names
+            self._disable_cpu_offload_for_layerwise_components(
+                explicitly_set_component_names
+            )
+            return
+
+    def _disable_cpu_offload_for_layerwise_components(
+        self, component_names: list[str]
+    ) -> None:
+        # Layerwise offload owns H2D/D2H for selected component weights.
+        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
+        disabled_flag_names: list[str] = []
+
+        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
+            self.dit_cpu_offload = False
+            disabled_flag_names.append("dit_cpu_offload")
+        if (
+            "text_encoder_cpu_offload" in flag_names
+            and self.text_encoder_cpu_offload is not False
+        ):
+            self.text_encoder_cpu_offload = False
+            disabled_flag_names.append("text_encoder_cpu_offload")
+        if (
+            "image_encoder_cpu_offload" in flag_names
+            and self.image_encoder_cpu_offload is not False
+        ):
+            self.image_encoder_cpu_offload = False
+            disabled_flag_names.append("image_encoder_cpu_offload")
+        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            self.vae_cpu_offload = False
+            disabled_flag_names.append("vae_cpu_offload")
+
+        if disabled_flag_names:
+            logger.info(
+                "Disabling %s because the selected layerwise offload components "
+                "manage the same weights.",
+                ", ".join(disabled_flag_names),
+            )
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -960,6 +1073,22 @@ class ServerArgs(DisaggArgsMixin):
             help="The specific model version to use (can be a branch name, tag name, or commit id)",
         )
 
+        parser.add_argument(
+            "--performance-mode",
+            "--mode",
+            type=str,
+            choices=PERFORMANCE_MODES,
+            default=ServerArgs.performance_mode,
+            help=(
+                "Preset for performance and memory defaults. "
+                "'manual' keeps performance-related server args under explicit user control, no adjustment is made; "
+                "'auto' keeps safe defaults and applies high-confidence FSDP/CFG improvements; "
+                "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
+                "'memory' favors lower GPU memory usage; "
+                "Explicit offload/FSDP/parallelism flags take precedence."
+            ),
+        )
+
         # Parallelism
         parser.add_argument(
             "--num-gpus",
@@ -967,7 +1096,6 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
-
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -994,9 +1122,9 @@ class ServerArgs(DisaggArgsMixin):
         )
         parser.add_argument(
             "--enable-cfg-parallel",
-            action="store_true",
+            action=StoreBoolean,
             default=None,
-            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
+            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
         )
         parser.add_argument(
             "--cfg-parallel-size",
@@ -1085,6 +1213,7 @@ class ServerArgs(DisaggArgsMixin):
             help="The number of warmup steps to perform for each resolution.",
         )
 
+        # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -1094,8 +1223,22 @@ class ServerArgs(DisaggArgsMixin):
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan, MOVA). "
-            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
+            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
+            "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+        )
+        parser.add_argument(
+            "--layerwise-offload-components",
+            "--layerwise-offload-modules",
+            type=str,
+            nargs="+",
+            default=ServerArgs.layerwise_offload_components,
+            help="Select pipeline components for layerwise offload. "
+            "Use dit to select the DiT layerwise group, default for the default group "
+            "(currently text_encoder, image_encoder, and vae), "
+            "or all to select every layerwise-offloadable component. "
+            "This option does not imply --dit-layerwise-offload. Example: "
+            "--layerwise-offload-components text_encoder image_encoder vae.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -1103,11 +1246,8 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
-        parser.add_argument(
-            "--use-fsdp-inference",
-            action=StoreBoolean,
-            help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
-        )
+
+        # offload flags
         parser.add_argument(
             "--text-encoder-cpu-offload",
             action=StoreBoolean,
@@ -1122,6 +1262,12 @@ class ServerArgs(DisaggArgsMixin):
             "--vae-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for VAE. Enable if run out of memory.",
+        )
+
+        parser.add_argument(
+            "--use-fsdp-inference",
+            action=StoreBoolean,
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
         )
         parser.add_argument(
             "--pin-cpu-memory",
@@ -1148,12 +1294,31 @@ class ServerArgs(DisaggArgsMixin):
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # quantization
         parser.add_argument(
             "--quantization",
             type=str,
-            default=None,
-            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
-            "When set, the transformer loader will use this instead of auto-detection.",
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Applies to both pre-quantized checkpoints and online "
+                "quantization. Use this flag to override auto-detection. "
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+            ),
+        )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
+            ),
         )
 
         # Nunchaku SVDQuant quantization parameters
@@ -1271,6 +1436,17 @@ class ServerArgs(DisaggArgsMixin):
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
         parser.add_argument(
+            "--lora-merge-mode",
+            type=str,
+            choices=LORA_MERGE_MODES,
+            default=ServerArgs.lora_merge_mode,
+            help=(
+                "How LoRA is applied: auto keeps static merge for regular weights "
+                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "merge always merges into base weights; dynamic always applies LoRA at forward time."
+            ),
+        )
+        parser.add_argument(
             "--lora-weight-name",
             type=str,
             default=ServerArgs.lora_weight_name,
@@ -1342,16 +1518,21 @@ class ServerArgs(DisaggArgsMixin):
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
+        self,
+        port: int,
+        port_inc: int = 42,
+        max_attempts: int = 100,
+        avoid: set[int] | None = None,
     ) -> int:
         """
         Find an available port with retry logic.
         """
         attempts = 0
         original_port = port
+        avoid = avoid or set()
 
         while attempts < max_attempts:
-            if is_port_available(port):
+            if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
                         f"Port {original_port} was unavailable, using port {port} instead"
@@ -1493,12 +1674,13 @@ class ServerArgs(DisaggArgsMixin):
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
+        server_args_kwargs["_explicit_arg_names"] = set(kwargs)
 
         for attr in attrs:
             if attr == "pipeline_config":
@@ -1534,6 +1716,8 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        explicit_arg_names = set(kwargs)
+
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
@@ -1542,6 +1726,7 @@ class ServerArgs(DisaggArgsMixin):
         convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
+        kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
     @staticmethod
@@ -1562,6 +1747,10 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
+        if "mode" in provided_arg_names:
+            provided_arg_names.add("performance_mode")
+        if "layerwise_offload_modules" in provided_arg_names:
+            provided_arg_names.add("layerwise_offload_components")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1594,34 +1783,36 @@ class ServerArgs(DisaggArgsMixin):
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
             )
 
-        # validate dit_layerwise_offload conflicts
-        if self.dit_layerwise_offload:
+        # validate layerwise offload conflicts
+        if self.layerwise_offload_components:
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            if self.use_fsdp_inference:
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
                 logger.warning(
-                    "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
+                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            if self.dit_cpu_offload is None:
+            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
-                    "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
+                    "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
                 )
                 self.dit_cpu_offload = False
 
-            if envs.SGLANG_CACHE_DIT_ENABLED:
+            if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
                 raise ValueError(
-                    "dit_layerwise_offload cannot be enabled together with cache-dit. "
+                    "DiT layerwise offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
                     "causing shape mismatch errors. "
-                    "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
+                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
+                    "or disable SGLANG_CACHE_DIT_ENABLED."
                 )
 
             logger.warning(
-                "dit_layerwise_offload is enabled: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
-                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping dit_layerwise_offload disabled.%s "
+                "layerwise offload components are selected: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
+                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping layerwise offload disabled.%s "
                 "Please tune this based on your memory headroom and performance target.",
                 GREEN,
                 RESET,
