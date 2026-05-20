@@ -8,6 +8,7 @@ Before optimizing the performance, you need to obtain accurate performance data,
 
 ### Network
 '''
+
     import torch
     import torch_npu
     
@@ -49,7 +50,10 @@ Before optimizing the performance, you need to obtain accurate performance data,
         for step in range(steps):
             train_one_step(step, steps, train_loader, model, optimizer, criterion)
             prof.step()
+
 '''
+
+
 Refer to the function event_loop_overlap of this document https://github.com/sgl-project/sglang/blob/ifmn/eagle-dp-attn/python/sglang/srt/managers/scheduler.py to revise the same function in scheduler.py
 
 
