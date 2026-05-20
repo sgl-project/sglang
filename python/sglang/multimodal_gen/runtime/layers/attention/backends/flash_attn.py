@@ -1,8 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
 import inspect
 import os
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
