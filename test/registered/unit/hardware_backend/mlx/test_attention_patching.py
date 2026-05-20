@@ -781,9 +781,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
     def test_finalize_pending_job_updates_scheduler_last_batch(self):
         token_ids = torch.tensor([7], dtype=torch.long)
         scheduler = FakeOverlapScheduler(token_ids)
-        stale_batch = SimpleNamespace(output_ids=None)
-        batch_copy = SimpleNamespace(output_ids=None)
-        schedule_batch = SimpleNamespace(output_ids=None)
+        stale_batch = SimpleNamespace(input_ids=None)
+        batch_copy = SimpleNamespace(input_ids=None)
+        schedule_batch = SimpleNamespace(input_ids=None)
         scheduler.last_batch = stale_batch
 
         pending = MlxPendingJob(
@@ -800,8 +800,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler._finalize_mlx_pending_job(pending)
 
         self.assertIs(scheduler.last_batch, schedule_batch)
-        self.assertTrue(torch.equal(batch_copy.output_ids, token_ids))
-        self.assertTrue(torch.equal(schedule_batch.output_ids, token_ids))
+        self.assertTrue(torch.equal(batch_copy.input_ids, token_ids))
+        self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
 
