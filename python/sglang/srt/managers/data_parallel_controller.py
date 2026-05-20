@@ -87,11 +87,16 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, dp_size: int):
+    def __init__(self, dp_size: int, reserved_tokens_per_req: int = 0):
         self.dp_size = dp_size
+        self.reserved_tokens_per_req = max(0, reserved_tokens_per_req)
         self._tie_breaker = 0
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.sent_dispatch_seqs = [0] * dp_size
+        self.sent_dispatch_cum_tokens = [0] * dp_size
+        self.acked_dispatch_seqs = [0] * dp_size
+        self.acked_dispatch_cum_tokens = [0] * dp_size
 
     def _choose_min_rank(self, key_fn: Callable[[int], object]):
         min_key = min(key_fn(i) for i in range(self.dp_size))
@@ -102,14 +107,54 @@ class DPBudget:
                 return dp_rank
         raise RuntimeError("No data parallel rank is available for dispatch.")
 
+    def get_effective_load(self, load):
+        dp_rank = load.dp_rank
+        acked_seq = max(
+            self.acked_dispatch_seqs[dp_rank],
+            getattr(load, "dp_dispatch_ack_seq", 0),
+        )
+        acked_tokens = max(
+            self.acked_dispatch_cum_tokens[dp_rank],
+            getattr(load, "dp_dispatch_ack_cum_tokens", 0),
+        )
+        acked_seq = min(acked_seq, self.sent_dispatch_seqs[dp_rank])
+        acked_tokens = min(acked_tokens, self.sent_dispatch_cum_tokens[dp_rank])
+
+        unacked_requests = self.sent_dispatch_seqs[dp_rank] - acked_seq
+        unacked_tokens = self.sent_dispatch_cum_tokens[dp_rank] - acked_tokens
+        reported_requests = load.num_running_reqs + load.num_waiting_reqs
+        pending_output_tokens = getattr(load, "num_pending_output_tokens", None)
+        if pending_output_tokens is None:
+            pending_output_tokens = (
+                reported_requests * self.reserved_tokens_per_req
+            )
+
+        return (
+            reported_requests + unacked_requests,
+            load.num_total_tokens + pending_output_tokens + unacked_tokens,
+        )
+
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget."""
         for load in load_update.loads:
             dp_rank = load.dp_rank
-            self.total_requests[dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
+            acked_seq = max(
+                self.acked_dispatch_seqs[dp_rank],
+                getattr(load, "dp_dispatch_ack_seq", 0),
             )
-            self.total_tokens[dp_rank] = load.num_total_tokens
+            acked_tokens = max(
+                self.acked_dispatch_cum_tokens[dp_rank],
+                getattr(load, "dp_dispatch_ack_cum_tokens", 0),
+            )
+            self.acked_dispatch_seqs[dp_rank] = min(
+                acked_seq, self.sent_dispatch_seqs[dp_rank]
+            )
+            self.acked_dispatch_cum_tokens[dp_rank] = min(
+                acked_tokens, self.sent_dispatch_cum_tokens[dp_rank]
+            )
+            total_requests, total_tokens = self.get_effective_load(load)
+            self.total_requests[dp_rank] = total_requests
+            self.total_tokens[dp_rank] = total_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -122,10 +167,16 @@ class DPBudget:
         else:
             return None
 
-        # Increment the load of that worker by one as a heuristic
+        # Increment the load of that worker by one as a heuristic.
+        self.sent_dispatch_seqs[target_rank] += 1
+        self.sent_dispatch_cum_tokens[target_rank] += estimated_tokens
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
-        return target_rank
+        return (
+            target_rank,
+            self.sent_dispatch_seqs[target_rank],
+            self.sent_dispatch_cum_tokens[target_rank],
+        )
 
 
 class DataParallelController:
@@ -149,10 +200,17 @@ class DataParallelController:
         self.global_balance_id = 0
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq.Context(2 + server_args.dp_size)
+        self.recv_from_scheduler_load_updates = None
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.recv_from_scheduler_load_updates = get_zmq_socket(
+                self.context,
+                zmq.PULL,
+                port_args.scheduler_load_update_ipc_name,
+                True,
             )
 
         # Dispatch method
@@ -166,7 +224,12 @@ class DataParallelController:
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
-        self.dp_budget = DPBudget(server_args.dp_size)
+        reserved_tokens_per_req = (
+            server_args.num_reserved_decode_tokens
+            if server_args.disaggregation_mode == "decode"
+            else 0
+        )
+        self.dp_budget = DPBudget(server_args.dp_size, reserved_tokens_per_req)
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -257,6 +320,9 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.scheduler_load_update_ipc_name = (
+                port_args.scheduler_load_update_ipc_name
+            )
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -608,26 +674,82 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker, dispatch_seq, dispatch_cum_tokens = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS
+        )
+        req.dp_dispatch_seq = dispatch_seq
+        req.dp_dispatch_cum_tokens = dispatch_cum_tokens
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        estimated_tokens = len(req.input_ids)
-        target_worker = self.dp_budget.dispatch(
+        estimated_tokens = len(req.input_ids) + max(
+            0, getattr(req.sampling_params, "max_new_tokens", 0) or 0
+        )
+        target_worker, dispatch_seq, dispatch_cum_tokens = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        req.dp_dispatch_seq = dispatch_seq
+        req.dp_dispatch_cum_tokens = dispatch_cum_tokens
         self.workers[target_worker].send_pyobj(req)
+
+    def _drain_scheduler_load_updates(
+        self, drained_load_updates: List[WatchLoadUpdateReq]
+    ) -> None:
+        if self.recv_from_scheduler_load_updates is None:
+            return
+
+        while True:
+            self.soft_watchdog.feed()
+            try:
+                recv_req = self.recv_from_scheduler_load_updates.recv_pyobj(
+                    zmq.NOBLOCK
+                )
+            except zmq.ZMQError:
+                break
+            drained_load_updates.append(recv_req)
+
+    def _handle_drained_load_updates(
+        self, drained_load_updates: List[WatchLoadUpdateReq]
+    ) -> None:
+        if not drained_load_updates:
+            return
+
+        latest_load_by_rank = {}
+        for load_update_req in drained_load_updates:
+            for load in load_update_req.loads:
+                old_load = latest_load_by_rank.get(load.dp_rank)
+                if old_load is None or load.timestamp >= old_load.timestamp:
+                    latest_load_by_rank[load.dp_rank] = load
+
+        self.handle_load_update_req(
+            WatchLoadUpdateReq(
+                loads=[
+                    latest_load_by_rank[dp_rank]
+                    for dp_rank in sorted(latest_load_by_rank)
+                ]
+            )
+        )
 
     def event_loop(self):
         while True:
+            drained_load_updates = []
+            drained_reqs = []
+            self._drain_scheduler_load_updates(drained_load_updates)
             while True:
                 self.soft_watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                if isinstance(recv_req, WatchLoadUpdateReq):
+                    drained_load_updates.append(recv_req)
+                else:
+                    drained_reqs.append(recv_req)
+            self._drain_scheduler_load_updates(drained_load_updates)
+            self._handle_drained_load_updates(drained_load_updates)
+            for recv_req in drained_reqs:
                 self._request_dispatcher(recv_req)
 
 

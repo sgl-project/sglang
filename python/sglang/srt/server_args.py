@@ -7673,6 +7673,8 @@ class PortArgs:
     tokenizer_ipc_name: str
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
+    # The ipc filename for the DP controller to receive load updates from schedulers (zmq)
+    scheduler_load_update_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
@@ -7711,6 +7713,7 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_load_update_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -7730,6 +7733,7 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            scheduler_load_update_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -7745,13 +7749,19 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    wait_port_available(
+                        scheduler_load_update_port, "scheduler_load_update_port"
+                    )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
-                    f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
+                    "Port is already in use. "
+                    f"{dist_init_port=} {port_base=} {detokenizer_port=} "
+                    f"{nccl_port=} {scheduler_input_port=} "
+                    f"{scheduler_load_update_port=}"
                 )
                 raise
 
@@ -7759,6 +7769,9 @@ class PortArgs:
                 tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
+                ).to_tcp(),
+                scheduler_load_update_ipc_name=NetworkAddress(
+                    dist_init_host, scheduler_load_update_port
                 ).to_tcp(),
                 detokenizer_ipc_name=NetworkAddress(
                     dist_init_host, detokenizer_port

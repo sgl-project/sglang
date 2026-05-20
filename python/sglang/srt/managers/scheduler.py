@@ -396,6 +396,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.dp_dispatch_ack_seq = 0
+        self.dp_dispatch_ack_cum_tokens = 0
+        self._dp_dispatch_accounted: Dict[int, int] = {}
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -531,8 +534,13 @@ class Scheduler(
                     self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
-        context = zmq.Context(2)
+        context = zmq.Context(3)
         self.idle_sleeper = None
+        self.send_load_to_controller = None
+        self.dp_load_direct_update_interval = (
+            max(0.0, envs.SGLANG_DP_LOAD_DIRECT_UPDATE_INTERVAL_MS.get()) / 1000.0
+        )
+        self.dp_load_direct_next_send_time = 0.0
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
@@ -558,6 +566,13 @@ class Scheduler(
 
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            if self.dp_load_direct_update_interval > 0:
+                self.send_load_to_controller = get_zmq_socket(
+                    context,
+                    zmq.PUSH,
+                    port_args.scheduler_load_update_ipc_name,
+                    False,
+                )
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -1850,6 +1865,7 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                self.observe_dp_dispatch_accounted(recv_req)
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -1859,10 +1875,31 @@ class Scheduler(
                 else:
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
+            self.observe_dp_dispatch_accounted(recv_req)
 
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def observe_dp_dispatch_accounted(self, recv_req):
+        if isinstance(
+            recv_req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+        ):
+            for req in recv_req:
+                self.observe_dp_dispatch_accounted(req)
+            return
+
+        dispatch_seq = getattr(recv_req, "dp_dispatch_seq", 0) or 0
+        if dispatch_seq <= 0 or dispatch_seq <= self.dp_dispatch_ack_seq:
+            return
+
+        self._dp_dispatch_accounted[dispatch_seq] = (
+            getattr(recv_req, "dp_dispatch_cum_tokens", 0) or 0
+        )
+        while self.dp_dispatch_ack_seq + 1 in self._dp_dispatch_accounted:
+            next_seq = self.dp_dispatch_ack_seq + 1
+            self.dp_dispatch_ack_seq = next_seq
+            self.dp_dispatch_ack_cum_tokens = self._dp_dispatch_accounted.pop(next_seq)
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)

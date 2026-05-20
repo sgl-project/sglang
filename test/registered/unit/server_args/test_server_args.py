@@ -121,6 +121,9 @@ class TestPortArgs(unittest.TestCase):
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("ipc://"))
         self.assertTrue(port_args.scheduler_input_ipc_name.startswith("ipc://"))
+        self.assertTrue(
+            port_args.scheduler_load_update_ipc_name.startswith("ipc://")
+        )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
 
@@ -139,6 +142,9 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(
             port_args.scheduler_input_ipc_name.startswith("tcp://127.0.0.1:")
         )
+        self.assertTrue(
+            port_args.scheduler_load_update_ipc_name.startswith("tcp://127.0.0.1:")
+        )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
@@ -154,6 +160,7 @@ class TestPortArgs(unittest.TestCase):
         port_args = PortArgs.init_new(server_args, dp_rank=2, worker_ports=worker_ports)
 
         self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25008"))
+        self.assertTrue(port_args.scheduler_load_update_ipc_name.endswith(":25006"))
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))

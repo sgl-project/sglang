@@ -8,6 +8,7 @@ retested here — it's covered by DP balance integration tests.
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -16,6 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.data_parallel_controller import DPBudget, LoadBalanceMethod
 from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
+from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
 
@@ -90,7 +92,10 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         budget = DPBudget(dp_size=3)
 
         self.assertEqual(
-            [budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS) for _ in range(4)],
+            [
+                budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)[0]
+                for _ in range(4)
+            ],
             [0, 1, 2, 0],
         )
         self.assertEqual(budget.total_requests, [2, 1, 1])
@@ -99,10 +104,145 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         budget = DPBudget(dp_size=2)
 
         self.assertEqual(
-            budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=32), 0
+            budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=32)[0],
+            0,
         )
         self.assertEqual(budget.total_requests, [1, 0])
         self.assertEqual(budget.total_tokens, [32, 0])
+
+    def test_load_update_preserves_unacked_dispatched_load(self):
+        budget = DPBudget(dp_size=2, reserved_tokens_per_req=512)
+
+        target_rank, dispatch_seq, dispatch_cum_tokens = budget.dispatch(
+            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=1536
+        )
+        self.assertEqual(target_rank, 0)
+        self.assertEqual(dispatch_seq, 1)
+        self.assertEqual(dispatch_cum_tokens, 1536)
+
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(
+                        dp_rank=0,
+                        num_running_reqs=0,
+                        num_waiting_reqs=0,
+                        num_total_tokens=0,
+                        dp_dispatch_ack_seq=0,
+                        dp_dispatch_ack_cum_tokens=0,
+                    )
+                ]
+            )
+        )
+        self.assertEqual(budget.total_requests, [1, 0])
+        self.assertEqual(budget.total_tokens, [1536, 0])
+
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(
+                        dp_rank=0,
+                        num_running_reqs=1,
+                        num_waiting_reqs=0,
+                        num_total_tokens=1024,
+                        num_pending_output_tokens=512,
+                        dp_dispatch_ack_seq=1,
+                        dp_dispatch_ack_cum_tokens=1536,
+                    )
+                ]
+            )
+        )
+        self.assertEqual(budget.total_requests, [1, 0])
+        self.assertEqual(budget.total_tokens, [1536, 0])
+
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(
+                        dp_rank=0,
+                        num_running_reqs=0,
+                        num_waiting_reqs=0,
+                        num_total_tokens=0,
+                        dp_dispatch_ack_seq=1,
+                        dp_dispatch_ack_cum_tokens=1536,
+                    )
+                ]
+            )
+        )
+        self.assertEqual(budget.total_requests, [0, 0])
+        self.assertEqual(budget.total_tokens, [0, 0])
+
+    def test_total_tokens_includes_pending_output_tokens(self):
+        budget = DPBudget(dp_size=2, reserved_tokens_per_req=512)
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(
+                        dp_rank=0,
+                        num_running_reqs=1,
+                        num_waiting_reqs=1,
+                        num_total_tokens=2048,
+                        num_pending_output_tokens=1024,
+                    ),
+                    _load(
+                        dp_rank=1,
+                        num_running_reqs=1,
+                        num_waiting_reqs=1,
+                        num_total_tokens=2048,
+                        num_pending_output_tokens=256,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(budget.total_tokens, [3072, 2304])
+
+
+def _scheduler_accounting_state():
+    return SimpleNamespace(
+        dp_dispatch_ack_seq=0,
+        dp_dispatch_ack_cum_tokens=0,
+        _dp_dispatch_accounted={},
+    )
+
+
+class TestSchedulerDPDispatchAccounting(CustomTestCase):
+    def test_ack_advances_only_after_contiguous_accounting(self):
+        scheduler = _scheduler_accounting_state()
+
+        Scheduler.observe_dp_dispatch_accounted(
+            scheduler,
+            SimpleNamespace(dp_dispatch_seq=2, dp_dispatch_cum_tokens=300),
+        )
+        self.assertEqual(scheduler.dp_dispatch_ack_seq, 0)
+        self.assertEqual(scheduler.dp_dispatch_ack_cum_tokens, 0)
+
+        Scheduler.observe_dp_dispatch_accounted(
+            scheduler,
+            SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=100),
+        )
+        self.assertEqual(scheduler.dp_dispatch_ack_seq, 2)
+        self.assertEqual(scheduler.dp_dispatch_ack_cum_tokens, 300)
+        self.assertEqual(scheduler._dp_dispatch_accounted, {})
+
+    def test_duplicate_or_unstamped_request_does_not_move_ack(self):
+        scheduler = _scheduler_accounting_state()
+
+        Scheduler.observe_dp_dispatch_accounted(
+            scheduler,
+            SimpleNamespace(dp_dispatch_seq=0, dp_dispatch_cum_tokens=0),
+        )
+        Scheduler.observe_dp_dispatch_accounted(
+            scheduler,
+            SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=100),
+        )
+        Scheduler.observe_dp_dispatch_accounted(
+            scheduler,
+            SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=200),
+        )
+
+        self.assertEqual(scheduler.dp_dispatch_ack_seq, 1)
+        self.assertEqual(scheduler.dp_dispatch_ack_cum_tokens, 100)
+        self.assertEqual(scheduler._dp_dispatch_accounted, {})
 
 
 if __name__ == "__main__":

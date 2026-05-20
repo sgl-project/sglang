@@ -1020,6 +1020,21 @@ class SchedulerMetricsMixin:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        balance_reqs = list(self.running_batch.reqs)
+        for queue in waiting_queues:
+            balance_reqs.extend(queue)
+        if self.chunked_req is not None:
+            balance_reqs.append(self.chunked_req)
+
+        def _pending_output_tokens(req) -> int:
+            base_req = getattr(req, "req", req)
+            sampling_params = getattr(base_req, "sampling_params", None)
+            max_new_tokens = getattr(sampling_params, "max_new_tokens", 0) or 0
+            return max(0, max_new_tokens - len(getattr(base_req, "output_ids", ())))
+
+        num_pending_output_tokens = sum(
+            _pending_output_tokens(req) for req in balance_reqs
+        )
 
         memory = None
         if include_all or "memory" in include:
@@ -1111,6 +1126,11 @@ class SchedulerMetricsMixin:
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),
             max_running_requests=self.max_running_requests,
+            num_pending_output_tokens=num_pending_output_tokens,
+            dp_dispatch_ack_seq=getattr(self, "dp_dispatch_ack_seq", 0),
+            dp_dispatch_ack_cum_tokens=getattr(
+                self, "dp_dispatch_ack_cum_tokens", 0
+            ),
             memory=memory,
             speculative=speculative,
             lora=lora,

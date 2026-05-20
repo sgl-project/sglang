@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
+import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -13,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     GetLoadsReqInput,
+    WatchLoadUpdateReq,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -1021,6 +1024,24 @@ class SchedulerOutputProcessorMixin:
                 f"Test crash after stream_output called {self._test_stream_output_count} times"
             )
 
+    def maybe_send_direct_dp_load_update(self: Scheduler):
+        if getattr(self, "send_load_to_controller", None) is None:
+            return
+
+        now = time.time()
+        if now < self.dp_load_direct_next_send_time:
+            return
+        self.dp_load_direct_next_send_time = now + self.dp_load_direct_update_interval
+
+        load = self.get_loads(GetLoadsReqInput(include=["core"]))
+        try:
+            self.send_load_to_controller.send_pyobj(
+                WatchLoadUpdateReq(loads=[load]),
+                zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
+
     def stream_output_generation(
         self: Scheduler,
         reqs: List[Req],
@@ -1050,7 +1071,12 @@ class SchedulerOutputProcessorMixin:
         spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
-        load = self.get_loads(GetLoadsReqInput(include=["core"]))
+        self.maybe_send_direct_dp_load_update()
+        load = (
+            None
+            if getattr(self, "send_load_to_controller", None) is not None
+            else self.get_loads(GetLoadsReqInput(include=["core"]))
+        )
         routed_experts = None
         indexer_topk = None
         customized_info = {}
