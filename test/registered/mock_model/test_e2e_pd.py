@@ -32,7 +32,7 @@ _MOCK_PD_COMMON_ARGS: List[str] = [
     "--json-model-override-args",
     '{"num_hidden_layers": 1}',
     "--sampling-backend",
-    "oracle",
+    "token_oracle",
     "--kv-canary",
     "raise",
 ]
@@ -141,6 +141,7 @@ class _MockModelPDBase(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls) -> None:
         os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
+        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
         super().setUpClass()
         cls.launch_all()
 
@@ -222,6 +223,7 @@ class TestPdTransferCorruptedByteDetected(
     @classmethod
     def setUpClass(cls) -> None:
         os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
+        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
         os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
         super().setUpClass()
 

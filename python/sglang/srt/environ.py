@@ -742,6 +742,7 @@ class Envs:
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
     SGLANG_KV_CANARY_ORACLE_SEED = EnvInt(0)
+    SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
     # ===================================================================

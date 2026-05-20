@@ -96,7 +96,10 @@ LLAMA4_MODEL_ARCHS = (
     "Llama4ForCausalLM",
 )
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "oracle"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+_TOKEN_ORACLE_BACKEND_NAME = "token_oracle"
+if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+    SAMPLING_BACKEND_CHOICES.add(_TOKEN_ORACLE_BACKEND_NAME)
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -5368,7 +5371,11 @@ class ServerArgs:
             type=str,
             choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
-            help="Choose the kernels for sampling layers.",
+            help=(
+                "Choose the kernels for sampling layers. "
+                "Set SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1 to expose the "
+                "'token_oracle' test backend used by --kv-canary."
+            ),
         )
         parser.add_argument(
             "--grammar-backend",

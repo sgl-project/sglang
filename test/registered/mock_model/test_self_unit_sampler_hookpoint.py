@@ -9,7 +9,10 @@ the factory with one bound to the new oracle.
 
 from __future__ import annotations
 
+import os
 import unittest
+
+os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
 
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
@@ -29,13 +32,13 @@ class TestInstallOracleSampler(CustomTestCase):
         oracle_b = HashOracle(seed=99, vocab_size=100)
 
         hook_a = install_oracle_sampler(oracle=oracle_a)
-        self.assertIn("oracle", _CUSTOM_SAMPLER_FACTORIES)
-        self.assertIn("oracle", SAMPLING_BACKEND_CHOICES)
-        factory_a = _CUSTOM_SAMPLER_FACTORIES["oracle"]
+        self.assertIn("token_oracle", _CUSTOM_SAMPLER_FACTORIES)
+        self.assertIn("token_oracle", SAMPLING_BACKEND_CHOICES)
+        factory_a = _CUSTOM_SAMPLER_FACTORIES["token_oracle"]
         self.assertIs(hook_a.oracle, oracle_a)
 
         hook_b = install_oracle_sampler(oracle=oracle_b)
-        factory_b = _CUSTOM_SAMPLER_FACTORIES["oracle"]
+        factory_b = _CUSTOM_SAMPLER_FACTORIES["token_oracle"]
         self.assertIs(hook_b.oracle, oracle_b)
         self.assertIsNot(hook_a, hook_b)
         self.assertIsNot(factory_a, factory_b)

@@ -7,13 +7,11 @@ import torch
 from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
+from sglang.srt.server_args import _TOKEN_ORACLE_BACKEND_NAME
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-
-_ORACLE_BACKEND_NAME: str = "oracle"
 
 
 def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
@@ -21,13 +19,13 @@ def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
     TokenOracleManager so the caller can attach it to a CanaryRunner for the input-check path.
 
     sglang's main Sampler has a single-line dispatch at the top of its sample() that, when the
-    'oracle' backend is selected, delegates to _OracleSampler — which forwards to the manager
-    instance bound at registration. No monkey-patching — relies on the existing
+    'token_oracle' backend is selected, delegates to _OracleSampler — which forwards to the
+    manager instance bound at registration. No monkey-patching — relies on the existing
     sampler-backend mechanism. Calling twice replaces the previously registered manager.
     """
     manager = TokenOracleManager(oracle=oracle)
     register_sampler_backend(
-        _ORACLE_BACKEND_NAME,
+        _TOKEN_ORACLE_BACKEND_NAME,
         lambda: _OracleSampler(token_oracle_manager=manager),
     )
     return manager
@@ -38,8 +36,8 @@ class _OracleSampler(Sampler):
 
     Constructed by the factory closure register_sampler_backend installs in
     install_oracle_sampler; the closure captures a single TokenOracleManager so every sampler
-    instance dispatched for the "oracle" backend shares the same stash filled by canary's
-    before_forward.
+    instance dispatched for the "token_oracle" backend shares the same stash filled by
+    canary's before_forward.
     """
 
     def __init__(self, *, token_oracle_manager: TokenOracleManager) -> None:
