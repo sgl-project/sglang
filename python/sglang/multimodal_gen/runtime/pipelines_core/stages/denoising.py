@@ -98,6 +98,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
@@ -335,6 +336,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
                 return True
         return False
+
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # Registered from ``_prepare_denoising_loop`` after cache-dit and
+        # torch.compile finalize the transformer tree.
+        # ``getattr`` because the MPS deallocation path ``del`` s the
+        # transformer attributes between requests; the next request
+        # then re-loads and re-registers via the zero-modules retry.
+        return [
+            (getattr(self, "transformer", None), "transformer"),
+            (getattr(self, "transformer_2", None), "transformer_2"),
+        ]
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -912,8 +924,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Run one scheduler-backed denoising step in the shared base path.
 
-        Model-specific stages should override this instead of the whole loop whenever possible to achieve better performance
+        Model-specific stages should override this instead of the whole loop
+        whenever possible to achieve better performance. Overrides that bypass
+        ``_predict_noise_with_cfg`` / ``ctx.scheduler.step`` will lose the
+        inner ``predict_noise`` / ``scheduler_step`` NVTX markers emitted
+        below; mirror them in the override if those markers are needed.
         """
+        use_nvtx = self.current_use_nvtx
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -940,31 +957,33 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # 4. Run the model prediction path, including CFG when enabled.
-        noise_pred = self._predict_noise_with_cfg(
-            current_model=step.current_model,
-            latent_model_input=latent_model_input,
-            timestep=timestep,
-            batch=batch,
-            timestep_index=step.step_index,
-            attn_metadata=step.attn_metadata,
-            target_dtype=ctx.target_dtype,
-            current_guidance_scale=step.current_guidance_scale,
-            cfg_policy=ctx.cfg_policy,
-            server_args=server_args,
-            guidance=ctx.guidance,
-            latents=ctx.latents,
-        )
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            noise_pred = self._predict_noise_with_cfg(
+                current_model=step.current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=step.step_index,
+                attn_metadata=step.attn_metadata,
+                target_dtype=ctx.target_dtype,
+                current_guidance_scale=step.current_guidance_scale,
+                cfg_policy=ctx.cfg_policy,
+                server_args=server_args,
+                guidance=ctx.guidance,
+                latents=ctx.latents,
+            )
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        ctx.latents = ctx.scheduler.step(
-            model_output=noise_pred,
-            timestep=step.t_device,
-            sample=ctx.latents,
-            **ctx.extra_step_kwargs,
-            return_dict=False,
-        )[0]
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            ctx.latents = ctx.scheduler.step(
+                model_output=noise_pred,
+                timestep=step.t_device,
+                sample=ctx.latents,
+                **ctx.extra_step_kwargs,
+                return_dict=False,
+            )[0]
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1062,6 +1081,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+            # Detach NVTX hooks so the next lazy-load re-registers them
+            # against the freshly loaded transformer.
+            self._detach_nvtx_hooks()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1252,14 +1274,23 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        # Re-apply the gate after the transformer's lazy load / cache-dit /
+        # torch.compile setup, so layer hooks bind to the finalized module
+        # tree (the gate already fired once in __call__ but the lazy-load
+        # path may have registered zero modules then).
+        use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
+
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=ctx.target_dtype,
             enabled=ctx.autocast_enabled,
-        ):
+        ), maybe_nvtx_range("denoising_loop", use_nvtx):
             with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
-                    with StageProfiler(
+                    # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
+                    # use non-integer timesteps keep their precision in markers.
+                    step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
+                    with maybe_nvtx_range(step_marker, use_nvtx), StageProfiler(
                         f"denoising_step_{step_index}",
                         logger=logger,
                         metrics=batch.metrics,

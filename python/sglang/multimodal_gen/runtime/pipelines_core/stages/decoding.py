@@ -85,6 +85,9 @@ class DecodingStage(PipelineStage):
             )
         ]
 
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        return [(self.vae, self.component_name or "vae")]
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:

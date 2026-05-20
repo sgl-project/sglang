@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
@@ -64,6 +65,11 @@ class PipelineStage(StageDedupMixin, ABC):
         self._component_residency_manager = None
         self._registered_stage_name: str | None = None
         self._profile_stage_name: str | None = None
+        # Layerwise NVTX hooks; registered lazily via _apply_nvtx_gate.
+        self._nvtx_hooks: DiffusionNvtxHooks | None = None
+        self._nvtx_registered_ids: frozenset[int] = frozenset()
+        self._nvtx_zero_warned: bool = False
+        self._current_use_nvtx: bool = False
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -206,6 +212,126 @@ class PipelineStage(StageDedupMixin, ABC):
         """Declares component uses of current stage for unified residency scheduling."""
         return []
 
+    # ---- Layerwise NVTX instrumentation (--enable-layerwise-nvtx-marker) ----
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        """Modules to instrument with layerwise NVTX hooks; default none.
+
+        Override in stages that own forward-able components. Each entry
+        is ``(module, prefix)`` where ``prefix`` is prepended to every
+        emitted NVTX range name. The base implementation returns an
+        empty list — stages without instrumentable components inherit
+        a no-op.
+
+        Conventions:
+
+        * ``None`` modules are skipped silently; this is the contract
+          for lazy-loaded components (return the attribute before the
+          loader runs and the next request retries registration).
+        * If a stage may ``del`` its component attribute (e.g. the MPS
+          deallocation path on ``DenoisingStage``), use
+          ``getattr(self, "<attr>", None)`` so the override does not
+          raise ``AttributeError`` between deallocate and re-load.
+        * Prefixes must be globally unique across stages that can
+          appear in the same pipeline. The current set is:
+          ``transformer`` / ``transformer_2`` (DenoisingStage),
+          ``text_encoder[_N]`` (TextEncodingStage),
+          ``image_encoder`` / ``image_text_encoder``
+          (ImageEncodingStage), ``vae`` (DecodingStage),
+          ``vae_encoder`` (EncodingStage), ``image_vae_encoder``
+          (ImageVAEEncodingStage), ``ltx2_vae_encoder`` /
+          ``ltx2_condition_image_encoder`` (LTX2ImageEncodingStage),
+          and ``qwen_layered_text_encoder`` / ``qwen_layered_vae``
+          (QwenImageLayeredBeforeDenoisingStage).
+        * Called every gate (once per request); should be O(modules)
+          and side-effect free.
+        """
+        return []
+
+    def _maybe_register_nvtx_hooks(self) -> None:
+        """Idempotently attach hooks; re-register when modules change.
+
+        Tracks the set of declared module identities and re-attaches when
+        it changes (lazy load, cache-dit wrap, hot swap), so hooks never
+        end up bound to an orphan module after the stage's underlying
+        components are rebound between calls. The zero-modules warning
+        fires at most once per stage instance.
+        """
+        if not self.server_args.enable_layerwise_nvtx_marker:
+            return
+        current = self.nvtx_hookable_modules()
+        current_ids = frozenset(id(m) for m, _ in current if m is not None)
+        is_rebind = False
+        if self._nvtx_hooks is not None:
+            if current_ids == self._nvtx_registered_ids:
+                return
+            # Underlying modules changed identity — detach and re-register.
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
+            self._nvtx_registered_ids = frozenset()
+            self._nvtx_zero_warned = False
+            is_rebind = True
+        hooks = DiffusionNvtxHooks()
+        total = 0
+        for module, prefix in current:
+            if module is None:
+                continue
+            total += hooks.register_hooks(module, prefix=prefix)
+        if total == 0:
+            if not self._nvtx_zero_warned:
+                logger.warning(
+                    "[%s] NVTX flag set but no modules available; will retry.",
+                    self.__class__.__name__,
+                )
+                self._nvtx_zero_warned = True
+            return
+        if is_rebind:
+            logger.info(
+                "[%s] Re-registered NVTX hooks on %d submodules (modules changed)",
+                self.__class__.__name__,
+                total,
+            )
+        else:
+            logger.info(
+                "[%s] Registered NVTX hooks on %d submodules",
+                self.__class__.__name__,
+                total,
+            )
+        self._nvtx_hooks = hooks
+        self._nvtx_registered_ids = current_ids
+
+    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
+        """Register (if needed) and toggle hooks for this request.
+
+        Caches the resolved ``use_nvtx`` value on ``self`` so
+        ``forward`` implementations that need to gate their own explicit
+        NVTX ranges can read it via :attr:`current_use_nvtx` instead of
+        recomputing.
+        """
+        self._maybe_register_nvtx_hooks()
+        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.set_enabled(use_nvtx)
+        self._current_use_nvtx = use_nvtx
+        return use_nvtx
+
+    @property
+    def current_use_nvtx(self) -> bool:
+        """Last resolved ``use_nvtx`` value from :meth:`_apply_nvtx_gate`.
+
+        ``forward`` implementations can read this to gate explicit
+        ``maybe_nvtx_range`` blocks without re-evaluating the flag.
+        """
+        return self._current_use_nvtx
+
+    def _detach_nvtx_hooks(self) -> None:
+        """Remove all hooks; call when the underlying module is about to
+        be deallocated or replaced (e.g. MPS dealloc)."""
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
+        self._nvtx_registered_ids = frozenset()
+        self._nvtx_zero_warned = False
+
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property
     def role_affinity(self) -> RoleType:
@@ -297,16 +423,31 @@ class PipelineStage(StageDedupMixin, ABC):
             logger.error("Input verification failed for %s: %s", stage_name, str(e))
             raise
 
-        # Execute the actual stage logic with unified profiling
-        with StageProfiler(
-            stage_name,
-            logger=logger,
-            metrics=batch.metrics,
-            log_stage_start_end=not batch.is_warmup
-            and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-        ):
-            result = self.forward(batch, server_args)
+        # Register and toggle layerwise NVTX hooks once per call. Stages
+        # whose components are not yet loaded (lazy load) are no-ops here
+        # and will register on the next call once modules become available.
+        self._apply_nvtx_gate(batch.is_warmup)
+
+        # Execute the actual stage logic with unified profiling. The
+        # ``finally`` disables this stage's hooks again so a module
+        # shared with another stage (e.g. a VAE referenced by both
+        # ImageVAEEncodingStage and DecodingStage) never has more than
+        # one stage's hooks armed at a time, even though both stages
+        # registered against the same module instance.
+        try:
+            with StageProfiler(
+                stage_name,
+                logger=logger,
+                metrics=batch.metrics,
+                log_stage_start_end=not batch.is_warmup
+                and not (self.server_args and self.server_args.comfyui_mode),
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                result = self.forward(batch, server_args)
+        finally:
+            if self._nvtx_hooks is not None:
+                self._nvtx_hooks.set_enabled(False)
+            self._current_use_nvtx = False
 
         # Post-execution output verification
         try:
