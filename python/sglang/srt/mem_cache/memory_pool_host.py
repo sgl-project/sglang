@@ -3,7 +3,9 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+import time
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -67,6 +69,70 @@ logger = logging.getLogger(__name__)
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+_host_register_tls = threading.local()
+PRETOUCH_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+@contextmanager
+def defer_cuda_host_register(stop_event: Optional[threading.Event] = None):
+    """Allocate host tensors without registering them from this thread."""
+
+    old_value = getattr(_host_register_tls, "defer", False)
+    old_stop_event = getattr(_host_register_tls, "stop_event", None)
+    _host_register_tls.defer = True
+    _host_register_tls.stop_event = stop_event
+    try:
+        yield
+    finally:
+        _host_register_tls.defer = old_value
+        _host_register_tls.stop_event = old_stop_event
+
+
+def is_cuda_host_register_deferred() -> bool:
+    return bool(getattr(_host_register_tls, "defer", False))
+
+
+def cuda_host_register_tensor(buffer: torch.Tensor, tag: str = "") -> None:
+    total_bytes = buffer.numel() * buffer.element_size()
+    t0 = time.perf_counter()
+    torch.cuda.cudart().cudaHostRegister(buffer.data_ptr(), total_bytes, 0)
+    suffix = f" ({tag})" if tag else ""
+    logger.info(
+        f"[hicache-register] cudaHostRegister {total_bytes / 1e9:.2f} GB "
+        f"took {time.perf_counter() - t0:.2f}s{suffix}"
+    )
+
+
+def bounded_pretouch_host_tensor(buffer: torch.Tensor, tag: str = "") -> None:
+    """Fault in host pages until the caller asks the background thread to stop."""
+
+    stop_event = getattr(_host_register_tls, "stop_event", None)
+    if stop_event is None or buffer.device.type != "cpu" or buffer.numel() == 0:
+        return
+
+    total_bytes = buffer.numel() * buffer.element_size()
+    page_step = max(1, 4096 // buffer.element_size())
+    chunk_elems = max(page_step, PRETOUCH_CHUNK_BYTES // buffer.element_size())
+    flat = buffer.reshape(-1)
+    touched_bytes = 0
+    t0 = time.perf_counter()
+
+    for start in range(0, flat.numel(), chunk_elems):
+        if stop_event.is_set():
+            break
+        end = min(start + chunk_elems, flat.numel())
+        flat[start:end:page_step].zero_()
+        touched_bytes += end - start
+
+    touched_bytes *= buffer.element_size()
+    status = "stopped" if stop_event.is_set() else "completed"
+    suffix = f" ({tag})" if tag else ""
+    logger.info(
+        f"[hicache-prealloc-thread] bounded pre-touch "
+        f"{touched_bytes / 1e9:.2f}/{total_bytes / 1e9:.2f} GB "
+        f"took {time.perf_counter() - t0:.2f}s ({status}){suffix}"
+    )
+
 
 def synchronized(func):
     @wraps(func)
@@ -123,9 +189,10 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
+        if is_cuda_host_register_deferred():
+            bounded_pretouch_host_tensor(buffer)
+        else:
+            cuda_host_register_tensor(buffer)
     return buffer
 
 
@@ -164,6 +231,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        defer_alloc: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -204,11 +272,144 @@ class HostKVCache(abc.ABC):
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
-        self.kv_buffer = self.init_kv_buffer()
-
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+
+        # Host buffer allocation can be started asynchronously by callers that
+        # want to overlap CPU allocation with CUDA graph capture. The default
+        # path still allocates synchronously to preserve existing behavior.
+        self.kv_buffer: Optional[torch.Tensor] = None
+        self._alloc_thread: Optional[threading.Thread] = None
+        self._alloc_error: Optional[BaseException] = None
+        self._buffer_ready = False
+        self._cuda_host_register_deferred = False
+        self._alloc_stop_event: Optional[threading.Event] = None
         self.clear()
+
+        if not defer_alloc:
+            self.wait_kv_buffer_ready()
+
+    def start_kv_buffer_allocation(self) -> None:
+        """Start host KV allocation in a background thread."""
+
+        with self.lock:
+            if self._buffer_ready or self._alloc_thread is not None:
+                return
+            self._alloc_cuda_device: Optional[int] = None
+            try:
+                if self.device_pool.device == "cuda" and torch.cuda.is_available():
+                    self._alloc_cuda_device = torch.cuda.current_device()
+            except Exception:  # noqa: BLE001
+                self._alloc_cuda_device = None
+
+            self._alloc_started_at = time.perf_counter()
+            self._alloc_finished_at: Optional[float] = None
+            self._alloc_stop_event = threading.Event()
+            self._alloc_thread = threading.Thread(
+                target=self._run_allocation,
+                name=f"hicache-host-alloc-{type(self).__name__}",
+                daemon=True,
+            )
+            self._alloc_thread.start()
+
+    def _run_allocation(self) -> None:
+        self._cuda_host_register_deferred = (
+            self.pin_memory and self.device_pool.device == "cuda"
+        )
+        ctx = (
+            defer_cuda_host_register(self._alloc_stop_event)
+            if self._cuda_host_register_deferred
+            else nullcontext()
+        )
+        try:
+            with ctx:
+                self._allocate_buffers()
+        finally:
+            self._alloc_finished_at = time.perf_counter()
+
+    def _allocate_buffers(self) -> None:
+        try:
+            t0 = time.perf_counter()
+            self.kv_buffer = self.init_kv_buffer()
+            log_prefix = (
+                "[hicache-prealloc-thread]"
+                if self._alloc_thread is not None
+                else "[hicache-alloc]"
+            )
+            logger.info(
+                f"{log_prefix} kv_buffer allocation finished in "
+                f"{time.perf_counter() - t0:.2f}s ({type(self).__name__})"
+            )
+        except BaseException as e:  # noqa: BLE001
+            self._alloc_error = e
+
+    def wait_kv_buffer_ready(self) -> None:
+        """Wait until host buffers exist and post-allocation setup is done."""
+
+        if self._buffer_ready:
+            return
+
+        wait_t0 = time.perf_counter()
+        spawned_async = self._alloc_thread is not None
+        if spawned_async:
+            if self._alloc_stop_event is not None:
+                self._alloc_stop_event.set()
+            self._alloc_thread.join()
+            self._alloc_thread = None
+            self._alloc_stop_event = None
+        else:
+            self._allocate_buffers()
+
+        wait_elapsed = time.perf_counter() - wait_t0
+        if spawned_async:
+            started_at = getattr(self, "_alloc_started_at", None)
+            finished_at = getattr(self, "_alloc_finished_at", None)
+            if started_at is not None and finished_at is not None:
+                logger.info(
+                    f"[hicache-prealloc] wait_kv_buffer_ready: blocked main "
+                    f"thread for {wait_elapsed:.2f}s; alloc total inflight "
+                    f"{finished_at - started_at:.2f}s; overlap window "
+                    f"{wait_t0 - started_at:.2f}s ({type(self).__name__})"
+                )
+            else:
+                logger.info(
+                    f"[hicache-prealloc] wait_kv_buffer_ready: blocked main "
+                    f"thread for {wait_elapsed:.2f}s ({type(self).__name__})"
+                )
+        else:
+            logger.info(
+                f"[hicache-alloc] wait_kv_buffer_ready: ran inline, "
+                f"took {wait_elapsed:.2f}s ({type(self).__name__})"
+            )
+
+        if self._alloc_error is not None:
+            raise self._alloc_error
+
+        self._register_deferred_cuda_host_buffers()
+        self._post_alloc_setup()
+        self._buffer_ready = True
+
+    def _register_deferred_cuda_host_buffers(self) -> None:
+        if not self._cuda_host_register_deferred:
+            return
+        captured_device = getattr(self, "_alloc_cuda_device", None)
+        if captured_device is not None:
+            torch.cuda.set_device(captured_device)
+        t0 = time.perf_counter()
+        for tag, buffer in self._iter_cuda_host_register_buffers():
+            cuda_host_register_tensor(buffer, tag=tag)
+        logger.info(
+            f"[hicache-register] deferred CUDA host registration finished in "
+            f"{time.perf_counter() - t0:.2f}s ({type(self).__name__})"
+        )
+        self._cuda_host_register_deferred = False
+
+    def _iter_cuda_host_register_buffers(self):
+        if self.kv_buffer is not None:
+            yield "kv_buffer", self.kv_buffer
+
+    def _post_alloc_setup(self) -> None:
+        return
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -301,6 +502,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        defer_alloc: bool = False,
     ):
         super().__init__(
             device_pool,
@@ -311,12 +513,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
-        )
-        self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+            defer_alloc=defer_alloc,
         )
 
+    def _post_alloc_setup(self):
+        super()._post_alloc_setup()
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -342,6 +543,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
         self.layer_num = self.device_pool.layer_num
+        self.element_dim = self.head_num * self.head_dim
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.element_dim * self.dtype.itemsize
+        )
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
@@ -799,6 +1004,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        defer_alloc: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -810,11 +1016,11 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
-        )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize
+            defer_alloc=defer_alloc,
         )
 
+    def _post_alloc_setup(self):
+        super()._post_alloc_setup()
         if self.layout == "page_first" and self.can_use_jit:
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -842,6 +1048,9 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.layer_num = self.device_pool.layer_num
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.kv_cache_dim * self.dtype.itemsize
         )
         return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
 
@@ -1183,6 +1392,45 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+def make_prealloc_host_kv_pool(
+    device_pool: KVCache,
+    host_to_device_ratio: float,
+    host_size: int,
+    page_size: int,
+    layout: str,
+) -> HostKVCache:
+    """Create a host KV pool whose backing buffers are not allocated yet.
+
+    The first PR intentionally supports only plain MHA and MLA pools. Hybrid
+    stacks and sidecar-backed pools keep the existing synchronous path.
+    """
+
+    if isinstance(device_pool, MHATokenToKVPool):
+        return MHATokenToKVPoolHost(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            defer_alloc=True,
+        )
+    if isinstance(device_pool, NSATokenToKVPool):
+        raise ValueError("HiCache prealloc does not support NSA host pools yet")
+    if isinstance(device_pool, MLATokenToKVPool):
+        return MLATokenToKVPoolHost(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            defer_alloc=True,
+        )
+    raise ValueError(
+        f"HiCache prealloc does not support host pool type "
+        f"{type(device_pool).__name__}"
+    )
 
 
 class MambaPoolHost(HostKVCache):

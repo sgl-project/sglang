@@ -839,6 +839,10 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        prealloc_host_kv_pool = None
+        if self.enable_hierarchical_cache and server_args.enable_hicache_prealloc:
+            prealloc_host_kv_pool = self.tp_worker.take_prealloc_host_kv_pool()
+
         self.disable_radix_cache = server_args.disable_radix_cache or (
             self.model_config.is_multimodal and uses_transformers_backend
         )
@@ -891,6 +895,7 @@ class Scheduler(
             pp_size=self.ps.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            prealloc_host_kv_pool=prealloc_host_kv_pool,
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:

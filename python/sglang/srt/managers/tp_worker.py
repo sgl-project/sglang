@@ -93,6 +93,9 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def take_prealloc_host_kv_pool(self):
+        return self.model_runner.take_prealloc_host_kv_pool()
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path,
