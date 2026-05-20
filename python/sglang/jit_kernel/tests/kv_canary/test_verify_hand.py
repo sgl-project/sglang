@@ -1996,7 +1996,7 @@ def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
             stored_prev_hash_signed=chain_anchor_signed(),
             stored_real_kv_hash_signed=to_signed_int64(stored_rkv_val),
             real_kv_sources=sources_cuda,
-            real_kv_hash_mode=RealKvHashMode.BIT,
+            real_kv_hash_mode=RealKvHashMode.PARTIAL,
         )
     )
 
@@ -2087,12 +2087,11 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
     assert int(cuda_log.write_index[0].item()) == 0
 
 
-def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
-    """BIT mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
+def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
+    """PARTIAL mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=8, device=_DEVICE)
     slot_idx = 3
-    rkv_clean = 0
     row_bytes = (
         sources_cuda[0]
         .tensor[slot_idx, : sources_cuda[0].read_bytes]
@@ -2100,10 +2099,7 @@ def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
         .cpu()
         .tolist()
     )
-    fold = 0
-    for b in row_bytes:
-        fold ^= int(b) & 1
-    rkv_clean = fold
+    rkv_clean = _hand_fold_partial(bytes(row_bytes))
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -2149,7 +2145,7 @@ def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.BIT,
+        real_kv_hash_mode=RealKvHashMode.PARTIAL,
     )
 
     assert int(cuda_log.write_index[0].item()) >= 1
