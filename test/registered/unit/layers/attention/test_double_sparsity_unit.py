@@ -795,6 +795,138 @@ class TestSelectorRealMode(unittest.TestCase):
                         f"request 1 selected foreign pages: {row1}")
 
 
+class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
+    """Round-11 fix [P2]: while a CUDA graph is being captured, the metric
+    emit's .item() sync would fail the capture. The emit must be gated on
+    ``torch.cuda.is_current_stream_capturing()``.
+    """
+
+    def test_record_selection_skipped_during_capture(self):
+        try:
+            import prometheus_client  # noqa: F401
+        except ImportError:
+            self.skipTest("prometheus_client not installed")
+        from unittest.mock import patch
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_signatures,
+        )
+        m.reset_for_testing()
+        num_layers, max_pages, num_heads, label_dim, head_dim = 1, 8, 2, 4, 16
+        signatures = torch.randn(num_layers, max_pages, num_heads, label_dim)
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim,
+                                         dtype=torch.int32)
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                      dtype=torch.float32)
+        queries = torch.randn(2, num_heads, head_dim)
+        # Simulate "inside CUDA graph capture" by mocking the introspection
+        # call. Real code calls torch.cuda.is_current_stream_capturing().
+        with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+            retrieve_topk_via_signatures(
+                queries=queries,
+                page_signatures=signatures,
+                valid_mask=valid_mask,
+                channel_selection=channel_selection,
+                channel_weights=channel_weights,
+                layer_id=0, max_top_k=4,
+            )
+        # Counters must NOT have advanced — the emit was gated.
+        if "selected_pages_count" in m._metric_objs:
+            cnt = m._metric_objs["selected_pages_count"]._value.get()
+            self.assertEqual(cnt, 0,
+                             "metric emit must be skipped during capture")
+        # Sanity: call again WITHOUT mocking; counters should now move.
+        retrieve_topk_via_signatures(
+            queries=queries,
+            page_signatures=signatures,
+            valid_mask=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0, max_top_k=4,
+        )
+        cnt = m._metric_objs["selected_pages_count"]._value.get()
+        self.assertEqual(cnt, 1)
+        m.reset_for_testing()
+
+
+class TestTritonNonPow2Extents(unittest.TestCase):
+    """Round-11 fix [P2]: Triton requires ``tl.arange`` extents to be
+    powers of two. The kernel wrappers pad up; verify a non-pow2
+    ``label_dim`` and ``max_pages`` are accepted without CompilationError.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(),
+                          "CUDA needed for Triton fast-path tests")
+    def test_compute_page_scores_kernel_non_pow2_label_dim(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            self.skipTest("triton not installed")
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            _compute_page_scores_triton, compute_page_scores,
+        )
+        dev = torch.device("cuda")
+        # Non-power-of-two label_dim (24) and max_pages (15).
+        num_layers, max_pages, num_heads, label_dim, head_dim = 1, 15, 2, 24, 64
+        bs = 2
+        queries = torch.randn(bs, num_heads, head_dim, device=dev)
+        page_signatures = torch.randn(num_layers, max_pages, num_heads, label_dim,
+                                       device=dev, dtype=torch.float16)
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool, device=dev)
+        channel_selection = torch.randint(0, head_dim, (num_layers, num_heads, label_dim),
+                                           dtype=torch.int32, device=dev)
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                      dtype=torch.float32, device=dev)
+        # End-to-end compute_page_scores routes through the Triton path on CUDA.
+        scores = compute_page_scores(
+            queries=queries,
+            page_signatures=page_signatures,
+            valid_mask=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0,
+        )
+        self.assertEqual(tuple(scores.shape), (bs, max_pages))
+        self.assertTrue(torch.isfinite(scores).all() | torch.isinf(scores).all().new_ones(()))
+
+    @unittest.skipUnless(torch.cuda.is_available(),
+                          "CUDA needed for Triton fast-path tests")
+    def test_page_signature_write_kernel_non_pow2_label_dim(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            self.skipTest("triton not installed")
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            page_signature_write, _PAGE_NOPE_STRIDE_BYTES,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        dev = torch.device("cuda")
+        # Non-power-of-two label_dim.
+        num_layers, num_heads, label_dim = 1, 2, 24
+        max_pages, page_size = 8, 64
+        table = allocate_page_signature_table(
+            num_layers_local=num_layers, max_pages=max_pages,
+            num_heads_local=num_heads, label_dim=label_dim,
+            page_size=page_size, dtype=torch.float16, device=dev,
+        )
+        nope_parts = torch.zeros(2, page_size, _PAGE_NOPE_STRIDE_BYTES,
+                                  dtype=torch.uint8, device=dev)
+        sel = torch.randint(0, 512, (num_heads, label_dim),
+                             dtype=torch.int32, device=dev)
+        w = torch.ones(num_heads, label_dim, dtype=torch.float32, device=dev)
+        # Should not raise CompilationError on the non-pow2 label_dim.
+        page_signature_write(
+            table.signatures, table.valid_mask, layer_id=0,
+            page_ids=[0, 1], nope_parts_u8=nope_parts,
+            channel_selection_layer=sel, channel_weights_layer=w,
+        )
+        self.assertTrue(bool(table.valid_mask[0, 0]))
+        self.assertTrue(bool(table.valid_mask[0, 1]))
+
+
 class TestRealSelectorMetrics(unittest.TestCase):
     """Round-10 fix [P2]: ``retrieve_topk_via_signatures`` must call
     ``metrics.record_selection`` so DS observability counters move on

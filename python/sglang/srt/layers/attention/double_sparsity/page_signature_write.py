@@ -55,6 +55,15 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= ``n`` (n>=1). Triton's ``tl.arange`` extents
+    must be powers of two; pad up and mask the unused tail.
+    """
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 if _TRITON_AVAILABLE:
 
     @triton.jit
@@ -79,19 +88,29 @@ if _TRITON_AVAILABLE:
         w_stride_head: tl.constexpr,
         out_stride_page: tl.constexpr,
         out_stride_head: tl.constexpr,
+        LABEL_DIM_POW2: tl.constexpr,  # power-of-two >= label_dim
+        NUM_TILES_POW2: tl.constexpr,  # power-of-two >= num_tiles
     ):
         page_id = tl.program_id(0)
         head_id = tl.program_id(1)
 
-        d_offsets = tl.arange(0, label_dim)
+        d_offsets = tl.arange(0, LABEL_DIM_POW2)
+        d_mask = d_offsets < label_dim
+        tile_offsets = tl.arange(0, NUM_TILES_POW2)
+        tile_mask = tile_offsets < num_tiles
+
         sel_offsets = head_id * sel_stride_head + d_offsets
-        sel_idx = tl.load(sel_ptr + sel_offsets).to(tl.int32)  # [label_dim]
-        w = tl.load(w_ptr + head_id * w_stride_head + d_offsets).to(tl.float32)
+        sel_idx = tl.load(
+            sel_ptr + sel_offsets, mask=d_mask, other=0
+        ).to(tl.int32)  # [LABEL_DIM_POW2]
+        w = tl.load(
+            w_ptr + head_id * w_stride_head + d_offsets, mask=d_mask, other=0.0
+        ).to(tl.float32)
 
         # Derive tile id per channel index.
-        tile_idx = sel_idx // tile_size  # [label_dim] in [0, num_tiles)
+        tile_idx = sel_idx // tile_size  # [LABEL_DIM_POW2] in [0, num_tiles)
 
-        acc = tl.zeros((label_dim,), dtype=tl.float32)
+        acc = tl.zeros((LABEL_DIM_POW2,), dtype=tl.float32)
 
         for tok in range(page_size):
             # Load all scales for this token, then gather the per-channel
@@ -99,17 +118,23 @@ if _TRITON_AVAILABLE:
             token_scale_base = (
                 page_id * scales_stride_page + tok * scales_stride_token
             )
-            scales = tl.load(scales_ptr + token_scale_base + tl.arange(0, num_tiles))
-            # [num_tiles] fp32
+            scales = tl.load(
+                scales_ptr + token_scale_base + tile_offsets,
+                mask=tile_mask,
+                other=0.0,
+            )
+            # [NUM_TILES_POW2] fp32
 
             # Gather per-channel scale: scales[tile_idx[d]] for each d.
-            # Triton trick: broadcast (label_dim, num_tiles) match and reduce.
+            # Triton trick: broadcast (LABEL_DIM_POW2, NUM_TILES_POW2) match and reduce.
             tile_match = (
-                tile_idx[:, None] == tl.arange(0, num_tiles)[None, :]
+                tile_idx[:, None] == tile_offsets[None, :]
             ).to(tl.float32)
             ch_scale = tl.sum(tile_match * scales[None, :], axis=1)
 
-            # Load the per-channel FP8 nope value.
+            # Load the per-channel FP8 nope value. Padded label-dim slots
+            # use the dummy sel_idx=0 channel; their contribution is gated
+            # to zero by the d_mask multiply below.
             fp8_offsets = (
                 page_id * nope_stride_page
                 + tok * nope_stride_token
@@ -124,7 +149,7 @@ if _TRITON_AVAILABLE:
         out_offsets = (
             page_id * out_stride_page + head_id * out_stride_head + d_offsets
         )
-        tl.store(out_ptr + out_offsets, acc.to(tl.float16))
+        tl.store(out_ptr + out_offsets, acc.to(tl.float16), mask=d_mask)
 
 
 def _page_signature_write_triton(
@@ -180,6 +205,8 @@ def _page_signature_write_triton(
         w_stride_head=channel_weights_layer.stride(0),
         out_stride_page=out.stride(0),
         out_stride_head=out.stride(1),
+        LABEL_DIM_POW2=_next_pow2(max(label_dim, 1)),
+        NUM_TILES_POW2=_next_pow2(max(_NUM_TILES, 1)),
     )
     return out
 

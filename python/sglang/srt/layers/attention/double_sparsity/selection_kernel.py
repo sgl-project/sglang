@@ -48,6 +48,15 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= ``n`` (n>=1). Triton's ``tl.arange`` extents
+    must be powers of two; we pad up and mask the unused tail.
+    """
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 if _TRITON_AVAILABLE:
 
     @triton.jit
@@ -65,14 +74,16 @@ if _TRITON_AVAILABLE:
         sig_stride_p: tl.constexpr,
         sig_stride_h: tl.constexpr,
         out_stride_b: tl.constexpr,
-        PAGE_BLOCK: tl.constexpr,
+        PAGE_BLOCK: tl.constexpr,  # power-of-two >= desired block
+        LABEL_DIM_POW2: tl.constexpr,  # power-of-two >= label_dim
     ):
         batch_id = tl.program_id(0)
         page_block = tl.program_id(1)
         page_offsets = page_block * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
         page_in_range = page_offsets < max_pages
 
-        d_offsets = tl.arange(0, label_dim)
+        d_offsets = tl.arange(0, LABEL_DIM_POW2)
+        d_mask = d_offsets < label_dim
 
         # Per-head max accumulator: start at -inf.
         max_score = tl.full((PAGE_BLOCK,), float("-inf"), dtype=tl.float32)
@@ -81,10 +92,12 @@ if _TRITON_AVAILABLE:
             q_offsets = (
                 batch_id * q_stride_b + h * q_stride_h + d_offsets
             )
-            q_block = tl.load(q_proj_ptr + q_offsets).to(tl.float32)
-            # [label_dim]
+            q_block = tl.load(
+                q_proj_ptr + q_offsets, mask=d_mask, other=0.0
+            ).to(tl.float32)
+            # [LABEL_DIM_POW2]; padded entries are 0 so they contribute 0 to the dot.
 
-            # Page-block × label_dim signatures: shape [PAGE_BLOCK, label_dim].
+            # Page-block × label_dim signatures: shape [PAGE_BLOCK, LABEL_DIM_POW2].
             sig_offsets = (
                 page_offsets[:, None] * sig_stride_p
                 + h * sig_stride_h
@@ -92,12 +105,13 @@ if _TRITON_AVAILABLE:
             )
             sig_block = tl.load(
                 sig_ptr + sig_offsets,
-                mask=page_in_range[:, None],
+                mask=page_in_range[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            # [PAGE_BLOCK, label_dim]
+            # [PAGE_BLOCK, LABEL_DIM_POW2]
 
-            # Dot per page = sum over d of q[d] * sig[p, d].
+            # Dot per page = sum over d of q[d] * sig[p, d]. Padded label-dim
+            # entries are 0 on both sides and contribute 0.
             dot = tl.sum(q_block[None, :] * sig_block, axis=1)
             # [PAGE_BLOCK]
 
@@ -144,10 +158,14 @@ def _compute_page_scores_triton(
     sig_c = sig_layer.contiguous()
     valid_c = valid_layer.contiguous()
 
-    page_block = min(page_block, max_pages)
-    if page_block <= 0:
-        page_block = max(1, max_pages)
-    num_page_blocks = (max_pages + page_block - 1) // page_block
+    # Triton's tl.arange extents must be powers of two; pad the per-tile
+    # block sizes up and rely on masks to drop padded entries.
+    desired_block = min(page_block, max(max_pages, 1))
+    if desired_block <= 0:
+        desired_block = max(1, max_pages)
+    page_block_pow2 = _next_pow2(desired_block)
+    label_dim_pow2 = _next_pow2(max(label_dim, 1))
+    num_page_blocks = (max_pages + page_block_pow2 - 1) // page_block_pow2
     grid = (bs, num_page_blocks)
 
     _compute_page_scores_kernel[grid](
@@ -164,7 +182,8 @@ def _compute_page_scores_triton(
         sig_stride_p=sig_c.stride(0),
         sig_stride_h=sig_c.stride(1),
         out_stride_b=out.stride(0),
-        PAGE_BLOCK=page_block,
+        PAGE_BLOCK=page_block_pow2,
+        LABEL_DIM_POW2=label_dim_pow2,
     )
     return out
 
@@ -447,19 +466,23 @@ def retrieve_topk_via_signatures(
         hot_pages=hot_pages,
         per_request_valid=pr_bool,
     )
-    # Best-effort observability emit. This requires a .item() sync on
-    # valid_lengths (and per_request_valid when supplied); it is intentionally
-    # outside any CUDA-graph capture region today. The page-table adapter
-    # milestone will hoist this above the captured decode region.
-    from sglang.srt.layers.attention.double_sparsity import metrics as _metrics
+    # Best-effort observability emit. Requires a .item() sync on
+    # valid_lengths (and per_request_valid when supplied), so it must be
+    # skipped while a CUDA graph is being captured — otherwise the host
+    # sync fails the capture. Eager / non-capture replays keep the metric.
+    # The page-table adapter milestone will replace this with a capture-
+    # safe pattern (write to a pre-allocated CPU scratch then emit after
+    # replay).
+    if not torch.cuda.is_current_stream_capturing():
+        from sglang.srt.layers.attention.double_sparsity import metrics as _metrics
 
-    selected_pages = int(valid_lengths.sum().item())
-    if pr_bool is not None:
-        total_valid_pages = int(pr_bool.to(torch.int64).sum().item())
-    else:
-        total_valid_pages = int(valid_lengths.shape[0]) * int(scores.shape[-1])
-    _metrics.record_selection(
-        selected_pages=selected_pages,
-        total_valid_pages=total_valid_pages,
-    )
+        selected_pages = int(valid_lengths.sum().item())
+        if pr_bool is not None:
+            total_valid_pages = int(pr_bool.to(torch.int64).sum().item())
+        else:
+            total_valid_pages = int(valid_lengths.shape[0]) * int(scores.shape[-1])
+        _metrics.record_selection(
+            selected_pages=selected_pages,
+            total_valid_pages=total_valid_pages,
+        )
     return indices, valid_lengths
