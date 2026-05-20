@@ -32,7 +32,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
-from sglang.srt.model_executor.pool_context import get_token_to_kv_pool, set_kv_pools
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -420,10 +419,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
-            set_kv_pools(
-                self.draft_runner_list[step].req_to_token_pool,
-                get_token_to_kv_pool(),
-            )
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -528,10 +523,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                set_kv_pools(
-                    self.draft_runner_list[step].req_to_token_pool,
-                    get_token_to_kv_pool(),
-                )
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
