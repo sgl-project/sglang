@@ -1879,6 +1879,7 @@ class DeepseekV2AttentionMLA(
         ``meta_info["double_sparsity"]``. Stores the latest layer's
         snapshot (last layer's stats win the per-request summary).
         """
+        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
         from sglang.srt.layers.attention.double_sparsity.metrics import (
             meta_info_for_request,
         )
@@ -1893,8 +1894,17 @@ class DeepseekV2AttentionMLA(
         vl_cpu = valid_lengths.detach().to("cpu").tolist()
         sl_cpu = seq_lens.detach().to("cpu").tolist()
 
+        # Pull per-request identifiers when available; fall back to row
+        # index strings so structured logs still have a stable key.
+        req_ids = getattr(forward_batch, "req_ids", None)
+
         records: List[Optional[Dict[str, Any]]] = []
         for b in range(bs):
+            req_id_str = (
+                str(req_ids[b])
+                if req_ids is not None and b < len(req_ids)
+                else f"row{b}"
+            )
             if b in row_errors:
                 cls, msg = row_errors[b]
                 records.append(
@@ -1905,6 +1915,17 @@ class DeepseekV2AttentionMLA(
                         "error_class": cls,
                         "error_message": msg,
                     }
+                )
+                # Surface the row-level failure through the Prometheus
+                # counter + structured WARNING log so it is observable
+                # even though the request is not aborted (per-request
+                # abort plumbing through the scheduler is queued).
+                _ds_metrics.record_error(
+                    "bad_adapter_input",
+                    message=msg,
+                    request_id=req_id_str,
+                    layer_id=layer_id,
+                    selector_id=f"layer{layer_id}-row{b}",
                 )
                 continue
             selected = int(vl_cpu[b])
@@ -1987,17 +2008,21 @@ class DeepseekV2AttentionMLA(
                 # failed row indices into `row_errors` and clamps those
                 # rows to -1 instead of raising for the whole batch.
                 row_errors: Dict[int, Tuple[str, str]] = {}
-                # Honor an NSA-metadata-owned out= buffer when present.
-                # This keeps the captured path allocation-free: the
-                # buffer is allocated once by `init_forward_metadata`
-                # and reused across steps.
+                # Per-batch allocator-owned out= buffer. Allocated once
+                # on the first DS layer's call per batch and reused by
+                # every subsequent DS layer in the same forward — so
+                # there are O(batches) allocations on the hot path, not
+                # O(batches × layers). The NSA backend may pre-allocate
+                # this in init_forward_metadata; if it does, we honor
+                # that buffer; otherwise we lazily allocate on
+                # forward_batch here.
                 ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
-                if ds_out is not None:
-                    # Slice to the current batch dimension if the buffer
-                    # was over-allocated.
-                    bs = int(selected_indices.shape[0])
-                    if ds_out.shape[0] != bs:
-                        ds_out = ds_out[:bs]
+                bs = int(selected_indices.shape[0])
+                if ds_out is None:
+                    ds_out = torch.empty_like(selected_indices)
+                    setattr(forward_batch, "ds_topk_indices_out", ds_out)
+                elif ds_out.shape[0] != bs:
+                    ds_out = ds_out[:bs]
                 topk_out = expand_ds_selection_to_topk_indices(
                     selected_indices=selected_indices,
                     valid_lengths=valid_lengths,

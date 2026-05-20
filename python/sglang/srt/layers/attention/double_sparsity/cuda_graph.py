@@ -2,7 +2,7 @@
 
 The DS selection pipeline must be replay-stable: every shape, every
 device-side branch, and every allocation must be deterministic across
-capture and replay. AC-6 spells out the requirements:
+capture and replay. The replay-stability contract requires:
 
 1. Static output buffers — ``selected_indices: [bs, max_top_k]`` (-1
    padded) and ``valid_lengths: [bs]`` are pre-allocated and reused
@@ -192,7 +192,7 @@ def capture_decode_step(
 def assert_no_alloc_in_region(label: str = "DS decode capture"):
     """Context manager that fails if any tensor is allocated in the body.
 
-    Used by the AC-6 regression test: wrap the captured region; if any
+    Used by the CUDA-graph allocation regression probe: wrap the captured region; if any
     ``torch.empty(...)`` / ``torch.zeros(...)`` / ``torch.tensor(...)``
     is called, raise ``RuntimeError`` so the test detects the rule
     violation. Implementation: snapshot the CUDA caching-allocator counter

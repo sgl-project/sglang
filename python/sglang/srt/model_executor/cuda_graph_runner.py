@@ -1328,6 +1328,7 @@ class CudaGraphRunner:
                     else None
                 ),
                 customized_info=output.customized_info,
+                per_request_summary=getattr(output, "per_request_summary", None),
             )
         else:
             assert isinstance(output, PPProxyTensors)

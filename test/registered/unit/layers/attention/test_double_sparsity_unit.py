@@ -3377,5 +3377,129 @@ class TestR3Coverage(unittest.TestCase):
         self.assertEqual(int(out[2, 2].item()), 192)
 
 
+class TestR4Coverage(unittest.TestCase):
+    """R4 production-wiring coverage: live transport, sanitized-row
+    observability, tokenizer None-skip, buffer-attach behavior.
+    """
+
+    def test_record_error_fires_on_sanitized_row(self):
+        """Sanitized rows now go through `record_error` so the Prometheus
+        counter increments and the structured log fires even though the
+        request is not aborted."""
+        from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
+
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 1000  # out-of-range
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(
+            return_value=(sel, vl)
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
+            ),
+            ds_topk_indices_out=None,
+            req_ids=["req-abc"],
+        )
+
+        # Capture log + count counter increments.
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.metrics",
+            level="WARNING",
+        ) as cm_log:
+            attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=7,
+            )
+        msg = "\n".join(cm_log.output)
+        self.assertIn("bad_adapter_input", msg)
+        self.assertIn("req-abc", msg)
+        self.assertIn("layer_id=7", msg)
+
+    def test_tokenizer_skips_none_per_request_summary(self):
+        """The tokenizer unpack only sets meta_info[k] when v[i] is not
+        None. Requests without a summary do NOT receive
+        meta_info["double_sparsity"] = None.
+        """
+        # Simulate the tokenizer unpack inline so we don't depend on a
+        # live tokenizer_manager instance.
+        per_request_summary = {
+            "double_sparsity": [
+                None,
+                {"sparsity_rate": 0.7},
+                None,
+            ],
+        }
+        meta_infos = [{}, {}, {}]
+        for i in range(3):
+            for k, v in per_request_summary.items():
+                if v is None or i >= len(v):
+                    continue
+                entry = v[i]
+                if entry is None:
+                    continue
+                meta_infos[i][k] = entry
+        self.assertNotIn("double_sparsity", meta_infos[0])
+        self.assertIn("double_sparsity", meta_infos[1])
+        self.assertNotIn("double_sparsity", meta_infos[2])
+
+    def test_forward_batch_ds_topk_indices_out_reused_across_layers(self):
+        """The DS branch attaches an `out=` buffer to forward_batch on
+        the first call and reuses it on subsequent layers (one
+        allocation per batch, not per layer).
+        """
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((2, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)
+        sel[1, 0:1] = torch.tensor([0], dtype=torch.int32)
+        vl = torch.tensor([2, 1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(
+            return_value=(sel, vl)
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([128, 256], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((2, 1024), dtype=torch.int32),
+            ),
+        )
+        # First call: buffer doesn't exist yet → allocated.
+        self.assertFalse(hasattr(forward_batch, "ds_topk_indices_out") and forward_batch.ds_topk_indices_out is not None)
+        attn._select_topk_indices(
+            x=torch.zeros(2, 16, 128),
+            q_lora=torch.zeros(2, 16, 128),
+            positions=torch.zeros(2, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+        first_buf = forward_batch.ds_topk_indices_out
+        self.assertIsNotNone(first_buf)
+        # Second call (next layer): same buffer reused (same id).
+        attn._select_topk_indices(
+            x=torch.zeros(2, 16, 128),
+            q_lora=torch.zeros(2, 16, 128),
+            positions=torch.zeros(2, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=1,
+        )
+        second_buf = forward_batch.ds_topk_indices_out
+        # Buffer identity is preserved across layers (allocator-owned).
+        self.assertIs(first_buf, second_buf)
+
+
 if __name__ == "__main__":
     unittest.main()

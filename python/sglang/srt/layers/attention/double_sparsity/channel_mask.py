@@ -398,7 +398,7 @@ def validate_against_runtime(
 ) -> None:
     """Raise if the loaded mask is incompatible with the running configuration.
 
-    Per AC-4: shape correctness, content identity (covered by load_channel_mask
+    Per the loader contract: shape correctness, content identity (covered by load_channel_mask
     hash check), and configuration agreement on dtype / head_dim / page_size /
     label_dim. Behavioural sanity is :func:`startup_sanity_probe`.
     """

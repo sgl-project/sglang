@@ -16,7 +16,7 @@ Two pipeline stages, both capture-safe (no host syncs, no dynamic shapes):
    in-fill page + N most-recent pages, per CMT-14). Returns
    ``(selected_indices, valid_lengths)`` with ``selected_indices`` in
    **sequence-order ascending** (logical-page-ID order) with ``-1`` padding,
-   per AC-2 contract.
+   per the selector ABI contract.
 
 The torch-based reference implementation is correct, deterministic, and
 capture-safe. A Triton kernel for the score step lives in

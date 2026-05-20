@@ -1742,9 +1742,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Per-request summary channel: v is a list of length bs, one dict
             # per request. Unpacks to a single dict per request in meta_info
             # (NOT a list of per-output-token dicts). Used by Double Sparsity.
+            # Skip None entries so requests without a summary do not get the
+            # key set to None — the key is absent for non-DS requests.
             if getattr(recv_obj, "per_request_summary", None):
                 for k, v in recv_obj.per_request_summary.items():
-                    meta_info[k] = v[i]
+                    if v is None or i >= len(v):
+                        continue
+                    entry = v[i]
+                    if entry is None:
+                        continue
+                    meta_info[k] = entry
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 

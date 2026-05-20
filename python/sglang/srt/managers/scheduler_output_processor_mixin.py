@@ -178,6 +178,30 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def maybe_collect_per_request_summary(
+        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ):
+        """Collect the latest per-request summary snapshot for req `i`.
+
+        Unlike customized_info (which appends per-output-token), this
+        overwrites: each model step replaces the prior snapshot. The
+        tokenizer surfaces the final value as a single dict per request.
+        """
+        if logits_output is None:
+            return
+        summary = getattr(logits_output, "per_request_summary", None)
+        if summary is None:
+            return
+        if req.per_request_summary is None:
+            req.per_request_summary = {}
+        for k, v in summary.items():
+            if v is None or i >= len(v):
+                continue
+            entry = v[i]
+            if entry is None:
+                continue
+            req.per_request_summary[k] = entry
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -261,6 +285,7 @@ class SchedulerOutputProcessorMixin:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
+                    self.maybe_collect_per_request_summary(i, req, logits_output)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -659,6 +684,7 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_completion_time()
 
         self.maybe_collect_customized_info(i, req, logits_output)
+        self.maybe_collect_per_request_summary(i, req, logits_output)
 
     def _maybe_update_reasoning_tokens(
         self: Scheduler, req: Req, next_token_id: Union[int, List[int]]

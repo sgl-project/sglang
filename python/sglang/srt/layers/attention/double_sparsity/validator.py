@@ -11,7 +11,7 @@ Enforces, at server startup:
 * presence of ``--double-sparsity-config`` JSON with at least
   ``channel_mask_path``,
 * JSON page-size pairing with ``--page-size``,
-* backend / KV-dtype pairing (AC-3): ``fp8_e4m3 ↔ flashmla_kv``,
+* backend / KV-dtype pairing: ``fp8_e4m3 ↔ flashmla_kv``,
   ``bfloat16 ↔ flashmla_sparse``,
 * unsupported page-size rejection (page must be in ``{32, 64, 128}``),
 * capability check (DEC-10): the running model must expose the ``nsa.Indexer``
@@ -104,7 +104,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             f"--page-size={server_page_size}. The two must agree at startup."
         )
 
-    # Backend / KV dtype pairing (AC-3).
+    # Backend / KV dtype pairing.
     kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
     if kv_cache_dtype in ("auto", None):
         # The model's default dtype is resolved later; let the runtime decide.
@@ -199,7 +199,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     setattr(server_args, "_double_sparsity_channel_mask", mask)
 
     # The mask passed schema + content-hash + runtime-pairing checks. Mark
-    # the AC-10 readiness gauge so /metrics reflects a healthy DS startup.
+    # the readiness gauge so /metrics reflects a healthy DS startup.
     # The metrics helper is best-effort (silent when prometheus_client is
     # missing); no error handling needed at the call site.
     from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
