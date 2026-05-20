@@ -299,40 +299,40 @@ def _plan_offsets_kernel(
     Single program; BLOCK_BS-wide tiles cover the full bs (caller ensures bs <= BS_BLOCK). All cumsum is done
     via block-level ``tl.cumsum`` in one program — no cross-program sync needed.
     """
-    bs_offs = tl.arange(0, BS_BLOCK)
-    bs_mask = bs_offs < bs
+    bs_offs = tl.arange(0, BS_BLOCK)  # [BS_BLOCK]
+    bs_mask = bs_offs < bs  # [BS_BLOCK] bool
 
     # Per-req inputs (int32 loads matching the dtype of fb_* / req_to_token).
-    rpi = tl.load(req_pool_indices_ptr + bs_offs, mask=bs_mask, other=0)
-    prefix_lens = tl.load(prefix_lens_ptr + bs_offs, mask=bs_mask, other=0)
-    extend_lens = tl.load(extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0)
+    rpi = tl.load(req_pool_indices_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
+    prefix_lens = tl.load(prefix_lens_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
+    extend_lens = tl.load(extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
 
-    is_active = (rpi != 0) & bs_mask
-    has_prefix = is_active & (prefix_lens > 0)
+    is_active = (rpi != 0) & bs_mask  # [BS_BLOCK] bool
+    has_prefix = is_active & (prefix_lens > 0)  # [BS_BLOCK] bool
 
-    window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)
+    window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)  # [BS_BLOCK]
 
-    verify_lens = prefix_lens - window_starts
+    verify_lens = prefix_lens - window_starts  # [BS_BLOCK]
     verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
     verify_lens = tl.where(is_active, verify_lens, 0)
 
-    write_lens = tl.where(extend_lens > 0, extend_lens, 0)
+    write_lens = tl.where(extend_lens > 0, extend_lens, 0)  # [BS_BLOCK]
     write_lens = tl.where(is_active, write_lens, 0)
 
-    has_write_contribution = has_prefix & (write_lens > 0)
+    has_write_contribution = has_prefix & (write_lens > 0)  # [BS_BLOCK] bool
 
     # Seed slot per req. prefix_lens == 0 means no prefix → -1 sentinel. Padding row → no write contribution
     # → -1 sentinel either way; we also mask write_lens onto seed below to match the ref's "no write → -1".
-    safe_prefix_pos = tl.where(prefix_lens > 0, prefix_lens - 1, 0)
-    stride_i64 = req_to_token_stride0
-    seed_full = tl.load(
+    safe_prefix_pos = tl.where(prefix_lens > 0, prefix_lens - 1, 0)  # [BS_BLOCK]
+    stride_i64 = req_to_token_stride0  # scalar
+    seed_full = tl.load(  # [BS_BLOCK]
         req_to_token_ptr + rpi.to(tl.int64) * stride_i64 + safe_prefix_pos.to(tl.int64),
         mask=has_prefix,
         other=0,
     )
 
     if HAS_SWA_LUT:
-        seed_translated = _swa_translate_tile(
+        seed_translated = _swa_translate_tile(  # [BS_BLOCK]
             seed_full,
             has_prefix,
             full_to_swa_lut_ptr,
@@ -342,24 +342,24 @@ def _plan_offsets_kernel(
         seed_translated = seed_full
 
     # Reqs with no write contribution should expose seed = -1 (ref's _seed_slot is masked by write_lens > 0).
-    minus_one = tl.full((BS_BLOCK,), -1, dtype=seed_translated.dtype)
-    seed_slot = tl.where(has_write_contribution, seed_translated, minus_one)
+    minus_one = tl.full((BS_BLOCK,), -1, dtype=seed_translated.dtype)  # [BS_BLOCK]
+    seed_slot = tl.where(has_write_contribution, seed_translated, minus_one)  # [BS_BLOCK]
 
     # Inclusive cumsum → exclusive offsets via subtraction.
-    verify_inclusive = tl.cumsum(verify_lens, axis=0)
-    write_inclusive = tl.cumsum(write_lens, axis=0)
-    verify_exclusive = verify_inclusive - verify_lens
-    write_exclusive = write_inclusive - write_lens
+    verify_inclusive = tl.cumsum(verify_lens, axis=0)  # [BS_BLOCK]
+    write_inclusive = tl.cumsum(write_lens, axis=0)  # [BS_BLOCK]
+    verify_exclusive = verify_inclusive - verify_lens  # [BS_BLOCK]
+    write_exclusive = write_inclusive - write_lens  # [BS_BLOCK]
 
     # Scatter exclusive offsets into the [bs+1]-sized output tensor. Positions [0, bs) get the exclusive sum;
     # position bs gets the total (totals = verify_inclusive at index bs - 1 if bs > 0, else 0).
-    out_offsets_mask = bs_mask
+    out_offsets_mask = bs_mask  # [BS_BLOCK] bool
     tl.store(
         out_verify_offsets_ptr + bs_offs,
         verify_exclusive.to(tl.int32),
         mask=out_offsets_mask,
     )
-    write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN
+    write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN  # [BS_BLOCK] bool
     tl.store(
         out_write_offsets_ptr + bs_offs,
         write_exclusive.to(tl.int32),
@@ -367,7 +367,7 @@ def _plan_offsets_kernel(
     )
 
     # Scatter seed slots (capped to write_req_capacity).
-    seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)
+    seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)  # [BS_BLOCK] bool
     tl.store(
         out_write_seed_slot_indices_ptr + bs_offs,
         seed_slot.to(tl.int32),
@@ -375,14 +375,14 @@ def _plan_offsets_kernel(
     )
 
     # Totals: sum of all per-req lens. Same value as the last inclusive entry but tl.sum is robust to bs == 0.
-    total_verify = tl.sum(verify_lens, axis=0)
-    total_write = tl.sum(write_lens, axis=0)
+    total_verify = tl.sum(verify_lens, axis=0)  # scalar
+    total_write = tl.sum(write_lens, axis=0)  # scalar
 
     # Store the [bs] slot of verify_offsets and write_offsets (one element past the last per-req entry).
     # verify_offsets scratch has length BS_BLOCK + 1 so the bs slot is always in range.
     tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int32))
     # write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
-    write_tail_in_range = bs < WRITE_OFFSETS_LEN
+    write_tail_in_range = bs < WRITE_OFFSETS_LEN  # scalar bool
     tl.store(
         out_write_offsets_ptr + bs,
         total_write.to(tl.int32),
@@ -390,7 +390,7 @@ def _plan_offsets_kernel(
     )
 
     # Scalar writes: verify_num_valid = total_verify + extras_count; write_num_valid_reqs = bs.
-    extras_count = tl.load(extra_verify_num_valid_ptr)
+    extras_count = tl.load(extra_verify_num_valid_ptr)  # scalar
     extras_count = tl.where(extras_count > 0, extras_count, 0)
     tl.store(out_verify_num_valid_ptr, (total_verify + extras_count).to(tl.int32))
     tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
@@ -422,51 +422,51 @@ def _plan_entries_kernel(
     Each program owns one (req, j-tile) cell. Verify capacity is the upper bound on entries-per-req used to
     pick the grid; per-req actual count comes from ``verify_offsets[r+1] - verify_offsets[r]``.
     """
-    r = tl.program_id(0)
-    tile_idx = tl.program_id(1)
+    r = tl.program_id(0)  # scalar
+    tile_idx = tl.program_id(1)  # scalar
 
-    rpi = tl.load(req_pool_indices_ptr + r)
-    prefix_lens = tl.load(prefix_lens_ptr + r)
+    rpi = tl.load(req_pool_indices_ptr + r)  # scalar
+    prefix_lens = tl.load(prefix_lens_ptr + r)  # scalar
 
     # Skip padding rows entirely.
     if rpi == 0:
         return
 
-    window_start = _compute_window_start(prefix_lens, SWA_WINDOW)
+    window_start = _compute_window_start(prefix_lens, SWA_WINDOW)  # scalar
 
-    verify_start = tl.load(verify_offsets_ptr + r)
-    verify_end = tl.load(verify_offsets_ptr + r + 1)
-    my_verify_len = verify_end - verify_start
+    verify_start = tl.load(verify_offsets_ptr + r)  # scalar
+    verify_end = tl.load(verify_offsets_ptr + r + 1)  # scalar
+    my_verify_len = verify_end - verify_start  # scalar
 
     if my_verify_len <= 0:
         return
 
-    j_offs = tile_idx * INNER_BLOCK + tl.arange(0, INNER_BLOCK)
-    j_mask = j_offs < my_verify_len
+    j_offs = tile_idx * INNER_BLOCK + tl.arange(0, INNER_BLOCK)  # [INNER_BLOCK]
+    j_mask = j_offs < my_verify_len  # [INNER_BLOCK] bool
 
-    positions = window_start + j_offs
-    rpi_i64 = rpi.to(tl.int64)
-    stride_i64 = req_to_token_stride0
-    positions_i64 = positions.to(tl.int64)
+    positions = window_start + j_offs  # [INNER_BLOCK]
+    rpi_i64 = rpi.to(tl.int64)  # scalar
+    stride_i64 = req_to_token_stride0  # scalar
+    positions_i64 = positions.to(tl.int64)  # [INNER_BLOCK]
 
-    slot_full = tl.load(
+    slot_full = tl.load(  # [INNER_BLOCK]
         req_to_token_ptr + rpi_i64 * stride_i64 + positions_i64,
         mask=j_mask,
         other=0,
     )
 
-    prev_pos_valid = (positions > 0) & j_mask
-    prev_positions_i64 = (positions - 1).to(tl.int64)
-    safe_prev_positions_i64 = tl.where(prev_pos_valid, prev_positions_i64, 0)
-    prev_slot_full = tl.load(
+    prev_pos_valid = (positions > 0) & j_mask  # [INNER_BLOCK] bool
+    prev_positions_i64 = (positions - 1).to(tl.int64)  # [INNER_BLOCK]
+    safe_prev_positions_i64 = tl.where(prev_pos_valid, prev_positions_i64, 0)  # [INNER_BLOCK]
+    prev_slot_full = tl.load(  # [INNER_BLOCK]
         req_to_token_ptr + rpi_i64 * stride_i64 + safe_prev_positions_i64,
         mask=prev_pos_valid,
         other=0,
     )
 
     if HAS_SWA_LUT:
-        slot = _swa_translate_tile(slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len)
-        prev_translated = _swa_translate_tile(
+        slot = _swa_translate_tile(slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len)  # [INNER_BLOCK]
+        prev_translated = _swa_translate_tile(  # [INNER_BLOCK]
             prev_slot_full,
             prev_pos_valid,
             full_to_swa_lut_ptr,
@@ -476,12 +476,12 @@ def _plan_entries_kernel(
         slot = slot_full
         prev_translated = prev_slot_full
 
-    chain_head_tile = tl.full((INNER_BLOCK,), -1, dtype=slot.dtype)
-    prev_slot = tl.where(prev_pos_valid, prev_translated, chain_head_tile)
+    chain_head_tile = tl.full((INNER_BLOCK,), -1, dtype=slot.dtype)  # [INNER_BLOCK]
+    prev_slot = tl.where(prev_pos_valid, prev_translated, chain_head_tile)  # [INNER_BLOCK]
 
-    out_offs = verify_start + j_offs
-    cap_mask = out_offs < verify_capacity
-    write_mask = j_mask & cap_mask
+    out_offs = verify_start + j_offs  # [INNER_BLOCK]
+    cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
+    write_mask = j_mask & cap_mask  # [INNER_BLOCK] bool
 
     tl.store(
         out_verify_slot_indices_ptr + out_offs,
@@ -549,22 +549,22 @@ def _plan_extras_kernel(
 
     Extras are caller-pre-translated; this kernel only copies (no LUT pass).
     """
-    tile_idx = tl.program_id(0)
-    k_offs = tile_idx * INNER_BLOCK + tl.arange(0, INNER_BLOCK)
+    tile_idx = tl.program_id(0)  # scalar
+    k_offs = tile_idx * INNER_BLOCK + tl.arange(0, INNER_BLOCK)  # [INNER_BLOCK]
 
-    extras_count = tl.load(extra_num_valid_ptr)
+    extras_count = tl.load(extra_num_valid_ptr)  # scalar
     extras_count = tl.where(extras_count > 0, extras_count, 0)
-    in_range_mask = k_offs < extras_count
+    in_range_mask = k_offs < extras_count  # [INNER_BLOCK] bool
 
-    base_idx = tl.load(verify_offsets_ptr + bs)
+    base_idx = tl.load(verify_offsets_ptr + bs)  # scalar
 
-    slots = tl.load(extra_slot_ptr + k_offs, mask=in_range_mask, other=0)
-    positions = tl.load(extra_positions_ptr + k_offs, mask=in_range_mask, other=0)
-    prevs = tl.load(extra_prev_slot_ptr + k_offs, mask=in_range_mask, other=0)
+    slots = tl.load(extra_slot_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
+    positions = tl.load(extra_positions_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
+    prevs = tl.load(extra_prev_slot_ptr + k_offs, mask=in_range_mask, other=0)  # [INNER_BLOCK]
 
-    out_offs = base_idx + k_offs
-    cap_mask = out_offs < verify_capacity
-    write_mask = in_range_mask & cap_mask
+    out_offs = base_idx + k_offs  # [INNER_BLOCK]
+    cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
+    write_mask = in_range_mask & cap_mask  # [INNER_BLOCK] bool
 
     tl.store(
         out_verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask
