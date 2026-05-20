@@ -14,12 +14,12 @@ from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.buffer_alloc import resolve_read_bytes
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
-    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
@@ -33,7 +33,7 @@ _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
     MHATokenToKVPoolFP4: attach_mha,
     MLATokenToKVPool: attach_mla,
     MLATokenToKVPoolFP4: attach_mla,
-    NSATokenToKVPool: attach_nsa,
+    DSATokenToKVPool: attach_nsa,
     SWAKVPool: attach_swa,
     DeepSeekV4TokenToKVPool: attach_dsv4,
 }
