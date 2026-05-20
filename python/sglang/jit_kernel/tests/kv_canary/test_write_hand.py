@@ -1254,8 +1254,22 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 0.
     _PATTERN = bytes(
         [
-            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-            0x81, 0x82, 0x84, 0x88, 0x90, 0xA0, 0xC0, 0xFF,
+            0x01,
+            0x02,
+            0x04,
+            0x08,
+            0x10,
+            0x20,
+            0x40,
+            0x80,
+            0x81,
+            0x82,
+            0x84,
+            0x88,
+            0x90,
+            0xA0,
+            0xC0,
+            0xFF,
         ]
     )
 

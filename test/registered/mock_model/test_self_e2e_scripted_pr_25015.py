@@ -48,6 +48,14 @@ def _spec_eagle_server_args() -> List[str]:
         "2048",
         "--max-total-tokens",
         "16384",
+        # Workaround: sglang piecewise CUDA graph hits FusedAddRMSNorm illegal
+        # memory access during warmup_compile under EAGLE + Qwen3-0.6B(1 layer).
+        # Reproduces with --kv-canary off (verified in repro test), so this is an
+        # upstream sglang piecewise bug, not a canary issue. sglang itself prints
+        # the suggested workaround in its error message. This is the ONLY canary
+        # e2e test allowed to pass --disable-piecewise-cuda-graph; the rest must
+        # exercise the in-graph canary kernel path per user-instruction b 段.
+        "--disable-piecewise-cuda-graph",
     ]
 
 

@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SWEEP_PASS_LOG_EVERY = 100
-
 
 class SweepOrchestrator:
     """Only walks the radix tree. Per-forward HEAD/TAIL covers running req KV slots every step;
@@ -123,9 +121,8 @@ class SweepOrchestrator:
             )
 
         self._sweep_passes += 1
-        if self._sweep_passes % _SWEEP_PASS_LOG_EVERY == 0:
-            logger.info(
-                "[canary] sweep succeeded %d times (last_step=%d)",
-                self._sweep_passes,
-                step_counter,
-            )
+        logger.info(
+            "[canary] sweep succeeded %d times (last_step=%d)",
+            self._sweep_passes,
+            step_counter,
+        )
