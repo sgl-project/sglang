@@ -272,9 +272,14 @@ class AnthropicServing:
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
 
-        # Enable usage in stream so we can report it
+        # Enable usage in stream so we can report it.
+        # continuous_usage_stats ensures every content chunk carries
+        # prompt_tokens so that message_start can report the real
+        # input_tokens count.
         if anthropic_request.stream:
-            request_data["stream_options"] = StreamOptions(include_usage=True)
+            request_data["stream_options"] = StreamOptions(
+                include_usage=True, continuous_usage_stats=True
+            )
 
         chat_request = ChatCompletionRequest(**request_data)
 
@@ -430,19 +435,49 @@ class AnthropicServing:
         anthropic_request: AnthropicMessagesRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
-        """Convert OpenAI chat stream to Anthropic event stream."""
+        """Convert OpenAI chat stream to Anthropic event stream.
+
+        Per the Anthropic streaming spec, ``message_start`` must carry the
+        real ``input_tokens`` count.  The underlying OpenAI stream reports
+        prompt-token counts via ``continuous_usage_stats`` starting from
+        the *second* content chunk (the first chunk is a role-only chunk
+        without usage).  We therefore defer emitting ``message_start``
+        until we encounter a chunk that carries usage information so that
+        ``input_tokens`` is populated correctly.
+        """
         openai_stream = self.openai_serving_chat._generate_chat_stream(
             adapted_request, processed_request, raw_request
         )
 
         # State tracking
-        first_chunk = True
+        message_start_emitted = False
         content_block_index = 0
         content_block_open = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        # Buffer of parsed chunks received before message_start is emitted.
+        buffered_chunks: list[ChatCompletionStreamResponse] = []
+
+        def _make_message_start(input_tokens: int) -> str:
+            """Build the ``message_start`` SSE payload."""
+            start_event = AnthropicStreamEvent(
+                type="message_start",
+                message=AnthropicMessagesResponse(
+                    id=message_id,
+                    content=[],
+                    model=model,
+                    usage=AnthropicUsage(
+                        input_tokens=input_tokens,
+                        output_tokens=0,
+                    ),
+                ),
+            )
+            return _wrap_sse_event(
+                start_event.model_dump_json(exclude_none=True),
+                "message_start",
+            )
 
         async for sse_line in openai_stream:
             if not sse_line.startswith("data: "):
@@ -451,6 +486,21 @@ class AnthropicServing:
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
+                # If we never emitted message_start (e.g. very short / empty
+                # generation), emit it now with whatever usage we collected
+                # and replay any finish_reason captured in buffered chunks.
+                if not message_start_emitted:
+                    yield _make_message_start(
+                        usage_info.get("input_tokens", 0) if usage_info else 0
+                    )
+                    message_start_emitted = True
+                    for buffered in buffered_chunks:
+                        if buffered.choices:
+                            bc = buffered.choices[0]
+                            if bc.finish_reason is not None:
+                                finish_reason = bc.finish_reason
+                    buffered_chunks.clear()
+
                 # Close any open content block
                 if content_block_open:
                     stop_event = AnthropicStreamEvent(
@@ -462,15 +512,16 @@ class AnthropicServing:
                         "content_block_stop",
                     )
 
-                # Emit message_delta with stop_reason and usage
+                # Emit message_delta with stop_reason and usage.
+                # Per the Anthropic spec, message_delta.usage reports only
+                # output_tokens (input_tokens was already sent in
+                # message_start).
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
                 delta_event = AnthropicStreamEvent(
                     type="message_delta",
                     delta=AnthropicDelta(stop_reason=stop_reason),
                     usage=AnthropicUsage(
-                        input_tokens=(
-                            usage_info.get("input_tokens", 0) if usage_info else 0
-                        ),
+                        input_tokens=0,
                         output_tokens=(
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
@@ -505,33 +556,7 @@ class AnthropicServing:
                 )
                 continue
 
-            # First chunk: emit message_start
-            if first_chunk:
-                first_chunk = False
-
-                start_event = AnthropicStreamEvent(
-                    type="message_start",
-                    message=AnthropicMessagesResponse(
-                        id=message_id,
-                        content=[],
-                        model=model,
-                        usage=AnthropicUsage(
-                            input_tokens=(
-                                chunk.usage.prompt_tokens if chunk.usage else 0
-                            ),
-                            output_tokens=0,
-                        ),
-                    ),
-                )
-                yield _wrap_sse_event(
-                    start_event.model_dump_json(exclude_none=True),
-                    "message_start",
-                )
-                # Skip if this was just the role chunk with empty content
-                if chunk.choices and chunk.choices[0].delta.content == "":
-                    continue
-
-            # Usage-only chunk (empty choices with usage info)
+            # Track the final usage-only chunk (empty choices with usage).
             if not chunk.choices and chunk.usage:
                 usage_info = {
                     "input_tokens": chunk.usage.prompt_tokens,
@@ -541,6 +566,31 @@ class AnthropicServing:
 
             if not chunk.choices:
                 continue
+
+            # ---------------------------------------------------------
+            # Defer message_start until we see a chunk with usage data
+            # so that input_tokens is accurate.
+            # ---------------------------------------------------------
+            if not message_start_emitted:
+                if chunk.usage and chunk.usage.prompt_tokens:
+                    # We have real usage -- emit message_start now.
+                    yield _make_message_start(chunk.usage.prompt_tokens)
+                    message_start_emitted = True
+
+                    # Replay any buffered chunks that captured a
+                    # finish_reason (the role-only chunk with empty
+                    # content is intentionally skipped).
+                    for buffered in buffered_chunks:
+                        if not buffered.choices:
+                            continue
+                        bc = buffered.choices[0]
+                        if bc.finish_reason is not None:
+                            finish_reason = bc.finish_reason
+                    buffered_chunks.clear()
+                else:
+                    # No usage yet -- buffer this chunk for later.
+                    buffered_chunks.append(chunk)
+                    continue
 
             choice = chunk.choices[0]
 
