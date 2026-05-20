@@ -470,7 +470,7 @@ def extend(reqs, model_runner):
 
 @torch.no_grad
 def decode(input_token_ids, batch, model_runner):
-    batch.output_ids = input_token_ids
+    batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     forward_batch = ForwardBatch.init_new(batch, model_runner)
