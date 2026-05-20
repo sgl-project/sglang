@@ -219,8 +219,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        component_registry = COMPONENT_REGISTRY
+        if params.component_registry_override:
+            component_registry = {
+                **COMPONENT_REGISTRY,
+                **params.component_registry_override,
+            }
         self.components: dict[ComponentType, TreeComponent] = {
-            ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
+            ct: component_registry[ct](self, params) for ct in self.tree_components
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()

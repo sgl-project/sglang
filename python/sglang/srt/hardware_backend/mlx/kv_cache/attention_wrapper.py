@@ -8,8 +8,14 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import ContiguousKVCache
+from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_head_dim,
+    get_num_heads,
+    get_num_kv_heads,
+)
+from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
+    ContiguousAttentionKVCache,
+)
 
 _thread_local = threading.local()
 
@@ -21,8 +27,9 @@ class BatchedDecodeContext:
 
     batch_size: int
     seq_lens: list[int]  # per-request token count before the new token
-    # layer_caches[layer_idx][req_idx] = ContiguousKVCache
-    layer_caches: list[list[ContiguousKVCache]]
+    # attention_layer_caches[attention_pool_idx][req_idx] = ContiguousAttentionKVCache
+    attention_layer_caches: list[list[ContiguousAttentionKVCache]]
+    attention_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -41,6 +48,10 @@ class BatchedDecodeContext:
         self.needs_padding = min(seq_lens) < max_seq_len
         self.pad_sizes = [max_seq_len - s for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
+        if not self.attention_pool_index_by_layer:
+            self.attention_pool_index_by_layer = {
+                idx: idx for idx in range(len(self.attention_layer_caches))
+            }
 
 
 def set_context(ctx: Optional[BatchedDecodeContext]) -> None:
@@ -77,15 +88,38 @@ class MLXAttentionWrapper(nn.Module):
         inner = self._inner
         layer_idx = self._layer_idx
         B = ctx.batch_size
+        n_heads = get_num_heads(inner)
+        n_kv_heads = get_num_kv_heads(inner)
+        if n_heads is None or n_kv_heads is None:
+            raise RuntimeError(
+                f"Cannot determine attention head counts for {type(inner).__name__}"
+            )
 
-        queries = inner.q_proj(x)
+        q_proj_output = inner.q_proj(x)
         keys = inner.k_proj(x)
         values = inner.v_proj(x)
 
-        head_dim = queries.shape[-1] // inner.n_heads
-        queries = queries.reshape(B, 1, inner.n_heads, head_dim)
-        keys = keys.reshape(B, 1, inner.n_kv_heads, head_dim)
-        values = values.reshape(B, 1, inner.n_kv_heads, head_dim)
+        head_dim = get_head_dim(inner)
+        if head_dim is None:
+            head_dim = keys.shape[-1] // n_kv_heads
+
+        q_width = n_heads * head_dim
+        gate = None
+        if q_proj_output.shape[-1] == q_width:
+            queries = q_proj_output.reshape(B, 1, n_heads, head_dim)
+        elif q_proj_output.shape[-1] == 2 * q_width:
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, 1, n_heads, 2 * head_dim), 2, axis=-1
+            )
+            gate = gate.reshape(B, 1, q_width)
+        else:
+            raise RuntimeError(
+                f"Unexpected q_proj output shape {q_proj_output.shape} for "
+                f"{type(inner).__name__}"
+            )
+
+        keys = keys.reshape(B, 1, n_kv_heads, head_dim)
+        values = values.reshape(B, 1, n_kv_heads, head_dim)
 
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
@@ -101,7 +135,8 @@ class MLXAttentionWrapper(nn.Module):
         queries = inner.rope(queries, offset=offsets)
         keys = inner.rope(keys, offset=offsets)
 
-        layer_caches = ctx.layer_caches[layer_idx]
+        attention_pool_idx = ctx.attention_pool_index_by_layer[layer_idx]
+        layer_caches = ctx.attention_layer_caches[attention_pool_idx]
         max_len = ctx.max_len
         pad_sizes = ctx.pad_sizes
 
@@ -118,12 +153,8 @@ class MLXAttentionWrapper(nn.Module):
 
             pad = pad_sizes[i]
             if pad > 0:
-                k_pad = mx.zeros(
-                    (1, inner.n_kv_heads, pad, head_dim), dtype=k_all.dtype
-                )
-                v_pad = mx.zeros(
-                    (1, inner.n_kv_heads, pad, head_dim), dtype=v_all.dtype
-                )
+                k_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=k_all.dtype)
+                v_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=v_all.dtype)
                 k_all = mx.concatenate([k_all, k_pad], axis=2)
                 v_all = mx.concatenate([v_all, v_pad], axis=2)
 
@@ -147,4 +178,6 @@ class MLXAttentionWrapper(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)
+        if gate is not None:
+            output = output * mx.sigmoid(gate)
         return inner.o_proj(output)

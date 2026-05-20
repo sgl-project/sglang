@@ -34,8 +34,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
+    EvictLayer,
+    TreeComponent,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
+    COMPONENT_REGISTRY,
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
@@ -109,6 +112,52 @@ class CacheConfig:
         ):
             parts.append(f"h{self.head_num}l{self.num_layers}")
         return "_".join(parts)
+
+
+class _FakeFullComponent(TreeComponent):
+    component_type = ComponentType.FULL
+
+    def create_match_validator(self, match_device_only: bool = False):
+        return lambda node: True
+
+    def redistribute_on_node_split(self, new_parent, child):
+        return None
+
+    def evict_component(
+        self, node, target: EvictLayer = EvictLayer.DEVICE
+    ) -> tuple[int, int]:
+        return 0, 0
+
+    def drive_eviction(self, params: EvictParams, tracker: dict[ComponentType, int]):
+        return None
+
+    def acquire_component_lock(self, node, result):
+        return result
+
+    def release_component_lock(self, node, params):
+        return None
+
+
+class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
+    def test_component_registry_override_is_instance_local(self):
+        params = CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=True,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+        )
+
+        tree = UnifiedRadixCache(params=params)
+
+        self.assertIsInstance(tree.components[ComponentType.FULL], _FakeFullComponent)
+        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
 def build_fixture(cfg: CacheConfig):
