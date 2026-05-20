@@ -1,6 +1,6 @@
 """MI35x GLM-5.1 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GLM-5.1-FP8 with NSA attention backend using few-shot
+Tests GLM-5.1-FP8 with DSA attention backend using few-shot
 completion benchmark on MI35x.
 
 Registry: nightly-amd-8-gpu-mi35x-glm51 suite
@@ -62,16 +62,16 @@ MI35X_GLM51_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=5400,
-        variant="nsa",
+        variant="dsa",
         other_args=[
             "--trust-remote-code",
             "--reasoning-parser",
             "glm45",
             "--tool-call-parser",
             "glm47",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--chunked-prefill-size",
             "131072",

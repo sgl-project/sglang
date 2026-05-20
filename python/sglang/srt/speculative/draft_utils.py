@@ -54,7 +54,8 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "tokenspeed_mla": self._create_tokenspeed_mla_decode_backend,
-            "nsa": self._create_nsa_decode_backend,
+            "dsa": self._create_dsa_decode_backend,
+            "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
@@ -81,7 +82,8 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
-            "nsa": self._create_nsa_prefill_backend,
+            "dsa": self._create_dsa_prefill_backend,
+            "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
@@ -97,19 +99,19 @@ class DraftBackendFactory:
             "EAGLE is not supported in attention backend {backend_type}",
         )
 
-    def _create_nsa_decode_backend(self):
-        from sglang.srt.layers.attention.nsa_backend import (
-            NativeSparseAttnMultiStepBackend,
+    def _create_dsa_decode_backend(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnMultiStepBackend,
         )
 
-        return NativeSparseAttnMultiStepBackend(
+        return DeepseekSparseAttnMultiStepBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
-    def _create_nsa_prefill_backend(self):
-        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+    def _create_dsa_prefill_backend(self):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-        return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return DeepseekSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
         if not get_global_server_args().use_mla_backend:

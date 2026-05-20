@@ -90,7 +90,7 @@ python3 -m sglang.launch_server \
     --tp-size 8 --dp-size 8 --enable-dp-attention \
     --mem-fraction-static 0.85 \
     --kv-cache-dtype bfloat16 \
-    --nsa-decode-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_sparse \
     --disaggregation-mode decode \
     --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3 \
     --dist-init-addr 127.0.0.1:5757 \
@@ -123,7 +123,7 @@ python3 -m sglang.bench_serving \
 - The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
 - On the decode instance, the following flags are **required** for HiSparse:
   - `--kv-cache-dtype bfloat16` — currently only bfloat16 KV cache is supported (more dtypes planned).
-  - `--nsa-decode-backend flashmla_sparse` — currently only `flashmla_sparse` backend is supported.
+  - `--dsa-decode-backend flashmla_sparse` — currently only `flashmla_sparse` backend is supported.
   - `--enable-hisparse` — enables HiSparse.
   - `--hisparse-config` — HiSparse configuration (top_k, device_buffer_size, host_to_device_ratio).
     - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
