@@ -128,9 +128,8 @@ class PipelineExecutor(ABC):
                 "audio_dit",
             ):
                 return True
-            if (
-                server_args.text_encoder_cpu_offload
-                and component_name.startswith("text_encoder")
+            if server_args.text_encoder_cpu_offload and component_name.startswith(
+                "text_encoder"
             ):
                 return True
             if server_args.image_encoder_cpu_offload and component_name in (
