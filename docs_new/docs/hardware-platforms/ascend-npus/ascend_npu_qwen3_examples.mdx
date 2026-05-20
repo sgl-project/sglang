@@ -5,6 +5,10 @@ metatags:
 ---
 ## Qwen3 examples
 
+<Warning>
+If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 ### Running Qwen3
 
 #### Running Qwen3-32B on 1 x Atlas 800I A3.
@@ -204,3 +208,7 @@ python -m sglang.launch_server \
    --model-path Qwen/Qwen3-VL-8B-Instruct \
    --mem-fraction-static 0.8
 ```
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
