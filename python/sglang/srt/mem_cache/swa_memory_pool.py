@@ -395,8 +395,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        self.clear()
         self._kvcache = kvcache
+        self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
