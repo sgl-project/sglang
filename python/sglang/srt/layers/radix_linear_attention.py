@@ -121,13 +121,11 @@ def unified_linear_attention_with_output(
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    original_swa_loc = forward_batch.swa_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
     if original_out_cache_loc_swa is not None:
         forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        forward_batch.swa_loc = forward_batch.out_cache_loc_swa
 
     ret = forward_batch.attn_backend.forward(
         layer=attention_layer,
@@ -138,8 +136,6 @@ def unified_linear_attention_with_output(
     )
     forward_batch.out_cache_loc = original_out_cache_loc
     forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None:
-        forward_batch.swa_loc = original_swa_loc
 
     output[:, :real_num_tokens].copy_(ret)
     return

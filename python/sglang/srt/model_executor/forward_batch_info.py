@@ -299,8 +299,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
 
-    # SWA (Sliding Window Attention) — derived from token_to_kv_pool, set in prepare phase
-    swa_loc: Optional[torch.Tensor] = None  # the current swa_loc tensor held by token_to_kv_pool
+    # KV cache type info — derived from token_to_kv_pool, set in prepare phase
     kv_cache_dtype: Optional[torch.dtype] = None  # token_to_kv_pool.dtype
     is_swa: bool = False  # isinstance(token_to_kv_pool, SWAKVPool)
     # The indices to track mamba state with
@@ -672,7 +671,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
             ret.is_swa = isinstance(pool, SWAKVPool)
-            ret.swa_loc = getattr(pool, "swa_loc", None)
 
         # Init lora information
         if model_runner.server_args.enable_lora:

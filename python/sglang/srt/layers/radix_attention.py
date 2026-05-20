@@ -180,13 +180,11 @@ def unified_attention_with_output(
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    original_swa_loc = forward_batch.swa_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
     if original_out_cache_loc_swa is not None:
         forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        forward_batch.swa_loc = forward_batch.out_cache_loc_swa
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_num_tokens to match the narrowed query shape —
@@ -204,8 +202,6 @@ def unified_attention_with_output(
     )
     forward_batch.out_cache_loc = original_out_cache_loc
     forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None:
-        forward_batch.swa_loc = original_swa_loc
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
