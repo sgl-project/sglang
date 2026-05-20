@@ -2008,3 +2008,177 @@ def test_violation_ring_row_byte_layout_hardcoded(hardcoded: bool) -> None:
         )
 
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+@pytest.mark.parametrize(
+    "token_val",
+    [0, 1, 0xFFFFFFFF, -1, 0x80000000, 0x7FFFFFFF],
+)
+def test_token_boundary_byte_equal_sweep(token_val: int) -> None:
+    """Sweep token boundary values; assert CUDA vs ref state byte-equal."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=token_val,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+
+@pytest.mark.parametrize(
+    "position_val",
+    [0, 1, 127, 128, 129, 0x7FFFFFFF],
+)
+def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
+    """Sweep position boundary values; assert CUDA vs ref state byte-equal."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=42,
+            position=position_val,
+            prev_hash=anchor_signed,
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[position_val], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[position_val], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+
+@pytest.mark.parametrize(
+    "prev_hash_val",
+    [0, None, 0xFFFFFFFFFFFFFFFF, 0x8000000000000000],
+    ids=["zero", "splitmix64_of_zero", "all_ones", "sign_bit"],
+)
+def test_prev_hash_boundary_byte_equal_sweep(prev_hash_val: int | None) -> None:
+    """Sweep prev_hash boundary values; assert CUDA vs ref state byte-equal."""
+    if prev_hash_val is None:
+        prev_hash_val = splitmix64(0)
+
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=42,
+            position=0,
+            prev_hash=to_signed_int64(prev_hash_val),
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+
+@pytest.mark.parametrize(
+    "stored_rkv_val",
+    [0, 1, 0xFFFFFFFFFFFFFFFF, 0x8000000000000000],
+)
+def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
+    """Sweep real_kv_hash boundary values; assert CUDA vs ref state byte-equal."""
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+
+    sources_cuda = make_real_kv_sources(count=1, device=_DEVICE)
+    sources_ref = (
+        RealKvSource(
+            tensor=sources_cuda[0].tensor.clone(),
+            page_size=sources_cuda[0].page_size,
+            num_bytes_per_token=sources_cuda[0].num_bytes_per_token,
+            read_bytes=sources_cuda[0].read_bytes,
+        ),
+    )
+
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=42,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=to_signed_int64(stored_rkv_val),
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=RealKvHashMode.BIT,
+    )
