@@ -1,0 +1,723 @@
+---
+title: MiniMax-M2.7
+metatags:
+    description: "Deploy MiniMax-M2.7 with SGLang on NVIDIA and AMD GPUs — model self-evolution, professional software engineering, and native agent teams."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) is MiniMax's first model deeply participating in its own evolution. Built for real-world productivity, M2.7 excels at building complex agent harnesses and completing highly elaborate productivity tasks, leveraging Agent Teams, complex Skills, and dynamic tool search.
+
+Key highlights:
+
+- **Model Self-Evolution**: During development, M2.7 updates its own memory, builds complex skills for RL experiments, and improves its own learning process. An internal version autonomously optimized a programming scaffold over 100+ rounds, achieving a **30% performance improvement**. On MLE Bench Lite, M2.7 achieved a **66.6% medal rate**.
+- **Professional Software Engineering**: Delivers outstanding real-world programming capabilities. On SWE-Pro, M2.7 achieved **56.22%**, with strong results on SWE Multilingual (76.5) and Multi SWE Bench (52.7). On Terminal Bench 2 (57.0%) and NL2Repo (39.8%), M2.7 demonstrates deep understanding of complex engineering systems.
+- **Professional Work**: Achieved an ELO score of **1495** on GDPval-AA (highest among open-source models). On Toolathon, M2.7 reached **46.3%** accuracy (global top tier).
+- **Native Agent Teams**: Supports multi-agent collaboration with stable role identity and autonomous decision-making.
+
+For more details, see the [official MiniMax-M2.7 blog post](https://www.minimax.io/news/minimax-m27-en).
+
+**License**: [Modified-MIT (MiniMax Model License)](https://github.com/MiniMax-AI/MiniMax-M2.7/blob/main/LICENSE)
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+**Docker Images by Hardware Platform:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware Platform</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA A100 / H100 / H200 / B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA B300 / GB300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-cu130`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-rocm720-mi30x`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-rocm720-mi35x`</td>
+    </tr>
+  </tbody>
+</table>
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and feature capabilities.
+
+import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-deployment.jsx'
+
+<MiniMaxM27Deployment />
+
+### 3.2 Configuration Tips
+
+**Key Parameters:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-call-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tool call parser for function calling support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-m2`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reasoning parser for thinking mode</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-append-think`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-remote-code`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Required for MiniMax model loading</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Always enabled</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mem-fraction-static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Static memory fraction for KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.85`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tensor parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2` / `4` / `8` depending on hardware</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Expert parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`8` (NVIDIA 8-GPU) or EP=TP (AMD)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-cache-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache data type (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fp8_e4m3`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention backend (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
+    </tr>
+  </tbody>
+</table>
+
+**Hardware Requirements: NVIDIA**
+
+- **4-GPU deployment**: Requires 4× high-memory GPUs (e.g., H200, B200, A100, H100) with TP=4
+- **8-GPU deployment**: Requires 8× GPUs (e.g., H200, B200, A100, H100) with TP=8 and EP=8
+
+**Hardware Requirements: NVIDIA GB300**
+
+- **2-GPU deployment**: GB300 (275GB per die) can host the model with TP=2
+- **4-GPU deployment**: Maximum single-node TP for GB300, recommended for higher throughput
+
+**Hardware Requirements: AMD**
+
+- **2-GPU deployment**: Requires 2× high-memory GPUs (e.g., MI300X, MI325X, MI355X) with TP=2, EP=2
+- **4-GPU deployment**: Requires 4× GPUs (e.g., MI300X, MI325X, MI355X) with TP=4, EP=4
+- **8-GPU deployment**: Requires 8× GPUs (e.g., MI300X, MI325X, MI355X) with TP=8, EP=8
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+**Deployment Command:**
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-M2.7 \
+  --tp 4 \
+  --tool-call-parser minimax-m2 \
+  --reasoning-parser minimax-append-think \
+  --trust-remote-code \
+  --mem-fraction-static 0.85
+```
+
+**Testing Deployment:**
+
+After startup, you can test the SGLang OpenAI-compatible API with the following command:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "MiniMaxAI/MiniMax-M2.7",
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]},
+            {"role": "user", "content": [{"type": "text", "text": "Who won the world series in 2020?"}]}
+        ]
+    }'
+```
+
+**Simple Completion Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="MiniMaxAI/MiniMax-M2.7",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Who won the world series in 2020?"}
+    ],
+    max_tokens=1024
+)
+
+print(response.choices[0].message.content)
+```
+
+**Example Output**:
+```text Output
+<think>The user asks: "Who won the World Series in 2020?" That's a simple factual question. The answer: the Los Angeles Dodgers won the 2020 MLB World Series, defeating the Tampa Bay Rays. So answer accordingly.
+
+We must be mindful of policy: it's a factual question about sports. It's allowed. Provide answer with brief context.
+
+We should answer concisely.
+
+Hence final answer: The Los Angeles Dodgers won the 2020 World Series, defeating the Tampa Bay Rays in six games (best-of-seven series). Possibly mention it was played at a neutral site due to COVID-19, at Globe Life Field in Arlington, Texas.
+
+We must avoid disallowed content, no issue.
+
+Thus final.
+</think>
+
+The **Los Angeles Dodgers** won the 2020 World Series. They defeated the **Tampa Bay Rays** in six games (4‑2) in a best‑of‑seven series that was played at Globe Life Field in Arlington, Texas, under the MLB bubble‑like arrangements for the COVID‑19 pandemic.
+```
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+MiniMax-M2.7 supports Thinking mode. Enable the reasoning parser during deployment to separate the thinking and the content sections:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-M2.7 \
+  --tp 4 \
+  --reasoning-parser minimax-append-think \
+  --trust-remote-code \
+  --mem-fraction-static 0.85
+```
+
+**Streaming with Thinking Process**
+
+With `minimax-append-think`, the thinking content is wrapped in `<think>...</think>` tags within the `content` field. You can parse these tags on the client side to separate the thinking and content sections:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="MiniMaxAI/MiniMax-M2.7",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream, separating <think>...</think> from content
+in_think = False
+think_printed_header = False
+content_printed_header = False
+buffer = ""
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            buffer += delta.content
+
+            while buffer:
+                if in_think:
+                    # Look for closing </think> tag
+                    end_idx = buffer.find("</think>")
+                    if end_idx != -1:
+                        print(buffer[:end_idx], end="", flush=True)
+                        buffer = buffer[end_idx + len("</think>"):]
+                        in_think = False
+                    else:
+                        # Still in thinking, print what we have
+                        print(buffer, end="", flush=True)
+                        buffer = ""
+                else:
+                    # Look for opening <think> tag
+                    start_idx = buffer.find("<think>")
+                    if start_idx != -1:
+                        # Print any content before <think>
+                        before = buffer[:start_idx]
+                        if before:
+                            if not content_printed_header:
+                                print("=============== Content =================", flush=True)
+                                content_printed_header = True
+                            print(before, end="", flush=True)
+                        buffer = buffer[start_idx + len("<think>"):]
+                        in_think = True
+                        if not think_printed_header:
+                            print("=============== Thinking =================", flush=True)
+                            think_printed_header = True
+                    else:
+                        # No <think> tag, print as content
+                        if not content_printed_header and think_printed_header:
+                            print("\n=============== Content =================", flush=True)
+                            content_printed_header = True
+                        print(buffer, end="", flush=True)
+                        buffer = ""
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user asks: "Solve this problem step by step: What is 15% of 240?" Straightforward. Provide solution: 15% = 15/100 = 0.15. Multiply 240 * 0.15 = 36. Show steps. So answer: 36. Provide explanation.
+
+But also ensure we follow any policy? No issues. Just straightforward.
+
+I'll provide a step-by-step solution.
+
+Also could show fraction: 15% = 15/100 = 3/20, multiply 240 * 3/20 = (240/20)*3 = 12*3 = 36.
+
+Yes. Provide final answer. Also show verification: 10% of 240 is 24, 5% is 12, total 36.
+
+All good.
+
+=============== Content =================
+
+**Step‑by‑step solution**
+
+1. **Convert the percent to a decimal (or a fraction).**
+
+   15% = 15/100 = 0.15 = 3/20
+
+2. **Multiply the original number (240) by this decimal/fraction.**
+
+   Using the decimal:
+   240 × 0.15 = 36
+
+   Or using the fraction:
+   240 × 3/20 = (240/20) × 3 = 12 × 3 = 36
+
+3. **Result:**
+
+   15% of 240 = **36**
+
+*Check:*
+- 10% of 240 = 24
+- 5% of 240 = 12
+- Adding them: 24 + 12 = 36, which matches the calculation.
+```
+
+**Note:** The `minimax-append-think` reasoning parser embeds the thinking process in `<think>...</think>` tags within the `content` field. The code above parses these tags in real-time to display thinking and content separately.
+
+#### 4.2.2 Tool Calling
+
+MiniMax-M2.7 supports tool calling capabilities. Enable the tool call parser:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-M2.7 \
+  --tp 4 \
+  --tool-call-parser minimax-m2 \
+  --reasoning-parser minimax-append-think \
+  --trust-remote-code \
+  --mem-fraction-static 0.85
+```
+
+**Python Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Non-streaming request
+response = client.chat.completions.create(
+    model="MiniMaxAI/MiniMax-M2.7",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools
+)
+
+message = response.choices[0].message
+
+# Check for tool calls
+if message.tool_calls:
+    for tool_call in message.tool_calls:
+        print(f"Tool Call: {tool_call.function.name}")
+        print(f"   Arguments: {tool_call.function.arguments}")
+else:
+    print(message.content)
+```
+
+**Output Example**:
+```text Output
+Tool Call: get_weather
+   Arguments: {"location": "Beijing"}
+```
+
+**Handling Tool Call Results:**
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="MiniMaxAI/MiniMax-M2.7",
+    messages=messages
+)
+
+print(final_response.choices[0].message.content)
+```
+
+**Output Example:**
+```text Output
+The weather in Beijing is currently 22°C and sunny.
+```
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+**Test Environment**:
+
+- Hardware: 2× NVIDIA GB300 (275GB per die)
+- Docker Image: `lmsysorg/sglang:v0.5.10.post1-cu130`
+- Model: MiniMax-M2.7 (FP8)
+- Tensor Parallelism: 2
+- SGLang version: 0.5.10.post1
+
+### 5.1 Accuracy Benchmark
+
+**Evaluation Tool**: [NVIDIA NeMo-Skills](https://github.com/NVIDIA-NeMo/Skills)
+
+**Evaluation Settings**: temperature=0.6, top_p=0.95, 8 seeds, max_tokens=120,000, `parse_reasoning=True`
+
+#### 5.1.1 GPQA Diamond
+
+- Dataset: [GPQA Diamond](https://huggingface.co/datasets/Idavidrein/gpqa) (198 questions)
+- Prompt: `eval/aai/mcq-4choices` (4-choice multiple choice, matching [Artificial Analysis methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking))
+- Evaluation command:
+```bash Command
+ns prepare_data gpqa
+
+ns eval \
+    --cluster=local \
+    --server_type=openai \
+    --model=MiniMaxAI/MiniMax-M2.7 \
+    --server_address=http://localhost:30000/v1 \
+    --output_dir=./m2.7-eval/ \
+    --benchmarks=gpqa:8 \
+    ++prompt_config=eval/aai/mcq-4choices \
+    ++inference.tokens_to_generate=120000 \
+    ++inference.temperature=0.6 \
+    ++inference.top_p=0.95 \
+    ++parse_reasoning=True
+```
+- Test Results:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (avg-of-8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>84.91%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.54%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**majority@8**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**88.89%**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>96.46%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+#### 5.1.2 AIME 2025
+
+- Dataset: AIME 2025 (30 problems)
+- Prompt: `generic/math` (boxed answer format)
+- Evaluation command:
+```bash Command
+ns prepare_data aime25
+
+ns eval \
+    --cluster=local \
+    --server_type=openai \
+    --model=MiniMaxAI/MiniMax-M2.7 \
+    --server_address=http://localhost:30000/v1 \
+    --output_dir=./m2.7-eval/ \
+    --benchmarks=aime25:8 \
+    ++inference.tokens_to_generate=120000 \
+    ++inference.temperature=0.6 \
+    ++inference.top_p=0.95 \
+    ++parse_reasoning=True
+```
+- Test Results:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (avg-of-8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>92.50% ± 5.56%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2.92%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**majority@8**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**97.08%**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100.00%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+#### 5.1.3 MMLU-Pro
+
+- Dataset: [MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) (12,032 questions, 10-choice)
+- Prompt: `eval/aai/mcq-10choices` (10-choice multiple choice)
+- Evaluation command:
+```bash Command
+ns prepare_data mmlu-pro
+
+ns eval \
+    --cluster=local \
+    --server_type=openai \
+    --model=MiniMaxAI/MiniMax-M2.7 \
+    --server_address=http://localhost:30000/v1 \
+    --output_dir=./m2.7-eval/ \
+    --benchmarks=mmlu-pro \
+    ++prompt_config=eval/aai/mcq-10choices \
+    ++inference.tokens_to_generate=32768 \
+    ++inference.temperature=0.0 \
+    ++parse_reasoning=True
+```
+- Test Results:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (greedy)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>69.41%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>18.75%</td>
+    </tr>
+  </tbody>
+</table>
+
+> **Note**: The high no-answer rate is due to the 32K token limit being insufficient for M2.7's extended thinking on some questions. A rerun with 120K tokens is expected to improve accuracy significantly.
+
+#### 5.1.4 GSM8K Benchmark
+- Benchmark Method: 8-shot Chain-of-Thought, evaluated via OpenAI-compatible API
+- Test Results:
+```text Output
+GSM8K Results (8-shot CoT)
+Model: MiniMaxAI/MiniMax-M2.7
+Total: 1319
+Correct: 1218
+Accuracy: 92.34%
+```
+
+### 5.2 Speed Benchmark
+
+#### 5.2.1 Low Concurrency
+
+- Benchmark Command:
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model MiniMaxAI/MiniMax-M2.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  34.33
+Total input tokens:                      6101
+Total generated tokens:                  4220
+Request throughput (req/s):              0.29
+Input token throughput (tok/s):          177.71
+Output token throughput (tok/s):         122.92
+Total token throughput (tok/s):          300.63
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3431.21
+Median E2E Latency (ms):                 2742.57
+---------------Time to First Token----------------
+Mean TTFT (ms):                          50.28
+Median TTFT (ms):                        53.85
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.02
+Median TPOT (ms):                        8.01
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.03
+Median ITL (ms):                         8.02
+==================================================
+```
+
+#### 5.2.2 High Concurrency
+
+- Benchmark Command:
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model MiniMaxAI/MiniMax-M2.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100
+```
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  100.20
+Total input tokens:                      249831
+Total generated tokens:                  252662
+Request throughput (req/s):              4.99
+Input token throughput (tok/s):          2493.41
+Output token throughput (tok/s):         2521.66
+Total token throughput (tok/s):          5015.07
+Concurrency:                             90.19
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   18072.69
+Median E2E Latency (ms):                 17761.84
+---------------Time to First Token----------------
+Mean TTFT (ms):                          247.94
+Median TTFT (ms):                        92.05
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          35.75
+Median TPOT (ms):                        36.67
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           35.34
+Median ITL (ms):                         30.55
+==================================================
+```

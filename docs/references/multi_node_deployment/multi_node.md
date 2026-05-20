@@ -30,7 +30,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 
 ## DeepSeek V3/R1
 
-Please refer to [DeepSeek documents for reference](https://docs.sglang.io/basic_usage/deepseek.html#running-examples-on-multi-node).
+Please refer to [DeepSeek documents for reference](https://docs.sglang.io/basic_usage/deepseek_v3.html#running-examples-on-multi-node).
 
 ## Multi-Node Inference on SLURM
 

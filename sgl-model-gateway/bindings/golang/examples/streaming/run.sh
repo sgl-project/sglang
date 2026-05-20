@@ -19,7 +19,7 @@ fi
 PYTHON_LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || echo "")
 
 # Set CGO_LDFLAGS to link with the Rust library
-export CGO_LDFLAGS="-L${LIB_DIR} -lsglang_router_rs ${PYTHON_LDFLAGS} -ldl"
+export CGO_LDFLAGS="-L${LIB_DIR} -lsgl_model_gateway_go ${PYTHON_LDFLAGS} -ldl"
 
 # macOS uses DYLD_LIBRARY_PATH, Linux uses LD_LIBRARY_PATH
 if [[ "$OSTYPE" == "darwin"* ]]; then

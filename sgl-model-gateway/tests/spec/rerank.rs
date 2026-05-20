@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::{from_str, to_string, Number, Value};
-use sgl_model_gateway::protocols::{
+use smg::protocols::{
     common::{GenerationRequest, StringOrArray, UsageInfo},
     rerank::{RerankRequest, RerankResponse, RerankResult, V1RerankReqInput},
 };

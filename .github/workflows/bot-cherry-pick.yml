@@ -1,0 +1,182 @@
+name: Bot Cherry Pick to Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA to cherry-pick (full or short hash)'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target release branch (e.g., release/v0.5.7)'
+        required: true
+        type: string
+      create_pr:
+        description: 'Create a PR instead of pushing directly'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cherry-pick-${{ github.event.inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  cherry-pick:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      - name: Validate inputs
+        env:
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+        run: |
+          if [[ ! "$TARGET_BRANCH" =~ ^release/v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Target branch must match pattern 'release/vX.Y' or 'release/vX.Y.Z' (e.g., release/v0.5.7)"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+      - name: Validate target branch exists
+        env:
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+        run: |
+          git fetch origin
+          if ! git ls-remote --exit-code --heads origin "$TARGET_BRANCH" > /dev/null 2>&1; then
+            echo "::error::Target branch '$TARGET_BRANCH' does not exist on remote"
+            exit 1
+          fi
+
+      - name: Get commit info
+        id: commit_info
+        env:
+          COMMIT_SHA_INPUT: ${{ github.event.inputs.commit_sha }}
+        run: |
+          # Verify commit exists
+          if ! git cat-file -t "$COMMIT_SHA_INPUT" > /dev/null 2>&1; then
+            echo "::error::Commit SHA '$COMMIT_SHA_INPUT' does not exist"
+            exit 1
+          fi
+
+          # Get full SHA if short hash provided
+          FULL_SHA=$(git rev-parse "$COMMIT_SHA_INPUT")
+          COMMIT_TITLE=$(git log -1 --format="%s" "$FULL_SHA")
+          SHORT_SHA=$(git rev-parse --short "$FULL_SHA")
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          # Use delimiter for multiline-safe output
+          {
+            echo "commit_title<<EOF"
+            echo "$COMMIT_TITLE"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          echo "Cherry-picking commit: $SHORT_SHA - $COMMIT_TITLE"
+
+      - name: Cherry-pick commit
+        id: cherry_pick
+        env:
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.commit_info.outputs.short_sha }}
+          CREATE_PR: ${{ github.event.inputs.create_pr }}
+        run: |
+          if [[ "$CREATE_PR" == "true" ]]; then
+            # Create a new branch for the PR
+            RANDOM_SUFFIX=$(head -c 4 /dev/urandom | xxd -p)
+            NEW_BRANCH="cherry-pick/${SHORT_SHA}-to-${TARGET_BRANCH#release/}-${RANDOM_SUFFIX}"
+            git checkout -b "$NEW_BRANCH" "origin/$TARGET_BRANCH"
+            echo "new_branch=$NEW_BRANCH" >> $GITHUB_OUTPUT
+          else
+            # Checkout target branch directly
+            git checkout "$TARGET_BRANCH"
+          fi
+
+          # Attempt cherry-pick
+          if git cherry-pick "$FULL_SHA"; then
+            echo "cherry_pick_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Cherry-pick failed due to conflicts. Please resolve manually."
+            git cherry-pick --abort || true
+            echo "cherry_pick_success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Push changes
+        if: steps.cherry_pick.outputs.cherry_pick_success == 'true'
+        env:
+          CREATE_PR: ${{ github.event.inputs.create_pr }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
+        run: |
+          if [[ "$CREATE_PR" == "true" ]]; then
+            git push origin "$NEW_BRANCH"
+          else
+            git push origin "$TARGET_BRANCH"
+          fi
+
+      - name: Create Pull Request
+        if: steps.cherry_pick.outputs.cherry_pick_success == 'true' && github.event.inputs.create_pr == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          SHORT_SHA: ${{ steps.commit_info.outputs.short_sha }}
+          COMMIT_TITLE: ${{ steps.commit_info.outputs.commit_title }}
+          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
+          NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
+        run: |
+          PR_TITLE="[Cherry-pick] ${COMMIT_TITLE} to ${TARGET_BRANCH}"
+
+          gh pr create \
+            --title "$PR_TITLE" \
+            --base "$TARGET_BRANCH" \
+            --head "$NEW_BRANCH" \
+            --label "cherry-pick" \
+            --body-file - <<EOF
+          Cherry-pick of commit ${FULL_SHA} to \`${TARGET_BRANCH}\`
+
+          **Original commit:** ${FULL_SHA}
+          **Original title:** ${COMMIT_TITLE}
+
+          ---
+          *This PR was automatically created by the cherry-pick workflow.*
+          EOF
+
+      - name: Summary
+        if: always()
+        env:
+          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
+          COMMIT_TITLE: ${{ steps.commit_info.outputs.commit_title }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          CHERRY_PICK_SUCCESS: ${{ steps.cherry_pick.outputs.cherry_pick_success }}
+          CREATE_PR: ${{ github.event.inputs.create_pr }}
+          NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "## Cherry-Pick Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** @${ACTOR}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${FULL_SHA}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Title:** ${COMMIT_TITLE}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Branch:** ${TARGET_BRANCH}" >> $GITHUB_STEP_SUMMARY
+          if [[ "$CHERRY_PICK_SUCCESS" == "true" ]]; then
+            echo "- **Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [[ "$CREATE_PR" == "true" && "$CHERRY_PICK_SUCCESS" == "true" ]]; then
+            echo "- **PR Branch:** ${NEW_BRANCH}" >> $GITHUB_STEP_SUMMARY
+          fi

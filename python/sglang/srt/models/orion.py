@@ -7,6 +7,7 @@
 # LICENSE: https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/main/LICENSE
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/orion.py
 """Inference-only Orion-14B model compatible with HuggingFace weights."""
+
 from collections.abc import Iterable
 from typing import Any, Optional, Tuple
 
@@ -34,6 +35,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class OrionMLP(nn.Module):
@@ -164,8 +166,7 @@ class OrionDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = OrionAttention(
             hidden_size=self.hidden_size,

@@ -83,7 +83,7 @@ class _StageExecutor:
         # handling DP attention
         forward_batch: ForwardBatch = inputs["forward_batch"]
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
-        self._local_dp_buffer_len = forward_batch.input_ids.shape[0]
+        self._local_dp_buffer_len = forward_batch.tbo_padded_len
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
         self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
@@ -92,13 +92,15 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        if self._global_dp_buffer_len is not None:
-            set_dp_buffer_len(
-                self._global_dp_buffer_len,
-                self._local_dp_buffer_len,
-                self._is_dp_max_padding,
-                self._global_num_tokens,
-            )
+        # TODO: We currently always call set_dp_buffer_len here because sub-batches
+        # may have different padded lengths. It can likely be removed after TBO slice &
+        # pad logic is refactored.
+        set_dp_buffer_len(
+            self._global_dp_buffer_len,
+            self._local_dp_buffer_len,
+            self._is_dp_max_padding,
+            self._global_num_tokens,
+        )
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
@@ -168,7 +170,7 @@ class _StateDict:
     def clear(self, expect_keys: Sequence[str]):
         if set(self._data.keys()) != set(expect_keys):
             raise Exception(
-                f"Unexpected keys when clearning. This may indicate you do not release memory early enough but leave it to here. {list(self._data.keys())=} {expect_keys=}"
+                f"Unexpected keys when clearing. This may indicate you do not release memory early enough but leave it until here. {list(self._data.keys())=} {expect_keys=}"
             )
 
         self._data.clear()

@@ -1,0 +1,7 @@
+{
+  "name": "deepseek_coder",
+  "fim_begin_token": "<｜fim▁begin｜>",
+  "fim_middle_token": "<｜fim▁hole｜>",
+  "fim_end_token": "<｜fim▁end｜>",
+  "fim_position": "MIDDLE"
+}

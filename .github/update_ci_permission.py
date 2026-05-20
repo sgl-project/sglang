@@ -22,7 +22,7 @@ The format of `CI_PERMISSIONS.json` is as follows:
 
 Permissions are assigned according to the following rules:
 
-1. Add the top 50 contributors from the last 90 days with full permissions, no cooldown, and the reason "top contributor".
+1. Add the top 50 contributors from the last 120 days with full permissions, no cooldown, and the reason "top contributor".
 2. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
    - If a user is already covered by rule 1, skip that user.
    - If the old reason of a user is "top contributor" but they are not in the current top contributors list, change their configuration to:
@@ -38,33 +38,40 @@ Permissions are assigned according to the following rules:
 Usage:
     export GH_TOKEN="your_github_token"
     python3 update_ci_permission.py
+
+    # Sort-only mode (no network calls, no GH_TOKEN required)
+    python3 update_ci_permission.py --sort-only
 """
 
+import argparse
 import json
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # Only needed for non-sort-only runs
 
 # Configuration
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
-FILE_NAME = "CI_PERMISSIONS.json"
-GH_TOKEN = os.getenv("GH_TOKEN")
-
-if not GH_TOKEN:
-    raise ValueError("Error: GH_TOKEN environment variable is not set.")
-
-HEADERS = {
-    "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+FILE_NAME = os.path.join(os.path.dirname(__file__), "CI_PERMISSIONS.json")
+HEADERS = {}
 
 
 def github_api_get(endpoint, params=None):
     """Helper to make paginated GitHub API requests."""
+    if requests is None:
+        raise RuntimeError(
+            "The requests package is required. Install it or use --sort-only."
+        )
+    if not HEADERS:
+        raise RuntimeError(
+            "GitHub headers not initialized. Set GH_TOKEN or use --sort-only."
+        )
+
     results = []
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/{endpoint}"
 
@@ -110,7 +117,7 @@ def get_write_access_users():
     return writers
 
 
-def get_top_contributors(days=90, limit=50):
+def get_top_contributors(days, limit):
     """Fetches top contributors based on commit count in the last N days."""
     print(f"Fetching commits from the last {days} days...")
     since_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -125,7 +132,7 @@ def get_top_contributors(days=90, limit=50):
             author_counts[commit["author"]["login"]] += 1
 
     top_users = [user for user, _ in author_counts.most_common(limit)]
-    print(f"Found {len(top_users)} active contributors in the last {days} days.")
+    print(f"Found {len(top_users)} top contributors in the last {days} days.")
     return set(top_users)
 
 
@@ -139,7 +146,46 @@ def load_existing_permissions():
     return {}
 
 
+def sort_permissions_file():
+    """Sort the existing CI permissions file alphabetically and exit."""
+    if not os.path.exists(FILE_NAME):
+        print(f"{FILE_NAME} not found. Nothing to sort.")
+        return
+
+    old_permissions = load_existing_permissions()
+    sorted_permissions = dict(sorted(old_permissions.items()))
+
+    with open(FILE_NAME, "w") as f:
+        json.dump(sorted_permissions, f, indent=4)
+        f.write("\n")
+
+    print(f"Sorted {FILE_NAME}. Total users: {len(sorted_permissions)}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Update or sort CI permissions.")
+    parser.add_argument(
+        "--sort-only",
+        action="store_true",
+        help="Only sort CI_PERMISSIONS.json alphabetically without fetching data.",
+    )
+    args = parser.parse_args()
+
+    if args.sort_only:
+        sort_permissions_file()
+        return
+
+    gh_token = os.getenv("GH_TOKEN")
+    if not gh_token:
+        raise ValueError("Error: GH_TOKEN environment variable is not set.")
+
+    global HEADERS
+    HEADERS = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
     # Gather Data
     try:
         write_access_users = get_write_access_users()
@@ -147,7 +193,7 @@ def main():
         print(f"Warning: Could not fetch collaborators (check token scope). Error: {e}")
         write_access_users = set()
 
-    top_contributors = get_top_contributors(days=90, limit=50)
+    top_contributors = get_top_contributors(days=120, limit=50)
     old_permissions = load_existing_permissions()
 
     new_permissions = {}
@@ -157,6 +203,7 @@ def main():
         new_permissions[user] = {
             "can_tag_run_ci_label": True,
             "can_rerun_failed_ci": True,
+            "can_rerun_stage": True,
             "cooldown_interval_minutes": 0,
             "reason": "top contributor",
         }
@@ -174,6 +221,7 @@ def main():
             new_permissions[user] = {
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
+                "can_rerun_stage": True,
                 "cooldown_interval_minutes": 60,
                 "reason": "custom override",
             }

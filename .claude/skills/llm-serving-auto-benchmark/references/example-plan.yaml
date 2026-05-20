@@ -1,0 +1,133 @@
+# Example run plan for the llm-serving-auto-benchmark skill. Baseline flags stay
+# in base_server_flags, search knobs stay in search_space, and aligned dataset
+# length pairs define scenarios.
+#
+# Note: this is the runtime plan shape (top-level `sla`, no `schema_version` or
+# `server_command`). Cookbook configs in configs/cookbook-llm/ use the extended
+# schema enforced by scripts/validate_cookbook_configs.py; do not run the
+# validator against this file as-is.
+
+model:
+  name: Qwen/Qwen3-32B
+  tokenizer: Qwen/Qwen3-32B
+  precision: bf16
+  quantization: none
+
+version_manifest:
+  sglang:
+    container_image: lmsysorg/sglang:dev
+    package_version: null
+    git_commit: null
+    server_help: artifacts/help/sglang_launch_server.txt
+    benchmark_help: artifacts/help/sglang_bench_serving.txt
+  vllm:
+    container_image: vllm/vllm-openai:latest
+    package_version: null
+    git_commit: null
+    server_help: artifacts/help/vllm_serve_all.txt
+    benchmark_help: artifacts/help/vllm_bench_serve_all.txt
+    sweep_help: artifacts/help/vllm_bench_sweep_serve_all.txt
+  tensorrt_llm:
+    container_image: nvcr.io/nvidia/tensorrt-llm/release:latest
+    package_version: null
+    git_commit: null
+    server_help: artifacts/help/trtllm_serve.txt
+    benchmark_help: artifacts/help/trtllm_benchmark_serving.txt
+
+hardware:
+  # Example values; replace with the actual target GPU (A100, H100, H200,
+  # B200, MI300, RTX 5090, etc.). gpu_model is recorded for fairness audit,
+  # not used as a scheduling hint.
+  gpu_model: NVIDIA H100 80GB HBM3
+  gpu_count: 4
+  multi_node: false
+
+dataset:
+  kind: random
+  num_prompts: 80
+  scenario_names: [chat, summarization]
+  input_len: [1000, 8000]
+  output_len: [1000, 1000]
+  canonical_jsonl: null
+
+benchmark:
+  endpoint: /v1/chat/completions
+  backend: auto
+  request_rates: null
+  max_concurrency: [null, 16, 32]
+  qps:
+    lower: 1.0
+    upper: 12.0
+    tolerance: 0.1
+    max_rounds: 5
+  extra_request_body:
+    temperature: 0.0
+
+sla:
+  max_p99_ttft_ms: 2000
+  max_p99_tpot_ms: 80
+  min_success_rate: 0.99
+
+search:
+  tier: 2
+  max_candidates_per_framework: 10
+  candidate_generation: baseline_first_bounded_product
+  resume: true
+  output_dir: /bench/results/llm-serving-auto-benchmark
+
+frameworks:
+  sglang:
+    enabled: true
+    base_server_flags:
+      tp_size: 4
+      trust_remote_code: true
+      mem_fraction_static: 0.82
+      schedule_policy: lpm
+      context_length: 12288
+    search_space:
+      # Verify these names against `python -m sglang.launch_server --help`.
+      prefill_attention_backend: [fa3, flashinfer]
+      decode_attention_backend: [fa3, flashinfer]
+      chunked_prefill_size: [8192, 16384]
+      max_running_requests: [64, 128]
+
+  vllm:
+    enabled: true
+    base_server_flags:
+      tensor_parallel_size: 4
+      trust_remote_code: true
+      gpu_memory_utilization: 0.90
+      max_model_len: 12288
+      dtype: auto
+    search_space:
+      # Verify these names against `vllm serve --help=all`.
+      max_num_seqs: [64, 128]
+      max_num_batched_tokens: [8192, 16384]
+      enable_chunked_prefill: [true]
+      # Raise above 1 only after the target model/runtime supports concurrent partial prefill.
+      max_num_partial_prefills: [1]
+      max_long_partial_prefills: [1]
+      long_prefill_token_threshold: [0, 4096]
+      enable_prefix_caching: [true]
+      kv_cache_dtype: [auto]
+      block_size: [16]
+
+  tensorrt_llm:
+    enabled: true
+    backend_policy: fixed_pytorch
+    base_server_flags:
+      backend: pytorch
+      tp_size: 4
+      pp_size: 1
+      kv_cache_free_gpu_memory_fraction: 0.75
+      trust_remote_code: true
+    search_space:
+      # Verify these names against `trtllm-serve serve --help`.
+      # Do not add backend choices here; TensorRT-LLM is fixed to the PyTorch backend.
+      max_batch_size: [64, 128]
+      max_num_tokens: [8192, 16384]
+      max_seq_len: [12288, 16384]
+      # Uncomment and point at concrete config files to sweep PyTorch-backend
+      # options via --extra_llm_api_options. A single [null] value contributes
+      # no dimension to the search.
+      # extra_llm_api_options: [null, /path/to/trt_llm_config_A.yaml]

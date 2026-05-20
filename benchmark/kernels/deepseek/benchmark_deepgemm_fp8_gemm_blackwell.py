@@ -6,6 +6,7 @@ import triton
 from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
@@ -195,10 +196,10 @@ def _benchmark(m, n, k, tp_size, provider):
         y_fp8, y_scale, [BLOCK_SIZE, BLOCK_SIZE]
     )
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
 
     if provider == "deepgemm":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = run_bench(
             lambda: fp8_gemm_deepgemm_blackwell(
                 dg_x_fp8,
                 dg_x_scale,
@@ -208,7 +209,7 @@ def _benchmark(m, n, k, tp_size, provider):
             quantiles=quantiles,
         )
     elif provider == "flashinfer":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = run_bench(
             lambda: fp8_gemm_flashinfer(
                 x_fp8,
                 x_scale,

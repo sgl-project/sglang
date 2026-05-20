@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from typing import Any, Callable
+
+import torch
+
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.pool_patch.buf_info_splice import (
+    BufInfoTriple,
+    splice_kv_buf_info,
+)
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
+    alloc_canary_buf,
+    make_packed_source,
+)
+from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
+
+
+def _dsv4_packed_nope_rope_bytes_per_token(pool: object) -> int:
+    """Per-token byte width of segment A (nope_fp8 + rope_bf16) inside a DSv4 packed page.
+
+    Each DSv4 page stores tokens in a field-major two-segment layout, NOT token-major contiguous bytes:
+
+        [page i]
+          segment A: [0, page_size * 576):
+            token0 nope+rope(576B) | token1 nope+rope | ... | token_{ps-1} nope+rope
+          segment B: [page_size * 576, page_size * 584):
+            token0 scale(8B) | token1 scale | ... | token_{ps-1} scale
+          + trailing per-page padding to bytes_per_page_padded
+
+    Only segment A is token-major and therefore satisfies the RealKvSource access formula
+    (``tensor[slot // page_size, (slot % page_size) * N : ((slot % page_size) + 1) * N]``). Canary fingerprints
+    only segment A; segment B + padding fall in the trailing portion of each row and are ignored per the
+    RealKvSource contract. Corruption inside the scale segment is by design a false negative — scale is 8 of
+    584 bytes per token (~1.4%) and detecting it would require extending RealKvSource with an in-row offset.
+    """
+    nbytes = (
+        pool.qk_nope_head_dim + pool.qk_rope_head_dim * pool.rope_storage_dtype.itemsize
+    )
+    assert nbytes == 576, f"unexpected DSv4 nope+rope width: {nbytes}"
+    return nbytes
+
+
+def attach_dsv4(
+    *,
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+) -> tuple[CanaryBufferGroup, ...]:
+    """Attach canary buffers to a DSV4 packed pool.
+
+    FULL group covers three sub-pools (c4 / indexer / c128) and splices into ``get_contiguous_buf_infos``;
+    SWA group covers swa_kv_pool and splices into ``get_state_buf_infos``. All real-KV sources use the
+    page-aware ``make_packed_source`` and target only the token-major segment A of each page — see
+    ``_dsv4_packed_nope_rope_bytes_per_token`` for the layout that motivates this.
+    """
+    full_group = _build_full_group(pool=pool, device=device, read_bytes=read_bytes)
+    swa_group = _build_swa_group(pool=pool, device=device, read_bytes=read_bytes)
+
+    _patch_contiguous_buf_info(pool, group=full_group)
+    _patch_state_buf_info(pool, group=swa_group)
+
+    return (full_group, swa_group)
+
+
+def _build_full_group(
+    *,
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+) -> CanaryBufferGroup:
+    c4_pool = pool.c4_kv_pool
+    indexer_pool = pool.c4_indexer_kv_pool
+    c128_pool = pool.c128_kv_pool
+
+    num_slots = int(c4_pool.kv_buffer[0].shape[0]) * c4_pool.page_size
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
+
+    indexer_buf = indexer_pool.index_k_with_scale_buffer[0]
+
+    sources = (
+        make_packed_source(
+            page_buffer=c4_pool.kv_buffer[0],
+            page_size=c4_pool.page_size,
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(c4_pool),
+            read_bytes=read_bytes,
+        )
+        # Indexer page mirrors c4/c128's two-segment layout: [token-major K (index_head_dim bytes/token) | scale | pad].
+        # index_head_dim is segment A's per-token byte width (K is fp8, 1B/elem); scale segment is trailing-ignored.
+        + make_packed_source(
+            page_buffer=indexer_buf,
+            page_size=indexer_pool.page_size,
+            bytes_per_token=indexer_pool.index_head_dim,
+            read_bytes=read_bytes,
+        )
+        + make_packed_source(
+            page_buffer=c128_pool.kv_buffer[0],
+            page_size=c128_pool.page_size,
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(c128_pool),
+            read_bytes=read_bytes,
+        )
+    )
+
+    return CanaryBufferGroup(
+        kind=PoolKind.FULL,
+        k_head=k_head,
+        k_tail=k_tail,
+        v_head=None,
+        v_tail=None,
+        real_kv_sources_k=sources,
+        real_kv_sources_v=(),
+        swa_index_lut=None,
+    )
+
+
+def _build_swa_group(
+    *,
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+) -> CanaryBufferGroup:
+    swa_pool = pool.swa_kv_pool
+    num_slots = int(swa_pool.kv_buffer[0].shape[0]) * swa_pool.page_size
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
+    return CanaryBufferGroup(
+        kind=PoolKind.SWA,
+        k_head=k_head,
+        k_tail=k_tail,
+        v_head=None,
+        v_tail=None,
+        real_kv_sources_k=make_packed_source(
+            page_buffer=swa_pool.kv_buffer[0],
+            page_size=swa_pool.page_size,
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(swa_pool),
+            read_bytes=read_bytes,
+        ),
+        real_kv_sources_v=(),
+        swa_index_lut=pool.full_to_swa_index_mapping,
+    )
+
+
+def _patch_contiguous_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
+    c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
+    indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
+    c128_layer_num = len(pool.c128_kv_pool.kv_buffer)
+    expected_total = c4_layer_num + indexer_layer_num + c128_layer_num
+    page_size = pool.page_size
+
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:
+        ptrs, lens, item_lens = original(*args, **kwargs)
+        if len(ptrs) != expected_total:
+            raise RuntimeError(
+                f"DSV4 buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
+            )
+        return splice_kv_buf_info(
+            ptrs=ptrs,
+            lens=lens,
+            item_lens=item_lens,
+            group=group,
+            has_v_half=False,
+            page_size=page_size,
+        )
+
+    wrap_method(pool, "get_contiguous_buf_infos", wrapper=_with_splice)
+
+
+def _patch_state_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
+    swa_layer_num = len(pool.swa_kv_pool.kv_buffer)
+    compress_state_count = sum(1 for p in pool.compress_state_pools if p is not None)
+    indexer_compress_state_count = sum(
+        1 for p in pool.indexer_compress_state_pools if p is not None
+    )
+    expected_total = swa_layer_num + compress_state_count + indexer_compress_state_count
+    page_size = pool.page_size
+
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:
+        ptrs, lens, item_lens = original(*args, **kwargs)
+        if len(ptrs) != expected_total:
+            raise RuntimeError(
+                f"DSV4 state buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
+            )
+        return splice_kv_buf_info(
+            ptrs=ptrs,
+            lens=lens,
+            item_lens=item_lens,
+            group=group,
+            has_v_half=False,
+            page_size=page_size,
+        )
+
+    wrap_method(pool, "get_state_buf_infos", wrapper=_with_splice)

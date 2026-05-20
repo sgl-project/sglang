@@ -14,7 +14,7 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.layers.linear import RowParallelLinear
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -90,7 +90,7 @@ class Gemma3nMultimodalEmbedder(nn.Module):
             eps=self.eps,
         )
 
-        self.embedding_projection = RowParallelLinear(
+        self.embedding_projection = ReplicatedLinear(
             self.multimodal_hidden_size,
             self.text_hidden_size,
             bias=False,

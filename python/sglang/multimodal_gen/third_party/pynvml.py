@@ -1321,7 +1321,7 @@ def _nvmlGetFunctionPointer(name):
     libLoadLock.acquire()
     try:
         # ensure library was loaded
-        if nvmlLib == None:
+        if nvmlLib is None:
             raise NVMLError(NVML_ERROR_UNINITIALIZED)
         try:
             _nvmlGetFunctionPointer_cache[name] = getattr(nvmlLib, name)
@@ -1629,7 +1629,7 @@ class nvmlClkMonStatus_t(Structure):
 # On Windows with the WDDM driver, usedGpuMemory is reported as None
 # Code that processes this structure should check for None, I.E.
 #
-# if (info.usedGpuMemory == None):
+# if (info.usedGpuMemory is None):
 #     # TODO handle the error
 #     pass
 # else:
@@ -2870,13 +2870,13 @@ def _LoadNvmlLibrary():
     """
     global nvmlLib
 
-    if nvmlLib == None:
+    if nvmlLib is None:
         # lock to ensure only one caller loads the library
         libLoadLock.acquire()
 
         try:
             # ensure the library still isn't loaded
-            if nvmlLib == None:
+            if nvmlLib is None:
                 try:
                     if sys.platform[:3] == "win":
                         # cdecl calling convention
@@ -2902,7 +2902,7 @@ def _LoadNvmlLibrary():
                         nvmlLib = CDLL("libnvidia-ml.so.1")
                 except OSError as ose:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
-                if nvmlLib == None:
+                if nvmlLib is None:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
         finally:
             # lock is always freed
@@ -4855,7 +4855,7 @@ def nvmlDeviceGetFieldValues(handle, fieldIds):
 
     for i, fieldId in enumerate(fieldIds):
         try:
-            (values[i].fieldId, values[i].scopeId) = fieldId
+            values[i].fieldId, values[i].scopeId = fieldId
         except TypeError:
             values[i].fieldId = fieldId
 
@@ -4871,7 +4871,7 @@ def nvmlDeviceClearFieldValues(handle, fieldIds):
 
     for i, fieldId in enumerate(fieldIds):
         try:
-            (values[i].fieldId, values[i].scopeId) = fieldId
+            values[i].fieldId, values[i].scopeId = fieldId
         except TypeError:
             values[i].fieldId = fieldId
 
