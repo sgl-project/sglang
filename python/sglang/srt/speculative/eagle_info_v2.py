@@ -173,11 +173,6 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        if not batch.enable_overlap:
-            # Overlap path defers this D2H to forward_stream entry (scheduler.py).
-            batch.seq_lens_cpu = batch.seq_lens.cpu()
-            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -236,8 +231,9 @@ class EagleDraftInputV2Mixin:
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        # seq_lens_sum derived from seq_lens_cpu in ForwardBatch.init_new.
-        batch.seq_lens_sum = None
+        # seq_lens_cpu was just CPU-updated in tandem — sync=False avoids
+        # a redundant D2H on the draft hot path.
+        batch.refresh_seq_lens_cpu(sync=False)
         batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens

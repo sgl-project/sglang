@@ -2835,12 +2835,9 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Refresh seq_lens_cpu/sum BEFORE _overlap_forward_isolation so
-                # snapshot captures fresh values and restore preserves them.
-                # (Was eagle_info_v2.prepare_for_decode's .cpu() in pre-overlap.)
-                if batch.is_spec_v2:
-                    batch.seq_lens_cpu = batch.seq_lens.cpu()
-                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                # Refresh BEFORE _overlap_forward_isolation so snapshot
+                # captures fresh values and restore preserves them.
+                batch.refresh_seq_lens_cpu()
 
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
