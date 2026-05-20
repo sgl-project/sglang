@@ -101,6 +101,20 @@ if TYPE_CHECKING:
             """
             return self.tree.writing_through(key, indices)
 
+        def insert_and_match(self, key: List[int], indices: torch.Tensor) -> Tuple[
+            List[Tuple[IOHandle, torch.Tensor, torch.Tensor]],
+            int,
+            List[torch.Tensor],
+            int,
+            TreeNodeCpp,
+            TreeNodeCpp,
+        ]:
+            """
+            Inserts a key-value pair into the radix tree, perform write-through check,
+            and returns the matching tree nodes and device indices.
+            """
+            return self.tree.insert_and_match(key, indices)
+
         def loading_onboard(
             self,
             host_node: TreeNodeCpp,
