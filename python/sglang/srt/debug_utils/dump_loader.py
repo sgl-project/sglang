@@ -7,8 +7,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import polars as pl
 import torch
 
-from sglang.srt.debug_utils.dumper import dumper
-
 LOAD_FAILED: object = object()
 
 
@@ -73,6 +71,8 @@ class DumpLoader:
 
     def load(self, name, **kwargs):
         assert self._enable, "Please call DumpLoader.load only when it is enabled"
+
+        from sglang.srt.debug_utils.dumper import dumper
 
         step = dumper._state.step
         conditions = dict(name=name, step=step, **kwargs)
