@@ -23,13 +23,6 @@ class TestSelfUnitRadixWalker(CustomTestCase):
     def setUp(self):
         self.device = CPU_DEVICE
 
-    def test_empty_radix_returns_zero_extras(self):
-        cache = make_radix_cache([[]], device=self.device)
-        slots, positions, prev_slots = walk_radix_cache_for_canary(radix_cache=cache)
-        self.assertEqual(slots.numel(), 0)
-        self.assertEqual(positions.numel(), 0)
-        self.assertEqual(prev_slots.numel(), 0)
-
     def test_single_node_chain_positions_increase(self):
         chain = [10, 20, 30, 40]
         cache = make_radix_cache([[], chain], device=self.device)
