@@ -58,9 +58,8 @@ def attach_canary_buffers(
 
     allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Required for
     SWA pools whose ``full_to_swa_index_mapping`` LUT is stored as int64: canary kernels read the LUT as
-    int32, so the pool's and the allocator's references are replaced in lockstep with an int32 copy and
-    the allocator's LUT-mutating methods are patched to keep both views coherent. Pools with an int32
-    LUT or no SWA group are left untouched.
+    int32, so an int32 mirror is stashed on the pool and the allocator's LUT-mutating methods are
+    monkeypatched to mirror each allocation. Pools with an int32 LUT or no SWA group are left untouched.
     """
     if getattr(pool, _CANARY_ATTACHED_ATTR, False):
         raise RuntimeError(
@@ -184,6 +183,19 @@ def _slot_count(pool: KVCache, kind: PoolKind) -> int:
 
 
 def _swa_index_lut(pool: KVCache) -> Optional[torch.Tensor]:
+    """Return the int32 LUT view the canary kernels can index directly.
+
+    canary_plan and canary_write read the SWA LUT as int32 (canary_write.cuh:329; Triton's element-typed
+    tl.load follows the tensor's declared dtype). SWA pools build the LUT as int64 (swa_memory_pool.py:358),
+    so accessing the raw pool tensor would have the kernels read low-32 bits of int64 cells — TAIL writes
+    land on the wrong canary slot and the next SWEEP launch reports stored=0 for the slot it sweeps. When
+    canary install detected an int64 LUT we built an int32 mirror and patched the SWA allocator to mirror
+    each LUT update; that mirror is returned here. Pools whose native LUT is already int32 (or pools without
+    an SWA group) fall back to the raw attribute.
+    """
+    int32_mirror = getattr(pool, _CANARY_INT32_LUT_MIRROR_ATTR, None)
+    if int32_mirror is not None:
+        return int32_mirror
     if isinstance(pool, SWAKVPool):
         return pool.full_to_swa_index_mapping
     if isinstance(pool, DeepSeekV4TokenToKVPool):
@@ -191,7 +203,13 @@ def _swa_index_lut(pool: KVCache) -> Optional[torch.Tensor]:
     return None
 
 
-_CANARY_INT32_SWA_LUT_ATTR = "_kv_canary_int32_swa_lut_installed"
+_CANARY_INT32_LUT_MIRROR_ATTR = "_kv_canary_int32_swa_lut_mirror"
+_CANARY_LUT_MIRROR_INSTALLED_ATTR = "_kv_canary_int32_swa_lut_mirror_installed"
+_LUT_ALLOC_METHOD_NAMES: Tuple[str, ...] = (
+    "alloc",
+    "alloc_extend",
+    "alloc_extend_swa_tail",
+)
 
 
 def _ensure_swa_lut_int32(
@@ -199,17 +217,18 @@ def _ensure_swa_lut_int32(
     pool: KVCache,
     allocator: Optional[object],
 ) -> None:
-    """Force the SWA full-to-swa LUT to int32 so the canary plan/write kernels read it correctly.
+    """Install an int32 mirror of the SWA full-to-swa LUT for canary kernels to consume.
 
-    The DSV4 / SWA pools build the LUT as int64 (see swa_memory_pool.py:358) but canary_plan / canary_write
-    cast the LUT pointer to int32 (canary_write.cuh:329 and Triton's element-typed loads). On little-endian
-    that mismatch makes the write kernel read low-32 bits of an int64 cell — effectively `lut[i // 2]`'s low
-    half — so TAIL writes land on the wrong slot and the next SWEEP launch reports stored=0 for the slot the
-    plan kernel sweeps. Patch both the pool's and the SWA allocator's references to a fresh int32 view so
-    the int64 storage is fully retired; in-place LUT updates after this point continue to work because
-    `__setitem__` on the int32 tensor stores int32 values directly.
+    The canary plan/write kernels cast the LUT pointer to int32 (canary_write.cuh:329 and Triton's element-
+    typed loads). SWA pools build the LUT as int64 (swa_memory_pool.py:358); on little-endian the int32 cast
+    reads the low 32 bits of every other int64 cell, so TAIL writes land on the wrong canary slot and the
+    next SWEEP launch reports stored=0 for a slot it sweeps. Allocate an int32 mirror once, stash it on the
+    pool, and monkeypatch the allocator's LUT-mutating methods (alloc / alloc_extend / alloc_extend_swa_tail)
+    to scatter the int32 view of each new allocation in lockstep with the int64 update. The DSV4 attention
+    backend continues to read the int64 LUT directly (we never replace the pool's tensor), so this is a
+    canary-only mirror.
     """
-    if getattr(pool, _CANARY_INT32_SWA_LUT_ATTR, False):
+    if getattr(pool, _CANARY_LUT_MIRROR_INSTALLED_ATTR, False):
         return
     if not hasattr(pool, "full_to_swa_index_mapping"):
         return
@@ -217,17 +236,69 @@ def _ensure_swa_lut_int32(
     if lut is None:
         return
     if lut.dtype is torch.int32:
-        setattr(pool, _CANARY_INT32_SWA_LUT_ATTR, True)
+        setattr(pool, _CANARY_INT32_LUT_MIRROR_ATTR, lut)
+        setattr(pool, _CANARY_LUT_MIRROR_INSTALLED_ATTR, True)
         return
 
-    int32_lut = lut.to(torch.int32).contiguous()
-    pool.full_to_swa_index_mapping = int32_lut
-    if allocator is not None and hasattr(allocator, "full_to_swa_index_mapping"):
-        allocator_lut = allocator.full_to_swa_index_mapping
-        if allocator_lut is not None and allocator_lut.data_ptr() == lut.data_ptr():
-            allocator.full_to_swa_index_mapping = int32_lut
+    mirror = lut.to(torch.int32).contiguous()
+    setattr(pool, _CANARY_INT32_LUT_MIRROR_ATTR, mirror)
 
-    setattr(pool, _CANARY_INT32_SWA_LUT_ATTR, True)
+    if allocator is not None:
+        _patch_allocator_lut_mirror(
+            allocator=allocator,
+            int64_lut=lut,
+            int32_mirror=mirror,
+        )
+
+    setattr(pool, _CANARY_LUT_MIRROR_INSTALLED_ATTR, True)
+
+
+def _patch_allocator_lut_mirror(
+    *,
+    allocator: object,
+    int64_lut: torch.Tensor,
+    int32_mirror: torch.Tensor,
+) -> None:
+    """Wrap each LUT-mutating method on the allocator with a post-write mirror copy.
+
+    SWATokenToKVPoolAllocator (and the DSV4 wrappers) updates the int64 LUT inside alloc / alloc_extend /
+    alloc_extend_swa_tail via tensor __setitem__ on the freshly allocated full-pool indices. Each wrapper
+    re-scatters the same range into the int32 mirror after the original method runs so the canary kernels
+    always see a coherent value. The wrapped method's return value (the full-pool indices) is preserved.
+    """
+    for name in _LUT_ALLOC_METHOD_NAMES:
+        original = getattr(allocator, name, None)
+        if original is None:
+            continue
+        wrapped = _make_lut_mirror_wrapper(
+            original=original,
+            int64_lut=int64_lut,
+            int32_mirror=int32_mirror,
+        )
+        setattr(allocator, name, wrapped)
+
+
+def _make_lut_mirror_wrapper(
+    *,
+    original: Callable,
+    int64_lut: torch.Tensor,
+    int32_mirror: torch.Tensor,
+) -> Callable:
+    def wrapped(*args, **kwargs):
+        alloc_full_indices = original(*args, **kwargs)
+        if not isinstance(alloc_full_indices, torch.Tensor):
+            return alloc_full_indices
+        if alloc_full_indices.numel() == 0:
+            return alloc_full_indices
+        idx_long = (
+            alloc_full_indices
+            if alloc_full_indices.dtype is torch.int64
+            else alloc_full_indices.to(torch.int64)
+        )
+        int32_mirror[idx_long] = int64_lut[idx_long].to(torch.int32)
+        return alloc_full_indices
+
+    return wrapped
 
 
 _ADAPTERS: Dict[Type, CanaryPoolAdapter] = {}
