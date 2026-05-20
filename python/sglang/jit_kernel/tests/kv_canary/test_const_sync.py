@@ -1,5 +1,3 @@
-"""C++/Python constant parity test for the kv_canary jit_kernel."""
-
 from __future__ import annotations
 
 import re
@@ -116,7 +114,6 @@ def _read_cuh() -> str:
 
 
 def test_canary_field_offsets() -> None:
-    """C++ ``kCanaryFieldToken / Position / PrevHash / RealKvHash`` parity with Python ``_FIELD_*``."""
     constants = _parse_int_constants(source=_read_cuh())
     assert constants["kCanaryFieldToken"] == _FIELD_TOKEN
     assert constants["kCanaryFieldPosition"] == _FIELD_POSITION
@@ -125,7 +122,6 @@ def test_canary_field_offsets() -> None:
 
 
 def test_violation_field_offsets() -> None:
-    """C++ ``kViolationField{KernelKind, SlotIdx, ...}`` parity with Python ``_VIOLATION_FIELD_*``."""
     constants = _parse_int_constants(source=_read_cuh())
     assert constants["kViolationFieldKernelKind"] == _VIOLATION_FIELD_KERNEL_KIND
     assert constants["kViolationFieldSlotIdx"] == _VIOLATION_FIELD_SLOT_IDX
@@ -143,7 +139,6 @@ def test_violation_field_offsets() -> None:
 
 
 def test_fail_reason_bits() -> None:
-    """``kFailReason{ChainHash, Position, RealKvHash, WriteTokenMismatch, WritePositionMismatch}`` parity."""
     constants = _parse_int_constants(source=_read_cuh())
     assert constants["kFailReasonChainHash"] == _FAIL_REASON_BIT_CHAIN_HASH
     assert constants["kFailReasonPosition"] == _FAIL_REASON_BIT_POSITION
@@ -159,7 +154,6 @@ def test_fail_reason_bits() -> None:
 
 
 def test_real_kv_hash_mode_enum() -> None:
-    """C++ ``RealKvHashMode {kOff, kPartial, kAll}`` parity with Python ``RealKvHashMode``."""
     members = _parse_enum_values(source=_read_cuh(), enum_name="RealKvHashMode")
     assert members["kOff"] == int(RealKvHashMode.OFF)
     assert members["kPartial"] == int(RealKvHashMode.PARTIAL)
@@ -167,21 +161,18 @@ def test_real_kv_hash_mode_enum() -> None:
 
 
 def test_canary_mock_mode_enum() -> None:
-    """C++ ``CanaryPseudoMode {kOff, kOn}`` parity with Python ``CanaryPseudoMode``."""
     members = _parse_enum_values(source=_read_cuh(), enum_name="CanaryPseudoMode")
     assert members["kOff"] == int(CanaryPseudoMode.OFF)
     assert members["kOn"] == int(CanaryPseudoMode.ON)
 
 
 def test_max_real_kv_sources() -> None:
-    """C++ ``kMaxRealKvSources == 4`` parity with Python ``_MAX_REAL_KV_SOURCES == 4``."""
     constants = _parse_int_constants(source=_read_cuh())
     assert constants["kMaxRealKvSources"] == _MAX_REAL_KV_SOURCES
     assert constants["kMaxRealKvSources"] == 4
 
 
 def test_violation_fields_count() -> None:
-    """C++ ``kViolationFields`` count parity with Python ``VIOLATION_FIELDS`` and the per-field count."""
     constants = _parse_int_constants(source=_read_cuh())
     assert constants["kViolationFields"] == VIOLATION_FIELDS
     # Sanity: the eight kViolationField* indices [0..7] line up with the count.

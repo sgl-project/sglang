@@ -348,8 +348,6 @@ def _run_both_and_assert_write_buf_and_state_equal(
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ShrinkResult:
-    """Outcome of ``shrink_inputs``: minified fuzz inputs + audit trail of accepted mutations."""
-
     inputs: Any
     mutations_applied: list[str]
 

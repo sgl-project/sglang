@@ -1,5 +1,3 @@
-"""E2E differential test: real plan → write → verify pipeline vs torch-reference pipeline, byte-equal."""
-
 from __future__ import annotations
 
 from typing import Any, Callable, Optional

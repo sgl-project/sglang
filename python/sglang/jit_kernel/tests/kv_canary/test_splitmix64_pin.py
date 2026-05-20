@@ -1,5 +1,3 @@
-"""Pin splitmix64 magic constants against hand-frozen hex literals."""
-
 from __future__ import annotations
 
 from sglang.jit_kernel.kv_canary.verify import CANARY_CHAIN_ANCHOR
