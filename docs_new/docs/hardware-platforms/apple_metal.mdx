@@ -19,15 +19,6 @@ xcode-select --install
 If you have the full Xcode app installed, the Command Line Tools are already
 available. You can verify with `xcode-select -p && xcrun --find metal`.
 
-Some AOT Metal kernels require the full Xcode Metal toolchain:
-
-```bash
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-sudo xcodebuild -downloadComponent MetalToolchain
-TOOLCHAINS=metal xcrun -sdk macosx --find metal
-TOOLCHAINS=metal xcrun -sdk macosx --find metallib
-```
-
 ## Install SGLang
 
 You can install SGLang using one of the methods below.
@@ -45,8 +36,7 @@ source sglang-metal/bin/activate
 
 # (Optional) Compile sgl-kernel
 uv pip install --upgrade pip
-TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace
-
+uv run sgl-kernel/setup_metal.py install
 # Install sglang python package along with diffusion support
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 uv pip install -e "python[all_mps]"

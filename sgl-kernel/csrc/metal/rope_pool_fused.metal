@@ -14,7 +14,7 @@ constant uint  HEADS_PER_THREAD   [[function_constant(4)]];
 constant uint HALF_DIM = HEAD_DIM / 2;
 
 // ----------------------------------------------------------------------
-// Kernel 1: Q rope (no branch, no pool write) — heads-per-thread amortized
+// Kernel 1: Q rope (no branch, no pool write) - heads-per-thread amortized
 //   grid: (HALF_DIM, num_tokens, NUM_QO_HEADS / HEADS_PER_THREAD)
 //   Each thread processes HEADS_PER_THREAD consecutive Q heads, sharing one
 //   cos/sin computation across them.
@@ -135,9 +135,104 @@ inline void v_to_pool_impl(
 }
 
 // ----------------------------------------------------------------------
+//   Single-dispatch rectangular kernel.
+//   grid: (HEAD_DIM, num_tokens, max(NUM_QO_HEADS, NUM_KV_HEADS) / HPT)
+//   - dim < HALF_DIM lanes rotate Q for Q heads
+//   - dim < HALF_DIM lanes rotate K and write K pool for KV heads
+//   - all dim lanes copy V for KV heads
+//   This avoids packed div/mod region decoding but wastes lanes when Q and KV
+//   head counts differ.
+// ----------------------------------------------------------------------
+template <typename T>
+inline void rope_pool_fused_rect_impl(
+    const device T*       q_in,
+    const device T*       k_in,
+    const device T*       v_in,
+    device T*             q_out,
+    device T*             k_out,
+    device T*             k_pool,
+    device T*             v_pool,
+    const device int32_t* positions,
+    const device int32_t* slots,
+    uint3 pos
+) {
+    const uint dim_idx = pos.x;
+    const uint token_id = pos.y;
+    const uint head_start = pos.z * HEADS_PER_THREAD;
+
+    const bool rope_lane = dim_idx < HALF_DIM;
+    float c = 0.0f;
+    float s = 0.0f;
+    if (rope_lane) {
+        const float pos_f = float(positions[token_id]);
+        const float theta = pos_f * metal::exp2(
+            -float(2u * dim_idx) * INV_DIM_LOG2_BASE);
+        c = metal::fast::cos(theta);
+        s = metal::fast::sin(theta);
+    }
+
+    const int32_t slot = slots[token_id];
+    const bool write_pool = slot >= 0;
+
+    for (uint h = 0; h < HEADS_PER_THREAD; ++h) {
+        const uint head_id = head_start + h;
+
+        if (rope_lane && head_id < NUM_QO_HEADS) {
+            const uint q_base = (token_id * NUM_QO_HEADS + head_id) * HEAD_DIM;
+            const uint q_i1 = q_base + dim_idx;
+            const uint q_i2 = q_base + HALF_DIM + dim_idx;
+            const float x1 = float(q_in[q_i1]);
+            const float x2 = float(q_in[q_i2]);
+            q_out[q_i1] = static_cast<T>(x1 * c - x2 * s);
+            q_out[q_i2] = static_cast<T>(x1 * s + x2 * c);
+        }
+
+        if (head_id >= NUM_KV_HEADS) continue;
+
+        const uint kv_base = (token_id * NUM_KV_HEADS + head_id) * HEAD_DIM;
+        const uint pool_base =
+            write_pool ? ((uint)slot * NUM_KV_HEADS + head_id) * HEAD_DIM : 0u;
+
+        if (write_pool) {
+            v_pool[pool_base + dim_idx] = v_in[kv_base + dim_idx];
+        }
+
+        if (!rope_lane) continue;
+
+        const uint k_i1 = kv_base + dim_idx;
+        const uint k_i2 = kv_base + HALF_DIM + dim_idx;
+        const float x1 = float(k_in[k_i1]);
+        const float x2 = float(k_in[k_i2]);
+        const T r1 = static_cast<T>(x1 * c - x2 * s);
+        const T r2 = static_cast<T>(x1 * s + x2 * c);
+        k_out[k_i1] = r1;
+        k_out[k_i2] = r2;
+
+        if (write_pool) {
+            k_pool[pool_base + dim_idx] = r1;
+            k_pool[pool_base + HALF_DIM + dim_idx] = r2;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 // dtype-specialized entry points
 // ----------------------------------------------------------------------
 #define INSTANTIATE(NAME, T)                                                     \
+    [[host_name("rope_pool_rect_" #NAME)]] [[kernel]] void rope_pool_rect_##NAME(\
+        const device T*       q_in       [[buffer(0)]],                         \
+        const device T*       k_in       [[buffer(1)]],                         \
+        const device T*       v_in       [[buffer(2)]],                         \
+        device T*             q_out      [[buffer(3)]],                         \
+        device T*             k_out      [[buffer(4)]],                         \
+        device T*             k_pool     [[buffer(5)]],                         \
+        device T*             v_pool     [[buffer(6)]],                         \
+        const device int32_t* positions  [[buffer(7)]],                         \
+        const device int32_t* slots      [[buffer(8)]],                         \
+        uint3 pos [[thread_position_in_grid]]) {                                 \
+        rope_pool_fused_rect_impl<T>(q_in, k_in, v_in, q_out, k_out, k_pool,     \
+                                     v_pool, positions, slots, pos);             \
+    }                                                                            \
     [[host_name("rope_q_" #NAME)]] [[kernel]] void rope_q_##NAME(                \
         const device T*       q_in       [[buffer(0)]],                         \
         device T*             q_out      [[buffer(1)]],                         \

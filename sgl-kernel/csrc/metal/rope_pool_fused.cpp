@@ -1,24 +1,5 @@
 // Combined optimal: real AOT .metallib + Primitive integration + optimized
 // 3-kernel + 3D-grid dispatch + fused KV pool write.
-//
-// Key learning from cross-checking PR #23449:
-//   - PR #23449's "lean" integration (raw encoder + add_temporary, no
-//     Primitive) silently FAILS to update mx.array buffers. The dispatch
-//     queues but the kernel writes never become visible to subsequent
-//     mx.eval / np.array readback.
-//   - Only `mlx::core::Primitive` integration produces correct output -
-//     it's how MLX's lazy graph links encoder writes back to the array.
-//
-// So the optimal blend is:
-//   * Real AOT-compiled .metallib (Apple's xcrun metal/metallib pipeline)
-//   * MLX Primitive subclass (correctness; ~10us overhead but unavoidable)
-//   * Our optimized kernels: 3 specialized kernels (rope_q, rope_k_pool,
-//     v_to_pool) with 3D thread grids, function-constant specialization,
-//     smart threadgroup sizing
-//   * Fused KV pool write (our unique extension over MLX & PR #23449)
-//
-// This is `Primitive + AOT + 3-kernel optimized` - the version with the
-// best correctness-guaranteed performance.
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>

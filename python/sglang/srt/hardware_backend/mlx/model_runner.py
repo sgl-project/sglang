@@ -27,6 +27,7 @@ from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
@@ -344,9 +345,7 @@ class MlxModelRunner:
         Metal extension missing) or when the model uses an unsupported RoPE
         variant (``traditional=True`` or ``rope_dim != head_dim``).
         """
-        import os
-
-        if os.environ.get("SGLANG_DISABLE_CUSTOM_ROPE", "0") == "1":
+        if envs.SGLANG_DISABLE_CUSTOM_ROPE.get():
             return 0.0, {}
         if hasattr(self, "_cached_rope_state"):
             return self._cached_rope_state
