@@ -62,54 +62,55 @@ The msProf tool is used to collect and analyze key performance indicators of ope
 
 '''
 
-msprof op --kernel-name=xxxxx python3 test_xxxxx.py
+    msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 
 '''
 
 '''
-|------|------|
-| Name | DequantSwigluQuant_int32_high_performance_100000000 |
-| Type | DequantSwigluQuant |
-| OP State | static |
-| Accelerator Core | AI_VECTOR_CORE |
-| Start Time(us) | 1774489226717521.715 |
-| Duration(us) | 102.824 |
-| Wait Time(us) | 0 |
-| Block Dim | 36 |
-| Mix Block Dim | 0 |
-| HF32 Eligible | NO |
-| Input Shapes | 163840,1024;128,1024;163840;;;;128 |
-| Input Data Types | INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64 |
-| Input Formats | ND;ND;ND;NULL;NULL;NULL;ND |
-| Output Shapes | 163840,512;163840 |
-| Output Data Types | INT8;FLOAT |
-| Output Formats | ND;ND |
-| Context ID | N/A |
-| aicore_time(us) | 0 |
-| aic_total_cycles | 0 |
-| aic_mac_time(us) | 0 |
-| aic_mac_ratio | 0 |
-| aic_scalar_time(us) | 0 |
-| aic_scalar_ratio | 0 |
-| aic_mte1_time(us) | 0 |
-| aic_mte1_ratio | 0 |
-| aic_mte2_time(us) | 0 |
-| aic_mte2_ratio | 0 |
-| aic_fixpipe_time(us) | 0 |
-| aic_fixpipe_ratio | 0 |
-| aic_icache_miss_rate | 0 |
-| aiv_time(us) | 59.128 |
-| aiv_total_cycles | 3512188 |
-| aiv_vec_time(us) | 36.708 |
-| aiv_vec_ratio | 0.621 |
-| aiv_scalar_time(us) | 41.403 |
-| aiv_scalar_ratio | 0.7 |
-| aiv_mte2_time(us) | 11.975 |
-| aiv_mte2_ratio | 0.203 |
-| aiv_mte3_time(us) | 9.738 |
-| aiv_mte3_ratio | 0.165 |
-| aiv_icache_miss_rate | 0.005 |
-| cube_utilization(%) | 0 |
+
+    |------|------|
+    | Name | DequantSwigluQuant_int32_high_performance_100000000 |
+    | Type | DequantSwigluQuant |
+    | OP State | static |
+    | Accelerator Core | AI_VECTOR_CORE |
+    | Start Time(us) | 1774489226717521.715 |
+    | Duration(us) | 102.824 |
+    | Wait Time(us) | 0 |
+    | Block Dim | 36 |
+    | Mix Block Dim | 0 |
+    | HF32 Eligible | NO |
+    | Input Shapes | 163840,1024;128,1024;163840;;;;128 |
+    | Input Data Types | INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64 |
+    | Input Formats | ND;ND;ND;NULL;NULL;NULL;ND |
+    | Output Shapes | 163840,512;163840 |
+    | Output Data Types | INT8;FLOAT |
+    | Output Formats | ND;ND |
+    | Context ID | N/A |
+    | aicore_time(us) | 0 |
+    | aic_total_cycles | 0 |
+    | aic_mac_time(us) | 0 |
+    | aic_mac_ratio | 0 |
+    | aic_scalar_time(us) | 0 |
+    | aic_scalar_ratio | 0 |
+    | aic_mte1_time(us) | 0 |
+    | aic_mte1_ratio | 0 |
+    | aic_mte2_time(us) | 0 |
+    | aic_mte2_ratio | 0 |
+    | aic_fixpipe_time(us) | 0 |
+    | aic_fixpipe_ratio | 0 |
+    | aic_icache_miss_rate | 0 |
+    | aiv_time(us) | 59.128 |
+    | aiv_total_cycles | 3512188 |
+    | aiv_vec_time(us) | 36.708 |
+    | aiv_vec_ratio | 0.621 |
+    | aiv_scalar_time(us) | 41.403 |
+    | aiv_scalar_ratio | 0.7 |
+    | aiv_mte2_time(us) | 11.975 |
+    | aiv_mte2_ratio | 0.203 |
+    | aiv_mte3_time(us) | 9.738 |
+    | aiv_mte3_ratio | 0.165 |
+    | aiv_icache_miss_rate | 0.005 |
+    | cube_utilization(%) | 0 |
 
 '''
 
