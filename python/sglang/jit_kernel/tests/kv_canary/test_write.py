@@ -1190,3 +1190,159 @@ def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
         assert stored_prev_hash == expected_signed[i], (
             f"slot {i}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
         )
+
+
+def _hand_fold_bit_write(raw_bytes: bytes) -> int:
+    """BIT-mode fold: parity of low bits across all read bytes, then splitmix64 mix into acc=0."""
+    _u64 = (1 << 64) - 1
+    parity = sum(b & 1 for b in raw_bytes) & 1
+    source_hash = parity
+    combined = 0 ^ source_hash
+    x = combined & _u64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _u64
+    return (x ^ (x >> 31)) & _u64
+
+
+def _hand_fold_all_write(raw_bytes: bytes) -> int:
+    """ALL-mode fold: pack bytes little-endian into 8-byte words, fold each via splitmix64, then mix into acc=0."""
+    _u64 = (1 << 64) - 1
+
+    def _sm64(v: int) -> int:
+        v = v & _u64
+        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
+        return (v ^ (v >> 31)) & _u64
+
+    pad = (8 - len(raw_bytes) % 8) % 8
+    padded = raw_bytes + bytes(pad)
+    num_words = len(padded) // 8
+    acc = 0
+    for w in range(num_words):
+        chunk = padded[w * 8 : (w + 1) * 8]
+        word = sum(b << (8 * k) for k, b in enumerate(chunk))
+        acc = _sm64(acc ^ word)
+    source_hash = acc
+    return _sm64(0 ^ source_hash)
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_real_kv_hash_bit_mode_writes_expected_hash_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
+    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    _EXPECTED_HASH: int = 0x5692161D100B05E5
+
+    # Step 2: verify hand-computed fold matches the hex literal.
+    assert _hand_fold_bit_write(_PATTERN) == _EXPECTED_HASH
+
+    cuda_buf, ref_buf = _setup_pair()
+    source_cuda = make_real_kv_source(
+        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+    )
+    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_ref = RealKvSource(
+        tensor=source_cuda.tensor.clone(),
+        page_size=source_cuda.page_size,
+        num_bytes_per_token=source_cuda.num_bytes_per_token,
+        read_bytes=source_cuda.read_bytes,
+    )
+
+    # Step 3: run write kernel on slot 0 with BIT mode.
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.BIT,
+    )
+
+    # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
+    _, _, _, stored_real_kv_hash = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
+    assert stored_real_kv_hash == to_signed_int64(_EXPECTED_HASH), (
+        f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(_EXPECTED_HASH):#x}"
+    )
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_real_kv_hash_all_mode_writes_expected_hash_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
+    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    _EXPECTED_HASH: int = 0xC4C41792E6578644
+
+    # Step 2: verify hand-computed fold matches the hex literal.
+    assert _hand_fold_all_write(_PATTERN) == _EXPECTED_HASH
+
+    cuda_buf, ref_buf = _setup_pair()
+    source_cuda = make_real_kv_source(
+        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+    )
+    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_ref = RealKvSource(
+        tensor=source_cuda.tensor.clone(),
+        page_size=source_cuda.page_size,
+        num_bytes_per_token=source_cuda.num_bytes_per_token,
+        read_bytes=source_cuda.read_bytes,
+    )
+
+    # Step 3: run write kernel on slot 0 with ALL mode.
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.ALL,
+    )
+
+    # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
+    _, _, _, stored_real_kv_hash = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
+    assert stored_real_kv_hash == to_signed_int64(_EXPECTED_HASH), (
+        f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(_EXPECTED_HASH):#x}"
+    )
