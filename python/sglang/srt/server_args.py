@@ -6167,7 +6167,6 @@ class ServerArgs:
                 "sit in the KV pool unused by the current forward — "
                 "typically radix-cached slots from completed requests that "
                 "aren't actively being verified per step. Requires "
-                "--kv-canary-real-data in {partial, all} and "
                 "--kv-canary in {log, raise}."
             ),
         )
@@ -7198,16 +7197,10 @@ class ServerArgs:
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_canary_sweep_interval > 0:
-            if self.kv_canary_real_data == "off":
-                raise ValueError(
-                    "--kv-canary-sweep-interval requires "
-                    "--kv-canary-real-data in {partial, all}"
-                )
-            if self.kv_canary == "off":
-                raise ValueError(
-                    "--kv-canary-sweep-interval requires " "--kv-canary in {log, raise}"
-                )
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "off":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
