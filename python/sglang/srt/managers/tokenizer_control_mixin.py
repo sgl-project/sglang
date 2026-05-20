@@ -764,10 +764,14 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> CheckWeightsReqOutput:
+    ) -> Tuple[bool, str, Optional[List[Dict]]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+        success, message = FanOutCommunicator.merge_results(results)
+        ranks: Optional[List[Dict]] = None
+        if any(r.payload is not None for r in results):
+            ranks = [r.payload for r in results]
+        return success, message, ranks
 
     async def slow_down(
         self: TokenizerManager,

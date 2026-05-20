@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/utils.py
 
 """Utilities for selecting and loading models."""
@@ -245,18 +247,6 @@ def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
-
-
-def post_load_weights(model: nn.Module, model_config: ModelConfig):
-    # Model weight loading consists of two stages:
-    # 1. Initial weight loading.
-    # 2. Post-processing of weights, including assigning specific member variables.
-    # For `dummy_init`, only the second stage is required.
-    if hasattr(model, "post_load_weights"):
-        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
-            model.post_load_weights(is_nextn=True)
-        else:
-            model.post_load_weights()
 
 
 def should_deepgemm_weight_requant_ue8m0(weight_block_size):

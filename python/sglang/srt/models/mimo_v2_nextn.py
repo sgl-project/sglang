@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -28,7 +29,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -44,6 +44,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -304,20 +305,24 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
-                    tp_size = get_attention_tp_size()
-                    tp_rank = get_attention_tp_rank()
                     param = params_dict[name]
-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
+                    load_mimo_v2_qkv_proj_weight(
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
+                            self.config
+                        ),
+                    )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
 
-                if weight_name not in name:
+                if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:
                     break
-                name = name.replace(weight_name, param_name)
+                name = name.replace(f".{weight_name}.", f".{param_name}.")
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
