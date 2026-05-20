@@ -1933,6 +1933,13 @@ class BlockReqInput(BaseReq):
 
 
 @dataclass
+class DrainReqInput(BaseReq):
+    """Block until in-flight requests complete or `timeout` seconds elapse."""
+
+    timeout: Optional[float] = None
+
+
+@dataclass
 class MemoryMetrics:
     """Memory breakdown metrics."""
 

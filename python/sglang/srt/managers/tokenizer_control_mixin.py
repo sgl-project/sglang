@@ -744,6 +744,30 @@ class TokenizerControlMixin:
         else:
             return all_parameters
 
+    async def drain(
+        self: TokenizerManager,
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.05,
+    ) -> Tuple[bool, int]:
+        """Block until no requests are in flight at the tokenizer manager.
+
+        Polls ``rid_to_state`` every ``poll_interval`` seconds. Returns
+        ``(success, remaining_requests)`` where ``success`` is False if the
+        wait was cut short by ``timeout``.
+
+        This does not prevent new requests from being submitted while the
+        wait is in progress; callers are responsible for not feeding new
+        work in during the drain window. A separate paused / quiesce flag
+        is the right place to enforce that and is left to a follow-up.
+        """
+        self.auto_create_handle_loop()
+        deadline = None if timeout is None else (time.monotonic() + timeout)
+        while self.rid_to_state:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False, len(self.rid_to_state)
+            await asyncio.sleep(poll_interval)
+        return True, 0
+
     async def release_memory_occupation(
         self: TokenizerManager,
         obj: ReleaseMemoryOccupationReqInput,
