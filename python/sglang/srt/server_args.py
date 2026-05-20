@@ -6150,8 +6150,7 @@ class ServerArgs:
                 "coverage at higher cost. Catches "
                 "corruption that the pure-canary path misses because the "
                 "canary slot itself is intact but the real KV got written "
-                "wrong (attn-kernel idle-logic misconfig; PD transfer "
-                "bit-rot)."
+                "wrong."
             ),
         )
         parser.add_argument(
