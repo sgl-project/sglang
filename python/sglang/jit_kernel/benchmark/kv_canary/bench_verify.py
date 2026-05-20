@@ -73,9 +73,7 @@ def _verify_num_slots(case: BenchCase) -> int:
     return max(2, case.bs * per_req_slots + 1)
 
 
-def _build_verify_inputs(
-    case: BenchCase, *, device: torch.device
-) -> Tuple[
+def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
     torch.Tensor,
     VerifyPlan,
     torch.Tensor,
