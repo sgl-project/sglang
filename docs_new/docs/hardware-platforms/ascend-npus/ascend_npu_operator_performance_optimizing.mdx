@@ -66,7 +66,49 @@ msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 
 '''
 
-| Name | Type | OP State | Accelerator Core | Start Time(us) | Duration(us) | Wait Time(us) | Block Dim | Mix Block Dim | HF32 Eligible | Input Shapes | Input Data Types | Input Formats | Output Shapes | Output Data Types | Output Formats | Context ID | aicore_time(us) | aic_total_cycles | aic_mac_time(us) | aic_mac_ratio | aic_scalar_time(us) | aic_scalar_ratio | aic_mte1_time(us) | aic_mte1_ratio | aic_mte2_time(us) | aic_mte2_ratio | aic_fixpipe_time(us) | aic_fixpipe_ratio | aic_icache_miss_rate | aiv_time(us) | aiv_total_cycles | aiv_vec_time(us) | aiv_vec_ratio | aiv_scalar_time(us) | aiv_scalar_ratio | aiv_mte2_time(us) | aiv_mte2_ratio | aiv_mte3_time(us) | aiv_mte3_ratio | aiv_icache_miss_rate | cube_utilization(%) ||---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|| DequantSwigluQuant_int32_high_performance_100000000 | DequantSwigluQuant | static | AI_VECTOR_CORE | 1774489226717521.715 | 102.824 | 0 | 36 | 0 | NO | 163840,1024;128,1024;163840;;;;128 | INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64 | ND;ND;ND;NULL;NULL;NULL;ND | 163840,512;163840 | INT8;FLOAT | ND;ND | N/A | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 59.128 | 3512188 | 36.708 | 0.621 | 41.403 | 0.7 | 11.975 | 0.203 | 9.738 | 0.165 | 0.005 | 0 |
+字段	数值
+Name	DequantSwigluQuant_int32_high_performance_100000000
+Type	DequantSwigluQuant
+OP State	static
+Accelerator Core	AI_VECTOR_CORE
+Start Time(us)	1774489226717521.715
+Duration(us)	102.824
+Wait Time(us)	0
+Block Dim	36
+Mix Block Dim	0
+HF32 Eligible	NO
+Input Shapes	163840,1024;128,1024;163840;;;;128
+Input Data Types	INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64
+Input Formats	ND;ND;ND;NULL;NULL;NULL;ND
+Output Shapes	163840,512;163840
+Output Data Types	INT8;FLOAT
+Output Formats	ND;ND
+Context ID	N/A
+aicore_time(us)	0
+aic_total_cycles	0
+aic_mac_time(us)	0
+aic_mac_ratio	0
+aic_scalar_time(us)	0
+aic_scalar_ratio	0
+aic_mte1_time(us)	0
+aic_mte1_ratio	0
+aic_mte2_time(us)	0
+aic_mte2_ratio	0
+aic_fixpipe_time(us)	0
+aic_fixpipe_ratio	0
+aic_icache_miss_rate	0
+aiv_time(us)	59.128
+aiv_total_cycles	3512188
+aiv_vec_time(us)	36.708
+aiv_vec_ratio	0.621
+aiv_scalar_time(us)	41.403
+aiv_scalar_ratio	0.7
+aiv_mte2_time(us)	11.975
+aiv_mte2_ratio	0.203
+aiv_mte3_time(us)	9.738
+aiv_mte3_ratio	0.165
+aiv_icache_miss_rate	0.005
+cube_utilization(%)	0
 
 
 The Task Duration field indicates the time consumed by each operator. You can sort the operators by Task Duration to find the operators that consume the most time, or sort the operators by Task Type to view the operators that consume the most time on the AI Core or AI CPU.
