@@ -807,9 +807,6 @@ class PiecewiseCudaGraphRunner:
             ),
         )
 
-        if out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
-
         return static_forward_batch
 
     def replay(
