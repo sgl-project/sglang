@@ -1700,9 +1700,9 @@ class ServerArgs:
             if is_sm120_supported():
                 # SM120: trtllm does not support SM120; use tilelang for both paths.
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "tilelang"
+                    self.dsa_prefill_backend = "tilelang"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "tilelang"
+                    self.dsa_decode_backend = "tilelang"
             elif major >= 10:
                 if not user_set_prefill:
                     self.dsa_prefill_backend = "trtllm"
@@ -1719,9 +1719,9 @@ class ServerArgs:
             if is_sm120_supported():
                 # SM120: trtllm does not support SM120; use tilelang (portable)
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "tilelang"
+                    self.dsa_prefill_backend = "tilelang"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "tilelang"
+                    self.dsa_decode_backend = "tilelang"
             elif major >= 10:
                 if not user_set_prefill:
                     self.dsa_prefill_backend = "flashmla_sparse"
