@@ -31,7 +31,7 @@ def _spec_eagle_server_args() -> List[str]:
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--sampling-backend",
-        "oracle",
+        "token_oracle",
         "--kv-canary",
         "raise",
         "--speculative-algorithm",
@@ -54,6 +54,7 @@ def _spec_eagle_server_args() -> List[str]:
 def _spec_eagle_env() -> dict[str, str]:
     env = os.environ.copy()
     env["SGLANG_KV_CANARY_INPUT_CHECK"] = "0"
+    env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
     return env
 
 

@@ -17,13 +17,17 @@ def mock_model_engine_kwargs(**overrides: Any) -> dict[str, Any]:
     Defaults:
         load_format = "dummy"            (no real weights loaded)
         json_model_override_args = '{"num_hidden_layers": 1}'
-        sampling_backend = "oracle"      (gate for install_token_oracle_from_env)
+        sampling_backend = "token_oracle" (gate for install_token_oracle_from_env)
         kv_canary = "raise"              (mock-model without canary is mostly pointless)
 
     Also sets ``SGLANG_KV_CANARY_INPUT_CHECK=1`` in the current process env so
     the canary's input-id verification path turns on when the engine starts.
     This is a side effect because input-check is mock-model-only and is no
     longer a server arg; the env var is the only injection path.
+
+    ``SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1`` is also set so server_args
+    accepts the test-only ``token_oracle`` sampling backend (the choice is
+    env-gated to keep it out of production ``--sampling-backend --help``).
 
     When ``speculative_algorithm`` is set, ``SGLANG_KV_CANARY_INPUT_CHECK`` is
     forced off — the oracle can't predict draft-position tokens, so
@@ -35,11 +39,12 @@ def mock_model_engine_kwargs(**overrides: Any) -> dict[str, Any]:
     """
     is_spec = "speculative_algorithm" in overrides
     os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "0" if is_spec else "1"
+    os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
 
     defaults: dict[str, Any] = {
         "load_format": "dummy",
         "json_model_override_args": json.dumps({"num_hidden_layers": 1}),
-        "sampling_backend": "oracle",
+        "sampling_backend": "token_oracle",
         "kv_canary": "raise",
     }
     if "json_model_override_args" in overrides:

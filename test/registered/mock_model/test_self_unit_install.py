@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
+
+os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
 
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
@@ -24,17 +27,17 @@ class TestInstallTokenOracleFromEnv(CustomTestCase):
     def test_install_token_oracle_from_env_enabled_registers_oracle_backend(
         self,
     ) -> None:
-        server_args = _make_server_args(sampling_backend="oracle")
+        server_args = _make_server_args(sampling_backend="token_oracle")
         hook = install_token_oracle_from_env(server_args=server_args, vocab_size=512)
         self.assertIsNotNone(hook)
-        self.assertIn("oracle", _CUSTOM_SAMPLER_FACTORIES)
+        self.assertIn("token_oracle", _CUSTOM_SAMPLER_FACTORIES)
 
     def test_install_token_oracle_from_env_enabled_returns_hook_with_hash_oracle(
         self,
     ) -> None:
         from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 
-        server_args = _make_server_args(sampling_backend="oracle")
+        server_args = _make_server_args(sampling_backend="token_oracle")
         hook = install_token_oracle_from_env(server_args=server_args, vocab_size=256)
         self.assertIsNotNone(hook)
         self.assertIsInstance(hook.oracle, HashOracle)

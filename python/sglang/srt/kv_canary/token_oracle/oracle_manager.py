@@ -16,9 +16,10 @@ class TokenOracleManager:
     row -> req-id mapping. Both canary's input-check path (fill_expected_inputs) and sglang's
     sampler dispatch (_OracleSampler) operate on the same instance.
 
-    Lifecycle: install_oracle_sampler constructs one and registers it as the "oracle" sampler
-    factory. The returned hook is then attached to the CanaryRunner so its before_forward can
-    populate the row -> req-id stash that _OracleSampler will read at sample time.
+    Lifecycle: install_oracle_sampler constructs one and registers it as the "token_oracle"
+    sampler factory. The returned hook is then attached to the CanaryRunner so its
+    before_forward can populate the row -> req-id stash that _OracleSampler will read at
+    sample time.
     """
 
     def __init__(self, *, oracle: TokenOracle) -> None:
