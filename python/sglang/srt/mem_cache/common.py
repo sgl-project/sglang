@@ -320,8 +320,7 @@ def alloc_token_slots(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        pretty_print_tree_cache(tree_cache)
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -388,8 +387,7 @@ def alloc_paged_token_slots_extend(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        pretty_print_tree_cache(tree_cache)
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -514,8 +512,7 @@ def alloc_paged_token_slots_decode(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        pretty_print_tree_cache(tree_cache)
         raise RuntimeError(error_msg)
 
     return out_cache_loc
@@ -619,5 +616,53 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     tree_cache.req_to_token_pool.free(req)
 
 
-def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
-    return tree_cache.available_and_evictable_str()
+def available_and_evictable_str(tree_cache: BasePrefixCache | None) -> str:
+    if tree_cache is None:
+        return ""
+
+    available_and_evictable = getattr(tree_cache, "available_and_evictable_str", None)
+    if callable(available_and_evictable):
+        try:
+            return available_and_evictable()
+        except Exception as exc:
+            return (
+                "Available tokens: unknown "
+                f"(available_and_evictable_str failed: {type(exc).__name__}: {exc})\n"
+            )
+
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    available_size = None
+    if allocator is not None and callable(getattr(allocator, "available_size", None)):
+        try:
+            available_size = allocator.available_size()
+        except Exception as exc:
+            available_size = f"unknown ({type(exc).__name__}: {exc})"
+
+    evictable_size = 0
+    if callable(getattr(tree_cache, "evictable_size", None)):
+        try:
+            evictable_size = tree_cache.evictable_size()
+        except Exception as exc:
+            evictable_size = f"unknown ({type(exc).__name__}: {exc})"
+
+    if isinstance(available_size, int) and isinstance(evictable_size, int):
+        total_size = available_size + evictable_size
+    else:
+        total_size = "unknown"
+
+    return (
+        f"Available tokens: {total_size} "
+        f"(available_size={available_size}, evictable_size={evictable_size})\n"
+    )
+
+
+def pretty_print_tree_cache(tree_cache: BasePrefixCache | None) -> None:
+    if tree_cache is None:
+        return
+
+    pretty_print = getattr(tree_cache, "pretty_print", None)
+    if callable(pretty_print):
+        try:
+            pretty_print()
+        except Exception:
+            logger.exception("Failed to pretty print tree cache")
