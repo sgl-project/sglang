@@ -259,12 +259,20 @@ def _collect_channel_importance(
         for h in handles:
             h.remove()
 
-    if any(s == 0 for s in seen):
-        logger.warning(
-            "Calibration hooks fired on %d/%d layers. Missing layers will have "
-            "zero importance — top-K selection will be arbitrary on those layers.",
-            sum(1 for s in seen if s > 0),
-            num_layers,
+    missing_layers = [i for i, s in enumerate(seen) if s == 0]
+    if missing_layers:
+        raise RuntimeError(
+            f"Calibration hooks did not fire on {len(missing_layers)}/"
+            f"{num_layers} layers (indices {missing_layers[:8]}"
+            f"{'...' if len(missing_layers) > 8 else ''}). The resulting "
+            "mask would have zero-importance rows that produce arbitrary "
+            "top-K channels with zero weights — content-hash-valid but "
+            "behaviorally invalid. The K-projection attribute search "
+            "(k_proj / kv_b_proj / wk) failed on these layers, or "
+            "kv_b_proj's output width did not match the expected K|V "
+            "concatenation. Use --allow-synthetic if a dev/CI artifact is "
+            "intentional; production calibration requires every layer to "
+            "be covered."
         )
 
     weights = importance / importance.clamp_min(1e-6).sum(dim=-1, keepdim=True)

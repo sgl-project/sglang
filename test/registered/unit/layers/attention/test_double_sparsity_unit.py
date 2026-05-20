@@ -243,7 +243,8 @@ class TestValidator(unittest.TestCase):
             save_channel_mask,
         )
         import tempfile, os as _os
-        sel_t = torch.randint(0, 512, (2, 4, 16), dtype=torch.int32)
+        # head_dim=128 below, so channel indices must be in [0, 128).
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
         w_t = torch.randn(2, 4, 16, dtype=torch.float32)
         with tempfile.TemporaryDirectory() as tmp:
             path = _os.path.join(tmp, "cm.safetensors")
@@ -387,8 +388,8 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
 
 
 class TestChannelMaskLoader(unittest.TestCase):
-    def _make_payload(self, *, L=4, H=4, label_dim=16):
-        sel = torch.randint(0, 512, (L, H, label_dim), dtype=torch.int32)
+    def _make_payload(self, *, L=4, H=4, label_dim=16, head_dim=128):
+        sel = torch.randint(0, head_dim, (L, H, label_dim), dtype=torch.int32)
         w = torch.randn(L, H, label_dim, dtype=torch.float32)
         return sel, w
 
@@ -447,6 +448,42 @@ class TestChannelMaskLoader(unittest.TestCase):
         )
         with self.assertRaises(FileNotFoundError):
             load_channel_mask("/nonexistent/path.safetensors")
+
+    def test_load_rejects_out_of_range_channel_indices(self):
+        """Round-9 fix [P2]: a content-hash-valid file whose
+        channel_selection has values >= head_dim must be rejected at load.
+        """
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            compute_content_sha256, load_channel_mask,
+        )
+        from safetensors.torch import save_file
+        import tempfile, os
+        sel = torch.zeros(1, 2, 4, dtype=torch.int32)
+        # Plant an out-of-range index: head_dim=128 in the metadata below.
+        sel[0, 0, 0] = 200
+        w = torch.zeros(1, 2, 4, dtype=torch.float32)
+        content = compute_content_sha256(sel, w)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.safetensors")
+            save_file(
+                {"channel_selection": sel, "channel_weights": w},
+                path,
+                metadata={
+                    "schema_version": "1",
+                    "dtype": "fp8_e4m3",
+                    "head_dim": "128",
+                    "page_size": "64",
+                    "label_dim": "4",
+                    "created_at": "2026-05-20T00:00:00Z",
+                    "content_sha256": content,
+                },
+            )
+            with self.assertRaises(ValueError) as ctx:
+                load_channel_mask(path)
+            msg = str(ctx.exception)
+            self.assertIn("head_dim", msg)
+            self.assertIn("out of range", msg)
 
     def test_validate_runtime_mismatches(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
@@ -951,6 +988,64 @@ class TestCalibrateCorpusEmpty(unittest.TestCase):
             self.assertIn("no non-empty lines", str(ctx.exception))
         finally:
             os.unlink(path)
+
+
+class TestCalibrateHooksFireRequirement(unittest.TestCase):
+    """Round-9 fix [P2]: real-path calibration must raise when one or more
+    layers' K-projection hooks never fire — otherwise zero-importance rows
+    silently land in the channel mask.
+    """
+
+    def test_missing_hooks_raises_runtime_error(self):
+        from unittest.mock import patch, MagicMock
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _collect_channel_importance,
+        )
+        from types import SimpleNamespace
+        import tempfile
+
+        # Fake config: 2 layers, 4 heads, head_dim=16, no MLA split.
+        cfg = SimpleNamespace(
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            head_dim=16,
+            hidden_size=64,
+        )
+        # Fake layer object with a self_attn that exposes NONE of the
+        # probed K-projection attribute names.
+        bare_attn = SimpleNamespace()  # no k_proj, no kv_b_proj, no wk
+        fake_layer = SimpleNamespace(self_attn=bare_attn)
+        fake_inner = SimpleNamespace(layers=[fake_layer, fake_layer])
+        fake_model = MagicMock()
+        fake_model.model = fake_inner
+        fake_model.eval = lambda: None
+        fake_model.device = torch.device("cpu")
+
+        # Tokenizer returns a tensor we can pass to the model call.
+        fake_tok = MagicMock(
+            return_value=MagicMock(
+                to=lambda *_a, **_k: {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+            )
+        )
+
+        with patch("transformers.AutoConfig") as mock_cfg_cls, \
+             patch("transformers.AutoModelForCausalLM") as mock_model_cls, \
+             patch("transformers.AutoTokenizer") as mock_tok_cls, \
+             tempfile.TemporaryDirectory() as tmp:
+            mock_cfg_cls.from_pretrained.return_value = cfg
+            mock_model_cls.from_pretrained.return_value = fake_model
+            mock_tok_cls.from_pretrained.return_value = fake_tok
+            with self.assertRaises(RuntimeError) as ctx:
+                _collect_channel_importance(
+                    model_path=tmp, dtype="bfloat16", tp=1,
+                    num_layers_hint=None, num_heads_hint=None,
+                    head_dim_hint=None,
+                    prompts=["hello"],
+                    allow_synthetic=False,
+                )
+        msg = str(ctx.exception)
+        self.assertIn("hooks did not fire", msg)
+        self.assertIn("allow-synthetic", msg)
 
 
 class TestChannelMaskSlicePerRank(unittest.TestCase):

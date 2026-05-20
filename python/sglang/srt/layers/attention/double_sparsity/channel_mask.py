@@ -185,6 +185,22 @@ def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
             f"channel_selection.shape[-1]={int(channel_selection.shape[-1])}."
         )
 
+    # channel_selection holds vocab indices into a head_dim-wide channel
+    # axis; out-of-range values blow up later in project_query_onto_channels
+    # with an opaque gather error, so reject up front.
+    if channel_selection.numel() > 0:
+        cs_int = channel_selection.to(torch.int64)
+        cs_min = int(cs_int.min().item())
+        cs_max = int(cs_int.max().item())
+        if cs_min < 0 or cs_max >= head_dim:
+            raise ValueError(
+                f"channel mask channel_selection values are out of range "
+                f"[0, head_dim={head_dim}): min={cs_min}, max={cs_max}. The "
+                "file's content hash is valid but the selection indices "
+                "cannot index into the model's head dimension. Recalibrate "
+                "with a current calibrate.py."
+            )
+
     expected_hash = raw_metadata["content_sha256"]
     actual_hash = compute_content_sha256(channel_selection, channel_weights)
     if expected_hash != actual_hash:
