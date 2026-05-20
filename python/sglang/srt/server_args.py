@@ -2223,11 +2223,8 @@ class ServerArgs:
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
-            if (
-                is_sm100_supported()
-                and self.moe_runner_backend == "auto"
-                and self.quantization == "modelopt_fp4"
-            ):
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
+
                 self.moe_runner_backend = "flashinfer_trtllm"
                 logger.info(
                     "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
