@@ -297,6 +297,7 @@ def select_topk_sequence_order(
     max_top_k: int,
     *,
     hot_pages: Optional[Sequence[Sequence[int]]] = None,
+    per_request_valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Top-K selection returning sequence-order-ascending indices.
 
@@ -304,6 +305,11 @@ def select_topk_sequence_order(
     hot_pages:   optional [bs] list of int lists with pages that must be in
                  the selected set regardless of score (active in-fill page +
                  local-window).
+    per_request_valid: optional [bs, max_pages] bool/int mask. When supplied,
+                 hot-page forcing only overwrites the score for cells the
+                 row's mask says are valid; foreign-page cells stay at the
+                 caller-set -inf. Filtering happens device-side via
+                 ``torch.where`` — no host sync.
 
     Returns:
         selected_indices: int32 [bs, max_top_k], ascending, -1 padded.
@@ -319,19 +325,34 @@ def select_topk_sequence_order(
     bs, max_pages = page_scores.shape
     device = page_scores.device
 
-    # Force hot pages to +inf so they always win the top-K.
+    # Force hot pages to +inf so they always win the top-K. When
+    # per_request_valid is supplied, gate the +inf write per cell with a
+    # device-side ``torch.where`` so a hot page outside the row's owned set
+    # stays at -inf (the caller's per-request mask).
     if hot_pages is not None:
         if len(hot_pages) != bs:
             raise ValueError(
                 f"hot_pages length {len(hot_pages)} must match batch size {bs}."
             )
+        inf_scalar = (
+            page_scores.new_tensor(float("inf"))
+            if per_request_valid is not None
+            else None
+        )
         for row, pages in enumerate(hot_pages):
             for page_id in pages:
                 if not (0 <= page_id < max_pages):
                     raise IndexError(
                         f"hot page {page_id} out of range [0, {max_pages})."
                     )
-                page_scores[row, page_id] = float("inf")
+                if per_request_valid is None:
+                    page_scores[row, page_id] = float("inf")
+                else:
+                    page_scores[row, page_id] = torch.where(
+                        per_request_valid[row, page_id].to(torch.bool),
+                        inf_scalar,
+                        page_scores[row, page_id],
+                    )
 
     effective_top_k = min(max_top_k, max_pages)
     topk = torch.topk(
@@ -411,6 +432,7 @@ def retrieve_topk_via_signatures(
         layer_id=layer_id,
     )
     scores = all_reduce_page_scores(scores, process_group=process_group)
+    pr_bool: Optional[torch.Tensor] = None
     if per_request_valid is not None:
         if per_request_valid.shape != scores.shape:
             raise ValueError(
@@ -419,20 +441,9 @@ def retrieve_topk_via_signatures(
             )
         pr_bool = per_request_valid.to(torch.bool)
         scores = scores.masked_fill(~pr_bool, float("-inf"))
-        if hot_pages is not None:
-            # Hot-page forcing in select_topk_sequence_order overwrites scores
-            # with +inf, which would otherwise re-introduce pages this row's
-            # per_request_valid mask just excluded (cross-request leak in
-            # mixed batches). Intersect each row's hot list with that row's
-            # valid set so forced hot pages can only come from the row's
-            # owned page set.
-            pr_rows = pr_bool.detach().cpu().tolist()
-            filtered: List[List[int]] = []
-            for row_idx, row_pages in enumerate(hot_pages):
-                row_valid = pr_rows[row_idx] if row_idx < len(pr_rows) else []
-                filtered.append([
-                    p for p in row_pages
-                    if 0 <= p < len(row_valid) and row_valid[p]
-                ])
-            hot_pages = filtered
-    return select_topk_sequence_order(scores, max_top_k, hot_pages=hot_pages)
+    return select_topk_sequence_order(
+        scores,
+        max_top_k,
+        hot_pages=hot_pages,
+        per_request_valid=pr_bool,
+    )

@@ -814,6 +814,85 @@ class TestHotPagesIntersectPerRequest(unittest.TestCase):
                         f"row 1 contains foreign pages: {row1}")
 
 
+    def test_select_topk_sequence_order_accepts_per_request_valid(self):
+        """Round-8 fix [P2]: select_topk_sequence_order applies a
+        device-side per-request gate when forcing hot pages, with no
+        CPU sync. Drive the helper directly to cover the new kwarg.
+        """
+
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            select_topk_sequence_order,
+        )
+        bs, max_pages = 2, 8
+        # Row 0 valid on pages [0..3], row 1 valid on [4..7]; everywhere
+        # else -inf so only "valid" pages can win, before hot-page forcing.
+        scores = torch.full((bs, max_pages), float("-inf"))
+        scores[0, 0:4] = 0.1
+        scores[1, 4:8] = 0.1
+        per_request = torch.tensor([
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 1],
+        ], dtype=torch.int32)
+        # Hot pages claim row 0 wants page 5 (foreign!) and row 1 wants page
+        # 3 (foreign!). The mask must keep both rows inside their own set.
+        hot = [[5], [3]]
+        indices, lengths = select_topk_sequence_order(
+            scores, max_top_k=4, hot_pages=hot, per_request_valid=per_request,
+        )
+        row0 = [int(v) for v in indices[0].tolist() if v >= 0]
+        row1 = [int(v) for v in indices[1].tolist() if v >= 0]
+        self.assertTrue(all(p in {0, 1, 2, 3} for p in row0),
+                        f"row 0 leaked foreign page: {row0}")
+        self.assertTrue(all(p in {4, 5, 6, 7} for p in row1),
+                        f"row 1 leaked foreign page: {row1}")
+
+    @unittest.skipUnless(torch.cuda.is_available(),
+                          "CUDA needed for device-resident hot-page filter test")
+    def test_hot_pages_no_host_sync_path(self):
+        """Round-8 fix [P2]: when retrieve_topk_via_signatures runs on
+        CUDA tensors with both hot_pages and per_request_valid, it must
+        not require ``.cpu()`` of the mask. We can't directly assert
+        "no host sync" cheaply, but we can prove the call succeeds and
+        produces the expected exclusion when everything lives on CUDA.
+        """
+
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_signatures,
+        )
+        dev = torch.device("cuda")
+        bs, max_pages = 2, 8
+        num_layers, num_heads, label_dim, head_dim = 1, 2, 4, 16
+        signatures = torch.randn(num_layers, max_pages, num_heads, label_dim, device=dev)
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool, device=dev)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim,
+                                         dtype=torch.int32, device=dev)
+        for h in range(num_heads):
+            for d in range(label_dim):
+                channel_selection[0, h, d] = (h * label_dim + d) % head_dim
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                      dtype=torch.float32, device=dev)
+        queries = torch.randn(bs, num_heads, head_dim, device=dev)
+        per_request = torch.tensor([
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 1],
+        ], dtype=torch.int32, device=dev)
+        hot = [[3], [3]]
+        indices, _ = retrieve_topk_via_signatures(
+            queries=queries,
+            page_signatures=signatures,
+            valid_mask=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0,
+            max_top_k=4,
+            hot_pages=hot,
+            per_request_valid=per_request,
+        )
+        row1 = [int(v) for v in indices[1].cpu().tolist() if v >= 0]
+        self.assertNotIn(3, row1,
+                          f"device-side filter must keep row 1 out of page 3: {row1}")
+
+
 class TestM3BFixtureWiderTable(unittest.TestCase):
     """Round-7 fix [P2]: M3-B fixture must work when table.max_pages
     exceeds the prompt page count (the normal allocator case).
