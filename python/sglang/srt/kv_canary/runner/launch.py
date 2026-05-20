@@ -31,7 +31,6 @@ def invoke_plan(
     req_to_token: torch.Tensor,
     swa_window_size: int,
 ) -> None:
-    """Invoke canary_plan_step for one (plan_input x buffer group) pair."""
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     canary_plan_step(
         verify_plan_out=verify_plan,
@@ -62,9 +61,6 @@ def launch_endpoints_per_forward(
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: CanaryInputCheckMode,
 ) -> None:
-    """Per-forward HEAD/TAIL endpoint launches. Iterates endpoints, applies tag_filter, drops
-    SWEEP_* tags.
-    """
     positions = forward_batch.positions
     if positions.dtype != torch.int32:
         positions = positions.to(torch.int32)
@@ -113,7 +109,6 @@ def launch_endpoints_sweep(
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
 ) -> None:
-    """Sweep endpoint launches. Iterates endpoints, keeps only SWEEP_* tags for the given group."""
     for endpoint in endpoints:
         if not _endpoint_belongs_to_group(endpoint, group):
             continue

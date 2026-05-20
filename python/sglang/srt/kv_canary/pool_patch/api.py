@@ -39,7 +39,6 @@ _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
 
 
 def register_pool_attacher(pool_class: Type, attacher: PoolAttacher) -> None:
-    """Register an attacher for an additional pool class. Used by tests with fake pools."""
     _POOL_ATTACHERS[pool_class] = attacher
 
 
@@ -90,9 +89,6 @@ def attach_canary_buffers(
 
 
 def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]:
-    """Return the ``{PoolKind: CanaryBufferGroup}`` mapping stashed on ``pool`` by a prior
-    :func:`attach_canary_buffers` call. Raises ``RuntimeError`` if canary has not been attached.
-    """
     groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
     if groups is None:
         raise RuntimeError(

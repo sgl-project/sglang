@@ -20,7 +20,6 @@ def attach_mla(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an MLA-style pool (single ``kv_buffer`` per layer, no V half)."""
     num_slots = int(pool.kv_buffer[0].shape[0])
     k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
 
@@ -53,7 +52,6 @@ def attach_nsa(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an NSA pool (MLA-style ``kv_buffer`` + a packed index buffer)."""
     num_slots = int(pool.kv_buffer[0].shape[0])
     k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
 

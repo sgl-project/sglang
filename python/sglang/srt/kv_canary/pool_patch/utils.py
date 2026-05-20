@@ -72,7 +72,6 @@ def alloc_canary_buf_pair(
     num_slots: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate (head, tail) canary buffers for one K- or V-half, shape ``[num_slots, CANARY_SLOT_BYTES]``."""
     head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     tail = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     return head, tail

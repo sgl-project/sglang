@@ -19,7 +19,6 @@ def attach_mha(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an MHA-style pool (separate K and V buffers per layer)."""
     num_slots = int(pool.k_buffer[0].shape[0])
     k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
     v_head, v_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
