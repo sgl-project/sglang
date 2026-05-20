@@ -1,21 +1,15 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     VerifyPlan,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
-from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
-from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -26,102 +20,23 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_verify_plan,
     make_write_plan,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import _empty_extras
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _assert_plans_byte_equal,
+    _run_both_plan,
+    _run_both_verify,
+    _run_both_write,
+)
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _dummy_pseudo_tensors,
+    _empty_extras,
+    make_extras_explicit,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 
 _DEVICE = torch.device("cuda")
-
-
-def _dummy_pseudo(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-    t = torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE)
-    return t, t.clone()
-
-
-def _run_verify_both(
-    *,
-    cuda_buf: torch.Tensor,
-    ref_buf: torch.Tensor,
-    plan_cuda: VerifyPlan,
-    plan_ref: VerifyPlan,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-) -> None:
-    canary_verify_step(
-        canary_buf=cuda_buf,
-        plan=plan_cuda,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        violation_ring=cuda_log.ring,
-        violation_write_index=cuda_log.write_index,
-        slot_run_counter=cuda_log.slot_run_counter,
-        kernel_run_counter=cuda_log.kernel_run_counter,
-        real_kv_sources=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
-    )
-    canary_verify_step_torch_reference(
-        canary_buf=ref_buf,
-        plan=plan_ref,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        violation_ring=ref_log.ring,
-        violation_write_index=ref_log.write_index,
-        slot_run_counter=ref_log.slot_run_counter,
-        kernel_run_counter=ref_log.kernel_run_counter,
-        real_kv_sources=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
-    )
-    torch.cuda.synchronize()
-
-
-def _run_write_both(
-    *,
-    cuda_buf: torch.Tensor,
-    ref_buf: torch.Tensor,
-    plan_cuda: WritePlan,
-    plan_ref: WritePlan,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-) -> None:
-    pseudo_tok, pseudo_pos = _dummy_pseudo(fb_input_ids.shape[0])
-    canary_write_step(
-        canary_buf=cuda_buf,
-        plan=plan_cuda,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        enable_write_verify_inputs=False,
-        expected_input_tokens=pseudo_tok,
-        expected_input_positions=pseudo_pos,
-        violation_ring=cuda_log.ring,
-        violation_write_index=cuda_log.write_index,
-        slot_run_counter=cuda_log.slot_run_counter,
-        kernel_run_counter=cuda_log.kernel_run_counter,
-        real_kv_sources=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
-    )
-    canary_write_step_torch_reference(
-        canary_buf=ref_buf,
-        plan=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        enable_write_verify_inputs=False,
-        expected_input_tokens=pseudo_tok,
-        expected_input_positions=pseudo_pos,
-        violation_ring=ref_log.ring,
-        violation_write_index=ref_log.write_index,
-        slot_run_counter=ref_log.slot_run_counter,
-        kernel_run_counter=ref_log.kernel_run_counter,
-        real_kv_sources=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
-    )
-    torch.cuda.synchronize()
 
 
 def _build_verify_plan_5_entries(
@@ -200,113 +115,6 @@ def _build_plan_fixtures(
     return fb_req_pool_indices, fb_prefix_lens, fb_extend_seq_lens, req_to_token
 
 
-def _make_extras(
-    *,
-    slot_indices: list[int],
-    positions: list[int],
-    prev_slot_indices: list[int],
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = len(slot_indices)
-    cap = max(n, 1)
-    slots = torch.zeros(cap, dtype=torch.int32, device=device)
-    pos = torch.zeros(cap, dtype=torch.int32, device=device)
-    prevs = torch.zeros(cap, dtype=torch.int32, device=device)
-    if n > 0:
-        slots[:n] = torch.tensor(slot_indices, dtype=torch.int32, device=device)
-        pos[:n] = torch.tensor(positions, dtype=torch.int32, device=device)
-        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int32, device=device)
-    num_valid = torch.tensor([n], dtype=torch.int32, device=device)
-    return slots, pos, prevs, num_valid
-
-
-def _run_plan_both(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    swa_window_size: int = 0,
-    full_to_swa_index_mapping: Optional[torch.Tensor] = None,
-) -> None:
-    extra_slots, extra_pos, extra_prev, extra_num = extras
-    canary_plan_step(
-        verify_plan_out=triton_verify,
-        write_plan_out=triton_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_pos,
-        extra_verify_prev_slot_indices=extra_prev,
-        extra_verify_num_valid=extra_num,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    canary_plan_step_torch_reference(
-        verify_plan_out=ref_verify,
-        write_plan_out=ref_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_pos,
-        extra_verify_prev_slot_indices=extra_prev,
-        extra_verify_num_valid=extra_num,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    torch.cuda.synchronize()
-
-
-def _assert_plan_equal(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-) -> None:
-    n_verify = int(triton_verify.verify_num_valid[0].item())
-    n_verify_ref = int(ref_verify.verify_num_valid[0].item())
-    assert (
-        n_verify == n_verify_ref
-    ), f"verify_num_valid: triton={n_verify} ref={n_verify_ref}"
-    if n_verify > 0:
-        assert torch.equal(
-            triton_verify.verify_slot_indices[:n_verify],
-            ref_verify.verify_slot_indices[:n_verify],
-        )
-        assert torch.equal(
-            triton_verify.verify_positions[:n_verify],
-            ref_verify.verify_positions[:n_verify],
-        )
-        assert torch.equal(
-            triton_verify.verify_prev_slot_indices[:n_verify],
-            ref_verify.verify_prev_slot_indices[:n_verify],
-        )
-    n_write = int(triton_write.write_num_valid_reqs[0].item())
-    n_write_ref = int(ref_write.write_num_valid_reqs[0].item())
-    assert (
-        n_write == n_write_ref
-    ), f"write_num_valid_reqs: triton={n_write} ref={n_write_ref}"
-    assert torch.equal(
-        triton_write.write_offsets[: n_write + 1],
-        ref_write.write_offsets[: n_write + 1],
-    )
-    if n_write > 0:
-        assert torch.equal(
-            triton_write.write_seed_slot_indices[:n_write],
-            ref_write.write_seed_slot_indices[:n_write],
-        )
-
-
 def test_verify_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
     plan_cuda, plan_ref = _build_verify_plan_5_entries(device=_DEVICE)
@@ -321,13 +129,17 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
         )
         cuda_log, ref_log = make_log_pair(capacity=64, device=_DEVICE)
 
-        _run_verify_both(
-            cuda_buf=cuda_buf,
-            ref_buf=ref_buf,
+        _run_both_verify(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
             plan_cuda=plan_cuda,
             plan_ref=plan_ref,
             cuda_log=cuda_log,
             ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
         assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
@@ -364,17 +176,25 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
         cuda_log, ref_log = make_log_pair(capacity=64, device=_DEVICE)
+        pseudo_tok, pseudo_pos = _dummy_pseudo_tensors(fb_input_ids.shape[0])
 
-        _run_write_both(
-            cuda_buf=cuda_buf,
-            ref_buf=ref_buf,
+        _run_both_write(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
             plan_cuda=plan_cuda,
             plan_ref=plan_ref,
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
+            enable_write_verify_inputs=False,
+            expected_input_tokens=pseudo_tok,
+            expected_input_positions=pseudo_pos,
             cuda_log=cuda_log,
             ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
         assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
@@ -411,7 +231,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
         ref_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE)
         ref_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE)
 
-        _run_plan_both(
+        _run_both_plan(
             triton_verify=triton_v,
             triton_write=triton_w,
             ref_verify=ref_v,
@@ -421,9 +241,11 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
             fb_extend_seq_lens=fb_extend,
             req_to_token=req_to_token,
             extras=_empty_extras(),
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
         )
 
-        _assert_plan_equal(
+        _assert_plans_byte_equal(
             triton_verify=triton_v,
             triton_write=triton_w,
             ref_verify=ref_v,
@@ -517,11 +339,11 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
         fb_extend = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
 
     if extras_present:
-        extras = _make_extras(
+        extras = make_extras_explicit(
             slot_indices=[10, 11],
             positions=[0, 1],
             prev_slot_indices=[-1, 10],
-            device=_DEVICE,
+            capacity=max(2, 1),
         )
     else:
         extras = _empty_extras()
@@ -531,7 +353,7 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
     ref_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE)
     ref_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE)
 
-    _run_plan_both(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -541,9 +363,11 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
         fb_extend_seq_lens=fb_extend,
         req_to_token=req_to_token,
         extras=extras,
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
     )
 
-    _assert_plan_equal(
+    _assert_plans_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
