@@ -5,8 +5,17 @@ import json
 import logging
 import time
 import uuid
+from enum import StrEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+
+
+class ThinkingMode(StrEnum):
+    """Mode for message encoding - chat vs thinking/reasoning."""
+
+    CHAT = "chat"
+    THINKING = "thinking"
+
 
 import jinja2
 import orjson
@@ -259,7 +268,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
-        thinking_mode: bool,
+        thinking_mode: ThinkingMode,
     ) -> Optional[List[int]]:
         """Encode messages for custom chat_encoding_spec values.
 
@@ -588,9 +597,11 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_requested = (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )
-        thinking_mode = "thinking" if thinking_requested else "chat"
+        thinking_mode = (
+            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
+        )
         prompt_ids = self._encode_messages(
-            [msg.model_dump() for msg in request.messages], request, thinking_requested
+            [msg.model_dump() for msg in request.messages], request, thinking_mode
         )
 
         if prompt_ids is not None:
