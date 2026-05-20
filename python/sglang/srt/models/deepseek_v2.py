@@ -1250,7 +1250,24 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            # `empty_topk_output` strips fused-shared-expert columns; the DeepEP
+            # dispatch metadata (and the non-TBO `forward_deepep` path) expects
+            # the full `top_k = num_experts_per_tok + num_fused_shared_experts`
+            # width. Without this fix, an idle/empty TBO sub-batch sends
+            # mismatched per-expert notify counts to the peer rank and the
+            # collective deadlocks on `intranode_dispatch` (CPU recv timeout).
+            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+                n = self.num_fused_shared_experts
+                topk_output = topk_output._replace(
+                    topk_ids=topk_output.topk_ids.new_empty(
+                        (0, topk_output.topk_ids.shape[-1] + n)
+                    ),
+                    topk_weights=topk_output.topk_weights.new_empty(
+                        (0, topk_output.topk_weights.shape[-1] + n)
+                    ),
+                )
+            state.topk_output = topk_output
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
