@@ -12,7 +12,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         import os
 
-        from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
             dpsk_v4_fp8_attention_fwd,
         )
 
