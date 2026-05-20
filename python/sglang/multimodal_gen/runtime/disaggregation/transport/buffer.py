@@ -104,7 +104,7 @@ class TransferTensorBuffer:
         name: str,
         tensor: torch.Tensor,
         byte_offset: int = 0,
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> int:
         """Copy a tensor into the pool slot. Returns bytes written."""
         src_tensor = tensor.contiguous()
@@ -136,7 +136,7 @@ class TransferTensorBuffer:
         dtype: torch.dtype,
         byte_offset: int = 0,
         device: torch.device | str = "cpu",
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> torch.Tensor:
         """Read a tensor from the pool slot. Returns a clone on target device."""
         nbytes = 1
@@ -170,7 +170,7 @@ class TransferTensorBuffer:
         self,
         handle: SlotHandle,
         tensors: dict[str, torch.Tensor | list[torch.Tensor] | None],
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> dict[str, list[dict]]:
         """Batch-write GPU tensors into a slot. Returns a manifest for later reads."""
         manifest: dict[str, list[dict]] = {}
@@ -225,7 +225,7 @@ class TransferTensorBuffer:
         handle: SlotHandle,
         manifest: dict[str, list[dict]],
         device: torch.device | str = "cpu",
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """Batch-read tensors from a slot using a manifest."""
         result: dict[str, torch.Tensor | list[torch.Tensor]] = {}
