@@ -71,15 +71,11 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: Union[List[int], array],
+        token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
-        # TODO(Jialin): clean up callers that still pass list[int] to
-        # RadixKey, then drop this coercion eventually.
-        self.token_ids: array[int] = (
-            token_ids if isinstance(token_ids, array) else array("q", token_ids)
-        )
+        self.token_ids: array[int] = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
@@ -815,20 +811,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()
 
-    # Example token id sequences (as lists of ints)
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
-    )
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
-    )
+    def _k(tokens):
+        return RadixKey(token_ids=array("q", tokens), extra_key=None)
+
+    tree.insert(InsertParams(key=_k([1, 2, 3])))
+    tree.insert(InsertParams(key=_k([1, 2, 3])))
+    tree.insert(InsertParams(key=_k([1, 2, 4, 5])))
+    tree.insert(InsertParams(key=_k([1, 2, 4, 5, 6, 7])))
+    tree.insert(InsertParams(key=_k([8, 9, 10, 11, 12])))
     tree.pretty_print()
 
-    print(
-        tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None))
-        )
-    )
+    print(tree.match_prefix(MatchPrefixParams(key=_k([1, 2, 3, 13, 14]))))
