@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
-use crate::workers::introspect::WorkerIntrospector;
+use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::WorkerRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -222,6 +222,36 @@ async fn register_one(
     let info = introspector.fetch(&worker_url).await;
     if let Some(name) = info.served_model_name {
         spec.model_ids = vec![ModelId(name)];
+    }
+    // Trust `/server_info` over the discovery backend when the worker
+    // self-disclosed its PD role: the server's own ServerArgs is the
+    // authoritative source for `disaggregation_mode` and
+    // `disaggregation_bootstrap_port`. The backend's mode (from K8s
+    // labels, static-file TOML, etc.) was a best-guess seed; if the
+    // server says it's actually a prefill peer on port 8998, that wins.
+    // `None` here means the worker didn't tell us — keep the backend's
+    // classification (older SGLang without the field, partial response,
+    // unknown mode value, etc.).
+    if let Some(role) = info.disaggregation_role {
+        let (new_mode, new_port) = match role {
+            DisaggregationRole::Plain => (WorkerMode::Plain, None),
+            DisaggregationRole::Prefill { bootstrap_port } => {
+                (WorkerMode::Prefill, Some(bootstrap_port))
+            }
+            DisaggregationRole::Decode => (WorkerMode::Decode, None),
+        };
+        if (new_mode, new_port) != (spec.mode, spec.bootstrap_port) {
+            tracing::info!(
+                worker_url = %worker_url,
+                backend_mode = ?spec.mode,
+                resolved_mode = ?new_mode,
+                backend_bootstrap_port = ?spec.bootstrap_port,
+                resolved_bootstrap_port = ?new_port,
+                "/server_info overrode discovery-backend classification",
+            );
+            spec.mode = new_mode;
+            spec.bootstrap_port = new_port;
+        }
     }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
     if let Err(e) = registry.add_with_cb(spec, cb) {
@@ -665,6 +695,69 @@ mod tests {
         assert!(
             removed.is_ok(),
             "manager must call active_load.forget_worker on Removed",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// Discovery backend emits a `Plain` worker with no bootstrap port,
+    /// but `/server_info` says `disaggregation_mode="prefill"` with
+    /// `disaggregation_bootstrap_port=8998`. The manager must trust
+    /// `/server_info` and register the worker as Prefill with the
+    /// disclosed port — this is the load-bearing assertion for
+    /// PD-on-K8s, where the K8s backend always emits Plain + None for
+    /// `bootstrap_port` and the manager has to recover the role from
+    /// the worker's self-disclosure.
+    #[tokio::test]
+    async fn manager_overrides_backend_classification_from_server_info() {
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "prefill",
+            "disaggregation_bootstrap_port": 8998,
+        }))
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+        ));
+
+        // Backend says Plain + None — the shape the K8s backend always
+        // emits today.
+        let spec = WorkerSpec {
+            id: WorkerId("w-prefill".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+
+        let resolved = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&spec.id) {
+                    if w.mode() == WorkerMode::Prefill && w.bootstrap_port() == Some(8998) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            resolved.is_ok(),
+            "manager must apply /server_info disaggregation_role override; \
+             expected mode=Prefill bootstrap_port=Some(8998), got {:?}",
+            registry
+                .get(&spec.id)
+                .map(|w| (w.mode(), w.bootstrap_port())),
         );
 
         drop(tx);
