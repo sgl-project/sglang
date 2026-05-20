@@ -123,15 +123,29 @@ def retrieve_timesteps(
 
 class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
-        self, vae, tokenizer, processor, transformer, scheduler, model_path
+        self,
+        vae,
+        tokenizer,
+        processor,
+        transformer,
+        scheduler,
+        model_path,
+        vae_dtype: torch.dtype,
+        text_encoder_dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        self.vae = vae.to(torch.bfloat16)
+        self.vae = vae.to(dtype=vae_dtype)
+        self.vae_dtype = vae_dtype
+        self.text_encoder_dtype = text_encoder_dtype
         from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder"
-        ).to(torch.bfloat16)
+        self.text_encoder = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path, subfolder="text_encoder"
+            )
+            .to(get_local_torch_device())
+            .to(dtype=self.text_encoder_dtype)
+        )
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -464,7 +478,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image, calculated_height, calculated_width
         )
         image = image.unsqueeze(2)
-        image = image.to(dtype=torch.bfloat16)
+        image = image.to(dtype=self.vae_dtype)
 
         prompt = batch.prompt
         with self.use_declared_component(

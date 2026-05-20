@@ -26,7 +26,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
     from sglang.jit_kernel.fused_store_index_cache import (
-        can_use_nsa_fused_store,
+        can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )
 
@@ -70,7 +70,7 @@ def _skip_if_unavailable(page_size: int = PAGE_SIZE):
         pytest.skip("torch.float8_e4m3fn not available")
     if not HAS_FUSED:
         pytest.skip("fused_store_index_cache not importable")
-    if not can_use_nsa_fused_store(torch.bfloat16, torch.int64, page_size):
+    if not can_use_dsa_fused_store(torch.bfloat16, torch.int64, page_size):
         pytest.skip("JIT kernel unavailable / failed to compile")
 
 
@@ -187,7 +187,7 @@ def _reference_quantize_and_store(
 
 def _import_act_quant():
     try:
-        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         return act_quant
     except Exception:
