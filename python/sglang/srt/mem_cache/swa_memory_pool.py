@@ -92,6 +92,10 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        # Cached per-batch SWA loc translation (same pattern as DSV4 cached_loc).
+        # Invalidated when the incoming loc tensor changes identity (new batch).
+        self._cached_swa_loc: Optional[torch.Tensor] = None
+        self._cached_loc_key: Optional[torch.Tensor] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -178,7 +182,13 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            loc = self.translate_loc_from_full_to_swa(loc)
+            # Translate once per batch: reuse cached result when loc tensor
+            # identity is unchanged (all SWA layers in one forward see the same
+            # loc object). Mirrors the cached_loc pattern in DSV4 memory pool.
+            if self._cached_loc_key is not loc:
+                self._cached_swa_loc = self.translate_loc_from_full_to_swa(loc)
+                self._cached_loc_key = loc
+            loc = self._cached_swa_loc
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 loc,
