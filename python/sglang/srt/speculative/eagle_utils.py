@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 import math
 from enum import IntEnum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -15,6 +20,29 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+def apply_eagle_prefill_input_rotation(
+    batch: ScheduleBatch, next_token_ids: torch.Tensor
+) -> None:
+    """EAGLE input rotation for draft prefill.
+
+    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] with
+    t_n = next_token_ids[i]. Aligns draft's position-i hidden with
+    target's label at i+1 — the basis of EAGLE chain prediction.
+    Vectorized: one whole-tensor left shift + scatter at segment tails.
+    """
+    if batch.forward_mode.is_idle():
+        return
+    assert len(next_token_ids) == len(batch.seq_lens)
+    extend_lens = torch.tensor(
+        batch.extend_lens, dtype=torch.int64, device=batch.input_ids.device
+    )
+    seg_ends = extend_lens.cumsum(0) - 1
+    rotated = torch.empty_like(batch.input_ids)
+    rotated[:-1] = batch.input_ids[1:]
+    rotated[seg_ends] = next_token_ids.to(batch.input_ids.dtype)
+    batch.input_ids = rotated
 
 
 def organize_draft_results(
