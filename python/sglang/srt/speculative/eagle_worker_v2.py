@@ -743,11 +743,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=self.server_args.cuda_graph_bs,
                 )
-                max_steps = max(self.adaptive_controller.candidate_steps)
-                topk = self.server_args.speculative_eagle_topk or 1
-                self.server_args._adaptive_max_alloc_len_per_decode = max(
-                    max_steps * topk, max_steps + 1
-                )
 
     @property
     def target_worker(self):
@@ -790,6 +785,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            # In SpecV2 (overlap scheduler), the step count must be set before
+            # the draft model runs because draft and verify are pipelined.  The
+            # EMA update from the previous batch's on_verify_complete may have
+            # changed the optimal step for the current batch size, so we query
+            # and activate here before entering the draft→verify→extend loop.
             if self.adaptive_controller is not None:
                 target_steps = self.adaptive_controller.get_steps_for_batch(
                     batch.seq_lens.shape[0]
