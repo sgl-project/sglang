@@ -689,6 +689,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_profile_flashinfer_autotune: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -6157,6 +6158,18 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-profile-flashinfer-autotune",
+            action="store_true",
+            help=(
+                "Enable torch profiler + CUDA memory snapshot capture around "
+                "the FlashInfer autotune kernel warmup. Writes "
+                "flashinfer_autotune_memory_usage.pickle in the cwd (open at "
+                "https://pytorch.org/memory_viz) and logs top ops by self "
+                "CUDA / CPU memory and CUDA / CPU time. Useful for measuring "
+                "autotune's startup memory and time cost."
+            ),
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

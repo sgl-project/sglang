@@ -215,6 +215,7 @@ from sglang.srt.utils.patch_torch import (
     monkey_patch_torch_reductions,
     register_sgl_tp_rank,
 )
+from sglang.srt.utils.profile_utils import profile_startup_region
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -2368,13 +2369,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cache_path = self._flashinfer_autotune_cache_path()
         logger.info("Running FlashInfer autotune with cache: %s", cache_path)
 
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        self.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
-        torch.cuda.current_stream().wait_stream(self.forward_stream)
+        with profile_startup_region(
+            label="flashinfer_autotune",
+            snapshot_path="flashinfer_autotune_memory_usage.pickle",
+            enabled=self.server_args.enable_profile_flashinfer_autotune,
+        ):
+            # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+            # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+            self.forward_stream.wait_stream(torch.cuda.current_stream())
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+                    self._dummy_run(batch_size=self.req_to_token_pool.size)
+            torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
     def _flashinfer_autotune_cache_path(self) -> Path:
