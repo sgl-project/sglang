@@ -22,6 +22,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     chain_anchor_signed,
     make_canary_buf,
     make_canary_buf_pair,
+    make_log_pair,
     make_real_kv_source,
     make_real_kv_sources,
     make_verify_plan,
@@ -94,8 +95,7 @@ def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
         prev_slot_indices=[-1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -128,8 +128,7 @@ def test_chain_head_anchor() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[5], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -167,8 +166,7 @@ def test_chain_link_byte_equal_5_step() -> None:
         prev_slot_indices=prev_slot_indices,
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -225,8 +223,7 @@ def test_violation_token_mismatch() -> None:
         prev_slot_indices=[2],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -263,8 +260,7 @@ def test_violation_position_mismatch() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[7], positions=[5], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -301,8 +297,7 @@ def test_violation_position_diverges_from_plan() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[3], positions=[99], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -355,8 +350,7 @@ def test_violation_prev_hash_mismatch() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[2], positions=[1], prev_slot_indices=[1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -424,8 +418,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
         prev_slot_indices=[-1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -451,8 +444,7 @@ def test_real_kv_mode_off_yields_zero() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     anchor_signed = chain_anchor_signed()
     for buf in (cuda_buf, ref_buf):
@@ -523,8 +515,7 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
         prev_slot_indices=[-1, 1, 2],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -593,8 +584,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         prev_slot_indices=[-1, 1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -640,8 +630,7 @@ def test_real_kv_source_padding_below_4() -> None:
             prev_hash=anchor_signed,
             real_kv_hash=0,
         )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -734,8 +723,7 @@ def test_real_kv_source_holey_dim1() -> None:
         prev_slot_indices=[-1, 1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -810,8 +798,7 @@ def test_page_size_gt_1_access_pattern() -> None:
         prev_slot_indices=[-1, 1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -848,8 +835,7 @@ def test_swa_translated_slot_indices() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[2], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -872,8 +858,7 @@ def test_kernel_run_counter_per_call() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for _ in range(3):
         _run_both_verify(
@@ -911,8 +896,7 @@ def test_slot_run_counter_per_entry() -> None:
         prev_slot_indices=[-1, 1, 2, 3],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -951,8 +935,7 @@ def test_violation_ring_fill_once_first_row() -> None:
         prev_slot_indices=[-1, -1, -1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -998,8 +981,7 @@ def test_violation_ring_overflow_counter_still_increments() -> None:
         prev_slot_indices=[-1] * n_violations,
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(capacity=4, device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1039,8 +1021,7 @@ def test_kernel_kind_stamped_into_row() -> None:
         plan_cuda, plan_ref = make_verify_plan_pair(
             slot_indices=[1], positions=[99], prev_slot_indices=[-1], device=_DEVICE
         )
-        cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-        ref_log = FakeViolationLog.allocate(device=_DEVICE)
+        cuda_log, ref_log = make_log_pair(device=_DEVICE)
         _run_both_verify(
             cuda_canary_buf=cuda_buf,
             ref_canary_buf=ref_buf,
@@ -1063,8 +1044,7 @@ def test_empty_plan_no_op() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1120,8 +1100,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
         prev_slot_indices=[-1, 1, 2, 3, 4],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1251,8 +1230,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
                 )
 
     ring_capacity = _RING_CAPACITY
-    cuda_log = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(capacity=ring_capacity, device=_DEVICE)
 
     if ring_state == "full":
         anchor_signed = chain_anchor_signed()
@@ -1395,8 +1373,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1420,8 +1397,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
     plan_cuda2, plan_ref2 = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log2 = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log2 = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log2, ref_log2 = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1494,8 +1470,7 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[5], positions=[99], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(capacity=4, device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1678,8 +1653,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
         prev_slot_indices=[-1, 1, 2],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1726,8 +1700,7 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
         prev_slot_indices=[-1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1804,8 +1777,7 @@ def test_paged_layout_page_size_16() -> None:
         prev_slot_indices=[-1, 15],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1835,8 +1807,7 @@ def test_violation_ring_atomic_with_many_violations() -> None:
         capacity=n,
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(capacity=128, device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(capacity=128, device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(capacity=128, device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -1875,8 +1846,7 @@ def test_chain_head_anchored_on_constant() -> None:
         prev_slot_indices=[-1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1913,8 +1883,7 @@ def test_position_mismatch_sets_position_bit_only() -> None:
         prev_slot_indices=[-1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1953,8 +1922,7 @@ def test_replay_does_not_double_count_run_counters() -> None:
         prev_slot_indices=[-1, 1, 2],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for _ in range(2):
         _run_both_verify(
@@ -1984,8 +1952,7 @@ def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
         prev_slot_indices=[-1] * 4,
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     launch_tag = CanaryLaunchTag.HEAD_V_SWA
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -2035,8 +2002,7 @@ def test_slot_run_counter_delta_equals_active_entries_across_random_plans() -> N
                 real_kv_hash=0,
             )
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for _ in range(50):
         bs = random.randint(1, 16)
@@ -2089,8 +2055,7 @@ def test_kernel_run_counter_per_call_invariant_50_calls() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for n in range(1, 51):
         _run_both_verify(
@@ -2128,8 +2093,7 @@ def test_empty_plan_keeps_slot_counter_unchanged() -> None:
     empty_plan_cuda, empty_plan_ref = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for _ in range(30):
         slot_before = int(cuda_log.slot_run_counter[0].item())
@@ -2192,8 +2156,7 @@ def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50() -> None:
             prev_slot_indices=[-1],
             device=_DEVICE,
         )
-        cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-        ref_log = FakeViolationLog.allocate(device=_DEVICE)
+        cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
         _run_both_verify(
             cuda_canary_buf=cuda_buf,
@@ -2239,8 +2202,7 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,
@@ -2280,8 +2242,7 @@ def test_clear_resets_ring_and_write_index_zero() -> None:
         prev_slot_indices=[-1, -1, -1],
         device=_DEVICE,
     )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_verify(
         cuda_canary_buf=cuda_buf,

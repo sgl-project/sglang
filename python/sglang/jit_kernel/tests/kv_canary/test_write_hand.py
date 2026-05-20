@@ -18,6 +18,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
+    make_log_pair,
     make_real_kv_source,
     make_real_kv_sources,
     make_write_plan,
@@ -71,8 +72,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
     sources_cuda = case.real_kv_sources
     sources_ref = clone_real_kv_sources(sources_cuda)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -102,8 +102,7 @@ def test_seed_slot_idx_negative_uses_anchor() -> None:
     fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -155,8 +154,7 @@ def test_seed_slot_idx_loads_predecessor() -> None:
     fb_positions = torch.tensor([5], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([2], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -207,8 +205,7 @@ def test_seed_slot_chain_link_continuous() -> None:
     fb_positions = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([2], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -262,8 +259,7 @@ def test_chain_link_byte_equal_5_step() -> None:
     fb_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -296,8 +292,7 @@ def test_mock_mode_off_ignores_expected() -> None:
     # Garbage expected tensors that, if the kernel mistakenly reads, would generate mismatches.
     pseudo_tokens = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -331,8 +326,7 @@ def test_mock_mode_on_match_no_violation() -> None:
     fb_out_cache_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens = fb_input_ids.clone()
     pseudo_positions = fb_positions.clone()
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -366,8 +360,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens = torch.tensor([99], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -405,8 +398,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -444,8 +436,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     # Every actual differs from expected.
     pseudo_tokens = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([999, 999, 999], dtype=torch.int32, device=_DEVICE)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -507,8 +498,7 @@ def test_negative_slot_skips_entry() -> None:
     fb_positions = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([4, -1], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -549,8 +539,7 @@ def test_pre_translated_slot_writes_normally() -> None:
     # endpoint's host gather. The kernel can't tell the difference and that's the point.
     fb_out_cache_loc = torch.tensor([4], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -586,8 +575,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
     fb_positions = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -625,8 +613,7 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     fb_positions = torch.tensor([0, 1, 2], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(3)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -669,8 +656,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     fb_positions = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -736,8 +722,7 @@ def test_kernel_run_counter_per_call() -> None:
     fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     for _ in range(3):
         _run_both_write(
@@ -776,8 +761,7 @@ def test_slot_run_counter_sums_entries() -> None:
     fb_positions = torch.tensor([0, 1, 0, 1, 2], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -814,8 +798,7 @@ def test_empty_plan_no_op() -> None:
     fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -855,8 +838,7 @@ def test_padding_block_skipped() -> None:
     fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -909,8 +891,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor(out_cache_loc, dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -981,8 +962,7 @@ def test_mock_violation_bit_injection_position_matrix(
     else:
         pseudo_positions[corruption_index] = positions[corruption_index] + 99
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -1077,8 +1057,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -1144,8 +1123,7 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
     fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor(out_cache_loc, dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,
@@ -1214,8 +1192,7 @@ def test_pseudo_mode_on_catches_token_mismatch() -> None:
     )
     pseudo_positions = fb_positions.clone()
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1266,8 +1243,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
     fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor(slot_indices, dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1318,8 +1294,7 @@ def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
 
     cuda_buf_before_slot_view = cuda_buf.view(torch.int64).clone()
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1383,8 +1358,7 @@ def test_seed_continues_existing_chain() -> None:
     fb_positions = torch.tensor([new_position], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([new_slot], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1433,8 +1407,7 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
     fb_positions = torch.tensor([0, 1], dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.tensor([3, 7], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1523,8 +1496,7 @@ def test_pseudo_mode_off_skips_token_check() -> None:
     pseudo_tokens = torch.tensor([99, 99, 99], dtype=torch.int32, device=_DEVICE)
     pseudo_positions = torch.tensor([99, 99, 99], dtype=torch.int32, device=_DEVICE)
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1565,8 +1537,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
     fb_positions_big = torch.tensor([0] * 8, dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc_big = torch.tensor(big_slots, dtype=torch.int32, device=_DEVICE)
     pseudo_tokens_big, pseudo_positions_big = _dummy_pseudo_tensors(8)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
     _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
@@ -1649,8 +1620,7 @@ def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
         (1,), 0x7F7F7F7F, dtype=torch.int32, device=_DEVICE
     )
 
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
     _run_both_write(
         cuda_canary_buf=cuda_buf,

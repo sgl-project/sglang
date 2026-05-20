@@ -15,6 +15,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
+    make_log_pair,
     make_verify_plan_pair,
     stamp_clean_chain,
 )
@@ -127,8 +128,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
 
 def _run_one(inputs: VerifyFuzzInputs) -> None:
     cuda_buf_before = inputs.cuda_canary_buf.clone()
-    cuda_log = FakeViolationLog.allocate(capacity=inputs.ring_capacity, device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(capacity=inputs.ring_capacity, device=_DEVICE)
+    cuda_log, ref_log = make_log_pair(capacity=inputs.ring_capacity, device=_DEVICE)
     log_before = FakeViolationLog.allocate(
         capacity=inputs.ring_capacity, device=_DEVICE
     )
