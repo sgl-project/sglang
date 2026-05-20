@@ -22,8 +22,30 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    make_real_kv_source,
+    make_real_kv_sources,
     splitmix64,
+    splitmix64_mix4,
 )
+
+__all__ = [
+    "FakeViolationLog",
+    "assert_canary_buf_equal",
+    "assert_canary_state_equal",
+    "assert_canary_state_multiset_equal",
+    "assert_only_bits_set",
+    "chain_anchor_signed",
+    "make_canary_buf",
+    "make_real_kv_source",
+    "make_real_kv_sources",
+    "make_verify_plan",
+    "make_write_plan",
+    "read_slot_fields",
+    "splitmix64",
+    "splitmix64_mix4",
+    "to_signed_int64",
+    "write_slot_fields",
+]
 
 # Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
 # stay realistic without bloating the assertion surface.

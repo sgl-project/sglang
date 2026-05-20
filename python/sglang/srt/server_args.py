@@ -681,10 +681,6 @@ class ServerArgs:
     kv_canary_real_data: str = "off"
     kv_canary_sweep_interval: int = 0
     kv_canary_input_check: bool = False
-    kv_canary_jitter_enabled: bool = False
-    kv_canary_jitter_per_slot_fire_prob: Optional[float] = None
-    kv_canary_jitter_max_cycles: Optional[int] = None
-    kv_canary_jitter_seed: Optional[int] = None
     mock_model_enabled: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -6121,51 +6117,6 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--kv-canary-jitter-enabled",
-            action="store_true",
-            default=ServerArgs.kv_canary_jitter_enabled,
-            help=(
-                "Enable the kv-canary timing-jitter fuzzer. When on, the canary "
-                "runner launches a single-thread spin-wait kernel at 4 fixed slots "
-                "inside the monkey-patched model.forward to perturb the relative "
-                "timing between canary HEAD/TAIL and real attention launches. "
-                "Testing-only knob; off by default. Requires --kv-canary in "
-                "{on, raise}."
-            ),
-        )
-        parser.add_argument(
-            "--kv-canary-jitter-per-slot-fire-prob",
-            type=float,
-            default=ServerArgs.kv_canary_jitter_per_slot_fire_prob,
-            help=(
-                "Per-slot per-step probability that a jitter slot fires (cycles>0)."
-                " 0.0 = no slot ever fires (jitter on but inert); 1.0 = every slot"
-                " fires every step. Default falls back to "
-                "SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB."
-            ),
-        )
-        parser.add_argument(
-            "--kv-canary-jitter-max-cycles",
-            type=int,
-            default=ServerArgs.kv_canary_jitter_max_cycles,
-            help=(
-                "Upper bound on per-slot device-cycle count when a jitter slot "
-                "fires. Sampled log-uniformly over [1, max_cycles]; ~100_000 is "
-                "about 50us on a 2GHz SM clock. Default falls back to "
-                "SGLANG_KV_CANARY_JITTER_MAX_CYCLES."
-            ),
-        )
-        parser.add_argument(
-            "--kv-canary-jitter-seed",
-            type=int,
-            default=ServerArgs.kv_canary_jitter_seed,
-            help=(
-                "Host-side RNG seed for jitter sampling. Same seed produces the "
-                "same per-step cycles sequence (within one run). Default falls "
-                "back to SGLANG_KV_CANARY_JITTER_SEED."
-            ),
-        )
-        parser.add_argument(
             "--mock-model-enabled",
             action="store_true",
             default=ServerArgs.mock_model_enabled,
@@ -7176,11 +7127,6 @@ class ServerArgs:
                     "--kv-canary-sweep-interval requires "
                     "--kv-canary in {log, raise}"
                 )
-
-        if self.kv_canary_jitter_enabled and self.kv_canary == "off":
-            raise ValueError(
-                "--kv-canary-jitter-enabled requires --kv-canary in {on, raise}"
-            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

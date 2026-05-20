@@ -104,28 +104,16 @@ class CanaryConfig:
         else:
             sweep_interval = envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get()
 
-        jitter_enabled_env = envs.SGLANG_KV_CANARY_JITTER_ENABLED.get()
-        jitter_enabled = (
-            bool(server_args.kv_canary_jitter_enabled) or jitter_enabled_env
-        )
         jitter_config = JitterConfig(
-            enabled=jitter_enabled,
-            per_slot_fire_prob=(
-                server_args.kv_canary_jitter_per_slot_fire_prob
-                if server_args.kv_canary_jitter_per_slot_fire_prob is not None
-                else envs.SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB.get()
-            ),
-            max_cycles=(
-                int(server_args.kv_canary_jitter_max_cycles)
-                if server_args.kv_canary_jitter_max_cycles is not None
-                else envs.SGLANG_KV_CANARY_JITTER_MAX_CYCLES.get()
-            ),
-            seed=(
-                int(server_args.kv_canary_jitter_seed)
-                if server_args.kv_canary_jitter_seed is not None
-                else envs.SGLANG_KV_CANARY_JITTER_SEED.get()
-            ),
+            enabled=envs.SGLANG_KV_CANARY_JITTER_ENABLED.get(),
+            per_slot_fire_prob=envs.SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB.get(),
+            max_cycles=envs.SGLANG_KV_CANARY_JITTER_MAX_CYCLES.get(),
+            seed=envs.SGLANG_KV_CANARY_JITTER_SEED.get(),
         )
+        if jitter_config.enabled and mode_raw == "off":
+            raise ValueError(
+                "SGLANG_KV_CANARY_JITTER_ENABLED requires --kv-canary in {on, raise}"
+            )
 
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
