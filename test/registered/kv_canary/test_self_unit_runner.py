@@ -335,7 +335,8 @@ class TestComputeLaunchCapacities(CustomTestCase):
             max_bs=max_bs, max_seq_len=max_seq_len, max_total_num_tokens=ceiling
         )
         with self.assertRaisesRegex(
-            RuntimeError, "per-forward verify capacity .* exceeds the cuda-grid-safe ceiling"
+            RuntimeError,
+            "per-forward verify capacity .* exceeds the cuda-grid-safe ceiling",
         ):
             api_module._compute_launch_capacities(model_runner=model_runner)
 
