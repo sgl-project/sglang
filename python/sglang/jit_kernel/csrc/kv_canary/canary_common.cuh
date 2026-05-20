@@ -68,19 +68,19 @@ SGL_DEVICE void real_kv_load_uint4(
 
 // Fold one source's read_bytes into a uint64 hash, mode-dispatching.
 //
-// PARTIAL mode: pack the first min(read_bytes, 16) bytes little-endian into 8-byte words and
-// splitmix64-fold them (at most 2 words). When read_bytes <= 16, PARTIAL produces the same hash as ALL.
-// ALL mode: pack bytes little-endian into 8-byte words and splitmix64-fold them iteratively.
+// PARTIAL mode: pack exactly the first 16 bytes (one 16B chunk = two 8B little-endian words) and
+// splitmix64-fold them. ALL mode: pack every 16 bytes little-endian and splitmix64-fold iteratively.
 //
 // Loads run in 16B (uint4) chunks; the host-side __post_init__ guarantees read_bytes % 16 == 0 so no
-// tail-padding logic is needed inside the kernel. Output is byte-equal to the Python ref helper
-// _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
+// tail-padding logic is needed inside the kernel. With the 16B-aligned contract, read_bytes is always
+// >= 16 when non-zero, so PARTIAL collapses to a constant 16B prefix. Output is byte-equal to the
+// Python ref helper _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   if (src.read_bytes <= 0) {
     return 0ULL;
   }
   const int64_t effective_read_bytes =
-      (mode == RealKvHashMode::kPartial) ? (src.read_bytes < 16 ? src.read_bytes : 16) : src.read_bytes;
+      (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
   for (int64_t i = 0; i < effective_read_bytes; i += 16) {
     uint64_t word_lo;

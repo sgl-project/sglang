@@ -189,10 +189,11 @@ def _compute_real_kv_hash_scalar(
 ) -> int:
     """Compute one uint64 real-KV fingerprint for a single slot index.
 
-    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold first min(16, read_bytes) bytes
-    (little-endian word-pack, at most 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian
-    word (zero-padded). Each source's contribution is mixed into the running accumulator via
-    splitmix64(acc ^ source_hash). When read_bytes <= 16, PARTIAL and ALL produce identical hashes.
+    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold exactly the first 16 bytes
+    (little-endian word-pack, 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian word.
+    Each source's contribution is mixed into the running accumulator via splitmix64(acc ^ source_hash).
+    With the 16B-aligned contract, read_bytes is always >= 16 when non-zero, so PARTIAL collapses to a
+    constant 16B prefix.
     """
     mode = int(real_kv_hash_mode)
     if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
@@ -216,9 +217,7 @@ def _compute_real_kv_hash_scalar(
         col_start = col_within_page * num_bytes_per_token
 
         effective_read_bytes = (
-            min(16, read_bytes)
-            if mode == int(consts.RealKvHashMode.PARTIAL)
-            else read_bytes
+            16 if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
         )
         raw_bytes: list[int] = []
         for b in range(effective_read_bytes):
