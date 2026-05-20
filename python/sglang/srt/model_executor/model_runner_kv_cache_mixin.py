@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_nsa_index_head_dim,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -137,7 +137,7 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_nsa_model = is_deepseek_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
@@ -328,7 +328,7 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_nsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
@@ -389,7 +389,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -522,7 +522,7 @@ class ModelRunnerKVCacheMixin:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:

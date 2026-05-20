@@ -1618,7 +1618,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        use_nsa: bool = False,
+        use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
     ):
         super().__init__(
@@ -1634,13 +1634,13 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.use_nsa = use_nsa
+        self.use_dsa = use_dsa
         self.nsa_kv_cache_store_fp8 = (
-            use_nsa
+            use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
@@ -1655,8 +1655,8 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if not use_nsa:
-            # NSA will allocate indexer KV cache later and then log the total size
+        if not use_dsa:
+            # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
@@ -1746,7 +1746,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -2005,7 +2005,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            use_nsa=True,
+            use_dsa=True,
             override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn

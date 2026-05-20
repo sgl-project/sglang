@@ -1680,13 +1680,13 @@ class ServerArgs:
 
     def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
-            apply_hisparse_nsa_backend_defaults,
+            apply_hisparse_dsa_backend_defaults,
         )
 
         user_set_prefill = self.dsa_prefill_backend is not None
         user_set_decode = self.dsa_decode_backend is not None
 
-        if apply_hisparse_nsa_backend_defaults(
+        if apply_hisparse_dsa_backend_defaults(
             self, user_set_prefill, user_set_decode, kv_cache_dtype
         ):
             return
@@ -1727,7 +1727,7 @@ class ServerArgs:
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
-            is_deepseek_nsa,
+            is_deepseek_dsa,
         )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -1768,7 +1768,7 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
@@ -1781,10 +1781,10 @@ class ServerArgs:
                         )
                     else:
                         # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_nsa_index_topk
+                        from sglang.srt.configs.model_config import get_dsa_index_topk
 
                         envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            get_nsa_index_topk(hf_config)
+                            get_dsa_index_topk(hf_config)
                         )
                         logger.warning(
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."

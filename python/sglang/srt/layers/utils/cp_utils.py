@@ -67,16 +67,16 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     from sglang.srt.layers.attention.dsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
+        dsa_cp_round_robin_split_data,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
@@ -89,17 +89,17 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     from sglang.srt.layers.attention.dsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
+        dsa_cp_round_robin_split_data,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
@@ -239,10 +239,10 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     from sglang.srt.layers.attention.dsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -396,10 +396,10 @@ def prepare_context_parallel_metadata(
     seqs_len,
 ):
     from sglang.srt.layers.attention.dsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         return ContextParallelMetadata()
 
     """prepare_input_dp_with_cp_dsa-zigzag index
@@ -512,9 +512,9 @@ def prepare_context_parallel_metadata(
     # would silently drop it whenever the scheduler packs multiple requests
     # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back
     # to 0), corrupting the indexer's ke_offset on prefix-cache hits.
-    from sglang.srt.layers.attention.dsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
-    if is_nsa_enable_prefill_cp():
+    if is_dsa_enable_prefill_cp():
         kv_len_prev = prefix_sum_list[cp_rank]
         kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     else:

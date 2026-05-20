@@ -15,8 +15,8 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
-    is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_in_seq_split,
+    is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_in_seq_split,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -210,8 +210,8 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
             self.cp_rank = get_attn_context_model_parallel_rank()
         else:
@@ -380,7 +380,7 @@ class Indexer(MultiPlatformOp):
         elif (
             self.alt_stream is not None
             and forward_batch.attn_cp_metadata is not None
-            and self.nsa_enable_prefill_cp
+            and self.dsa_enable_prefill_cp
         ):
             key = rotate_activation(key)
             current_stream = torch.cuda.current_stream()
@@ -401,7 +401,7 @@ class Indexer(MultiPlatformOp):
             key = rotate_activation(key)
 
         # allgather+rerrange
-        if forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp:
+        if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
@@ -1203,7 +1203,7 @@ class Indexer(MultiPlatformOp):
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
             return maybe_capture_indexer_topk(
                 layer_id,
                 self._forward_cuda_k_only(
@@ -1334,7 +1334,7 @@ class Indexer(MultiPlatformOp):
             else:
                 if (
                     forward_batch.attn_cp_metadata is not None
-                    and is_nsa_prefill_cp_in_seq_split()
+                    and is_dsa_prefill_cp_in_seq_split()
                 ):
                     kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
                     kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
@@ -1546,7 +1546,7 @@ class Indexer(MultiPlatformOp):
 
         if (
             is_prefill
-            and self.nsa_enable_prefill_cp
+            and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
             k = cp_all_gather_rerange_output(
@@ -1561,7 +1561,7 @@ class Indexer(MultiPlatformOp):
         )
         if is_prefill:
             if (
-                self.nsa_enable_prefill_cp
+                self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
                 forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
@@ -1638,7 +1638,7 @@ class Indexer(MultiPlatformOp):
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
-            and self.nsa_enable_prefill_cp
+            and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
             block_table = block_table[: actual_seq_lengths_q[0].numel()]

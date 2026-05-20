@@ -38,9 +38,9 @@ def verify_single_backend_fused_metadata_copy(
     fused_cache_seqlens = metadata.cache_seqlens_int32.clone()
     fused_cu_seqlens_k = metadata.cu_seqlens_k.clone()
     fused_page_table_1 = metadata.page_table_1.clone()
-    fused_nsa_cache_seqlens = metadata.nsa_cache_seqlens_int32.clone()
-    fused_nsa_seqlens_expanded = metadata.nsa_seqlens_expanded.clone()
-    fused_nsa_cu_seqlens_k = metadata.nsa_cu_seqlens_k.clone()
+    fused_dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32.clone()
+    fused_dsa_seqlens_expanded = metadata.dsa_seqlens_expanded.clone()
+    fused_dsa_cu_seqlens_k = metadata.dsa_cu_seqlens_k.clone()
     fused_real_page_table = (
         metadata.real_page_table.clone()
         if precomputed.real_page_table is not None
@@ -56,9 +56,9 @@ def verify_single_backend_fused_metadata_copy(
     ref_cache_seqlens = torch.zeros_like(metadata.cache_seqlens_int32)
     ref_cu_seqlens_k = torch.zeros_like(metadata.cu_seqlens_k)
     ref_page_table_1 = torch.zeros_like(metadata.page_table_1)
-    ref_nsa_cache_seqlens = torch.zeros_like(metadata.nsa_cache_seqlens_int32)
-    ref_nsa_seqlens_expanded = torch.zeros_like(metadata.nsa_seqlens_expanded)
-    ref_nsa_cu_seqlens_k = torch.zeros_like(metadata.nsa_cu_seqlens_k)
+    ref_dsa_cache_seqlens = torch.zeros_like(metadata.dsa_cache_seqlens_int32)
+    ref_dsa_seqlens_expanded = torch.zeros_like(metadata.dsa_seqlens_expanded)
+    ref_dsa_cu_seqlens_k = torch.zeros_like(metadata.dsa_cu_seqlens_k)
     ref_real_page_table = (
         torch.zeros_like(metadata.real_page_table)
         if precomputed.real_page_table is not None
@@ -77,24 +77,24 @@ def verify_single_backend_fused_metadata_copy(
     if forward_mode.is_decode_or_idle():
         # Decode mode
         ref_page_table_1[:, : precomputed.max_len].copy_(precomputed.page_indices)
-        ref_nsa_cache_seqlens.copy_(precomputed.nsa_cache_seqlens)
+        ref_dsa_cache_seqlens.copy_(precomputed.dsa_cache_seqlens)
     elif forward_mode.is_target_verify():
         # Target verify mode
         ref_page_table_1[:, : precomputed.max_seqlen_k].copy_(precomputed.page_indices)
-        ref_nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
-        ref_nsa_cache_seqlens.copy_(precomputed.nsa_cache_seqlens)
+        ref_dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
+        ref_dsa_cache_seqlens.copy_(precomputed.dsa_cache_seqlens)
     elif forward_mode.is_draft_extend():
         # Draft extend mode
         rows = precomputed.page_indices.shape[0]
         cols = precomputed.max_seqlen_k
         ref_page_table_1[:rows, :cols].copy_(precomputed.page_indices)
         size = precomputed.seqlens_expanded_size
-        ref_nsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-        ref_nsa_cache_seqlens[:size].copy_(precomputed.nsa_cache_seqlens)
+        ref_dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
+        ref_dsa_cache_seqlens[:size].copy_(precomputed.dsa_cache_seqlens)
 
     # Copy NSA cu_seqlens
     size = precomputed.seqlens_expanded_size
-    ref_nsa_cu_seqlens_k[1 : 1 + size].copy_(precomputed.nsa_cu_seqlens_k[1 : 1 + size])
+    ref_dsa_cu_seqlens_k[1 : 1 + size].copy_(precomputed.dsa_cu_seqlens_k[1 : 1 + size])
 
     # Copy real page table
     if precomputed.real_page_table is not None:
@@ -150,36 +150,36 @@ def verify_single_backend_fused_metadata_copy(
             ref_page_table_1[:rows, :cols],
         )
 
-    # Compare nsa_cache_seqlens only for the region that was updated
+    # Compare dsa_cache_seqlens only for the region that was updated
     if forward_mode.is_decode_or_idle():
         check_tensor_equal(
-            "nsa_cache_seqlens",
-            fused_nsa_cache_seqlens,
-            ref_nsa_cache_seqlens,
+            "dsa_cache_seqlens",
+            fused_dsa_cache_seqlens,
+            ref_dsa_cache_seqlens,
         )
     else:  # TARGET_VERIFY or DRAFT_EXTEND
         size = precomputed.seqlens_expanded_size
         check_tensor_equal(
-            "nsa_cache_seqlens",
-            fused_nsa_cache_seqlens[:size],
-            ref_nsa_cache_seqlens[:size],
+            "dsa_cache_seqlens",
+            fused_dsa_cache_seqlens[:size],
+            ref_dsa_cache_seqlens[:size],
         )
 
-    # Compare nsa_seqlens_expanded only for TARGET_VERIFY and DRAFT_EXTEND
+    # Compare dsa_seqlens_expanded only for TARGET_VERIFY and DRAFT_EXTEND
     if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
         size = precomputed.seqlens_expanded_size
         check_tensor_equal(
-            "nsa_seqlens_expanded",
-            fused_nsa_seqlens_expanded[:size],
-            ref_nsa_seqlens_expanded[:size],
+            "dsa_seqlens_expanded",
+            fused_dsa_seqlens_expanded[:size],
+            ref_dsa_seqlens_expanded[:size],
         )
 
-    # Compare nsa_cu_seqlens_k only for the region that was updated
+    # Compare dsa_cu_seqlens_k only for the region that was updated
     size = precomputed.seqlens_expanded_size
     check_tensor_equal(
-        "nsa_cu_seqlens_k",
-        fused_nsa_cu_seqlens_k[: 1 + size],
-        ref_nsa_cu_seqlens_k[: 1 + size],
+        "dsa_cu_seqlens_k",
+        fused_dsa_cu_seqlens_k[: 1 + size],
+        ref_dsa_cu_seqlens_k[: 1 + size],
     )
 
     if precomputed.real_page_table is not None:
@@ -235,8 +235,8 @@ def verify_multi_backend_fused_metadata_copy(
         fused_cache_seqlens = metadata.cache_seqlens_int32.clone()
         fused_cu_seqlens_k = metadata.cu_seqlens_k.clone()
         fused_page_table_1 = metadata.page_table_1.clone()
-        fused_nsa_cache_seqlens = metadata.nsa_cache_seqlens_int32.clone()
-        fused_nsa_cu_seqlens_k = metadata.nsa_cu_seqlens_k.clone()
+        fused_dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32.clone()
+        fused_dsa_cu_seqlens_k = metadata.dsa_cu_seqlens_k.clone()
         fused_real_page_table = (
             metadata.real_page_table.clone()
             if precomputed.real_page_table is not None
@@ -255,8 +255,8 @@ def verify_multi_backend_fused_metadata_copy(
                 "cache_seqlens": fused_cache_seqlens,
                 "cu_seqlens_k": fused_cu_seqlens_k,
                 "page_table_1": fused_page_table_1,
-                "nsa_cache_seqlens": fused_nsa_cache_seqlens,
-                "nsa_cu_seqlens_k": fused_nsa_cu_seqlens_k,
+                "dsa_cache_seqlens": fused_dsa_cache_seqlens,
+                "dsa_cu_seqlens_k": fused_dsa_cu_seqlens_k,
                 "real_page_table": fused_real_page_table,
                 "flashmla_num_splits": fused_flashmla_num_splits,
                 "flashmla_metadata": fused_flashmla_metadata,
@@ -272,8 +272,8 @@ def verify_multi_backend_fused_metadata_copy(
         ref_cache_seqlens = torch.zeros_like(metadata.cache_seqlens_int32)
         ref_cu_seqlens_k = torch.zeros_like(metadata.cu_seqlens_k)
         ref_page_table_1 = torch.zeros_like(metadata.page_table_1)
-        ref_nsa_cache_seqlens = torch.zeros_like(metadata.nsa_cache_seqlens_int32)
-        ref_nsa_cu_seqlens_k = torch.zeros_like(metadata.nsa_cu_seqlens_k)
+        ref_dsa_cache_seqlens = torch.zeros_like(metadata.dsa_cache_seqlens_int32)
+        ref_dsa_cu_seqlens_k = torch.zeros_like(metadata.dsa_cu_seqlens_k)
         ref_real_page_table = (
             torch.zeros_like(metadata.real_page_table)
             if precomputed.real_page_table is not None
@@ -293,12 +293,12 @@ def verify_multi_backend_fused_metadata_copy(
         ref_cache_seqlens.copy_(precomputed.cache_seqlens)
         ref_cu_seqlens_k[1:].copy_(precomputed.cu_seqlens_k[1:])
         ref_page_table_1[:, : precomputed.max_len].copy_(precomputed.page_indices)
-        ref_nsa_cache_seqlens.copy_(precomputed.nsa_cache_seqlens)
+        ref_dsa_cache_seqlens.copy_(precomputed.dsa_cache_seqlens)
 
         # Copy NSA cu_seqlens
         size = precomputed.seqlens_expanded_size
-        ref_nsa_cu_seqlens_k[1 : 1 + size].copy_(
-            precomputed.nsa_cu_seqlens_k[1 : 1 + size]
+        ref_dsa_cu_seqlens_k[1 : 1 + size].copy_(
+            precomputed.dsa_cu_seqlens_k[1 : 1 + size]
         )
 
         # Copy real page table
@@ -318,8 +318,8 @@ def verify_multi_backend_fused_metadata_copy(
                 "cache_seqlens": ref_cache_seqlens,
                 "cu_seqlens_k": ref_cu_seqlens_k,
                 "page_table_1": ref_page_table_1,
-                "nsa_cache_seqlens": ref_nsa_cache_seqlens,
-                "nsa_cu_seqlens_k": ref_nsa_cu_seqlens_k,
+                "dsa_cache_seqlens": ref_dsa_cache_seqlens,
+                "dsa_cu_seqlens_k": ref_dsa_cu_seqlens_k,
                 "real_page_table": ref_real_page_table,
                 "flashmla_num_splits": ref_flashmla_num_splits,
                 "flashmla_metadata": ref_flashmla_metadata,
@@ -370,16 +370,16 @@ def verify_multi_backend_fused_metadata_copy(
         )
         check_tensor_equal(
             idx,
-            "nsa_cache_seqlens",
-            fused["nsa_cache_seqlens"],
-            ref["nsa_cache_seqlens"],
+            "dsa_cache_seqlens",
+            fused["dsa_cache_seqlens"],
+            ref["dsa_cache_seqlens"],
         )
-        # DECODE mode uses bs for nsa_cu_seqlens_k size
+        # DECODE mode uses bs for dsa_cu_seqlens_k size
         check_tensor_equal(
             idx,
-            "nsa_cu_seqlens_k",
-            fused["nsa_cu_seqlens_k"][: bs + 1],
-            ref["nsa_cu_seqlens_k"][: bs + 1],
+            "dsa_cu_seqlens_k",
+            fused["dsa_cu_seqlens_k"][: bs + 1],
+            ref["dsa_cu_seqlens_k"][: bs + 1],
         )
 
         if precomputed.real_page_table is not None:

@@ -20,7 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -932,7 +932,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if (
             is_prefill
-            and is_nsa_enable_prefill_cp()
+            and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(

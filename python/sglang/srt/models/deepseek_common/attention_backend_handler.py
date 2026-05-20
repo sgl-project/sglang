@@ -149,7 +149,7 @@ def handle_attention_aiter(attn, forward_batch):
 
 def handle_attention_dsa(attn, forward_batch):
     """
-    Dispatch logic is centralized in DeepseekSparseAttnBackend.set_nsa_prefill_impl and executed
+    Dispatch logic is centralized in DeepseekSparseAttnBackend.set_dsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
 

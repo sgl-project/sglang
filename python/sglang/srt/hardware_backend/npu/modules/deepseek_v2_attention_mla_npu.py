@@ -13,7 +13,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
-    nsa_use_prefill_cp,
+    dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 
@@ -45,7 +45,7 @@ def forward_mha_prepare_npu(
 
         # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
-        if m.use_nsa:
+        if m.use_dsa:
             q_lora = m.q_a_layernorm(q)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             _ = m.indexer(
@@ -206,7 +206,7 @@ def forward_mla_prepare_npu(
             k_nope = m.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if m.use_nsa:
+            if m.use_dsa:
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
@@ -226,7 +226,7 @@ def forward_mla_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -359,7 +359,7 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not nsa_use_prefill_cp(
+            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
                 forward_batch
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
@@ -398,7 +398,7 @@ def forward_dsa_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

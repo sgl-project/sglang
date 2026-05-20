@@ -58,42 +58,42 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
-    return original_seq_lens.clamp(max=nsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
+    return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def is_nsa_enable_prefill_cp():
+def is_dsa_enable_prefill_cp():
     return get_global_server_args().enable_dsa_prefill_context_parallel
 
 
-def is_nsa_prefill_cp_in_seq_split():
+def is_dsa_prefill_cp_in_seq_split():
     return (
-        is_nsa_enable_prefill_cp()
+        is_dsa_enable_prefill_cp()
         and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
-def is_nsa_prefill_cp_round_robin_split():
+def is_dsa_prefill_cp_round_robin_split():
     return (
-        is_nsa_enable_prefill_cp()
+        is_dsa_enable_prefill_cp()
         and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
-def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
+def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_attention_cp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return (
-        is_nsa_prefill_cp_round_robin_split()
+        is_dsa_prefill_cp_round_robin_split()
         and seq_len > 0
         and seq_len >= cp_size
         and cp_size > 1
     )
 
 
-def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
     |   +-----------before split------------+|
@@ -141,33 +141,33 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = global_num_tokens[get_attention_dp_rank()]
     else:
         tokens = global_num_tokens[0]
-    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+    if can_dsa_prefill_cp_round_robin_split(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
-def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     attn_cp_size = get_attention_cp_size()
-    needs_cp_pad = attn_cp_size > 1 and can_nsa_prefill_cp_round_robin_split(
+    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
         forward_batch
     )
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
-        return nsa_cache_seqlens
+        return dsa_cache_seqlens
     tokens = cal_padded_tokens(forward_batch)
-    pad_len = tokens - nsa_cache_seqlens.shape[0]
+    pad_len = tokens - dsa_cache_seqlens.shape[0]
     if pad_len > 0:
-        nsa_cache_seqlens = torch.cat(
+        dsa_cache_seqlens = torch.cat(
             [
-                nsa_cache_seqlens,
-                nsa_cache_seqlens.new_zeros(pad_len, *nsa_cache_seqlens.shape[1:]),
+                dsa_cache_seqlens,
+                dsa_cache_seqlens.new_zeros(pad_len, *dsa_cache_seqlens.shape[1:]),
             ]
         )
-    return nsa_cache_seqlens
+    return dsa_cache_seqlens
 
 
-def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
-    if is_nsa_prefill_cp_round_robin_split():
+def can_dsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+    if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
@@ -182,7 +182,7 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         and cp_size > 1
         and use_nsa
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
+        and is_dsa_enable_prefill_cp()
         and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
     ):
         return True
@@ -191,7 +191,7 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 @triton.jit
-def nsa_cp_round_robin_split_q_seqs_kernel(
+def dsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
@@ -212,7 +212,7 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
         extra_seq = cur_len - cur_seq * cp_size
 
 
-def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
     cp_size = get_attention_cp_size()
     cp_rank = get_attention_cp_rank()
     extra_seq = 0
@@ -227,7 +227,7 @@ def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
     return q_seqs, bs_idx
 
 
-def nsa_cp_round_robin_split_q_seqs(
+def dsa_cp_round_robin_split_q_seqs(
     extend_seqs_cpu, extend_seqs
 ) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
     """
@@ -242,7 +242,7 @@ def nsa_cp_round_robin_split_q_seqs(
     cp_size = get_attention_cp_size()
     cp_rank = get_attention_cp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
-    ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
     )
@@ -250,18 +250,18 @@ def nsa_cp_round_robin_split_q_seqs(
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
     )
     grid = (1,)
-    nsa_cp_round_robin_split_q_seqs_kernel[grid](
+    dsa_cp_round_robin_split_q_seqs_kernel[grid](
         extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
     )
     return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
 
-def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
-    if nsa_enable_prefill_cp is None:
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
+    if dsa_enable_prefill_cp is None:
+        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
     if (
         forward_batch.attn_cp_metadata is not None
-        and nsa_enable_prefill_cp
+        and dsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
         return True

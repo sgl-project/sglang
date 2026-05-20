@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.dsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -358,7 +358,7 @@ class Compressor(nn.Module):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
                 get_attention_cp_size(),

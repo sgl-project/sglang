@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -177,7 +177,7 @@ class DeepseekMLAForwardMixin:
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-                        if self.use_nsa:
+                        if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                                 q,
                                 self.q_a_layernorm.weight,
@@ -219,7 +219,7 @@ class DeepseekMLAForwardMixin:
                         k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if self.use_nsa:
+            if self.use_dsa:
                 if q_lora is None:
                     q_lora = q
 
@@ -372,11 +372,11 @@ class DeepseekMLAForwardMixin:
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

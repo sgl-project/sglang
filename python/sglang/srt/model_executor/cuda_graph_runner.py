@@ -43,7 +43,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -285,7 +285,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         seq_len_fill_value: int,
         require_gathered_buffer: bool,
         num_tokens_per_bs: int,
-        nsa_enable_prefill_cp: bool,
+        dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
@@ -354,7 +354,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
         if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not nsa_enable_prefill_cp:
+            if require_gathered_buffer and not dsa_enable_prefill_cp:
                 num_tokens_per_dp = bs * num_tokens_per_bs
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
@@ -588,7 +588,7 @@ class CudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -946,7 +946,7 @@ class CudaGraphRunner:
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
-            and not self.nsa_enable_prefill_cp
+            and not self.dsa_enable_prefill_cp
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
@@ -1211,7 +1211,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
+            dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )
