@@ -25,6 +25,8 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     assert_canary_buf_equal,
     assert_canary_state_equal,
     make_canary_buf,
+    make_canary_buf_pair,
+    make_log_pair,
     make_verify_plan,
     make_write_plan,
 )
@@ -34,19 +36,6 @@ register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 
 _DEVICE = torch.device("cuda")
-
-
-def _make_canary_pair(*, num_slots: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
-    cuda_buf = make_canary_buf(num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE)
-    ref_buf = cuda_buf.clone()
-    return cuda_buf, ref_buf
-
-
-def _make_log_pair() -> tuple[FakeViolationLog, FakeViolationLog]:
-    return (
-        FakeViolationLog.allocate(capacity=64, device=_DEVICE),
-        FakeViolationLog.allocate(capacity=64, device=_DEVICE),
-    )
 
 
 def _dummy_pseudo(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -138,9 +127,13 @@ def _run_write_both(
     torch.cuda.synchronize()
 
 
-def _build_verify_plan_5_entries(*, device: torch.device) -> tuple[VerifyPlan, VerifyPlan]:
+def _build_verify_plan_5_entries(
+    *, device: torch.device
+) -> tuple[VerifyPlan, VerifyPlan]:
     num_slots = 16
-    cuda_buf, ref_buf = _make_canary_pair(num_slots=num_slots)
+    cuda_buf, ref_buf = make_canary_buf_pair(
+        num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+    )
 
     plan_cuda = make_verify_plan(
         slot_indices=[0, 1, 2, 3, 4],
@@ -186,7 +179,13 @@ def _build_write_fixtures(
 def _build_plan_fixtures(
     *, device: torch.device, int64_req_to_token: bool = False
 ) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     bs = 3
     max_reqs = 4
@@ -290,7 +289,9 @@ def _assert_plan_equal(
 ) -> None:
     n_verify = int(triton_verify.verify_num_valid[0].item())
     n_verify_ref = int(ref_verify.verify_num_valid[0].item())
-    assert n_verify == n_verify_ref, f"verify_num_valid: triton={n_verify} ref={n_verify_ref}"
+    assert (
+        n_verify == n_verify_ref
+    ), f"verify_num_valid: triton={n_verify} ref={n_verify_ref}"
     if n_verify > 0:
         assert torch.equal(
             triton_verify.verify_slot_indices[:n_verify],
@@ -306,7 +307,9 @@ def _assert_plan_equal(
         )
     n_write = int(triton_write.write_num_valid_reqs[0].item())
     n_write_ref = int(ref_write.write_num_valid_reqs[0].item())
-    assert n_write == n_write_ref, f"write_num_valid_reqs: triton={n_write} ref={n_write_ref}"
+    assert (
+        n_write == n_write_ref
+    ), f"write_num_valid_reqs: triton={n_write} ref={n_write_ref}"
     assert torch.equal(
         triton_write.write_offsets[: n_write + 1],
         ref_write.write_offsets[: n_write + 1],
@@ -327,8 +330,10 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
     snapshot_bufs: list[torch.Tensor] = []
 
     for _ in range(num_launches):
-        cuda_buf, ref_buf = _make_canary_pair(num_slots=16)
-        cuda_log, ref_log = _make_log_pair()
+        cuda_buf, ref_buf = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        cuda_log, ref_log = make_log_pair(capacity=64, device=_DEVICE)
 
         _run_verify_both(
             cuda_buf=cuda_buf,
@@ -360,8 +365,8 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
 
 def test_write_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
-    plan_cuda, plan_ref, fb_input_ids, fb_positions, fb_out_cache_loc = _build_write_fixtures(
-        device=_DEVICE
+    plan_cuda, plan_ref, fb_input_ids, fb_positions, fb_out_cache_loc = (
+        _build_write_fixtures(device=_DEVICE)
     )
 
     snapshot_bufs: list[torch.Tensor] = []
@@ -369,8 +374,10 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
     snapshot_counters: list[torch.Tensor] = []
 
     for _ in range(num_launches):
-        cuda_buf, ref_buf = _make_canary_pair(num_slots=16)
-        cuda_log, ref_log = _make_log_pair()
+        cuda_buf, ref_buf = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        cuda_log, ref_log = make_log_pair(capacity=64, device=_DEVICE)
 
         _run_write_both(
             cuda_buf=cuda_buf,
@@ -487,9 +494,9 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
 
     torch.cuda.synchronize()
 
-    assert int(cuda_log.kernel_run_counter[0].item()) == num_launches, (
-        f"kernel_run_counter expected {num_launches}, got {cuda_log.kernel_run_counter[0].item()}"
-    )
+    assert (
+        int(cuda_log.kernel_run_counter[0].item()) == num_launches
+    ), f"kernel_run_counter expected {num_launches}, got {cuda_log.kernel_run_counter[0].item()}"
     assert int(cuda_log.slot_run_counter[0].item()) == num_launches, (
         f"slot_run_counter expected {num_launches} (1 active entry x 100 launches), "
         f"got {cuda_log.slot_run_counter[0].item()}"

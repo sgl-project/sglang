@@ -23,6 +23,7 @@ from sglang.jit_kernel.kv_canary.write import (
     canary_write_step,
 )
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
+from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -244,20 +245,6 @@ def _run_both_and_assert_pipeline_equal(
     )
 
 
-def _clone_real_kv_sources(
-    sources: tuple[RealKvSource, ...],
-) -> tuple[RealKvSource, ...]:
-    return tuple(
-        RealKvSource(
-            tensor=src.tensor.clone(),
-            page_size=src.page_size,
-            num_bytes_per_token=src.num_bytes_per_token,
-            read_bytes=src.read_bytes,
-        )
-        for src in sources
-    )
-
-
 def test_pipeline_basic_5_step_single_req() -> None:
     """Single req, prefix_len=0, extend_seq_len=5: basic plan→write→verify byte-equal."""
     max_seq_len = 16
@@ -420,7 +407,7 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: RealKvHashMode) -> None:
     )
 
     sources_real = make_real_kv_sources(count=2, num_slots=64, device=_DEVICE)
-    sources_ref = _clone_real_kv_sources(sources_real)
+    sources_ref = clone_real_kv_sources(sources_real)
 
     _run_both_and_assert_pipeline_equal(
         fb_req_pool_indices=fb_req_pool_indices,

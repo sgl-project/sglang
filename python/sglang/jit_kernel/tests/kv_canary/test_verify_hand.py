@@ -36,6 +36,7 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     assert_only_bits_set,
     chain_anchor_signed,
     make_canary_buf,
+    make_canary_buf_pair,
     make_real_kv_source,
     make_real_kv_sources,
     make_verify_plan,
@@ -65,11 +66,9 @@ def _setup_pair_with_canned_chain(
     The buffers start zero-filled; tests stamp chain state via ``write_slot_fields`` on both copies so the
     CUDA and ref paths see byte-equal input.
     """
-    cuda_buf = make_canary_buf(
+    return make_canary_buf_pair(
         num_slots=num_slots, slot_stride_bytes=slot_stride_bytes, device=_DEVICE
     )
-    ref_buf = cuda_buf.clone()
-    return cuda_buf, ref_buf
 
 
 def _stamp_chain(

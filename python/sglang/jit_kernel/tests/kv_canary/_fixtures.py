@@ -154,6 +154,20 @@ def make_real_kv_sources(
     return tuple(sources)
 
 
+def clone_real_kv_sources(
+    sources: tuple[RealKvSource, ...],
+) -> tuple[RealKvSource, ...]:
+    return tuple(
+        RealKvSource(
+            tensor=src.tensor.clone(),
+            page_size=src.page_size,
+            num_bytes_per_token=src.num_bytes_per_token,
+            read_bytes=src.read_bytes,
+        )
+        for src in sources
+    )
+
+
 PaddingKind = Literal["none", "trailing", "interleaved"]
 
 

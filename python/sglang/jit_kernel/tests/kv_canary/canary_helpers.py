@@ -36,6 +36,8 @@ __all__ = [
     "assert_only_bits_set",
     "chain_anchor_signed",
     "make_canary_buf",
+    "make_canary_buf_pair",
+    "make_log_pair",
     "make_real_kv_source",
     "make_real_kv_sources",
     "make_verify_plan",
@@ -93,6 +95,30 @@ def make_canary_buf(
 ) -> torch.Tensor:
     """Allocate a fresh canary buffer of the conventional uint8 [num_slots, slot_stride_bytes] shape."""
     return torch.zeros(num_slots, slot_stride_bytes, dtype=torch.uint8, device=device)
+
+
+def make_canary_buf_pair(
+    *,
+    num_slots: int = DEFAULT_NUM_SLOTS,
+    slot_stride_bytes: int = DEFAULT_SLOT_STRIDE_BYTES,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (cuda_buf, ref_buf) of byte-identical contents — both zero-filled."""
+    cuda_buf = make_canary_buf(
+        num_slots=num_slots, slot_stride_bytes=slot_stride_bytes, device=device
+    )
+    return cuda_buf, cuda_buf.clone()
+
+
+def make_log_pair(
+    *,
+    capacity: int = DEFAULT_RING_CAPACITY,
+    device: torch.device,
+) -> tuple[FakeViolationLog, FakeViolationLog]:
+    return (
+        FakeViolationLog.allocate(capacity=capacity, device=device),
+        FakeViolationLog.allocate(capacity=capacity, device=device),
+    )
 
 
 def make_verify_plan(
