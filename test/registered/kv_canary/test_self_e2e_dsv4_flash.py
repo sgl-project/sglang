@@ -46,8 +46,14 @@ _DSV4_BASE_ARGS: List[str] = [
     "4",
     "--mem-fraction-static",
     "0.6",
+    "--cuda-graph-max-bs",
+    "8",
     "--max-running-requests",
     "32",
+    "--context-length",
+    "2048",
+    "--max-total-tokens",
+    "16384",
 ]
 _PER_CASE_TIMEOUT = 300.0
 
