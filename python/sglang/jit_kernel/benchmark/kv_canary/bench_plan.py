@@ -55,13 +55,16 @@ def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
     return cases
 
 
-_X_NAMES_MATRIX = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
+_X_NAMES_MATRIX = ["scenario", "bs", "prefix_len", "mode", "extend_len", "pool_kind"]
 
 
 def _cases_to_matrix_x_vals(
     cases: list[BenchCase],
-) -> list[tuple[int, int, str, int, str]]:
-    return [(c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind) for c in cases]
+) -> list[tuple[str, int, int, str, int, str]]:
+    return [
+        (c.scenario, c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
+        for c in cases
+    ]
 
 
 _X_VALS_MATRIX = _cases_to_matrix_x_vals(
@@ -181,6 +184,7 @@ def _make_plan_callable(inputs: dict):
     )
 )
 def benchmark_matrix(
+    scenario: str,
     bs: int,
     prefix_len: int,
     mode: str,
@@ -188,6 +192,9 @@ def benchmark_matrix(
     pool_kind: str,
     provider: str,
 ) -> Tuple[float, float, float]:
+    del scenario
+    del mode
+
     device = torch.device(DEFAULT_DEVICE)
     if provider == "canary":
         inputs = _build_plan_inputs(
