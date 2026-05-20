@@ -15,8 +15,7 @@ namespace {
 constexpr size_t kBlockSize = 256;
 constexpr size_t kVectorizedMinElements = 1 << 20;
 constexpr size_t kVectorBytes = device::kMaxVecBytes;
-static_assert(
-    kVectorBytes % sizeof(int32_t) == 0, "Vector byte width must contain whole int32_t elements");
+static_assert(kVectorBytes % sizeof(int32_t) == 0, "Vector byte width must contain whole int32_t elements");
 constexpr size_t kElementsPerVector = kVectorBytes / sizeof(int32_t);
 
 template <typename Vector>
