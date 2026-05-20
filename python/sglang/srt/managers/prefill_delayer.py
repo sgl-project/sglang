@@ -59,13 +59,20 @@ class PrefillDelayer:
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        # Negotiation cadence: run the cross-rank all-gather every N steps;
+        # on the other N-1 steps short-circuit to a delay decision without
+        # touching the collective. All ranks must use the same N so they
+        # skip/run the gather in lockstep.
+        self._check_interval = max(1, int(server_args.prefill_delayer_check_interval))
+        self._step_counter = 0
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
-            f"queue_trigger_enabled={self._queue_trigger_enabled}"
+            f"queue_trigger_enabled={self._queue_trigger_enabled} "
+            f"check_interval={self._check_interval}"
         )
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
@@ -115,6 +122,17 @@ class PrefillDelayer:
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
     ) -> _NegotiateOutput:
+        is_check_step = self._step_counter % self._check_interval == 0
+        self._step_counter += 1
+
+        if not is_check_step:
+            # Skip the collective and default to delay. Keeps wait-time
+            # bookkeeping in self._curr_state so metrics and the next real
+            # check still see a consistent running delay window.
+            out = self._build_skipped_check_output(prev_state=self._curr_state)
+            self._curr_state = out.next_state
+            return out
+
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
@@ -126,6 +144,18 @@ class PrefillDelayer:
         )
         self._curr_state = out.next_state
         return out
+
+    @staticmethod
+    def _build_skipped_check_output(prev_state: Optional[_State]) -> _NegotiateOutput:
+        next_state = (prev_state or _State()).bump_delayed_count()
+        return _NegotiateOutput(
+            next_state=next_state,
+            input_estimation="skipped",
+            output_allow=False,
+            output_reason="skipped_check",
+            num_prefillable=0,
+            num_token_watermark_force_allow=0,
+        )
 
     # (Almost) pure function, do not modify self state
     def _negotiate_should_allow_prefill_pure(
@@ -373,6 +403,7 @@ def _record_single_pass_result(
                 "wait_success",
                 "no_wait",
                 "delay",
+                "skipped_check",
             }
 
     if metrics_collector is not None:
