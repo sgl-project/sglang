@@ -463,6 +463,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -848,6 +851,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
