@@ -22,10 +22,6 @@ from typing import Tuple
 
 import torch
 import triton
-
-if not hasattr(triton, "__version__"):
-    triton.__version__ = "custom-amd-build"
-
 import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
