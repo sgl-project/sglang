@@ -102,9 +102,6 @@ class FutureMap:
                 device=self.device,
             )
 
-    def alloc_future_indices(self, batch: ScheduleBatch) -> FutureIndices:
-        return FutureIndices(indices=batch.req_pool_indices)
-
     def resolve_future(self, batch: ScheduleBatch):
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)

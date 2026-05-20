@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -2834,7 +2835,7 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
-                    future_indices = self.future_map.alloc_future_indices(batch)
+                    future_indices = FutureIndices(indices=batch.req_pool_indices)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
