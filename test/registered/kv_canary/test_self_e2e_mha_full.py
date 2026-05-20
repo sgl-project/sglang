@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar, List
 
-from sglang.test.canary_e2e_base import CanaryE2EBase
+from sglang.test.kv_canary.utils import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")

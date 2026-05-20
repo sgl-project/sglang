@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from _fixtures import (  # noqa: E402
+from sglang.jit_kernel.kv_canary.verify import (
+    _MAX_REAL_KV_SOURCES,
+    CANARY_SLOT_BYTES,
+    RealKvSource,
+)
+from sglang.srt.kv_canary.buffer_group import PoolKind
+from sglang.srt.kv_canary.pool_patch.api import (
+    attach_canary_buffers,
+    get_canary_buffer_groups,
+)
+from sglang.srt.kv_canary.pool_patch.helpers import _make_row_source
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,
     make_base_config,
     make_dsv4_pool,
@@ -19,20 +25,7 @@ from _fixtures import (  # noqa: E402
     make_swa_pool,
     patch_fake_pool_helpers,
 )
-
-from sglang.jit_kernel.kv_canary.verify import (  # noqa: E402
-    _MAX_REAL_KV_SOURCES,
-    CANARY_SLOT_BYTES,
-    RealKvSource,
-)
-from sglang.srt.kv_canary.buffer_group import PoolKind  # noqa: E402
-from sglang.srt.kv_canary.pool_patch.api import (  # noqa: E402
-    attach_canary_buffers,
-    get_canary_buffer_groups,
-)
-from sglang.srt.kv_canary.pool_patch.helpers import _make_row_source  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 

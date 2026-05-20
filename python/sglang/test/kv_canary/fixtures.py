@@ -1,10 +1,8 @@
 """Shared helpers for canary srt-integration self-unit tests.
 
-This module replaces the previous pytest conftest.py. Tests in this directory
-use unittest + CustomTestCase; helpers here are plain module-level functions
-and classes, plus a patch_fake_pool_helpers() context manager that takes the
-place of the old autouse fixture. The underscore prefix keeps this module
-out of run_suite.py's test discovery.
+Helpers are plain module-level functions / dataclasses plus a
+patch_fake_pool_helpers() context manager that replaces the legacy autouse
+fixture. Importers use ``from sglang.test.kv_canary.fixtures import ...``.
 """
 
 from __future__ import annotations

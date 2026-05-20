@@ -1,41 +1,34 @@
 from __future__ import annotations
 
 import logging
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
 
 import torch
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from _fixtures import (  # noqa: E402
-    CPU_DEVICE,
-    make_radix_cache,
-    make_req_to_token_pool,
-)
-
-from sglang.jit_kernel.kv_canary.verify import (  # noqa: E402
+from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvHashMode,
 )
-from sglang.srt.kv_canary import endpoint as endpoint_module  # noqa: E402
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind  # noqa: E402
-from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode  # noqa: E402
-from sglang.srt.kv_canary.runner import canary_runner as runner_module  # noqa: E402
-from sglang.srt.kv_canary.runner import launch as launch_module  # noqa: E402
-from sglang.srt.kv_canary.runner.canary_runner import (  # noqa: E402
+from sglang.srt.kv_canary import endpoint as endpoint_module
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.runner import canary_runner as runner_module
+from sglang.srt.kv_canary.runner import launch as launch_module
+from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
 )
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
+    CPU_DEVICE,
+    make_radix_cache,
+    make_req_to_token_pool,
+)
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 

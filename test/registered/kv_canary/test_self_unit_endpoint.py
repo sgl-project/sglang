@@ -1,42 +1,35 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
 
 import torch
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from _fixtures import (  # noqa: E402
-    CPU_DEVICE,
-    make_base_config,
-    make_buffer_group,
-)
-
-from sglang.jit_kernel.kv_canary.verify import (  # noqa: E402
+from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvHashMode,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan  # noqa: E402
-from sglang.srt.kv_canary import endpoint as endpoint_module  # noqa: E402
-from sglang.srt.kv_canary.endpoint import (  # noqa: E402
+from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
+from sglang.srt.kv_canary import endpoint as endpoint_module
+from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.violation_state import (  # noqa: E402
+from sglang.srt.kv_canary.violation_state import (
     CanaryDeviceState,
     ViolationLog,
 )
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
+    CPU_DEVICE,
+    make_base_config,
+    make_buffer_group,
+)
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
 
