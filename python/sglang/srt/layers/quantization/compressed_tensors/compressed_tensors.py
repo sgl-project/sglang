@@ -495,14 +495,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
         input_quant_none = input_quant is None
-        is_symmetric = weight_quant.symmetric
         is_channel_group = (
             weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        # Both symmetric and asymmetric weight quant are handled by
+        # CompressedTensorsWNA16 via the Marlin kernel path; asymmetric
+        # checkpoints carry a weight zero-point.
+        return is_channel_group and input_quant_none and is_static
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -554,6 +556,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
                     actorder=weight_quant.actorder,
                 )
             else:
