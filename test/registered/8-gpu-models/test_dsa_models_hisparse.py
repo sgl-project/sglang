@@ -12,9 +12,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(
-    est_time=720, stage="stage-c", runner_config="8-gpu-h200", nightly=True
-)
+register_cuda_ci(est_time=720, stage="base-c", runner_config="8-gpu-h200", nightly=True)
 
 GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"
 
@@ -40,7 +38,7 @@ class TestGLM5DPHiSparse(CustomTestCase):
             "--disable-radix-cache",
             "--kv-cache-dtype",
             "bfloat16",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "flashmla_sparse",
             "--enable-hisparse",
             "--hisparse-config",
