@@ -22,8 +22,8 @@ def patch_buf_info_method(
     """Wrap ``pool.<method_name>()`` so its (ptrs, lens, item_lens) triple is spliced with K/V
     head and tail entries from ``group``.
 
-    Per Rule: PD layout is ``k0 k1 ... kN v0 v1 ... vN`` — head/tail sit at index 0 / N+1 within
-    EACH half, not at the absolute ends of the combined list.
+    PD layout is ``k0 k1 ... kN v0 v1 ... vN`` — head/tail sit at index 0 / N+1 within EACH half,
+    not at the absolute ends of the combined list.
     """
 
     def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:

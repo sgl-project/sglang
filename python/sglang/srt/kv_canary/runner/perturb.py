@@ -181,6 +181,7 @@ class PerturbHook:
             return []
         slot_tensor, _, _ = walk_radix_cache_for_canary(
             radix_cache=self._radix_cache,
+            unlocked_only=True,
         )
         if slot_tensor.numel() == 0:
             return []

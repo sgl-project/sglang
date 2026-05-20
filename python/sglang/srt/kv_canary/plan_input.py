@@ -44,14 +44,15 @@ class PlanInput:
     Allocated up front by CanaryRunner. ForwardBatch.positions has dtype-by-backend (cuda=int32,
     hip/npu=int64) — runner casts to int32 before passing to canary_write_step if needed.
 
-    **Static-buffer contract (cuda-graph correctness)**: the per-forward PlanInput's tensors are
-    allocated once during CanaryRunner.__init__ (sized for the worst-case per-forward batch).
-    The per-forward builder MUTATES those tensors in place each step via ``.copy_()`` /
-    ``.fill_()`` / index-assign on the default stream. The captured cuda-graph reads them by
-    address; therefore: (a) never reallocate, (b) all writes complete on the default stream
+    **Static-buffer contract (cuda-graph correctness, per-forward path only)**: the per-forward
+    PlanInput's tensors are allocated once during CanaryRunner.__init__ (sized for the worst-case
+    per-forward batch). The per-forward builder MUTATES those tensors in place each step via
+    ``.copy_()`` / ``.fill_()`` / index-assign on the default stream. The captured cuda-graph reads
+    them by address; therefore: (a) never reallocate, (b) all writes complete on the default stream
     before the captured region runs (i.e. the writes happen in ``CanaryRunner.before_forward``
     which the caller invokes in ``ModelRunner.forward`` BEFORE ``graph_runner.replay()`` or
-    ``model.forward()``).
+    ``model.forward()``). The radix-sweep path does NOT use static buffers — its builder allocates
+    a fresh PlanInput each sweep step (radix-sweep never runs inside a cuda-graph capture).
     """
 
     fb_req_pool_indices: torch.Tensor
@@ -148,7 +149,8 @@ def build_plan_input_radix_sweep(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
 ) -> PlanInput:
-    """Builder for the radix-sweep caller.
+    """Builder for the radix-sweep caller. Allocates a fresh PlanInput each sweep step (the
+    Static-buffer contract on the PlanInput class applies to the per-forward path only).
 
     - fb_req_pool_indices: empty (bs = 0); plan kernel skips the per-req path entirely.
     - fb_prefix_lens / fb_extend_seq_lens: empty.
@@ -197,6 +199,7 @@ def build_plan_input_radix_sweep(
 def walk_radix_cache_for_canary(
     *,
     radix_cache: "BasePrefixCache",
+    unlocked_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors for
     EVERY slot held by the radix cache (including slots whose tokens are also referenced by a
@@ -213,6 +216,12 @@ def walk_radix_cache_for_canary(
 
     Returns three host int32 tensors (then runner H2D-copies). NOT SWA-translated — caller does
     the LUT lookup before packing into PlanInput.
+
+    Args:
+        unlocked_only: When True, skip nodes whose ``lock_ref > 0`` (i.e. currently referenced by a
+            running req). Used by the perturb path which MUST NOT mutate slots actively in use.
+            Default False: sweep emits every radix-tree slot (overlap with per-forward HEAD/TAIL
+            coverage is harmless redundancy).
 
     Cost: O(total radix slots). Runs on host every sweep_interval; bounded by pool size.
     If profiling shows this is the sweep hot path, future work can move it to a Triton kernel —
@@ -236,6 +245,7 @@ def walk_radix_cache_for_canary(
         position_buf=position_buf,
         prev_slot_buf=prev_slot_buf,
         is_root=True,
+        unlocked_only=unlocked_only,
     )
 
     slot_tensor = torch.tensor(slot_buf, dtype=torch.int32)
@@ -253,13 +263,17 @@ def _walk_radix_subtree(
     position_buf: list[int],
     prev_slot_buf: list[int],
     is_root: bool,
+    unlocked_only: bool,
 ) -> None:
     if isinstance(node.value, torch.Tensor):
         node_slots = [int(s) for s in node.value.tolist()]
     else:
         node_slots = []
 
-    emit_slots = not is_root and node.lock_ref == 0
+    if unlocked_only:
+        emit_slots = not is_root and node.lock_ref == 0
+    else:
+        emit_slots = not is_root
 
     chain_last_slot = parent_last_slot
     for j, slot in enumerate(node_slots):
@@ -280,6 +294,7 @@ def _walk_radix_subtree(
             position_buf=position_buf,
             prev_slot_buf=prev_slot_buf,
             is_root=False,
+            unlocked_only=unlocked_only,
         )
 
 
