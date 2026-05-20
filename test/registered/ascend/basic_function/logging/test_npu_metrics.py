@@ -54,7 +54,8 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
             )
             testcase.assertTrue(
                 pattern.search(content),
-                f"Metric not found: sglang:{metric_suffix}{{le='{le}', model_name='{model}'}}",
+                f"Metric not found: sglang:{metric_suffix}{{le='{le}', model_name='{model}'}} in\n"
+                + content,
             )
 
     @staticmethod
