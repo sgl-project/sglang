@@ -157,10 +157,13 @@ diffusion_mps = [
 test = [
   "accelerate",
   "expecttest",
+  "human-eval",
   "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
+  "peft",
+  "polars",
   "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
