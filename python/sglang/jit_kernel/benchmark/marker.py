@@ -262,38 +262,50 @@ class Benchmark(Generic[F]):
             bandwidth_widths = [
                 get_width(f"{system}(GB/s)", 15) for system in self.line_vals
             ]
+
+        def _print(arg: str = "") -> None:
+            nonlocal counter
+            print(arg, end="")
+            counter += len(arg)
+
+        counter = 0
         # id, args... , system0, system1, ...
-        print(" " * id_width, end="")
+        _print(" " * id_width)
         for key, width in zip(benchmark_configs.keys(), args_widths):
-            print(f"{key:>{width}}", end="")
+            _print(f"{key:>{width}}")
+        _print(" | ")
         for system, width in zip(self.line_vals, system_widths):
             system_name = f"{system}({self.unit})"
-            print(f"{system_name:>{width}}", end="")
+            _print(f"{system_name:>{width}}")
         if should_log_bandwidth:
+            _print(" | ")
             for system, width in zip(self.line_vals, bandwidth_widths):
                 system_name = f"{system}(GB/s)"
-                print(f"{system_name:>{width}}", end="")
+                _print(f"{system_name:>{width}}")
         print()
+        print("-" * counter)
         for id, config in enumerate(itertools.product(*benchmark_configs.values())):
-            print(f"{id:<{id_width}}", end="")
+            _print(f"{id:<{id_width}}")
             for arg, width in zip(config, args_widths):
-                print(f"{str(arg):>{width}}", end="")
+                _print(f"{str(arg):>{width}}")
+            _print(" | ")
             for system_result, width in zip(results, system_widths):
-                print(f"{format_latency(system_result[id]):>{width}}", end="")
+                _print(f"{format_latency(system_result[id]):>{width}}")
+            _print(" | ")
             if should_log_bandwidth:
                 for bandwidth_result, width in zip(bandwidth_results, bandwidth_widths):
-                    print(f"{format_bandwidth(bandwidth_result[id]):>{width}}", end="")
+                    _print(f"{format_bandwidth(bandwidth_result[id]):>{width}}")
             print()
 
 
-def mark_benchmark(line_arg: str, line_vals: List[str], *, unit: str = "us"):
+def benchmark(line_arg: str, line_vals: List[str], *, unit: str = "us"):
     def decorator(fn: F) -> Benchmark[F]:
         return Benchmark(fn, line_arg, line_vals, unit=unit)
 
     return decorator
 
 
-def mark_args(name: str, vals: List[Any], ci_vals: Optional[List[Any]] = None):
+def parametrize(name: str, vals: List[Any], ci_vals: Optional[List[Any]] = None):
     def decorator(bench: Benchmark[F]) -> Benchmark[F]:
         if ci_vals is not None and is_in_ci():
             bench.benchmark_configs[name] = ci_vals

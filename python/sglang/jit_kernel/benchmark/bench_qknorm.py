@@ -53,11 +53,11 @@ FN_MAP = {
 }
 
 
-@marker.mark_args("head_dim", [128, 256, 512, 1024], [128])
-@marker.mark_args("GQA", [4, 8], [4])
-@marker.mark_args("num_kv_heads", [1, 2, 4, 8], [1])
-@marker.mark_args("batch_size", [2**n for n in range(0, 14)], [16])
-@marker.mark_benchmark("impl", ["aot", "jit", "torch"])
+@marker.parametrize("head_dim", [128, 256, 512, 1024], [128])
+@marker.parametrize("GQA", [4, 8], [4])
+@marker.parametrize("num_kv_heads", [1, 2, 4, 8], [1])
+@marker.parametrize("batch_size", [2**n for n in range(0, 14)], [16])
+@marker.benchmark("impl", ["aot", "jit", "torch"])
 def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl: str):
     num_qo_heads = GQA * num_kv_heads
     q = create_random(batch_size, num_qo_heads, head_dim)

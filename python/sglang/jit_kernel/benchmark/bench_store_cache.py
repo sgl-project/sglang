@@ -50,9 +50,9 @@ FN_MAP = {
 }
 
 
-@marker.mark_args("item_size", [64, 128, 256, 512, 1024], [1024])
-@marker.mark_args("batch_size", [2**n for n in range(0, 15)], [16])
-@marker.mark_benchmark("impl", ["jit", "torch_compile", "torch_streams"])
+@marker.parametrize("item_size", [64, 128, 256, 512, 1024], [1024])
+@marker.parametrize("batch_size", [2**n for n in range(0, 15)], [16])
+@marker.benchmark("impl", ["jit", "torch_compile", "torch_streams"])
 def benchmark(batch_size: int, item_size: int, impl: str):
     torch.manual_seed(42)
     k = create_random(batch_size, item_size)
