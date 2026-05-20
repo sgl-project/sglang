@@ -24,6 +24,13 @@ if TYPE_CHECKING:
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
+    return (
+        m.rotary_emb is not None
+        and getattr(m, "use_explicit_npu_interleaved_rope", False)
+    )
+
+
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -76,11 +83,16 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
-    if m.use_deepseek_yarn_rope:
+    if m.use_deepseek_yarn_rope or _use_explicit_npu_interleaved_rope(m):
         B, S = q.shape[0], 1
-        cos, sin = m.rotary_emb.get_cos_sin_cache(
-            positions, hidden_states.dtype, offsets=None
-        )
+        if m.use_deepseek_yarn_rope:
+            cos, sin = m.rotary_emb.get_cos_sin_cache(
+                positions, hidden_states.dtype, offsets=None
+            )
+        else:
+            cos, sin = m.rotary_emb.update_and_get_cos_sin_cache(
+                positions, m.layer_id, hidden_states.dtype, offsets=None
+            )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
             cos,
@@ -223,6 +235,11 @@ def forward_mla_prepare_npu(
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+
+        if _use_explicit_npu_interleaved_rope(m):
+            m.rotary_emb.update_and_get_cos_sin_cache(
+                positions, m.layer_id, hidden_states.dtype, offsets=None
+            )
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 

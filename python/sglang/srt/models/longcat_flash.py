@@ -32,7 +32,7 @@
 
 import concurrent.futures
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -42,14 +42,18 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
+    dp_scatter,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_dp_buffer,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -59,6 +63,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -120,6 +125,8 @@ elif _is_hip:
     from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
+elif _is_npu:
+    from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
 else:
     pass
 
@@ -265,29 +272,51 @@ class LongcatFlashMoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.router(hidden_states)
-        topk_weights, topk_idx, _ = self.topk(
-            hidden_states,
-            router_logits,
-        )
-        if self.zero_expert_type is not None:
-            zero_expert_result = zero_experts_compute_triton(
-                expert_indices=topk_idx,
-                expert_scales=topk_weights,
-                num_experts=self.num_experts,
-                zero_expert_type=self.zero_expert_type,
-                hidden_states=hidden_states,
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.router(hidden_states)
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
             )
-        topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+            if self.zero_expert_type is not None:
+                if not _is_npu:
+                    zero_expert_result = zero_experts_compute_triton(
+                        expert_indices=topk_idx,
+                        expert_scales=topk_weights,
+                        num_experts=self.num_experts,
+                        zero_expert_type=self.zero_expert_type,
+                        hidden_states=hidden_states,
+                    )
+                else:
+                    identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
+                    zero_expert_result = zero_experts_compute_identity_triton(
+                        expert_indices=topk_idx,
+                        expert_scales=topk_weights,
+                        num_experts=self.num_experts,
+                        zero_expert_type=self.zero_expert_type,
+                        hidden_states=hidden_states,
+                        identity_mask_value=identity_mask_value,
+                    )
+            topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
+        if (
+            self.tp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+            and self.zero_expert_type is not None
+            and hidden_states.shape[0] > 0
+        ):
+            zero_expert_result *= self.tp_size
+
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -311,13 +340,18 @@ class LongcatFlashDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
+        moe_alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.moe_alt_stream = moe_alt_stream
+        self.device_module = torch.get_device_module()
+        self.is_first_layer = layer_id == 0
+        self.is_last_layer = layer_id == config.num_hidden_layers - 1
         self.self_attn = nn.ModuleList(
             [
                 DeepseekV2AttentionMLA(
@@ -329,7 +363,12 @@ class LongcatFlashDecoderLayer(nn.Module):
                     v_head_dim=config.v_head_dim,
                     q_lora_rank=config.q_lora_rank,
                     kv_lora_rank=config.kv_lora_rank,
-                    rope_theta=config.rope_parameters["rope_theta"],
+                    rope_theta=(
+                        config.rope_parameters["rope_theta"]
+                        if hasattr(config, "rope_parameters")
+                        and config.rope_parameters is not None
+                        else config.rope_theta
+                    ),
                     rope_scaling=None,
                     max_position_embeddings=config.max_position_embeddings,
                     quant_config=(
@@ -345,6 +384,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 for i in range(2)
             ]
         )
+        if _is_npu:
+            for attn in self.self_attn:
+                attn.use_explicit_npu_interleaved_rope = True
+                attn.rotary_emb.use_explicit_npu_interleaved_rope = True
+                attn.rotary_emb.sync_explicit_npu_interleaved_cache()
 
         self.input_layernorm = nn.ModuleList(
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
@@ -379,6 +423,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_group = get_attention_tp_group()
 
         self.mlp_layer_scatter_modes = [
             LayerScatterModes.init_new(
@@ -425,6 +470,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         # first_attn
+        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+            residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -435,34 +482,100 @@ class LongcatFlashDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
             )
+        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+            mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
+        else:
+            mlp_residual = residual.clone()
+        mlp_hidden_states = hidden_states.clone()
 
-        # moe
-        hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        moe_hidden_states = hidden_states.clone()
-        moe_residual = residual.clone()
-        moe_hidden_states = self.mlp(moe_hidden_states)
-        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-            moe_hidden_states, moe_residual, forward_batch
-        )
-
-        hidden_states, residual = self.forward_mlp(
-            hidden_states, positions, residual, forward_batch, zero_allocator
+        enable_double_stream = (
+            self.moe_alt_stream is not None
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
-        hidden_states = moe_hidden_states + hidden_states
+        if enable_double_stream:
+            main_stream = self.device_module.current_stream()
+            first_attn_finished = self.device_module.Event()
+            fia_ffn_finished_event = self.device_module.Event()
+
+            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            first_attn_finished.record(main_stream)
+
+            moe_hidden_states = None
+            with self.device_module.stream(self.moe_alt_stream):
+                self.device_module.current_stream().wait_event(first_attn_finished)
+                moe_hidden_states = self.mlp(hidden_states)
+                self.device_module.current_stream().wait_event(fia_ffn_finished_event)
+                moe_hidden_states, moe_residual = (
+                    self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                )
+                moe_hidden_states.record_stream(main_stream)
+
+            mlp_hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states,
+                positions,
+                mlp_residual,
+                forward_batch,
+                zero_allocator,
+                fia_ffn_finished_event,
+            )
+            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
+
+            main_stream.wait_stream(self.moe_alt_stream)
+            hidden_states = moe_hidden_states + mlp_hidden_states
+        else:
+            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            moe_hidden_states = self.mlp(hidden_states)
+            moe_hidden_states, moe_residual = (
+                self.moe_layer_communicator.postprocess_layer(
+                    moe_hidden_states, moe_residual, forward_batch
+                )
+            )
+
+            hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
+            )
+            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
+
+            hidden_states = moe_hidden_states + hidden_states
         return hidden_states, residual
 
     def forward_mlp(
-        self, hidden_states, positions, residual, forward_batch, zero_allocator
+        self,
+        hidden_states,
+        positions,
+        residual,
+        forward_batch,
+        zero_allocator,
+        fia_ffn_finished_event=None,
     ):
         # first_mlp
+        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
         hidden_states = self.mlps[0](hidden_states)
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # second_attn
+        if is_dp_attention_enabled():
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -479,6 +592,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         hidden_states = self.mlps[1](hidden_states)
+        if fia_ffn_finished_event is not None:
+            self.device_module.current_stream().record_event(fia_ffn_finished_event)
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
@@ -518,7 +633,12 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = torch.cuda.Stream()
+        device_module = torch.get_device_module()
+        self.alt_stream = device_module.Stream()
+        if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+            self.moe_alt_stream = device_module.Stream()
+        else:
+            self.moe_alt_stream = None
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
@@ -527,6 +647,7 @@ class LongcatFlashModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    moe_alt_stream=self.moe_alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -764,9 +885,10 @@ class LongcatFlashForCausalLM(nn.Module):
                         self_attn.w_kc,
                         w_kc.transpose(1, 2).contiguous().transpose(1, 2),
                     )
-                    self_attn.w_vc = bind_or_assign(
-                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                    )
+                    w_vc = w_vc.contiguous().transpose(1, 2)
+                    if _is_npu:
+                        w_vc = w_vc.contiguous()
+                    self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                     if (
                         hasattr(self_attn.kv_b_proj, "weight_scale")
                         and self_attn.w_scale is None

@@ -1366,6 +1366,7 @@ class DeepseekV2AttentionMLA(
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.use_explicit_npu_interleaved_rope = False
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
