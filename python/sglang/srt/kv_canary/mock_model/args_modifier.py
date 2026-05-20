@@ -12,14 +12,14 @@ _MOCK_MODEL_DEFAULTS: Dict[str, Any] = {
     "load_format": "dummy",
     "sampling_backend": "oracle",
     "kv_canary": "raise",
-    "kv_canary_input_check_mode": "ON",
+    "kv_canary_input_check": True,
 }
 
 _DEFAULT_SENTINELS: Dict[str, Any] = {
     "load_format": "auto",
     "sampling_backend": None,
     "kv_canary": "off",
-    "kv_canary_input_check_mode": None,
+    "kv_canary_input_check": False,
 }
 
 
@@ -32,7 +32,7 @@ def apply_mock_model_defaults(server_args: "ServerArgs") -> "ServerArgs":
         - load_format = "dummy"            (no real weights loaded)
         - sampling_backend = "oracle"      (so install_oracle_sampler is the live backend)
         - kv_canary = "raise"        (mock_model without canary is mostly pointless)
-        - kv_canary_input_check_mode = "ON"  (turn on the input-id verification path)
+        - kv_canary_input_check = True  (turn on the input-id verification path)
 
     Additionally injects ``{"num_hidden_layers": 1}`` into ``json_model_override_args`` so the
     mock model loads with a single layer. A user-supplied ``num_hidden_layers`` is preserved.

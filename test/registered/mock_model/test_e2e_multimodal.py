@@ -23,7 +23,7 @@ def test_multimodal_no_canary_violation() -> None:
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
         kv_canary="raise",
-        kv_canary_input_check_mode="ON",
+        kv_canary_input_check=True,
     )
     try:
         engine.generate(

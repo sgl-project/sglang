@@ -21,7 +21,7 @@ def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
         mock_model_enabled=True,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
-        kv_canary_input_check_mode="ON",
+        kv_canary_input_check=True,
     )
     try:
         with pytest.raises(Exception):
@@ -41,7 +41,7 @@ def test_eagle_positions_match_with_fix() -> None:
         mock_model_enabled=True,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
-        kv_canary_input_check_mode="ON",
+        kv_canary_input_check=True,
     )
     try:
         engine.generate(

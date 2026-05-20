@@ -127,7 +127,7 @@ def test_apply_mock_model_defaults_fills_holes_when_enabled() -> None:
     assert json.loads(result.json_model_override_args).get("num_hidden_layers") == 1
     assert result.sampling_backend == "oracle"
     assert result.kv_canary == "raise"
-    assert result.kv_canary_input_check_mode == "ON"
+    assert result.kv_canary_input_check is True
 
 
 def test_apply_mock_model_defaults_preserves_user_overrides() -> None:

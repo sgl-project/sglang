@@ -680,7 +680,7 @@ class ServerArgs:
     kv_canary: str = "off"
     kv_canary_real_data: str = "off"
     kv_canary_sweep_interval: int = 0
-    kv_canary_input_check_mode: Optional[str] = None
+    kv_canary_input_check: bool = False
     kv_canary_jitter_enabled: bool = False
     kv_canary_jitter_per_slot_fire_prob: Optional[float] = None
     kv_canary_jitter_max_cycles: Optional[int] = None
@@ -6110,16 +6110,14 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--kv-canary-input-check-mode",
-            type=str,
-            default=ServerArgs.kv_canary_input_check_mode,
-            choices=[None, "off", "on"],
+            "--kv-canary-input-check",
+            action="store_true",
+            default=ServerArgs.kv_canary_input_check,
             help=(
                 "Enable comparison of forward_batch.input_ids/positions against "
                 "caller-supplied expected_input_tokens/positions inside the canary "
-                "write kernel. None (default) leaves the canary unaware of inputs; "
-                "'on' enables the comparison and requires an oracle (mock_model) "
-                "to populate the expected_* placeholders per forward."
+                "write kernel. Requires an oracle (mock_model) to populate the "
+                "expected_* placeholders per forward."
             ),
         )
         parser.add_argument(

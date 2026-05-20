@@ -92,18 +92,11 @@ class CanaryConfig:
                 f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
             )
 
-        input_check_cli = server_args.kv_canary_input_check_mode
-        if input_check_cli:
-            input_check_raw = input_check_cli.strip().upper()
-        else:
-            input_check_raw = (
-                envs.SGLANG_KV_CANARY_INPUT_CHECK_MODE.get().strip().upper()
-            )
-        if input_check_raw not in CanaryInputCheckMode.__members__:
-            raise ValueError(
-                f"kv-canary: kv_canary_input_check_mode must be one of "
-                f"{list(CanaryInputCheckMode.__members__)}, got {input_check_raw!r}"
-            )
+        input_check_mode = (
+            CanaryInputCheckMode.ON
+            if server_args.kv_canary_input_check
+            else CanaryInputCheckMode.OFF
+        )
 
         sweep_cli = int(server_args.kv_canary_sweep_interval or 0)
         if sweep_cli > 0:
@@ -139,7 +132,7 @@ class CanaryConfig:
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
-            input_check_mode=CanaryInputCheckMode[input_check_raw],
+            input_check_mode=input_check_mode,
             perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
             perturb_real_kv_prob=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get(),
             perturb_real_kv_require_orphan=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN.get(),
