@@ -5,12 +5,12 @@
 //! janitor.
 //!
 //! The cache-aware-zmq policy ([`super::cache_aware_zmq`]) needs to combine
-//! the M3 hash tree's overlap score with a per-worker load signal. The
-//! per-worker `Worker::active_requests` counter (from M2) tracks one axis —
-//! number of in-flight HTTP requests — and is already drop-safe through
+//! the hash tree's overlap score with a per-worker load signal. The
+//! per-worker `Worker::active_requests` counter tracks one axis — number of
+//! in-flight HTTP requests — and is already drop-safe through
 //! [`crate::workers::LoadGuard`].
 //!
-//! M4 adds two things on top of that:
+//! This module adds two things on top of that:
 //!
 //! 1. **Per-request bookkeeping** keyed on a `RequestId` so a background
 //!    janitor can sweep requests that outlive the configured
@@ -78,10 +78,10 @@ impl std::fmt::Display for RequestId {
 /// without each axis spamming through the other's counter.
 ///
 /// Production tracks **active requests** as the unit (count of in-flight
-/// requests pinning the worker), not raw token / block counts — until M5
-/// wires real prompt-token / completion-block accounting into the proxy
-/// path. The two axes will become meaningful once the proxy starts passing
-/// `prompt_tokens` and `output_blocks` through to `register`.
+/// requests pinning the worker), not raw token / block counts — until the
+/// proxy wires real prompt-token / completion-block accounting through to
+/// `register`. The two axes will become meaningful once the proxy starts
+/// passing `prompt_tokens` and `output_blocks` to it.
 #[derive(Debug, Default)]
 struct WorkerCounters {
     prefill_load: AtomicUsize,
@@ -241,16 +241,18 @@ impl ActiveLoadRegistry {
         );
     }
 
-    /// Default-config registry: monotonic system clock + 5-minute stale
+    /// Default-config registry: monotonic system clock + 10-minute stale
     /// timeout. Convenience constructor for production callers; tests use
-    /// [`Self::new`] with a `MockClock`.
+    /// [`Self::new`] with a `MockClock`. Mirrors
+    /// `default_stale_request_timeout_secs` in `config::types`.
     ///
-    /// 5 minutes is comfortable above 99p generation tail latency while
+    /// 10 minutes is comfortable above 99p generation tail latency
+    /// (including long-queue throughput-focused workloads) while
     /// bounding leak-induced load inflation.
     pub fn with_defaults() -> Arc<Self> {
         Self::new(
             Arc::new(SystemTimeClock) as Arc<dyn Clock>,
-            Duration::from_secs(5 * 60),
+            Duration::from_secs(10 * 60),
         )
     }
 

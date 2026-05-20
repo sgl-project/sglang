@@ -22,7 +22,7 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
-    /// return headers + body. Default 60 s. The circuit breaker
+    /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires; the chat handler's caller
     /// observes `ApiError::UpstreamTimeout`.
     #[serde(default = "default_proxy_request_timeout_secs")]
@@ -30,7 +30,7 @@ pub struct ProxyConfig {
 }
 
 fn default_proxy_request_timeout_secs() -> u64 {
-    60
+    300
 }
 
 impl Default for ProxyConfig {
@@ -45,19 +45,20 @@ impl Default for ProxyConfig {
 /// leaked or stalled request entry stays in the registry before the
 /// janitor reclaims it. Setting it short in tests lets
 /// `test_stale_request_expired_returns_504` fire the janitor within
-/// the test's wall-time budget; production defaults to 5 minutes,
-/// matching SMG.
+/// the test's wall-time budget; production defaults to 10 minutes,
+/// kept above `proxy.request_timeout_secs` so the proxy timeout is
+/// the one users hit first for normal slow upstreams.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ActiveLoadConfig {
     /// How long a request entry can live in the registry before the
     /// janitor fires its `cancel_token` and the chat handler returns
-    /// 504 `stale_request_expired`. Default 300 s.
+    /// 504 `stale_request_expired`. Default 600 s.
     #[serde(default = "default_stale_request_timeout_secs")]
     pub stale_request_timeout_secs: u64,
 }
 
 fn default_stale_request_timeout_secs() -> u64 {
-    300
+    600
 }
 
 impl Default for ActiveLoadConfig {
