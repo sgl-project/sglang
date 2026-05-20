@@ -53,10 +53,10 @@ class HashTopK(nn.Module):
         # DummyModelLoader only initializes floating tensors, so keep this int
         # lookup table valid until real checkpoints overwrite it.
         token_ids = torch.arange(
-            self.tid2eid.shape[0], dtype=torch.int64, device=self.tid2eid.device
+            self.tid2eid.shape[0], dtype=self.tid2eid.dtype, device=self.tid2eid.device
         ).unsqueeze(1)
         expert_offsets = torch.arange(
-            topk, dtype=torch.int64, device=self.tid2eid.device
+            topk, dtype=self.tid2eid.dtype, device=self.tid2eid.device
         ).unsqueeze(0)
         tid2eid = (token_ids + expert_offsets) % self.num_experts
         with torch.no_grad():
