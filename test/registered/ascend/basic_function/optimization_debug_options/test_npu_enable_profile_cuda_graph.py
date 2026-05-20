@@ -83,7 +83,7 @@ class TestEnableProfileCudaGraph(CustomTestCase):
         self.out_log_file.seek(0)
         content = self.out_log_file.read()
         self.assertTrue(len(content) > 0)
-        self.assertIn("profiler.py: Start parsing profiling data:", content)
+        self.assertIn("profiler.py: Start parsing profiling data in", content)
 
 
 if __name__ == "__main__":
