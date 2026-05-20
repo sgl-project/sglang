@@ -101,6 +101,47 @@ def _run_both(
     torch.cuda.synchronize()
 
 
+def _run_both_and_assert_buf_and_state_equal(
+    *,
+    cuda_canary_buf: torch.Tensor,
+    ref_canary_buf: torch.Tensor,
+    plan_cuda,
+    plan_ref,
+    fb_input_ids: torch.Tensor,
+    fb_positions: torch.Tensor,
+    fb_out_cache_loc: torch.Tensor,
+    pseudo_mode: CanaryPseudoMode,
+    pseudo_expected_tokens: torch.Tensor,
+    pseudo_expected_positions: torch.Tensor,
+    cuda_log: FakeViolationLog,
+    ref_log: FakeViolationLog,
+    real_kv_sources_cuda: tuple[RealKvSource, ...],
+    real_kv_sources_ref: tuple[RealKvSource, ...],
+    real_kv_hash_mode: RealKvHashMode,
+    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+) -> None:
+    _run_both(
+        cuda_canary_buf=cuda_canary_buf,
+        ref_canary_buf=ref_canary_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=pseudo_mode,
+        pseudo_expected_tokens=pseudo_expected_tokens,
+        pseudo_expected_positions=pseudo_expected_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_cuda,
+        real_kv_sources_ref=real_kv_sources_ref,
+        real_kv_hash_mode=real_kv_hash_mode,
+        kernel_kind=kernel_kind,
+    )
+    assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
 def _setup_pair() -> tuple[torch.Tensor, torch.Tensor]:
     cuda_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     return cuda_buf, cuda_buf.clone()
@@ -301,7 +342,7 @@ def test_chain_link_byte_equal_5_step() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_and_assert_buf_and_state_equal(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -318,9 +359,6 @@ def test_chain_link_byte_equal_5_step() -> None:
         real_kv_sources_ref=(),
         real_kv_hash_mode=RealKvHashMode.OFF,
     )
-
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_mock_mode_off_ignores_expected() -> None:
@@ -718,7 +756,7 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_and_assert_buf_and_state_equal(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -735,9 +773,6 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
         real_kv_sources_ref=sources_ref,
         real_kv_hash_mode=mode,
     )
-
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_real_kv_mode_bit_byte_equal() -> None:
@@ -776,7 +811,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_and_assert_buf_and_state_equal(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -793,9 +828,6 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         real_kv_sources_ref=sources_ref,
         real_kv_hash_mode=RealKvHashMode.ALL,
     )
-
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_real_kv_source_above_4_raises() -> None:
