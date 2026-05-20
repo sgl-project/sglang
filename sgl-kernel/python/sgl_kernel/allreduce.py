@@ -2,6 +2,23 @@ from typing import List, Optional, Tuple
 
 import torch
 
+
+def _is_rdna() -> bool:
+    """Return True if the current AMD GPU is an RDNA architecture (GFX10/11/12)."""
+    if torch.version.hip is None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        # RDNA3: gfx1100/gfx1101/gfx1102; RDNA4: gfx1200/gfx1201
+        return arch.startswith("gfx11") or arch.startswith("gfx12")
+    except Exception:
+        return False
+
+
+_HIP_IS_RDNA = _is_rdna()
+
 if torch.version.hip is not None:
     # ROCM custom allreduce
     def init_custom_ar(
@@ -61,36 +78,38 @@ if torch.version.hip is not None:
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return torch.ops.sgl_kernel.get_meta_buffer_ipc_handle.default(inp)
 
-    # ROCM quick allreduce
-    def init_custom_qr(
-        rank: int, world_size: int, qr_max_size: Optional[int] = None
-    ) -> int:
-        return torch.ops.sgl_kernel.init_custom_qr.default(
-            world_size, rank, qr_max_size
-        )
+    # ROCM quick allreduce — CDNA only (not available on RDNA)
+    if not _HIP_IS_RDNA:
 
-    def qr_get_handle(fa: int) -> torch.Tensor:
-        return torch.ops.sgl_kernel.qr_get_handle.default(fa)
+        def init_custom_qr(
+            rank: int, world_size: int, qr_max_size: Optional[int] = None
+        ) -> int:
+            return torch.ops.sgl_kernel.init_custom_qr.default(
+                rank, world_size, qr_max_size
+            )
 
-    def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None:
-        torch.ops.sgl_kernel.qr_open_handles.default(fa, handles)
+        def qr_get_handle(fa: int) -> torch.Tensor:
+            return torch.ops.sgl_kernel.qr_get_handle.default(fa)
 
-    def qr_all_reduce(
-        fa: int,
-        profile: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        cast_bf162half: bool,
-    ) -> None:
-        torch.ops.sgl_kernel.qr_all_reduce.default(
-            fa, profile, inp, out, cast_bf162half
-        )
+        def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None:
+            torch.ops.sgl_kernel.qr_open_handles.default(fa, handles)
 
-    def qr_destroy(fa: int) -> None:
-        torch.ops.sgl_kernel.qr_destroy.default(fa)
+        def qr_all_reduce(
+            fa: int,
+            inp: torch.Tensor,
+            out: torch.Tensor,
+            quant_level: int,
+            cast_bf2half: bool = False,
+        ) -> None:
+            torch.ops.sgl_kernel.qr_all_reduce.default(
+                fa, inp, out, quant_level, cast_bf2half
+            )
 
-    def qr_max_size() -> int:
-        return torch.ops.sgl_kernel.qr_max_size.default()
+        def qr_destroy(fa: int) -> None:
+            torch.ops.sgl_kernel.qr_destroy.default(fa)
+
+        def qr_max_size() -> int:
+            return torch.ops.sgl_kernel.qr_max_size.default()
 
     # mscclpp
     def mscclpp_generate_unique_id() -> bytes:

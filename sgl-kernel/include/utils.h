@@ -342,7 +342,14 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+// ROCm: host code used to always see WARP_SIZE 64 via !__HIP_DEVICE_COMPILE__, while RDNA
+// device code used 32 — breaking host-side grid/block math in MoE topk launchers.
+#ifdef SGL_ROCM_WARP_SIZE
+#define WARP_SIZE SGL_ROCM_WARP_SIZE
+#elif defined(__gfx942__) || defined(__gfx941__) || defined(__gfx940__) || defined(__gfx950__) || \
+    defined(__gfx90a__) || defined(__gfx908__) || defined(__gfx906__)
+#define WARP_SIZE 64
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX9__)
 #define WARP_SIZE 64
 #else
 #define WARP_SIZE 32
@@ -384,7 +391,9 @@ constexpr auto FP8_E4M3_MAX = 224.0f;
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
-#error "fp8 is not supported in this processor (arch < gfx942)."
+#ifdef ENABLE_FP8
+#error "FP8 is not supported on this AMD GPU. Enable FP8 only for gfx942+ (CDNA3) or RDNA4 (gfx1200+)."
+#endif  // ENABLE_FP8
 #endif  // HIP_FP8_TYPE_E4M3
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM

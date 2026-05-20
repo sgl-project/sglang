@@ -70,13 +70,15 @@ void register_graph_buffers(
     fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
-// quick allreduce
+// quick allreduce — CDNA only (MUBUF instructions not available on RDNA)
+#ifndef SGL_IS_RDNA
 fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
 void qr_destroy(fptr_t _fa);
 torch::Tensor qr_get_handle(fptr_t _fa);
 void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
+#endif  // !SGL_IS_RDNA
 #else
 // custom allreduce
 fptr_t
