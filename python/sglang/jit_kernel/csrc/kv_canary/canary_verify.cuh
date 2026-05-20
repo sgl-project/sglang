@@ -33,11 +33,8 @@ struct VerifyKernelParams {
   const int32_t* verify_num_valid;
   int32_t verify_capacity;
 
-  // Violation sink.
-  int64_t* violation_ring;
-  int32_t* violation_write_index;
-  int32_t ring_capacity;
-  int32_t kernel_kind;
+  // Violation sink (ring + write_index + capacity + kernel_kind bundled in canary_common.cuh).
+  ViolationSink violation_sink;
 
   // Health counters.
   int64_t* slot_run_counter;
@@ -132,17 +129,16 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     // torch reference). The "stored_chain_hash" column carries the slot's stored prev_hash; the
     // "expected_aux" column carries the recomputed expected chain hash.
     record_violation(
-        p.violation_ring,
-        p.violation_write_index,
-        p.ring_capacity,
-        p.kernel_kind,
-        slot_idx,
-        stored_position,
-        stored_token,
-        /* expected_token = */ 0,
-        stored_chain_hash,
-        /* expected_aux = */ expected_chain_hash,
-        static_cast<int64_t>(fail_reason_bits));
+        p.violation_sink,
+        ViolationRow{
+            /* slot_idx = */ slot_idx,
+            /* position = */ stored_position,
+            /* stored_token = */ stored_token,
+            /* expected_token = */ 0,
+            /* stored_chain_hash = */ stored_chain_hash,
+            /* expected_aux = */ expected_chain_hash,
+            /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),
+        });
   }
 }
 
@@ -262,10 +258,10 @@ inline void canary_verify_step_cuda(
   p.verify_prev_slot_indices = static_cast<const int32_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
   p.verify_capacity = verify_capacity;
-  p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());
-  p.violation_write_index = static_cast<int32_t*>(violation_write_index.data_ptr());
-  p.ring_capacity = ring_capacity;
-  p.kernel_kind = static_cast<int32_t>(kernel_kind);
+  p.violation_sink.ring = static_cast<int64_t*>(violation_ring.data_ptr());
+  p.violation_sink.write_index = static_cast<int32_t*>(violation_write_index.data_ptr());
+  p.violation_sink.ring_capacity = ring_capacity;
+  p.violation_sink.kernel_kind = static_cast<int32_t>(kernel_kind);
   p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
 
