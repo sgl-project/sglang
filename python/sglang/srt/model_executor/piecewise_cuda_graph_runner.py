@@ -595,9 +595,7 @@ class PiecewiseCudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+            self.model_runner.maybe_invalidate_swa_loc_cache()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None

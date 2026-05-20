@@ -181,15 +181,13 @@ class SWAKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
-        # Key on (data_ptr, numel): views of the same parent at the same offset
-        # (e.g. out_cache_loc[:real_n] created each layer) hit the same entry.
-        # data_ptr() distinguishes views at different offsets within a storage,
-        # unlike untyped_storage().data_ptr() which is the same for all views.
+        # Key on (storage_ptr, numel): views of the same parent share storage, so
+        # out_cache_loc[:real_n] from different layers all hit the same entry.
         # invalidate_loc_cache() is called at the start of every forward pass to
-        # prevent stale results when a new batch reuses the same tensor object.
+        # prevent stale results when a new batch allocates the same storage block.
         # Note: kv_indices could have -1 values (from alloc_extend), which will
         # be mapped to -1 since the last item of full_to_swa_index_mapping is -1.
-        key = (kv_indices.data_ptr(), kv_indices.numel())
+        key = (kv_indices.untyped_storage().data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
@@ -210,7 +208,7 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            # translate_loc_from_full_to_swa() is memoised on (data_ptr, numel):
+            # translate_loc_from_full_to_swa() is memoised on loc.data_ptr():
             # O(1) for all but the first SWA layer per batch.
             loc = self.translate_loc_from_full_to_swa(loc)
             self.swa_kv_pool.set_kv_buffer(
@@ -523,13 +521,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         """Allocate full KV for the whole extend and SWA KV only for the tail.
 
         This is used by disaggregated decode preallocation: decode receives full
         prompt KV for full-attention layers, but only the sliding-window state is
         transferred for SWA layers.
         """
+        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1

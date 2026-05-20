@@ -776,7 +776,7 @@ class CudaGraphRunner:
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -1062,14 +1062,10 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Invalidate SWA loc translation cache so every model invocation
-            # (warmup 1, warmup 2, and capture run) starts clean. Without this,
-            # warmup 1 would cache the translation and the capture run would get a
-            # cache hit — no gather is recorded in the graph, and replay would
-            # reuse stale warmup-1 translations, silently writing KV to wrong
-            # SWA locations.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+            # Invalidate SWA loc cache before every invocation (warmup 1, warmup 2,
+            # and capture) so capture always records a fresh gather, not a cache hit
+            # from warmup 1 that would replay with stale translations.
+            self.model_runner.maybe_invalidate_swa_loc_cache()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None

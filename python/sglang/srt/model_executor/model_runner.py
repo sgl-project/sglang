@@ -438,7 +438,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eagle_aux_hidden_state_layer_ids = eagle_config[
                     "eagle_aux_hidden_state_layer_ids"
                 ]
-            except Exception:
+            except:
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
@@ -908,7 +908,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError:
+        except ImportError as e:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
             )
@@ -1048,7 +1048,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     from mooncake import ep as mooncake_ep
 
                     mooncake_ep.set_device_filter(mooncake_ib_device)
-                except Exception:
+                except:
                     pass  # A warning will be raised in `init_distributed_environment`
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1876,7 +1876,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
-            return True, "Succeeded to update parameter online."
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -2191,10 +2191,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
                 logger.warning(
-                    "--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
         else:
@@ -3189,6 +3189,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
+    def maybe_invalidate_swa_loc_cache(self) -> None:
+        """Invalidate the SWA loc translation cache before each forward/graph entry.
+
+        Must be called once per forward pass so translate_loc_from_full_to_swa
+        recomputes on the first SWA layer rather than returning a stale result from
+        the previous batch (allocator address reuse, CUDA graph warmup, etc.).
+        """
+        if self.is_hybrid_swa:
+            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                self.token_to_kv_pool.invalidate_loc_cache()
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3244,11 +3257,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
-        # Invalidate SWA loc translation cache so the first translate call in this
-        # forward computes fresh results. Called here once per batch to close the
-        # allocator-address-reuse window between batches.
-        if self.is_hybrid_swa:
-            self.token_to_kv_pool.invalidate_loc_cache()
+        # Invalidate SWA loc translation cache before any translate call in this
+        # forward; closes the allocator-address-reuse window between batches.
+        self.maybe_invalidate_swa_loc_cache()
 
         # Hisparse coordinator
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
