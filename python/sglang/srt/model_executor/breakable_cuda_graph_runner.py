@@ -23,6 +23,7 @@ breaks are inserted eagerly via :func:`eager_on_graph` decorated callables
 from __future__ import annotations
 
 import bisect
+import inspect
 import logging
 from typing import TYPE_CHECKING, Union
 
@@ -143,14 +144,13 @@ class BreakableCudaGraphRunner:
             return
         self.use_input_embeds = self.is_multimodal
         if self.use_input_embeds:
-            import inspect
-
             sig = inspect.signature(self.layer_model.forward)
             params = list(sig.parameters)
-            assert "input_embeds" in params, (
-                f"layer_model.forward must accept 'input_embeds' for "
-                f"multimodal BCG, got params: {params}"
-            )
+            if "input_embeds" not in params:
+                raise ValueError(
+                    f"layer_model.forward must accept 'input_embeds' for "
+                    f"multimodal BCG, got params: {params}"
+                )
             self._input_embeds_arg_idx = params.index("input_embeds")
 
         # Memory pool
@@ -414,13 +414,11 @@ class BreakableCudaGraphRunner:
         return graph, output
 
     def replay_prepare(self, forward_batch, **kwargs):
+        # TODO: fix PiecewiseCudaGraphRunner to support draft workers as well.
         static_forward_batch = PiecewiseCudaGraphRunner.replay_prepare(
             self, forward_batch, **kwargs
         )
-        if (
-            self.model_runner.is_draft_worker
-            and forward_batch.spec_info is not None
-        ):
+        if self.model_runner.is_draft_worker and forward_batch.spec_info is not None:
             num_tokens = len(forward_batch.input_ids)
             self.static_draft_hidden_states[:num_tokens].copy_(
                 forward_batch.spec_info.hidden_states
@@ -439,24 +437,27 @@ class BreakableCudaGraphRunner:
         captured_graph = self.graphs[static_num_tokens]
         captured_hidden = self.output_buffers[static_num_tokens]
 
+        # Closure replaces layer_model.forward for the duration of the outer
+        # model.forward call. Replays the captured CUDAGraph and hands the
+        # outer forward the captured hidden_states; logits_processor / pooler
+        # then runs eagerly on top with the live multi-req forward_batch.
         def replay_layer_forward(*args, **layer_kwargs):
             ie = layer_kwargs.get("input_embeds") or (
                 args[self._input_embeds_arg_idx]
-                if self.use_input_embeds
-                and len(args) > self._input_embeds_arg_idx
+                if self.use_input_embeds and len(args) > self._input_embeds_arg_idx
                 else None
             )
             if self.use_input_embeds:
-                assert ie is not None, (
-                    "BCG replay expects input_embeds but got None"
-                )
+                if ie is None:
+                    raise ValueError("BCG replay expects input_embeds but got None")
                 self.buffers.input_embeds[:static_num_tokens].copy_(
                     ie[:static_num_tokens]
                 )
             else:
-                assert ie is None, (
-                    "BCG replay got unexpected input_embeds on non-multimodal model"
-                )
+                if ie is not None:
+                    raise ValueError(
+                        "BCG replay got unexpected input_embeds on non-multimodal model"
+                    )
             captured_graph.replay()
             return captured_hidden
 
