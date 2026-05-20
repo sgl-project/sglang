@@ -54,6 +54,7 @@ def canary_verify_step_torch_reference(
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: RealKvHashMode,
+    pad_sentinel_slot: int = -1,
 ) -> None:
     """Torch reference for :func:`canary_verify_step`. Same signature & byte-equal semantics.
 
@@ -80,6 +81,22 @@ def canary_verify_step_torch_reference(
     prev_slot_indices = plan.verify_prev_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
+
+    # slot_run_counter is bumped from the pre-skip active count (kernel computes it from is_active_entry,
+    # which is fixed by tid < verify_num_valid before the pad-sentinel branch fires).
+    slot_run_counter.add_(active)
+
+    # Mirror the CUDA kernel's pad-sentinel skip: drop entries pointing at the reserved padding slot before
+    # any canary_buf indexing so unfilled req_to_token positions (zero-init reads as slot 0 in sglang's pool)
+    # do not produce spurious chain_hash/position violations.
+    if pad_sentinel_slot >= 0:
+        keep_mask = slot_indices != pad_sentinel_slot
+        slot_indices = slot_indices[keep_mask]
+        expected_positions = expected_positions[keep_mask]
+        prev_slot_indices = prev_slot_indices[keep_mask]
+        active = int(slot_indices.shape[0])
+        if active <= 0:
+            return
 
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
     slot_stride_i64 = (
@@ -142,8 +159,6 @@ def canary_verify_step_torch_reference(
         torch.full_like(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH),
         torch.zeros_like(fail_bits),
     )
-
-    slot_run_counter.add_(active)
 
     violation_mask = fail_bits != 0
     num_new_violations = int(violation_mask.sum().item())

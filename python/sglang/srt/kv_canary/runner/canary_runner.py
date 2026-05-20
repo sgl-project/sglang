@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# sglang's KV pool reserves slot 0 as the padded-output sink (memory_pool.py: free_slots starts at 1) and
+# zero-initializes req_to_token. Unfilled positions therefore read as slot 0; treating it as a verify
+# sentinel keeps canary launches from producing spurious chain_hash/position violations on those entries.
+_PAD_SENTINEL_SLOT: int = 0
+
 
 class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives until
@@ -302,6 +307,7 @@ class CanaryRunner:
                     verify_plan=verify_plan,
                     violation_log=violation_log,
                     real_kv_hash_mode=self.config.real_kv_hash_mode,
+                    pad_sentinel_slot=_PAD_SENTINEL_SLOT,
                 )
                 continue
             assert forward_batch is not None and positions is not None
@@ -323,4 +329,5 @@ class CanaryRunner:
                 expected_input_positions=expected_positions_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self.config.real_kv_hash_mode,
+                pad_sentinel_slot=_PAD_SENTINEL_SLOT,
             )
