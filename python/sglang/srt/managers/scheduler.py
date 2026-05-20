@@ -42,6 +42,8 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.dumper import dumper
+from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -508,8 +510,6 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         if envs.SGLANG_DEBUG_REVERT_PR.get() == "25015":
-            from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
-
             revert_pr_fix(25015)
 
         self.is_initializing = False
@@ -3850,8 +3850,6 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
-        from sglang.srt.debug_utils.dumper import dumper
-
         try:
             response: list = []
             if (
