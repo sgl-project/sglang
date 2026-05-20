@@ -134,7 +134,9 @@ def install_oracle_sampler(*, oracle: Oracle) -> OracleSamplerHook:
     sampler-backend mechanism. Calling twice replaces the previously registered hook.
     """
     hook = OracleSamplerHook(oracle=oracle)
-    register_sampler_backend(_ORACLE_BACKEND_NAME, lambda: _OracleSampler(hook=hook))
+    register_sampler_backend(
+        _ORACLE_BACKEND_NAME, lambda: _OracleSampler(oracle_sampler_hook=hook)
+    )
     return hook
 
 
@@ -175,9 +177,9 @@ class _OracleSampler(Sampler):
     before_forward.
     """
 
-    def __init__(self, *, hook: OracleSamplerHook) -> None:
+    def __init__(self, *, oracle_sampler_hook: OracleSamplerHook) -> None:
         super().__init__()
-        self._hook = hook
+        self._oracle_sampler_hook = oracle_sampler_hook
 
     def forward(
         self,
@@ -188,7 +190,7 @@ class _OracleSampler(Sampler):
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        batch_next_token_ids = self._hook.sample(
+        batch_next_token_ids = self._oracle_sampler_hook.sample(
             logits=logits_output.next_token_logits,
             positions=positions,
         )

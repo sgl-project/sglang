@@ -26,21 +26,21 @@ class HealthAndStats:
         device: torch.device,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        pump: PumpAndAllreduce,
-        sweep: SweepOrchestrator,
+        pump_and_allreduce: PumpAndAllreduce,
+        sweep_orchestrator: SweepOrchestrator,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
-        self._pump = pump
-        self._sweep = sweep
+        self._pump_and_allreduce = pump_and_allreduce
+        self._sweep_orchestrator = sweep_orchestrator
         self._d2h: CanaryD2HPipeline = CanaryD2HPipeline(device=device)
         self._previous_health_event: Optional[torch.cuda.Event] = None
         self._previous_stats_write_index_event: Optional[torch.cuda.Event] = None
         self._previous_stats_slot_sum_event: Optional[torch.cuda.Event] = None
 
     def health_check_step(self) -> None:
-        step_counter = self._pump.step_counter
+        step_counter = self._pump_and_allreduce.step_counter
         if step_counter < _HEALTH_CHECK_WARMUP_STEPS:
             return
         if step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
@@ -71,7 +71,7 @@ class HealthAndStats:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
             return
-        step_counter = self._pump.step_counter
+        step_counter = self._pump_and_allreduce.step_counter
         if step_counter == 0 or step_counter % period != 0:
             return
 
@@ -90,7 +90,7 @@ class HealthAndStats:
                 "launch_tags_active=%d/%d",
                 step_counter,
                 protected,
-                self._sweep.sweep_passes,
+                self._sweep_orchestrator.sweep_passes,
                 violations,
                 active,
                 len(CanaryLaunchTag),

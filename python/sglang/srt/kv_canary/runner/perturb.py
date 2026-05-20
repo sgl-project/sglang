@@ -20,11 +20,11 @@ class PerturbHook:
         *,
         config: CanaryConfig,
         req_to_token_pool: "ReqToTokenPool",
-        groups: tuple[CanaryBufferGroup, ...],
+        buffer_groups: tuple[CanaryBufferGroup, ...],
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
-        self._groups = groups
+        self._buffer_groups = buffer_groups
         self._radix_cache: Optional["BasePrefixCache"] = None
         self._perturb_undo: Optional[tuple[int, int, int]] = None
 
@@ -92,7 +92,7 @@ class PerturbHook:
             return
 
         groups_with_real_kv: list[CanaryBufferGroup] = [
-            group for group in self._groups if group.real_kv_sources_k
+            group for group in self._buffer_groups if group.real_kv_sources_k
         ]
         if not groups_with_real_kv:
             return

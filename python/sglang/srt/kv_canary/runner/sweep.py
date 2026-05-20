@@ -39,20 +39,20 @@ class SweepOrchestrator:
         config: CanaryConfig,
         device: torch.device,
         device_state: CanaryDeviceState,
-        groups: tuple[CanaryBufferGroup, ...],
+        buffer_groups: tuple[CanaryBufferGroup, ...],
         endpoints: tuple[CanaryEndpoint, ...],
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
         sweep_verify_capacity: int,
-        pump: PumpAndAllreduce,
+        pump_and_allreduce: PumpAndAllreduce,
     ) -> None:
         self._config = config
         self._device_state = device_state
-        self._groups = groups
+        self._buffer_groups = buffer_groups
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._pump = pump
+        self._pump_and_allreduce = pump_and_allreduce
         self._radix_cache: Optional["BasePrefixCache"] = None
 
         self._verify_plan_sweep_radix = VerifyPlan.allocate(
@@ -73,7 +73,7 @@ class SweepOrchestrator:
     def maybe_run_sweep(self) -> None:
         if self._config.sweep_every_n_steps == 0:
             return
-        step_counter = self._pump.step_counter
+        step_counter = self._pump_and_allreduce.step_counter
         if (
             self._last_sweep_step >= 0
             and step_counter - self._last_sweep_step < self._config.sweep_every_n_steps
@@ -85,7 +85,7 @@ class SweepOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        for group in self._groups:
+        for group in self._buffer_groups:
             window = self._swa_window_size if group.kind is PoolKind.SWA else 0
             radix_input = build_plan_input_radix_sweep(
                 radix_cache=self._radix_cache,

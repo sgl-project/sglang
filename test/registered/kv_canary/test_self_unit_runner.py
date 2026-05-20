@@ -165,15 +165,15 @@ class TestSelfUnitRunner(CustomTestCase):
         runner.launch_head_kernels(fb)
 
         sweep_calls: List[int] = []
-        real_maybe = runner._sweep.maybe_run_sweep
+        real_maybe = runner._sweep_orchestrator.maybe_run_sweep
 
         def _spy():
-            before = runner._sweep._last_sweep_step
+            before = runner._sweep_orchestrator._last_sweep_step
             real_maybe()
-            if runner._sweep._last_sweep_step != before:
-                sweep_calls.append(runner._pump._step_counter)
+            if runner._sweep_orchestrator._last_sweep_step != before:
+                sweep_calls.append(runner._pump_and_allreduce._step_counter)
 
-        with patch.object(runner._sweep, "maybe_run_sweep", _spy):
+        with patch.object(runner._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
                 runner.end_of_step()
         self.assertEqual(sweep_calls, [0, 4, 8])
@@ -200,7 +200,7 @@ class TestSelfUnitRunner(CustomTestCase):
             "canary_plan_step",
             lambda **kwargs: plan_calls.append("plan"),
         ):
-            runner._sweep.maybe_run_sweep()
+            runner._sweep_orchestrator.maybe_run_sweep()
         self.assertGreaterEqual(plan_calls.count("plan"), 1)
 
     def test_violation_pump_d2h_detects_errored(self):
@@ -222,7 +222,7 @@ class TestSelfUnitRunner(CustomTestCase):
         runner = _make_runner(device=self.device, config=config)
 
         fake_group = SimpleNamespace(device_group=object())
-        runner._pump._tp_group = fake_group
+        runner._pump_and_allreduce._tp_group = fake_group
 
         def fake_all_reduce(tensor, op, group):
             tensor.fill_(1)
@@ -241,10 +241,10 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         runner = _make_runner(device=self.device)
-        runner._pump._step_counter = 1000
+        runner._pump_and_allreduce._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
         with self.assertRaises(RuntimeError):
-            runner._health.health_check_step()
+            runner._health_and_stats.health_check_step()
 
     def test_runner_disabled_short_circuits(self):
         config = CanaryConfig(mode=CanaryMode.OFF)
@@ -260,7 +260,7 @@ class TestSelfUnitRunner(CustomTestCase):
             runner.before_forward(fb)
             runner.launch_head_kernels(fb)
             runner.launch_tail_kernels(fb)
-            runner._sweep.maybe_run_sweep()
+            runner._sweep_orchestrator.maybe_run_sweep()
             runner.end_of_step()
         self.assertEqual(plan_calls, [])
 
@@ -276,8 +276,8 @@ class TestSelfUnitRunner(CustomTestCase):
 
         with self.assertLogs(runner_module.logger.name, level=logging.INFO) as cm:
             for _ in range(10):
-                runner._health.print_periodic_stats()
-                runner._pump._step_counter += 1
+                runner._health_and_stats.print_periodic_stats()
+                runner._pump_and_allreduce._step_counter += 1
         log_text = "\n".join(cm.output)
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)
@@ -335,7 +335,7 @@ class TestSelfUnitRunner(CustomTestCase):
             "canary_verify_step",
             lambda **kwargs: sweep_kernel_kinds.append(kwargs["kernel_kind"].name),
         ):
-            runner._sweep.maybe_run_sweep()
+            runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
 
     def test_runner_raises_when_other_rank_errored_but_local_clean(self):
@@ -345,7 +345,7 @@ class TestSelfUnitRunner(CustomTestCase):
             allreduce_violation_signal=True,
         )
         runner = _make_runner(device=self.device, config=config)
-        runner._pump._tp_group = SimpleNamespace(device_group=object())
+        runner._pump_and_allreduce._tp_group = SimpleNamespace(device_group=object())
 
         def lockstep_all_reduce(tensor, op, group):
             tensor.fill_(1)
@@ -360,7 +360,7 @@ class TestSelfUnitRunner(CustomTestCase):
             torch.distributed.all_reduce(
                 runner._device_state.allreduce_buf,
                 op=torch.distributed.ReduceOp.MAX,
-                group=runner._pump._tp_group.device_group,
+                group=runner._pump_and_allreduce._tp_group.device_group,
             )
             self.assertEqual(int(runner._device_state.allreduce_buf.item()), 1)
 

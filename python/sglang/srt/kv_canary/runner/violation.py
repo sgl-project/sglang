@@ -18,11 +18,11 @@ class ViolationReporter:
         *,
         config: CanaryConfig,
         device_state: CanaryDeviceState,
-        pump: PumpAndAllreduce,
+        pump_and_allreduce: PumpAndAllreduce,
     ) -> None:
         self._config = config
         self._device_state = device_state
-        self._pump = pump
+        self._pump_and_allreduce = pump_and_allreduce
         self._on_mode_violations_logged: int = 0
         self._raised: bool = False
 
@@ -41,7 +41,7 @@ class ViolationReporter:
             row=ring[0].tolist(),
             total=write_index,
             ring_overflow=ring_overflow,
-            step_when_pumped=self._pump.step_counter,
+            step_when_pumped=self._pump_and_allreduce.step_counter,
         )
         if self._config.mode == "on":
             self._on_mode_violations_logged += 1
