@@ -710,6 +710,17 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REAL_KV = EnvFloat(0.0)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
     SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
+    # Timing-jitter fuzzer (testing only). When enabled the canary runner
+    # launches a single-thread spin-wait kernel at 4 fixed slots inside
+    # the monkey-patched ``model.forward`` to perturb the relative timing
+    # between canary HEAD/TAIL and real attention launches. Cycles are
+    # sampled log-uniformly over ``[1, MAX_CYCLES]`` and gated by
+    # ``PER_SLOT_FIRE_PROB``; off by default and never installed when
+    # ``--kv-canary=off``.
+    SGLANG_KV_CANARY_JITTER_ENABLED = EnvBool(False)
+    SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB = EnvFloat(0.5)
+    SGLANG_KV_CANARY_JITTER_MAX_CYCLES = EnvInt(100_000)
+    SGLANG_KV_CANARY_JITTER_SEED = EnvInt(0)
     # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
     # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
     # (default 1.5x). Override via env var when runner jitter or temporary

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 from sglang.jit_kernel.kv_canary.verify import RealKvHashMode
 from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.srt.environ import envs
+from sglang.srt.kv_canary.runner.jitter import JitterConfig
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -54,6 +55,8 @@ class CanaryConfig:
         allreduce_violation_signal: True = end-of-step pump performs cross-rank allreduce on the local
             is_errored byte so all ranks raise in lockstep; False = each rank raises independently (faster
             but produces partial-failure logs across TP groups). Default True.
+        jitter_config: timing-jitter fuzzer settings. Default-constructed JitterConfig is disabled; when
+            ``mode == "off"`` the runner never installs jitter even if this is enabled.
     """
 
     mode: Literal["off", "on", "raise"]
@@ -66,6 +69,7 @@ class CanaryConfig:
     perturb_real_kv_require_orphan: bool = False
     stats_print_every_n_steps: int = 0
     allreduce_violation_signal: bool = True
+    jitter_config: JitterConfig = JitterConfig()
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -107,6 +111,29 @@ class CanaryConfig:
         else:
             sweep_every_n_steps = envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get()
 
+        jitter_enabled_env = envs.SGLANG_KV_CANARY_JITTER_ENABLED.get()
+        jitter_enabled = (
+            bool(server_args.kv_canary_jitter_enabled) or jitter_enabled_env
+        )
+        jitter_config = JitterConfig(
+            enabled=jitter_enabled,
+            per_slot_fire_prob=(
+                server_args.kv_canary_jitter_per_slot_fire_prob
+                if server_args.kv_canary_jitter_per_slot_fire_prob is not None
+                else envs.SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB.get()
+            ),
+            max_cycles=(
+                int(server_args.kv_canary_jitter_max_cycles)
+                if server_args.kv_canary_jitter_max_cycles is not None
+                else envs.SGLANG_KV_CANARY_JITTER_MAX_CYCLES.get()
+            ),
+            seed=(
+                int(server_args.kv_canary_jitter_seed)
+                if server_args.kv_canary_jitter_seed is not None
+                else envs.SGLANG_KV_CANARY_JITTER_SEED.get()
+            ),
+        )
+
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
@@ -118,4 +145,5 @@ class CanaryConfig:
             perturb_real_kv_require_orphan=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN.get(),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
             allreduce_violation_signal=envs.SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL.get(),
+            jitter_config=jitter_config,
         )
