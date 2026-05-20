@@ -742,6 +742,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                         time.perf_counter() - tic,
                     )
 
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
+
+        token_counts = get_mhc_pre_token_count_representatives(
+            max_num_tokens, self.hc_mult * self.hidden_size
+        )
+        if not token_counts:
+            return token_counts
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
+            max_num_tokens,
+            token_counts,
+        )
+        self.prewarm_mhc_token_counts(token_counts, device)
+        return token_counts
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -1029,19 +1048,23 @@ class DeepseekV4Model(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
 
-    def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
-    ) -> None:
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
         tic = time.perf_counter()
         logger.info(
-            "Running DeepSeek V4 MHC prewarm for token-count shapes: %s",
+            "Running DeepSeek V4 MHC prewarm for max_num_tokens=%s",
+            max_num_tokens,
+        )
+        token_counts = self.layers[self.start_layer].prewarm_mhc_token_count_buckets(
+            max_num_tokens, device
+        )
+        logger.info(
+            "DeepSeek V4 MHC prewarm finished in %.3fs for representative token counts: %s",
+            time.perf_counter() - tic,
             token_counts,
         )
-        self.layers[self.start_layer].prewarm_mhc_token_counts(token_counts, device)
-        logger.info(
-            "DeepSeek V4 MHC prewarm finished in %.3fs",
-            time.perf_counter() - tic,
-        )
+        return token_counts
 
     def hc_head(
         self,
@@ -1194,10 +1217,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
 
-    def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
-    ) -> None:
-        self.model.prewarm_mhc_token_counts(token_counts, device)
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
     @property
     def routed_experts_weights_of_layer(self):

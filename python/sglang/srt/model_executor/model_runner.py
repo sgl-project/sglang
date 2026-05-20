@@ -2309,29 +2309,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
 
-        token_values = envs.SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS.get()
-        legacy_token_values = envs.SGLANG_DSV4_MHC_PREWARM_TOKENS.get()
-        if not token_values and legacy_token_values:
-            token_values = legacy_token_values
-            logger.warning(
-                "SGLANG_DSV4_MHC_PREWARM_TOKENS is deprecated; use "
-                "SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS instead."
+        max_num_tokens = envs.SGLANG_DSV4_MHC_PREWARM_MAX_TOKENS.get()
+        if max_num_tokens < 0:
+            raise ValueError(
+                "SGLANG_DSV4_MHC_PREWARM_MAX_TOKENS expects a non-negative "
+                f"integer, got {max_num_tokens}"
             )
-        if not token_values:
+        if max_num_tokens == 0:
             return
 
-        token_counts = tuple(int(x) for x in token_values)
-        if any(x <= 0 for x in token_counts):
-            raise ValueError(
-                "SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS expects positive integers, "
-                f"got {token_values}"
-            )
-
-        self.model.prewarm_mhc_token_counts(token_counts, self.device)
+        token_counts = self.model.prewarm_mhc_token_count_buckets(
+            max_num_tokens, self.device
+        )
         self.tp_group.barrier()
 
         logger.info(
-            "DeepSeek V4 MHC prewarm completed for token-count shapes: %s",
+            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
             token_counts,
         )
 
