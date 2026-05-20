@@ -191,15 +191,20 @@ jobs:
 
   finish:
     if: always()
-    needs: [stage-b-test-1-gpu-xpu, pr-gate]
+    needs: [stage-a-test-1-gpu-xpu, stage-b-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
-          result="${{ needs.stage-b-test-1-gpu-xpu.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "Job failed with result: $result"
+          stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
+          stage_b="${{ needs.stage-b-test-1-gpu-xpu.result }}"
+          if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
+            echo "stage-a failed with result: $stage_a"
             exit 1
           fi
-          echo "All jobs completed successfully (result: $result)"
+          if [ "$stage_b" != "success" ] && [ "$stage_b" != "skipped" ]; then
+            echo "stage-b failed with result: $stage_b"
+            exit 1
+          fi
+          echo "All jobs completed successfully"
           exit 0
