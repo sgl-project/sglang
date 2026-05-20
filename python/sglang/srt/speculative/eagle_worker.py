@@ -884,9 +884,19 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
+            # Preserve state that may be overwritten by the DP-attention MLP sync path.
+            accept_length_backup = spec_info.accept_length
+            global_num_tokens_cpu_backup = (
+                list(forward_batch.global_num_tokens_cpu)
+                if forward_batch.global_num_tokens_cpu is not None
+                else None
+            )
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
+            spec_info.accept_length = accept_length_backup
+            if global_num_tokens_cpu_backup is not None:
+                forward_batch.global_num_tokens_cpu = global_num_tokens_cpu_backup
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
