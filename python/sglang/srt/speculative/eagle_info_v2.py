@@ -14,7 +14,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -277,22 +280,8 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                mapping = (
-                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-                )
-                req_pool_idx_tensor = batch.req_pool_indices.to(
-                    device=mapping.device, dtype=torch.int64
-                )
-                track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                ).to(mapping.device, non_blocking=True)
-                batch.mamba_track_indices = mapping[
-                    req_pool_idx_tensor, track_col_idx
-                ].to(dtype=torch.int64)
+                set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
