@@ -20,6 +20,7 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 _CONTEXT_LENGTH_SLACK = 16
+_PIECEWISE_CUDA_GRAPH_MAX_TOKENS = 8192
 _MAX_TOTAL_TOKENS_SLACK = 8192
 
 
@@ -30,7 +31,10 @@ def _make_server_args(
     # The canary kernel must run inside the cuda graph alongside the real attn
     # kernel; an overhead measurement taken with the graph disabled does not
     # represent the production path canary actually ships on.
-    context_length = input_len + output_len + _CONTEXT_LENGTH_SLACK
+    context_length = max(
+        input_len + output_len + _CONTEXT_LENGTH_SLACK,
+        _PIECEWISE_CUDA_GRAPH_MAX_TOKENS,
+    )
     max_total_tokens = batch_size * (input_len + output_len) + _MAX_TOTAL_TOKENS_SLACK
 
     extra: List[str] = [
