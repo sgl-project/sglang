@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     File,
     Form,
     HTTPException,
@@ -23,6 +24,13 @@ from fastapi.responses import FileResponse
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
+)
+from sglang.multimodal_gen.runtime.cancellation import (
+    CLIENT_CANCELLED_MESSAGE,
+    CLIENT_CANCELLED_REASON,
+    RequestCancelledError,
+    mark_request_cancelled,
+    raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
@@ -134,6 +142,112 @@ async def _save_first_input_image(
     )
 
 
+def _cancelled_video_fields() -> dict[str, Any]:
+    return {
+        "status": "cancelled",
+        "completed_at": int(time.time()),
+        "error": {
+            "type": CLIENT_CANCELLED_REASON,
+            "message": CLIENT_CANCELLED_MESSAGE,
+        },
+    }
+
+
+def _cleanup_video_paths(job_or_paths: dict[str, Any] | list[str] | None) -> None:
+    paths: list[str] = []
+    if isinstance(job_or_paths, dict):
+        file_path = job_or_paths.get("file_path")
+        if file_path:
+            paths.append(file_path)
+        paths.extend(job_or_paths.get("file_paths") or [])
+    elif isinstance(job_or_paths, list):
+        paths.extend(job_or_paths)
+
+    for path in paths:
+        if not path:
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove video artifact during cleanup: %s", path)
+
+
+async def _mark_video_cancelled(job_id: str) -> dict[str, Any] | None:
+    return await VIDEO_STORE.update_fields(job_id, _cancelled_video_fields())
+
+
+async def _notify_scheduler_cancel(video_id: str) -> None:
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+
+    try:
+        ack = await async_scheduler_client.cancel(video_id)
+        ack_output = getattr(ack, "output", None)
+        if isinstance(ack_output, dict) and ack_output.get("state") == "queued":
+            await _mark_video_cancelled(video_id)
+    except Exception as e:
+        logger.debug(
+            "Scheduler cancel request for video %s did not ack: %s",
+            video_id,
+            e,
+        )
+
+
+def _log_scheduler_cancel_task_result(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Unexpected video cancel notification failure")
+
+
+def _schedule_scheduler_cancel_notification(
+    video_id: str,
+    background_tasks: BackgroundTasks | None,
+) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(_notify_scheduler_cancel, video_id)
+        return
+
+    task = asyncio.create_task(_notify_scheduler_cancel(video_id))
+    task.add_done_callback(_log_scheduler_cancel_task_result)
+
+
+async def _cancel_video_job(
+    video_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    job = await VIDEO_STORE.get(video_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    status = job.get("status")
+    if status == "cancelled":
+        return job
+    if status in ("completed", "failed", "deleted"):
+        return job
+
+    mark_request_cancelled(video_id, get_global_server_args(), CLIENT_CANCELLED_REASON)
+    updated = await VIDEO_STORE.update_fields(
+        video_id,
+        {
+            "status": "cancelling",
+            "error": {
+                "type": CLIENT_CANCELLED_REASON,
+                "message": CLIENT_CANCELLED_MESSAGE,
+            },
+        },
+    )
+    _schedule_scheduler_cancel_notification(video_id, background_tasks)
+
+    return updated or job
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
@@ -143,13 +257,21 @@ async def _dispatch_job_async(
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
+    save_file_path_list: list[str] = []
     try:
+        job = await VIDEO_STORE.get(job_id)
+        if job and job.get("status") == "queued":
+            await VIDEO_STORE.update_fields(job_id, {"status": "in_progress"})
+
+        raise_if_cancelled(batch, get_global_server_args())
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
+        raise_if_cancelled(batch, get_global_server_args())
         save_file_path = save_file_path_list[0]
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        raise_if_cancelled(batch, get_global_server_args())
 
         persistent_path = (
             save_file_path if not cloud_url and output_persistent else None
@@ -171,6 +293,9 @@ async def _dispatch_job_async(
             update_fields, request_id=job_id, result=result
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
+    except RequestCancelledError:
+        _cleanup_video_paths(save_file_path_list)
+        await _mark_video_cancelled(job_id)
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
@@ -421,13 +546,32 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
+@router.post("/{video_id}/cancel", response_model=VideoResponse)
+async def cancel_video(
+    background_tasks: BackgroundTasks,
+    video_id: str = Path(...),
+):
+    job = await _cancel_video_job(video_id, background_tasks)
+    return VideoResponse(**job)
+
+
 @router.delete("/{video_id}", response_model=VideoResponse)
-async def delete_video(video_id: str = Path(...)):
+async def delete_video(
+    background_tasks: BackgroundTasks,
+    video_id: str = Path(...),
+):
+    job = await VIDEO_STORE.get(video_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if job.get("status") in ("queued", "in_progress", "cancelling"):
+        cancelled_job = await _cancel_video_job(video_id, background_tasks)
+        return VideoResponse(**cancelled_job)
+
     job = await VIDEO_STORE.pop(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
+    _cleanup_video_paths(job)
     job["status"] = "deleted"
     return VideoResponse(**job)
 
@@ -445,6 +589,9 @@ async def download_video_content(
             status_code=400,
             detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
         )
+
+    if job.get("status") == "cancelled":
+        raise HTTPException(status_code=404, detail="Video generation was cancelled")
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):

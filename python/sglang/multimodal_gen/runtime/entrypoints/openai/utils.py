@@ -16,6 +16,12 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.cancellation import (
+    CLIENT_CANCELLED_MESSAGE,
+    CLIENT_CANCELLED_REASON,
+    RequestCancelledError,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -328,6 +334,13 @@ async def process_generation_batch(
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
+        if result.cancelled:
+            raise RequestCancelledError(
+                request_id=batch.request_id,
+                reason=result.cancel_reason or CLIENT_CANCELLED_REASON,
+                message=result.error or CLIENT_CANCELLED_MESSAGE,
+            )
+
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
@@ -354,6 +367,10 @@ async def process_generation_batch(
                 enable_upscaling=batch.enable_upscaling,
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
+                cancel_check=lambda: raise_if_cancelled(
+                    batch,
+                    get_global_server_args(),
+                ),
             )
 
     total_time = time.perf_counter() - total_start_time

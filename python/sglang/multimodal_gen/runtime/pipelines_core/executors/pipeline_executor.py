@@ -9,6 +9,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List
 
+from sglang.multimodal_gen.runtime.cancellation import raise_if_cancelled
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -62,6 +63,7 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> None:
+        raise_if_cancelled(batch, server_args)
         stage.set_component_residency_manager(self.component_residency_manager)
         self.component_residency_manager.before_stage(
             stage, stage_index, batch, server_args

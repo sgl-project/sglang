@@ -16,6 +16,7 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.cancellation import RequestCancelledError
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     CYAN,
@@ -242,6 +243,14 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            if issubclass(exc_type, RequestCancelledError):
+                self.logger.info(
+                    "[%s] cancelled after %.4f ms: %s",
+                    self.stage_name,
+                    execution_time_s * 1000,
+                    exc_val,
+                )
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,

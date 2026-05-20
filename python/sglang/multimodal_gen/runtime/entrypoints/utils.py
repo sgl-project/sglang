@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.cancellation import CLIENT_CANCELLED_REASON
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -70,6 +71,12 @@ class ListLorasReq:
 @dataclass
 class ShutdownReq:
     pass
+
+
+@dataclass
+class CancelGenerationReq:
+    request_id: str
+    reason: str = CLIENT_CANCELLED_REASON
 
 
 @dataclass
@@ -487,10 +494,13 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
     for idx, output in enumerate(outputs):
+        if cancel_check is not None:
+            cancel_check()
         save_file_path = build_output_path(idx)
         sample = output
         if data_type == DataType.VIDEO:
@@ -511,6 +521,7 @@ def save_outputs(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            cancel_check=cancel_check,
         )
 
         if samples_out is not None:
@@ -546,6 +557,7 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    cancel_check: Callable[[], None] | None = None,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -587,8 +599,13 @@ def post_process_sample(
                 arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
             frames = list(arr)
 
+    if cancel_check is not None:
+        cancel_check()
+
     # 2. Frame interpolation (video only)
     if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        if cancel_check is not None:
+            cancel_check()
         from sglang.multimodal_gen.runtime.postprocess import (
             interpolate_video_frames,
         )
@@ -601,8 +618,13 @@ def post_process_sample(
         )
         fps = fps * multiplier
 
+    if cancel_check is not None:
+        cancel_check()
+
     # 3. Upscaling (images and videos)
     if enable_upscaling and frames:
+        if cancel_check is not None:
+            cancel_check()
         from sglang.multimodal_gen.runtime.postprocess import upscale_frames
 
         frames = upscale_frames(
@@ -610,6 +632,9 @@ def post_process_sample(
             model_path=upscaling_model_path,
             scale=upscaling_scale,
         )
+
+    if cancel_check is not None:
+        cancel_check()
 
     # 4. Save outputs if requested
     if save_output:

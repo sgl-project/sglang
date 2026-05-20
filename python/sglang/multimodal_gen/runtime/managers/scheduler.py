@@ -5,6 +5,7 @@ import asyncio
 import dataclasses
 import os
 import pickle
+import shutil
 import tempfile
 import time
 from collections import deque
@@ -15,6 +16,15 @@ from typing import Any, Iterator, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.cancellation import (
+    CLIENT_CANCELLED_MESSAGE,
+    first_cancelled_request_id,
+    get_cancel_reason,
+    is_payload_cancelled,
+    is_request_cancelled,
+    mark_request_cancelled,
+    request_alias_groups,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -29,6 +39,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    CancelGenerationReq,
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -133,6 +144,7 @@ class Scheduler(SchedulerDisaggMixin):
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
+            CancelGenerationReq: self._handle_cancel_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
@@ -210,6 +222,100 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_cancel_generation(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        mark_request_cancelled(req.request_id, self.server_args, req.reason)
+        removed = self._remove_cancelled_waiting_items(
+            request_id=req.request_id,
+            reason=req.reason,
+        )
+        state = "queued" if removed else "running_or_not_found"
+        return OutputBatch(
+            output={
+                "request_id": req.request_id,
+                "cancelled": True,
+                "state": state,
+                "removed_from_queue": removed,
+            }
+        )
+
+    @staticmethod
+    def _cancelled_output(reason: str) -> OutputBatch:
+        return OutputBatch(
+            error=CLIENT_CANCELLED_MESSAGE,
+            cancelled=True,
+            cancel_reason=reason,
+        )
+
+    def _remove_cancelled_waiting_items(
+        self,
+        *,
+        request_id: str,
+        reason: str,
+    ) -> bool:
+        if not self.waiting_queue:
+            return False
+
+        removed = False
+        remaining: deque[tuple[bytes | None, Any, float]] = deque()
+        while self.waiting_queue:
+            identity, queued_req, enqueue_ts = self.waiting_queue.popleft()
+            if self._first_generation_req(queued_req) is not None and (
+                self._payload_matches_cancelled_request(queued_req, request_id)
+            ):
+                removed = True
+                self.return_result(
+                    self._cancelled_output(reason),
+                    identity,
+                    is_warmup=self._is_warmup_item(queued_req),
+                )
+                continue
+            remaining.append((identity, queued_req, enqueue_ts))
+
+        self.waiting_queue = remaining
+        return removed
+
+    def _drain_cancelled_waiting_items(self) -> None:
+        if not self.waiting_queue:
+            return
+
+        remaining: deque[tuple[bytes | None, Any, float]] = deque()
+        while self.waiting_queue:
+            identity, queued_req, enqueue_ts = self.waiting_queue.popleft()
+            if (
+                self._first_generation_req(queued_req) is None
+                or self._is_warmup_item(queued_req)
+                or not is_payload_cancelled(
+                    queued_req,
+                    self.server_args,
+                    require_all_for_batched=True,
+                )
+            ):
+                remaining.append((identity, queued_req, enqueue_ts))
+                continue
+
+            request_id = first_cancelled_request_id(queued_req, self.server_args)
+            reason = get_cancel_reason(request_id, self.server_args)
+            self.return_result(
+                self._cancelled_output(reason),
+                identity,
+                is_warmup=False,
+            )
+
+        self.waiting_queue = remaining
+
+    def _payload_matches_cancelled_request(
+        self,
+        payload: Any,
+        request_id: str,
+    ) -> bool:
+        for group in request_alias_groups(payload):
+            if request_id in group:
+                return True
+            if any(is_request_cancelled(alias, self.server_args) for alias in group):
+                return True
+        return False
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -307,8 +413,61 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_generation(
         self, reqs: list[Any], *, allow_dynamic_batching: bool = True
     ):
-        """Dispatch generation requests, merging compatible requests when allowed."""
+        """Dispatch generation requests, merging compatible requests when allowed.
+
+        Cancellation is checked before merge so already-cancelled queue entries
+        do not keep occupying slots in a new dynamic batch.
+        """
         reqs = self._normalize_generation_reqs(reqs)
+        if len(reqs) > 1 and allow_dynamic_batching:
+            # Drop cancelled members before they ever enter a merged request.
+            # Running batches handle the same problem later by tensor compaction.
+            cancelled_mask = [
+                is_payload_cancelled(
+                    req,
+                    self.server_args,
+                    require_all_for_batched=False,
+                )
+                for req in reqs
+            ]
+            if any(cancelled_mask):
+                active_reqs = [
+                    req for req, cancelled in zip(reqs, cancelled_mask) if not cancelled
+                ]
+                active_outputs = (
+                    self._handle_generation(
+                        active_reqs,
+                        allow_dynamic_batching=allow_dynamic_batching,
+                    )
+                    if active_reqs
+                    else []
+                )
+                if not isinstance(active_outputs, list):
+                    active_outputs = [active_outputs]
+                active_iter = iter(active_outputs)
+                outputs: list[OutputBatch] = []
+                for req, cancelled in zip(reqs, cancelled_mask):
+                    if cancelled:
+                        request_id = first_cancelled_request_id(req, self.server_args)
+                        reason = get_cancel_reason(request_id, self.server_args)
+                        outputs.append(self._cancelled_output(reason))
+                    else:
+                        outputs.append(next(active_iter))
+                return outputs
+
+        # For non-dynamic paths, or when every member of a dynamic payload is
+        # already cancelled, return a cancellation result without invoking the worker.
+        if is_payload_cancelled(
+            reqs,
+            self.server_args,
+            require_all_for_batched=not allow_dynamic_batching,
+        ):
+            request_id = first_cancelled_request_id(reqs, self.server_args)
+            reason = get_cancel_reason(request_id, self.server_args)
+            if len(reqs) > 1:
+                return [self._cancelled_output(reason) for _ in reqs]
+            return self._cancelled_output(reason)
+
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
@@ -337,9 +496,49 @@ class Scheduler(SchedulerDisaggMixin):
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                if self.receiver is None:
+                    # Non-zero ranks execute the same forward through worker pipes.
+                    # Only rank 0 owns client ZMQ identities and can return real outputs.
+                    return [OutputBatch() for _ in reqs]
+                if output_batch.cancelled:
+                    return [
+                        OutputBatch(
+                            error=output_batch.error,
+                            cancelled=True,
+                            cancel_reason=output_batch.cancel_reason,
+                        )
+                        for _ in reqs
+                    ]
                 if output_batch.error:
+                    if output_batch.active_request_indices is not None:
+                        active_request_indices = {
+                            int(index) for index in output_batch.active_request_indices
+                        }
+                        if len(active_request_indices) < len(reqs):
+                            # Some requests were compacted out, but an active member
+                            # still failed. Preserve cancelled results for removed
+                            # members and return the worker error only to survivors.
+                            outputs: list[OutputBatch] = []
+                            for req_index, original_req in enumerate(reqs):
+                                request_id = first_cancelled_request_id(
+                                    original_req, self.server_args
+                                )
+                                if request_id is not None or (
+                                    req_index not in active_request_indices
+                                ):
+                                    reason = get_cancel_reason(
+                                        request_id or original_req.request_id,
+                                        self.server_args,
+                                    )
+                                    outputs.append(self._cancelled_output(reason))
+                                else:
+                                    outputs.append(
+                                        OutputBatch(error=output_batch.error)
+                                    )
+                            return outputs
                     logger.error(
-                        "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
+                        "Dynamic batch execution returned error. "
+                        "Skipping sequential fallback and returning errors: %s",
                         output_batch.error,
                     )
                     return self._build_dynamic_batch_error_outputs(
@@ -350,7 +549,8 @@ class Scheduler(SchedulerDisaggMixin):
                 split_outputs = self._split_batched_output(output_batch, reqs)
                 if split_outputs is None:
                     logger.error(
-                        "Failed to split dynamic batched output cleanly. Skipping sequential fallback and returning errors."
+                        "Failed to split dynamic batched output cleanly. "
+                        "Skipping sequential fallback and returning errors."
                     )
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
@@ -366,7 +566,8 @@ class Scheduler(SchedulerDisaggMixin):
                 return split_outputs
             except Exception as e:
                 logger.error(
-                    "Dynamic batching failed (%s). Skipping sequential fallback and returning errors.",
+                    "Dynamic batching failed (%s). "
+                    "Skipping sequential fallback and returning errors.",
                     e,
                     exc_info=True,
                 )
@@ -668,6 +869,17 @@ class Scheduler(SchedulerDisaggMixin):
 
         merged_req.extra = deepcopy(merged_req.extra)
         merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
+        dynamic_request_ids = [req.request_id for req in reqs]
+        merged_req.extra["dynamic_batch_request_ids"] = dynamic_request_ids
+        merged_req.extra["dynamic_batch_original_request_ids"] = list(
+            dynamic_request_ids
+        )
+        merged_req.extra["dynamic_batch_active_request_indices"] = list(
+            range(len(reqs))
+        )
+        merged_req.extra["dynamic_batch_num_outputs_per_request"] = [
+            req.num_outputs_per_prompt for req in reqs
+        ]
         merged_req.return_file_paths_only = base_req.return_file_paths_only
         if merged_req.return_file_paths_only:
             dynamic_output_paths: list[str] = []
@@ -719,73 +931,152 @@ class Scheduler(SchedulerDisaggMixin):
         # Scalar / non-batched metadata
         return deepcopy(value)
 
+    def _slice_active_batched_value(
+        self,
+        value: Any,
+        req_index: int,
+        active_offsets: dict[int, tuple[int, int]],
+        active_total_items: int,
+    ) -> Any:
+        if req_index not in active_offsets:
+            return None
+        start, end = active_offsets[req_index]
+        return self._slice_batched_value(value, start, end, active_total_items)
+
     def _split_batched_output(
         self, output_batch: OutputBatch, reqs: List[Req]
     ) -> List[OutputBatch] | None:
-        """Split a merged result only when outputs map one-to-one to requests."""
+        """Split a merged result back into the original request order.
+
+        `active_request_indices` records which original requests survived
+        mid-denoise compaction. Missing indices are returned as cancelled and
+        never receive tensor or file-path outputs.
+        """
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
-        total_items = sum(per_req_counts)
+        if output_batch.active_request_indices is None:
+            active_request_indices = list(range(len(reqs)))
+        else:
+            try:
+                active_request_indices = [
+                    int(index) for index in output_batch.active_request_indices
+                ]
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid dynamic batch active_request_indices: %s",
+                    output_batch.active_request_indices,
+                )
+                return None
+
+        if len(set(active_request_indices)) != len(active_request_indices) or any(
+            index < 0 or index >= len(reqs) for index in active_request_indices
+        ):
+            logger.warning(
+                "Invalid dynamic batch active_request_indices: %s",
+                active_request_indices,
+            )
+            return None
+
+        active_offsets: dict[int, tuple[int, int]] = {}
+        active_total_items = 0
+        for req_index in active_request_indices:
+            req_count = per_req_counts[req_index]
+            active_offsets[req_index] = (
+                active_total_items,
+                active_total_items + req_count,
+            )
+            active_total_items += req_count
+
         output_items = self._count_first_dim(output_batch.output)
         output_path_items = self._count_first_dim(output_batch.output_file_paths)
 
         if output_items is None and output_path_items is None:
             logger.warning(
-                "Batched output has neither tensor outputs nor output_file_paths; cannot split safely."
+                "Batched output has neither tensor outputs nor output_file_paths; "
+                "cannot split safely."
             )
             return None
 
-        if output_items is not None and output_items != total_items:
+        if output_items is not None and output_items != active_total_items:
             logger.warning(
                 "Unexpected batched output size: got %s items, expected %s",
                 output_items,
-                total_items,
+                active_total_items,
             )
             return None
-        if output_path_items is not None and output_path_items != total_items:
+        if output_path_items is not None and output_path_items != active_total_items:
             logger.warning(
                 "Unexpected batched output_file_paths size: got %s items, expected %s",
                 output_path_items,
-                total_items,
+                active_total_items,
             )
             return None
 
         outputs: list[OutputBatch] = []
-        start = 0
-        for req, req_count in zip(reqs, per_req_counts):
-            end = start + req_count
+        sliced_fields = (
+            "output",
+            "audio",
+            "trajectory_timesteps",
+            "trajectory_latents",
+            "trajectory_decoded",
+            "output_file_paths",
+            "noise_pred",
+        )
+        for req_index, req in enumerate(reqs):
+            request_id = first_cancelled_request_id(req, self.server_args)
+            is_active = req_index in active_offsets
+            is_cancelled = request_id is not None or not is_active
+            if request_id is None and is_cancelled:
+                request_id = req.request_id
+            cancel_reason = (
+                get_cancel_reason(request_id, self.server_args)
+                if is_cancelled
+                else None
+            )
             split = OutputBatch(
-                output=self._slice_batched_value(
-                    output_batch.output, start, end, total_items
-                ),
-                audio=self._slice_batched_value(
-                    output_batch.audio, start, end, total_items
-                ),
                 audio_sample_rate=output_batch.audio_sample_rate,
-                trajectory_timesteps=self._slice_batched_value(
-                    output_batch.trajectory_timesteps, start, end, total_items
-                ),
-                trajectory_latents=self._slice_batched_value(
-                    output_batch.trajectory_latents, start, end, total_items
-                ),
-                trajectory_decoded=self._slice_batched_value(
-                    output_batch.trajectory_decoded, start, end, total_items
-                ),
-                error=output_batch.error,
-                output_file_paths=self._slice_batched_value(
-                    output_batch.output_file_paths, start, end, total_items
-                ),
+                error=CLIENT_CANCELLED_MESSAGE if is_cancelled else output_batch.error,
+                cancelled=is_cancelled,
+                cancel_reason=cancel_reason,
                 metrics=deepcopy(output_batch.metrics),
-                noise_pred=self._slice_batched_value(
-                    output_batch.noise_pred, start, end, total_items
-                ),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )
+            for field_name in sliced_fields:
+                setattr(
+                    split,
+                    field_name,
+                    self._slice_active_batched_value(
+                        getattr(output_batch, field_name),
+                        req_index,
+                        active_offsets,
+                        active_total_items,
+                    ),
+                )
             if split.metrics is not None:
                 split.metrics.request_id = req.request_id
+            if split.cancelled:
+                self._cleanup_cancelled_output_paths(split.output_file_paths)
+                split.output = None
+                split.audio = None
+                split.audio_sample_rate = None
+                split.output_file_paths = None
             outputs.append(split)
-            start = end
 
         return outputs
+
+    @staticmethod
+    def _cleanup_cancelled_output_paths(paths: list[str] | None) -> None:
+        for path in paths or []:
+            if not path:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Failed to remove cancelled output path: %s", path)
 
     def _dynamic_batching_enabled(self) -> bool:
         """Return whether this server and pipeline can use dynamic batching.
@@ -1126,6 +1417,7 @@ class Scheduler(SchedulerDisaggMixin):
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                self._drain_cancelled_waiting_items()
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:

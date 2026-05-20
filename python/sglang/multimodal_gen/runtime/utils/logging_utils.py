@@ -21,6 +21,7 @@ from types import MethodType
 from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.cancellation import RequestCancelledError
 
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
@@ -630,6 +631,9 @@ def log_generation_timer(
             f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
             timer.duration,
         )
+    except RequestCancelledError as e:
+        logger.info("Generation cancelled for request %s: %s", e.request_id, e)
+        raise
     except Exception as e:
         if request_idx is not None:
             logger.error(

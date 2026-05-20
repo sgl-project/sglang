@@ -16,6 +16,7 @@ from enum import Enum, auto
 
 import torch
 
+from sglang.multimodal_gen.runtime.cancellation import raise_if_cancelled
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -307,6 +308,9 @@ class PipelineStage(StageDedupMixin, ABC):
             perf_dump_path_provided=batch.perf_dump_path is not None,
         ):
             result = self.forward(batch, server_args)
+
+        if isinstance(result, Req):
+            raise_if_cancelled(result, server_args)
 
         # Post-execution output verification
         try:

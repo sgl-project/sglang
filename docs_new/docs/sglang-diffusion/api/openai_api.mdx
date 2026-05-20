@@ -233,6 +233,34 @@ curl -sS -X GET "http://localhost:30010/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890"
 ```
 
+**Cancel a video job**
+
+`/v1/videos` is an async job endpoint: `POST /v1/videos` returns a job ID immediately while generation continues in the background. Use the job ID to cancel queued or running work.
+
+**Endpoint:** `POST /v1/videos/&#123;video_id&#125;/cancel`
+
+**Curl Example:**
+
+```bash curl
+curl -sS -X POST "http://localhost:30010/v1/videos/<VIDEO_ID>/cancel" \
+  -H "Authorization: Bearer sk-proj-1234567890"
+```
+
+`DELETE /v1/videos/&#123;video_id&#125;` also cancels jobs whose status is `queued`, `in_progress`, or `cancelling`.
+
+**Endpoint:** `DELETE /v1/videos/&#123;video_id&#125;`
+
+**Curl Example:**
+
+```bash curl
+curl -sS -X DELETE "http://localhost:30010/v1/videos/<VIDEO_ID>" \
+  -H "Authorization: Bearer sk-proj-1234567890"
+```
+
+Cancellation is cooperative. Queued jobs are removed before execution. Running jobs move to `cancelling` and observe cancellation during denoising or post-processing, then finish as `cancelled`. Completed, failed, or already deleted jobs are not re-cancelled.
+
+Cancelled jobs cannot be downloaded from `/v1/videos/<VIDEO_ID>/content`; the content endpoint returns `404` for cancelled or still-running jobs. Completed jobs can still be downloaded unless they were uploaded to cloud storage, in which case the response includes the cloud URL.
+
 **Download video content**
 
 **Endpoint:** `GET /v1/videos/&#123;video_id&#125;/content`
