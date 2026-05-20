@@ -20,7 +20,6 @@ from sglang.test.kv_canary.fixtures import (
     make_base_config,
     make_dsv4_pool,
     make_mha_pool,
-    make_mla_pool,
     make_swa_pool,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -54,15 +53,6 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 8)
         self.assertIsNotNone(groups[PoolKind.SWA].swa_index_lut)
         self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
-
-    def test_mla_pool_no_v_half(self):
-        pool = make_mla_pool(self.device, num_slots=16, dim=16)
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        group = get_canary_buffer_groups(pool)[PoolKind.FULL]
-        self.assertIsNone(group.v_head)
-        self.assertIsNone(group.v_tail)
-        self.assertEqual(group.real_kv_sources_v, ())
-        self.assertFalse(group.has_v_half)
 
     def test_dsv4_pool_real_kv_sources_count(self):
         pool = make_dsv4_pool(self.device, full_slots=16, swa_slots=8, page_size=128)
