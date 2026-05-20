@@ -82,9 +82,6 @@ class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
     out_cache_loc_swa: Optional[torch.Tensor]
-    mamba_track_indices: Optional[torch.Tensor]
-    mamba_track_mask: Optional[torch.Tensor]
-    mamba_track_seqlens: Optional[torch.Tensor]
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
@@ -161,13 +158,6 @@ def set_torch_compile_config():
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def is_mamba_track_enabled(self):
-        return (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
-            and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
-        )
-
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
@@ -233,10 +223,7 @@ class PiecewiseCudaGraphRunner:
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
-        self.max_bs = model_runner.req_to_token_pool.size
-
         self.is_multimodal = model_runner.is_multimodal
-        self.mamba_track_enabled = self.is_mamba_track_enabled()
         # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -250,21 +237,6 @@ class PiecewiseCudaGraphRunner:
             out_cache_loc_swa = (
                 torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
-                else None
-            )
-            mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
@@ -292,9 +264,6 @@ class PiecewiseCudaGraphRunner:
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
@@ -373,21 +342,6 @@ class PiecewiseCudaGraphRunner:
             if buffers.out_cache_loc_swa is not None
             else None
         )
-        mamba_track_indices = (
-            buffers.mamba_track_indices[:1]
-            if buffers.mamba_track_indices is not None
-            else None
-        )
-        mamba_track_mask = (
-            buffers.mamba_track_mask[:1]
-            if buffers.mamba_track_mask is not None
-            else None
-        )
-        mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:1]
-            if buffers.mamba_track_seqlens is not None
-            else None
-        )
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -405,9 +359,6 @@ class PiecewiseCudaGraphRunner:
                 out_cache_loc=out_cache_loc,
                 out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
-                mamba_track_indices=mamba_track_indices,
-                mamba_track_mask=mamba_track_mask,
-                mamba_track_seqlens=mamba_track_seqlens,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -532,21 +483,6 @@ class PiecewiseCudaGraphRunner:
             if buffers.out_cache_loc_swa is not None
             else None
         )
-        mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
-            else None
-        )
-        mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
-        )
-        mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
-            else None
-        )
         positions = buffers.positions[:num_tokens]
         mrope_positions = (
             buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -578,9 +514,6 @@ class PiecewiseCudaGraphRunner:
                 out_cache_loc=out_cache_loc,
                 out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
-                mamba_track_indices=mamba_track_indices,
-                mamba_track_mask=mamba_track_mask,
-                mamba_track_seqlens=mamba_track_seqlens,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -683,22 +616,6 @@ class PiecewiseCudaGraphRunner:
                 )
             )
 
-        if (
-            buffers.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            buffers.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            buffers.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
-
         input_ids = buffers.input_ids[:static_num_tokens]
         positions = buffers.positions[:static_num_tokens]
         out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
@@ -709,25 +626,9 @@ class PiecewiseCudaGraphRunner:
             else None
         )
 
-        mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
-            else None
-        )
-        mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
-        )
-        mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
-            else None
-        )
         if forward_batch.mrope_positions is not None:
             buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
 
-        input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
         )
@@ -768,9 +669,7 @@ class PiecewiseCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
+            encoder_lens=forward_batch.encoder_lens,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
