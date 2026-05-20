@@ -1457,6 +1457,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     load_format: Optional[str] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Tensor transfer mode inside the custom update process group.
+    transfer_mode: str = "broadcast"
 
 
 @dataclass
@@ -1596,6 +1598,8 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # Weight update transfer mode. "broadcast" joins every TP rank; "relay" joins TP0 only.
+    transfer_mode: str = "broadcast"
 
 
 @dataclass

@@ -985,6 +985,7 @@ class Engine(EngineScoreMixin, EngineBase):
         world_size: int,
         group_name: str,
         backend: str = "nccl",
+        transfer_mode: str = "broadcast",
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -994,6 +995,7 @@ class Engine(EngineScoreMixin, EngineBase):
             world_size=world_size,
             group_name=group_name,
             backend=backend,
+            transfer_mode=transfer_mode,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)
@@ -1019,6 +1021,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        transfer_mode: str = "broadcast",
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1028,6 +1031,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            transfer_mode=transfer_mode,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
