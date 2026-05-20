@@ -13,6 +13,8 @@
 # ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
+from __future__ import annotations
+
 import math
 import re
 from array import array

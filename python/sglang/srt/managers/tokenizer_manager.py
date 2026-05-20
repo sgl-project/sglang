@@ -13,6 +13,8 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import dataclasses
