@@ -14,18 +14,93 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
-# Default base images
-ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
-ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+# Default base images (slim ROCm dev images; PyTorch is installed below).
+ARG BASE_IMAGE_ROCM700="rocm/dev-ubuntu-22.04:7.0-complete"
+ARG BASE_IMAGE_ROCM720="rocm/dev-ubuntu-22.04:7.2-complete"
+
+# AMD-published ROCm torch/triton/torchvision wheels (Python 3.10, "lw" lightweight variants).
+# torchvision is required because the SGLang `timm` dep pulls it transitively;
+# without a ROCm wheel installed up front, pip's resolver fetches the PyPI CUDA
+# build of torchvision and cascades a CUDA torch replacement that breaks GPU access.
+ARG ROCM700_TORCH_WHL="torch-2.8.0+rocm7.0.0.lw.git64359f59-cp310-cp310-linux_x86_64.whl"
+ARG ROCM700_TRITON_WHL="pytorch_triton_rocm-3.4.0+rocm7.0.0.gitf9e5bf54-cp310-cp310-linux_x86_64.whl"
+ARG ROCM700_TORCHVISION_WHL="torchvision-0.23.0+rocm7.0.0.git824e8c87-cp310-cp310-linux_x86_64.whl"
+ARG ROCM700_WHL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0"
+
+ARG ROCM720_TORCH_WHL="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
+ARG ROCM720_TRITON_WHL="triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl"
+ARG ROCM720_TORCHVISION_WHL="torchvision-0.24.0+rocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl"
+ARG ROCM720_WHL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 942 with rocm700 and args
-FROM $BASE_IMAGE_942 AS gfx942
+# Shared base for ROCm 7.0 flavors: install Python toolchain + AMD torch/triton wheels.
+FROM $BASE_IMAGE_ROCM700 AS base-rocm700
+ARG ROCM700_TORCH_WHL
+ARG ROCM700_TRITON_WHL
+ARG ROCM700_TORCHVISION_WHL
+ARG ROCM700_WHL_INDEX
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip python3-venv \
+        git curl wget gnupg ca-certificates build-essential \
+    && mkdir -p /etc/apt/keyrings \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
+    && python -m pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && cd /tmp \
+    && curl -fLO "${ROCM700_WHL_INDEX}/${ROCM700_TORCH_WHL}" \
+    && curl -fLO "${ROCM700_WHL_INDEX}/${ROCM700_TRITON_WHL}" \
+    && curl -fLO "${ROCM700_WHL_INDEX}/${ROCM700_TORCHVISION_WHL}" \
+    && pip install --no-cache-dir \
+        "/tmp/${ROCM700_TORCH_WHL}" \
+        "/tmp/${ROCM700_TRITON_WHL}" \
+        "/tmp/${ROCM700_TORCHVISION_WHL}" \
+    && rm -f "/tmp/${ROCM700_TORCH_WHL}" "/tmp/${ROCM700_TRITON_WHL}" "/tmp/${ROCM700_TORCHVISION_WHL}" \
+    # Alias pytorch-triton-rocm dist-info as `triton` so pip considers SGLang's
+    # transitive `triton` requirement (via xgrammar) satisfied; otherwise pip
+    # pulls triton 3.7.0 from PyPI (CUDA build) and breaks the inductor path.
+    # The pytorch_triton_rocm wheel already installs the `triton` Python module;
+    # this just adds the package-name registration that pip's resolver needs.
+    && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
+    && SRC_DIST=$(ls -d "$SITE"/pytorch_triton_rocm-*.dist-info | head -1) \
+    && DST_DIST=$(echo "$SRC_DIST" | sed 's|/pytorch_triton_rocm-|/triton-|') \
+    && cp -r "$SRC_DIST" "$DST_DIST" \
+    && sed -i 's/^Name: pytorch[-_]triton[-_]rocm$/Name: triton/' "$DST_DIST/METADATA" \
+    && python -c 'import importlib.metadata as m; print("pip sees triton ==", m.version("triton"))'
+
+# ===============================
+# Shared base for ROCm 7.2.2 flavors.
+FROM $BASE_IMAGE_ROCM720 AS base-rocm720
+ARG ROCM720_TORCH_WHL
+ARG ROCM720_TRITON_WHL
+ARG ROCM720_TORCHVISION_WHL
+ARG ROCM720_WHL_INDEX
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip python3-venv \
+        git curl wget gnupg ca-certificates build-essential \
+    && mkdir -p /etc/apt/keyrings \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
+    && python -m pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && cd /tmp \
+    && curl -fLO "${ROCM720_WHL_INDEX}/${ROCM720_TORCH_WHL}" \
+    && curl -fLO "${ROCM720_WHL_INDEX}/${ROCM720_TRITON_WHL}" \
+    && curl -fLO "${ROCM720_WHL_INDEX}/${ROCM720_TORCHVISION_WHL}" \
+    && pip install --no-cache-dir \
+        "/tmp/${ROCM720_TORCH_WHL}" \
+        "/tmp/${ROCM720_TRITON_WHL}" \
+        "/tmp/${ROCM720_TORCHVISION_WHL}" \
+    && rm -f "/tmp/${ROCM720_TORCH_WHL}" "/tmp/${ROCM720_TRITON_WHL}" "/tmp/${ROCM720_TORCHVISION_WHL}"
+
+# ===============================
+# Per-arch base aliases (so the rest of the file can FROM ${GPU_ARCH} into the right base).
+FROM base-rocm700 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -33,9 +108,7 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
-# ===============================
-# Base image 942 with rocm720 and args
-FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
+FROM base-rocm720 AS gfx942-rocm720
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
@@ -43,9 +116,7 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
-# ===============================
-# Base image 950 and args
-FROM $BASE_IMAGE_950 AS gfx950
+FROM base-rocm700 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -53,9 +124,7 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
-# ===============================
-# Base image 950 with rocm720 and args
-FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+FROM base-rocm720 AS gfx950-rocm720
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
@@ -254,7 +323,7 @@ ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
-ARG ENABLE_MORI=0
+ARG ENABLE_MORI=1
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
@@ -323,18 +392,14 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && rm -f "$(which sccache 2>/dev/null)" || true
 
 # Install AMD SMI Python package from ROCm distribution.
-# The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
+# dev-ubuntu-22.04:*-complete images ship the sources under /opt/rocm/share/amd_smi
+# but no Python wheel; build & install in-place. Skip if the dir is absent.
 RUN set -eux; \
-    case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd /opt/rocm/share/amd_smi \
-        && python3 -m pip install --no-cache-dir . \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
-        ;; \
-    esac
+    if [ -d /opt/rocm/share/amd_smi ]; then \
+        cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .; \
+    else \
+        echo "amd_smi sources not found at /opt/rocm/share/amd_smi, skipping"; \
+    fi
 
 WORKDIR /sgl-workspace
 
@@ -570,79 +635,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
-# Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly. hack.py is written in its own RUN
-# because heredoc + case in a single RUN does not parse reliably under
-# /bin/sh.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir -p /tmp/whl && cat > /tmp/whl/hack.py <<"PY"
-import zipfile, csv, os, re
-from pathlib import Path
-
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
-
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
-PY
-
-RUN set -eux; \
-    case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd /tmp/whl \
-        && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-        && python hack.py \
-        && python3 -m pip install --force --no-deps --no-cache-dir /tmp/${TORCH_ROCM_FILE} \
-        && rm -rf /tmp/whl /tmp/${TORCH_ROCM_FILE}; \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        rm -rf /tmp/whl; \
-        ;; \
-    esac
-
-
-# -----------------------
-# Install custom Triton from builder-triton wheel (ROCm 7.2 only). When
-# BUILD_TRITON=0 the builder produced no wheel and this is a no-op.
+# Install custom Triton from builder-triton wheel (opt-in via BUILD_TRITON=1).
+# When BUILD_TRITON=0 the builder produced no wheel and this is a no-op; the
+# AMD-published triton installed in the base stage is used instead.
 COPY --from=builder-triton /tmp/triton-wheel/ /tmp/triton-wheel/
 RUN set -eux; \
     if ls /tmp/triton-wheel/*.whl 1>/dev/null 2>&1; then \
