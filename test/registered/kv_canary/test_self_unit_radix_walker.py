@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from _fixtures import CPU_DEVICE, make_radix_cache  # noqa: E402
-
-from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import CPU_DEVICE, make_radix_cache
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 

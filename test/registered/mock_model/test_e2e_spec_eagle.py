@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from test.registered.mock_model.utils import mock_model_engine_kwargs
+
+from utils import mock_model_engine_kwargs
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci

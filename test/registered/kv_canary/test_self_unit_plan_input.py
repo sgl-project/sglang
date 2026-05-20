@@ -1,29 +1,22 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from _fixtures import (  # noqa: E402
+from sglang.srt.kv_canary.plan_input import (
+    PlanInput,
+    build_plan_input_radix_sweep,
+    fill_plan_input_per_forward,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,
     make_forward_batch,
     make_radix_cache,
     make_req_to_token_pool,
 )
-
-from sglang.srt.kv_canary.plan_input import (  # noqa: E402
-    PlanInput,
-    build_plan_input_radix_sweep,
-    fill_plan_input_per_forward,
-)
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 

@@ -4,9 +4,9 @@ import dataclasses
 import json
 import os
 import unittest
-from test.registered.mock_model.utils import mock_model_engine_kwargs
 
 import torch
+from utils import mock_model_engine_kwargs
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
