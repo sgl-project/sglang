@@ -12,10 +12,10 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvHashMode,
 )
 from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary import runner as runner_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_canary.runner import CanaryRunner
+from sglang.srt.kv_canary.runner import canary_runner as runner_module
+from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")

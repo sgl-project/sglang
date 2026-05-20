@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner import CanaryRunner
+from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
