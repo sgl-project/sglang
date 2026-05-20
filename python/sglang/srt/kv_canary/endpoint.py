@@ -71,6 +71,7 @@ class CanaryEndpoint:
         expected_input_positions: torch.Tensor,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
+        pad_sentinel_slot: int = -1,
     ) -> None:
         """Call canary_verify_step then canary_write_step against this endpoint's canary_buf. Both use
         the shared violation_log. Used by head and tail endpoints; sweep endpoints raise NotImplementedError.
@@ -90,14 +91,24 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
+            pad_sentinel_slot=pad_sentinel_slot,
         )
+        # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
+        # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". FULL endpoints pass
+        # fb_out_cache_loc through unchanged.
+        if self.full_to_swa_index_mapping is not None:
+            fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
+                fb_out_cache_loc.to(torch.int64)
+            ].to(torch.int32)
+        else:
+            fb_out_cache_loc_for_canary = fb_out_cache_loc
+
         canary_write_step(
             canary_buf=self.canary_buf,
             plan=write_plan,
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
-            fb_out_cache_loc=fb_out_cache_loc,
-            full_to_swa_index_mapping=self.full_to_swa_index_mapping,
+            fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             pseudo_mode=input_check_mode,
             pseudo_expected_tokens=expected_input_tokens,
@@ -116,6 +127,7 @@ class CanaryEndpoint:
         verify_plan: VerifyPlan,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
+        pad_sentinel_slot: int = -1,
     ) -> None:
         """Call only canary_verify_step against this endpoint's canary_buf. Used by sweep endpoints;
         head/tail endpoints raise NotImplementedError.
@@ -135,6 +147,7 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
+            pad_sentinel_slot=pad_sentinel_slot,
         )
 
 

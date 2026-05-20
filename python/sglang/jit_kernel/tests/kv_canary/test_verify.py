@@ -24,7 +24,7 @@ from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
-from sglang.jit_kernel.tests.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     chain_anchor_signed,
@@ -480,7 +480,6 @@ def test_violation_real_kv_hash_mismatch() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=None,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         pseudo_mode=CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
@@ -603,7 +602,6 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=None,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         pseudo_mode=CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
@@ -689,7 +687,6 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=None,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         pseudo_mode=CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
@@ -885,7 +882,6 @@ def test_real_kv_source_holey_dim1() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=None,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         pseudo_mode=CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
@@ -976,7 +972,6 @@ def test_page_size_gt_1_access_pattern() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=None,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         pseudo_mode=CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,

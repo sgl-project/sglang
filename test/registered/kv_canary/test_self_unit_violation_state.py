@@ -74,7 +74,7 @@ def test_ring_fill_once_overflow_drops_row_keeps_counter(device):
 def test_raise_message_includes_idx_expected_actual(device):
     from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
     from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-    from sglang.srt.kv_canary.runner import CanaryRunner
+    from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 
     config = CanaryConfig(mode=CanaryMode.RAISE)
     k_head = torch.zeros(4, 32, dtype=torch.uint8, device=device)

@@ -47,6 +47,10 @@ struct VerifyKernelParams {
   RealKvSourceHandle sources[kMaxRealKvSources];
   int32_t num_sources;
   RealKvHashMode real_kv_hash_mode;
+
+  // Slot index treated as a host-side padding sentinel; entries pointing at it are skipped before any
+  // canary_buf load. -1 disables the skip (default; unit tests use slot 0 as valid data).
+  int32_t pad_sentinel_slot;
 };
 
 __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ p) {
@@ -77,6 +81,12 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[tid]);
   const int64_t expected_position = static_cast<int64_t>(p.verify_positions[tid]);
   const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[tid]);
+
+  // Skip the reserved padding sentinel so unfilled req_to_token positions (zero-initialized) do not
+  // produce spurious chain_hash/position violations from an untouched slot.
+  if (p.pad_sentinel_slot >= 0 && static_cast<int32_t>(slot_idx) == p.pad_sentinel_slot) {
+    return;
+  }
 
   const int64_t stored_token = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldToken);
   const int64_t stored_position = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
@@ -168,7 +178,8 @@ inline void canary_verify_step_cuda(
     tvm::ffi::TensorView real_kv_buf_3,
     tvm::ffi::TensorView real_kv_source_params,
     int64_t num_sources,
-    int64_t real_kv_hash_mode) {
+    int64_t real_kv_hash_mode,
+    int64_t pad_sentinel_slot) {
   using namespace host;
 
   SymbolicSize N_slots = {"num_canary_slots"};
@@ -275,6 +286,7 @@ inline void canary_verify_step_cuda(
   }
   p.num_sources = static_cast<int32_t>(num_sources);
   p.real_kv_hash_mode = static_cast<RealKvHashMode>(real_kv_hash_mode);
+  p.pad_sentinel_slot = static_cast<int32_t>(pad_sentinel_slot);
 
   // Grid: one thread per verify_capacity entry; the kernel early-exits on tid >= verify_num_valid[0].
   // Always launch at least one block so the unconditional kernel_run_counter bump runs even when

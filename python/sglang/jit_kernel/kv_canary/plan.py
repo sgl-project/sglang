@@ -24,26 +24,27 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
-# Upper bound on bs for the phase-1 block-level cumsum. Reqs larger than this exceed Triton's single-program
-# tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally generous so the
-# wrapper never silently truncates.
+# Upper bound on bs for _plan_offsets_kernel's block-level cumsum. Reqs larger than this exceed Triton's
+# single-program tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally
+# generous so the wrapper never silently truncates.
 _PLAN_BS_BLOCK_SIZE: int = 1024
 
-# Inner-tile width for the verify materialization phase. Each (req, j-tile) program owns this many entries
-# along the j-axis of the (bs, max_verify_per_req) logical grid.
+# Inner-tile width for _plan_entries_kernel. Each (req, j-tile) program owns this many entries along the
+# j-axis of the (bs, max_verify_per_req) logical grid.
 _PLAN_VERIFY_INNER_BLOCK: int = 64
 
-# Inner-tile width for the extras-append phase. Each program copies this many extras into the verify tail.
+# Inner-tile width for _plan_extras_kernel. Each program copies this many extras into the verify tail.
 _PLAN_EXTRAS_INNER_BLOCK: int = 64
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PlanScratch:
-    """Per-device scratch used by ``canary_plan_step`` across phases.
+    """Per-device scratch used by ``canary_plan_step`` across its sub-kernels.
 
-    The verify cumsum produced by phase 1 must survive into phase 3 (the entry materializer needs each req's
-    flat-output offset) but ``VerifyPlan`` does not carry an offsets tensor of its own. We cache a stable
-    scratch tensor on the host wrapper so its data_ptr() is captured into any cuda-graph and reused on replay.
+    The verify cumsum produced by ``_plan_offsets_kernel`` must survive into ``_plan_entries_kernel`` (the
+    entry materializer needs each req's flat-output offset) but ``VerifyPlan`` does not carry an offsets
+    tensor of its own. We cache a stable scratch tensor on the host wrapper so its data_ptr() is captured
+    into any cuda-graph and reused on replay.
 
     Fields:
         verify_offsets: Exclusive prefix sum of per-req verify counts, shape [_PLAN_BS_BLOCK_SIZE + 1], int32.
@@ -122,31 +123,26 @@ def canary_plan_step(
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
 
     Implementation:
-        - Single Triton @triton.jit launch (`canary_plan_kernel`) split into three logical phases inside one
-          program:
-          1. **Per-req count + seed gather** (1-D grid `(bs,)`, each program = one req): each program reads
-             fb_req_pool_indices[r], fb_prefix_lens[r], fb_extend_seq_lens[r], computes verify_count =
-             (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0 padding), and
-             gathers seed_slot_full = req_to_token[rp, prefix_lens - 1] (or -1 if prefix_lens == 0).
-             SWA-translates seed_slot via full_to_swa_index_mapping[seed_slot_full] if non-None.
-          2. **Block-level cumsum** (`tl.cumsum(verify_counts, axis=0)` and `tl.cumsum(write_counts, axis=0)`)
-             produces verify_offsets[bs+1] and write_plan_out.write_offsets[bs+1] in-place. write_seed slots
-             from phase 1 are scattered to write_plan_out.write_seed_slot_indices.
-          3. **Per-entry materialization** (2-D logical grid `(bs, max_verify_per_req)`, masked by per-req
-             verify_count): for each (r, j) with j < verify_count[r], gather slot =
-             req_to_token[fb_req_pool_indices[r], window_start[r] + j] (SWA-translated), prev_slot =
-             req_to_token[..., window_start[r] + j - 1] when (window_start[r] + j) > 0 (also translated) else
-             -1, position =
-             window_start[r] + j; scatter (slot, position, prev_slot) into verify_plan_out at flat index
-             verify_offsets[r] + j.
-        - **Extra entries append** (1-D grid `(extra_verify_num_valid,)`): copy extra_verify_*[: num_valid]
-          into verify_plan_out.verify_* starting at flat index verify_offsets[bs]. Extras are
-          caller-pre-translated, no LUT pass.
-        - Scalar writes: verify_plan_out.verify_num_valid = verify_offsets[bs] + extra_verify_num_valid;
-          write_plan_out.write_num_valid_reqs = bs (or smaller if padding rows trail). Done by a single program
-          at the end.
-        - All output tensors are addressed at addresses baked into the cuda-graph capture; phases are launched
-          as one kernel (via tl.where / tl.arange branching) so capture sees a single launch per call.
+        - Three sub-kernels with action-named identifiers, launched in sequence:
+          1. ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
+             reads fb_req_pool_indices[r], fb_prefix_lens[r], fb_extend_seq_lens[r] for each r; computes
+             verify_count = (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0
+             padding); gathers seed_slot_full = req_to_token[rp, prefix_lens - 1] (or -1 if prefix_lens == 0),
+             SWA-translates seed_slot via full_to_swa_index_mapping[seed_slot_full] if non-None; runs
+             block-level cumsum (``tl.cumsum``) to produce verify_offsets[bs+1] and
+             write_plan_out.write_offsets[bs+1] in-place; scatters write_seed slots; writes scalar totals
+             ``verify_plan_out.verify_num_valid`` and ``write_plan_out.write_num_valid_reqs``.
+          2. ``_plan_entries_kernel`` (2-D grid ``(bs, max_j_tiles)``, masked by per-req verify_count): for
+             each (r, j) with j < verify_count[r], gather slot = req_to_token[fb_req_pool_indices[r],
+             window_start[r] + j] (SWA-translated), prev_slot = req_to_token[..., window_start[r] + j - 1]
+             when (window_start[r] + j) > 0 (also translated) else -1, position = window_start[r] + j;
+             scatter (slot, position, prev_slot) into verify_plan_out at flat index verify_offsets[r] + j.
+          3. ``_plan_extras_kernel`` (1-D grid ``(k_tiles,)``, only launched when extra_verify_num_valid > 0):
+             copy extra_verify_*[: num_valid] into verify_plan_out.verify_* starting at flat index
+             verify_offsets[bs]. Extras are caller-pre-translated, no LUT pass.
+        - All output tensors are addressed at addresses baked into the cuda-graph capture; the 2nd and 3rd
+          kernels are conditionally launched based on cached host-side scalars from the 1st (graph-safe
+          under stream-capture conditionals).
 
     Calling contract:
         - Pure side-effect; no host work, no D2H.
@@ -226,9 +222,9 @@ def canary_plan_step(
     # cuda-graph-safe (no allocation) and avoids one Triton launch.
     write_plan_out.write_offsets.zero_()
 
-    # Phase 1 + 2: per-req count + seed gather + block-level cumsum, single program, scalar phase 4 (num_valid
-    # scalars) also written by the same program (it has the totals in registers already).
-    _plan_phase1_kernel[(1,)](
+    # Offsets kernel: per-req count + seed gather + block-level cumsum, single program; the num_valid
+    # scalars are written by the same program (it has the totals in registers already).
+    _plan_offsets_kernel[(1,)](
         fb_req_pool_indices,
         fb_prefix_lens,
         fb_extend_seq_lens,
@@ -250,15 +246,15 @@ def canary_plan_step(
         WRITE_REQ_CAPACITY=write_req_capacity,
     )
 
-    # Phase 3: per-(req, j-tile) entry materialization. The j-axis upper bound is verify_capacity (each req
-    # cannot contribute more than verify_capacity entries); we mask per-req actual count read back from
-    # verify_offsets_scratch inside the kernel.
+    # Entries kernel: per-(req, j-tile) verify entry materialization. The j-axis upper bound is
+    # verify_capacity (each req cannot contribute more than verify_capacity entries); we mask per-req actual
+    # count read back from verify_offsets_scratch inside the kernel.
     if bs > 0 and verify_capacity > 0:
         max_j_tiles = (
             verify_capacity + _PLAN_VERIFY_INNER_BLOCK - 1
         ) // _PLAN_VERIFY_INNER_BLOCK
-        grid_phase3 = (bs, max_j_tiles)
-        _plan_phase3_kernel[grid_phase3](
+        grid_entries = (bs, max_j_tiles)
+        _plan_entries_kernel[grid_entries](
             fb_req_pool_indices,
             fb_prefix_lens,
             req_to_token,
@@ -275,7 +271,7 @@ def canary_plan_step(
             HAS_SWA_LUT=has_swa_lut,
         )
 
-    # Phase 4: append extras into the verify tail. The base index lives in verify_offsets_scratch[bs].
+    # Extras kernel: append extras into the verify tail. The base index lives in verify_offsets_scratch[bs].
     if extras_capacity > 0:
         max_k_tiles = (
             extras_capacity + _PLAN_EXTRAS_INNER_BLOCK - 1
@@ -317,7 +313,7 @@ def _get_plan_scratch(*, device: torch.device) -> _PlanScratch:
 
 
 @triton.jit
-def _plan_phase1_kernel(
+def _plan_offsets_kernel(
     # Input pointers.
     req_pool_indices_ptr,
     prefix_lens_ptr,
@@ -342,7 +338,7 @@ def _plan_phase1_kernel(
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
 ):
-    """Phase 1 + 2 + scalar writes: per-req counts, seeds, exclusive-prefix-sum offsets, totals.
+    """Offsets kernel: per-req counts, seeds, exclusive-prefix-sum offsets, scalar totals.
 
     Single program; BLOCK_BS-wide tiles cover the full bs (caller ensures bs <= BS_BLOCK). All cumsum is done
     via block-level ``tl.cumsum`` in one program — no cross-program sync needed.
@@ -452,7 +448,7 @@ def _plan_phase1_kernel(
 
 
 @triton.jit
-def _plan_phase3_kernel(
+def _plan_entries_kernel(
     # Input pointers.
     req_pool_indices_ptr,
     prefix_lens_ptr,
@@ -472,7 +468,7 @@ def _plan_phase3_kernel(
     SWA_WINDOW: tl.constexpr,
     HAS_SWA_LUT: tl.constexpr,
 ):
-    """Phase 3: materialize per-req verify entries. Grid = (bs, j_tiles).
+    """Entries kernel: materialize per-req verify entries. Grid = (bs, j_tiles).
 
     Each program owns one (req, j-tile) cell. Verify capacity is the upper bound on entries-per-req used to
     pick the grid; per-req actual count comes from ``verify_offsets[r+1] - verify_offsets[r]``.
@@ -592,7 +588,7 @@ def _plan_extras_kernel(
     # Compile-time constants.
     INNER_BLOCK: tl.constexpr,
 ):
-    """Phase 4: append extras into the verify tail at base = verify_offsets[bs]. Grid = (k_tiles,).
+    """Extras kernel: append extras into the verify tail at base = verify_offsets[bs]. Grid = (k_tiles,).
 
     Extras are caller-pre-translated; this kernel only copies (no LUT pass).
     """

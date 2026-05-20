@@ -1,14 +1,13 @@
 """Torch reference implementation of canary_write_step.
 
 Vectorised across write reqs; the per-req chain loop stays serial (a chain is intrinsically sequential — each
-step's hash depends on the previous step's full slot state). SWA translation is inline (no pre-pass). When
-pseudo_mode == ON, mismatches between actual fb_input_ids[i] / fb_positions[i] and the caller-supplied expected
-tensors record a violation but the chain still advances on the actual values.
+step's hash depends on the previous step's full slot state). fb_out_cache_loc is consumed opaquely (SWA
+translation is the caller's responsibility); entries with slot < 0 are skipped. When pseudo_mode == ON,
+mismatches between actual fb_input_ids[i] / fb_positions[i] and the caller-supplied expected tensors record
+a violation but the chain still advances on the actual values.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 
@@ -54,7 +53,6 @@ def canary_write_step_torch_reference(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
     kernel_kind: CanaryLaunchTag,
     pseudo_mode: CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
@@ -99,11 +97,6 @@ def canary_write_step_torch_reference(
         return
 
     slot_indices_all = fb_out_cache_loc_host[:total_entries].clone()
-    if full_to_swa_index_mapping is not None:
-        lut = full_to_swa_index_mapping.detach().to(
-            device=work_device, dtype=torch.int64
-        )
-        slot_indices_all = _swa_translate(slot_indices=slot_indices_all, lut=lut)
 
     tokens_all = fb_input_ids_host[:total_entries]
     positions_all = fb_positions_host[:total_entries]
@@ -235,20 +228,6 @@ def canary_write_step_torch_reference(
         violation_ring.copy_(ring_host.to(violation_ring.device))
 
     violation_write_index[0] = violation_write_index[0] + len(violation_rows)
-
-
-def _swa_translate(*, slot_indices: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
-    """SWA full-pool→swa-pool translation. -1 sentinel rows pass through unchanged."""
-    lut_len = int(lut.shape[0])
-    sentinel_mask = slot_indices < 0
-    safe_idx = torch.where(sentinel_mask, torch.zeros_like(slot_indices), slot_indices)
-    if lut_len > 0:
-        oob_mask = safe_idx >= lut_len
-        safe_idx = torch.where(
-            oob_mask, torch.full_like(safe_idx, lut_len - 1), safe_idx
-        )
-    translated = lut[safe_idx]
-    return torch.where(sentinel_mask, slot_indices, translated)
 
 
 def _compute_pseudo_mismatch_bits(

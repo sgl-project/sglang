@@ -221,6 +221,7 @@ def canary_verify_step(
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: RealKvHashMode,
+    pad_sentinel_slot: int = -1,
 ) -> None:
     """Verify one canary buffer against a VerifyPlan.
 
@@ -251,6 +252,11 @@ def canary_verify_step(
             tuple disables the mixin. Multiple sources are folded sequentially via splitmix64. Each source's
             buf is shape [num_slots, slot_stride_bytes], uint8.
         real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Applies uniformly across all sources.
+        pad_sentinel_slot: Optional opt-in. When ``>= 0``, every verify entry whose slot index equals this value
+            is skipped before any canary_buf load — used by the sglang canary runner to drop entries pointing
+            at the KV pool's reserved padding slot (sglang reserves slot 0; req_to_token zero-init reads as slot
+            0 for unfilled positions). Default ``-1`` disables the skip so existing unit tests (which use slot
+            0 as valid data, bypassing the allocator) remain unaffected.
 
     Implementation:
         - CUDA __global__ `canary_verify_kernel`: 1-D grid `((verify_capacity + 127) / 128, 1, 1)` blocks ×
@@ -320,6 +326,7 @@ def canary_verify_step(
         source_params,
         len(real_kv_sources),
         int(real_kv_hash_mode),
+        int(pad_sentinel_slot),
     )
 
 

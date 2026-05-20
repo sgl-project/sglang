@@ -9,11 +9,11 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
 )
 from sglang.srt.kv_canary.buffer_group import PoolKind
-from sglang.srt.kv_canary.pool_patch import (
-    _make_row_source,
+from sglang.srt.kv_canary.pool_patch.api import (
     attach_canary_buffers,
     get_canary_buffer_groups,
 )
+from sglang.srt.kv_canary.pool_patch.helpers import _make_row_source
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")

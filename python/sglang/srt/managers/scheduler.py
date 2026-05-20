@@ -69,6 +69,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.kv_canary.api import get_canary_runner
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -984,10 +985,6 @@ class Scheduler(
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
 
-        # Local import: kv_canary.api pulls in jit_kernel modules; keep it lazy so non-canary
-        # scheduler instances don't pay the load cost.
-        from sglang.srt.kv_canary.api import get_canary_runner
-
         canary_runner = get_canary_runner(self.tp_worker.model_runner)
         if canary_runner is not None:
             canary_runner.attach_radix_cache(self.tree_cache)
@@ -1090,7 +1087,6 @@ class Scheduler(
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-        self._canary_paused_warned: bool = False
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
@@ -3119,38 +3115,6 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    def _push_canary_alive_reqs_snapshot(self, batch: ScheduleBatch) -> None:
-        from sglang.srt.kv_canary.api import get_canary_runner
-        from sglang.srt.kv_canary.plan_input import AliveReqSnapshot
-
-        canary_runner = get_canary_runner(self.tp_worker.model_runner)
-        if canary_runner is None:
-            return
-
-        req_pool_indices = batch.req_pool_indices
-        seq_lens = batch.seq_lens
-        if req_pool_indices is None or seq_lens is None:
-            canary_runner.set_alive_reqs_snapshot(None)
-            return
-        if req_pool_indices.numel() == 0:
-            canary_runner.set_alive_reqs_snapshot(None)
-            return
-
-        if self.num_paused_reqs > 0 and not self._canary_paused_warned:
-            logger.warning(
-                "kv-canary: sweep snapshot sourced from running ScheduleBatch only; "
-                "%d paused reqs are NOT included (paused-reqs collection not yet "
-                "wired to scheduler — gap vs SOT §4.1)",
-                self.num_paused_reqs,
-            )
-            self._canary_paused_warned = True
-
-        snapshot = AliveReqSnapshot(
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-        )
-        canary_runner.set_alive_reqs_snapshot(snapshot)
-
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3159,8 +3123,6 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
-
-        self._push_canary_alive_reqs_snapshot(batch)
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

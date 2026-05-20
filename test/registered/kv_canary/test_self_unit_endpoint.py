@@ -169,16 +169,20 @@ def test_endpoint_shares_violation_log_across_launches(device, monkeypatch):
     )
 
 
-def test_swa_endpoint_passes_lut(device, monkeypatch):
-    captured: List = []
+def test_swa_endpoint_pre_translates_fb_out_cache_loc(device, monkeypatch):
+    """SWA endpoint host-gathers ``lut[fb_out_cache_loc]`` before calling canary_write_step; FULL
+    endpoint passes fb_out_cache_loc through unchanged. The kernel never sees a LUT.
+    """
+    captured: List[torch.Tensor] = []
     monkeypatch.setattr(endpoint_module, "canary_verify_step", lambda **kwargs: None)
     monkeypatch.setattr(
         endpoint_module,
         "canary_write_step",
-        lambda **kwargs: captured.append(kwargs["full_to_swa_index_mapping"]),
+        lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
     )
 
-    lut = torch.arange(8, dtype=torch.int32, device=device)
+    # LUT maps full slot i → swa slot (i + 100) so we can verify the gather happened.
+    lut = (torch.arange(8, dtype=torch.int32, device=device) + 100).to(torch.int32)
     swa_ep = _make_endpoint(
         device=device, kernel_kind=CanaryLaunchTag.HEAD_K_SWA, swa_lut=lut
     )
@@ -211,8 +215,11 @@ def test_swa_endpoint_passes_lut(device, monkeypatch):
         violation_log=args.violation_log,
         real_kv_hash_mode=args.real_kv_hash_mode,
     )
-    assert captured[0] is lut
-    assert captured[1] is None
+    # SWA call: fb_out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
+    expected_swa = lut[args.fb_out_cache_loc.to(torch.int64)].to(torch.int32)
+    assert torch.equal(captured[0], expected_swa)
+    # FULL call: fb_out_cache_loc passed through unchanged.
+    assert captured[1] is args.fb_out_cache_loc
 
 
 def test_head_tail_share_class(device, make_buffer_group, base_config):
