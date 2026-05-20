@@ -36,6 +36,7 @@ __all__ = [
     "read_slot_fields",
     "splitmix64",
     "splitmix64_mix4",
+    "stamp_clean_chain",
     "to_signed_int64",
     "write_slot_fields",
 ]
@@ -199,6 +200,39 @@ def read_slot_fields(
 ) -> tuple[int, int, int, int]:
     row = canary_buf.view(torch.int64)[slot_idx, :4].detach().cpu().tolist()
     return int(row[0]), int(row[1]), int(row[2]), int(row[3])
+
+
+def stamp_clean_chain(
+    *,
+    cuda_buf: torch.Tensor,
+    ref_buf: torch.Tensor,
+    slot_indices: list[int],
+    tokens: list[int],
+    positions: list[int],
+    real_kv_hashes: Optional[list[int]] = None,
+) -> list[int]:
+    n = len(tokens)
+    real_kv_hashes = real_kv_hashes if real_kv_hashes is not None else [0] * n
+    running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)
+    stored_prev_hashes: list[int] = []
+    for slot_idx, token, position, real_kv_hash in zip(
+        slot_indices, tokens, positions, real_kv_hashes
+    ):
+        signed_prev = to_signed_int64(running_prev_hash)
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=token,
+                position=position,
+                prev_hash=signed_prev,
+                real_kv_hash=to_signed_int64(real_kv_hash),
+            )
+        stored_prev_hashes.append(signed_prev)
+        running_prev_hash = splitmix64_mix4(
+            running_prev_hash, token, position, real_kv_hash
+        )
+    return stored_prev_hashes
 
 
 def assert_canary_state_equal(
