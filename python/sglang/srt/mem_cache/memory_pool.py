@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -358,7 +358,29 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
+    # -- Batched alloc for match_prefix --
+    def alloc_group_begin(self, num_reqs: int):
+        self._alloc_iter: Optional[Iterator] = None
+        if num_reqs > 0:
+            result = self._do_alloc(num_reqs)
+            if result is not None:
+                self._alloc_iter = iter(result.split(1))
+
+    def alloc_group_end(self):
+        if self._alloc_iter is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self.free(torch.cat(remaining))
+        self._alloc_iter = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if getattr(self, "_alloc_iter", None) is not None and need_size == 1:
+            slot = next(self._alloc_iter, None)
+            if slot is not None:
+                return slot
+        return self._do_alloc(need_size)
+
+    def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 
