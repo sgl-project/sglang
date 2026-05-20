@@ -186,6 +186,7 @@ class _StubStage:
 
     def __init__(self, modules, enable_flag: bool) -> None:
         self._nvtx_hooks = None
+        self._nvtx_registered_ids: frozenset[int] = frozenset()
         self._nvtx_zero_warned = False
         self._current_use_nvtx = False
         self._modules = modules
@@ -194,26 +195,34 @@ class _StubStage:
         )()
         self.zero_warn_count = 0  # tracked by the stub for spam-test
 
-    def _nvtx_hookable_modules(self):
+    def nvtx_hookable_modules(self):
         return self._modules
 
     def _maybe_register_nvtx_hooks(self):
         if not self.server_args.enable_layerwise_nvtx_marker:
             return
+        current = self.nvtx_hookable_modules()
+        current_ids = frozenset(id(m) for m, _ in current if m is not None)
         if self._nvtx_hooks is not None:
-            return
+            if current_ids == self._nvtx_registered_ids:
+                return
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
+            self._nvtx_registered_ids = frozenset()
+            self._nvtx_zero_warned = False
         hooks = DiffusionNvtxHooks()
         total = 0
-        for module, prefix in self._nvtx_hookable_modules():
+        for module, prefix in current:
             if module is None:
                 continue
             total += hooks.register_hooks(module, prefix=prefix)
         if total == 0:
             if not self._nvtx_zero_warned:
-                self.zero_warn_count += 1  # stub tracks calls to "warning"
+                self.zero_warn_count += 1
                 self._nvtx_zero_warned = True
             return
         self._nvtx_hooks = hooks
+        self._nvtx_registered_ids = current_ids
 
     def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
         self._maybe_register_nvtx_hooks()
@@ -231,6 +240,8 @@ class _StubStage:
         if self._nvtx_hooks is not None:
             self._nvtx_hooks.remove_hooks()
             self._nvtx_hooks = None
+        self._nvtx_registered_ids = frozenset()
+        self._nvtx_zero_warned = False
 
 
 class TestStageMixin(unittest.TestCase):
@@ -272,6 +283,77 @@ class TestStageMixin(unittest.TestCase):
         self.assertTrue(stage.current_use_nvtx)
         stage._apply_nvtx_gate(is_warmup=True)
         self.assertFalse(stage.current_use_nvtx)
+
+    def test_call_invokes_gate_before_forward(self) -> None:
+        """Integration: ``PipelineStage.__call__`` must run
+        ``_apply_nvtx_gate`` before ``forward``. Catches drift between
+        the stub above and the real base class (which may grow new
+        responsibilities the stub doesn't mirror)."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+            PipelineStage,
+        )
+
+        class _Spy(PipelineStage):
+            def __init__(self, mod) -> None:
+                self.server_args = type(
+                    "Args",
+                    (),
+                    {
+                        "enable_layerwise_nvtx_marker": True,
+                        "comfyui_mode": False,
+                    },
+                )()
+                self._component_residency_manager = None
+                self._registered_stage_name = None
+                self._profile_stage_name = None
+                self._nvtx_hooks = None
+                self._nvtx_registered_ids = frozenset()
+                self._nvtx_zero_warned = False
+                self._current_use_nvtx = False
+                self._mod = mod
+                self.use_nvtx_during_forward: bool | None = None
+
+            def nvtx_hookable_modules(self):
+                return [(self._mod, "spy")]
+
+            def forward(self, batch, server_args):
+                self.use_nvtx_during_forward = self.current_use_nvtx
+                return batch
+
+        class _Batch:
+            is_warmup = False
+            metrics = None
+            perf_dump_path = None
+
+        spy = _Spy(torch.nn.Linear(2, 2))
+        spy(_Batch(), spy.server_args)
+        # __call__ must have set current_use_nvtx before forward executed.
+        self.assertTrue(spy.use_nvtx_during_forward)
+        self.assertIsNotNone(spy._nvtx_hooks)
+
+    def test_re_registers_when_module_identity_changes(self) -> None:
+        """Regression: when the underlying module reference is replaced
+        between calls (lazy load, cache-dit wrap, hot swap), hooks must
+        rebind to the new instance. The previous design's idempotency
+        guard would have silently kept hooks on the orphan module."""
+        a = torch.nn.Linear(2, 2)
+        stage = _StubStage([(a, "t")], enable_flag=True)
+        stage._maybe_register_nvtx_hooks()
+        first_hooks = stage._nvtx_hooks
+        self.assertIsNotNone(first_hooks)
+        self.assertIn(a, first_hooks._module_to_name_map)
+
+        # Replace the declared module with a different instance — same
+        # role / same prefix, different identity (mimics cache-dit wrap).
+        b = torch.nn.Linear(2, 2)
+        stage._modules = [(b, "t")]
+        stage._maybe_register_nvtx_hooks()
+
+        # A fresh DiffusionNvtxHooks instance must have replaced the old
+        # one and registered hooks on B; A must no longer be tracked.
+        self.assertIsNot(stage._nvtx_hooks, first_hooks)
+        self.assertIn(b, stage._nvtx_hooks._module_to_name_map)
+        self.assertNotIn(a, stage._nvtx_hooks._module_to_name_map)
 
 
 class TestCollectInputShapes(unittest.TestCase):

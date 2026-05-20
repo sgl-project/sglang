@@ -156,7 +156,7 @@ class ImageEncodingStage(PipelineStage):
             uses.append(ComponentUse(stage_name, "text_encoder"))
         return uses
 
-    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         # Use ``image_text_encoder`` for the text encoder owned by this
         # stage to avoid colliding with TextEncodingStage's ``text_encoder``
         # prefix when both stages are present in the same trace.
@@ -460,6 +460,17 @@ class LTX2ImageEncodingStage(PipelineStage):
         if self.vae is None:
             return []
         return [ComponentUse(stage_name, "vae")]
+
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # ``ltx2_vae_encoder`` / ``ltx2_condition_image_encoder`` avoid
+        # collisions with EncodingStage/ImageEncodingStage prefixes when
+        # multiple encoder stages coexist in a trace.
+        mods: list[tuple[torch.nn.Module, str]] = []
+        if self.vae is not None:
+            mods.append((self.vae, "ltx2_vae_encoder"))
+        if self._condition_image_encoder is not None:
+            mods.append((self._condition_image_encoder, "ltx2_condition_image_encoder"))
+        return mods
 
     # -- lazy condition encoder (LTX-2.3) --------------------------------
 
@@ -836,6 +847,11 @@ class ImageVAEEncodingStage(PipelineStage):
                 target_dtype=vae_dtype,
             )
         ]
+
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # ``image_vae_encoder`` keeps the prefix distinct from
+        # EncodingStage's ``vae_encoder`` and DecodingStage's ``vae``.
+        return [(self.vae, "image_vae_encoder")]
 
     def forward(
         self,

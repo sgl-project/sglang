@@ -44,7 +44,14 @@ class SyncExecutor(PipelineExecutor):
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             for stage_index, stage in enumerate(stages):
-                stage_name = stage.__class__.__name__
+                # Honor any pipeline-set profile name so multi-pass pipelines
+                # (LTX-2 two-stage etc.) don't collapse repeated stage classes
+                # into a single NVTX range name.
+                stage_name = getattr(
+                    stage,
+                    "_active_profile_stage_name",
+                    lambda: stage.__class__.__name__,
+                )()
                 self.before_stage(stage, stage_index, payload, server_args)
                 with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
                     payload = self.run_stage_with_context(

@@ -85,7 +85,7 @@ class DecodingStage(PipelineStage):
             )
         ]
 
-    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         return [(self.vae, self.component_name or "vae")]
 
     @property

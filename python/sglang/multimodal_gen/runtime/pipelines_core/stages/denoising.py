@@ -345,7 +345,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
-    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         # Registered from ``_prepare_denoising_loop`` after cache-dit and
         # torch.compile finalize the transformer tree.
         return [

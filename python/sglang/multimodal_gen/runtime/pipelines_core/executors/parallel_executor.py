@@ -85,7 +85,14 @@ class ParallelExecutor(PipelineExecutor):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
                 paradigm = stage.parallelism_type
-                stage_name = stage.__class__.__name__
+                # Honor any pipeline-set profile name so multi-pass pipelines
+                # (LTX-2 two-stage etc.) don't collapse repeated stage classes
+                # into a single NVTX range name.
+                stage_name = getattr(
+                    stage,
+                    "_active_profile_stage_name",
+                    lambda: stage.__class__.__name__,
+                )()
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:
