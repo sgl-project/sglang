@@ -110,6 +110,16 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
         )
 
+    if _is_cpu and _cpu_has_amx_support:
+        return torch.ops.sgl_kernel.store_cache_cpu(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            row_dim,
+        )
+
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     if get_is_capture_mode() and alt_stream is not None:
