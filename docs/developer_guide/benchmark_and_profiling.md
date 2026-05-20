@@ -40,8 +40,6 @@ Use `bench_serving` by default unless there are specific needs.
   python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
-Kernel-level benchmarks under `python/sglang/jit_kernel/benchmark/` should mirror the runtime shape that reaches the kernel. For chunked prefill/extend paths, benchmark the per-forward chunk after scheduler splitting rather than the logical request batch; for example, a 4096-token extend chunk should be represented as `bs=1`, not `bs=32`.
-
 ## Profile with PyTorch Profiler
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
