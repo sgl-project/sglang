@@ -590,7 +590,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         thinking_mode = "thinking" if thinking_requested else "chat"
         prompt_ids = self._encode_messages(
-            [msg.model_dump() for msg in request.messages], request, thinking_mode
+            [msg.model_dump() for msg in request.messages], request, thinking_requested
         )
 
         if prompt_ids is not None:
