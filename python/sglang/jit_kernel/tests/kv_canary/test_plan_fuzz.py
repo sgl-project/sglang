@@ -8,9 +8,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.tests.kv_canary._differential import (
-    ShrinkResult,
     _run_both_and_assert_plan_byte_equal,
-    shrink_inputs,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _allocate_plan_pair,
@@ -18,6 +16,10 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_lut,
     make_padding_mask,
     make_req_to_token,
+)
+from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
+    FUZZ_SEEDS_PR,
+    run_fuzz_combo,
 )
 from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_plan_invariants
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -28,8 +30,6 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 _DEVICE = torch.device("cuda")
 
-_FUZZ_SEEDS_PR = [0]
-_FUZZ_SEEDS_NIGHTLY = list(range(10))
 _FUZZ_ITER_PER_SEED = 50
 
 
@@ -214,14 +214,6 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
     return triton_v, triton_w
 
 
-def _check_repro(inputs: PlanFuzzInputs) -> bool:
-    try:
-        _run_one(inputs)
-    except (AssertionError, RuntimeError, ValueError):
-        return True
-    return False
-
-
 def _summarize(inputs: PlanFuzzInputs) -> str:
     return (
         f"bs={int(inputs.fb_req_pool_indices.shape[0])} "
@@ -231,19 +223,13 @@ def _summarize(inputs: PlanFuzzInputs) -> str:
     )
 
 
-@pytest.mark.parametrize("seed", _FUZZ_SEEDS_PR)
+@pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_plan_fuzz_full_combo(seed: int) -> None:
     """Multi-dim plan fuzzer: random LUT/rtt/extras/padding/capacity/swa × N iters, byte-equal."""
-    rng = random.Random(seed)
-    for iteration in range(_FUZZ_ITER_PER_SEED):
-        inputs = _draw_random_plan_inputs(rng)
-        try:
-            _run_one(inputs)
-        except AssertionError as exc:
-            shrunk: ShrinkResult = shrink_inputs(inputs, check_fn=_check_repro)
-            raise AssertionError(
-                f"seed={seed} iter={iteration} failure: {exc}\n"
-                f"original: {_summarize(inputs)}\n"
-                f"shrunk:   {_summarize(shrunk.inputs)}\n"
-                f"mutations applied: {shrunk.mutations_applied}"
-            ) from exc
+    run_fuzz_combo(
+        seed,
+        draw_fn=_draw_random_plan_inputs,
+        run_one_fn=_run_one,
+        summarize_fn=_summarize,
+        n_iter=_FUZZ_ITER_PER_SEED,
+    )
