@@ -1141,6 +1141,68 @@ export const Playground = ({ config }) => {
   };
 
   // ==========================================================================
+  // 7b. Verified-cell submission helpers
+  // ==========================================================================
+  // Format a cell object the same way the cookbook config does, so a
+  // maintainer can paste the snippet directly into `cells: [...]` without
+  // reformatting. Each line is indented to match the surrounding array
+  // (8 spaces for cell fields, 8 spaces continuation for env/flags items).
+  //
+  // The output intentionally keeps {{MODEL_NAME}}, {{HOST_IP}}, {{PORT}}
+  // etc. as raw placeholders (NOT interpolated) — that's how the rest of
+  // the catalog stores them so the deployment widget can render the right
+  // model name per (hw|variant|quant) lookup.
+  const serializeCell = (sel, env, flags) => {
+    const matchEntries = [
+      `hw: ${JSON.stringify(sel.hw)}`,
+      `variant: ${JSON.stringify(sel.variant)}`,
+      `quant: ${JSON.stringify(sel.quant)}`,
+      `strategy: ${JSON.stringify(sel.strategy)}`,
+      `nodes: ${JSON.stringify(sel.nodes)}`,
+    ].join(", ");
+    const fmtList = (items) => {
+      if (!items || items.length === 0) return "[]";
+      const lines = items.map((s) => `        ${JSON.stringify(s)},`).join("\n");
+      return `[\n${lines}\n      ]`;
+    };
+    return [
+      "    {",
+      `      match: { ${matchEntries} },`,
+      "      verified: true,",
+      `      env: ${fmtList(env)},`,
+      `      flags: ${fmtList(flags)},`,
+      "    },",
+    ].join("\n");
+  };
+
+  // Build the GitHub Issue prefill URL. Field IDs must match the
+  // `id:` values in .github/ISSUE_TEMPLATE/3-playground-verified-cell.yml
+  // — those are the URL query keys GitHub recognizes.
+  //
+  // `config.github` lets per-cookbook configs override the repo target
+  // and the issue-template filename; defaults match the SGLang repo.
+  const buildSubmitUrl = (sel, fields) => {
+    const gh = (config.github) || {};
+    const owner = gh.owner || "sgl-project";
+    const repo  = gh.repo  || "sglang";
+    const tmpl  = gh.issueTemplate || "3-playground-verified-cell.yml";
+    const cookbookModel = gh.cookbookModel || "deepseek-ai/deepseek-v4";
+    const combo = `${sel.hw} / ${sel.variant} / ${sel.quant} / ${sel.strategy} / ${sel.nodes}`;
+    const params = new URLSearchParams({
+      template: tmpl,
+      title: `[Playground] Verified cell: ${combo}`,
+      model: cookbookModel,
+      combination: combo,
+      "cell-snippet": fields.cellSnippet || "",
+      "existing-cell": fields.existingCell || "",
+      "sglang-version": fields.sglangVersion || "",
+      "bench-result": fields.benchResult || "",
+      notes: fields.notes || "",
+    });
+    return `https://github.com/${owner}/${repo}/issues/new?${params.toString()}`;
+  };
+
+  // ==========================================================================
   // 8. Style helper (dark-mode-aware)
   // ==========================================================================
   const makeStyles = (isDark) => ({
@@ -1297,19 +1359,28 @@ export const Playground = ({ config }) => {
       color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
     }),
     headerLeft: { display: "inline-flex", alignItems: "center", gap: "8px" },
-    modalBackdrop: {
-      position: "fixed", inset: 0,
-      background: "rgba(0,0,0,0.5)",
-      display: "flex", alignItems: "center", justifyContent: "center",
-      zIndex: 9999,
-    },
-    modalBox: {
+    // Native <dialog> in top-layer mode (via .showModal()) bypasses all
+    // stacking-context rules — necessary because Mintlify's mdx-content
+    // container uses `container-type: inline-size` (CSS Container Queries),
+    // which makes it a containing block for `position: fixed` descendants
+    // and traps any plain fixed-position modal inside that container. The
+    // browser-native top layer is rendered ABOVE all page content,
+    // including the sticky Mintlify navbar.
+    //
+    // We style the dialog element directly. The ::backdrop pseudo-element
+    // can't be styled inline, so a small global stylesheet is injected
+    // once via useEffect.
+    dialog: {
       background: isDark ? "#1f2937" : "#fff",
       color: isDark ? "#e5e7eb" : "#111827",
       borderRadius: "8px", padding: "20px",
-      maxWidth: "720px", width: "92%", maxHeight: "85vh", overflowY: "auto",
+      maxWidth: "720px", width: "92%",
+      maxHeight: "calc(100vh - 80px)", overflowY: "auto",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       boxShadow: "0 10px 25px rgba(0,0,0,0.25)",
+      // Browser-default dialog margin = "auto" → centers in viewport,
+      // which is exactly what we want.
+      margin: "auto",
     },
     modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" },
     modalTitle: { fontSize: "15px", fontWeight: 600 },
@@ -1466,24 +1537,64 @@ export const Playground = ({ config }) => {
     });
   }, [base.hw, base.variant, base.quant, base.strategy, base.nodes]);
 
-  const [modal, setModal] = useState(null); // 'curl' | 'env' | null
+  const [modal, setModal] = useState(null); // 'curl' | 'env' | 'submit' | null
+
+  // Open the native <dialog> as soon as React mounts it. The callback-ref
+  // form fires once per mount so this is effectively "show on render". The
+  // top-layer behavior comes from .showModal() (NOT plain .show()) —
+  // showModal also handles ESC, focus trap, and body-scroll lock natively,
+  // which is why we no longer need a manual keydown / overflow effect.
+  const openDialog = (el) => {
+    if (el && !el.open) {
+      try { el.showModal(); } catch { /* already open or unsupported */ }
+    }
+  };
+
+  // Click-outside-to-close. Clicks on the ::backdrop dispatch to the dialog
+  // element itself, but with coordinates outside the dialog's bounding rect
+  // — checking the click point against the rect distinguishes "clicked the
+  // backdrop" from "clicked inside the box".
+  const onDialogClick = (e) => {
+    if (e.target !== e.currentTarget) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const { clientX: x, clientY: y } = e;
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) setModal(null);
+  };
+
+  // ::backdrop is a pseudo-element so it can't be styled inline. Inject
+  // a single dim-overlay rule into <head> once for the lifetime of the
+  // component instance.
   useEffect(() => {
-    if (modal === null) return;
-    const onKey = (e) => { if (e.key === "Escape") setModal(null); };
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      document.body.style.overflow = prev;
-    };
-  }, [modal]);
+    const ID = "__playground_dialog_backdrop";
+    if (document.getElementById(ID)) return undefined;
+    const style = document.createElement("style");
+    style.id = ID;
+    style.textContent = `dialog::backdrop { background: rgba(0, 0, 0, 0.5); }`;
+    document.head.appendChild(style);
+    return () => { const el = document.getElementById(ID); if (el) el.remove(); };
+  }, []);
 
   const [copied, setCopied] = useState(false);
   const [curlCopied, setCurlCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
   const [runMode, setRunMode] = useState("python");
+
+  // Submit-verified-cell modal state: free-text fields + the 3 required
+  // attestation booleans. Reset each time the modal opens so a re-open
+  // doesn't carry stale text into a different combination.
+  const [submitDraft, setSubmitDraft] = useState({
+    sglangVersion: "", benchResult: "", notes: "",
+  });
+  const [submitAttest, setSubmitAttest] = useState({
+    ranCommand: false, reachedReady: false, outputCorrect: false,
+  });
+  useEffect(() => {
+    if (modal === "submit") {
+      setSubmitDraft({ sglangVersion: "", benchResult: "", notes: "" });
+      setSubmitAttest({ ranCommand: false, reachedReady: false, outputCorrect: false });
+    }
+  }, [modal]);
 
   // ==========================================================================
   // 10. Derived values
@@ -1509,9 +1620,13 @@ export const Playground = ({ config }) => {
   let baseCommand = "";
   let playgroundCommand = "";
   let diffLines = [];
+  let pgFlagsLatest = [];
+  let pgEnvLatest = [];
   if (baseCell) {
     baseCommand = renderCommandLines(baseCell, baseCell.flags, baseCell.env, base, env, null, runMode);
     const { flags: pgFlags, env: pgEnv, pdMode } = applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap);
+    pgFlagsLatest = pgFlags;
+    pgEnvLatest = pgEnv;
     playgroundCommand = renderCommandLines(baseCell, pgFlags, pgEnv, base, env, pdMode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
@@ -1524,6 +1639,25 @@ export const Playground = ({ config }) => {
     !!(baseCell && baseCell.verified)
     && diffLines.length > 0
     && diffLines.every((d) => d.kind === "unchanged");
+
+  // Submission snippets — the proposed cell to add to the cookbook config,
+  // plus the existing one at the same match (for the maintainer's diff).
+  // Computed only when the playground actually differs from base; otherwise
+  // there's nothing to submit (the badge is already Verified).
+  const proposedCellSnippet = baseCell
+    ? serializeCell(base, pgEnvLatest, pgFlagsLatest) : "";
+  const existingCellSnippet = baseCell
+    ? serializeCell(base, baseCell.env || [], baseCell.flags) : "";
+  const submitUrl = baseCell ? buildSubmitUrl(base, {
+    cellSnippet: proposedCellSnippet,
+    existingCell: existingCellSnippet,
+    sglangVersion: submitDraft.sglangVersion,
+    benchResult: submitDraft.benchResult,
+    notes: submitDraft.notes,
+  }) : "";
+  const submitReady =
+    submitAttest.ranCommand && submitAttest.reachedReady && submitAttest.outputCorrect
+    && submitDraft.sglangVersion.trim().length > 0;
 
   const curlText = interpolate(config.curl || "", env, modelName);
 
@@ -1679,7 +1813,7 @@ export const Playground = ({ config }) => {
 
       {/* Command box (diff vs verified base) */}
       <div style={s.card}>
-        <div style={s.title}>Playground Command (diff vs verified base)</div>
+        <div style={s.title}>Playground Command (compare with base)</div>
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
             <div style={s.headerLeft}>
@@ -1712,6 +1846,19 @@ export const Playground = ({ config }) => {
               </button>
               <button style={s.iconButton} onClick={() => setModal("curl")}>$ cURL</button>
               <button style={s.iconButton} onClick={() => setModal("env")}>⚙ Env</button>
+              {/* "Submit verified cell" only makes sense when the playground
+                  differs from the verified base — otherwise there's nothing
+                  to submit. Hide the button when the badge is already green. */}
+              {!playgroundVerified && baseCell && (
+                <button
+                  style={{ ...s.iconButton, borderColor: isDark ? "#FDBA74" : "#FB923C",
+                           color: isDark ? "#FDBA74" : "#C2410C", fontWeight: 600 }}
+                  onClick={() => setModal("submit")}
+                  title="I verified this command on my hardware — open a pre-filled GitHub issue to land it as a cookbook cell."
+                >
+                  Verified ↗
+                </button>
+              )}
             </div>
           </div>
           <pre style={s.commandPre}>
@@ -1732,40 +1879,39 @@ export const Playground = ({ config }) => {
         </div>
       </div>
 
-      {/* cURL modal */}
+      {/* cURL modal — native <dialog> in top layer (escapes @container) */}
       {modal === "curl" && (
-        <div style={s.modalBackdrop} onClick={() => setModal(null)}>
-          <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
-            <div style={s.modalHeader}>
-              <div style={s.modalTitle}>cURL example</div>
-              <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
-            </div>
-            <div style={s.commandWrap}>
-              <div style={s.commandHeader}>
-                <div style={{ fontSize: 11, opacity: 0.7 }}>
-                  Model: <code>{modelName || "(unresolved)"}</code>
-                </div>
-                <button style={s.iconButton} onClick={copyCurl}>
-                  {curlCopied ? "✓ Copied" : "⧉ Copy"}
-                </button>
-              </div>
-              <pre style={s.commandPre}>{curlText}</pre>
-            </div>
-            <p style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>
-              Edit <code>CURL_HOST</code> / <code>CURL_PORT</code> in the Env panel.
-            </p>
+        <dialog ref={openDialog} style={s.dialog}
+                onClose={() => setModal(null)} onClick={onDialogClick}>
+          <div style={s.modalHeader}>
+            <div style={s.modalTitle}>cURL example</div>
+            <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
           </div>
-        </div>
+          <div style={s.commandWrap}>
+            <div style={s.commandHeader}>
+              <div style={{ fontSize: 11, opacity: 0.7 }}>
+                Model: <code>{modelName || "(unresolved)"}</code>
+              </div>
+              <button style={s.iconButton} onClick={copyCurl}>
+                {curlCopied ? "✓ Copied" : "⧉ Copy"}
+              </button>
+            </div>
+            <pre style={s.commandPre}>{curlText}</pre>
+          </div>
+          <p style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>
+            Edit <code>CURL_HOST</code> / <code>CURL_PORT</code> in the Env panel.
+          </p>
+        </dialog>
       )}
 
-      {/* Env modal */}
+      {/* Env modal — native <dialog> in top layer */}
       {modal === "env" && (
-        <div style={s.modalBackdrop} onClick={() => setModal(null)}>
-          <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
-            <div style={s.modalHeader}>
-              <div style={s.modalTitle}>Env / placeholder values</div>
-              <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
-            </div>
+        <dialog ref={openDialog} style={s.dialog}
+                onClose={() => setModal(null)} onClick={onDialogClick}>
+          <div style={s.modalHeader}>
+            <div style={s.modalTitle}>Env / placeholder values</div>
+            <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+          </div>
             {placeholderGroups.curl.length > 0 && (
               <div>
                 <div style={s.sectionHeading}>cURL placeholders</div>
@@ -1804,11 +1950,141 @@ export const Playground = ({ config }) => {
               <button style={{ ...s.iconButton, padding: "6px 14px" }} onClick={() => setModal(null)}>Cancel</button>
               <button style={s.primaryBtn} onClick={() => { saveEnv(envDraft); setModal(null); }}>Save</button>
             </div>
-            <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
-              Values persist in localStorage and are shared with §3.
+          <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
+            Values persist in localStorage and are shared with §3.
+          </p>
+        </dialog>
+      )}
+
+      {/* Submit-verified-cell modal — native <dialog> in top layer */}
+      {modal === "submit" && (
+        <dialog ref={openDialog} style={s.dialog}
+                onClose={() => setModal(null)} onClick={onDialogClick}>
+            <div style={s.modalHeader}>
+              <div style={s.modalTitle}>Submit verified cell</div>
+              <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+            </div>
+            <p style={{ fontSize: 12, opacity: 0.85, marginTop: 0, marginBottom: 12 }}>
+              You've put together a combination that isn't in the verified
+              catalog yet. After you've run the command end-to-end on the
+              target hardware, this submits a pre-filled GitHub Issue that a
+              maintainer can convert into a PR.
             </p>
-          </div>
-        </div>
+
+            <div style={s.sectionHeading}>Combination</div>
+            <code style={{ fontFamily: "Menlo, monospace", fontSize: 12 }}>
+              {base.hw} / {base.variant} / {base.quant} / {base.strategy} / {base.nodes}
+            </code>
+            {/* Overrides summary — the actual diff vs base in flag form.
+                Lists every added / removed line so the maintainer (and the
+                user double-checking) can see exactly what's new in this
+                submission without scrolling back to the command box. */}
+            {(() => {
+              const adds = diffLines.filter((d) => d.kind === "added");
+              const rems = diffLines.filter((d) => d.kind === "removed");
+              if (adds.length === 0 && rems.length === 0) return null;
+              return (
+                <>
+                  <div style={{ ...s.sectionHeading, marginTop: 10 }}>
+                    Overrides vs base ({adds.length} added · {rems.length} removed)
+                  </div>
+                  <pre style={{
+                    margin: 0, padding: "8px 10px",
+                    background: isDark ? "#111827" : "#f5f5f5",
+                    border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+                    borderRadius: 4,
+                    fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+                    fontSize: 12, lineHeight: 1.4,
+                    maxHeight: 160, overflowY: "auto",
+                    whiteSpace: "pre-wrap",
+                  }}>
+                    {[...rems, ...adds].map((d, i) => (
+                      <div
+                        key={i}
+                        style={d.kind === "added" ? s.diffLineAdded : s.diffLineRemoved}
+                      >
+                        {d.kind === "added" ? "+ " : "- "}
+                        {d.line.replace(/^\s*/, "")}
+                      </div>
+                    ))}
+                  </pre>
+                </>
+              );
+            })()}
+
+            <div style={{ ...s.sectionHeading, marginTop: 14 }}>Attestation (all required)</div>
+            <div style={s.formField}>
+              <label style={{ fontSize: 12, display: "flex", alignItems: "flex-start", gap: 6 }}>
+                <input type="checkbox" checked={submitAttest.ranCommand}
+                  onChange={(e) => setSubmitAttest({ ...submitAttest, ranCommand: e.target.checked })} />
+                I ran this exact command on the listed hardware.
+              </label>
+              <label style={{ fontSize: 12, display: "flex", alignItems: "flex-start", gap: 6 }}>
+                <input type="checkbox" checked={submitAttest.reachedReady}
+                  onChange={(e) => setSubmitAttest({ ...submitAttest, reachedReady: e.target.checked })} />
+                The server reached READY and answered a cURL request successfully.
+              </label>
+              <label style={{ fontSize: 12, display: "flex", alignItems: "flex-start", gap: 6 }}>
+                <input type="checkbox" checked={submitAttest.outputCorrect}
+                  onChange={(e) => setSubmitAttest({ ...submitAttest, outputCorrect: e.target.checked })} />
+                Output looked correct on at least one prompt.
+              </label>
+            </div>
+
+            <div style={{ ...s.sectionHeading, marginTop: 14 }}>SGLang version (required)</div>
+            <input
+              style={{ ...s.formInput, width: "100%", boxSizing: "border-box" }}
+              placeholder="sglang==0.5.4  (or git SHA abc1234)"
+              value={submitDraft.sglangVersion}
+              onChange={(e) => setSubmitDraft({ ...submitDraft, sglangVersion: e.target.value })}
+            />
+
+            <div style={{ ...s.sectionHeading, marginTop: 14 }}>Benchmark result (optional)</div>
+            <input
+              style={{ ...s.formInput, width: "100%", boxSizing: "border-box" }}
+              placeholder="TTFT 95 ms / TPOT 18 ms / 1820 tok/s @ bs=64"
+              value={submitDraft.benchResult}
+              onChange={(e) => setSubmitDraft({ ...submitDraft, benchResult: e.target.value })}
+            />
+
+            <div style={{ ...s.sectionHeading, marginTop: 14 }}>Notes / caveats (optional)</div>
+            <textarea
+              style={{ ...s.formInput, width: "100%", boxSizing: "border-box",
+                       minHeight: 110, resize: "vertical", fontFamily: "inherit" }}
+              placeholder="Cluster config, env-var quirks, NIC mappings, multi-node bootstrap details, …"
+              value={submitDraft.notes}
+              onChange={(e) => setSubmitDraft({ ...submitDraft, notes: e.target.value })}
+            />
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16, alignItems: "center" }}>
+              {!submitReady && (
+                <span style={{ fontSize: 11, opacity: 0.7, marginRight: "auto" }}>
+                  Tick all attestations and fill SGLang version to enable submit.
+                </span>
+              )}
+              <button style={{ ...s.iconButton, padding: "6px 14px" }} onClick={() => setModal(null)}>Cancel</button>
+              <a
+                href={submitReady ? submitUrl : undefined}
+                target="_blank" rel="noopener noreferrer"
+                onClick={(e) => { if (!submitReady) e.preventDefault(); else setModal(null); }}
+                style={{
+                  ...s.primaryBtn,
+                  textDecoration: "none",
+                  display: "inline-flex", alignItems: "center",
+                  opacity: submitReady ? 1 : 0.4,
+                  cursor: submitReady ? "pointer" : "not-allowed",
+                }}
+              >
+                Open submission on GitHub →
+              </a>
+            </div>
+          <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
+            The CTA opens a pre-filled GitHub Issue using the
+            <code> 3-playground-verified-cell.yml</code> template. A
+            maintainer with the listed hardware will review and convert it
+            into a cookbook PR.
+          </p>
+        </dialog>
       )}
     </div>
   );
