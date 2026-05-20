@@ -1339,6 +1339,10 @@ class ServerArgs:
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
+        # 19. NSA prefill context parallelism (attn_cp_size is set later in
+        # _handle_model_specific_adjustments, so check the flag directly here)
+        if self.enable_nsa_prefill_context_parallel:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
@@ -3166,22 +3170,6 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
-
-        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
-        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
-        # custom op (moe_impl), so bypassed topk is handled inside the op body.
-        if (
-            not self.enforce_piecewise_cuda_graph
-            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
-            and self.get_model_config().hf_config.architectures[0]
-            != "GptOssForCausalLM"
-        ):
-            self.disable_piecewise_cuda_graph = True
-            logger.info(
-                f"Piecewise cuda graph is disabled for MoE runner backend "
-                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
-                f"with torch.compile)."
-            )
 
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
