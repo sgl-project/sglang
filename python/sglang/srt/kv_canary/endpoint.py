@@ -183,6 +183,26 @@ def _resolve_real_kv_sources(
     return group.real_kv_sources_v
 
 
+_FULL_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
+    (CanaryLaunchTag.HEAD_K_FULL, "HEAD", "K"),
+    (CanaryLaunchTag.HEAD_V_FULL, "HEAD", "V"),
+    (CanaryLaunchTag.TAIL_K_FULL, "TAIL", "K"),
+    (CanaryLaunchTag.TAIL_V_FULL, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_FULL, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_FULL, "SWEEP", "V"),
+)
+
+
+_SWA_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
+    (CanaryLaunchTag.HEAD_K_SWA, "HEAD", "K"),
+    (CanaryLaunchTag.HEAD_V_SWA, "HEAD", "V"),
+    (CanaryLaunchTag.TAIL_K_SWA, "TAIL", "K"),
+    (CanaryLaunchTag.TAIL_V_SWA, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_SWA, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_SWA, "SWEEP", "V"),
+)
+
+
 def build_endpoints_from_group(
     *,
     group: CanaryBufferGroup,
@@ -203,14 +223,10 @@ def build_endpoints_from_group(
     groups and left None for FULL groups.
     """
     pool_kind = group.kind
-    expected_suffix = pool_kind.name
+    layout = _FULL_LAYOUT if pool_kind is PoolKind.FULL else _SWA_LAYOUT
 
     endpoints: list[CanaryEndpoint] = []
-    for tag in CanaryLaunchTag:
-        slot, half, suffix = tag.name.split("_")
-
-        if suffix != expected_suffix:
-            continue
+    for tag, slot, half in layout:
         if half == "V" and not group.has_v_half:
             continue
 
