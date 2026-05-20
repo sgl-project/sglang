@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -341,13 +342,18 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    if out_page_indices.shape[1] == 512:
-        module = _jit_topk_module()
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
     else:
-        module = _jit_topk1024_module()
-    module.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-    )
+        if out_page_indices.shape[1] == 512:
+            module = _jit_topk_module()
+        else:
+            module = _jit_topk1024_module()
+        module.topk_transform(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
 
 
 _WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
@@ -393,25 +399,38 @@ def hash_topk(
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
-    num_tokens = router_logits.size(0)
-    topk_routed = tid2eid.size(1)
-    topk_fused = topk_routed + num_fused_shared_experts
-    topk_ids = torch.empty(
-        (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
-    )
-    topk_weights = torch.empty(
-        (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
-    )
-    module = _jit_hash_topk_module()
-    module.hash_topk(
-        router_logits,
-        input_ids,
-        tid2eid,
-        topk_weights,
-        topk_ids,
-        routed_scaling_factor,
-    )
-    return topk_weights, topk_ids
+
+    if is_hip_runtime():
+        from sglang.jit_kernel.triton.hash_topk import hash_topk_triton
+
+        return hash_topk_triton(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            scoring_func,
+        )
+    else:
+        num_tokens = router_logits.size(0)
+        topk_routed = tid2eid.size(1)
+        topk_fused = topk_routed + num_fused_shared_experts
+        topk_ids = torch.empty(
+            (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+        )
+        topk_weights = torch.empty(
+            (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
+        )
+        module = _jit_hash_topk_module()
+        module.hash_topk(
+            router_logits,
+            input_ids,
+            tid2eid,
+            topk_weights,
+            topk_ids,
+            routed_scaling_factor,
+        )
+        return topk_weights, topk_ids
 
 
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
@@ -691,10 +710,27 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-    module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
-    )
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    else:
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module.forward(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
     return q_fp8, weights_out
 
 
@@ -853,13 +889,18 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    module = _jit_fused_store_module(
-        name=type,
-        input_dtype=input.dtype,
-        index_dtype=indices.dtype,
-        page_size=page_size,
-    )
-    module.run(input, cache, indices)
+    if is_hip_runtime() and envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
+
+        triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
+    else:
+        module = _jit_fused_store_module(
+            name=type,
+            input_dtype=input.dtype,
+            index_dtype=indices.dtype,
+            page_size=page_size,
+        )
+        module.run(input, cache, indices)
 
 
 def silu_and_mul_clamp(
@@ -1022,7 +1063,9 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def _dispatch_bf16_fp32_backend(
     x: torch.Tensor, y: torch.Tensor, *, algo: str
 ) -> torch.Tensor:
-    if algo == "cublas":
+    if _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
+    elif algo == "cublas":
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
     elif algo == "deep_gemm":
@@ -1031,7 +1074,5 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
-    elif _use_aiter:
-        return tgemm.mm(x, y, otype=torch.float32)
     else:
         return torch.nn.functional.linear(x.float(), y.float())
