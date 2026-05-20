@@ -56,6 +56,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    TORCH_DTYPE_TO_STR,
     assign_draft_cache_locs,
     draft_tp_context,
     fast_topk,
@@ -126,11 +127,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Match draft dtype to target. EAGLE-3 / MTP drafts share target's embed/lm_head
         # weights and aux hidden states; dtype divergence trips strict norm kernels.
-        server_args.dtype = {
-            torch.bfloat16: "bfloat16",
-            torch.float16: "float16",
-            torch.float32: "float32",
-        }[target_worker.model_runner.model_config.dtype]
+        server_args.dtype = TORCH_DTYPE_TO_STR[
+            target_worker.model_runner.model_config.dtype
+        ]
 
         # Do not capture cuda graph in `super().__init__()`
         # It will be captured later.
