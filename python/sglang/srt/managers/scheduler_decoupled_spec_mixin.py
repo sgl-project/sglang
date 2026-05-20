@@ -52,6 +52,20 @@ class DraftReqState:
     mamba_checkpoint_slots: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class DraftKVTruncation:
+    req_pool_idx: int
+    kv_start: int
+    kv_end: int
+
+
+@dataclass(frozen=True)
+class DraftBatchMetadataUpdate:
+    req_batch_idx: int
+    new_seq_len: int
+    new_tail_token_id: int
+
+
 class SchedulerDecoupledSpecMixin:
     """Decoupled-spec scheduler hooks and request lifecycle helpers."""
 
@@ -580,13 +594,115 @@ class SchedulerDecoupledSpecMixin:
         )
         mamba_restore_pairs.clear()
 
+    def _flush_draft_kv_truncations(
+        self: Scheduler,
+        kv_truncations: list[DraftKVTruncation],
+    ) -> None:
+        if not kv_truncations:
+            return
+
+        indices_to_free: list[torch.Tensor] = []
+        req_to_token = self.req_to_token_pool.req_to_token
+        for truncation in kv_truncations:
+            if truncation.kv_start >= truncation.kv_end:
+                continue
+            kv_indices = req_to_token[
+                truncation.req_pool_idx, truncation.kv_start : truncation.kv_end
+            ]
+            if len(kv_indices) > 0:
+                indices_to_free.append(kv_indices)
+
+        if indices_to_free:
+            self.token_to_kv_pool_allocator.free(torch.cat(indices_to_free))
+        kv_truncations.clear()
+
+    def _flush_draft_batch_metadata_updates(
+        self: Scheduler,
+        batch_metadata_updates: list[DraftBatchMetadataUpdate],
+    ) -> None:
+        if not batch_metadata_updates:
+            return
+
+        batch = self.running_batch
+        if batch is None or batch.is_empty():
+            raise RuntimeError(
+                "Decoupled draft batch metadata update requires a non-empty "
+                "running_batch. VerifyCommit metadata updates should only be "
+                "queued for requests in running_batch."
+            )
+        if (
+            batch.seq_lens_cpu is None
+            or batch.seq_lens is None
+            or batch.orig_seq_lens is None
+            or batch.output_ids is None
+            or batch.seq_lens_sum is None
+        ):
+            raise RuntimeError(
+                "Decoupled draft batch metadata update requires complete "
+                "running_batch metadata: seq_lens_cpu, seq_lens, "
+                "orig_seq_lens, output_ids, and seq_lens_sum must be set."
+            )
+
+        req_batch_idx_set = {update.req_batch_idx for update in batch_metadata_updates}
+        if len(req_batch_idx_set) != len(batch_metadata_updates):
+            raise RuntimeError(
+                "Decoupled draft batch metadata update received duplicate batch "
+                "indices in one flush. This indicates multiple VerifyCommit "
+                "rewrites for the same in-flight request."
+            )
+
+        req_batch_indices = [update.req_batch_idx for update in batch_metadata_updates]
+        new_seq_lens = [update.new_seq_len for update in batch_metadata_updates]
+        new_tail_token_ids = [
+            update.new_tail_token_id for update in batch_metadata_updates
+        ]
+
+        req_batch_indices_cpu = torch.tensor(req_batch_indices, dtype=torch.int64)
+        old_seq_lens_cpu = batch.seq_lens_cpu[req_batch_indices_cpu]
+        new_seq_lens_cpu = torch.tensor(
+            new_seq_lens, dtype=batch.seq_lens_cpu.dtype
+        )
+        batch.seq_lens_cpu[req_batch_indices_cpu] = new_seq_lens_cpu
+
+        req_batch_indices_device = req_batch_indices_cpu.to(
+            device=batch.seq_lens.device
+        )
+        batch.seq_lens[req_batch_indices_device] = torch.tensor(
+            new_seq_lens,
+            dtype=batch.seq_lens.dtype,
+            device=batch.seq_lens.device,
+        )
+
+        req_batch_indices_device = req_batch_indices_cpu.to(
+            device=batch.orig_seq_lens.device
+        )
+        batch.orig_seq_lens[req_batch_indices_device] = torch.tensor(
+            new_seq_lens,
+            dtype=batch.orig_seq_lens.dtype,
+            device=batch.orig_seq_lens.device,
+        )
+
+        req_batch_indices_device = req_batch_indices_cpu.to(
+            device=batch.output_ids.device
+        )
+        batch.output_ids[req_batch_indices_device] = torch.tensor(
+            new_tail_token_ids,
+            dtype=batch.output_ids.dtype,
+            device=batch.output_ids.device,
+        )
+
+        batch.seq_lens_sum += int((new_seq_lens_cpu - old_seq_lens_cpu).sum().item())
+
+        batch_metadata_updates.clear()
+
     def apply_verify_commit(
         self: Scheduler,
         req: Req,
         message: VerifyCommit,
         *,
-        batch: Optional[ScheduleBatch] = None,
         req_batch_idx: Optional[int] = None,
+        kv_truncations: list[DraftKVTruncation],
+        batch_metadata_updates: list[DraftBatchMetadataUpdate],
         mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
         """
@@ -740,11 +856,13 @@ class SchedulerDecoupledSpecMixin:
                     req.kv_allocated_len, prompt_len + len(req.output_ids)
                 )
                 if kv_truncate_from < trimmed_end:
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, kv_truncate_from:trimmed_end
-                    ]
-                    if len(indices_to_free) > 0:
-                        self.token_to_kv_pool_allocator.free(indices_to_free)
+                    kv_truncations.append(
+                        DraftKVTruncation(
+                            req_pool_idx=int(req.req_pool_idx),
+                            kv_start=kv_truncate_from,
+                            kv_end=trimmed_end,
+                        )
+                    )
                 req.kv_committed_len = min(req.kv_committed_len, kv_truncate_from)
                 req.kv_allocated_len = min(req.kv_allocated_len, kv_truncate_from)
                 req.cache_protected_len = min(req.cache_protected_len, kv_truncate_from)
@@ -799,7 +917,15 @@ class SchedulerDecoupledSpecMixin:
         state.verifier_committed_prefix_len = new_committed_len
         self._prune_draft_mamba_checkpoints(state)
 
-        if batch is not None and req_batch_idx is not None:
+        if req_batch_idx is not None:
+            batch = self.running_batch
+            if batch is None or batch.is_empty():
+                raise RuntimeError(
+                    "Decoupled draft verify commit received a running batch "
+                    "index, but running_batch is empty: "
+                    f"request_id={state.key.request_id} "
+                    f"req_batch_idx={req_batch_idx}"
+                )
             if not (0 <= req_batch_idx < len(batch.reqs)):
                 raise RuntimeError(
                     "Decoupled draft verify commit received an invalid batch "
@@ -842,34 +968,6 @@ class SchedulerDecoupledSpecMixin:
                     f"Draft request {req.rid} has no token to decode from"
                 )
 
-            old_seq_len = None
-            if batch.seq_lens_cpu is not None:
-                # Save the old per-request seq_len so seq_lens_sum can be adjusted by
-                # delta. req_batch_idx is the inclusive index of this req in batch.reqs.
-                old_seq_len = int(batch.seq_lens_cpu[req_batch_idx].item())
-                batch.seq_lens_cpu[req_batch_idx] = new_seq_len
-
-            # Mirror the same new_seq_len into every per-request seq_len buffer.
-            if batch.seq_lens is not None:
-                batch.seq_lens[req_batch_idx] = new_seq_len
-            if batch.orig_seq_lens is not None:
-                batch.orig_seq_lens[req_batch_idx] = new_seq_len
-
-            # The batch-level output_ids entry is not the whole output sequence. It is
-            # exactly the one tail token for this request's next decode step.
-            if batch.output_ids is not None:
-                batch.output_ids[req_batch_idx] = new_tail_token_id
-
-            if batch.seq_lens_sum is not None:
-                if old_seq_len is not None:
-                    # Incrementally maintain sum(seq_lens). This is equivalent to
-                    # replacing one element: sum' = sum - old_seq_len + new_seq_len.
-                    batch.seq_lens_sum += new_seq_len - old_seq_len
-                elif batch.seq_lens_cpu is not None:
-                    # Fallback when the old value was unavailable: recompute the full
-                    # sum over all requests in the batch.
-                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-
             if new_seq_len > min(req.kv_committed_len, req.kv_allocated_len):
                 raise RuntimeError(
                     "Decoupled draft batch seq_len points beyond materialized KV "
@@ -879,6 +977,13 @@ class SchedulerDecoupledSpecMixin:
                     f"kv_committed_len={req.kv_committed_len} "
                     f"kv_allocated_len={req.kv_allocated_len}"
                 )
+            batch_metadata_updates.append(
+                DraftBatchMetadataUpdate(
+                    req_batch_idx=req_batch_idx,
+                    new_seq_len=new_seq_len,
+                    new_tail_token_id=new_tail_token_id,
+                )
+            )
 
     def release_draft_request(self: Scheduler, req: Req) -> None:
         """
@@ -955,21 +1060,21 @@ class SchedulerDecoupledSpecMixin:
         state.verifier_committed_prefix_len = len(req.output_ids)
         return req
 
-    def _find_draft_req_batch(
+    def _find_req_in_running_batch_idx(
         self: Scheduler,
         req: Req,
-    ) -> tuple[Optional[ScheduleBatch], Optional[int]]:
-        for batch in (self.running_batch, self.last_batch, self.cur_batch):
-            if batch is None or batch.is_empty():
-                continue
+    ) -> Optional[int]:
+        batch = self.running_batch
+        if batch is not None and not batch.is_empty():
             for req_batch_idx, batch_req in enumerate(batch.reqs):
                 if batch_req is req:
-                    return batch, req_batch_idx
-        return None, None
-
+                    return req_batch_idx
+        return None
 
     def _apply_pending_verify_commits(self: Scheduler) -> list[VerifyCommit]:
         mamba_restore_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        kv_truncations: list[DraftKVTruncation] = []
+        batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
         applied_commits: list[VerifyCommit] = []
 
         for state in list(self.draft_req_table.values()):
@@ -988,16 +1093,19 @@ class SchedulerDecoupledSpecMixin:
                     # The draft request has not materialized the bonus token position.
                     break
                 state.pending_verify_commits.popleft()
-                batch, req_batch_idx = self._find_draft_req_batch(req)
+                req_batch_idx = self._find_req_in_running_batch_idx(req)
                 self.apply_verify_commit(
                     req,
                     verify_commit,
-                    batch=batch,
                     req_batch_idx=req_batch_idx,
+                    kv_truncations=kv_truncations,
+                    batch_metadata_updates=batch_metadata_updates,
                     mamba_restore_pairs=mamba_restore_pairs,
                 )
                 applied_commits.append(verify_commit)
 
+        self._flush_draft_kv_truncations(kv_truncations)
+        self._flush_draft_batch_metadata_updates(batch_metadata_updates)
         self._flush_draft_mamba_checkpoint_restores(mamba_restore_pairs)
         return applied_commits
 

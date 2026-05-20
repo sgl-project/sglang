@@ -1562,8 +1562,6 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            if self.spec_algorithm.is_decoupled_draft():
-                self.sync_draft_requests()
             if self._engine_paused:
                 continue
 
@@ -2577,8 +2575,10 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
-        # for decoupled drafter, after applying VerifyCommit messages, some sleeping draft requests need to be woken up
+        # For decoupled drafter, apply verifier control messages after last_batch
+        # has been merged into running_batch, then wake sleeping requests.
         if self.spec_algorithm.is_decoupled_draft():
+            self.sync_draft_requests()
             self.wake_draft_sleeping_requests()
 
         if self.dllm_config is not None:
