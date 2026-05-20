@@ -26,7 +26,6 @@ import itertools
 
 import pytest
 import torch
-
 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -43,15 +42,10 @@ PAGE_SIZE = 64
 DEVICE = "cuda"
 
 
-# -----------------------------------------------------------------------------
-# Pure-PyTorch reference (oracle).
-#
-# Mirrors the .cuh in exact integer arithmetic: ceil-div via int64 to
-# dodge overflow for batch_size * MAX_SEQ_LEN / kSplitKV, then Phase-3
-# host-side greedy advance. Stays in Python ints throughout to match the
-# kernel's uint32 semantics. Output is int32 [num_sm+1, 2]; row i holds
-# (start_batch_idx, intra_batch_offset).
-# -----------------------------------------------------------------------------
+# Algorithmic spec for the int32 [num_sm+1, 2] schedule. Ground-truth
+# correctness is gated by ``test_matches_deep_gemm`` below; this ref is
+# used by the wider envelope tests where deep_gemm exceeds the sm_90
+# smem cap.
 def paged_mqa_metadata_ref(
     seq_lens: torch.Tensor, num_sm: int, page_size: int
 ) -> torch.Tensor:
@@ -223,6 +217,47 @@ def test_matches_pytorch_ref_at_large_num_sm(bs: int, num_sm: int):
     assert torch.equal(got, ref), (
         f"kernel != ref at bs={bs} num_sm={num_sm}; "
         f"last-5 rows: got={got[-5:].tolist()} ref={ref[-5:].tolist()}"
+    )
+
+
+def _to_2d_context_lens(seq_lens: torch.Tensor) -> torch.Tensor:
+    return seq_lens.contiguous().view(-1, 1)
+
+
+def _load_deep_gemm():
+    try:
+        import deep_gemm  # noqa: PLC0415
+
+        return deep_gemm
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"deep_gemm unavailable: {type(e).__name__}: {e}")
+
+
+@pytest.mark.parametrize(
+    "bs", [64, 128, 1025, 2048, 4096, 8192, 32768, 65536]
+)
+@pytest.mark.parametrize("max_ctx", [256, 32768])
+def test_matches_deep_gemm(bs: int, max_ctx: int):
+    """Byte-equal against the production deep_gemm reference. Auto-skips
+    at large bs where deep_gemm exceeds sm_90 smem cap."""
+    deep_gemm = _load_deep_gemm()
+    seq_lens = _make_seq_lens(bs, max_ctx)
+    got = get_paged_mqa_logits_metadata(seq_lens, PAGE_SIZE, NUM_SM)
+    try:
+        dg = deep_gemm.get_paged_mqa_logits_metadata(
+            _to_2d_context_lens(seq_lens), PAGE_SIZE, NUM_SM
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if "smem" in msg.lower() or "capacity" in msg.lower():
+            pytest.skip(
+                f"deep_gemm smem cap exceeded at bs={bs}: {msg.splitlines()[0]}"
+            )
+        raise
+    assert torch.equal(got, dg), (
+        f"kernel != deep_gemm for bs={bs} max_ctx={max_ctx}\n"
+        f"  kernel first row: {got[0].tolist()}\n"
+        f"  dg     first row: {dg[0].tolist()}"
     )
 
 

@@ -15,8 +15,6 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 namespace {
 
@@ -298,43 +296,14 @@ __global__ __launch_bounds__(kKernelBThreads, 1)  //
   }
 }
 
-// Per-device scratch cache for the multi-block path. Synchronous cudaMalloc
-// (host-side, returns void*; issues no stream work) is used so the cache
-// hit path is safe under CUDA Graph capture/replay (warmup populates,
-// capture/replay does pointer lookup only).
-struct WorkspaceState {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-};
-
-inline auto get_cached_workspace(size_t required_bytes, int device_id) -> void* {
-  if (required_bytes == 0) return nullptr;
-
-  static std::mutex mu;
-  static std::unordered_map<int, WorkspaceState> cache;
-  std::lock_guard<std::mutex> lock(mu);
-  auto& ws = cache[device_id];
-
-  if (ws.ptr != nullptr && ws.bytes >= required_bytes) {
-    return ws.ptr;
-  }
-
-  host::RuntimeDeviceCheck(::cudaSetDevice(device_id));
-  if (ws.ptr != nullptr) {
-    host::RuntimeDeviceCheck(::cudaFree(ws.ptr));
-    ws.ptr = nullptr;
-    ws.bytes = 0;
-  }
-  host::RuntimeDeviceCheck(::cudaMalloc(&ws.ptr, required_bytes));
-  ws.bytes = required_bytes;
-  return ws.ptr;
-}
-
 struct IndexerMetadataKernel {
-  static void run(tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView metadata) {
+  static void run(tvm::ffi::TensorView seq_lens,
+                  tvm::ffi::TensorView metadata,
+                  tvm::ffi::TensorView workspace) {
     using namespace host;
     auto N = SymbolicSize{"batch_size"};
     auto M = SymbolicSize{"num_sm"};
+    auto W = SymbolicSize{"workspace"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     TensorMatcher({N})  //
@@ -345,6 +314,10 @@ struct IndexerMetadataKernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(metadata);
+    TensorMatcher({W})  //
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(workspace);
 
     const auto batch_size = static_cast<uint32_t>(N.unwrap());
     const auto num_sm = static_cast<uint32_t>(M.unwrap()) - 1;
@@ -365,8 +338,10 @@ struct IndexerMetadataKernel {
       LaunchKernel(1, kSmallBlock, dl_device)(paged_mqa_metadata_small_kernel, params);
     } else {
       const auto num_tiles = (batch_size + kMBTileSize - 1) / kMBTileSize;
-      const auto ws_bytes = static_cast<size_t>(batch_size + num_tiles) * sizeof(uint32_t);
-      auto* scratch_prefix = static_cast<uint32_t*>(get_cached_workspace(ws_bytes, dl_device.device_id));
+      const auto required = static_cast<int64_t>(batch_size) + num_tiles;
+      RuntimeCheck(static_cast<int64_t>(W.unwrap()) >= required,
+                   "workspace too small for multi-block path");
+      auto* scratch_prefix = static_cast<uint32_t*>(workspace.data_ptr());
       auto* tile_sums = scratch_prefix + batch_size;
 
       LaunchKernel(num_tiles, kMBBlockSize, dl_device)(phase1_tile_scan_kernel, params, scratch_prefix, tile_sums);
