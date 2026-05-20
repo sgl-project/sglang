@@ -226,6 +226,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Using one backend for denoising metadata.",
                 sorted(backend.name.lower() for backend in backends),
             )
+        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in backends:
+            return AttentionBackendEnum.VIDEO_SPARSE_ATTN
         return sorted(backends, key=lambda backend: backend.name)[0]
 
     def component_uses(

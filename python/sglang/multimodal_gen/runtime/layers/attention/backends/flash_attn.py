@@ -286,7 +286,7 @@ def flash_attn_varlen_func_op_lse(
     )
 
 
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # noqa: E402
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
@@ -381,8 +381,12 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
+        attn_metadata = get_forward_context().attn_metadata
+        if (
+            attn_metadata is not None
+            and hasattr(attn_metadata, "max_seqlen_q")
+            and attn_metadata.max_seqlen_q is None
+        ):
             attn_metadata.max_seqlen_q = query.shape[1]
             attn_metadata.max_seqlen_k = key.shape[1]
             max_seqlen_q = attn_metadata.max_seqlen_q

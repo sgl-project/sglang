@@ -8,9 +8,15 @@ from dataclasses import dataclass
 import torch
 
 try:
-    from vsa import video_sparse_attn
+    from vsa import torch_attention, video_sparse_attn
+
+    from vsa.block_sparse_attn_triton import triton_block_sparse_attn_forward
 except ImportError:
+    torch_attention = None
+    triton_block_sparse_attn_forward = None
     video_sparse_attn = None
+
+from collections.abc import Callable
 
 from typing import Any
 
@@ -121,6 +127,86 @@ def get_non_pad_index(
         < variable_block_sizes[:, None]
     )
     return index_pad[index_mask]
+
+
+def _use_index_native_vsa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate_compress: torch.Tensor | None,
+) -> bool:
+    if torch_attention is None or triton_block_sparse_attn_forward is None:
+        return False
+    if not torch.is_grad_enabled():
+        return True
+    return not any(
+        tensor is not None and tensor.requires_grad
+        for tensor in (query, key, value, gate_compress)
+    )
+
+
+def _video_sparse_attn_index_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    topk: int,
+    block_size: int | tuple[int, int, int],
+    compress_attn_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if isinstance(block_size, int):
+        block_size = (block_size, block_size, block_size)
+
+    block_elements = math.prod(block_size)
+    assert block_elements == math.prod(VSA_TILE_SIZE)
+    assert q.shape[2] % block_elements == 0
+
+    batch_size, num_heads, seq_len, head_dim = q.shape
+    num_blocks = seq_len // block_elements
+    block_sizes = variable_block_sizes.view(1, 1, -1, 1)
+    q_compress = (
+        q.view(batch_size, num_heads, num_blocks, block_elements, head_dim)
+        .float()
+        .sum(dim=3)
+        / block_sizes
+    ).to(q.dtype)
+    k_compress = (
+        k.view(batch_size, num_heads, num_blocks, block_elements, head_dim)
+        .float()
+        .sum(dim=3)
+        / block_sizes
+    ).to(k.dtype)
+    v_compress = (
+        v.view(batch_size, num_heads, num_blocks, block_elements, head_dim)
+        .float()
+        .sum(dim=3)
+        / block_sizes
+    ).to(v.dtype)
+
+    output_compress, block_attn_score = torch_attention(q_compress, k_compress, v_compress)
+    output_compress = (
+        output_compress.view(batch_size, num_heads, num_blocks, 1, head_dim)
+        .repeat(1, 1, 1, block_elements, 1)
+        .view(batch_size, num_heads, seq_len, head_dim)
+    )
+
+    q2k_idx = torch.topk(block_attn_score, topk, dim=-1).indices.to(torch.int32)
+    q2k_idx = q2k_idx.contiguous()
+    q2k_num = torch.full(
+        q2k_idx.shape[:-1], topk, dtype=torch.int32, device=q2k_idx.device
+    )
+    output_select, _ = triton_block_sparse_attn_forward(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        q2k_idx,
+        q2k_num,
+        variable_block_sizes.to(torch.int32).contiguous(),
+    )
+
+    if compress_attn_weight is not None:
+        return output_compress * compress_attn_weight + output_select
+    return output_compress + output_select
 
 
 class VideoSparseAttentionBackend(AttentionBackend):
@@ -319,7 +405,12 @@ class VideoSparseAttentionImpl(AttentionImpl):
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")
-        hidden_states = video_sparse_attn(
+        attn_fn: Callable[..., torch.Tensor]
+        if _use_index_native_vsa(query, key, value, gate_compress):
+            attn_fn = _video_sparse_attn_index_native
+        else:
+            attn_fn = video_sparse_attn
+        hidden_states = attn_fn(
             query,
             key,
             value,
