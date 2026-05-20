@@ -210,9 +210,7 @@ class TestFlashInferTrtllmBf16HotUpdate(CustomTestCase):
                         padded_per_rank_size : padded_per_rank_size + per_rank_size,
                         :,
                     ],
-                    full_w13[
-                        :, first_half_start : first_half_start + per_rank_size, :
-                    ],
+                    full_w13[:, first_half_start : first_half_start + per_rank_size, :],
                 )
 
     def test_tp_padded_load_uses_unpadded_source_shard(self):
