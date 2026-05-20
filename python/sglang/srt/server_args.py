@@ -2194,7 +2194,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch == "Gemma4ForConditionalGeneration":
+        elif model_arch in (
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+        ):
             default_attention_backend = (
                 "trtllm_mha" if is_sm100_supported() else "triton"
             )
@@ -2219,6 +2222,16 @@ class ServerArgs:
                 "Gemma4 only supports trtllm_mha or triton attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
+
+            if (
+                is_sm100_supported()
+                and self.moe_runner_backend == "auto"
+                and self.quantization == "modelopt_fp4"
+            ):
+                self.moe_runner_backend = "flashinfer_trtllm"
+                logger.info(
+                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
+                )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
