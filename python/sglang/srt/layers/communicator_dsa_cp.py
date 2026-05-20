@@ -18,9 +18,9 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -40,14 +40,14 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def nsa_enable_prefill_cp():
+def dsa_enable_prefill_cp():
     # After using cp, the communication mode of this part changes.
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
-    return is_nsa_enable_prefill_cp()
+    return is_dsa_enable_prefill_cp()
 
 
-class NSACPLayerCommunicator(LayerCommunicator):
+class DSACPLayerCommunicator(LayerCommunicator):
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
@@ -73,19 +73,19 @@ class NSACPLayerCommunicator(LayerCommunicator):
             assert (
                 self._context.attn_dp_size == 1
             ), f"dp_size should be 1 when moe_runner_backend is none"
-        self._communicate_simple_fn = NSACPCommunicateSimpleFn.get_fn(
+        self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = NSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+        self._communicate_with_all_reduce_and_layer_norm_fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
             hidden_states_input_mode=ScatterMode.SCATTERED,
             residual_input_mode=ScatterMode.SCATTERED,
             hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
             residual_output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_summable_tensor_pair_fn = NSACPCommunicateSummableTensorPairFn.get_fn(
+        self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
@@ -93,7 +93,7 @@ class NSACPLayerCommunicator(LayerCommunicator):
         )
 
 
-class NSACPCommunicateSimpleFn(CommunicateSimpleFn):
+class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
     @staticmethod
     def get_fn(
         input_mode: ScatterMode,
@@ -101,12 +101,12 @@ class NSACPCommunicateSimpleFn(CommunicateSimpleFn):
         context: CommunicateContext,
     ):
         if context.is_same_group_size(input_mode, output_mode):
-            return NSACPCommunicateSimpleFn._trivial
+            return DSACPCommunicateSimpleFn._trivial
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
-class NSACPCommunicateWithAllReduceAndLayerNormFn(
+class DSACPCommunicateWithAllReduceAndLayerNormFn(
     CommunicateWithAllReduceAndLayerNormFn
 ):
     """Besides communication, needs to
@@ -126,11 +126,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         assert residual_input_mode == ScatterMode.SCATTERED
         assert residual_output_mode == ScatterMode.SCATTERED
         if hidden_states_output_mode == ScatterMode.SCATTERED:
-            return NSACPCommunicateWithAllReduceAndLayerNormFn._simple
+            return DSACPCommunicateWithAllReduceAndLayerNormFn._simple
 
         if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
-                NSACPCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                DSACPCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -152,7 +152,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(get_attention_cp_group()),
@@ -165,7 +165,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         return hidden_states, residual
 
 
-class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
+class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
     @staticmethod
@@ -184,12 +184,12 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.SCATTERED)
         ):
-            return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
+            return DSACPCommunicateSummableTensorPairFn._scatter_hidden_states
 
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return NSACPCommunicateSummableTensorPairFn._trivial
+            return DSACPCommunicateSummableTensorPairFn._trivial
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
@@ -205,7 +205,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states
             hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
