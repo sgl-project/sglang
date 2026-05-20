@@ -701,7 +701,7 @@ def ensure_workspace_initialized(
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
-    effective_dtype = dtype or torch.
+    effective_dtype = dtype or torch.bfloat16
     server_backend = get_global_server_args().flashinfer_allreduce_fusion_backend
     if server_backend is None:
         return False
