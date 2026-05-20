@@ -132,9 +132,9 @@ class TestSelfUnitRunner(CustomTestCase):
         ):
             runner = _make_runner(device=self.device)
             fb = _make_forward_batch(self.device)
-            runner.before_forward(fb)
-            runner.launch_head_kernels(fb)
-            runner.launch_tail_kernels(fb)
+            with runner.with_forward_pass(fb):
+                runner.launch_head_kernels(fb)
+                runner.launch_tail_kernels(fb)
 
         self.assertEqual(calls[0], "plan")
         self.assertTrue(
@@ -161,8 +161,8 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
-        runner.before_forward(fb)
-        runner.launch_head_kernels(fb)
+        with runner.with_forward_pass(fb):
+            runner.launch_head_kernels(fb)
 
         sweep_calls: List[int] = []
         real_maybe = runner._sweep_orchestrator.maybe_run_sweep
@@ -175,7 +175,8 @@ class TestSelfUnitRunner(CustomTestCase):
 
         with patch.object(runner._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
-                runner.end_of_step()
+                with runner.with_forward_pass(fb):
+                    pass
         self.assertEqual(sweep_calls, [0, 4, 8])
 
     def test_sweep_runs_radix_path(self):
@@ -187,8 +188,8 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
-        runner.before_forward(fb)
-        runner.launch_head_kernels(fb)
+        with runner.with_forward_pass(fb):
+            runner.launch_head_kernels(fb)
 
         cache = make_radix_cache([[], [10, 11]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
@@ -257,11 +258,10 @@ class TestSelfUnitRunner(CustomTestCase):
             lambda **kwargs: plan_calls.append("plan"),
         ):
             fb = _make_forward_batch(self.device)
-            runner.before_forward(fb)
-            runner.launch_head_kernels(fb)
-            runner.launch_tail_kernels(fb)
+            with runner.with_forward_pass(fb):
+                runner.launch_head_kernels(fb)
+                runner.launch_tail_kernels(fb)
             runner._sweep_orchestrator.maybe_run_sweep()
-            runner.end_of_step()
         self.assertEqual(plan_calls, [])
 
     def test_periodic_stats_log_every_n_step(self):
@@ -307,9 +307,9 @@ class TestSelfUnitRunner(CustomTestCase):
             lambda **kwargs: counters.append(kwargs["kernel_kind"].name),
         ), patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None):
             fb = _make_forward_batch(self.device)
-            runner.before_forward(fb)
-            runner.launch_head_kernels(fb)
-            runner.launch_tail_kernels(fb)
+            with runner.with_forward_pass(fb):
+                runner.launch_head_kernels(fb)
+                runner.launch_tail_kernels(fb)
         self.assertTrue(any("HEAD" in name for name in counters))
         self.assertTrue(any("TAIL" in name for name in counters))
 
@@ -322,8 +322,8 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
-        runner.before_forward(fb)
-        runner.launch_head_kernels(fb)
+        with runner.with_forward_pass(fb):
+            runner.launch_head_kernels(fb)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)

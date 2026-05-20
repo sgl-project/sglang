@@ -193,16 +193,13 @@ class CanaryRunner:
         from the monkey-patched ``model.forward`` so they are captured (and auto-replayed) the
         same way the model itself is.
         """
-        self.before_forward(forward_batch)
+        self._before_forward(forward_batch)
         try:
             yield
         finally:
-            self.end_of_step()
+            self._end_of_step()
 
-    def before_forward(self, forward_batch: "ForwardBatch") -> None:
-        """Host-side prep (perturb + plan-input fill). Runs OUTSIDE the cuda-graph capture
-        region. Prefer ``with_forward_pass`` over calling this + ``end_of_step`` directly.
-        """
+    def _before_forward(self, forward_batch: "ForwardBatch") -> None:
         self._per_forward_orchestrator.before_forward(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
@@ -215,12 +212,7 @@ class CanaryRunner:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def end_of_step(self) -> None:
-        """Sweep + async D2H pump + step bump + drain previous pump + allreduce + raise.
-
-        Host-side, runs in ``ModelRunner.forward`` AFTER ``graph_runner.replay()`` /
-        ``model.forward()`` returns.
-        """
+    def _end_of_step(self) -> None:
         if self.config.mode == "off":
             return
 
