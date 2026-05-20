@@ -535,7 +535,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         active_keywords=(
             "fused_metadata_copy",
             "fused_metadata_copy_multi",
-            "fused_nsa_cache_seqlens",
+            "fused_dsa_cache_seqlens",
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
