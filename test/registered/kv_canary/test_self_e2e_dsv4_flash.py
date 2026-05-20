@@ -11,7 +11,7 @@ register_cuda_ci(est_time=1200, stage="extra-a", runner_config="dsv4-8-gpu-h200"
 
 
 _DSV4_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
-# SOT-required: 5 layers + compress_ratios [0, 0, 4, 128, 4] to cover all three
+# 5 layers + compress_ratios [0, 0, 4, 128, 4] to cover all three
 # DSV4 compression flavours (full / c4 / c128). The 128 axis is load-bearing —
 # c128 is what makes DSV4 unique.
 #

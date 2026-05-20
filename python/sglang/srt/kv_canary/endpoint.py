@@ -44,7 +44,7 @@ class CanaryEndpoint:
             buffer with one of head/tail (typically tail — sweep verifies the most recent canary state).
         full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. None iff this
             endpoint is on the FULL group.
-        real_kv_sources: RealKvSource tuple folded into real_kv_hash. Length 0..4 (kernels.md §2.4.1).
+        real_kv_sources: RealKvSource tuple folded into real_kv_hash. Length 0..4.
             Empty tuple disables the mixin for this endpoint.
         slot_run_counter_view: One-element int64 view into CanaryDeviceState.slot_run_counters at
             kernel_kind's slot index.

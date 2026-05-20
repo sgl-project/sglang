@@ -6,6 +6,10 @@ from sglang.jit_kernel.kv_canary.verify import (
     _FAIL_REASON_BIT_CHAIN_HASH,
     _FAIL_REASON_BIT_POSITION,
     _FAIL_REASON_BIT_REAL_KV_HASH,
+    _FIELD_POSITION,
+    _FIELD_PREV_HASH,
+    _FIELD_REAL_KV_HASH,
+    _FIELD_TOKEN,
     _VIOLATION_FIELD_EXPECTED_AUX,
     _VIOLATION_FIELD_EXPECTED_TOKEN,
     _VIOLATION_FIELD_FAIL_REASON_BITS,
@@ -24,12 +28,6 @@ from sglang.jit_kernel.kv_canary.verify import (
 
 _U64_MASK: int = (1 << 64) - 1
 _I64_SIGN_BIT: int = 1 << 63
-
-# Canary slot field offsets within the 4-int64 layout.
-_FIELD_TOKEN: int = 0
-_FIELD_POSITION: int = 1
-_FIELD_PREV_HASH: int = 2
-_FIELD_REAL_KV_HASH: int = 3
 
 
 def canary_verify_step_torch_reference(
