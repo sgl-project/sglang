@@ -1386,11 +1386,14 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            # Reserve extra space in kv_indices for a potential piecewise CUDA graph
-            # dummy request (see below). Worst case: static_num_tokens extra pages.
+            # Reserve extra space in kv_indices for a potential padding dummy request
+            # (piecewise CUDA graph or DP-attention). Worst case: padded_num_tokens pages.
             fwd_ctx = get_forward_context()
             pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
-            extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
+            padded_num_tokens = (
+                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
+            )
+            extra_kv = max(pcg_num_tokens or 0, padded_num_tokens or 0)
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + extra_kv + 256,
                 dtype=torch.int32,
@@ -1408,33 +1411,26 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
-            # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
-            # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
-            # Append a dummy request for the padding tokens so that
-            # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
-            # without corrupting the causal masks of real requests.
+            # Padding for piecewise CUDA graph or DP-attention: input_ids are padded
+            # to a target token count, so q.shape[0] == target but qo_indptr[-1] ==
+            # actual tokens. Append a dummy request for the padding tokens so that
+            # qo_indptr[-1] == target, satisfying flashinfer's shape check without
+            # corrupting the causal masks of real requests.
             # The dummy request's KV indices all point to slot 0 (a scratch location);
             # its attention output is discarded via the [:raw_num_tokens] slice in replay.
             bs_eff = bs
-            # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
-            # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
-            # so this block requires no CPU-GPU synchronisation.
-            actual_qo_tokens = (
-                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
-            )
-            if (
-                pcg_num_tokens is not None
-                and actual_qo_tokens is not None
-                and pcg_num_tokens > actual_qo_tokens
-            ):
-                pad_tokens = pcg_num_tokens - actual_qo_tokens
+            target_num_tokens = pcg_num_tokens or padded_num_tokens
+            # qo_indptr[-1] is the real token count from cumsum(seq_lens - prefix_lens)
+            real_qo_tokens = qo_indptr[-1].item()
+            if target_num_tokens is not None and target_num_tokens > real_qo_tokens:
+                pad_tokens = target_num_tokens - real_qo_tokens
                 num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
                 kv_start = (
                     paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
                 )
                 kv_indices[kv_start : kv_start + num_dummy_pages] = 0
                 qo_indptr = torch.cat(
-                    [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
+                    [qo_indptr, qo_indptr.new_tensor([target_num_tokens])]
                 )
                 kv_indptr = torch.cat(
                     [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
