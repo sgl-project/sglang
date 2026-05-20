@@ -18,7 +18,6 @@ This module provides the /v1/loads endpoint which returns detailed scheduler
 metrics for load balancing, monitoring, and capacity planning.
 """
 
-import dataclasses
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -26,25 +25,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from sglang.srt.managers.io_struct import (
-    DisaggregationMetrics,
-    GetLoadsReqOutput,
-    LoRAMetrics,
-    MemoryMetrics,
-    QueueMetrics,
-    SpeculativeMetrics,
-)
 from sglang.version import __version__
 
 router = APIRouter()
-
-_OPTIONAL_METRIC_SECTIONS = {
-    "memory": ("memory", MemoryMetrics),
-    "speculative": ("spec", SpeculativeMetrics),
-    "lora": ("lora", LoRAMetrics),
-    "disaggregation": ("disagg", DisaggregationMetrics),
-    "queues": ("queues", QueueMetrics),
-}
 
 
 def _get_tokenizer_manager():
@@ -52,11 +35,6 @@ def _get_tokenizer_manager():
     from sglang.srt.entrypoints.http_server import get_global_state
 
     return get_global_state().tokenizer_manager
-
-
-def _loads_dict_factory(items):
-    """Factory for dataclasses.asdict() that excludes None values and timestamp."""
-    return {k: v for k, v in items if v is not None and k != "timestamp"}
 
 
 def _compute_aggregate(load_dicts: list) -> dict:
@@ -89,42 +67,30 @@ def _compute_aggregate(load_dicts: list) -> dict:
 
 
 def _format_loads_prometheus(load_results) -> Response:
-    """Format load metrics in Prometheus text exposition format.
+    """Format load metrics in Prometheus text exposition format."""
+    section_prefixes = {"speculative": "spec", "disaggregation": "disagg"}
+    metric_samples = {}
 
-    Metrics are derived from dataclass field metadata, providing a single source of truth.
-    """
+    for load in load_results:
+        load_dict = load.to_dict()
+        dp_rank = load_dict.pop("dp_rank")
+
+        for key, value in load_dict.items():
+            if isinstance(value, dict):
+                prefix = section_prefixes.get(key, key)
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, (int, float)):
+                        metric_samples.setdefault(
+                            f"sglang_{prefix}_{sub_key}", []
+                        ).append((dp_rank, sub_value))
+            elif isinstance(value, (int, float)):
+                metric_samples.setdefault(f"sglang_{key}", []).append((dp_rank, value))
+
     lines = []
-
-    for f in dataclasses.fields(GetLoadsReqOutput):
-        if "metric" not in f.metadata:
-            continue
-        metric_type, description = f.metadata["metric"]
-        metric_name = f"sglang_{f.name}"
-        lines.append(f"# HELP {metric_name} {description}")
-        lines.append(f"# TYPE {metric_name} {metric_type}")
-        for load in load_results:
-            value = getattr(load, f.name, None)
-            if value is not None:
-                lines.append(f'{metric_name}{{dp_rank="{load.dp_rank}"}} {value}')
-
-    for attr_name, (prefix, dataclass_type) in _OPTIONAL_METRIC_SECTIONS.items():
-        if not any(getattr(load, attr_name, None) for load in load_results):
-            continue
-        for f in dataclasses.fields(dataclass_type):
-            if "metric" not in f.metadata:
-                continue
-            metric_type, description = f.metadata["metric"]
-            metric_name = f"sglang_{prefix}_{f.name}"
-            lines.append(f"# HELP {metric_name} {description}")
-            lines.append(f"# TYPE {metric_name} {metric_type}")
-            for load in load_results:
-                section = getattr(load, attr_name, None)
-                if section:
-                    value = getattr(section, f.name, None)
-                    if value is not None:
-                        lines.append(
-                            f'{metric_name}{{dp_rank="{load.dp_rank}"}} {value}'
-                        )
+    for metric_name, samples in metric_samples.items():
+        lines.append(f"# TYPE {metric_name} gauge")
+        for dp_rank, value in samples:
+            lines.append(f'{metric_name}{{dp_rank="{dp_rank}"}} {value}')
 
     return Response(
         content="\n".join(lines) + "\n",
@@ -174,7 +140,7 @@ async def get_loads(
 
     loads = []
     for load in load_results:
-        d = dataclasses.asdict(load, dict_factory=_loads_dict_factory)
+        d = load.to_dict()
         d["num_total_reqs"] = d["num_running_reqs"] + d["num_waiting_reqs"]
         loads.append(d)
 

@@ -3,18 +3,17 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
-    GetLoadsReqInput,
-    GetLoadsReqOutput,
     LoRAMetrics,
     MemoryMetrics,
     QueueMetrics,
     SpeculativeMetrics,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -72,20 +71,17 @@ class SchedulerLoadInquirer:
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
-    def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
+    def get_loads(self, include: Optional[List[str]] = None) -> LoadSnapshot:
         """
         Get comprehensive load metrics for /v1/loads endpoint.
 
         Args:
-            req: Request containing include list and optional dp_rank filter
+            include: Sections to include in the output.
 
         Returns:
-            GetLoadsReqOutput with core metrics and optional detailed sections
+            LoadSnapshot with core metrics and optional detailed sections
         """
-        if req is None:
-            req = GetLoadsReqInput()
-
-        include = set(req.include) if req.include else {"core"}
+        include = set(include) if include else {"core"}
         include_all = "all" in include
 
         num_running_reqs = len(self.get_running_batch().reqs)
@@ -188,8 +184,8 @@ class SchedulerLoadInquirer:
                 retracted=self.get_stats().num_retracted_reqs,
             )
 
-        return GetLoadsReqOutput(
-            dp_rank=self.ps.dp_rank,
+        return LoadSnapshot.from_metrics(
+            dp_rank=self.ps.dp_rank if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
