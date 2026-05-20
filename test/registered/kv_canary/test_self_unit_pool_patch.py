@@ -133,22 +133,20 @@ class TestSelfUnitPoolPatch(CustomTestCase):
                     ptrs_after, _, _ = pool.get_contiguous_buf_infos()
                     self.assertEqual(ptrs_after, ptrs_before)
 
-    def test_get_state_buf_infos_inserts_canary_entries(self):
-        for patched in (False, True):
-            with self.subTest(patched=patched):
-                pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
-                ptrs_before, _, _ = pool.get_state_buf_infos()
-                n_before = len(ptrs_before)
+    def test_swa_attach_splices_full_into_contiguous_and_swa_into_state(self):
+        """FULL group splices into ``get_contiguous_buf_infos`` (FULL sub-pool),
+        SWA group splices into ``get_state_buf_infos`` (SWA sub-pool). +4 entries each
+        (K head + K tail + V head + V tail)."""
+        pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
+        contiguous_before, _, _ = pool.get_contiguous_buf_infos()
+        state_before, _, _ = pool.get_state_buf_infos()
 
-                if patched:
-                    attach_canary_buffers(
-                        pool=pool, config=self.config, device=self.device
-                    )
-                    ptrs_after, _, _ = pool.get_state_buf_infos()
-                    self.assertEqual(len(ptrs_after), n_before + 8)
-                else:
-                    ptrs_after, _, _ = pool.get_state_buf_infos()
-                    self.assertEqual(ptrs_after, ptrs_before)
+        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
+
+        contiguous_after, _, _ = pool.get_contiguous_buf_infos()
+        state_after, _, _ = pool.get_state_buf_infos()
+        self.assertEqual(len(contiguous_after), len(contiguous_before) + 4)
+        self.assertEqual(len(state_after), len(state_before) + 4)
 
     def test_pd_layout_canary_inserted_correctly(self):
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)

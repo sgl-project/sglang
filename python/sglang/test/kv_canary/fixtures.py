@@ -21,6 +21,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
+from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.kv_canary.pool_patch.utils import (
     alloc_canary_buf_pair,
@@ -72,37 +73,78 @@ class FakeSwaSubPool:
 
 @dataclass
 class FakeSWAPool:
+    """Mirrors real SWAKVPool's method split: ``get_contiguous_buf_infos`` exposes the FULL
+    sub-pool, ``get_state_buf_infos`` exposes the SWA sub-pool. Combining them would force
+    canary attach to wrap one method twice, hitting :func:`wrap_method`'s idempotency guard.
+    """
+
     full_kv_pool: object
     swa_kv_pool: object
     full_to_swa_index_mapping: torch.Tensor
     page_size: int = 1
 
+    def get_contiguous_buf_infos(self):
+        return _kv_buf_infos(
+            k_buffer=self.full_kv_pool.k_buffer,
+            v_buffer=self.full_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
+
     def get_state_buf_infos(self):
-        all_k = self.full_kv_pool.k_buffer + self.swa_kv_pool.k_buffer
-        all_v = self.full_kv_pool.v_buffer + self.swa_kv_pool.v_buffer
-        ptrs = [b.data_ptr() for b in all_k] + [b.data_ptr() for b in all_v]
-        lens = [b.nbytes for b in all_k] + [b.nbytes for b in all_v]
-        item_lens = [b[0].nbytes * self.page_size for b in all_k] + [
-            b[0].nbytes * self.page_size for b in all_v
-        ]
-        return ptrs, lens, item_lens
+        return _kv_buf_infos(
+            k_buffer=self.swa_kv_pool.k_buffer,
+            v_buffer=self.swa_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
 
 
 @dataclass
 class FakeDsv4Pool:
-    """DSV4-style packed pool: MLA (no v-half) + SWA dual + page_size 128."""
+    """DSV4-style packed pool: MLA (no v-half) + SWA dual + page_size 128. Same method-split
+    convention as :class:`FakeSWAPool` to avoid the double-wrap idempotency trap.
+    """
 
     full_kv_pool: object
     swa_kv_pool: object
     full_to_swa_index_mapping: torch.Tensor
     page_size: int = 128
 
+    def get_contiguous_buf_infos(self):
+        return _kv_only_buf_infos(
+            kv_buffer=self.full_kv_pool.kv_buffer,
+            page_size=self.page_size,
+        )
+
     def get_state_buf_infos(self):
-        all_kv = self.full_kv_pool.kv_buffer + self.swa_kv_pool.kv_buffer
-        ptrs = [b.data_ptr() for b in all_kv]
-        lens = [b.nbytes for b in all_kv]
-        item_lens = [b[0].nbytes * self.page_size for b in all_kv]
-        return ptrs, lens, item_lens
+        return _kv_only_buf_infos(
+            kv_buffer=self.swa_kv_pool.kv_buffer,
+            page_size=self.page_size,
+        )
+
+
+def _kv_buf_infos(
+    *,
+    k_buffer: List[torch.Tensor],
+    v_buffer: List[torch.Tensor],
+    page_size: int,
+) -> tuple:
+    ptrs = [b.data_ptr() for b in k_buffer] + [b.data_ptr() for b in v_buffer]
+    lens = [b.nbytes for b in k_buffer] + [b.nbytes for b in v_buffer]
+    item_lens = [b[0].nbytes * page_size for b in k_buffer] + [
+        b[0].nbytes * page_size for b in v_buffer
+    ]
+    return ptrs, lens, item_lens
+
+
+def _kv_only_buf_infos(
+    *,
+    kv_buffer: List[torch.Tensor],
+    page_size: int,
+) -> tuple:
+    ptrs = [b.data_ptr() for b in kv_buffer]
+    lens = [b.nbytes for b in kv_buffer]
+    item_lens = [b[0].nbytes * page_size for b in kv_buffer]
+    return ptrs, lens, item_lens
 
 
 @dataclass
@@ -332,75 +374,6 @@ def make_radix_cache(slot_lists: List[List[int]], device: torch.device = CPU_DEV
     return cache
 
 
-def _attach_fake_swa(
-    *,
-    pool: FakeSWAPool,
-    device: torch.device,
-    read_bytes: int,
-    allocator: Optional[object] = None,
-) -> tuple[CanaryBufferGroup, ...]:
-    """FakeSWAPool only exposes ``get_state_buf_infos`` (no separate ``get_contiguous_buf_infos``),
-    so both FULL and SWA groups splice through it.
-    """
-    ensure_swa_lut_int32(pool=pool, allocator=allocator)
-    full_group = _build_fake_swa_group(
-        sub_pool=pool.full_kv_pool,
-        kind=PoolKind.FULL,
-        device=device,
-        read_bytes=read_bytes,
-        swa_lut=None,
-    )
-    swa_group = _build_fake_swa_group(
-        sub_pool=pool.swa_kv_pool,
-        kind=PoolKind.SWA,
-        device=device,
-        read_bytes=read_bytes,
-        swa_lut=swa_index_lut(pool),
-    )
-    patch_buf_info_method(
-        pool,
-        method_name="get_state_buf_infos",
-        group=full_group,
-        has_v_half=True,
-        page_size=pool.page_size,
-    )
-    patch_buf_info_method(
-        pool,
-        method_name="get_state_buf_infos",
-        group=swa_group,
-        has_v_half=True,
-        page_size=pool.page_size,
-    )
-    return (full_group, swa_group)
-
-
-def _build_fake_swa_group(
-    *,
-    sub_pool: FakeSwaSubPool,
-    kind: PoolKind,
-    device: torch.device,
-    read_bytes: int,
-    swa_lut: Optional[torch.Tensor],
-) -> CanaryBufferGroup:
-    num_slots = int(sub_pool.k_buffer[0].shape[0])
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
-    v_head, v_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=k_head,
-        k_tail=k_tail,
-        v_head=v_head,
-        v_tail=v_tail,
-        real_kv_sources_k=make_row_source(
-            layer_buffer=sub_pool.k_buffer[0], read_bytes=read_bytes
-        ),
-        real_kv_sources_v=make_row_source(
-            layer_buffer=sub_pool.v_buffer[0], read_bytes=read_bytes
-        ),
-        swa_index_lut=swa_lut,
-    )
-
-
 def _attach_fake_dsv4(
     *,
     pool: FakeDsv4Pool,
@@ -408,8 +381,9 @@ def _attach_fake_dsv4(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """FakeDsv4Pool is an MLA-style packed pool (single ``kv_buffer`` per sub-pool, no V half),
-    exposing only ``get_state_buf_infos``.
+    """MLA-style packed pool (single ``kv_buffer`` per sub-pool, no V half). Real DSV4's
+    multi-segment c4/indexer/c128 layout isn't replicated in the fake — each sub-pool gets a
+    single K-only splice (FULL -> ``get_contiguous_buf_infos``, SWA -> ``get_state_buf_infos``).
     """
     ensure_swa_lut_int32(pool=pool, allocator=allocator)
     full_group = _build_fake_dsv4_group(
@@ -428,7 +402,7 @@ def _attach_fake_dsv4(
     )
     patch_buf_info_method(
         pool,
-        method_name="get_state_buf_infos",
+        method_name="get_contiguous_buf_infos",
         group=full_group,
         has_v_half=False,
         page_size=pool.page_size,
@@ -469,5 +443,5 @@ def _build_fake_dsv4_group(
 
 register_pool_attacher(FakeMHAPool, attach_mha)
 register_pool_attacher(FakeMLAPool, attach_mla)
-register_pool_attacher(FakeSWAPool, _attach_fake_swa)
+register_pool_attacher(FakeSWAPool, attach_swa)
 register_pool_attacher(FakeDsv4Pool, _attach_fake_dsv4)
