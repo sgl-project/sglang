@@ -75,8 +75,6 @@ def canary_verify_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_signed = _to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
-
     violation_rows: list[list[int]] = []
 
     for k in range(active):
@@ -91,16 +89,9 @@ def canary_verify_step_torch_reference(
             buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
         )
 
-        if prev_slot < 0:
-            expected_chain_hash = chain_anchor_signed
-        else:
-            prev_ph = int(buf_i64[prev_slot, consts.CANARY_FIELD_PREV_HASH].item())
-            prev_tok = int(buf_i64[prev_slot, consts.CANARY_FIELD_TOKEN].item())
-            prev_pos = int(buf_i64[prev_slot, consts.CANARY_FIELD_POSITION].item())
-            prev_rkv = int(buf_i64[prev_slot, consts.CANARY_FIELD_REAL_KV_HASH].item())
-            expected_chain_hash = _to_signed_int64(
-                splitmix64_mix4(prev_ph, prev_tok, prev_pos, prev_rkv)
-            )
+        expected_chain_hash = _to_signed_int64(
+            chain_advance_from_slot(buf_i64, prev_slot)
+        )
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
@@ -162,6 +153,24 @@ def _to_signed_int64(value: int) -> int:
     if value >= _I64_SIGN_BIT:
         value -= 1 << 64
     return value
+
+
+def chain_advance_from_slot(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
+    """Advance the canary chain one step starting from ``source_slot_idx``: load that slot's four stored
+    fields (token, position, prev_hash, real_kv_hash) and fold them through splitmix64_mix4. The result is
+    the chain hash that the slot immediately following ``source_slot_idx`` should store as its prev_hash.
+
+    ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on ``splitmix64(CANARY_CHAIN_ANCHOR)``.
+    Output is a uint64; the caller applies ``_to_signed_int64`` if a signed-storage view is needed. Mirrors
+    ``chain_advance_from_slot`` in csrc/kv_canary/canary_common.cuh.
+    """
+    if source_slot_idx < 0:
+        return splitmix64(consts.CANARY_CHAIN_ANCHOR)
+    token = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_TOKEN].item())
+    position = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_POSITION].item())
+    prev_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
+    real_kv_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item())
+    return splitmix64_mix4(prev_hash, token, position, real_kv_hash)
 
 
 def _compute_real_kv_hash_scalar(

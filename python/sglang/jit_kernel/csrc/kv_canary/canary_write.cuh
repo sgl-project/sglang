@@ -76,26 +76,11 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
   const int32_t seed_slot_idx = p.write_seed_slot_indices[r];
 
-  // Initialize running_prev_hash. When seed >= 0, apply the same advance step that produced seed's
-  // successor — keeping slot[0]'s stored prev_hash consistent with §6.1's chain link.
-  uint64_t running_prev_hash;
-  if (seed_slot_idx >= 0) {
-    const int64_t seed_idx64 = static_cast<int64_t>(seed_slot_idx);
-    const int64_t seed_token = canary_load_field(p.canary_buf, seed_idx64, p.slot_stride_bytes, kCanaryFieldToken);
-    const int64_t seed_position =
-        canary_load_field(p.canary_buf, seed_idx64, p.slot_stride_bytes, kCanaryFieldPosition);
-    const int64_t seed_prev_hash =
-        canary_load_field(p.canary_buf, seed_idx64, p.slot_stride_bytes, kCanaryFieldPrevHash);
-    const int64_t seed_real_kv_hash =
-        canary_load_field(p.canary_buf, seed_idx64, p.slot_stride_bytes, kCanaryFieldRealKvHash);
-    running_prev_hash = splitmix64_mix4(
-        static_cast<uint64_t>(seed_prev_hash),
-        static_cast<uint64_t>(seed_token),
-        static_cast<uint64_t>(seed_position),
-        static_cast<uint64_t>(seed_real_kv_hash));
-  } else {
-    running_prev_hash = splitmix64(kCanaryChainAnchor);
-  }
+  // Initialize running_prev_hash by advancing the chain from the seed slot — this keeps the first
+  // written slot's stored prev_hash consistent with the chain link the verify kernel will recompute.
+  // seed_slot_idx < 0 anchors on splitmix64(kCanaryChainAnchor).
+  uint64_t running_prev_hash =
+      chain_advance_from_slot(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
   int32_t entries_written = 0;
   for (int32_t j = 0; j < entry_count; ++j) {

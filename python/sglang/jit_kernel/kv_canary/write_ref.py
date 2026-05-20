@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     _to_signed_int64,
-    splitmix64,
+    chain_advance_from_slot,
     splitmix64_mix4,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
@@ -73,8 +73,6 @@ def canary_write_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_u64 = splitmix64(consts.CANARY_CHAIN_ANCHOR)
-
     pseudo_mode_on = int(pseudo_mode) != int(consts.CanaryPseudoMode.OFF)
     pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(
         device=work_device, dtype=torch.int64
@@ -94,27 +92,7 @@ def canary_write_step_torch_reference(
             continue
 
         seed_slot = int(seed_slot_indices_host[r].item())
-        if seed_slot < 0:
-            running_prev_hash = chain_anchor_u64
-        else:
-            seed_prev_hash_signed = int(
-                buf_i64[seed_slot, consts.CANARY_FIELD_PREV_HASH].item()
-            )
-            seed_token_signed = int(
-                buf_i64[seed_slot, consts.CANARY_FIELD_TOKEN].item()
-            )
-            seed_position_signed = int(
-                buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
-            )
-            seed_real_kv_signed = int(
-                buf_i64[seed_slot, consts.CANARY_FIELD_REAL_KV_HASH].item()
-            )
-            running_prev_hash = splitmix64_mix4(
-                seed_prev_hash_signed,
-                seed_token_signed,
-                seed_position_signed,
-                seed_real_kv_signed,
-            )
+        running_prev_hash = chain_advance_from_slot(buf_i64, seed_slot)
 
         for j in range(entry_count):
             i = entry_start + j

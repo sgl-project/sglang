@@ -88,26 +88,10 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   const int64_t stored_real_kv_hash =
       canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash);
 
-  // Expected chain hash: for chain-head entries (prev < 0) use splitmix64(kCanaryChainAnchor); else read
-  // the predecessor's 4 fields and splitmix64_mix4 them.
-  uint64_t expected_chain_hash_u64;
-  if (prev_slot_idx < 0) {
-    expected_chain_hash_u64 = splitmix64(kCanaryChainAnchor);
-  } else {
-    const int64_t prev_token = canary_load_field(p.canary_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldToken);
-    const int64_t prev_position =
-        canary_load_field(p.canary_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    const int64_t prev_chain_hash =
-        canary_load_field(p.canary_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash);
-    const int64_t prev_real_kv_hash =
-        canary_load_field(p.canary_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash);
-    expected_chain_hash_u64 = splitmix64_mix4(
-        static_cast<uint64_t>(prev_chain_hash),
-        static_cast<uint64_t>(prev_token),
-        static_cast<uint64_t>(prev_position),
-        static_cast<uint64_t>(prev_real_kv_hash));
-  }
-  const int64_t expected_chain_hash = static_cast<int64_t>(expected_chain_hash_u64);
+  // Expected chain hash: advance the chain one step from prev_slot_idx (or anchor on
+  // splitmix64(kCanaryChainAnchor) when prev_slot_idx < 0 = chain head).
+  const int64_t expected_chain_hash =
+      static_cast<int64_t>(chain_advance_from_slot(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
 
   const uint64_t expected_real_kv_hash_u64 =
       real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
