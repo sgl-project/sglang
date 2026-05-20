@@ -1198,8 +1198,40 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+        orig_out_cache_loc = forward_batch.out_cache_loc
+        orig_seq_lens = forward_batch.seq_lens
+        orig_seq_lens_cpu = forward_batch.seq_lens_cpu
+
+        step_out_cache_locs = None
+        if (
+            orig_out_cache_loc is not None
+            and self.topk > 0
+            and orig_out_cache_loc.numel()
+            == forward_batch.batch_size * self.topk * self.speculative_num_steps
+        ):
+            step_out_cache_locs = (
+                orig_out_cache_loc.reshape(
+                    forward_batch.batch_size, self.topk, self.speculative_num_steps
+                )
+                .permute((2, 0, 1))
+                .reshape(self.speculative_num_steps, -1)
+            )
+
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                if step_out_cache_locs is not None:
+                    forward_batch.out_cache_loc = step_out_cache_locs[i]
+                    forward_batch.seq_lens = orig_seq_lens + i + 1
+                    forward_batch.seq_lens_cpu = (
+                        None
+                        if orig_seq_lens_cpu is None
+                        else orig_seq_lens_cpu + i + 1
+                    )
+                self.attn_backends[i].init_forward_metadata(forward_batch)
+        finally:
+            forward_batch.out_cache_loc = orig_out_cache_loc
+            forward_batch.seq_lens = orig_seq_lens
+            forward_batch.seq_lens_cpu = orig_seq_lens_cpu
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
