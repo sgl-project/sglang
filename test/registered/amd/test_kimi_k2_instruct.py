@@ -38,8 +38,6 @@ class TestKimiK2Instruct0905(CustomTestCase):
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--mem-fraction-static",
-            "0.8",
         ]
         env = os.environ.copy()
         env["SGLANG_USE_AITER"] = "1"
@@ -65,7 +63,7 @@ class TestKimiK2Instruct0905(CustomTestCase):
             num_shots=8,
             data_path=None,
             num_questions=1319,
-            parallel=1319,
+            parallel=512,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
