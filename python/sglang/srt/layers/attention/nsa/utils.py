@@ -127,11 +127,16 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
+    # NOTE: prepare_mlp_sync_batch aligns global_num_tokens to (attn_cp_size * 2)
+    # so the zigzag CP split (prev/next halves per rank) is load-balanced. This
+    # function must use the same multiplier, otherwise nsa_cu_seqlens_q derived
+    # from pad_nsa_cache_seqlens disagrees with the padded q shape and FA3
+    # fails with "batch_size must be equal to batch_size_k".
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
     attn_cp_size = get_attention_cp_size()
     for i in range(sync_group_size):
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
         forward_batch.is_extend_in_batch, global_num_tokens
     )
