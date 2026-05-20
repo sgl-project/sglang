@@ -2334,9 +2334,17 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     if os.environ.get("SGLANG_THREADED_ENGINE") == "1":
-        from sglang.srt.entrypoints.engine_threaded import launch_threaded_server
+        if server_args.tp_size > 1:
+            logger.warning(
+                "SGLANG_THREADED_ENGINE is not beneficial for tp>1 "
+                "(CPU contention slows NCCL sync). Falling back to standard Engine."
+            )
+        else:
+            from sglang.srt.entrypoints.engine_threaded import launch_threaded_server
 
-        return launch_threaded_server(server_args, execute_warmup_func, launch_callback)
+            return launch_threaded_server(
+                server_args, execute_warmup_func, launch_callback
+            )
 
     # Launch subprocesses
     (

@@ -1,23 +1,25 @@
-"""ThreadedEngine: rank-0 scheduler + detokenizer as threads, not processes.
+"""ThreadedEngine: scheduler + detokenizer as threads, not processes.
 
 Activated by setting the environment variable:
     SGLANG_THREADED_ENGINE=1
 
 Designed for free-threaded Python (no-GIL).  Eliminates ZMQ serialization
-overhead for the rank-0 <-> tokenizer/detokenizer path.
+overhead for the scheduler <-> tokenizer/detokenizer path.
 
-For tp=1: all components are threads (no ZMQ at all).
-For tp>1: rank 0 is a thread in the main process; ranks 1..n are
-          separate processes (required by torch.distributed).
+Only effective for tp=1.  For tp>1, http_server.py automatically falls
+back to the standard multi-process Engine (CPU contention between the
+scheduler thread and HTTP/tokenizer threads causes NCCL sync delays
+that degrade throughput).
 
 Limitations:
+  - tp_size must be 1 (enforced by http_server.py fallback)
   - pp_size must be 1
   - dp_size must be 1
   - No Ray
 
 This file is fully self-contained: it uses monkey-patching at runtime
 to adapt behavior of other modules, so ZERO modifications are needed to
-existing SGLang source files (except the 3-line env check in http_server.py).
+existing SGLang source files (except the env check in http_server.py).
 """
 
 from __future__ import annotations
@@ -38,7 +40,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _compute_parallelism_ranks,
-    _wait_for_scheduler_ready,
     init_tokenizer_manager,
 )
 from sglang.srt.managers.channel import ChannelHub
@@ -48,13 +49,10 @@ from sglang.srt.managers.scheduler import (
     SenderWrapper,
     configure_scheduler_process,
     dispatch_event_loop,
-    run_scheduler_process,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, maybe_reindex_device_id, numa_utils
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -73,14 +71,19 @@ def _apply_runtime_patches(server_args: ServerArgs):
     These avoid modifying source files:
     1. fork -> spawn for ProcessPoolExecutor in multimodal processor
     2. Skip SHM tensor transport for tp=1 (objects passed by reference)
+    3. Disable piecewise CUDA graph (torch.compile workers can deadlock
+       when the scheduler runs as a thread in a free-threaded process)
     """
     global _patches_applied
     if _patches_applied:
         return
     _patches_applied = True
 
-    # Patch 1: Force "spawn" instead of "fork" for mp.get_context calls.
+    # Patch 1: Force "spawn" for all multiprocessing.
     # In threaded mode, fork from a multi-threaded process can deadlock.
+    # Also ensures numa_utils assertion (requires start_method == "spawn").
+    mp.set_start_method("spawn", force=True)
+
     _orig_get_context = mp.get_context
 
     def _safe_get_context(method=None):
@@ -90,12 +93,18 @@ def _apply_runtime_patches(server_args: ServerArgs):
 
     mp.get_context = _safe_get_context
 
-    # Patch 2: For tp=1, skip SHM wrapping entirely (zero-copy via queue).
-    # Setting this module-level flag makes wrap_shm_features() a no-op.
-    if server_args.tp_size == 1:
-        import sglang.srt.managers.mm_utils as _mm_utils
+    # Patch 2: Skip SHM wrapping entirely (zero-copy via queue).
+    # In ThreadedEngine, rank-0 scheduler and tokenizer are in the same
+    # process, so tensors can be passed by reference. Ranks 1..n get their
+    # data from rank 0 via NCCL broadcast, not from the tokenizer.
+    import sglang.srt.managers.mm_utils as _mm_utils
 
-        _mm_utils._is_default_tensor_transport = True
+    _mm_utils._is_default_tensor_transport = True
+
+    # Patch 3: Disable piecewise CUDA graph. torch.compile spawns
+    # inductor compile workers that can deadlock in a multi-threaded,
+    # free-threaded process. Regular (non-piecewise) CUDA graphs still work.
+    server_args.disable_piecewise_cuda_graph = True
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +145,9 @@ class _ThreadedTokenizerManager(TokenizerManager):
 
 
 class ThreadedEngine(Engine):
-    """Engine variant that runs rank-0 scheduler + detokenizer as threads.
+    """Engine variant that runs scheduler + detokenizer as threads (tp=1 only).
 
-    For tp=1: full in-process, zero IPC.
-    For tp>1: rank 0 thread + ranks 1..n as processes.
+    All components run in-process with zero IPC overhead.
     """
 
     def __init__(self, **kwargs):
@@ -154,6 +162,7 @@ class ThreadedEngine(Engine):
 
         self.server_args = server_args
 
+        assert server_args.tp_size == 1, "ThreadedEngine only supports tp_size=1"
         assert server_args.pp_size == 1, "ThreadedEngine only supports pp_size=1"
         assert server_args.dp_size == 1, "ThreadedEngine only supports dp_size=1"
 
@@ -168,46 +177,6 @@ class ThreadedEngine(Engine):
 
         hub = ChannelHub()
         self._channel_hub = hub
-
-        # ---- launch rank 1..n as processes (if tp>1) ----
-        scheduler_procs: List[mp.Process] = []
-        scheduler_pipe_readers = []
-        tp_size = server_args.tp_size
-        mp_ctx = mp.get_context("spawn")
-
-        if tp_size > 1:
-            memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=server_args.enable_memory_saver
-            )
-            for tp_rank in range(1, tp_size):
-                reader, writer = mp_ctx.Pipe(duplex=False)
-                gpu_id = server_args.base_gpu_id + tp_rank * server_args.gpu_id_step
-                attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                    server_args, tp_rank
-                )
-                with maybe_reindex_device_id(gpu_id) as gpu_id:
-                    proc = mp_ctx.Process(
-                        target=run_scheduler_process,
-                        args=(
-                            server_args,
-                            port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            0,  # pp_rank
-                            None,  # dp_rank
-                            writer,
-                        ),
-                    )
-                    with memory_saver_adapter.configure_subprocess(), \
-                         numa_utils.configure_subprocess(server_args, gpu_id):
-                        proc.start()
-                scheduler_procs.append(proc)
-                scheduler_pipe_readers.append(reader)
-
-        self._scheduler_procs = scheduler_procs
 
         # ---- rank 0 scheduler thread ----
         scheduler_ready = threading.Event()
@@ -312,21 +281,14 @@ class ThreadedEngine(Engine):
         )
         detoken_thread.start()
 
-        # ---- wait for all schedulers ----
+        # ---- wait for scheduler ----
         scheduler_ready.wait(timeout=600)
         if scheduler_error_box[0] is not None:
             raise RuntimeError(
                 f"Scheduler rank-0 thread failed:\n{scheduler_error_box[0]}"
             )
 
-        if scheduler_pipe_readers:
-            other_infos = _wait_for_scheduler_ready(
-                scheduler_pipe_readers, scheduler_procs
-            )
-        else:
-            other_infos = []
-
-        all_infos = [scheduler_info_box] + other_infos
+        all_infos = [scheduler_info_box]
 
         # ---- tokenizer manager (main thread) ----
         tokenizer_manager, template_manager = init_tokenizer_manager(
@@ -361,7 +323,7 @@ class ThreadedEngine(Engine):
 
         self._scheduler_init_result = SchedulerInitResult(
             scheduler_infos=all_infos,
-            all_child_pids=[p.pid for p in scheduler_procs],
+            all_child_pids=[],
         )
 
         try:
@@ -371,7 +333,7 @@ class ThreadedEngine(Engine):
             asyncio.set_event_loop(self.loop)
 
     def get_all_child_pids(self):
-        return [p.pid for p in self._scheduler_procs]
+        return []
 
     def shutdown(self):
         self._shutting_down = True
