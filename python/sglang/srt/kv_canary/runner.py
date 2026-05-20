@@ -30,7 +30,7 @@ from sglang.srt.kv_canary.plan_input import (
     build_plan_input_running_sweep,
     walk_radix_cache_for_canary,
 )
-from sglang.srt.kv_canary.pool_patch import attach_canary_buffers
+from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.violation_state import CanaryDeviceState
 
 if TYPE_CHECKING:
