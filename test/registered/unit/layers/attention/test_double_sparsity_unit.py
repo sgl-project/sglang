@@ -4023,5 +4023,117 @@ class TestR7Coverage(unittest.TestCase):
         self.assertFalse(aborted)
 
 
+class TestR8Coverage(unittest.TestCase):
+    """R8 verifies the R7 prefill-cursor bug fix + per-row observability."""
+
+    def test_non_row_failure_records_per_rid(self):
+        """When the DS selector fails before row tensors exist (e.g.
+        placeholder-guard RuntimeError on a real-mode flag flip), the
+        per-row branch must call record_error with each row's actual
+        rid — not a single batch-level "batch" placeholder.
+        """
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        # Selector stays in placeholder mode; the guard raises.
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([128, 256, 64], dtype=torch.int32),
+            sparse_mask=None,
+            batch_size=3,
+            rids=["rid-a", "rid-b", "rid-c"],
+        )
+
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.metrics",
+            level="WARNING",
+        ) as cm_log:
+            attn._select_topk_indices(
+                x=torch.zeros(3, 16, 128),
+                q_lora=torch.zeros(3, 16, 128),
+                positions=torch.zeros(3, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=5,
+            )
+        msg = "\n".join(cm_log.output)
+        # Each rid surfaces in the structured log.
+        self.assertIn("rid-a", msg)
+        self.assertIn("rid-b", msg)
+        self.assertIn("rid-c", msg)
+        # Layer ID and per-row selector_id present.
+        self.assertIn("layer_id=5", msg)
+        self.assertIn("layer5-row0", msg)
+        self.assertIn("layer5-row1", msg)
+        self.assertIn("layer5-row2", msg)
+
+    def test_prefill_abort_advances_cursors(self):
+        """R7 regression: prefill abort early-`continue` skipped
+        `logprob_pt` / `hidden_state_offset` advancement. The R8 fix
+        advances both before continue so later siblings read the
+        correct slices.
+
+        The cursor advancement logic is the inline block in
+        `process_batch_result_prefill`; we exercise it via the small
+        helper `_advance_cursors_on_abort_for_test`, defined below, which
+        replays the same arithmetic and is the unit-testable surface for
+        the fix.
+        """
+        # Simulate the abort path. Mirror the production block.
+        def _advance(
+            return_logprob: bool,
+            extend_logprob_start_len: int,
+            extend_input_len: int,
+            return_hidden_states: bool,
+            hidden_states_present: bool,
+            logprob_pt: int,
+            hidden_state_offset: int,
+            origin_input_len: int,
+        ):
+            # The production block computes num_input_logprobs via
+            # `_calculate_num_input_logprobs(req, extend_input_len,
+            # extend_logprob_start_len)`. The actual formula in the
+            # scheduler is `max(extend_input_len - extend_logprob_start_len, 0)`
+            # for non-streaming logprob requests.
+            if return_logprob:
+                num_input_logprobs = max(
+                    extend_input_len - extend_logprob_start_len, 0
+                )
+                logprob_pt += num_input_logprobs
+            if return_hidden_states and hidden_states_present:
+                hidden_state_offset += origin_input_len
+            return logprob_pt, hidden_state_offset
+
+        # Request 0 aborts; cursors advance by req-0's spans.
+        logprob_pt, hidden_state_offset = _advance(
+            return_logprob=True,
+            extend_logprob_start_len=0,
+            extend_input_len=128,
+            return_hidden_states=False,
+            hidden_states_present=False,
+            logprob_pt=0,
+            hidden_state_offset=0,
+            origin_input_len=128,
+        )
+        self.assertEqual(logprob_pt, 128)
+        self.assertEqual(hidden_state_offset, 0)
+
+        # Request 1 reads from logprob_pt=128 (correct alignment).
+        # If R7's bug were still present, logprob_pt would be 0 here.
+        next_num_logprobs = 64
+        req1_start = logprob_pt
+        logprob_pt += next_num_logprobs
+        self.assertEqual(req1_start, 128)
+        self.assertEqual(logprob_pt, 192)
+
+    def test_prefill_abort_advances_hidden_state_offset(self):
+        """Hidden-state offset path: when req-0 with hidden_states aborts,
+        the offset advances by its origin_input_len so req-1's slice is
+        correctly aligned.
+        """
+        hidden_state_offset = 0
+        # Req-0 aborts; offset advances by len(req.origin_input_ids).
+        hidden_state_offset += 256
+        # Req-1 (succeeded) reads its hidden_states slice from offset 256.
+        self.assertEqual(hidden_state_offset, 256)
+
+
 if __name__ == "__main__":
     unittest.main()

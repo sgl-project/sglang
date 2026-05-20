@@ -2074,8 +2074,20 @@ class DeepseekV2AttentionMLA(
                 bs = int(forward_batch.batch_size) if hasattr(
                     forward_batch, "batch_size"
                 ) else 1
+                rids = getattr(forward_batch, "rids", None)
+                if rids is None:
+                    rids = getattr(forward_batch, "req_ids", None)
                 records: List[Optional[Dict[str, Any]]] = []
+                from sglang.srt.layers.attention.double_sparsity import (
+                    metrics as _ds_metrics,
+                )
+
                 for _b in range(bs):
+                    rid_str = (
+                        str(rids[_b])
+                        if rids is not None and _b < len(rids)
+                        else f"row{_b}"
+                    )
                     records.append(
                         {
                             "sparsity_rate": 0.0,
@@ -2084,6 +2096,20 @@ class DeepseekV2AttentionMLA(
                             "error_class": error_cls,
                             "error_message": error_message,
                         }
+                    )
+                    # Per-row record_error: each affected request gets
+                    # its own counter increment + structured log line.
+                    # The earlier `try_run_ds_step` call already
+                    # incremented the counter once with `request_id="batch"`
+                    # — that's a defensive batch-level signal; the
+                    # per-row calls below give operators the actual
+                    # request IDs.
+                    _ds_metrics.record_error(
+                        error_cls,
+                        message=error_message,
+                        request_id=rid_str,
+                        layer_id=layer_id,
+                        selector_id=f"layer{layer_id}-row{_b}",
                     )
                 summary = getattr(forward_batch, "ds_per_request_summary", None)
                 if summary is None:

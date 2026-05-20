@@ -350,6 +350,28 @@ class SchedulerOutputProcessorMixin:
                 if self.maybe_abort_on_ds_error(i, req, logits_output):
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
+                    # Advance batch-wide cursors for the aborted row so
+                    # subsequent siblings read the correct flattened
+                    # logprob / hidden-state slices. Token append,
+                    # grammar, and request logprob bookkeeping are
+                    # intentionally skipped for the failed request.
+                    if (
+                        batch.return_logprob
+                        and extend_logprob_start_len_per_req is not None
+                        and extend_input_len_per_req is not None
+                    ):
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+                        num_input_logprobs = self._calculate_num_input_logprobs(
+                            req, extend_input_len, extend_logprob_start_len
+                        )
+                        logprob_pt += num_input_logprobs
+                    if (
+                        getattr(req, "return_hidden_states", False)
+                        and logits_output is not None
+                        and logits_output.hidden_states is not None
+                    ):
+                        hidden_state_offset += len(req.origin_input_ids)
                     continue
 
                 if req.is_chunked <= 0:
