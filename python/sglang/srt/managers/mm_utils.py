@@ -671,6 +671,11 @@ def _get_chunked_prefill_embedding(
     miss_embeddings = []
     if all_miss_items:
         _move_items_to_device(all_miss_items, device)
+        # vit_input_tokens = sum(
+        #     item.feature.shape[0] for item in all_miss_items
+        #     if isinstance(item.feature, torch.Tensor)
+        # )
+        # logger.info(f"ViT batch: {len(all_miss_items)} items, {vit_input_tokens} input patches, {sum(all_miss_token_counts)} output tokens")
         all_miss_embedding = data_embedding_func(all_miss_items)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
