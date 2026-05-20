@@ -37,7 +37,7 @@ def _spec_eagle_server_args() -> List[str]:
         "--speculative-algorithm",
         "EAGLE",
         # Cap canary's per-forward + sweep capacities under the cuda-grid-safe
-        # ceiling (4M, see api.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
+        # ceiling (4M, see capacities.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
         # max_bs = max(cuda_graph_max_bs, max_running_requests); both must be
         # capped or the pool sizing blows past the ceiling.
         "--cuda-graph-max-bs",

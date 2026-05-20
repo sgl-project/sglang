@@ -97,14 +97,14 @@ class PerForwardOrchestrator:
             raise RuntimeError(
                 f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
                 f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
-                f"or check install_canary._compute_launch_capacities"
+                f"or check CanaryLaunchCapacities.from_args"
             )
         if num_tokens > self._write_entry_capacity:
             raise RuntimeError(
                 f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
                 f"write_entry_capacity={self._write_entry_capacity}; raise "
                 f"--chunked-prefill-size / --max-prefill-tokens or check "
-                f"install_canary._compute_launch_capacities"
+                f"CanaryLaunchCapacities.from_args"
             )
 
         # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
@@ -117,7 +117,7 @@ class PerForwardOrchestrator:
             raise RuntimeError(
                 f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds "
                 f"pre-allocated per_forward_verify_capacity={self._verify_capacity}; raise the "
-                f"verify capacity in install_canary._compute_launch_capacities (or "
+                f"verify capacity in CanaryLaunchCapacities.from_args (or "
                 f"_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
             )
 

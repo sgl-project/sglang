@@ -21,7 +21,7 @@ _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 # workaround.
 
 # Cap canary install-time capacities below the cuda-grid-safe ceiling
-# enforced by install_canary (4M, see api.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
+# enforced by install_canary (4M, see capacities.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
 # Two guards trip otherwise:
 #   per-forward: max(cuda_graph_max_bs, max_running_requests) * max_seq_len_per_req
 #   sweep:       max_total_num_tokens
