@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import torch
 
@@ -14,6 +15,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
@@ -125,6 +127,7 @@ class CanaryRunner:
         self._last_sweep_step: int = -1
         self._sweep_passes: int = 0
         self._raised: bool = False
+        self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
 
         assert (
             self._req_to_token_pool is not None
@@ -159,9 +162,36 @@ class CanaryRunner:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
+    def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
+        """Bind the OracleSamplerHook returned by install_oracle_sampler so the per-forward
+        input-check path (input_check_mode == ON) can fill expected_input_* tensors from the
+        same oracle that drives sampling.
+        """
+        self._oracle_sampler_hook = hook
+
+    @contextlib.contextmanager
+    def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
+        """Bracket one forward pass: host-side prep before, host-side end-of-step after.
+
+        Caller in ``ModelRunner.forward`` writes::
+
+            with canary_runner.with_forward_pass(forward_batch):
+                output = self._forward_raw(...)
+
+        The body is whatever invokes ``graph_runner.replay()`` / ``model.forward()``. Cuda-graph
+        capture happens inside the body; the in-graph HEAD/TAIL kernel launches are dispatched
+        from the monkey-patched ``model.forward`` so they are captured (and auto-replayed) the
+        same way the model itself is.
+        """
+        self.before_forward(forward_batch)
+        try:
+            yield
+        finally:
+            self.end_of_step()
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
-        """Host-side prep (perturb + plan-input fill). Caller is ``ModelRunner.forward`` — runs
-        OUTSIDE the cuda-graph capture region.
+        """Host-side prep (perturb + plan-input fill). Runs OUTSIDE the cuda-graph capture
+        region. Prefer ``with_forward_pass`` over calling this + ``end_of_step`` directly.
         """
         self._per_forward.before_forward(forward_batch)
 

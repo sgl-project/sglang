@@ -69,6 +69,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.kv_canary.api import get_canary_runner
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -975,10 +976,6 @@ class Scheduler(
             and not self.tree_cache.supports_streaming_session()
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
-
-        # Local import: kv_canary.api pulls in jit_kernel modules; keep it lazy so non-canary
-        # scheduler instances don't pay the load cost.
-        from sglang.srt.kv_canary.api import get_canary_runner
 
         canary_runner = get_canary_runner(self.tp_worker.model_runner)
         if canary_runner is not None:

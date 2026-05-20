@@ -9,7 +9,6 @@ from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputChe
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
-from sglang.srt.kv_canary.mock_model.sampler import fill_expected_inputs
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 
 if TYPE_CHECKING:
@@ -87,7 +86,14 @@ class PerForwardOrchestrator:
         self._last_forward_batch = forward_batch
 
         if owner.config.input_check_mode == CanaryInputCheckMode.ON:
-            fill_expected_inputs(
+            hook = owner._oracle_sampler_hook
+            if hook is None:
+                raise RuntimeError(
+                    "kv-canary: input_check_mode=ON requires an OracleSamplerHook; call "
+                    "CanaryRunner.attach_oracle_sampler_hook(hook) where hook is the return "
+                    "value of install_oracle_sampler(oracle=...)"
+                )
+            hook.fill_expected_inputs(
                 forward_batch=forward_batch,
                 expected_input_tokens_out=self._expected_input_tokens,
                 expected_input_positions_out=self._expected_input_positions,

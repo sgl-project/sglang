@@ -38,6 +38,7 @@ from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_b
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.kv_canary.mock_model.args_modifier import apply_mock_model_defaults
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -1178,16 +1179,12 @@ class ServerArgs:
             self.speculative_draft_model_quantization = None
 
     def _apply_mock_model_defaults(self):
-        """Bridge to kv-canary mock_model args_modifier per upper-level SOT §8.3.
+        """Bridge to kv-canary mock_model args_modifier.
 
         The helper returns a new ServerArgs via dataclasses.replace; we copy the resolved
-        fields back into self because __post_init__ cannot reassign self. apply_mock_model_defaults
-        itself is contractually side-effect free.
+        fields back into self because __post_init__ cannot reassign self.
+        apply_mock_model_defaults itself is contractually side-effect free.
         """
-        from sglang.srt.kv_canary.mock_model.args_modifier import (
-            apply_mock_model_defaults,
-        )
-
         resolved = apply_mock_model_defaults(self)
         if resolved is self:
             return

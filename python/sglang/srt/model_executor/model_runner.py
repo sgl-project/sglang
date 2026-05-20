@@ -105,6 +105,7 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -743,10 +744,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
-        # Local import: kv_canary.api imports ModelRunner globally, so
-        # importing it at module top here would form a cycle.
-        from sglang.srt.kv_canary.api import install_canary
-
         install_canary(server_args=server_args, model_runner=self)
 
         # Init ngram embedding token table
@@ -3141,6 +3138,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         canary_runner = getattr(self, "canary_runner", None)
+        canary_ctx = (
+            canary_runner.with_forward_pass(forward_batch)
+            if canary_runner is not None
+            else contextlib.nullcontext()
+        )
 
         with (
             step_span_ctx,
@@ -3148,9 +3150,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            canary_ctx,
         ):
-            if canary_runner is not None:
-                canary_runner.before_forward(forward_batch)
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3158,8 +3159,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if canary_runner is not None:
-                canary_runner.end_of_step()
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

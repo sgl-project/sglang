@@ -1,23 +1,19 @@
-"""fill_expected_inputs writes oracle-derived (token, position) into canary placeholders, and
-apply_mock_model_defaults pre-fills the dependent ServerArgs flags when mock_model is opted in.
+"""OracleSamplerHook.fill_expected_inputs writes oracle-derived (token, position) into canary
+placeholders, and apply_mock_model_defaults pre-fills the dependent ServerArgs flags when
+mock_model is opted in.
 """
 
 from __future__ import annotations
 
 import dataclasses
 
-import pytest
 import torch
 
-from sglang.srt.kv_canary.mock_model import sampler as oracle_sampler_module
 from sglang.srt.kv_canary.mock_model.args_modifier import (
     apply_mock_model_defaults,
 )
 from sglang.srt.kv_canary.mock_model.oracle import ScriptedOracle
-from sglang.srt.kv_canary.mock_model.sampler import (
-    fill_expected_inputs,
-    install_oracle_sampler,
-)
+from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
@@ -42,7 +38,7 @@ class _StubForwardBatch:
 
 def test_fill_expected_inputs_decode_one_token_per_req() -> None:
     table = {(5, 10): 111, (7, 20): 333}
-    install_oracle_sampler(oracle=ScriptedOracle(table=table))
+    hook = install_oracle_sampler(oracle=ScriptedOracle(table=table))
 
     fb = _StubForwardBatch(
         input_ids=torch.tensor([0, 0], dtype=torch.int64),
@@ -54,7 +50,7 @@ def test_fill_expected_inputs_decode_one_token_per_req() -> None:
     tokens_out = torch.zeros(8, dtype=torch.int32)
     positions_out = torch.zeros(8, dtype=torch.int32)
 
-    fill_expected_inputs(
+    hook.fill_expected_inputs(
         forward_batch=fb,
         expected_input_tokens_out=tokens_out,
         expected_input_positions_out=positions_out,
@@ -66,7 +62,7 @@ def test_fill_expected_inputs_decode_one_token_per_req() -> None:
 
 def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
     table = {(5, 0): 11, (5, 1): 22, (5, 2): 33, (7, 0): 99}
-    install_oracle_sampler(oracle=ScriptedOracle(table=table))
+    hook = install_oracle_sampler(oracle=ScriptedOracle(table=table))
 
     fb = _StubForwardBatch(
         input_ids=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
@@ -78,7 +74,7 @@ def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
     tokens_out = torch.zeros(8, dtype=torch.int32)
     positions_out = torch.zeros(8, dtype=torch.int32)
 
-    fill_expected_inputs(
+    hook.fill_expected_inputs(
         forward_batch=fb,
         expected_input_tokens_out=tokens_out,
         expected_input_positions_out=positions_out,
@@ -89,7 +85,7 @@ def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
 
 
 def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None:
-    install_oracle_sampler(oracle=ScriptedOracle(table={}))
+    hook = install_oracle_sampler(oracle=ScriptedOracle(table={}))
 
     fb = _StubForwardBatch(
         input_ids=torch.empty(0, dtype=torch.int64),
@@ -101,34 +97,13 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
     tokens_out = torch.zeros(4, dtype=torch.int32)
     positions_out = torch.zeros(4, dtype=torch.int32)
 
-    fill_expected_inputs(
+    hook.fill_expected_inputs(
         forward_batch=fb,
         expected_input_tokens_out=tokens_out,
         expected_input_positions_out=positions_out,
     )
 
-    assert oracle_sampler_module._LAST_REQ_POOL_INDICES == [5, 7]
-
-
-def test_fill_expected_inputs_raises_without_install_oracle_sampler() -> None:
-    oracle_sampler_module._REGISTERED_ORACLE = None
-
-    fb = _StubForwardBatch(
-        input_ids=torch.tensor([0], dtype=torch.int64),
-        positions=torch.tensor([0], dtype=torch.int64),
-        req_pool_indices=torch.tensor([1], dtype=torch.int64),
-        forward_mode=_StubForwardMode(extend=False),
-        extend_seq_lens=None,
-    )
-
-    with pytest.raises(
-        RuntimeError, match="fill_expected_inputs called before install_oracle_sampler"
-    ):
-        fill_expected_inputs(
-            forward_batch=fb,
-            expected_input_tokens_out=torch.zeros(4, dtype=torch.int32),
-            expected_input_positions_out=torch.zeros(4, dtype=torch.int32),
-        )
+    assert hook._req_pool_indices_per_row == [5, 7]
 
 
 def test_apply_mock_model_defaults_no_op_when_disabled() -> None:
