@@ -57,6 +57,119 @@ class _DummyKVCache(KVCache):
         return 0, 0
 
 
+class _DummyMambaPool:
+    """Bookkeeping-only mamba pool for MLX hybrid models.
+
+    MLX keeps linear-attention state in native mlx-lm caches.  The scheduler
+    still needs mamba pool indices for radix bookkeeping, so this pool tracks
+    slots without allocating state tensors.
+    """
+
+    def __init__(self, size: int, device: str):
+        self.size = size
+        self.device = device
+        self.mamba_cache = None
+        self.mem_usage = 0
+        self.clear()
+
+    def available_size(self):
+        return int(self.free_slots.numel())
+
+    def alloc(self, need_size: int):
+        if need_size > self.available_size():
+            return None
+        slots = self.free_slots[:need_size].clone()
+        self.free_slots = self.free_slots[need_size:]
+        return slots
+
+    def free(self, indices):
+        if indices is None:
+            return
+        indices = torch.as_tensor(indices, dtype=torch.int64, device=self.device).view(
+            -1
+        )
+        if indices.numel() == 0:
+            return
+        self.free_slots = torch.cat([self.free_slots, indices])
+
+    def fork_from(self, src):
+        dst = self.alloc(1)
+        if dst is None:
+            return None
+        self.copy_from(src, dst)
+        return dst
+
+    def copy_from(self, src, dst):
+        return None
+
+    def clear(self):
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
+
+
+class _DummyMambaReqToTokenPool(ReqToTokenPool):
+    """Req-to-token pool with mamba slot bookkeeping but no mamba tensors."""
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        mamba_size: int,
+    ):
+        super().__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+        self.mamba_pool = _DummyMambaPool(size=mamba_size, device=device)
+        self.enable_mamba_extra_buffer = False
+        self.req_index_to_mamba_index_mapping = torch.zeros(
+            self._alloc_size, dtype=torch.int32, device=device
+        )
+
+    def alloc(self, reqs):
+        select_index = super().alloc(reqs)
+        if select_index is None:
+            return None
+
+        mamba_indices = []
+        for req in reqs:
+            if getattr(req, "mamba_pool_idx", None) is not None:
+                mid = req.mamba_pool_idx
+            else:
+                allocated = self.mamba_pool.alloc(1)
+                assert allocated is not None, "Not enough dummy mamba slots"
+                mid = allocated[0]
+                req.mamba_pool_idx = mid
+            mamba_indices.append(mid.to(dtype=torch.int32))
+        self.req_index_to_mamba_index_mapping[select_index] = torch.stack(mamba_indices)
+        return select_index
+
+    def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.req_index_to_mamba_index_mapping[req_indices]
+
+    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
+        return 0
+
+    def free_mamba_cache(self, req, mamba_ping_pong_track_buffer_to_keep=None):
+        if getattr(req, "mamba_pool_idx", None) is not None:
+            self.mamba_pool.free(req.mamba_pool_idx.unsqueeze(0))
+            req.mamba_pool_idx = None
+
+    def free(self, req):
+        super().free(req)
+
+    def clear(self):
+        super().clear()
+        self.mamba_pool.clear()
+        self.req_index_to_mamba_index_mapping.zero_()
+
+
 class _DummyModel:
     """Minimal stand-in so that `inspect.signature(model.forward)` and
     `getattr(model, ...)` calls in ModelRunner.__init__ don't crash."""
@@ -141,12 +254,24 @@ class MlxModelRunnerStub(ModelRunner):
         self.is_hybrid_swa = False
 
         # Create minimal pools
-        self.req_to_token_pool = ReqToTokenPool(
-            size=self.max_running_requests,
-            max_context_len=self.model_config.context_len,
-            device="cpu",
-            enable_memory_saver=False,
-        )
+        if self.mambaish_config is not None:
+            mamba_size = self.server_args.max_mamba_cache_size
+            if mamba_size is None:
+                mamba_size = self.max_running_requests * 4
+            self.req_to_token_pool = _DummyMambaReqToTokenPool(
+                size=self.max_running_requests,
+                max_context_len=self.model_config.context_len,
+                device="cpu",
+                enable_memory_saver=False,
+                mamba_size=mamba_size,
+            )
+        else:
+            self.req_to_token_pool = ReqToTokenPool(
+                size=self.max_running_requests,
+                max_context_len=self.model_config.context_len,
+                device="cpu",
+                enable_memory_saver=False,
+            )
 
         dummy_kv = _DummyKVCache(
             size=self.max_total_num_tokens,

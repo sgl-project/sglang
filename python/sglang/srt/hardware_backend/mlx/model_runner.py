@@ -17,13 +17,14 @@ state.
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
-import mlx.core as mx
 import psutil
-from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
+import mlx.core as mx
+from mlx.utils import tree_flatten
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
@@ -32,7 +33,8 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     PoolBackedCache,
     clear_context,
     find_attention_layers,
-    get_num_layers,
+    get_head_dim,
+    get_num_kv_heads,
     patch_model_attention,
     set_context,
 )
@@ -46,14 +48,14 @@ logger = logging.getLogger(__name__)
 class MlxPendingPrefill:
     """Lazy prefill state, finalised after ``mx.eval``/``async_eval``.
 
-    ``cache`` is the per-layer list of ``ContiguousKVCache`` that will
+    ``cache`` is the per-layer cache list that will
     become ``_req_caches[req_id]`` once the request is committed.  It
     may have been converted from a transient ``PoolBackedCache`` list
     already (so its ``state`` arrays are safe to hand to ``async_eval``).
     """
 
     lazy_token: mx.array
-    cache: list  # list[ContiguousKVCache]
+    cache: list[Any]
     req_id: str
     full_token_ids: list[int]
     req_pool_idx: int
@@ -80,7 +82,7 @@ class MlxPendingExtend:
 class MlxPendingDecode:
     """Lazy decode state, finalised after ``mx.eval``/``async_eval``.
 
-    ``caches`` is a per-request list of per-layer ``ContiguousKVCache``
+    ``caches`` is a per-request list of per-layer cache
     references (``caches[req_idx][layer_idx]``).  These are the same
     objects the attention wrapper writes into during the forward pass,
     so :meth:`decode_batch_start_chained` can launch the next step on
@@ -89,7 +91,7 @@ class MlxPendingDecode:
 
     lazy_tokens: mx.array
     req_ids: list[str]
-    caches: list  # list[list[ContiguousKVCache]]
+    caches: list[list[Any]]
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -135,12 +137,25 @@ class MlxModelRunner:
 
         patch_model_attention(self.model)
 
-        self._num_layers = get_num_layers(self.model)
+        self._layer_list, self._attn_attrs = find_attention_layers(self.model)
+        self._num_layers = len(self._layer_list)
+        self._attention_layer_indices = [
+            idx for idx, attr in enumerate(self._attn_attrs) if attr is not None
+        ]
+        self._num_attention_layers = len(self._attention_layer_indices)
+        self._has_non_attention_layers = self._num_attention_layers != self._num_layers
+        if self._num_attention_layers == 0:
+            raise RuntimeError("MLX model has no supported attention layers")
+        if self._has_non_attention_layers and not hasattr(self.model, "make_cache"):
+            raise RuntimeError(
+                "Hybrid MLX models require model.make_cache() for native "
+                "non-attention layer state."
+            )
         self._max_seq_len = 4096  # doubles on overflow
 
-        self._req_caches: dict[str, list[ContiguousKVCache | PoolBackedCache]] = {}
+        self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
-        self._cache_pool: list[list[ContiguousKVCache]] = []  # reusable caches
+        self._cache_pool: list[list[Any]] = []  # reusable full-attention caches
 
         self._kv_pool: MlxKVPool | None = None
         self._req_to_token_pool: ReqToTokenPool | None = None
@@ -156,33 +171,69 @@ class MlxModelRunner:
             return model_output[0]
         return model_output
 
-    def _acquire_cache(self) -> list[ContiguousKVCache]:
+    def _new_native_cache(self) -> list[Any]:
+        """Create a model-shaped cache list with custom KV caches for attention."""
+        if self._has_non_attention_layers:
+            cache = self.model.make_cache()
+            if len(cache) != self._num_layers:
+                raise RuntimeError(
+                    "model.make_cache() returned "
+                    f"{len(cache)} entries for {self._num_layers} layers"
+                )
+        else:
+            cache = [None] * self._num_layers
+
+        for layer_idx in self._attention_layer_indices:
+            cache[layer_idx] = ContiguousKVCache(max_seq_len=self._max_seq_len)
+        return cache
+
+    def _acquire_cache(self) -> list[Any]:
         """Get a reusable cache list from the pool, or create a new one."""
-        if self._cache_pool:
+        if not self._has_non_attention_layers and self._cache_pool:
             cache = self._cache_pool.pop()
             for c in cache:
                 c.offset = 0
             return cache
-        return [
-            ContiguousKVCache(max_seq_len=self._max_seq_len)
-            for _ in range(self._num_layers)
-        ]
+        return self._new_native_cache()
 
-    def _release_cache(self, cache: list[ContiguousKVCache]) -> None:
+    def _release_cache(self, cache: list[Any]) -> None:
         """Return a cache list to the pool for reuse."""
-        self._cache_pool.append(cache)
+        if not self._has_non_attention_layers:
+            self._cache_pool.append(cache)
+
+    def _first_attention_cache(self, cache: list[Any]) -> Any:
+        return cache[self._attention_layer_indices[0]]
 
     @staticmethod
-    def _eval_with_cache(
-        token_result: mx.array, cache: list[ContiguousKVCache | PoolBackedCache]
-    ) -> None:
+    def _cache_arrays(cache: Any) -> list[mx.array]:
+        """Return every MLX array nested under ``cache.state``."""
+        arrays: list[mx.array] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif value is None:
+                return
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        collect(getattr(cache, "state", ()))
+        return arrays
+
+    @staticmethod
+    def _eval_with_cache(token_result: mx.array, cache: list[Any]) -> None:
         """Evaluate token result and all cache buffers in one mx.eval call."""
-        mx.eval(token_result, *[s for c in cache for s in c.state])
+        mx.eval(
+            token_result,
+            *[s for c in cache for s in MlxModelRunner._cache_arrays(c)],
+        )
 
     @staticmethod
-    def _cache_state_arrays(
-        pending_caches: list[list[ContiguousKVCache | PoolBackedCache]],
-    ) -> list[mx.array]:
+    def _cache_state_arrays(pending_caches: list[list[Any]]) -> list[mx.array]:
         """Flatten pending decode cache state list into an array list.
 
         Safe to hand to ``mx.async_eval``.
@@ -191,7 +242,7 @@ class MlxModelRunner:
             s
             for cache_list in pending_caches
             for cache in cache_list
-            for s in cache.state
+            for s in MlxModelRunner._cache_arrays(cache)
         ]
 
     def _load_model(self):
@@ -262,18 +313,19 @@ class MlxModelRunner:
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
         """Return (n_kv_heads, head_dim, dtype) from the model."""
-        layer_list, attn_attr = find_attention_layers(self.model)
-        if not layer_list:
-            raise RuntimeError("Cannot determine attention config: no layers found")
-        sample_attn = getattr(layer_list[0], attn_attr)
+        if not self._attention_layer_indices:
+            raise RuntimeError(
+                "Cannot determine attention config: no attention module found"
+            )
+        layer_idx = self._attention_layer_indices[0]
+        sample_attn = getattr(self._layer_list[layer_idx], self._attn_attrs[layer_idx])
         if isinstance(sample_attn, MLXAttentionWrapper):
             sample_attn = sample_attn._inner
-        n_kv_heads = sample_attn.n_kv_heads
-        if hasattr(sample_attn, "head_dim"):
-            head_dim = sample_attn.head_dim
-        elif hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
-            head_dim = sample_attn.k_proj.weight.shape[0] // n_kv_heads
-        else:
+        n_kv_heads = get_num_kv_heads(sample_attn)
+        if n_kv_heads is None:
+            raise RuntimeError("Cannot determine n_kv_heads from attention module")
+        head_dim = get_head_dim(sample_attn)
+        if head_dim is None:
             raise RuntimeError("Cannot determine head_dim from attention module")
         dtype = mx.float16
         if hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
@@ -285,7 +337,7 @@ class MlxModelRunner:
         if explicit_size is not None:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
-        num_layers = self._num_layers
+        num_layers = self._num_attention_layers
         sys_available = psutil.virtual_memory().available
         mlx_limit = mx.device_info().get(
             "max_recommended_working_set_size",
@@ -318,11 +370,17 @@ class MlxModelRunner:
         self._req_to_token_pool = req_to_token_pool
         if self.disable_radix_cache:
             return
+        if self._has_non_attention_layers:
+            logger.info(
+                "MLX radix KV reuse is disabled for hybrid attention models; "
+                "non-attention layer state stays in native mlx-lm caches."
+            )
+            return
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # +1 for padding slot 0
         self._kv_pool = MlxKVPool(
             pool_size=self._pool_size + 1,
-            num_layers=self._num_layers,
+            num_layers=self._num_attention_layers,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
@@ -330,7 +388,8 @@ class MlxModelRunner:
         logger.info(
             f"KV pool initialized: pool_size={self._pool_size} "
             f"(buffer size {self._pool_size + 1} incl. padding slot 0), "
-            f"{self._num_layers} layers, {n_kv_heads} kv_heads, {head_dim} head_dim"
+            f"{self._num_attention_layers} attention layers, "
+            f"{n_kv_heads} kv_heads, {head_dim} head_dim"
         )
 
     def prefill(
@@ -367,40 +426,43 @@ class MlxModelRunner:
 
     def _sync_new_kv_to_pool(
         self,
-        cache: list[ContiguousKVCache],
+        cache: list[Any],
         cache_start: int,
         slot_ids: list[int],
     ) -> None:
         """Sync KV from contiguous cache to pool at the given slot IDs."""
-        if not slot_ids or self._kv_pool is None:
+        if not slot_ids or self._kv_pool is None or self._has_non_attention_layers:
             return
-        num_layers = len(cache)
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
         # TODO: Standardize ContiguousKVCache size to avoid transpose
         # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
         k_all = mx.stack(
             [
-                cache[i].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for i in range(num_layers)
+                cache[layer_idx].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
+                for layer_idx in self._attention_layer_indices
             ]
         )
         v_all = mx.stack(
             [
-                cache[i].values[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for i in range(num_layers)
+                cache[layer_idx].values[0, :, cache_start:end, :].transpose(1, 0, 2)
+                for layer_idx in self._attention_layer_indices
             ]
         )
         self._kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
     def _sync_decode_kv_to_pool(self, req_id: str) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool."""
-        if self._kv_pool is None or self._req_to_token_pool is None:
+        if (
+            self._kv_pool is None
+            or self._req_to_token_pool is None
+            or self._has_non_attention_layers
+        ):
             return
         cache = self._req_caches.get(req_id)
         if cache is None:
             return
-        current_offset = cache[0].offset
+        current_offset = self._first_attention_cache(cache).offset
         synced_offset = self._req_synced_offset.get(req_id, 0)
         if current_offset <= synced_offset:
             return
@@ -420,7 +482,11 @@ class MlxModelRunner:
 
     def flush_all_decode_kv(self) -> None:
         """Sync all active requests' un-flushed decode KV to the pool."""
-        if self.disable_radix_cache or self._kv_pool is None:
+        if (
+            self.disable_radix_cache
+            or self._kv_pool is None
+            or self._has_non_attention_layers
+        ):
             return
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
@@ -456,6 +522,24 @@ class MlxModelRunner:
         """
         num_layers = self._num_layers
         prefix_len = len(prefix_slot_ids)
+
+        if self._has_non_attention_layers:
+            cache = self._acquire_cache()
+            # Qwen3.5-style hybrid layers keep recurrent state outside KV.
+            # Re-run the complete prompt instead of reconstructing only the
+            # softmax-attention prefix from the radix pool.
+            input_ids = mx.array([full_token_ids or new_token_ids], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+            return MlxPendingPrefill(
+                lazy_token=lazy_token,
+                cache=cache,
+                req_id=req_id,
+                full_token_ids=list(full_token_ids),
+                req_pool_idx=req_pool_idx,
+                synced_offset=0,
+            )
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()
@@ -558,7 +642,11 @@ class MlxModelRunner:
         logits = self._extract_logits(model_output)
         lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
 
-        if not self.disable_radix_cache and new_slot_ids:
+        if (
+            not self.disable_radix_cache
+            and not self._has_non_attention_layers
+            and new_slot_ids
+        ):
             synced = self._req_synced_offset[req_id]
             self._sync_new_kv_to_pool(cache, synced, new_slot_ids)
             new_synced_offset = synced + len(new_slot_ids)
@@ -597,20 +685,28 @@ class MlxModelRunner:
 
         caches = [self._req_caches[rid] for rid in req_ids]
 
-        if batch_size == 1:
-            cache = caches[0]
-            last_token = self._req_token_ids[req_ids[0]][-1]
-            input_ids = mx.array([[last_token]], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-            logits = self._extract_logits(model_output)
-            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        if batch_size == 1 or self._has_non_attention_layers:
+            lazy_token_list = []
+            for rid, cache in zip(req_ids, caches):
+                last_token = self._req_token_ids[rid][-1]
+                input_ids = mx.array([[last_token]], dtype=mx.int32)
+                model_output = self.model(input_ids, cache=cache)
+                logits = self._extract_logits(model_output)
+                lazy_token_list.append(mx.argmax(logits[:, -1, :], axis=-1))
+            lazy_tokens = (
+                lazy_token_list[0]
+                if batch_size == 1
+                else mx.concatenate(lazy_token_list, axis=0)
+            )
             return MlxPendingDecode(
                 lazy_tokens=lazy_tokens,
                 req_ids=list(req_ids),
                 caches=caches,
             )
 
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+        seq_lens = [
+            self._first_attention_cache(caches[i]).offset for i in range(batch_size)
+        ]
         layer_caches = [
             [caches[i][layer_idx] for i in range(batch_size)]
             for layer_idx in range(num_layers)
@@ -672,14 +768,22 @@ class MlxModelRunner:
         # mutates the Python offset synchronously at graph-build time.
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+        seq_lens = [
+            self._first_attention_cache(caches[i]).offset for i in range(batch_size)
+        ]
 
-        if batch_size == 1:
-            cache = caches[0]
-            batched_input = prev.lazy_tokens[:, None]
-            model_output = self.model(batched_input, cache=cache)
-            logits = self._extract_logits(model_output)
-            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        if batch_size == 1 or self._has_non_attention_layers:
+            lazy_token_list = []
+            for i, cache in enumerate(caches):
+                batched_input = prev.lazy_tokens[i : i + 1, None]
+                model_output = self.model(batched_input, cache=cache)
+                logits = self._extract_logits(model_output)
+                lazy_token_list.append(mx.argmax(logits[:, -1, :], axis=-1))
+            lazy_tokens = (
+                lazy_token_list[0]
+                if batch_size == 1
+                else mx.concatenate(lazy_token_list, axis=0)
+            )
             return MlxPendingDecode(
                 lazy_tokens=lazy_tokens,
                 req_ids=prev.req_ids,
@@ -746,7 +850,7 @@ class MlxModelRunner:
 
     def remove_request(self, req_id: str):
         """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
+        if not self.disable_radix_cache and not self._has_non_attention_layers:
             self._sync_decode_kv_to_pool(req_id)
 
         self._req_token_ids.pop(req_id, None)
@@ -760,7 +864,7 @@ class MlxModelRunner:
         """Clear all request states."""
         self._req_token_ids.clear()
         for cache in self._req_caches.values():
-            self._cache_pool.append(cache)
+            self._release_cache(cache)
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()

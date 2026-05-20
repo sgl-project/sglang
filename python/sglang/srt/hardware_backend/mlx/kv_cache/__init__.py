@@ -1,5 +1,11 @@
 """KV cache components for the MLX backend."""
 
+from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_head_dim,
+    get_num_heads,
+    get_num_kv_heads,
+    is_attention_module,
+)
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_wrapper import (
     BatchedDecodeContext,
     MLXAttentionWrapper,
@@ -24,8 +30,12 @@ __all__ = [
     "clear_context",
     "ContiguousKVCache",
     "find_attention_layers",
+    "get_head_dim",
     "get_context",
     "get_num_layers",
+    "get_num_heads",
+    "get_num_kv_heads",
+    "is_attention_module",
     "MLXAttentionWrapper",
     "MlxKVPool",
     "OffsetCache",

@@ -15,9 +15,9 @@ normal ``GenerationBatchResult``.
 import logging
 from typing import Optional, Union
 
-import mlx.core as mx
 import torch
 
+import mlx.core as mx
 from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingDecode,
     MlxPendingExtend,
@@ -377,7 +377,23 @@ class MlxTpModelWorker(TpModelWorker):
     @staticmethod
     def _cache_state(cache_list) -> list[mx.array]:
         """Flatten a per-layer cache list to its ``state`` arrays."""
-        return [s for c in cache_list for s in c.state]
+        arrays: list[mx.array] = []
+
+        def collect(value):
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif value is None:
+                return
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        for cache in cache_list:
+            collect(getattr(cache, "state", ()))
+        return arrays
 
     def async_chained_decode_mlx(
         self,
