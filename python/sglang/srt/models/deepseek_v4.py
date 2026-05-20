@@ -33,11 +33,14 @@ from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
+    attn_tp_all_reduce,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -494,7 +497,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size() and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -729,9 +732,6 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = forward_batch.attn_backend
@@ -815,6 +815,8 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            o = attn_tp_all_reduce(o)
 
         return o
 
@@ -1173,16 +1175,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            # `get_global_dp_buffer` upstream now requires the TP group as an
-            # explicit positional arg; mirror communicator.py:986 to fix the
-            # nodeepep (moe_a2a_backend=none) path which crashed with
-            # `TypeError: get_global_dp_buffer() missing 1 required positional
-            # argument: 'group'` on every DP rank's first forward.
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # hidden_states here follow TP_ATTN_FULL semantics: they are replicated
+            # within an attention-TP group. Use replicate gather to avoid summing the
+            # same activations across attention-TP ranks before entering MLP/MoE.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -1199,10 +1199,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  mlp     shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if _use_tp_moe_gather:
-            # Paired scatter back to local buffer; same TP group as the gather
-            # above (see fix comment there).
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_attention_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -1308,7 +1306,9 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Token ids are replicated within an attention-TP group. Use replicate
+            # gather here to avoid summing duplicated ids when attention_tp_size > 1.
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids

@@ -464,6 +464,23 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
+        # DP-attention IDLE ranks get a padded batch (bs>0) but seq_lens are
+        # all zero. The sparse-attn metadata kernel
+        # (npu_sparse_attn_sharedkv_metadata) doesn't accept this shape; even
+        # after clamping seqused_kv it tries to read the request's page table
+        # at positions that were never written, which surfaces as an AICPU
+        # exception (errcode 0x2a / runtime 507018) on the next sync.
+        # The rest of the V4 backend already treats IDLE as a no-op (see
+        # forward_compress / forward_c4_indexer below), so we mirror that
+        # contract here: stash empty-but-typed defaults on fm so any later
+        # attribute access stays well-defined, then return without invoking
+        # any sparse-attn metadata kernels.
+        if forward_batch.forward_mode.is_idle():
+            fm.actual_seq_lengths_q = None
+            fm.actual_seq_lengths_q_pa = None
+            fm.kernel_metadata = {}
+            return
+
         # Build TND cu_seqlens_q (= cumulative QUERY seq lens, int32 device tensor).
         # The kernel uses cu_seqlens_q to slice the q tensor by request, so
         # the per-request length here must equal the per-request token count
