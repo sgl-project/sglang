@@ -140,17 +140,32 @@ def test_different_seed_produces_different_sequence() -> None:
     assert diverged, "different seeds must produce different cycles sequences"
 
 
-def test_launch_slot_executes_on_device() -> None:
-    """``launch_slot`` must enqueue a spin_wait kernel that synchronizes successfully.
+def test_launch_slot_executes_on_device(monkeypatch) -> None:
+    """``launch_slot`` must invoke ``spin_wait_step`` once per slot and synchronize cleanly.
 
-    Smoke test: a 1000-cycle slot launch followed by ``cuda.synchronize`` must not raise. Wall time
-    coverage lives in the kernel unit tests under ``jit_kernel/tests``.
+    Counts kernel launches via monkeypatch so a refactor that silently drops a slot launch fails
+    here; wall-time coverage lives in the kernel unit tests under ``jit_kernel/tests``.
     """
     runner = _make_runner(per_slot_fire_prob=1.0, max_cycles=1_000)
     runner.randomize_for_next_step()
+
+    launch_calls: List[int] = []
+    real_spin_wait = jitter_module.spin_wait_step
+
+    def _counting_spin_wait(*, cycles: torch.Tensor) -> None:
+        launch_calls.append(1)
+        real_spin_wait(cycles=cycles)
+
+    monkeypatch.setattr(jitter_module, "spin_wait_step", _counting_spin_wait)
+
     for slot in JitterSlot:
         runner.launch_slot(slot=slot)
     torch.cuda.synchronize()
+
+    assert len(launch_calls) == JitterRunner.NUM_SLOTS, (
+        f"launch_slot must fire exactly once per slot; "
+        f"observed {len(launch_calls)} for {JitterRunner.NUM_SLOTS} slots"
+    )
 
 
 def test_step_counter_increments() -> None:

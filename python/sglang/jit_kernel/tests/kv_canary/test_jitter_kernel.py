@@ -60,6 +60,12 @@ def test_spin_wait_monotonic_in_cycles() -> None:
         f"large={wall_large * 1e6:.1f}us"
     )
 
+    # Absolute band: 1M cycles at 1-2 GHz SM clock is ~0.5-1ms; wide tolerance for cold caches.
+    assert 200e-6 < wall_large < 5e-3, (
+        f"1_000_000-cycle wall must fall in [200us, 5ms]; got {wall_large * 1e6:.1f}us "
+        f"(launch overhead or shrunk loop?)"
+    )
+
 
 def test_spin_wait_kernel_loop_present_in_source() -> None:
     """White-box guard against nvcc dead-store elimination silently turning the body into a no-op.
