@@ -2420,7 +2420,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
@@ -2515,7 +2516,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
@@ -2576,7 +2578,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        # seq_lens_sum computed lazily in ForwardBatch.init_new from seq_lens_cpu.
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
         self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
