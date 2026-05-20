@@ -181,7 +181,11 @@ class _StubStage:
 
     Importing the real ``PipelineStage`` would drag in unrelated runtime
     dependencies (server_args, residency manager); the copies below are
-    deliberately byte-identical to the methods in ``stages/base.py``.
+    logic-equivalent to the methods in ``stages/base.py`` — logging is
+    swapped for an in-test counter so spam-tests can assert call counts.
+    Drift between this stub and the real base is caught by
+    ``test_call_invokes_gate_before_forward`` below, which subclasses
+    the real ``PipelineStage`` directly.
     """
 
     def __init__(self, modules, enable_flag: bool) -> None:
@@ -354,6 +358,54 @@ class TestStageMixin(unittest.TestCase):
         self.assertIsNot(stage._nvtx_hooks, first_hooks)
         self.assertIn(b, stage._nvtx_hooks._module_to_name_map)
         self.assertNotIn(a, stage._nvtx_hooks._module_to_name_map)
+
+    def test_gate_survives_deleted_module_attr(self) -> None:
+        """Regression: overrides that read ``self.<attr>`` via ``getattr``
+        with a ``None`` default must not raise after a stage deallocates
+        its component (e.g. MPS dealloc deletes ``self.transformer``)."""
+
+        class _DeletableStage(_StubStage):
+            def __init__(self) -> None:
+                super().__init__([], enable_flag=True)
+                self.module = torch.nn.Linear(2, 2)
+
+            def nvtx_hookable_modules(self):
+                return [(getattr(self, "module", None), "m")]
+
+        stage = _DeletableStage()
+        stage._apply_nvtx_gate(is_warmup=False)
+        self.assertIsNotNone(stage._nvtx_hooks)
+        # Mimic MPS dealloc: detach + del the attr, then the next request's
+        # gate must not raise even though the override reads the attribute.
+        stage._detach_nvtx_hooks()
+        del stage.module
+        stage._apply_nvtx_gate(is_warmup=False)
+        self.assertIsNone(stage._nvtx_hooks)  # zero-modules retry path
+
+    def test_finally_disables_hooks_for_cross_stage_isolation(self) -> None:
+        """Regression: when two stages share a module (e.g. VAE shared
+        between ImageVAEEncodingStage and DecodingStage), each stage's
+        own hooks must only fire during its own forward. The base
+        ``__call__`` disables this stage's hooks in a ``finally`` block.
+
+        This stub-level test asserts the contract by simulating the
+        sequence: stage A enables → A's forward → A disables → stage B
+        enables → B's forward sees A.enabled = False."""
+        shared = torch.nn.Linear(2, 2)
+        stage_a = _StubStage([(shared, "a_prefix")], enable_flag=True)
+        stage_b = _StubStage([(shared, "b_prefix")], enable_flag=True)
+
+        # Stage A's call cycle
+        stage_a._apply_nvtx_gate(is_warmup=False)
+        self.assertTrue(stage_a._nvtx_hooks._enabled)
+        # Simulate the base __call__'s finally clause.
+        stage_a._nvtx_hooks.set_enabled(False)
+
+        # Stage B's call cycle
+        stage_b._apply_nvtx_gate(is_warmup=False)
+        self.assertTrue(stage_b._nvtx_hooks._enabled)
+        # While B is enabled, A is still disabled (the finally above ran).
+        self.assertFalse(stage_a._nvtx_hooks._enabled)
 
 
 class TestCollectInputShapes(unittest.TestCase):

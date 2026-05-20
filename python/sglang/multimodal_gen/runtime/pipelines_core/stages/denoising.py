@@ -340,9 +340,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         # Registered from ``_prepare_denoising_loop`` after cache-dit and
         # torch.compile finalize the transformer tree.
+        # ``getattr`` because the MPS deallocation path ``del`` s the
+        # transformer attributes between requests; the next request
+        # then re-loads and re-registers via the zero-modules retry.
         return [
-            (self.transformer, "transformer"),
-            (self.transformer_2, "transformer_2"),
+            (getattr(self, "transformer", None), "transformer"),
+            (getattr(self, "transformer_2", None), "transformer_2"),
         ]
 
     def _maybe_enable_cache_dit(

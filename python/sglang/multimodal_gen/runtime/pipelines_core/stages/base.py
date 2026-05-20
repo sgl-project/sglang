@@ -216,8 +216,34 @@ class PipelineStage(StageDedupMixin, ABC):
     def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         """Modules to instrument with layerwise NVTX hooks; default none.
 
-        Override in stages that own forward-able components. Each entry is
-        ``(module, prefix)`` where ``prefix`` is the marker-name prefix.
+        Override in stages that own forward-able components. Each entry
+        is ``(module, prefix)`` where ``prefix`` is prepended to every
+        emitted NVTX range name. The base implementation returns an
+        empty list — stages without instrumentable components inherit
+        a no-op.
+
+        Conventions:
+
+        * ``None`` modules are skipped silently; this is the contract
+          for lazy-loaded components (return the attribute before the
+          loader runs and the next request retries registration).
+        * If a stage may ``del`` its component attribute (e.g. the MPS
+          deallocation path on ``DenoisingStage``), use
+          ``getattr(self, "<attr>", None)`` so the override does not
+          raise ``AttributeError`` between deallocate and re-load.
+        * Prefixes must be globally unique across stages that can
+          appear in the same pipeline. The current set is:
+          ``transformer`` / ``transformer_2`` (DenoisingStage),
+          ``text_encoder[_N]`` (TextEncodingStage),
+          ``image_encoder`` / ``image_text_encoder``
+          (ImageEncodingStage), ``vae`` (DecodingStage),
+          ``vae_encoder`` (EncodingStage), ``image_vae_encoder``
+          (ImageVAEEncodingStage), ``ltx2_vae_encoder`` /
+          ``ltx2_condition_image_encoder`` (LTX2ImageEncodingStage),
+          and ``qwen_layered_text_encoder`` / ``qwen_layered_vae``
+          (QwenImageLayeredBeforeDenoisingStage).
+        * Called every gate (once per request); should be O(modules)
+          and side-effect free.
         """
         return []
 
@@ -234,6 +260,7 @@ class PipelineStage(StageDedupMixin, ABC):
             return
         current = self.nvtx_hookable_modules()
         current_ids = frozenset(id(m) for m, _ in current if m is not None)
+        is_rebind = False
         if self._nvtx_hooks is not None:
             if current_ids == self._nvtx_registered_ids:
                 return
@@ -242,6 +269,7 @@ class PipelineStage(StageDedupMixin, ABC):
             self._nvtx_hooks = None
             self._nvtx_registered_ids = frozenset()
             self._nvtx_zero_warned = False
+            is_rebind = True
         hooks = DiffusionNvtxHooks()
         total = 0
         for module, prefix in current:
@@ -256,11 +284,18 @@ class PipelineStage(StageDedupMixin, ABC):
                 )
                 self._nvtx_zero_warned = True
             return
-        logger.info(
-            "[%s] Registered NVTX hooks on %d submodules",
-            self.__class__.__name__,
-            total,
-        )
+        if is_rebind:
+            logger.info(
+                "[%s] Re-registered NVTX hooks on %d submodules (modules changed)",
+                self.__class__.__name__,
+                total,
+            )
+        else:
+            logger.info(
+                "[%s] Registered NVTX hooks on %d submodules",
+                self.__class__.__name__,
+                total,
+            )
         self._nvtx_hooks = hooks
         self._nvtx_registered_ids = current_ids
 
@@ -393,16 +428,26 @@ class PipelineStage(StageDedupMixin, ABC):
         # and will register on the next call once modules become available.
         self._apply_nvtx_gate(batch.is_warmup)
 
-        # Execute the actual stage logic with unified profiling
-        with StageProfiler(
-            stage_name,
-            logger=logger,
-            metrics=batch.metrics,
-            log_stage_start_end=not batch.is_warmup
-            and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-        ):
-            result = self.forward(batch, server_args)
+        # Execute the actual stage logic with unified profiling. The
+        # ``finally`` disables this stage's hooks again so a module
+        # shared with another stage (e.g. a VAE referenced by both
+        # ImageVAEEncodingStage and DecodingStage) never has more than
+        # one stage's hooks armed at a time, even though both stages
+        # registered against the same module instance.
+        try:
+            with StageProfiler(
+                stage_name,
+                logger=logger,
+                metrics=batch.metrics,
+                log_stage_start_end=not batch.is_warmup
+                and not (self.server_args and self.server_args.comfyui_mode),
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                result = self.forward(batch, server_args)
+        finally:
+            if self._nvtx_hooks is not None:
+                self._nvtx_hooks.set_enabled(False)
+            self._current_use_nvtx = False
 
         # Post-execution output verification
         try:
