@@ -9,7 +9,7 @@ the factory with one bound to the new oracle.
 
 from __future__ import annotations
 
-from sglang.srt.kv_canary.mock_model.oracle import HashOracle, ScriptedOracle
+from sglang.srt.kv_canary.mock_model.oracle import HashOracle
 from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
@@ -40,7 +40,7 @@ def test_install_oracle_sampler_twice_returns_distinct_hooks_with_replaced_oracl
     None
 ):
     oracle_a = HashOracle(seed=10, vocab_size=100)
-    oracle_b = ScriptedOracle(table={(0, 0): 77})
+    oracle_b = HashOracle(seed=99, vocab_size=100)
 
     hook_a = install_oracle_sampler(oracle=oracle_a)
     factory_a = _CUSTOM_SAMPLER_FACTORIES["oracle"]

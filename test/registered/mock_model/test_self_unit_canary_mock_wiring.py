@@ -11,7 +11,7 @@ import os
 import torch
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.mock_model.oracle import ScriptedOracle
+from sglang.srt.kv_canary.mock_model.oracle import HashOracle
 from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -38,8 +38,8 @@ class _StubForwardBatch:
 
 
 def test_fill_expected_inputs_decode_one_token_per_req() -> None:
-    table = {(5, 10): 111, (7, 20): 333}
-    hook = install_oracle_sampler(oracle=ScriptedOracle(table=table))
+    oracle = HashOracle(seed=1, vocab_size=32000)
+    hook = install_oracle_sampler(oracle=oracle)
 
     fb = _StubForwardBatch(
         input_ids=torch.tensor([0, 0], dtype=torch.int64),
@@ -55,13 +55,16 @@ def test_fill_expected_inputs_decode_one_token_per_req() -> None:
         expected_inputs_out=expected_inputs,
     )
 
-    assert expected_inputs.tokens[:2].tolist() == [111, 333]
+    assert expected_inputs.tokens[:2].tolist() == [
+        oracle.expected_token(req_id=5, position=10),
+        oracle.expected_token(req_id=7, position=20),
+    ]
     assert expected_inputs.positions[:2].tolist() == [10, 20]
 
 
 def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
-    table = {(5, 0): 11, (5, 1): 22, (5, 2): 33, (7, 0): 99}
-    hook = install_oracle_sampler(oracle=ScriptedOracle(table=table))
+    oracle = HashOracle(seed=2, vocab_size=32000)
+    hook = install_oracle_sampler(oracle=oracle)
 
     fb = _StubForwardBatch(
         input_ids=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
@@ -77,12 +80,17 @@ def test_fill_expected_inputs_extend_uses_extend_seq_lens() -> None:
         expected_inputs_out=expected_inputs,
     )
 
-    assert expected_inputs.tokens[:4].tolist() == [11, 22, 33, 99]
+    assert expected_inputs.tokens[:4].tolist() == [
+        oracle.expected_token(req_id=5, position=0),
+        oracle.expected_token(req_id=5, position=1),
+        oracle.expected_token(req_id=5, position=2),
+        oracle.expected_token(req_id=7, position=0),
+    ]
     assert expected_inputs.positions[:4].tolist() == [0, 1, 2, 0]
 
 
 def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None:
-    hook = install_oracle_sampler(oracle=ScriptedOracle(table={}))
+    hook = install_oracle_sampler(oracle=HashOracle(seed=0, vocab_size=100))
 
     fb = _StubForwardBatch(
         input_ids=torch.empty(0, dtype=torch.int64),
