@@ -67,8 +67,9 @@ class PerForwardOrchestrator:
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=max(1, per_forward_verify_capacity), device=device
         )
+        write_req_capacity = max(1, per_forward_write_req_capacity)
         self._write_plan_per_forward = WritePlan.allocate(
-            write_req_capacity=max(1, per_forward_write_req_capacity), device=device
+            write_req_capacity=write_req_capacity, device=device
         )
 
         write_entry_capacity = max(1, per_forward_write_entry_capacity)
@@ -76,12 +77,14 @@ class PerForwardOrchestrator:
             capacity=write_entry_capacity, device=device
         )
 
-        bs_capacity = max(1, per_forward_write_req_capacity)
         self._plan_input_per_forward = PlanInput.allocate(
-            bs_capacity=bs_capacity,
+            bs_capacity=write_req_capacity,
             extra_verify_capacity=0,
             device=device,
         )
+
+        self._write_req_capacity = write_req_capacity
+        self._write_entry_capacity = write_entry_capacity
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
@@ -91,6 +94,20 @@ class PerForwardOrchestrator:
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
+
+        bs = int(forward_batch.batch_size)
+        num_tokens = int(forward_batch.positions.shape[0])
+        assert bs <= self._write_req_capacity, (
+            f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
+            f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
+            f"or check install_canary._compute_launch_capacities"
+        )
+        assert num_tokens <= self._write_entry_capacity, (
+            f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
+            f"write_entry_capacity={self._write_entry_capacity}; raise "
+            f"--chunked-prefill-size / --max-prefill-tokens or check "
+            f"install_canary._compute_launch_capacities"
+        )
 
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
