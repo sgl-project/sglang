@@ -33,7 +33,7 @@ def _call(oracle: HashOracle, *, req_id: int, position: int) -> int:
 
 class TestHashOracle(CustomTestCase):
     def test_hash_oracle_is_deterministic_for_same_inputs(self) -> None:
-        oracle = HashOracle(seed=12345, vocab_size=32000)
+        oracle = HashOracle(vocab_size=32000)
 
         first = _call(oracle, req_id=7, position=42)
         second = _call(oracle, req_id=7, position=42)
@@ -42,7 +42,7 @@ class TestHashOracle(CustomTestCase):
 
     def test_hash_oracle_output_in_vocab_range(self) -> None:
         vocab_size = 1024
-        oracle = HashOracle(seed=0xCAFEBABE, vocab_size=vocab_size)
+        oracle = HashOracle(vocab_size=vocab_size)
 
         req_ids = torch.arange(0, 64, dtype=torch.int64).repeat_interleave(64)
         positions = torch.arange(0, 64, dtype=torch.int64).repeat(64)

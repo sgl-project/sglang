@@ -44,7 +44,7 @@ def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) ->
 
 class TestFillExpectedInputs(CustomTestCase):
     def test_fill_expected_inputs_decode_one_token_per_req(self) -> None:
-        oracle = HashOracle(seed=1, vocab_size=32000)
+        oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
         fb = _StubForwardBatch(
@@ -73,7 +73,7 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])
 
     def test_fill_expected_inputs_extend_uses_extend_seq_lens(self) -> None:
-        oracle = HashOracle(seed=2, vocab_size=32000)
+        oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
         fb = _StubForwardBatch(
@@ -106,7 +106,7 @@ class TestFillExpectedInputs(CustomTestCase):
     def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool(
         self,
     ) -> None:
-        hook = install_oracle_sampler(oracle=HashOracle(seed=0, vocab_size=100))
+        hook = install_oracle_sampler(oracle=HashOracle(vocab_size=100))
 
         fb = _StubForwardBatch(
             input_ids=torch.empty(0, dtype=torch.int64),
