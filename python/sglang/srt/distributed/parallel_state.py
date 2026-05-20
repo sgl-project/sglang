@@ -829,6 +829,7 @@ class GroupCoordinator:
             and self._has_aiter_custom_all_gather()
             and input.is_contiguous()
             and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
             and ca_comm.should_custom_ag(input)
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):

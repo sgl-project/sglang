@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import sys
 import unittest
@@ -19,8 +18,8 @@ class TestAiterAllGatherAmd(unittest.TestCase):
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     def test_aiter_allgather_matches_rccl(self):
-        nproc = min(self._gpu_count(), 4)
-        if nproc < 2:
+        gpu_count = self._gpu_count()
+        if gpu_count < 2:
             self.skipTest("This test requires at least 2 GPUs.")
 
         repo_root = Path(__file__).resolve().parents[3]
@@ -32,60 +31,92 @@ class TestAiterAllGatherAmd(unittest.TestCase):
             f"Missing benchmark script: {benchmark_script}",
         )
 
-        shapes = "1,32320;2,32320;4,32320"
-        cmd = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            f"--nproc_per_node={nproc}",
-            str(benchmark_script),
-            "--dtype",
+        dtype_names = [
+            "float32",
+            "float16",
             "bfloat16",
-            "--shapes",
-            shapes,
-            "--warmup",
-            "3",
-            "--iters",
-            "10",
+            "uint64_t",
+            "int64_t",
+            "uint32_t",
+            "int32_t",
+            "int16_t",
+            "uint8_t",
+            "int8_t",
         ]
+        # Keep the CI matrix compact: one small metadata shape and one
+        # medium aligned 2-D shape exercise both naive and vectorized kernels.
+        shapes = "16,;8,1024"
+        dims = "0,-1"
+        tp_sizes = [tp for tp in (2, 4, 8) if gpu_count >= tp]
 
-        env = os.environ.copy()
-        result = subprocess.run(
-            cmd,
-            cwd=str(repo_root),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300,
-        )
+        outputs = []
+        for tp_size in tp_sizes:
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc_per_node={tp_size}",
+                str(benchmark_script),
+                "--dtype",
+                ",".join(dtype_names),
+                "--shapes",
+                shapes,
+                "--dims",
+                dims,
+                "--warmup",
+                "0",
+                "--iters",
+                "1",
+                "--correctness-only",
+            ]
 
-        if result.returncode != 0:
-            self.fail(
-                "Aiter all-gather benchmark failed.\n"
-                f"Return code: {result.returncode}\n"
-                f"Command: {' '.join(cmd)}\n"
-                f"Output:\n{result.stdout}"
+            env = os.environ.copy()
+            env.setdefault("AITER_AOT_IMPORT", "1")
+            result = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=240,
+            )
+            outputs.append(f"### TP={tp_size}\n{result.stdout}")
+
+            if result.returncode != 0:
+                self.fail(
+                    "Aiter all-gather correctness sweep failed.\n"
+                    f"Return code: {result.returncode}\n"
+                    f"Command: {' '.join(cmd)}\n"
+                    f"Output:\n{result.stdout}"
+                )
+
+            expected_rows = (
+                len(dtype_names) * len(shapes.split(";")) * len(dims.split(","))
+            )
+            rows = [
+                line.strip()
+                for line in result.stdout.splitlines()
+                if line.strip().startswith(tuple(dtype_names))
+            ]
+            self.assertEqual(
+                expected_rows,
+                len(rows),
+                f"Expected {expected_rows} rows for TP={tp_size}, got:\n{result.stdout}",
             )
 
-        rows = [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if re.match(r"^\(\d+, 32320\)", line.strip())
-        ]
-        self.assertEqual(
-            3,
-            len(rows),
-            f"Expected 3 benchmark rows for shapes {shapes}, got:\n{result.stdout}",
-        )
+            bad_rows = [row for row in rows if " True " not in row]
+            self.assertEqual(
+                [],
+                bad_rows,
+                f"Correctness failed for one or more all-gather rows:\n{result.stdout}",
+            )
 
-        bad_rows = [row for row in rows if " True " not in row]
-        self.assertEqual(
-            [],
-            bad_rows,
-            f"Correctness failed for one or more all-gather rows:\n{result.stdout}",
-        )
+        if gpu_count >= 8:
+            self.assertEqual([2, 4, 8], tp_sizes)
+        else:
+            self.assertEqual([2, 4][: len(tp_sizes)], tp_sizes)
 
 
 if __name__ == "__main__":
