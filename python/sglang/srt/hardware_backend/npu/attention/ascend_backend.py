@@ -1103,7 +1103,7 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
                         softmax_scale=layer.scaling,
                         sparse_mode=4 if layer.sliding_window_size != -1 else 3,
-                        learnable_sinks=sinks,
+                        learnable_sink=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
@@ -2036,6 +2036,12 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
+                    if self.forward_metadata.seq_lens_cpu_int is None:
+                        actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                    else:
+                        actual_seq_len_kv = (
+                            self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                        )
                     block_size = 128
                     max_model_len = block_tables.shape[-1] * block_size
                     swa_mask = self.ascend_attn_mask_builder.get_swa_mask(
@@ -2057,13 +2063,13 @@ class AscendAttnBackend(AttentionBackend):
                         num_query_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="BSND",
-                        block_size=128,
-                        atten_mask=swa_mask,
-                        sparse_mode=4,
+                        block_size=block_size,
+                        atten_mask=swa_mask if layer.sliding_window_size != -1 else None,
+                        sparse_mode=4 if layer.sliding_window_size != -1 else 0,
                         softmax_scale=layer.scaling,
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
-                        actual_seq_kvlen=self.forward_metadata.seq_lens,
+                        actual_seq_kvlen=actual_seq_len_kv,
                         learnable_sinks=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
