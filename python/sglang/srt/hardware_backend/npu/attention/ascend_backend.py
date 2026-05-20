@@ -1075,6 +1075,12 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
+                    num_token_padding = q.shape[0]
+                    if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                        q, k, v = [
+                            data[: forward_batch.num_token_non_padded_cpu]
+                            for data in [q, k, v]
+                        ]
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     block_size = 128
                     attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
@@ -1105,6 +1111,17 @@ class AscendAttnBackend(AttentionBackend):
                         sparse_mode=4 if layer.sliding_window_size != -1 else 3,
                         learnable_sink=sinks,
                     )
+                    if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                        attn_out = torch.cat(
+                            [
+                                attn_out,
+                                attn_out.new_zeros(
+                                    num_token_padding - attn_out.shape[0],
+                                    *attn_out.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
                     attn_out = attention_sinks_prefill_triton(
