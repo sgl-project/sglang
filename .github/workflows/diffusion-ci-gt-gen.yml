@@ -14,7 +14,12 @@ on:
         default: ''
         type: string
       output_name:
-        description: 'Custom output folder name (also used for artifact names and publish target dir). Leave empty to use defaults.'
+        description: 'Custom local output/artifact folder name. Leave empty to use defaults.'
+        required: false
+        default: ''
+        type: string
+      publish_target_dir:
+        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
         required: false
         default: ''
         type: string
@@ -23,9 +28,29 @@ on:
         required: false
         default: ''
         type: string
+      run_official_cases:
+        description: 'Run official comparable GT cases instead of native SGLang GT cases.'
+        required: false
+        default: false
+        type: boolean
+      official_case_ids:
+        description: 'Specific official case IDs to run (space-separated). Leave empty to run all official comparable cases.'
+        required: false
+        default: ''
+        type: string
+      official_source_group:
+        description: 'Official GT source group filter: all, diffusers, wan21, ltx, or ltx23. Used only when run_official_cases is true.'
+        required: false
+        default: ''
+        type: string
+      ci_data_ref:
+        description: 'ci-data ref to use for repro scripts when running official GT cases.'
+        required: false
+        default: 'main'
+        type: string
 
 concurrency:
-  group: diffusion-ci-gt-gen-${{ github.ref }}
+  group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
   cancel-in-progress: true
 
 permissions:
@@ -36,14 +61,288 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
+  PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
 
 jobs:
+  compute-official-gt-matrix:
+    if: github.repository == 'sgl-project/sglang' && inputs.run_official_cases
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      case-count: ${{ steps.compute.outputs.case-count }}
+    steps:
+      - name: Compute official case matrix
+        id: compute
+        env:
+          OFFICIAL_CASE_IDS: ${{ inputs.official_case_ids }}
+          OFFICIAL_SOURCE_GROUP: ${{ inputs.official_source_group || 'all' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          groups = {
+              "diffusers": [
+                  "flux_2_image_t2i",
+                  "flux_2_klein_image_t2i",
+                  "flux_2_ti2i",
+                  "flux_image_t2i",
+                  "qwen_image_edit_2509_ti2i",
+                  "qwen_image_edit_2511_ti2i",
+                  "qwen_image_edit_ti2i",
+                  "qwen_image_layered_i2i",
+                  "qwen_image_t2i",
+                  "zimage_image_t2i",
+              ],
+              "wan21": ["wan2_1_t2v_1.3b"],
+              "ltx": [
+                  "ltx_2_two_stage_t2v",
+                  "ltx_2.3_two_stage_t2v_2gpus",
+                  "ltx_2_3_two_stage_ti2v_2gpus",
+                  "ltx_2.3_one_stage_ti2v",
+                  "ltx_2_3_hq_pipeline",
+              ],
+              "ltx23": [
+                  "ltx_2.3_two_stage_t2v_2gpus",
+                  "ltx_2.3_one_stage_ti2v",
+              ],
+          }
+          source_group = os.environ["OFFICIAL_SOURCE_GROUP"].strip() or "all"
+          if source_group == "all":
+              selected_groups = ["diffusers", "wan21", "ltx"]
+          elif source_group in groups:
+              selected_groups = [source_group]
+          else:
+              raise SystemExit(f"unknown official_source_group: {source_group}")
+
+          requested = os.environ["OFFICIAL_CASE_IDS"].split()
+          requested_set = set(requested)
+          h200_cases = {
+              "flux_2_image_t2i",
+              "flux_2_klein_image_t2i",
+              "flux_2_ti2i",
+          }
+          include = []
+          for group in selected_groups:
+              for case_id in groups[group]:
+                  if requested_set and case_id not in requested_set:
+                      continue
+                  include.append(
+                      {
+                          "source_group": group,
+                          "case_id": case_id,
+                          "runner": "8-gpu-h200" if case_id in h200_cases else "1-gpu-h100",
+                      }
+                  )
+
+          known_cases = {case for cases in groups.values() for case in cases}
+          unknown = sorted(requested_set - known_cases)
+          if unknown:
+              raise SystemExit(f"unknown official case id(s): {' '.join(unknown)}")
+          if not include:
+              raise SystemExit("official case matrix is empty")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+              f.write(f"case-count={len(include)}\n")
+          PY
+
+  official-gt-hopper:
+    needs: compute-official-gt-matrix
+    if: needs.compute-official-gt-matrix.result == 'success'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-official-gt-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout ci-data repro scripts
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/ci-data
+          ref: ${{ inputs.ci_data_ref || 'main' }}
+          path: ci-data
+          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          sparse-checkout: |
+            diffusion-ci/repro_scripts
+            diffusion-ci/consistency_gt/official_generated/case_map.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Install official LTX repro dependencies
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
+        run: |
+          UV_SYSTEM_PYTHON=1 uv pip install \
+            "transformers==4.52.4" \
+            openimageio \
+            --index-strategy unsafe-best-match \
+            --prerelease allow
+          UV_SYSTEM_PYTHON=1 uv pip uninstall kernels
+
+      - name: Checkout official Wan2.1 repo
+        if: matrix.source_group == 'wan21'
+        run: |
+          mkdir -p /tmp/mmgen-official-code
+          if [ ! -d /tmp/mmgen-official-code/Wan2.1/.git ]; then
+            git clone https://github.com/Wan-Video/Wan2.1.git /tmp/mmgen-official-code/Wan2.1
+          fi
+          git -C /tmp/mmgen-official-code/Wan2.1 fetch --depth 1 origin 9737cba9c1c3c4d04b33fcad41c111989865d315
+          git -C /tmp/mmgen-official-code/Wan2.1 checkout 9737cba9c1c3c4d04b33fcad41c111989865d315
+          git -C /tmp/mmgen-official-code/Wan2.1 rev-parse HEAD
+
+      - name: Checkout official LTX-2 repo
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
+        run: |
+          mkdir -p /tmp/mmgen-official-code
+          if [ ! -d /tmp/mmgen-official-code/LTX-2/.git ]; then
+            git clone https://github.com/Lightricks/LTX-2.git /tmp/mmgen-official-code/LTX-2
+          fi
+          git -C /tmp/mmgen-official-code/LTX-2 fetch --depth 1 origin 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
+          git -C /tmp/mmgen-official-code/LTX-2 checkout 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
+          git -C /tmp/mmgen-official-code/LTX-2 rev-parse HEAD
+
+      - name: Generate official output
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+          CUDA_VISIBLE_DEVICES: 0
+          CASE_ID: ${{ matrix.case_id }}
+          SOURCE_GROUP: ${{ matrix.source_group }}
+        run: |
+          git -C ci-data rev-parse HEAD
+          mkdir -p "python/${{ env.OUTPUT_NAME }}"
+          if [ "$SOURCE_GROUP" = "diffusers" ]; then
+            cd python
+            python ../ci-data/diffusion-ci/repro_scripts/gen_official_diffusion_gt.py \
+              --suite 1-gpu \
+              --out-dir ./${{ env.OUTPUT_NAME }} \
+              --case-ids "$CASE_ID" \
+              --dtype bf16 \
+              --device-map none \
+              --generator-device cuda
+          elif [ "$SOURCE_GROUP" = "wan21" ]; then
+            cd python
+            python ../ci-data/diffusion-ci/repro_scripts/gen_official_diffusion_gt.py \
+              --suite 1-gpu \
+              --out-dir ./${{ env.OUTPUT_NAME }} \
+              --case-ids "$CASE_ID" \
+              --wan-official-repo-dir /tmp/mmgen-official-code/Wan2.1 \
+              --dtype bf16 \
+              --device-map none \
+              --generator-device cuda
+          elif [ "$SOURCE_GROUP" = "ltx" ] || [ "$SOURCE_GROUP" = "ltx23" ]; then
+            cd python
+            extra_ltx_args=()
+            if [ "$CASE_ID" = "ltx_2_3_hq_pipeline" ]; then
+              extra_ltx_args+=(--num-frames 24)
+            fi
+            set +e
+            PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
+              python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
+                --out-dir ./${{ env.OUTPUT_NAME }} \
+                --case-ids "$CASE_ID" \
+                "${extra_ltx_args[@]}"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              find ./${{ env.OUTPUT_NAME }} \( -name 'official_ltx_manifest.json' -o -name 'official_ltx23_manifest.json' \) -print -exec cat {} \;
+              exit "$status"
+            fi
+          else
+            echo "Unknown SOURCE_GROUP=$SOURCE_GROUP"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}-${{ matrix.source_group }}-${{ matrix.case_id }}
+          path: |
+            python/${{ env.OUTPUT_NAME }}/*.jpg
+            python/${{ env.OUTPUT_NAME }}/*.png
+            python/${{ env.OUTPUT_NAME }}/official_gt_manifest_*.json
+            python/${{ env.OUTPUT_NAME }}/official_ltx_manifest.json
+            python/${{ env.OUTPUT_NAME }}/official_ltx23_manifest.json
+          retention-days: 7
+
+      - name: Publish official GT images to sgl-project/ci-data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+
+  compute-diffusion-partitions:
+    if: github.repository == 'sgl-project/sglang' && !inputs.run_official_cases
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
+      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+      matrix-b200: ${{ steps.compute.outputs.matrix-b200 }}
+      partition-count-1gpu: ${{ steps.compute.outputs['partition-count-1gpu'] }}
+      partition-count-2gpu: ${{ steps.compute.outputs['partition-count-2gpu'] }}
+      partition-count-b200: ${{ steps.compute.outputs['partition-count-b200'] }}
+      plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
+      plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
+      plan-b200: ${{ steps.compute.outputs.plan-b200 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py \
+            --min-time 1200 \
+            --target-time 1800 \
+            --max-time 2400 \
+            --max-partitions 10 \
+            --parametrized-only
+
   multimodal-diffusion-gen-1gpu:
-    if: github.repository == 'sgl-project/sglang'
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}'
     runs-on: 1-gpu-h100
     strategy:
-      matrix:
-        part: [0, 1]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     timeout-minutes: 150
     steps:
       - name: Checkout code
@@ -75,12 +374,14 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
@@ -91,20 +392,23 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
   multimodal-diffusion-gen-2gpu:
-    if: github.repository == 'sgl-project/sglang'
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}'
     runs-on: 2-gpu-h100
     strategy:
-      matrix:
-        part: [0, 1]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     timeout-minutes: 150
     steps:
       - name: Checkout code
@@ -136,12 +440,14 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
@@ -152,17 +458,23 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
   multimodal-diffusion-gen-b200:
-    if: github.repository == 'sgl-project/sglang'
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-b200 != '{"include":[]}'
     runs-on: 4-gpu-b200
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-b200) }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -194,24 +506,28 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-b200 }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-gpu-b200 \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-b200'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.OUTPUT_NAME }}-b200
+          name: ${{ env.OUTPUT_NAME }}-b200-part${{ matrix.part }}
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"

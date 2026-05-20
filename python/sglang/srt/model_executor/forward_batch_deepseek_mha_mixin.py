@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 
 
@@ -44,9 +45,7 @@ class ForwardBatchDeepSeekMHAMixin:
     mha_one_shot_kv_indices: Optional[torch.Tensor] = None
 
     def get_max_chunk_capacity(self):
-        # Maximum number of tokens in each chunk
-        # TODO: Should be changed to a better value, maybe passed through server args
-        return 128 * 1024
+        return envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
 
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx

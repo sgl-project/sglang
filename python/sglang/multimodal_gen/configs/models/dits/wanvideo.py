@@ -4,15 +4,12 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-
-
-def is_blocks(n: str, m) -> bool:
-    return "blocks" in n and str.isdigit(n.split(".")[-1])
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 
 @dataclass
 class WanVideoArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
@@ -31,6 +28,7 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.attn1\.norm_q\.(.*)$": r"blocks.\1.norm_q.\2",
             r"^blocks\.(\d+)\.attn1\.norm_k\.(.*)$": r"blocks.\1.norm_k.\2",
             r"^blocks\.(\d+)\.attn1\.attn_op\.local_attn\.proj_l\.(.*)$": r"blocks.\1.attn1.local_attn.proj_l.\2",
+            r"^blocks\.(\d+)\.attn2\.norm_added_q\.(.*)$": "",
             r"^blocks\.(\d+)\.attn2\.to_out\.0\.(.*)$": r"blocks.\1.attn2.to_out.\2",
             r"^blocks\.(\d+)\.ffn\.net\.0\.proj\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.net\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",

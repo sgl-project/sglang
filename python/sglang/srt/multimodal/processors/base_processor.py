@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -428,7 +428,7 @@ class BaseMultimodalProcessor(ABC):
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
