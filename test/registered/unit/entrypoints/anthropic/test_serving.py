@@ -692,17 +692,19 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
-        assistant_msg = next(
-            m for m in chat_request.messages if m["role"] == "assistant"
-        )
-        content = assistant_msg["content"]
+        # ``ChatCompletionRequest.messages`` is a list of Pydantic
+        # ChatCompletionMessage*Param instances; access via attributes.
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        content = assistant_msg.content
         # Reasoning history sits in front; the thinking block itself is dropped
         # from the prompt so its text is not duplicated.
         if isinstance(content, list):
-            texts = [
-                part.get("text", "") if isinstance(part, dict) else ""
-                for part in content
-            ]
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    texts.append(part.get("text", ""))
+                else:
+                    texts.append(getattr(part, "text", "") or "")
         else:
             texts = [content]
         joined = "\n".join(texts)
