@@ -186,6 +186,15 @@ class SchedulerOutputProcessorMixin:
         Unlike customized_info (which appends per-output-token), this
         overwrites: each model step replaces the prior snapshot. The
         tokenizer surfaces the final value as a single dict per request.
+
+        Additionally: when the snapshot for the Double Sparsity namespace
+        carries an `error_class` (set by `_publish_ds_request_summary`
+        when the DS adapter sanitized this row), clear the partial
+        per-output-token `customized_info["double_sparsity"]` for this
+        request so a degraded request does not surface stale stats from
+        prior steps. Per-request abort plumbing through the scheduler
+        boundary remains queued; this method ensures the partial state
+        is at least consistent.
         """
         if logits_output is None:
             return
@@ -201,6 +210,17 @@ class SchedulerOutputProcessorMixin:
             if entry is None:
                 continue
             req.per_request_summary[k] = entry
+
+            # If the DS row was sanitized, clear the partial per-token
+            # accumulator for this request's DS namespace so the request
+            # does not surface mixed pre-failure and post-failure stats.
+            if (
+                k == "double_sparsity"
+                and isinstance(entry, dict)
+                and entry.get("error_class")
+                and req.customized_info is not None
+            ):
+                req.customized_info.pop("double_sparsity", None)
 
     def process_batch_result_prefill(
         self: Scheduler,

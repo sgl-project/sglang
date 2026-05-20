@@ -1895,8 +1895,12 @@ class DeepseekV2AttentionMLA(
         sl_cpu = seq_lens.detach().to("cpu").tolist()
 
         # Pull per-request identifiers when available; fall back to row
-        # index strings so structured logs still have a stable key.
-        req_ids = getattr(forward_batch, "req_ids", None)
+        # index strings so structured logs still have a stable key. The
+        # live ForwardBatch carries them as `rids` (not `req_ids`); we
+        # accept either for forward-compat with synthetic fixtures.
+        req_ids = getattr(forward_batch, "rids", None)
+        if req_ids is None:
+            req_ids = getattr(forward_batch, "req_ids", None)
 
         records: List[Optional[Dict[str, Any]]] = []
         for b in range(bs):

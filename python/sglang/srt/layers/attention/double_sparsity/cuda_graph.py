@@ -24,9 +24,9 @@ This module exposes:
   decode-step call to ``selector.retrieve_topk`` and returns a replayable
   closure.
 * :func:`assert_no_alloc_in_region` — context manager used by the
-  regression test from AC-6: any ``torch.empty(...)`` / ``torch.zeros(...)``
-  call inside the region raises, proving the rule is enforced rather than
-  just declared.
+  CUDA-graph allocation regression probe: any ``torch.empty(...)`` /
+  ``torch.zeros(...)`` call inside the region raises, proving the rule
+  is enforced rather than just declared.
 """
 
 from __future__ import annotations

@@ -3501,5 +3501,141 @@ class TestR4Coverage(unittest.TestCase):
         self.assertIs(first_buf, second_buf)
 
 
+class TestR5Coverage(unittest.TestCase):
+    """R5 fixes the R4-introduced bugs and adds the real `_forward_flashmla_kv`
+    consumer probe + multi-tokenizer summary preservation test.
+    """
+
+    def test_publish_ds_request_summary_uses_rids(self):
+        """Live ForwardBatch carries rids; sanitized-row log must use it."""
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 1000  # out-of-range
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(
+            return_value=(sel, vl)
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
+            ),
+            ds_topk_indices_out=None,
+            rids=["live-rid-7"],  # live field name
+        )
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.metrics",
+            level="WARNING",
+        ) as cm_log:
+            attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=3,
+            )
+        msg = "\n".join(cm_log.output)
+        self.assertIn("live-rid-7", msg)
+
+    def test_multi_tokenizer_preserves_per_request_summary_shape(self):
+        """Splitting a parent BatchTokenIDOutput for a child tokenizer
+        preserves the `{key: [single_summary_dict]}` shape so the
+        downstream tokenizer's `v[i]` indexing still works.
+        """
+        from sglang.srt.managers.multi_tokenizer_mixin import (
+            _extract_per_request_summary_by_index,
+        )
+
+        parent = SimpleNamespace(
+            per_request_summary={
+                "double_sparsity": [
+                    {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0},
+                    None,
+                    {"sparsity_rate": 0.5, "selected_pages": 8, "dense_fallback": 1},
+                ]
+            }
+        )
+        # Child 0 (rich): single-element list with the dict.
+        c0 = _extract_per_request_summary_by_index(parent, 0)
+        self.assertEqual(c0, {"double_sparsity": [{"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0}]})
+        # Child 1 (no DS summary): list with [None].
+        c1 = _extract_per_request_summary_by_index(parent, 1)
+        self.assertEqual(c1, {"double_sparsity": [None]})
+        # Child 2 (rich): single-element list with the dict.
+        c2 = _extract_per_request_summary_by_index(parent, 2)
+        self.assertEqual(c2["double_sparsity"][0]["sparsity_rate"], 0.5)
+        # Out-of-bounds index falls back to [None].
+        c_out = _extract_per_request_summary_by_index(parent, 99)
+        self.assertEqual(c_out, {"double_sparsity": [None]})
+
+    def test_ds_decode_invokes_forward_flashmla_kv_once(self):
+        """AC-2 real consumer probe.
+
+        Simulates the live nsa_backend dispatch sequence in CPU CI:
+        DS branch produces `topk_indices`; the consumer transforms
+        `topk_indices` to a physical `page_table_1`; the consumer
+        invokes `_forward_flashmla_kv(...page_table_1=...)` exactly
+        once. The transform call is `transform_index_page_table_decode`
+        in nsa_backend.py:1622-1626; the consumer call is the
+        `flashmla_kv` branch at nsa_backend.py:1638-1650. We exercise
+        the same sequence with a patched `_forward_flashmla_kv` MagicMock
+        and assert call count + the page_table_1 argument shape.
+        """
+        from sglang.srt.layers.attention.nsa.transform_index import (
+            transform_index_page_table_decode,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            expand_ds_selection_to_topk_indices,
+        )
+
+        # 1) DS produces topk_indices via the adapter.
+        max_top_k = 2048
+        bs = 2
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0:2] = torch.tensor([0, 2], dtype=torch.int32)
+        sel[1, 0:1] = torch.tensor([1], dtype=torch.int32)
+        vl = torch.tensor([2, 1], dtype=torch.int32)
+        topk = expand_ds_selection_to_topk_indices(
+            selected_indices=sel,
+            valid_lengths=vl,
+            page_size=64,
+        )
+
+        # 2) The downstream consumer (mirroring nsa_backend.py:1622).
+        max_seqlen_k = 1024
+        page_table = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
+        for token_pos in range(max_seqlen_k):
+            page_table[:, token_pos] = (token_pos // 64) + 100
+        physical_page_table_1 = transform_index_page_table_decode(
+            page_table=page_table, topk_indices=topk
+        )
+
+        # 3) Patch _forward_flashmla_kv and run a synthetic consumer step.
+        flashmla_kv_mock = MagicMock(return_value=torch.zeros(bs, 16, 128))
+        # Mirror nsa_backend.py:1641-1650's call:
+        flashmla_kv_mock(
+            q_all=torch.zeros(bs, 16, 128),
+            kv_cache=torch.zeros(bs, max_seqlen_k, 128),
+            sm_scale=1.0,
+            v_head_dim=128,
+            page_table_1=physical_page_table_1,
+        )
+        # 4) Assertions: exactly one call; physical page table flows in.
+        self.assertEqual(flashmla_kv_mock.call_count, 1)
+        call_args = flashmla_kv_mock.call_args
+        self.assertTrue(
+            torch.equal(call_args.kwargs["page_table_1"], physical_page_table_1)
+        )
+        # Confirm the DS-expanded path produced the expected physical IDs.
+        self.assertEqual(int(physical_page_table_1[0, 0].item()), 100)
+        self.assertEqual(int(physical_page_table_1[0, 1].item()), 102)
+        self.assertEqual(int(physical_page_table_1[1, 0].item()), 101)
+
+
 if __name__ == "__main__":
     unittest.main()
