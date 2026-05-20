@@ -28,8 +28,6 @@ _NUM_LAYERS_OVERRIDE = json.dumps({"num_hidden_layers": 1})
 
 def _spec_eagle_server_args() -> List[str]:
     return [
-        "--load-format",
-        "dummy",
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--sampling-backend",
