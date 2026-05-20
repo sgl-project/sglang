@@ -206,6 +206,11 @@ export const GLM5Deployment = () => {
       cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 
+    // H200 FP8: flashinfer allreduce fusion.
+    if (hardware === 'h200' && effectiveQuant === 'fp8') {
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+    }
+
     cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
     return cmd;
   };
