@@ -18,11 +18,15 @@ _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 # that exercises that invariant end-to-end.
 
 # Cap canary install-time capacities below the 1M cuda-grid-safe ceiling
-# enforced by install_canary (max_bs * max_seq_len_per_req). Defaults
-# (cuda_graph_max_bs=4096, req_to_token_cols=40964) overshoot by 167x.
+# enforced by install_canary: max_bs * max_seq_len_per_req. max_bs is
+# max(cuda_graph_max_bs, max_running_requests), so capping just
+# cuda_graph_max_bs is not enough -- the pool size (derived from
+# mem_fraction_static) still pushes max_running_requests to 4096+.
 _CANARY_CAPACITY_CAPS: List[str] = [
     "--cuda-graph-max-bs",
     "8",
+    "--max-running-requests",
+    "32",
     "--context-length",
     "2048",
 ]
