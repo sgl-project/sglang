@@ -137,14 +137,14 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_dsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
         # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
-        if not is_nsa_model:
+        if not is_dsa_model:
             return kv_cache_dim
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
@@ -199,7 +199,7 @@ class ModelRunnerKVCacheMixin:
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
-        is_nsa_model: bool,
+        is_dsa_model: bool,
         is_dsv4_model: bool,
         current_platform,
     ):
@@ -215,7 +215,7 @@ class ModelRunnerKVCacheMixin:
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
@@ -328,14 +328,14 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_dsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
-            is_nsa_model, is_dsv4_model, current_platform
+            is_dsa_model, is_dsv4_model, current_platform
         )
 
         if is_dsv4_model:
@@ -375,7 +375,7 @@ class ModelRunnerKVCacheMixin:
                 enable_hisparse=self.enable_hisparse,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_nsa_model:
+            if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
@@ -400,7 +400,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -472,7 +472,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -499,7 +499,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_dsa_model:
             PoolCls = (
                 HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
             )
@@ -526,7 +526,7 @@ class ModelRunnerKVCacheMixin:
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_nsa_model
+            assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,

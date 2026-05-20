@@ -132,7 +132,7 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
-    def get_nsa_extend_len_cpu(self) -> List[int]:
+    def get_dsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
         """
@@ -511,7 +511,7 @@ class Indexer(MultiPlatformOp):
 
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
-        q_offset = sum(metadata.get_nsa_extend_len_cpu())
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 

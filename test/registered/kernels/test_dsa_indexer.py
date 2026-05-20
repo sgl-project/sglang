@@ -136,7 +136,7 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         """Return: seq lens for each batch."""
         return torch.tensor(self.seq_lens, dtype=torch.int32, device=self.device)
 
-    def get_nsa_extend_len_cpu(self) -> List[int]:
+    def get_dsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
         """

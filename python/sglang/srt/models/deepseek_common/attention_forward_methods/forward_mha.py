@@ -238,7 +238,7 @@ class DeepseekMHAForwardMixin:
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
@@ -471,7 +471,7 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _get_mla_kv_buffer_from_fp8_for_nsa(
+    def _get_mla_kv_buffer_from_fp8_for_dsa(
         self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ):

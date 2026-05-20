@@ -365,12 +365,12 @@ class DeepseekMLAForwardMixin:
         if is_kv_b_lora_active(self):
             q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
-        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
-            and (not skip_rope_for_nsa_tilelang_fused)
+            and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
         ):
@@ -409,7 +409,7 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
+            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -433,14 +433,14 @@ class DeepseekMLAForwardMixin:
                 )
                 save_kv_cache = False
                 # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # nsa_backend.forward_decode reuses q_cat as a zero-copy view
+                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
                 # (`q.contiguous().view(...)` fast-path) instead of running the
                 # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
                 # that would otherwise rebuild a tensor byte-identical to q_cat.
                 # On ROCm tilelang decode, this eliminates the
                 # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
                 # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because nsa_backend.forward_extend
+                # Prefill keeps the split form because dsa_backend.forward_extend
                 # asserts `q_rope is not None`.
                 if forward_batch.forward_mode.is_decode_or_idle():
                     if llama_4_scaling is not None:
@@ -705,7 +705,7 @@ class DeepseekMLAForwardMixin:
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
-    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """

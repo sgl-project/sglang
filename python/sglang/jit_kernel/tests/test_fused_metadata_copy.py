@@ -62,7 +62,7 @@ def create_test_metadata(
     dsa_cache_seqlens_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_seqlens_expanded_dst = torch.zeros(
+    dsa_seqlens_expanded_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
     dsa_cu_seqlens_k_dst = torch.zeros(
@@ -119,7 +119,7 @@ def create_test_metadata(
             "cu_seqlens_k": cu_seqlens_k_dst,
             "page_table_1": page_table_1_dst,
             "dsa_cache_seqlens": dsa_cache_seqlens_dst,
-            "nsa_seqlens_expanded": nsa_seqlens_expanded_dst,
+            "dsa_seqlens_expanded": dsa_seqlens_expanded_dst,
             "dsa_cu_seqlens_k": dsa_cu_seqlens_k_dst,
             "real_page_table": real_page_table_dst,
             "flashmla_num_splits": flashmla_num_splits_dst,
@@ -159,7 +159,7 @@ def reference_copy_target_verify(src, dst, max_seqlen_k, seqlens_expanded_size):
 
     rows, cols = src["page_indices"].shape
     dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["nsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
+    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
     dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
     dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
         src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
@@ -187,7 +187,7 @@ def reference_copy_draft_extend(src, dst, max_seqlen_k, seqlens_expanded_size):
 
     rows, cols = src["page_indices"].shape
     dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["nsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
+    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
     dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
     dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
         src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
@@ -250,7 +250,7 @@ def test_fused_metadata_copy_dtype_validation():
     dsa_cache_seqlens_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_seqlens_expanded_dst = torch.zeros(
+    dsa_seqlens_expanded_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
     dsa_cu_seqlens_k_dst = torch.zeros(
@@ -273,7 +273,7 @@ def test_fused_metadata_copy_dtype_validation():
             cu_seqlens_k_dst,
             page_table_1_dst,
             dsa_cache_seqlens_dst,
-            nsa_seqlens_expanded_dst,
+            dsa_seqlens_expanded_dst,
             dsa_cu_seqlens_k_dst,
             None,  # real_page_table_dst
             None,  # flashmla_num_splits_dst
@@ -306,7 +306,7 @@ def test_fused_metadata_copy_dtype_validation():
             cu_seqlens_k_dst,
             page_table_1_dst,
             dsa_cache_seqlens_dst,
-            nsa_seqlens_expanded_dst,
+            dsa_seqlens_expanded_dst,
             dsa_cu_seqlens_k_dst,
             None,
             None,
@@ -379,7 +379,7 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         dst_fused["cu_seqlens_k"],
         dst_fused["page_table_1"],
         dst_fused["dsa_cache_seqlens"],
-        dst_fused["nsa_seqlens_expanded"],
+        dst_fused["dsa_seqlens_expanded"],
         dst_fused["dsa_cu_seqlens_k"],
         dst_fused["real_page_table"],
         dst_fused["flashmla_num_splits"],
@@ -405,8 +405,8 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         dst_ref["dsa_cache_seqlens"], dst_fused["dsa_cache_seqlens"]
     ), "dsa_cache_seqlens mismatch"
     assert torch.equal(
-        dst_ref["nsa_seqlens_expanded"], dst_fused["nsa_seqlens_expanded"]
-    ), "nsa_seqlens_expanded mismatch"
+        dst_ref["dsa_seqlens_expanded"], dst_fused["dsa_seqlens_expanded"]
+    ), "dsa_seqlens_expanded mismatch"
     assert torch.equal(
         dst_ref["dsa_cu_seqlens_k"], dst_fused["dsa_cu_seqlens_k"]
     ), "dsa_cu_seqlens_k mismatch"
@@ -468,7 +468,7 @@ def test_fused_metadata_copy_large_batch(bs):
         dst_fused["cu_seqlens_k"],
         dst_fused["page_table_1"],
         dst_fused["dsa_cache_seqlens"],
-        dst_fused["nsa_seqlens_expanded"],
+        dst_fused["dsa_seqlens_expanded"],
         dst_fused["dsa_cu_seqlens_k"],
         dst_fused["real_page_table"],
         dst_fused["flashmla_num_splits"],

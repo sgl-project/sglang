@@ -22,7 +22,7 @@ _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
 _ALGORITHM_REGISTRY = {
     "quest": lambda config, device, **kw: QuestAlgorithm(config, device, **kw),
-    "deepseek_nsa": lambda config, device, **kw: DeepSeekDSAAlgorithm(
+    "deepseek_dsa": lambda config, device, **kw: DeepSeekDSAAlgorithm(
         config, device, **kw
     ),
 }

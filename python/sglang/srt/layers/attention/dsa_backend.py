@@ -2371,7 +2371,7 @@ class DeepseekSparseAttnMultiStepBackend:
                     metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
                     metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
 
-                    # Set nsa_prefill_impl for first 3 backends (required by the method)
+                    # Set dsa_prefill_impl for first 3 backends (required by the method)
                     for i in range(3):
                         self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
 
