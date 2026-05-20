@@ -230,3 +230,11 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
 
     setattr(server_args, "_double_sparsity_parsed_config", config)
     setattr(server_args, "_double_sparsity_channel_mask", mask)
+
+    # The mask passed schema + content-hash + runtime-pairing checks. Mark
+    # the AC-10 readiness gauge so /metrics reflects a healthy DS startup.
+    # The metrics helper is best-effort (silent when prometheus_client is
+    # missing); no error handling needed at the call site.
+    from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
+
+    _ds_metrics.mark_channel_mask_valid(True)

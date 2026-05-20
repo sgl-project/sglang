@@ -157,7 +157,13 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
     )
     gpu_raw = _from_either("gpu_id")
     if gpu_raw is None:
-        gpu_raw = _from_either("device")
+        # bench_serving's /server_info emits `device: "cuda"` (a generic
+        # device type, not a GPU identifier) and the rank under
+        # `base_gpu_id`. Falling back to `device` would collapse GPU 0 and
+        # GPU 1 onto the same "cuda" string and defeat the Round-12 default
+        # GPU-match gate. Only try `base_gpu_id`; if neither is present,
+        # leave gpu_id=None so _match_or_refuse refuses the comparison.
+        gpu_raw = _from_either("base_gpu_id")
     context = RunContext(
         gpu_id=str(gpu_raw) if gpu_raw is not None else None,
         tp_size=_from_either("tp_size"),

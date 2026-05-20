@@ -272,6 +272,52 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
+    def test_marks_channel_mask_valid_on_success(self):
+        """Round-13 fix [P2]: a healthy validator pass must set the AC-10
+        ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.
+        """
+
+        try:
+            import prometheus_client  # noqa: F401
+        except ImportError:
+            self.skipTest("prometheus_client not installed")
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+        m.reset_for_testing()
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                path, sel_t, w_t, dtype="fp8_e4m3", head_dim=128, page_size=64,
+                label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            args = self._args(
+                enable_double_sparsity=True,
+                double_sparsity_config=_valid_payload(path),
+                page_size=64,
+                kv_cache_dtype="fp8_e4m3",
+                nsa_prefill_backend="flashmla_kv",
+                nsa_decode_backend="flashmla_kv",
+                disable_radix_cache=True,
+            )
+            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+            try:
+                validate_double_sparsity(args)
+            finally:
+                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+        gauge = m._metric_objs.get("channel_mask_valid")
+        self.assertIsNotNone(gauge,
+                              "channel_mask_valid gauge should be registered")
+        self.assertEqual(gauge._value.get(), 1,
+                          "gauge must read 1 after a successful validation")
+        m.reset_for_testing()
+
 
 class TestPlaceholderGuard(unittest.TestCase):
     def setUp(self):
@@ -1663,6 +1709,63 @@ class TestBenchmarkCompareReader(unittest.TestCase):
         )
         reasons = bc._match_or_refuse(base, ds, allow_gpu_mismatch=True)
         self.assertEqual(reasons, [])
+
+    def test_gpu_id_extraction_prefers_base_gpu_id_over_device(self):
+        """Round-13 fix [P2]: bench_serving emits ``device: "cuda"`` (not a
+        GPU identifier) and the real rank under ``base_gpu_id``. Falling
+        back to ``device`` would collapse different GPUs to the same
+        identifier and defeat the Round-12 default match gate.
+        """
+
+        bc = self._import_compare()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            payload_with_base = {
+                "max_concurrency": 32,
+                "median_ttft_ms": 800.0, "p99_ttft_ms": 21000.0,
+                "median_tpot_ms": 4.0, "p99_tpot_ms": 12.0,
+                "output_lens": [100], "ttfts": [0.5],
+                "itls": [[0.01] * 99],
+                "server_info": {
+                    "tp_size": 8, "page_size": 64,
+                    "disable_radix_cache": True,
+                    "device": "cuda", "base_gpu_id": 0,
+                },
+            }
+            p1 = self._write_jsonl(tmp, "a.jsonl", payload_with_base)
+            ctx1, _ = bc._read_bench_jsonl(p1)
+            self.assertEqual(ctx1.gpu_id, "0",
+                              f"expected base_gpu_id source; got {ctx1.gpu_id!r}")
+
+            payload_no_id = dict(payload_with_base)
+            payload_no_id["server_info"] = {
+                "tp_size": 8, "page_size": 64,
+                "disable_radix_cache": True,
+                "device": "cuda",  # no gpu_id and no base_gpu_id
+            }
+            p2 = self._write_jsonl(tmp, "b.jsonl", payload_no_id)
+            ctx2, _ = bc._read_bench_jsonl(p2)
+            self.assertIsNone(
+                ctx2.gpu_id,
+                f"missing identifier must stay None; device must not become "
+                f"gpu_id. got {ctx2.gpu_id!r}",
+            )
+
+    def test_comparator_rejects_different_base_gpu_ids(self):
+        bc = self._import_compare()
+        base = bc.RunContext(
+            gpu_id="0", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        ds = bc.RunContext(
+            gpu_id="1", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(base, ds)
+        self.assertTrue(
+            any("gpu_id mismatch" in r for r in reasons),
+            f"expected gpu_id mismatch between rank 0 and rank 1; got {reasons}",
+        )
 
     def test_default_path_accepts_when_all_fields_match(self):
         """Sanity: matching contexts (including gpu_id) still publish."""
