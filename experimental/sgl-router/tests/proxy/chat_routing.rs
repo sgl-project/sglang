@@ -3,7 +3,7 @@
 
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -37,9 +37,8 @@ fn config_for(_worker_url: &str) -> Config {
             cache_aware: None,
         }],
         discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                path: "/tmp/x.toml".into(),
-                poll_interval_ms: 200,
+            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
             }),
         },
         proxy: ProxyConfig::default(),
@@ -870,7 +869,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     }
 }
 
-/// A malformed worker URL (operator typo in `workers.toml`, broken k8s
+/// A malformed worker URL (operator typo in `discovery.static_urls`, broken k8s
 /// annotation) must surface as 503 `worker_misconfigured` (not 500
 /// `internal_error`) AND trip the worker's circuit breaker so the malformed
 /// worker drops out of `healthy_workers_for` and subsequent requests skip

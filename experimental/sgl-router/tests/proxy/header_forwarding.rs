@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -35,9 +35,8 @@ async fn forwards_whitelisted_headers_strips_others() {
             cache_aware: None,
         }],
         discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                path: "/tmp/test-workers.toml".into(),
-                poll_interval_ms: 200,
+            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
             }),
         },
         proxy: ProxyConfig::default(),

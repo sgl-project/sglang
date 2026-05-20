@@ -37,9 +37,46 @@ impl Config {
             }
         }
         match &self.discovery.backend {
-            DiscoveryBackend::StaticFile(s) => {
-                if s.path.is_empty() {
-                    return Err(anyhow!("discovery.static_file.path must be set"));
+            DiscoveryBackend::StaticUrls(s) => {
+                if s.urls.is_empty() {
+                    return Err(anyhow!(
+                        "discovery.static_urls.urls must be a non-empty list"
+                    ));
+                }
+                // Validate every entry up front so typos surface at
+                // config-load with a precise diagnostic instead of as
+                // per-worker introspect failures or as two registry
+                // entries pointing at the same SGLang (trailing-slash
+                // near-duplicates). Dedupe runs against a normalized
+                // form (trimmed + trailing `/` stripped) so
+                // `"http://x:30000"` and `"http://x:30000/"` collide.
+                let mut seen = std::collections::HashSet::new();
+                for raw in &s.urls {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return Err(anyhow!(
+                            "discovery.static_urls.urls contains an empty or whitespace-only entry"
+                        ));
+                    }
+                    let parsed = url::Url::parse(trimmed).map_err(|e| {
+                        anyhow!(
+                            "discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}"
+                        )
+                    })?;
+                    match parsed.scheme() {
+                        "http" | "https" => {}
+                        other => {
+                            return Err(anyhow!(
+                                "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
+                            ));
+                        }
+                    }
+                    let normalized = parsed.as_str().trim_end_matches('/').to_string();
+                    if !seen.insert(normalized.clone()) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
+                        ));
+                    }
                 }
             }
             DiscoveryBackend::K8s(k) => {
@@ -73,9 +110,10 @@ models:
   - id: "qwen3-0.6b"
     tokenizer_path: "/tmp/qwen.json"
 discovery:
-  backend: static_file
-  static_file:
-    path: "/tmp/workers.toml"
+  backend: static_urls
+  static_urls:
+    urls:
+      - "http://10.0.0.1:30000"
 "#,
         )
         .unwrap();
@@ -83,8 +121,10 @@ discovery:
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
         match &c.discovery.backend {
-            DiscoveryBackend::StaticFile(s) => assert_eq!(s.path, "/tmp/workers.toml"),
-            _ => panic!("expected static_file backend"),
+            DiscoveryBackend::StaticUrls(s) => {
+                assert_eq!(s.urls, vec!["http://10.0.0.1:30000".to_string()])
+            }
+            _ => panic!("expected static_urls backend"),
         }
     }
 
@@ -102,22 +142,24 @@ port = 8090
 id = "qwen3-0.6b"
 tokenizer_path = "/tmp/qwen.json"
 [discovery]
-backend = "static_file"
-[discovery.static_file]
-path = "/tmp/workers.toml"
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://10.0.0.1:30000"]
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         match &c.discovery.backend {
-            DiscoveryBackend::StaticFile(s) => assert_eq!(s.path, "/tmp/workers.toml"),
-            _ => panic!("expected static_file backend"),
+            DiscoveryBackend::StaticUrls(s) => {
+                assert_eq!(s.urls, vec!["http://10.0.0.1:30000".to_string()])
+            }
+            _ => panic!("expected static_urls backend"),
         }
     }
 
     #[test]
-    fn rejects_missing_workers() {
+    fn rejects_missing_discovery_section() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.yaml");
         std::fs::write(
@@ -143,7 +185,7 @@ path = "/tmp/workers.toml"
     }
 
     #[test]
-    fn loads_static_file_discovery() {
+    fn loads_static_urls_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.toml");
         std::fs::write(
@@ -157,20 +199,210 @@ id = "qwen3-0.6b"
 tokenizer_path = "/tmp/qwen.json"
 policy = "round_robin"
 [discovery]
-backend = "static_file"
-[discovery.static_file]
-path = "/etc/experimental/sgl-router/workers.toml"
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         match &c.discovery.backend {
-            DiscoveryBackend::StaticFile(s) => {
-                assert_eq!(s.path, "/etc/experimental/sgl-router/workers.toml");
+            DiscoveryBackend::StaticUrls(s) => {
+                assert_eq!(
+                    s.urls,
+                    vec![
+                        "http://10.0.0.1:30000".to_string(),
+                        "http://10.0.0.2:30000".to_string(),
+                    ],
+                );
             }
-            _ => panic!("expected static_file backend"),
+            _ => panic!("expected static_urls backend"),
         }
         assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
+    }
+
+    #[test]
+    fn rejects_static_urls_with_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = []
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_static_urls_with_duplicate_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://x:30000", "http://x:30000"]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_static_urls_with_empty_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://x:30000", ""]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    /// Whitespace-only entries are user typos that previously slipped
+    /// through `is_empty()` checks and surfaced as "introspect against
+    /// `   /server_info` failed" at runtime. Catch at load.
+    #[test]
+    fn rejects_static_urls_with_whitespace_only_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://x:30000", "   "]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    /// `"10.0.0.1:30000"` (missing scheme) used to pass validation; the
+    /// scheme/`http://` would only fail (or worse, silently degrade
+    /// because of the `parse_bootstrap_host` localhost fallback) at
+    /// introspect time. Reject at load.
+    #[test]
+    fn rejects_static_urls_with_schemeless_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["10.0.0.1:30000"]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("not a valid URL") || err.contains("unsupported scheme"),
+            "got: {err}"
+        );
+    }
+
+    /// Non-http(s) schemes are rejected. The router speaks HTTP to
+    /// workers; a `tcp://` or `ws://` entry is almost certainly an
+    /// operator typo.
+    #[test]
+    fn rejects_static_urls_with_non_http_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["ws://x:30000"]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("unsupported scheme"), "got: {err}");
+    }
+
+    /// Trailing-slash near-duplicates collide in the registry but used
+    /// to pass byte-equality dedupe. Normalize before checking so two
+    /// pointers at the same SGLang surface as a config error.
+    #[test]
+    fn rejects_static_urls_with_trailing_slash_near_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "m"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://x:30000", "http://x:30000/"]
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[test]
@@ -390,9 +622,10 @@ server:
   host: 0.0.0.0
   port: 8090
 discovery:
-  backend: static_file
-  static_file:
-    path: /tmp/w.toml
+  backend: static_urls
+  static_urls:
+    urls:
+      - http://x:30000
 models:
   - id: qwen
     tokenizer_path: /tmp/qwen.json
@@ -422,9 +655,9 @@ port = 8090
 id = "qwen"
 tokenizer_path = "/tmp/qwen.json"
 [discovery]
-backend = "static_file"
-[discovery.static_file]
-path = "/tmp/w.toml"
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://x:30000"]
 "#,
         )
         .unwrap();

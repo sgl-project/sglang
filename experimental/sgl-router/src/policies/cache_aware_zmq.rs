@@ -300,10 +300,9 @@ mod tests {
                 cache_aware: None,
             }],
             discovery: crate::config::DiscoveryConfig {
-                backend: crate::config::DiscoveryBackend::StaticFile(
-                    crate::config::StaticFileDiscoveryConfig {
-                        path: "/tmp/w".into(),
-                        poll_interval_ms: 200,
+                backend: crate::config::DiscoveryBackend::StaticUrls(
+                    crate::config::StaticUrlsDiscoveryConfig {
+                        urls: vec!["http://placeholder:0".into()],
                     },
                 ),
             },

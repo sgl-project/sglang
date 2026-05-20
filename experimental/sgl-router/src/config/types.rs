@@ -211,17 +211,19 @@ fn default_cb_cool_down() -> u64 {
 /// TOML:
 /// ```toml
 /// [discovery]
-/// backend = "static_file"
-/// [discovery.static_file]
-/// path = "/etc/experimental/sgl-router/workers.toml"
+/// backend = "static_urls"
+/// [discovery.static_urls]
+/// urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
 /// ```
 ///
 /// YAML:
 /// ```yaml
 /// discovery:
-///   backend: static_file
-///   static_file:
-///     path: /etc/experimental/sgl-router/workers.toml
+///   backend: static_urls
+///   static_urls:
+///     urls:
+///       - http://10.0.0.1:30000
+///       - http://10.0.0.2:30000
 /// ```
 ///
 /// After deserialization `validate()` converts the raw fields into
@@ -229,7 +231,7 @@ fn default_cb_cool_down() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryConfigRaw {
     pub backend: String,
-    pub static_file: Option<StaticFileDiscoveryConfig>,
+    pub static_urls: Option<StaticUrlsDiscoveryConfig>,
     pub k8s: Option<K8sDiscoveryConfig>,
 }
 
@@ -265,11 +267,11 @@ impl TryFrom<DiscoveryConfigRaw> for DiscoveryConfig {
 
     fn try_from(raw: DiscoveryConfigRaw) -> Result<Self, Self::Error> {
         let backend = match raw.backend.as_str() {
-            "static_file" => {
-                let s = raw.static_file.ok_or(
-                    "discovery.backend = \"static_file\" requires [discovery.static_file] section",
+            "static_urls" => {
+                let s = raw.static_urls.ok_or(
+                    "discovery.backend = \"static_urls\" requires [discovery.static_urls] section",
                 )?;
-                DiscoveryBackend::StaticFile(s)
+                DiscoveryBackend::StaticUrls(s)
             }
             "k8s" => {
                 let k = raw
@@ -279,7 +281,7 @@ impl TryFrom<DiscoveryConfigRaw> for DiscoveryConfig {
             }
             other => {
                 return Err(format!(
-                    "unknown discovery.backend = {other:?}; valid: \"static_file\", \"k8s\""
+                    "unknown discovery.backend = {other:?}; valid: \"static_urls\", \"k8s\""
                 ))
             }
         };
@@ -290,14 +292,14 @@ impl TryFrom<DiscoveryConfigRaw> for DiscoveryConfig {
 impl From<DiscoveryConfig> for DiscoveryConfigRaw {
     fn from(cfg: DiscoveryConfig) -> Self {
         match cfg.backend {
-            DiscoveryBackend::StaticFile(s) => DiscoveryConfigRaw {
-                backend: "static_file".to_string(),
-                static_file: Some(s),
+            DiscoveryBackend::StaticUrls(s) => DiscoveryConfigRaw {
+                backend: "static_urls".to_string(),
+                static_urls: Some(s),
                 k8s: None,
             },
             DiscoveryBackend::K8s(k) => DiscoveryConfigRaw {
                 backend: "k8s".to_string(),
-                static_file: None,
+                static_urls: None,
                 k8s: Some(k),
             },
         }
@@ -306,19 +308,18 @@ impl From<DiscoveryConfig> for DiscoveryConfigRaw {
 
 #[derive(Debug, Clone)]
 pub enum DiscoveryBackend {
-    StaticFile(StaticFileDiscoveryConfig),
+    StaticUrls(StaticUrlsDiscoveryConfig),
     K8s(K8sDiscoveryConfig),
 }
 
+/// Fixed list of worker URLs. Each URL is registered once at startup;
+/// `mode`, `model_ids`, and `bootstrap_port` are resolved per-worker
+/// from `/server_info` (see [`crate::workers::introspect`]).
+///
+/// No file watcher, no hot-reload: topology change requires a restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaticFileDiscoveryConfig {
-    pub path: String,
-    #[serde(default = "default_poll_ms")]
-    pub poll_interval_ms: u64,
-}
-
-fn default_poll_ms() -> u64 {
-    200
+pub struct StaticUrlsDiscoveryConfig {
+    pub urls: Vec<String>,
 }
 
 /// Configuration for the Kubernetes `EndpointSlice` discovery backend.
