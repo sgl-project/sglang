@@ -22,7 +22,7 @@ from sglang.srt.kv_canary.runner.perturb_config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
-from sglang.srt.kv_canary.state import CanaryDeviceState, CanaryHostState
+from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -85,9 +85,6 @@ class CanaryRunner:
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
-        self._host_state = CanaryHostState.allocate(
-            config=config, num_tags=len(CanaryLaunchTag)
-        )
 
         endpoints: list[CanaryEndpoint] = []
         for group in self._buffer_groups:
@@ -113,7 +110,6 @@ class CanaryRunner:
             config=config,
             device=device,
             device_state=self._device_state,
-            host_state=self._host_state,
             tp_group=tp_group,
             d2h_stream=self._d2h_stream,
         )
@@ -155,7 +151,6 @@ class CanaryRunner:
             config=config,
             device=device,
             device_state=self._device_state,
-            host_state=self._host_state,
             active_tags=self._active_tags,
             pump_and_allreduce=self._pump_and_allreduce,
             sweep_orchestrator=self._sweep_orchestrator,
