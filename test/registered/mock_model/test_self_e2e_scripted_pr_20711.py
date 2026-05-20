@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-except ImportError:
-    MockEngine = None
-
+from sglang.srt.steppable_engine import SteppableEngine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires apply_pr_20711_fix toggle which is not currently implemented"
 )
 
 
@@ -23,7 +19,7 @@ def _fake_prompt(length: int) -> list[int]:
 
 
 def test_cross_batch_bitwise_regression() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         apply_pr_20711_fix=False,
@@ -43,7 +39,7 @@ def test_cross_batch_bitwise_regression() -> None:
 
 
 def test_cross_batch_bitwise_with_fix() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         apply_pr_20711_fix=True,

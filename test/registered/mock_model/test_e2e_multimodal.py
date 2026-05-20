@@ -6,17 +6,13 @@ import time
 
 import pytest
 
-try:
-    from sglang.srt.mock_mode import MockEngine
-except ImportError:
-    MockEngine = None
-
+from sglang.srt.steppable_engine import SteppableEngine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="extra-a-1-gpu")
 
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires multimodal support which is not currently implemented"
 )
 
 
@@ -28,7 +24,7 @@ def _mixed_prompt(text_len: int, image_count: int) -> list[int]:
 
 
 def test_multimodal_image_embed_canary_clean() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         multimodal=True,
@@ -45,7 +41,7 @@ def test_multimodal_image_embed_canary_clean() -> None:
 
 
 def test_multimodal_special_token_position_chain() -> None:
-    engine = MockEngine.launch(
+    engine = SteppableEngine.launch(
         model="Qwen/Qwen3-0.6B",
         num_hidden_layers=1,
         multimodal=True,

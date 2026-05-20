@@ -14,12 +14,12 @@ try:
         rule,
     )
 
-    from sglang.srt.mock_mode import MockEngine
+    from sglang.srt.steppable_engine import SteppableEngine
 
     _MOCK_MODE_AVAILABLE = True
 except ImportError:
     _MOCK_MODE_AVAILABLE = False
-    MockEngine = None
+    SteppableEngine = None
     RuleBasedStateMachine = object
     invariant = lambda *a, **k: (lambda f: f)
     precondition = lambda *a, **k: (lambda f: f)
@@ -31,14 +31,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
-if not _MOCK_MODE_AVAILABLE:
-    pytest.skip(
-        "awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3",
-        allow_module_level=True,
-    )
-
 pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
+    reason="requires force_preempt API which is not currently implemented"
 )
 
 
@@ -49,7 +43,9 @@ def _fake_prompt(length: int) -> list[int]:
 class SchedulerContractMachine(RuleBasedStateMachine):
     def __init__(self) -> None:
         super().__init__()
-        self.engine = MockEngine.launch(model="Qwen/Qwen3-0.6B", num_hidden_layers=1)
+        self.engine = SteppableEngine.launch(
+            model="Qwen/Qwen3-0.6B", num_hidden_layers=1
+        )
         self.handles: list = []
 
     def teardown(self) -> None:
