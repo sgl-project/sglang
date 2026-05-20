@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
-
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 from .utils import mock_model_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
-
-pytestmark = pytest.mark.skip(
-    reason="requires EAGLE v2 spec decoding support which is not currently implemented"
-)
 
 
 def _fake_prompt(length: int) -> list[int]:
