@@ -43,32 +43,30 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
         if not le_list:
             return
 
-        pattern_template = r'sglang:{}{.*le="{}".*model_name="{}".*}'
+        pattern_template = r'sglang:{}{{.*le="{}".*model_name="{}".*}}'
 
         for le in le_list:
             pattern = re.compile(
                 pattern_template.format(
-                    re.escape(metric_suffix),
-                    re.escape(le),
-                    re.escape(model)
+                    re.escape(metric_suffix), re.escape(le), re.escape(model)
                 ),
-                re.DOTALL
+                re.DOTALL,
             )
             testcase.assertTrue(
                 pattern.search(content),
-                f"Metric not found: sglang:{metric_suffix}{{le='{le}', model_name='{model}'}}"
+                f"Metric not found: sglang:{metric_suffix}{{le='{le}', model_name='{model}'}}",
             )
 
     @staticmethod
     def _verify_metrics_and_bucket_boundary(
-            testcase,
-            model,
-            url,
-            expected_time_to_first_token_bucket=None,
-            expected_inter_token_latency_bucket=None,
-            expected_e2e_request_latency_bucket=None,
-            expected_prompt_tokens_bucket=None,
-            expected_generation_tokens_bucket=None,
+        testcase,
+        model,
+        url,
+        expected_time_to_first_token_bucket=None,
+        expected_inter_token_latency_bucket=None,
+        expected_e2e_request_latency_bucket=None,
+        expected_prompt_tokens_bucket=None,
+        expected_generation_tokens_bucket=None,
     ):
         """Validate that metrics buckets align with expected boundaries when --enable-metrics and bucket configuration parameters are set."""
         # Generate tokens
@@ -88,11 +86,41 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
 
         checker = TestNPUMetricsDefaultBucketBoundary.check_metric
 
-        checker(testcase, metrics_content, "time_to_first_token_seconds_bucket", expected_time_to_first_token_bucket, model)
-        checker(testcase, metrics_content, "inter_token_latency_seconds_bucket", expected_inter_token_latency_bucket, model)
-        checker(testcase, metrics_content, "e2e_request_latency_seconds_bucket", expected_e2e_request_latency_bucket, model)
-        checker(testcase, metrics_content, "prompt_tokens_histogram_bucket", expected_prompt_tokens_bucket, model)
-        checker(testcase, metrics_content, "generation_tokens_histogram_bucket", expected_generation_tokens_bucket, model)
+        checker(
+            testcase,
+            metrics_content,
+            "time_to_first_token_seconds_bucket",
+            expected_time_to_first_token_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "inter_token_latency_seconds_bucket",
+            expected_inter_token_latency_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "e2e_request_latency_seconds_bucket",
+            expected_e2e_request_latency_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "prompt_tokens_histogram_bucket",
+            expected_prompt_tokens_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "generation_tokens_histogram_bucket",
+            expected_generation_tokens_bucket,
+            model,
+        )
 
         return metrics_content
 
