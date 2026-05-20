@@ -7,7 +7,7 @@ import torch
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patch.utils import (
     BufInfoTriple,
-    alloc_canary_buf_pair,
+    alloc_canary_buf,
     ensure_swa_lut_int32,
     make_packed_source,
     make_row_source,
@@ -51,7 +51,8 @@ def _build_full_group(
     c128_pool = pool.c128_kv_pool
 
     num_slots = int(c4_pool.kv_buffer[0].shape[0]) * c4_pool.page_size
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
 
     indexer_buf = indexer_pool.index_k_with_scale_buffer[0]
     indexer_bytes_per_token = int(indexer_buf.shape[1]) // indexer_pool.page_size
@@ -97,7 +98,8 @@ def _build_swa_group(
 ) -> CanaryBufferGroup:
     swa_pool = pool.swa_kv_pool
     num_slots = int(swa_pool.kv_buffer[0].shape[0]) * swa_pool.page_size
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
     return CanaryBufferGroup(
         kind=PoolKind.SWA,
         k_head=k_head,

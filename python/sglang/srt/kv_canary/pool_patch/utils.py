@@ -67,14 +67,12 @@ def resolve_read_bytes(config: CanaryConfig) -> int:
     return _DEFAULT_REAL_KV_READ_BYTES
 
 
-def alloc_canary_buf_pair(
+def alloc_canary_buf(
     *,
     num_slots: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-    tail = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-    return head, tail
+) -> torch.Tensor:
+    return torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
 
 
 def make_row_source(

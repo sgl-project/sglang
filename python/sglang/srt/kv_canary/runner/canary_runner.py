@@ -70,6 +70,7 @@ class CanaryRunner:
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
+        pp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: "ReqToTokenPool",
         radix_cache: Optional["BasePrefixCache"] = None,
         launch_capacities: CanaryLaunchCapacities,
@@ -111,6 +112,7 @@ class CanaryRunner:
             device=device,
             device_state=self._device_state,
             tp_group=tp_group,
+            pp_group=pp_group,
             d2h_stream=self._d2h_stream,
         )
         self._sweep_orchestrator = SweepOrchestrator(
@@ -163,14 +165,6 @@ class CanaryRunner:
     @property
     def active_tag_count(self) -> int:
         return len(self._active_tags)
-
-    @property
-    def step_counter(self) -> int:
-        return self._pump_and_allreduce.step_counter
-
-    @property
-    def sweep_passes(self) -> int:
-        return self._sweep_orchestrator.sweep_passes
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)

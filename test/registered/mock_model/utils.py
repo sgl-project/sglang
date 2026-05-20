@@ -1,6 +1,6 @@
-"""Default kwargs for spinning up an Engine in token-oracle + canary mode.
+"""Default kwargs for spinning up an Engine in mock-model + canary mode.
 
-Token-oracle mode is testing-only; the default-filling logic lives here so the
+Mock-model mode is testing-only; the default-filling logic lives here so the
 main code (server_args) does not have to know about it.
 """
 
@@ -11,25 +11,30 @@ import os
 from typing import Any
 
 
-def token_oracle_engine_kwargs(**overrides: Any) -> dict[str, Any]:
-    """Return Engine() kwargs that wire up token-oracle + canary together.
+def mock_model_engine_kwargs(**overrides: Any) -> dict[str, Any]:
+    """Return Engine() kwargs that wire up mock-model + canary together.
 
     Defaults:
         load_format = "dummy"            (no real weights loaded)
         json_model_override_args = '{"num_hidden_layers": 1}'
         sampling_backend = "oracle"      (gate for install_token_oracle_from_env)
-        kv_canary = "raise"              (token_oracle without canary is mostly pointless)
+        kv_canary = "raise"              (mock-model without canary is mostly pointless)
 
     Also sets ``SGLANG_KV_CANARY_INPUT_CHECK=1`` in the current process env so
     the canary's input-id verification path turns on when the engine starts.
-    This is a side effect because input-check is token-oracle-only and is no
+    This is a side effect because input-check is mock-model-only and is no
     longer a server arg; the env var is the only injection path.
+
+    When ``speculative_algorithm`` is set, ``SGLANG_KV_CANARY_INPUT_CHECK`` is
+    forced off — the oracle can't predict draft-position tokens, so
+    input-check would always fire.
 
     Caller-supplied overrides win; for json_model_override_args, the override
     dict is merged on top of the default so callers can add extra keys without
     losing num_hidden_layers=1.
     """
-    os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
+    is_spec = "speculative_algorithm" in overrides
+    os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "0" if is_spec else "1"
 
     defaults: dict[str, Any] = {
         "load_format": "dummy",

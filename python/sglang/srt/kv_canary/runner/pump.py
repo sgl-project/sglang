@@ -21,12 +21,14 @@ class PumpAndAllreduce:
         device: torch.device,
         device_state: CanaryDeviceState,
         tp_group: Optional["GroupCoordinator"],
+        pp_group: Optional["GroupCoordinator"],
         d2h_stream: Optional[torch.cuda.Stream],
     ) -> None:
         self._config = config
         self._device = device
         self._device_state = device_state
         self._tp_group = tp_group
+        self._pp_group = pp_group
         self._d2h_stream = d2h_stream
         self._step_counter: int = 0
         self._previous_pump_future: Optional[FutureTensor] = None
@@ -63,6 +65,12 @@ class PumpAndAllreduce:
                 op=dist.ReduceOp.MAX,
                 group=self._tp_group.device_group,
             )
+            if self._pp_group is not None and self._pp_group.world_size > 1:
+                dist.all_reduce(
+                    allreduce_buf,
+                    op=dist.ReduceOp.MAX,
+                    group=self._pp_group.device_group,
+                )
             if self._previous_allreduce_future is not None:
                 any_rank_errored = bool(
                     int(self._previous_allreduce_future.wait().item())
