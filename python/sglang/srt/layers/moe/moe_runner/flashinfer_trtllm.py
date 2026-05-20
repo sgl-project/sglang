@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_tensor_in_symmetric_mempool,
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_wrapper,
@@ -882,9 +883,26 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
-        hidden_states, quant_info.w13_input_scale_quant
-    )
+    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            1.0 / (448.0 * 6.0),
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+        )
+
+        seq_len, hidden_size = hidden_states.shape
+        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // 16
+        )
+    else:
+        per_token_scale = None
+        hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
@@ -939,6 +957,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_output.topk_ids.shape[1],
             n_group=0,
@@ -986,6 +1005,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,

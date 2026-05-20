@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -25,6 +25,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -46,8 +47,9 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -67,6 +69,59 @@ def get_attention_sliding_window_size(config):
 
 Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+def pp_filter_load_weight(
+    name,
+    loaded_weight,
+    *,
+    pp_group,
+    start_layer,
+    end_layer,
+    params_dict,
+    loaded_params,
+    tie_word_embeddings,
+    embed_weight_name,
+    first_rank_only_patterns=(),
+    last_rank_only_prefixes=(),
+    head_param_name="lm_head.weight",
+):
+    """Shared PP filter for Gemma4 load_weights paths.
+
+    Returns True if the caller should ``continue`` (handled or skipped),
+    False otherwise.  No-op when ``pp_group.world_size == 1``.
+
+    Handles three concerns in order:
+      1. Drop transformer-layer weights outside [start_layer, end_layer).
+      2. Route the tied ``embed_tokens.weight`` to ``lm_head`` on the last
+         rank (under PP, embed and lm_head live on different ranks so they
+         can't be tied via module aliasing).
+      3. Skip rank-local module weights on the wrong rank.
+    """
+    if pp_group.world_size <= 1:
+        return False
+
+    layer_id = get_layer_id(name)
+    if layer_id is not None and (layer_id < start_layer or layer_id >= end_layer):
+        return True
+
+    if tie_word_embeddings and pp_group.is_last_rank and name == embed_weight_name:
+        head_param = params_dict.get(head_param_name)
+        if head_param is not None:
+            wl = getattr(head_param, "weight_loader", default_weight_loader)
+            wl(head_param, loaded_weight)
+            loaded_params.add(head_param_name)
+        return True
+
+    if not pp_group.is_first_rank and any(p in name for p in first_rank_only_patterns):
+        return True
+
+    if not pp_group.is_last_rank and any(
+        name.startswith(p) for p in last_rank_only_prefixes
+    ):
+        return True
+
+    return False
 
 
 class Gemma4Router(nn.Module):
@@ -674,15 +729,12 @@ class Gemma4TextModel(PreTrainedModel):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
+        self.pp_group = get_pp_group()
 
-        self.embed_tokens = Gemma4TextScaledWordEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            self.padding_idx,
-            embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
-        )
-
-        # Per-layer input embeddings
+        # Token / per-layer embedding tables and the per-layer projection only
+        # produce activations consumed at the model entry, so they live on the
+        # first PP rank only.  Other ranks substitute PPMissingLayer so that
+        # parameter iteration still works (load_weights skips them explicitly).
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = (
             getattr(config, "hidden_size_per_layer_input", None) or 0
@@ -691,7 +743,43 @@ class Gemma4TextModel(PreTrainedModel):
             getattr(config, "vocab_size_per_layer_input", None) or config.vocab_size
         )
 
-        if self.hidden_size_per_layer_input and self.hidden_size_per_layer_input > 0:
+        # PLE-enabled variants (E2B/E4B) forward `per_layer_inputs` through
+        # the PP proxy, but cuda_graph_runner hardcodes the proxy schema to
+        # {hidden_states, residual} and silently drops any extra keys at
+        # replay time.  Empirically this corrupts E4B output to garbage on
+        # non-first PP ranks (eager path produces correct output and
+        # GSM8K ~0.92, cuda-graph path emits token soup).  Refuse the
+        # combination until the runner becomes schema-aware; users can run
+        # PP + PLE eagerly with --disable-cuda-graph.
+        if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
+            sa = get_global_server_args()
+            if sa is not None and not sa.disable_cuda_graph:
+                raise ValueError(
+                    "Pipeline parallelism is currently incompatible with "
+                    "per-layer-input (PLE) embeddings under CUDA graph: "
+                    "the runner's PP proxy schema is hardcoded to "
+                    "{hidden_states, residual} and silently drops "
+                    "per_layer_inputs, corrupting per-layer contributions on "
+                    "non-first PP ranks. Workarounds: (a) pass "
+                    "--disable-cuda-graph to fall back to eager replay, or "
+                    "(b) use tensor parallelism (--tp-size) instead of PP."
+                )
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = Gemma4TextScaledWordEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                self.padding_idx,
+                embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        if (
+            self.pp_group.is_first_rank
+            and self.hidden_size_per_layer_input
+            and self.hidden_size_per_layer_input > 0
+        ):
             self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
                 self.vocab_size_per_layer_input,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
@@ -722,7 +810,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
-        self.layers = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(
                 layer_id=idx,
@@ -730,10 +818,15 @@ class Gemma4TextModel(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
         self.layers_to_capture = []
         self.post_init()
 
@@ -818,24 +911,35 @@ class Gemma4TextModel(PreTrainedModel):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        if (input_ids is None) ^ (input_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if (input_ids is None) ^ (input_embeds is not None):
+                raise ValueError(
+                    "You must specify exactly one of input_ids or inputs_embeds"
+                )
+
+            if input_ids is not None:
+                input_embeds = self.embed_tokens(input_ids)
+                per_layer_inputs = self.get_per_layer_inputs(input_ids)
+            per_layer_inputs = self.project_per_layer_inputs(
+                input_embeds, per_layer_inputs
             )
-
-        if input_ids is not None:
-            input_embeds = self.embed_tokens(input_ids)
-            per_layer_inputs = self.get_per_layer_inputs(input_ids)
-        per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
-
-        hidden_states = input_embeds
+            hidden_states = input_embeds
+        else:
+            assert (
+                pp_proxy_tensors is not None
+            ), "pp_proxy_tensors is required on non-first PP ranks"
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # PLE inputs were computed on rank 0 and forwarded along the
+            # pipeline; non-PLE models simply omit the key.
+            per_layer_inputs = pp_proxy_tensors.tensors.get("per_layer_inputs", None)
 
         aux_hidden_states = []
-        num_layers = len(self.layers)
+        num_layers = self.config.num_hidden_layers
 
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx in range(self.start_layer, self.end_layer):
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states)
 
@@ -843,6 +947,7 @@ class Gemma4TextModel(PreTrainedModel):
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
             else:
                 per_layer_input = None
+            layer = self.layers[layer_idx]
             layer_outputs = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -851,7 +956,23 @@ class Gemma4TextModel(PreTrainedModel):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-            residual = layer_outputs[1] if len(layer_outputs) > 1 else None
+            # Gemma4DecoderLayer.forward always returns (hidden_states, None);
+            # the residual is fused inside the layer, so nothing to thread.
+
+        if not self.pp_group.is_last_rank:
+            # cuda_graph_runner allocates a fixed PP-proxy schema of
+            # {hidden_states, residual} and KeyErrors if a model omits a key.
+            # Gemma4 fuses the residual inside each layer so we don't have a
+            # standalone tensor to forward; emit a zero placeholder instead so
+            # graph replay can still copy it.  The receiving stage never reads
+            # this key.
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": torch.zeros_like(hidden_states),
+            }
+            if per_layer_inputs is not None:
+                proxy["per_layer_inputs"] = per_layer_inputs
+            return PPProxyTensors(proxy)
 
         # Capture the output of the last layer if requested.
         # layers_to_capture uses +1 offset, so num_layers means
@@ -859,10 +980,7 @@ class Gemma4TextModel(PreTrainedModel):
         if num_layers in self.layers_to_capture:
             aux_hidden_states.append(hidden_states)
 
-        if residual is None:
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -919,24 +1037,45 @@ class Gemma4ForCausalLM(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
 
-        if self.config.tie_word_embeddings:
+        # tie_word_embeddings ties lm_head to embed_tokens, but with PP those
+        # tensors live on opposite ranks (first vs last).  In the PP > 1 case
+        # we materialize a real ParallelLMHead on the last rank and route the
+        # checkpoint's embed_tokens.weight into it during load_weights.
+        if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
-        else:
+        elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        else:
+            self.lm_head = PPMissingLayer()
+
         self.capture_aux_hidden_states = False
         self.post_init()
+
+    def tie_weights(self, *args, **kwargs):
+        # HF's PreTrainedModel.tie_weights uses ``_tied_weights_keys`` to bind
+        # ``lm_head.weight`` to ``model.embed_tokens.weight``.  Under PP those
+        # tensors live on different ranks (embed on first, head on last) and
+        # the missing side is a PPMissingLayer with no ``weight`` attribute,
+        # which makes the default tie_weights crash.  load_weights routes the
+        # checkpoint embedding into lm_head explicitly, so the tie is a no-op
+        # here when PP is active.
+        if self.pp_group.world_size > 1:
+            return
+        super().tie_weights(*args, **kwargs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -958,16 +1097,23 @@ class Gemma4ForCausalLM(PreTrainedModel):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
-    ) -> LogitsProcessor:
+    ) -> Union[LogitsProcessor, PPProxyTensors]:
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
             per_layer_inputs,
+            pp_proxy_tensors=pp_proxy_tensors,
             **kwargs,
         )
+
+        if not self.pp_group.is_last_rank:
+            # `hidden_states` here is actually a PPProxyTensors handed off to
+            # the next stage; logits processing only happens on the last rank.
+            return hidden_states
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1039,6 +1185,25 @@ class Gemma4ForCausalLM(PreTrainedModel):
             name = name.replace(".router.per_expert_scale", ".moe.per_expert_scale")
             if ".experts." in name and ".moe.experts." not in name:
                 name = name.replace(".experts.", ".moe.experts.")
+
+            if pp_filter_load_weight(
+                name,
+                loaded_weight,
+                pp_group=self.pp_group,
+                start_layer=self.model.start_layer,
+                end_layer=self.model.end_layer,
+                params_dict=params_dict,
+                loaded_params=loaded_params,
+                tie_word_embeddings=self.config.tie_word_embeddings,
+                embed_weight_name="model.embed_tokens.weight",
+                first_rank_only_patterns=(
+                    "embed_tokens",
+                    "per_layer_model_projection",
+                    "per_layer_projection_norm",
+                ),
+                last_rank_only_prefixes=("model.norm.", "lm_head."),
+            ):
+                continue
 
             # attention_k_eq_v: full-attention layers have no v_proj in the
             # checkpoint (K and V share weights).  When we see a k_proj weight
@@ -1174,6 +1339,19 @@ class Gemma4ForCausalLM(PreTrainedModel):
         return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self):
+        if self.pp_group.world_size > 1:
+            # Under PP, embed_tokens lives on the first rank and lm_head on
+            # the last; neither rank holds both tensors, so we can't return
+            # the pair locally without a cross-stage gather.  Callers (RL
+            # weight sync, remote weight loader) currently assume a
+            # single-rank view — fail loudly rather than dereference a
+            # PPMissingLayer.
+            raise NotImplementedError(
+                "get_embed_and_head() is not implemented for Gemma4ForCausalLM "
+                "under pipeline parallelism. embed_tokens lives on the first "
+                "PP rank and lm_head on the last; use --pp-size 1 if you "
+                "need this API."
+            )
         embed = self._shard_weight(self.model.embed_tokens.weight)
         head = self._shard_weight(self.lm_head.weight)
         return embed, head

@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -44,6 +45,8 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         if (
