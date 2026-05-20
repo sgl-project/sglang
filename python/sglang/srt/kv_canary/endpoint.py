@@ -91,13 +91,22 @@ class CanaryEndpoint:
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
         )
+        # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
+        # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". FULL endpoints pass
+        # fb_out_cache_loc through unchanged.
+        if self.full_to_swa_index_mapping is not None:
+            fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
+                fb_out_cache_loc.to(torch.int64)
+            ].to(torch.int32)
+        else:
+            fb_out_cache_loc_for_canary = fb_out_cache_loc
+
         canary_write_step(
             canary_buf=self.canary_buf,
             plan=write_plan,
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
-            fb_out_cache_loc=fb_out_cache_loc,
-            full_to_swa_index_mapping=self.full_to_swa_index_mapping,
+            fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             pseudo_mode=input_check_mode,
             pseudo_expected_tokens=expected_input_tokens,

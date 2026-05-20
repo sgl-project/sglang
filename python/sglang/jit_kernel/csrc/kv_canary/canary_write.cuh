@@ -20,11 +20,6 @@ namespace {
 // Single thread per block — chain advance is inherently serial.
 constexpr uint32_t kWriteBlockSize = 1;
 
-// Sentinel value for full_to_swa_index_mapping_present. When 0, the kernel skips SWA translation and uses
-// fb_out_cache_loc[i] directly. Mirrors the host wrapper's "lut is None" branch.
-constexpr int32_t kSwaMappingAbsent = 0;
-constexpr int32_t kSwaMappingPresent = 1;
-
 struct WriteKernelParams {
   uint8_t* canary_buf;
   int64_t slot_stride_bytes;
@@ -35,15 +30,11 @@ struct WriteKernelParams {
   const int32_t* write_num_valid_reqs;
   int32_t write_req_capacity;
 
-  // ForwardBatch passthroughs.
+  // ForwardBatch passthroughs. fb_out_cache_loc is caller-pre-translated for SWA groups; the kernel
+  // treats it opaquely and skips entries with slot < 0.
   const int32_t* fb_input_ids;
   const int32_t* fb_positions;
   const int32_t* fb_out_cache_loc;
-
-  // SWA LUT (always passed; presence flag toggles whether the kernel applies it).
-  const int32_t* full_to_swa_index_mapping;
-  int32_t swa_mapping_present;
-  int32_t swa_lut_len;
 
   // Pseudo-mode oracle inputs.
   CanaryPseudoMode pseudo_mode;
@@ -65,22 +56,6 @@ struct WriteKernelParams {
   int32_t num_sources;
   RealKvHashMode real_kv_hash_mode;
 };
-
-// SWA translation matching _swa_translate in kv_canary/write_ref.py. Negative slot_full passes
-// through unchanged; out-of-bounds indices clamp to lut_len - 1 (the trailing sentinel row).
-SGL_DEVICE int64_t swa_translate_one(int64_t slot_full, const int32_t* lut, int32_t lut_len, int32_t mapping_present) {
-  if (mapping_present == kSwaMappingAbsent) {
-    return slot_full;
-  }
-  if (slot_full < 0) {
-    return slot_full;
-  }
-  int64_t safe_idx = slot_full;
-  if (lut_len > 0 && safe_idx >= static_cast<int64_t>(lut_len)) {
-    safe_idx = static_cast<int64_t>(lut_len - 1);
-  }
-  return static_cast<int64_t>(lut[safe_idx]);
-}
 
 __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p) {
   const uint32_t r = blockIdx.x;
@@ -128,9 +103,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   int32_t entries_written = 0;
   for (int32_t j = 0; j < entry_count; ++j) {
     const int32_t i = entry_start + j;
-    const int64_t slot_full = static_cast<int64_t>(p.fb_out_cache_loc[i]);
-    const int64_t slot =
-        swa_translate_one(slot_full, p.full_to_swa_index_mapping, p.swa_lut_len, p.swa_mapping_present);
+    const int64_t slot = static_cast<int64_t>(p.fb_out_cache_loc[i]);
     if (slot < 0) {
       continue;
     }
@@ -196,9 +169,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 // - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots.
 // - real_kv_source_params is a CPU int32 [kMaxRealKvSources, 3] table of (page_size, num_bytes_per_token,
 //   read_bytes) triplets.
-// - full_to_swa_index_mapping is passed as a tensor with swa_mapping_present == kSwaMappingPresent if and
-//   only if the SWA LUT is in effect. When absent the wrapper passes a 1-element dummy and sets
-//   swa_mapping_present = 0.
+// - fb_out_cache_loc is caller-pre-translated for SWA groups; -1 entries mark skip. The kernel does not
+//   consult any LUT.
 inline void canary_write_step_cuda(
     tvm::ffi::TensorView canary_buf,
     tvm::ffi::TensorView write_offsets,
@@ -207,8 +179,6 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView fb_input_ids,
     tvm::ffi::TensorView fb_positions,
     tvm::ffi::TensorView fb_out_cache_loc,
-    tvm::ffi::TensorView full_to_swa_index_mapping,
-    int64_t swa_mapping_present,
     int64_t kernel_kind,
     int64_t pseudo_mode,
     tvm::ffi::TensorView pseudo_expected_tokens,
@@ -326,9 +296,6 @@ inline void canary_write_step_cuda(
   p.fb_input_ids = static_cast<const int32_t*>(fb_input_ids.data_ptr());
   p.fb_positions = static_cast<const int32_t*>(fb_positions.data_ptr());
   p.fb_out_cache_loc = static_cast<const int32_t*>(fb_out_cache_loc.data_ptr());
-  p.full_to_swa_index_mapping = static_cast<const int32_t*>(full_to_swa_index_mapping.data_ptr());
-  p.swa_mapping_present = static_cast<int32_t>(swa_mapping_present);
-  p.swa_lut_len = static_cast<int32_t>(full_to_swa_index_mapping.size(0));
   p.pseudo_mode = static_cast<CanaryPseudoMode>(pseudo_mode);
   p.pseudo_expected_tokens = static_cast<const int32_t*>(pseudo_expected_tokens.data_ptr());
   p.pseudo_expected_positions = static_cast<const int32_t*>(pseudo_expected_positions.data_ptr());

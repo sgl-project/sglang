@@ -99,11 +99,12 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
         fb_positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int32)
         fb_out_cache_loc[:total_entries] = slots.to(torch.int32)
 
+    # For SWA cases, pre-translate fb_out_cache_loc the same way an endpoint would (identity LUT here
+    # so the cost is realistic but slot values are unchanged); FULL cases pass it through.
     if case.pool_kind == "swa_window_128":
         full_to_swa = torch.arange(num_slots + 1, dtype=torch.int32, device=device)
         full_to_swa[-1] = -1
-    else:
-        full_to_swa = None
+        fb_out_cache_loc = full_to_swa[fb_out_cache_loc.to(torch.int64)].to(torch.int32)
 
     pseudo_expected_tokens = torch.zeros(
         num_tokens_padded, dtype=torch.int32, device=device
@@ -125,7 +126,6 @@ def _build_write_inputs(case: BenchCase, *, device: torch.device) -> dict:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        full_to_swa_index_mapping=full_to_swa,
         pseudo_expected_tokens=pseudo_expected_tokens,
         pseudo_expected_positions=pseudo_expected_positions,
         violation_ring=violation_ring,
@@ -146,7 +146,6 @@ def _run_one_case(case: BenchCase) -> dict:
             fb_input_ids=inputs["fb_input_ids"],
             fb_positions=inputs["fb_positions"],
             fb_out_cache_loc=inputs["fb_out_cache_loc"],
-            full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
             pseudo_mode=CanaryPseudoMode.OFF,
             pseudo_expected_tokens=inputs["pseudo_expected_tokens"],
