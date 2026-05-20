@@ -18,10 +18,12 @@ from sglang.jit_kernel.kv_canary.verify import (
     CANARY_CHAIN_ANCHOR,
     CANARY_SLOT_BYTES,
     VIOLATION_FIELDS,
-    RealKvSource,
     VerifyPlan,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    splitmix64,
+)
 
 # Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
 # stay realistic without bloating the assertion surface.
@@ -133,77 +135,6 @@ def make_write_plan(
     )
     plan.write_num_valid_reqs[0] = num_valid_reqs
     return plan
-
-
-def make_real_kv_source(
-    *,
-    num_slots: int = DEFAULT_NUM_SLOTS,
-    num_bytes_per_token: int = 8,
-    page_size: int = 1,
-    read_bytes: Optional[int] = None,
-    pad_dim1: int = 0,
-    device: torch.device,
-    fill: int = 0,
-) -> RealKvSource:
-    """Allocate one RealKvSource with the canonical [num_rows, dim1_bytes] uint8 shape.
-
-    ``pad_dim1`` adds trailing per-row bytes the canary should skip — used by the "holey dim 1" case to
-    confirm the kernel never reads past ``page_size * num_bytes_per_token``.
-    """
-    num_rows = (num_slots + page_size - 1) // page_size
-    cols = page_size * num_bytes_per_token + pad_dim1
-    tensor = torch.full(
-        (num_rows, cols), fill_value=fill, dtype=torch.uint8, device=device
-    )
-    effective_read = read_bytes if read_bytes is not None else num_bytes_per_token
-    return RealKvSource(
-        tensor=tensor,
-        page_size=page_size,
-        num_bytes_per_token=num_bytes_per_token,
-        read_bytes=effective_read,
-    )
-
-
-def make_real_kv_sources(
-    *,
-    count: int,
-    num_slots: int = DEFAULT_NUM_SLOTS,
-    device: torch.device,
-) -> tuple[RealKvSource, ...]:
-    """Build ``count`` distinct RealKvSource entries with non-trivial bytes per slot.
-
-    Each source's tensor is initialised with a per-source-distinct constant so the fold is sensitive to
-    per-source input rather than degenerating to zero.
-    """
-    sources: list[RealKvSource] = []
-    for i in range(count):
-        src = make_real_kv_source(
-            num_slots=num_slots,
-            num_bytes_per_token=8,
-            page_size=1,
-            read_bytes=8,
-            device=device,
-            fill=(i + 1) * 17,
-        )
-        sources.append(src)
-    return tuple(sources)
-
-
-def splitmix64(value: int) -> int:
-    """Python splitmix64 finalizer used by hardcoded-expected cases (bit-equal CUDA + ref + cuh).
-
-    Hardcoded cases manually compute multi-step chains via this helper so a ref / kernel co-regression
-    cannot silently fix the diff comparison.
-    """
-    x = value & _U64_MASK
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
-    return (x ^ (x >> 31)) & _U64_MASK
-
-
-def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
-    """4-arg chain step matching the cuh + ref helpers."""
-    return splitmix64((a ^ b ^ c ^ d) & _U64_MASK)
 
 
 def to_signed_int64(value: int) -> int:
