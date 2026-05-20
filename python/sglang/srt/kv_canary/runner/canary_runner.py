@@ -102,12 +102,19 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
+        self._d2h_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=device)
+            if device.type == "cuda" and torch.cuda.is_available()
+            else None
+        )
+
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
             device=device,
             device_state=self._device_state,
             host_state=self._host_state,
             tp_group=tp_group,
+            d2h_stream=self._d2h_stream,
         )
         self._sweep_orchestrator = SweepOrchestrator(
             config=config,
@@ -151,6 +158,7 @@ class CanaryRunner:
             active_tags=self._active_tags,
             pump_and_allreduce=self._pump_and_allreduce,
             sweep_orchestrator=self._sweep_orchestrator,
+            d2h_stream=self._d2h_stream,
         )
 
         if radix_cache is not None:
