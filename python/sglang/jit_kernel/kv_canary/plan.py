@@ -351,20 +351,19 @@ def _plan_offsets_kernel(
     prefix_lens = tl.load(prefix_lens_ptr + bs_offs, mask=bs_mask, other=0)
     extend_lens = tl.load(extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0)
 
-    not_padding = (rpi != 0) & bs_mask
+    is_active = (rpi != 0) & bs_mask
+    has_prefix = is_active & (prefix_lens > 0)
 
-    if SWA_WINDOW > 0:
-        clipped = prefix_lens - SWA_WINDOW
-        window_starts = tl.where(clipped > 0, clipped, 0)
-    else:
-        window_starts = tl.zeros((BS_BLOCK,), dtype=prefix_lens.dtype)
+    window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)
 
     verify_lens = prefix_lens - window_starts
     verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
-    verify_lens = tl.where(not_padding, verify_lens, 0)
+    verify_lens = tl.where(is_active, verify_lens, 0)
 
     write_lens = tl.where(extend_lens > 0, extend_lens, 0)
-    write_lens = tl.where(not_padding, write_lens, 0)
+    write_lens = tl.where(is_active, write_lens, 0)
+
+    has_write_contribution = has_prefix & (write_lens > 0)
 
     # Seed slot per req. prefix_lens == 0 means no prefix → -1 sentinel. Padding row → no write contribution
     # → -1 sentinel either way; we also mask write_lens onto seed below to match the ref's "no write → -1".
@@ -372,29 +371,23 @@ def _plan_offsets_kernel(
     stride_i64 = req_to_token_stride0.to(tl.int64)
     seed_full = tl.load(
         req_to_token_ptr + rpi.to(tl.int64) * stride_i64 + safe_prefix_pos.to(tl.int64),
-        mask=bs_mask & (prefix_lens > 0),
+        mask=has_prefix,
         other=0,
     )
 
     if HAS_SWA_LUT:
-        seed_sentinel = seed_full < 0
-        seed_safe = tl.where(seed_sentinel, 0, seed_full)
-        if swa_lut_len > 0:
-            seed_safe = tl.where(seed_safe >= swa_lut_len, swa_lut_len - 1, seed_safe)
-        seed_xlat = tl.load(
-            full_to_swa_lut_ptr + seed_safe,
-            mask=bs_mask & (prefix_lens > 0) & (~seed_sentinel),
-            other=0,
+        seed_translated = _swa_translate_tile(
+            seed_full,
+            has_prefix,
+            full_to_swa_lut_ptr,
+            swa_lut_len,
         )
-        seed_translated = tl.where(seed_sentinel, seed_full, seed_xlat)
     else:
         seed_translated = seed_full
 
     # Reqs with no write contribution should expose seed = -1 (ref's _seed_slot is masked by write_lens > 0).
     minus_one = tl.full((BS_BLOCK,), -1, dtype=seed_translated.dtype)
-    seed_slot = tl.where(
-        (prefix_lens > 0) & (write_lens > 0), seed_translated, minus_one
-    )
+    seed_slot = tl.where(has_write_contribution, seed_translated, minus_one)
 
     # Inclusive cumsum → exclusive offsets via subtraction.
     verify_inclusive = tl.cumsum(verify_lens, axis=0)
@@ -483,11 +476,7 @@ def _plan_entries_kernel(
     if rpi == 0:
         return
 
-    if SWA_WINDOW > 0:
-        clipped = prefix_lens - SWA_WINDOW
-        window_start = tl.where(clipped > 0, clipped, 0)
-    else:
-        window_start = prefix_lens - prefix_lens
+    window_start = _compute_window_start(prefix_lens, SWA_WINDOW)
 
     verify_start = tl.load(verify_offsets_ptr + r)
     verify_end = tl.load(verify_offsets_ptr + r + 1)
@@ -553,6 +542,18 @@ def _plan_entries_kernel(
         prev_slot.to(tl.int32),
         mask=write_mask,
     )
+
+
+@triton.jit
+def _compute_window_start(prefix_lens, SWA_WINDOW: tl.constexpr):
+    """Per-req window start: max(prefix_lens - SWA_WINDOW, 0) when SWA, else 0.
+    Works for tile and scalar inputs (broadcasts via prefix_lens shape).
+    """
+    if SWA_WINDOW > 0:
+        clipped = prefix_lens - SWA_WINDOW
+        return tl.where(clipped > 0, clipped, 0)
+    else:
+        return prefix_lens - prefix_lens
 
 
 @triton.jit
