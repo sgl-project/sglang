@@ -1031,6 +1031,7 @@ class DFlashWorker:
                 v,
                 attn.attn.k_scale,
                 attn.attn.v_scale,
+                swa_loc=None,
             )
 
     def _append_target_hidden_fused(
@@ -1054,6 +1055,7 @@ class DFlashWorker:
                 cache_v,
                 attn.k_scale,
                 attn.v_scale,
+                swa_loc=None,
             )
 
         self._fused_kv_helper.materialize(

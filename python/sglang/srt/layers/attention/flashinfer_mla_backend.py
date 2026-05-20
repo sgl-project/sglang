@@ -548,7 +548,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         layer, cache_loc, k, k_rope
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
+                    )
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -623,6 +626,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         cache_loc,
                         k,
                         v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
 
         # Reshape inputs

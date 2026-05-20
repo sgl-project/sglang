@@ -253,6 +253,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                         cache_loc,
                         k,
                         v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
 
         # Reshape inputs

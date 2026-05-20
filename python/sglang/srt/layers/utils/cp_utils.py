@@ -349,6 +349,7 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         value_cache_full,
         layer.k_scale,
         layer.v_scale,
+        swa_loc=forward_batch.out_cache_loc_swa,
     )
 
 

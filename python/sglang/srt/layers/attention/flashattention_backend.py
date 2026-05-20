@@ -642,7 +642,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -1051,7 +1052,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(

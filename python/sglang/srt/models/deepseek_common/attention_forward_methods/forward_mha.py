@@ -437,7 +437,8 @@ class DeepseekMHAForwardMixin:
         elif _is_npu:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -445,7 +446,8 @@ class DeepseekMHAForwardMixin:
 
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
 
     def _get_mla_kv_buffer(

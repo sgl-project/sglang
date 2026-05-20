@@ -209,7 +209,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -260,7 +263,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 

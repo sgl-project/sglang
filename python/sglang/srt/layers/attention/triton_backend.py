@@ -922,6 +922,7 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.out_cache_loc,
                         k,
                         v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -933,6 +934,7 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.out_cache_loc,
                         k_scaled,
                         v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -942,6 +944,7 @@ class TritonAttnBackend(AttentionBackend):
                         v.clone(),
                         layer.k_scale,
                         layer.v_scale,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -1187,6 +1190,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     k,
                     v,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1196,6 +1200,7 @@ class TritonAttnBackend(AttentionBackend):
                     v,
                     layer.k_scale,
                     layer.v_scale,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:

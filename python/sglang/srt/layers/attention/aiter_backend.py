@@ -2380,10 +2380,14 @@ class AiterAttnBackend(AttentionBackend):
                         v_scale=v_descale,
                     )
                 elif self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
+                    )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_descale, v_descale
+                        layer, cache_loc, k, v, k_descale, v_descale,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
 
         if self.use_mla:
@@ -2837,7 +2841,8 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         if self.use_mla:

@@ -116,7 +116,8 @@ def forward_mha_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe,
+            swa_loc=forward_batch.out_cache_loc_swa,
         )
 
     q[..., m.qk_nope_head_dim :] = q_pe

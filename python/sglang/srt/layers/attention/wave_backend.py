@@ -557,7 +557,8 @@ class WaveAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
 
         max_extend_len = self.forward_metadata.max_extend_len
@@ -607,7 +608,8 @@ class WaveAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
 
         self.decode_attention_fwd(

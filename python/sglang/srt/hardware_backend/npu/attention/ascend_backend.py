@@ -248,6 +248,7 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
         cache_loc,
         key_cache_full,
         value_cache_full,
+        swa_loc=forward_batch.out_cache_loc_swa,
     )
 
 
@@ -884,7 +885,8 @@ class AscendAttnBackend(AttentionBackend):
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer, forward_batch.out_cache_loc, k, k_rope,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1050,7 +1052,10 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v,
+                        swa_loc=forward_batch.out_cache_loc_swa,
+                    )
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1428,7 +1433,8 @@ class AscendAttnBackend(AttentionBackend):
                 kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, kv_c, k_rope
+                        layer, forward_batch.out_cache_loc, kv_c, k_rope,
+                        swa_loc=forward_batch.out_cache_loc_swa,
                     )
                 attn_output = q.new_empty(
                     (q.shape[0], layer.tp_q_head_num, kv_lora_rank)
@@ -1515,7 +1521,8 @@ class AscendAttnBackend(AttentionBackend):
     ):
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1575,11 +1582,13 @@ class AscendAttnBackend(AttentionBackend):
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
                 k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
+                    layer, forward_batch.out_cache_loc, k, k_rope,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         if not self.use_mla:
@@ -1757,11 +1766,13 @@ class AscendAttnBackend(AttentionBackend):
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
                 k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
+                    layer, forward_batch.out_cache_loc, k, k_rope,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         if sinks is not None:
@@ -1976,7 +1987,10 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v,
+                    swa_loc=forward_batch.out_cache_loc_swa,
+                )
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2113,7 +2127,8 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
+                    layer, forward_batch.out_cache_loc, k, k_rope,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
             num_tokens = q.shape[0]
             kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2219,7 +2234,8 @@ class AscendAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)

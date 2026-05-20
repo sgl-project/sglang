@@ -365,6 +365,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     value,
                     layer.k_scale,
                     layer.v_scale,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         if not save_kv_cache:
@@ -461,6 +462,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     value,
                     layer.k_scale,
                     layer.v_scale,
+                    swa_loc=forward_batch.out_cache_loc_swa,
                 )
 
         # apply DCA scaling

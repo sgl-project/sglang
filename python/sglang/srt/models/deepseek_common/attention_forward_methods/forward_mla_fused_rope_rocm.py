@@ -127,7 +127,8 @@ class DeepseekMLARocmForwardMixin:
 
         # save current latent cache.
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+            self.attn_mqa, forward_batch.out_cache_loc, k_input, None,
+            swa_loc=forward_batch.out_cache_loc_swa,
         )
         key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
             self.attn_mqa.layer_id
@@ -195,7 +196,8 @@ class DeepseekMLARocmForwardMixin:
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+                self.attn_mqa, forward_batch.out_cache_loc, k_input, None,
+                swa_loc=forward_batch.out_cache_loc_swa,
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
