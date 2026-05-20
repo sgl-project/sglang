@@ -25,10 +25,8 @@ from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.kv_canary.pool_patch.utils import (
     alloc_canary_buf,
-    ensure_swa_lut_int32,
     make_row_source,
     patch_buf_info_method,
-    swa_index_lut,
 )
 
 CPU_DEVICE: torch.device = torch.device("cpu")
@@ -212,8 +210,8 @@ def make_swa_pool(
             for _ in range(layer_num)
         ],
     )
-    lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
-    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int64, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
     return FakeSWAPool(
         full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
     )
@@ -240,8 +238,8 @@ def make_dsv4_pool(
             for _ in range(layer_num)
         ]
     )
-    lut = torch.full((full_slots + 1,), -1, dtype=torch.int32, device=device)
-    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int32, device=device)
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int64, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
     return FakeDsv4Pool(
         full_kv_pool=full,
         swa_kv_pool=swa,
@@ -385,7 +383,6 @@ def _attach_fake_dsv4(
     multi-segment c4/indexer/c128 layout isn't replicated in the fake — each sub-pool gets a
     single K-only splice (FULL -> ``get_contiguous_buf_infos``, SWA -> ``get_state_buf_infos``).
     """
-    ensure_swa_lut_int32(pool=pool, allocator=allocator)
     full_group = _build_fake_dsv4_group(
         sub_pool=pool.full_kv_pool,
         kind=PoolKind.FULL,
@@ -398,7 +395,7 @@ def _attach_fake_dsv4(
         kind=PoolKind.SWA,
         device=device,
         read_bytes=read_bytes,
-        swa_lut=swa_index_lut(pool),
+        swa_lut=pool.full_to_swa_index_mapping,
     )
     patch_buf_info_method(
         pool,
