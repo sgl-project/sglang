@@ -18,7 +18,7 @@ from sglang.srt.kv_canary.runner.launch import (
 )
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
 from sglang.srt.kv_canary.state import CanaryDeviceState
-from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenIdOracleManager
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -62,7 +62,7 @@ class PerForwardOrchestrator:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._perturb_hook = perturb_hook
-        self._token_id_oracle_manager: Optional[TokenIdOracleManager] = None
+        self._token_oracle_manager: Optional[TokenOracleManager] = None
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=max(1, per_forward_verify_capacity), device=device
@@ -85,8 +85,8 @@ class PerForwardOrchestrator:
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
-    def attach_token_id_oracle_manager(self, manager: TokenIdOracleManager) -> None:
-        self._token_id_oracle_manager = manager
+    def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
+        self._token_oracle_manager = manager
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
@@ -97,11 +97,11 @@ class PerForwardOrchestrator:
         self._last_forward_batch = forward_batch
 
         if self._config.input_check_mode == CanaryInputCheckMode.ON:
-            manager = self._token_id_oracle_manager
+            manager = self._token_oracle_manager
             if manager is None:
                 raise RuntimeError(
-                    "kv-canary: input_check_mode=ON requires a TokenIdOracleManager; call "
-                    "CanaryRunner.attach_token_id_oracle_manager(manager) where manager is "
+                    "kv-canary: input_check_mode=ON requires a TokenOracleManager; call "
+                    "CanaryRunner.attach_token_oracle_manager(manager) where manager is "
                     "the return value of install_oracle_sampler(oracle=...)"
                 )
             manager.fill_expected_inputs(

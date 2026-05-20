@@ -1,5 +1,5 @@
-"""TokenIdOracleManager.fill_expected_inputs writes oracle-derived (token, position) into canary
-placeholders, and mock_model_engine_kwargs returns the right Engine kwargs for mock-model tests.
+"""TokenOracleManager.fill_expected_inputs writes oracle-derived (token, position) into canary
+placeholders, and token_oracle_engine_kwargs returns the right Engine kwargs for token-oracle tests.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 
-from .utils import mock_model_engine_kwargs
+from .utils import token_oracle_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
@@ -118,10 +118,10 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
     assert hook._req_pool_indices_per_row.tolist() == [5, 7]
 
 
-def test_mock_model_engine_kwargs_returns_defaults() -> None:
+def test_token_oracle_engine_kwargs_returns_defaults() -> None:
     os.environ.pop("SGLANG_KV_CANARY_INPUT_CHECK", None)
 
-    kwargs = mock_model_engine_kwargs()
+    kwargs = token_oracle_engine_kwargs()
 
     assert kwargs["load_format"] == "dummy"
     assert json.loads(kwargs["json_model_override_args"]) == {"num_hidden_layers": 1}
@@ -130,8 +130,8 @@ def test_mock_model_engine_kwargs_returns_defaults() -> None:
     assert os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] == "1"
 
 
-def test_mock_model_engine_kwargs_overrides_win() -> None:
-    kwargs = mock_model_engine_kwargs(
+def test_token_oracle_engine_kwargs_overrides_win() -> None:
+    kwargs = token_oracle_engine_kwargs(
         kv_canary="log",
         sampling_backend="pytorch",
         tp_size=2,
@@ -143,8 +143,8 @@ def test_mock_model_engine_kwargs_overrides_win() -> None:
     assert kwargs["load_format"] == "dummy"
 
 
-def test_mock_model_engine_kwargs_merges_json_override() -> None:
-    kwargs = mock_model_engine_kwargs(
+def test_token_oracle_engine_kwargs_merges_json_override() -> None:
+    kwargs = token_oracle_engine_kwargs(
         json_model_override_args='{"rope_theta": 1000.0}',
     )
 

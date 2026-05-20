@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.token_oracle.oracle import TokenIdOracle
+from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class TokenIdOracleManager:
+class TokenOracleManager:
     """One-per-server state for the oracle sampler integration. Owns the oracle and the per-step
     row -> req-id mapping. Both canary's input-check path (fill_expected_inputs) and sglang's
     sampler dispatch (_OracleSampler) operate on the same instance.
@@ -21,7 +21,7 @@ class TokenIdOracleManager:
     populate the row -> req-id stash that _OracleSampler will read at sample time.
     """
 
-    def __init__(self, *, oracle: TokenIdOracle) -> None:
+    def __init__(self, *, oracle: TokenOracle) -> None:
         self.oracle = oracle
         self._req_pool_indices_per_row: Optional[torch.Tensor] = None
 
@@ -70,13 +70,13 @@ class TokenIdOracleManager:
         stash = self._req_pool_indices_per_row
         if stash is None:
             raise RuntimeError(
-                "TokenIdOracleManager.sample: req_pool_indices not stashed; "
+                "TokenOracleManager.sample: req_pool_indices not stashed; "
                 "fill_expected_inputs must be called before sampling "
                 "(input_check_mode == ON required)"
             )
 
         assert int(stash.shape[0]) == int(logits.shape[0]), (
-            f"TokenIdOracleManager.sample: stashed req_pool_indices length "
+            f"TokenOracleManager.sample: stashed req_pool_indices length "
             f"{int(stash.shape[0])} != logits batch size {int(logits.shape[0])}"
         )
 

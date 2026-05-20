@@ -1,6 +1,6 @@
-"""Default kwargs for spinning up an Engine in mock-model + canary mode.
+"""Default kwargs for spinning up an Engine in token-oracle + canary mode.
 
-Mock-model mode is testing-only; the default-filling logic lives here so the
+Token-oracle mode is testing-only; the default-filling logic lives here so the
 main code (server_args) does not have to know about it.
 """
 
@@ -11,18 +11,18 @@ import os
 from typing import Any
 
 
-def mock_model_engine_kwargs(**overrides: Any) -> dict[str, Any]:
-    """Return Engine() kwargs that wire up mock-model + canary together.
+def token_oracle_engine_kwargs(**overrides: Any) -> dict[str, Any]:
+    """Return Engine() kwargs that wire up token-oracle + canary together.
 
     Defaults:
         load_format = "dummy"            (no real weights loaded)
         json_model_override_args = '{"num_hidden_layers": 1}'
-        sampling_backend = "oracle"      (gate for install_mock_model_sampler)
-        kv_canary = "raise"              (mock_model without canary is mostly pointless)
+        sampling_backend = "oracle"      (gate for install_token_oracle_from_env)
+        kv_canary = "raise"              (token_oracle without canary is mostly pointless)
 
     Also sets ``SGLANG_KV_CANARY_INPUT_CHECK=1`` in the current process env so
     the canary's input-id verification path turns on when the engine starts.
-    This is a side effect because input-check is mock-model-only and is no
+    This is a side effect because input-check is token-oracle-only and is no
     longer a server arg; the env var is the only injection path.
 
     Caller-supplied overrides win; for json_model_override_args, the override

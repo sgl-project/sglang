@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.srt.kv_canary.token_oracle.oracle import HashOracle, TokenIdOracle
+from sglang.srt.kv_canary.token_oracle.oracle import HashOracle, TokenOracle
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
@@ -69,7 +69,7 @@ def test_hash_oracle_different_req_ids_give_different_tokens() -> None:
 
 
 def test_hash_oracle_satisfies_oracle_protocol() -> None:
-    oracle: TokenIdOracle = HashOracle(seed=0, vocab_size=100)
+    oracle: TokenOracle = HashOracle(seed=0, vocab_size=100)
 
     out = oracle.expected_tokens(
         req_ids=torch.tensor([0], dtype=torch.int64),
