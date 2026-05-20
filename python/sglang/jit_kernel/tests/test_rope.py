@@ -2,7 +2,6 @@ import sys
 
 import pytest
 import torch
-import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -10,7 +9,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=64, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
 
-DEVICE = "cuda"
+# Determine device: prefer CUDA for CUDA CI coverage, fall back to XPU
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+else:
+    DEVICE = None
+
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
 ROPE_BASE = 10000.0
@@ -85,8 +91,42 @@ def torch_impl_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    # TODO: implement a pure-PyTorch reference for extra coverage
-    pass
+    """Pure-PyTorch RoPE reference, works on any device (including XPU).
+
+    Operates in-place on *q* and *k*.  The rotation dimension is
+    ``min(q.shape[-1], cos_sin_cache.shape[-1])`` so the function handles
+    both full-head RoPE and partial-RoPE (where q/k are pre-sliced to rope_dim
+    or are narrower than the cache).
+    """
+    cache_dim = cos_sin_cache.shape[-1]
+    # Actual rotation dim: limited by both q's last dim and the cache.
+    rope_dim = min(q.shape[-1], cache_dim)
+    # cos_sin_cache: [max_pos, cache_dim] — first half cos, second half sin
+    cos = cos_sin_cache[positions, : rope_dim // 2].float()  # [T, rope_dim/2]
+    sin = cos_sin_cache[positions, cache_dim // 2 : cache_dim // 2 + rope_dim // 2].float()  # [T, rope_dim/2]
+
+    def _rotate(x: torch.Tensor) -> None:
+        # x: [T, H, D] where D >= rope_dim; only the first rope_dim elements rotate.
+        half = rope_dim // 2
+        if is_neox:
+            x_f = x[..., :rope_dim].float()
+            x1, x2 = x_f[..., :half], x_f[..., half:]
+            c = cos.unsqueeze(1)  # [T, 1, half]
+            s = sin.unsqueeze(1)
+            x[..., :half] = (x1 * c - x2 * s).to(x.dtype)
+            x[..., half:rope_dim] = (x1 * s + x2 * c).to(x.dtype)
+        else:
+            x_f = x[..., :rope_dim].float()
+            # Reshape to adjacent pairs: [..., half, 2]
+            pairs = x_f.reshape(*x_f.shape[:-1], half, 2)
+            c = cos.unsqueeze(1)  # [T, 1, half]
+            s = sin.unsqueeze(1)
+            x0, x1 = pairs[..., 0], pairs[..., 1]
+            out = torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1)
+            x[..., :rope_dim] = out.reshape(*x_f.shape).to(x.dtype)
+
+    _rotate(q)
+    _rotate(k)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +161,9 @@ def test_rope(
     is_neox: bool,
     dtype: torch.dtype,
 ) -> None:
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+    
     num_qo_heads = num_kv_heads * gqa_ratio
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
@@ -132,17 +175,31 @@ def test_rope(
     q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
-    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+    # Use flashinfer as reference only for CUDA
+    if DEVICE == "cuda":
+        flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
+        sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+        
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+    else:
+        # For XPU, compare against the pure-PyTorch reference.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+        sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
-    atol = rtol = 1e-2
-    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_ref, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+    
     batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
     is_neox = True
 
@@ -154,12 +211,21 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
-    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+    if DEVICE == "cuda":
+        flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+        sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
-    atol = rtol = 1e-2
-    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+    else:
+        # For XPU, compare against the pure-PyTorch reference.
+        torch_impl_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
+        sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -167,6 +233,9 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 @pytest.mark.parametrize("rope_dim", PARTIAL_ROPE_DIM_LIST)
 @pytest.mark.parametrize("head_dim", HEAD_DIM_LIST)
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+    
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
     num_qo_heads, num_kv_heads = 8, 2
@@ -180,12 +249,28 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     q_jit, k_jit = q.clone(), k.clone()
     rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
-    sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+    if DEVICE == "cuda":
+        flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+        sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
-    atol = rtol = 1e-2
-    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+    else:
+        # For XPU, compare the first rope_dim elements against the pure-PyTorch
+        # reference, and verify the remainder of each head is unchanged.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref[rope], k_ref[rope], cos_sin_cache, positions, is_neox)
+        sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+
+        atol = rtol = 1e-2
+        # Rotated slice should match the reference.
+        torch.testing.assert_close(q_ref[rope], q_jit[rope], atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref[rope], k_jit[rope], atol=atol, rtol=rtol)
+        # Unrotated tail should be unchanged from the original.
+        tail = ..., slice(rope_dim, None)
+        torch.testing.assert_close(q[tail], q_jit[tail])
+        torch.testing.assert_close(k[tail], k_jit[tail])
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -202,6 +287,9 @@ def test_fused_rope_store(
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
     from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
+    
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
 
     num_qo_heads = num_kv_heads * gqa_ratio
     dtype = DTYPE
@@ -221,36 +309,67 @@ def test_fused_rope_store(
     k_cache_fused = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
     v_cache_fused = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
 
-    # --- reference: separate RoPE then manual scatter ---
-    q_ref, k_ref = q.clone(), k.clone()
-    flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-    k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
-    v_cache_ref[out_loc] = v.view(batch_size, -1)
+    if DEVICE == "cuda":
+        # --- reference: separate RoPE then manual scatter ---
+        q_ref, k_ref = q.clone(), k.clone()
+        flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+        k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
+        v_cache_ref[out_loc] = v.view(batch_size, -1)
 
-    # --- fused kernel ---
-    q_fused, k_fused = q.clone(), k.clone()
-    v_fused = v.clone()
-    apply_rope_inplace_with_kvcache(
-        q_fused,
-        k_fused,
-        v_fused,
-        k_cache_fused,
-        v_cache_fused,
-        cos_sin_cache,
-        positions,
-        out_loc,
-        is_neox=is_neox,
-    )
+        # --- fused kernel ---
+        q_fused, k_fused = q.clone(), k.clone()
+        v_fused = v.clone()
+        apply_rope_inplace_with_kvcache(
+            q_fused,
+            k_fused,
+            v_fused,
+            k_cache_fused,
+            v_cache_fused,
+            cos_sin_cache,
+            positions,
+            out_loc,
+            is_neox=is_neox,
+        )
 
-    atol = rtol = 1e-2
-    # q should match RoPE-only result
-    triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
-    # k_cache should contain the rotated k
-    triton.testing.assert_close(
-        k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
-    )
-    # v_cache should be an exact copy
-    assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
+        atol = rtol = 1e-2
+        # q should match RoPE-only result
+        torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+        # k_cache should contain the rotated k
+        torch.testing.assert_close(
+            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
+        )
+        # v_cache should be an exact copy
+        assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
+    else:
+        # For XPU, compare against a pure-PyTorch reference: RoPE + explicit scatter.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+        k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
+        v_cache_ref[out_loc] = v.view(batch_size, -1)
+
+        q_fused, k_fused = q.clone(), k.clone()
+        v_fused = v.clone()
+        apply_rope_inplace_with_kvcache(
+            q_fused,
+            k_fused,
+            v_fused,
+            k_cache_fused,
+            v_cache_fused,
+            cos_sin_cache,
+            positions,
+            out_loc,
+            is_neox=is_neox,
+        )
+
+        atol = rtol = 1e-2
+        # q/k inplace rotation should match the reference.
+        torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+        # k_cache rows at out_loc should match rotated k.
+        torch.testing.assert_close(
+            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
+        )
+        # v_cache rows should be an exact copy of v.
+        assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
 
 if __name__ == "__main__":
