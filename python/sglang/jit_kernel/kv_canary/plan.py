@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -26,43 +25,19 @@ _PLAN_VERIFY_INNER_BLOCK: int = 64
 _PLAN_EXTRAS_INNER_BLOCK: int = 64
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _PlanScratch:
-    """Per-device scratch used by ``canary_plan_step`` across its sub-kernels.
-
-    The verify cumsum produced by ``_plan_offsets_kernel`` must survive into ``_plan_entries_kernel`` (the
-    entry materializer needs each req's flat-output offset) but ``VerifyPlan`` does not carry an offsets
-    tensor of its own. We cache a stable scratch tensor on the host wrapper so its data_ptr() is captured
-    into any cuda-graph and reused on replay.
-
-    Fields:
-        verify_offsets: Exclusive prefix sum of per-req verify counts, shape [_PLAN_BS_BLOCK_SIZE + 1], int32.
-            Slot ``[bs]`` carries the total verify entry count (= base index for extras append).
-        swa_lut_sentinel: One-element int64 zero tensor used as a stable LUT pointer when the caller passes
-            ``full_to_swa_index_mapping=None``. Cached so the wrapper never allocates per call; its data_ptr()
-            is pinned into any cuda-graph capture and the kernel never dereferences it (HAS_SWA_LUT is False).
-            Dtype matches the production LUT (int64) so Triton ``tl.load`` element typing stays consistent.
-    """
-
-    verify_offsets: torch.Tensor
-    swa_lut_sentinel: torch.Tensor
-
-
-_PLAN_SCRATCH_CACHE: dict[torch.device, _PlanScratch] = {}
-
-
 def _resolve_swa_lut(
-    lut: Optional[torch.Tensor], scratch: _PlanScratch
+    lut: Optional[torch.Tensor], device: torch.device
 ) -> tuple[torch.Tensor, int, bool]:
     """Return the (tensor, length, has_lut) triple to launch the plan kernel with.
 
     Triton requires a valid tensor pointer at every kernel-arg slot even when ``HAS_SWA_LUT`` is False, so
-    when the caller passes ``None`` we substitute the scratch's cached one-element sentinel tensor and set
-    ``lut_len=0``; the kernel's constexpr branch guarantees no dereference happens.
+    when the caller passes ``None`` we substitute a one-element sentinel tensor and set ``lut_len=0``;
+    the kernel's constexpr branch guarantees no dereference happens. Dtype matches the production LUT
+    (int64) so Triton ``tl.load`` element typing stays consistent.
     """
     if lut is not None:
         return lut, int(lut.shape[0]), True
-    return scratch.swa_lut_sentinel, 0, False
+    return torch.zeros(1, dtype=torch.int64, device=device), 0, False
 
 
 def canary_plan_step(
@@ -203,8 +178,9 @@ def canary_plan_step(
         _assert_contiguous(full_to_swa_index_mapping, "full_to_swa_index_mapping")
 
     device = verify_plan_out.verify_slot_indices.device
-    scratch = _get_plan_scratch(device=device)
-    verify_offsets_scratch = scratch.verify_offsets
+    verify_offsets_scratch = torch.zeros(
+        _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
+    )
 
     verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     write_req_capacity_plus_one = int(write_plan_out.write_offsets.shape[0])
@@ -212,7 +188,7 @@ def canary_plan_step(
     extras_capacity = int(extra_verify_slot_indices.shape[0])
 
     lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
-        full_to_swa_index_mapping, scratch
+        full_to_swa_index_mapping, device
     )
 
     req_to_token_stride0 = int(req_to_token.stride(0))
@@ -290,26 +266,6 @@ def canary_plan_step(
             verify_capacity,
             INNER_BLOCK=_PLAN_EXTRAS_INNER_BLOCK,
         )
-
-
-def _get_plan_scratch(*, device: torch.device) -> _PlanScratch:
-    """Return the cached scratch for ``device``; allocate once on first call.
-
-    Allocation happens at most once per device. The returned tensor's data_ptr() is stable for the lifetime of
-    the process, which is what cuda-graph capture requires: the very first canary_plan_step call (eager mode
-    or under capture) pins the address, and every later call — including replays — reuses it.
-    """
-    cached = _PLAN_SCRATCH_CACHE.get(device)
-    if cached is not None:
-        return cached
-    scratch = _PlanScratch(
-        verify_offsets=torch.zeros(
-            _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
-        ),
-        swa_lut_sentinel=torch.zeros(1, dtype=torch.int64, device=device),
-    )
-    _PLAN_SCRATCH_CACHE[device] = scratch
-    return scratch
 
 
 @triton.jit
