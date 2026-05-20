@@ -12,9 +12,14 @@ from sglang.srt.kv_canary.pool_patch.buf_info_splice import (
 from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
     make_packed_source,
-    make_row_source,
 )
 from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
+
+
+def _dsv4_packed_nope_rope_bytes_per_token(pool: object) -> int:
+    nbytes = pool.qk_nope_head_dim + pool.qk_rope_head_dim * pool.rope_storage_dtype.itemsize
+    assert nbytes == 576, f"unexpected DSv4 nope+rope width: {nbytes}"
+    return nbytes
 
 
 def attach_dsv4(
@@ -52,25 +57,24 @@ def _build_full_group(
     k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
 
     indexer_buf = indexer_pool.index_k_with_scale_buffer[0]
-    indexer_bytes_per_token = int(indexer_buf.shape[1]) // indexer_pool.page_size
 
     sources = (
         make_packed_source(
             page_buffer=c4_pool.kv_buffer[0],
             page_size=c4_pool.page_size,
-            bytes_per_token=c4_pool.get_bytes_per_token(),
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(c4_pool),
             read_bytes=read_bytes,
         )
         + make_packed_source(
             page_buffer=indexer_buf,
             page_size=indexer_pool.page_size,
-            bytes_per_token=indexer_bytes_per_token,
+            bytes_per_token=indexer_pool.index_head_dim,
             read_bytes=read_bytes,
         )
         + make_packed_source(
             page_buffer=c128_pool.kv_buffer[0],
             page_size=c128_pool.page_size,
-            bytes_per_token=c128_pool.get_bytes_per_token(),
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(c128_pool),
             read_bytes=read_bytes,
         )
     )
@@ -103,8 +107,11 @@ def _build_swa_group(
         k_tail=k_tail,
         v_head=None,
         v_tail=None,
-        real_kv_sources_k=make_row_source(
-            layer_buffer=swa_pool.kv_buffer[0], read_bytes=read_bytes
+        real_kv_sources_k=make_packed_source(
+            page_buffer=swa_pool.kv_buffer[0],
+            page_size=swa_pool.page_size,
+            bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(swa_pool),
+            read_bytes=read_bytes,
         ),
         real_kv_sources_v=(),
         swa_index_lut=pool.full_to_swa_index_mapping,
