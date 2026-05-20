@@ -218,7 +218,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         if not has_tool_call:
             self._buffer = ""
-            normal_text = _strip_special_tokens(new_text)
+            normal_text = _strip_special_tokens(current_text)
             return StreamingParseResult(normal_text=normal_text)
 
         normal_text = ""
@@ -238,8 +238,14 @@ class KimiK2Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            match = self.stream_tool_call_portion_regex.search(current_text)
-            if match:
+            # Loop to drain the buffer: a single chunk may contain multiple
+            # complete tool calls (e.g. with speculative decoding). After each
+            # finalized call we re-scan the remaining buffer for the next one.
+            while True:
+                match = self.stream_tool_call_portion_regex.search(current_text)
+                if not match:
+                    break
+
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
 
@@ -280,60 +286,65 @@ class KimiK2Detector(BaseFormatDetector):
                         "name": function_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
+
+                # Also emit argument diff in the same call (handles the case
+                # where name + complete args arrive in one chunk, e.g. with
+                # speculative decoding).
+                argument_diff = (
+                    function_args[len(self._last_arguments) :]
+                    if function_args.startswith(self._last_arguments)
+                    else function_args
+                )
+
+                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[0]
+
+                if parsed_args_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=parsed_args_diff,
+                        )
                     )
+                    self._last_arguments += parsed_args_diff
+                    self.streamed_args_for_tool[
+                        self.current_tool_id
+                    ] += parsed_args_diff
 
-                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                        0
-                    ]
+                parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
+                if _is_complete_json(parsed_args):
+                    try:
+                        parsed_args = json.loads(parsed_args)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
 
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self._last_arguments += parsed_args_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
+                    # Find the end of the current tool call and remove only that part from buffer
+                    tool_call_end_pattern = (
+                        r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
+                    )
+                    end_match = re.search(
+                        tool_call_end_pattern, current_text, re.DOTALL
+                    )
+                    if end_match:
+                        self._buffer = current_text[end_match.end() :]
+                    else:
+                        self._buffer = ""
 
-                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
-                    if _is_complete_json(parsed_args):
-                        try:
-                            parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    self._current_stream_function_name = None
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        end_match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if end_match:
-                            self._buffer = current_text[end_match.end() :]
-                        else:
-                            self._buffer = ""
+                    # Continue draining the buffer in case more tool calls
+                    # were delivered in the same chunk.
+                    current_text = self._buffer
+                    continue
 
-                        result = StreamingParseResult(
-                            normal_text=normal_text, calls=calls
-                        )
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._current_stream_function_name = None
-                        return result
+                # Partial args — wait for more chunks.
+                break
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
