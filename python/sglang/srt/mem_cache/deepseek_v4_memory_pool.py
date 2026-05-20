@@ -492,6 +492,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.cached_loc = None  # mapping replaced; discard any cached translation
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
