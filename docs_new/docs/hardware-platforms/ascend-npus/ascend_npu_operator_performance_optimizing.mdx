@@ -8,47 +8,47 @@ Before optimizing the performance, you need to obtain accurate performance data,
 
 ### Network
 '''
-import torch
-import torch_npu
-
-experimental_config = torch_npu.profiler._ExperimentalConfig(
-    export_type=[
-        torch_npu.profiler.ExportType.Text
-        ],
-    profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-    mstx=False,
-    mstx_domain_include=[],
-    mstx_domain_exclude=[],
-    aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-    l2_cache=False,
-    op_attr=False,
-    data_simplification=False,
-    record_op_args=False,
-    gc_detect_threshold=None,
-    host_sys=[
-        torch_npu.profiler.HostSystem.CPU,
-        torch_npu.profiler.HostSystem.MEM],
-    sys_io=False,
-    sys_interconnection=False
-)
-
-with torch_npu.profiler.profile(
-    activities=[
-        torch_npu.profiler.ProfilerActivity.CPU,
-        torch_npu.profiler.ProfilerActivity.NPU
-        ],
-    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=1),
-    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
-    record_shapes=False,
-    profile_memory=False,
-    with_stack=False,
-    with_modules=False,
-    with_flops=False,
-    experimental_config=experimental_config) as prof:
-
-    for step in range(steps):
-        train_one_step(step, steps, train_loader, model, optimizer, criterion)
-        prof.step()
+    import torch
+    import torch_npu
+    
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=[
+            torch_npu.profiler.ExportType.Text
+            ],
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+        mstx=False,
+        mstx_domain_include=[],
+        mstx_domain_exclude=[],
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=False,
+        record_op_args=False,
+        gc_detect_threshold=None,
+        host_sys=[
+            torch_npu.profiler.HostSystem.CPU,
+            torch_npu.profiler.HostSystem.MEM],
+        sys_io=False,
+        sys_interconnection=False
+    )
+    
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU
+            ],
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=1),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        with_flops=False,
+        experimental_config=experimental_config) as prof:
+    
+        for step in range(steps):
+            train_one_step(step, steps, train_loader, model, optimizer, criterion)
+            prof.step()
 '''
 Refer to the function event_loop_overlap of this document https://github.com/sgl-project/sglang/blob/ifmn/eagle-dp-attn/python/sglang/srt/managers/scheduler.py to revise the same function in scheduler.py
 
