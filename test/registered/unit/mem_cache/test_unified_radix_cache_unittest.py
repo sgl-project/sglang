@@ -881,6 +881,41 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_tombstone_clears_full_mapping(self):
+        """SWA tombstones must not leave stale full->swa mappings behind."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the mapping expectation precise")
+
+        for case in ("evict", "split"):
+            with self.subTest(case=case):
+                tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+                seq = self._make_seq(1, 2)
+                self._insert(tree, allocator, req_to_token_pool, seq)
+
+                node = tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(seq))
+                ).last_device_node
+                full_value = node.component_data[ComponentType.FULL].value.clone()
+                self._set_aux_host_tombstone(tree, node, ComponentType.SWA)
+                self.assertTrue(
+                    torch.all(allocator.full_to_swa_index_mapping[full_value] > 0)
+                )
+
+                if case == "evict":
+                    tree.components[ComponentType.SWA].evict_component(node)
+                    cleared_full_value = full_value
+                else:
+                    parent = tree._split_node(node.key, node, self.cfg.page_size)
+                    cleared_full_value = parent.component_data[ComponentType.FULL].value
+
+                self.assertTrue(
+                    torch.all(
+                        allocator.full_to_swa_index_mapping[cleared_full_value] == 0
+                    )
+                )
+
     def test_tombstone_cleanup_respects_locked_parent(self):
         tree, _, _ = build_fixture(self.cfg)
         parent = UnifiedTreeNode(self.cfg.components)
