@@ -112,6 +112,12 @@ repos:
         language: system
         files: ^sgl-model-gateway/.*\.rs$
         pass_filenames: false
+      - id: rustfmt-sgl-router
+        name: rustfmt experimental/sgl-router
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        language: system
+        files: ^experimental/sgl-router/.*\.rs$
+        pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:
