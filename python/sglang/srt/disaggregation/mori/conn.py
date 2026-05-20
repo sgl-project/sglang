@@ -961,7 +961,7 @@ class MoriKVManager(CommonKVManager):
                 peer_info, src_state_indices, dst_state_indices
             )
         elif state_type in ("swa", "nsa"):
-            return self._send_swa_nsa_state(
+            return self._send_swa_dsa_state(
                 peer_info, src_state_indices, dst_state_indices, state_type
             )
         else:
@@ -1056,7 +1056,7 @@ class MoriKVManager(CommonKVManager):
 
         return statuses
 
-    def _send_swa_nsa_state(
+    def _send_swa_dsa_state(
         self,
         peer_info: KVArgsRegisterInfo,
         src_state_indices: npt.NDArray[np.int32],

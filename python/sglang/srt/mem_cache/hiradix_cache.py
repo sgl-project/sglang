@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
+    DSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -82,7 +82,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
+        elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
@@ -122,7 +122,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
@@ -643,7 +643,7 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,

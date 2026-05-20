@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseNSATokenToKVPool,
+    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NoOpMHATokenToKVPool,
-    NSATokenToKVPool,
+    DSATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
@@ -165,8 +165,8 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
-        quant_block_size = NSATokenToKVPool.quant_block_size
-        rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
+        quant_block_size = DSATokenToKVPool.quant_block_size
+        rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
         # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
@@ -501,7 +501,7 @@ class ModelRunnerKVCacheMixin:
                 )
         elif self.use_mla_backend and is_nsa_model:
             PoolCls = (
-                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
+                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
             )
             pool_kwargs = {}
             if self.enable_hisparse:

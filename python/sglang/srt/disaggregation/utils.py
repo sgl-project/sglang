@@ -567,7 +567,7 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, DSATokenToKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -593,9 +593,9 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
-        elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
+        elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, NSATokenToKVPool
+                draft_token_to_kv_pool, DSATokenToKVPool
             ):
                 (
                     draft_data_ptrs,

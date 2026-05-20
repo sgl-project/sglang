@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
+    DSAIndexerPoolHost,
     PoolEntry,
 )
 
@@ -658,7 +658,7 @@ def attach_hybrid_pool_to_unified_cache(
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MLATokenToKVPool,
-        NSATokenToKVPool,
+        DSATokenToKVPool,
     )
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
@@ -667,7 +667,7 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         swa_stack = isinstance(kvcache, SWAKVPool)
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
-        nsa_stack = isinstance(kvcache, NSATokenToKVPool)
+        dsa_stack = isinstance(kvcache, DSATokenToKVPool)
         deepseek_v4_stack = isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
         if deepseek_v4_stack:
@@ -820,7 +820,7 @@ def attach_hybrid_pool_to_unified_cache(
                 cache.swa_kv_pool_host
             )
             transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
-        elif nsa_stack:
+        elif dsa_stack:
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
             }
@@ -838,7 +838,7 @@ def attach_hybrid_pool_to_unified_cache(
                 storage_backend=None,
                 use_mla=use_mla,
                 override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-                sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+                sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                     full_kv_pool,
                     kv_host_pool,
                     server_args.hicache_mem_layout,
@@ -897,7 +897,7 @@ def attach_hybrid_pool_to_unified_cache(
             pools_desc = "KV + MAMBA"
         elif swa_stack:
             pools_desc = "KV + SWA"
-        elif nsa_stack:
+        elif dsa_stack:
             pools_desc = "KV + INDEXER"
         else:
             pools_desc = "KV"
@@ -945,7 +945,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,

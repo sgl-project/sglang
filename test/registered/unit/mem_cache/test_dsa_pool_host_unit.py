@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
     MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
+    DSAIndexerPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -42,7 +42,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
         layer_num = 2
         size = page_size * 4
 
-        device_pool = NSATokenToKVPool(
+        device_pool = DSATokenToKVPool(
             size=size,
             page_size=page_size,
             kv_lora_rank=128,
@@ -70,7 +70,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
                 allocator_type="default",
                 override_kv_cache_dim=device_pool.kv_cache_dim,
             )
-            indexer_host = NSAIndexerPoolHost(
+            indexer_host = DSAIndexerPoolHost(
                 device_pool=device_pool,
                 anchor_host=mla_host,
                 layout="layer_first",

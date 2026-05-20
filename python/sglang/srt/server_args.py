@@ -3411,7 +3411,7 @@ class ServerArgs:
                 "the paged cache, which the no-op pool does not support."
             )
 
-        # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
+        # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
         # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
         if self.enable_hisparse:
             raise ValueError(

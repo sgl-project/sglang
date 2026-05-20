@@ -1635,7 +1635,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
-        self.nsa_kv_cache_store_fp8 = (
+        self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
@@ -1644,7 +1644,7 @@ class MLATokenToKVPool(KVCache):
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1726,7 +1726,7 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1756,7 +1756,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
-        elif self.nsa_kv_cache_store_fp8:
+        elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1905,7 +1905,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1930,7 +1930,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -1968,7 +1968,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class NSATokenToKVPool(MLATokenToKVPool):
+class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16

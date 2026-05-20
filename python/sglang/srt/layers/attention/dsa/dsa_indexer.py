@@ -84,7 +84,7 @@ from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
@@ -446,7 +446,7 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -622,7 +622,7 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
@@ -849,7 +849,7 @@ class Indexer(MultiPlatformOp):
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
 
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
@@ -1173,7 +1173,7 @@ class Indexer(MultiPlatformOp):
             from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
 
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.

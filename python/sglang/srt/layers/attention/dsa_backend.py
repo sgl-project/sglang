@@ -317,7 +317,7 @@ class DeepseekSparseAttnBackend(
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
         self.dsa_kv_cache_store_fp8 = (
-            model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
@@ -434,7 +434,7 @@ class DeepseekSparseAttnBackend(
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_dsa_prefill_impl(forward_batch)
-        nsa_impl_for_batch = (
+        dsa_impl_for_batch = (
             self.dsa_decode_impl
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -443,7 +443,7 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        use_flashmla_kv = (not self.use_mha) and nsa_impl_for_batch == "flashmla_kv"
+        use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -1345,7 +1345,7 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        nsa_impl = (
+        dsa_impl = (
             self.dsa_decode_impl
             if (
                 forward_batch.forward_mode.is_target_verify()
@@ -1354,7 +1354,7 @@ class DeepseekSparseAttnBackend(
             else self.dsa_prefill_impl
         )
 
-        if nsa_impl == "trtllm" and not self.use_mha:
+        if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
@@ -1458,7 +1458,7 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
-        if nsa_impl == "tilelang":
+        if dsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -1468,7 +1468,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif nsa_impl == "flashmla_sparse":
+        elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
@@ -1492,7 +1492,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif nsa_impl == "flashmla_kv":
+        elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -1505,7 +1505,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif nsa_impl == "fa3":
+        elif dsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1520,7 +1520,7 @@ class DeepseekSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
-        elif nsa_impl == "aiter":
+        elif dsa_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter_extend(
@@ -1531,7 +1531,7 @@ class DeepseekSparseAttnBackend(
             )
         else:
             raise ValueError(
-                f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
+                f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
     def forward_decode(

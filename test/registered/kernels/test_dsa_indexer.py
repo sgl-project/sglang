@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -224,9 +224,9 @@ class MockModelRunner:
             },
         )()
 
-        # Create NSATokenToKVPool
+        # Create DSATokenToKVPool
         max_total_num_tokens = max_batch_size * max_context_len
-        self.token_to_kv_pool = NSATokenToKVPool(
+        self.token_to_kv_pool = DSATokenToKVPool(
             size=max_total_num_tokens,
             page_size=self.config["page_size"],
             dtype=self.config["kv_cache_dtype"],
@@ -255,7 +255,7 @@ class MockModelRunner:
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
-class TestNSAIndexer(CustomTestCase):
+class TestDSAIndexer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         """Set up global server args for testing."""

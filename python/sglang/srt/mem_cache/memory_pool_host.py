@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
+    DSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -2608,14 +2608,14 @@ class HostPoolGroup:
             )
 
 
-class NSAIndexerPoolHost(HostKVCache):
+class DSAIndexerPoolHost(HostKVCache):
     """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
 
-    device_pool: NSATokenToKVPool
+    device_pool: DSATokenToKVPool
 
     def __init__(
         self,
-        device_pool: NSATokenToKVPool,
+        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         layout: str,
         pin_memory: bool = True,
@@ -2635,7 +2635,7 @@ class NSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
         self.indexer_size_per_token = (
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
