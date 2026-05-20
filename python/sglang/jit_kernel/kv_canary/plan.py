@@ -51,6 +51,20 @@ class _PlanScratch:
 _PLAN_SCRATCH_CACHE: dict[torch.device, _PlanScratch] = {}
 
 
+def _resolve_swa_lut(
+    lut: Optional[torch.Tensor], scratch: _PlanScratch
+) -> tuple[torch.Tensor, int, bool]:
+    """Return the (tensor, length, has_lut) triple to launch the plan kernel with.
+
+    Triton requires a valid tensor pointer at every kernel-arg slot even when ``HAS_SWA_LUT`` is False, so
+    when the caller passes ``None`` we substitute the scratch's cached one-element sentinel tensor and set
+    ``lut_len=0``; the kernel's constexpr branch guarantees no dereference happens.
+    """
+    if lut is not None:
+        return lut, int(lut.shape[0]), True
+    return scratch.swa_lut_sentinel, 0, False
+
+
 def canary_plan_step(
     *,
     verify_plan_out: VerifyPlan,
@@ -197,15 +211,9 @@ def canary_plan_step(
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
     extras_capacity = int(extra_verify_slot_indices.shape[0])
 
-    has_swa_lut = full_to_swa_index_mapping is not None
-    if has_swa_lut:
-        lut_tensor = full_to_swa_index_mapping
-        lut_len = int(full_to_swa_index_mapping.shape[0])
-    else:
-        # Sentinel one-element tensor keeps the pointer well-defined; kernel never dereferences it when
-        # HAS_SWA_LUT is False. Cached on the scratch so we never allocate per call.
-        lut_tensor = scratch.swa_lut_sentinel
-        lut_len = 0
+    lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
+        full_to_swa_index_mapping, scratch
+    )
 
     req_to_token_stride0 = int(req_to_token.stride(0))
 
