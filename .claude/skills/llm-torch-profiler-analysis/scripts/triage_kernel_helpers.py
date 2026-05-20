@@ -530,16 +530,16 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         likely_share=0.5,
     ),
     FusionPatternSpec(
-        pattern="NSA fused metadata copy for graph replay",
+        pattern="DSA fused metadata copy for graph replay",
         candidate_path="python/sglang/jit_kernel/fused_metadata_copy.py",
         active_keywords=(
             "fused_metadata_copy",
             "fused_metadata_copy_multi",
-            "fused_nsa_cache_seqlens",
+            "fused_dsa_cache_seqlens",
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
-            "NSA replay metadata copies are already fused into one-kernel" " families."
+            "DSA replay metadata copies are already fused into one-kernel" " families."
         ),
         min_share=0.02,
         likely_share=0.2,
@@ -744,23 +744,23 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         likely_share=1.5,
     ),
     FusionPatternSpec(
-        pattern="NSA fused top-k transform / page-table build",
-        candidate_path="python/sglang/srt/layers/attention/nsa_backend.py",
+        pattern="DSA fused top-k transform / page-table build",
+        candidate_path="python/sglang/srt/layers/attention/dsa_backend.py",
         active_keywords=(
             "fast_topk_transform_fused",
             "fast_topk_transform_ragged_fused",
         ),
         rationale_hint=(
-            "NSA top-k metadata preparation already has fused transform kernels."
+            "DSA top-k metadata preparation already has fused transform kernels."
         ),
         min_share=0.05,
         likely_share=0.3,
     ),
     FusionPatternSpec(
-        pattern="NSA fused quantize + indexed K-cache store",
+        pattern="DSA fused quantize + indexed K-cache store",
         candidate_path=(
             "python/sglang/jit_kernel/fused_store_index_cache.py"
-            "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
+            "<br>python/sglang/srt/layers/attention/dsa/dsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),
         split_groups=(
@@ -768,7 +768,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("index_k", "cache", "store"),
         ),
         rationale_hint=(
-            "NSA already has a fused quantize-and-indexed-store kernel family."
+            "DSA already has a fused quantize-and-indexed-store kernel family."
         ),
         min_share=0.2,
         likely_share=1.0,
