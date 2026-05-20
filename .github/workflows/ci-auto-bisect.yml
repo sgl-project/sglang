@@ -2,7 +2,7 @@ name: CI Auto Bisect
 
 on:
   workflow_run:
-    workflows: ["PR Test"]
+    workflows: ["PR Test Base"]
     types: [completed]
     branches: [main]
   workflow_dispatch: {}

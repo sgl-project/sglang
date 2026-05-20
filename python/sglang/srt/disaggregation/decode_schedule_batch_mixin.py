@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 
@@ -85,8 +85,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
-            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -107,9 +107,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
-        self.output_ids = []
+        last_tokens: List[int] = []
         for req in self.reqs:
-            self.output_ids.append(req.output_ids[-1])
+            last_tokens.append(req.output_ids[-1])
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -124,13 +124,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
-                    # handles the release via check_finished -> release_kv_cache in one place.
+                    # handles the release via update_finish_state -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     req.to_finish = FINISH_ABORT(
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        last_tokens_tensor = torch.tensor(
+            last_tokens, dtype=torch.int64, device=self.device
+        )
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -170,9 +172,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
-                bonus_tokens=self.output_ids,
+                bonus_tokens=last_tokens_tensor,
                 new_seq_lens=self.seq_lens,
             )
+            # prepare_for_extend shifts batch.input_ids in place — keep it
+            # as the prefill prompt, not the [bs] last-token tensor.
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
@@ -183,3 +187,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
+        else:
+            # Non-spec: input_ids feeds the next decode forward directly.
+            self.input_ids = last_tokens_tensor

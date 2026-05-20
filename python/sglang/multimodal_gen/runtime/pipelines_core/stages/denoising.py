@@ -67,8 +67,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -1579,6 +1581,35 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
+            )
+        elif self.attn_backend.get_enum() in [
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
+        ]:
+            sparse_config = server_args.attention_backend_config
+
+            current_timestep = i
+            skip_first_steps = sparse_config.get("skip_first_steps", 10)
+            sparsity = sparse_config.get("sparsity", 0.2)
+
+            raw_latent_shape = batch.raw_latent_shape
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+                else:
+                    patch_size = (patch_size, patch_size, patch_size)
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                skip_first_steps=skip_first_steps,
+                sparsity=sparsity,
+                raw_latent_shape=raw_latent_shape,
+                patch_size=patch_size,
             )
         else:
             # attn_metadata can be None for SDPA attention backend

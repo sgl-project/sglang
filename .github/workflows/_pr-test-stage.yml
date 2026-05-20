@@ -4,7 +4,7 @@ name: PR Test Stage
 # `caller_inputs` = toJson(inputs) as bundles. `partitions` is forwarded
 # separately to keep matrix expressions single-fromJson — its value is itself
 # a JSON string, so reading it via `check_changes` would need double fromJson,
-# and matrix can't use step-resolved values. stage-a-test-cpu stays inline in
+# and matrix can't use step-resolved values. base-a-test-cpu stays inline in
 # pr-test.yml (bespoke uv pip / protoc / rust-cache install).
 
 on:
@@ -23,7 +23,7 @@ on:
         type: string
         required: true
       caller_inputs:
-        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).git_ref / skip_stage_health_check / test_parallel_dispatch.'
+        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).git_ref / skip_pr_test_health_check / test_parallel_dispatch.'
         type: string
         required: true
       partitions:
@@ -62,7 +62,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_stage_health_check && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -97,7 +97,7 @@ jobs:
       - name: Export rdma_devices to job env
         run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
