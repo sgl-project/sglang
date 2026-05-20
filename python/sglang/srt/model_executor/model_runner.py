@@ -741,6 +741,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        from sglang.srt.model_executor.pool_context import set_kv_pools
+
+        set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
