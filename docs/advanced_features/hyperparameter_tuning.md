@@ -55,7 +55,7 @@ Another straightforward approach is to increase `--mem-fraction-static` in incre
 
 If you encounter out-of-memory (OOM) errors, you can adjust the following parameters:
 
-- If OOM occurs during prefill, try reducing `--chunked-prefill-size` to `4096` or `2048`. This saves memory but slows down the prefill speed for long prompts.
+- If OOM occurs during prefill, try reducing `--chunked-prefill-size` to `4096` or `2048`. This saves memory but slows down the prefill speed for long prompts. Note that this is a shared per-batch budget, not a per-request cap — see [`--chunked-prefill-size`](./server_arguments.md) for its interaction with `--max-prefill-tokens`.
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
