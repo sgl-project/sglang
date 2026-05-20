@@ -668,8 +668,8 @@ class Envs:
     SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
     # Baseline-relative hard-gate ratio for ``test_self_bench_speed.py``.
     # ``overhead_pct`` greater than ``baseline_pct * ratio`` fails the bench
-    # (default 1.5x). Override via env var when runner jitter or temporary
-    # debugging needs a wider window.
+    # (default 1.5x). Override via env var when temporary debugging needs a
+    # wider window.
     SGLANG_KV_CANARY_BENCH_OVERHEAD_THRESHOLD_RATIO = EnvFloat(1.5)
     # KV cache canary perturbation. When >0, the canary install hooks corrupt
     # ``req_to_token_pool`` rows with this per-write probability so the canary
@@ -684,16 +684,6 @@ class Envs:
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
-    # Timing-jitter fuzzer. When enabled the canary runner launches a single-thread
-    # spin-wait kernel at 4 fixed slots inside the monkey-patched ``model.forward``
-    # to perturb the relative timing between canary HEAD/TAIL and real attention
-    # launches. Cycles are sampled log-uniformly over ``[1, MAX_CYCLES]`` and gated
-    # by ``PER_SLOT_FIRE_PROB``; off by default and never installed when
-    # ``--kv-canary=off``.
-    SGLANG_KV_CANARY_JITTER_ENABLED = EnvBool(False)
-    SGLANG_KV_CANARY_JITTER_PER_SLOT_FIRE_PROB = EnvFloat(0.5)
-    SGLANG_KV_CANARY_JITTER_MAX_CYCLES = EnvInt(100_000)
-    SGLANG_KV_CANARY_JITTER_SEED = EnvInt(0)
     # Mock-engine sampler-override per-element probability for writing the
     # wrong input token so the canary's ``INPUT_TOKEN_MISMATCH`` fires on
     # the next forward. Used by the canary <-> mock-oracle wiring tests in
