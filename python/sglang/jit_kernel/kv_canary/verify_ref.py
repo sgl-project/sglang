@@ -75,7 +75,6 @@ def canary_verify_step_torch_reference(
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: RealKvHashMode,
-    pad_sentinel_slot: int = -1,
 ) -> None:
     """Torch reference for :func:`canary_verify_step`. Same signature & byte-equal semantics.
 
@@ -88,7 +87,6 @@ def canary_verify_step_torch_reference(
     result = _load_active_verify_entries(
         plan=plan,
         work_device=work_device,
-        pad_sentinel_slot=pad_sentinel_slot,
         slot_run_counter=slot_run_counter,
     )
     if result is None:
@@ -156,7 +154,6 @@ def _load_active_verify_entries(
     *,
     plan: VerifyPlan,
     work_device: torch.device,
-    pad_sentinel_slot: int,
     slot_run_counter: torch.Tensor,
 ) -> Optional[_ActiveVerifyEntries]:
     num_valid = int(
@@ -185,8 +182,8 @@ def _load_active_verify_entries(
     # Mirror the CUDA kernel's pad-sentinel skip: drop entries pointing at the reserved padding slot before
     # any canary_buf indexing so unfilled req_to_token positions (zero-init reads as slot 0 in sglang's pool)
     # do not produce spurious chain_hash/position violations.
-    if pad_sentinel_slot >= 0:
-        keep_mask = slot_indices != pad_sentinel_slot
+    keep_mask = slot_indices != 0
+    if not bool(keep_mask.all()):
         slot_indices = slot_indices[keep_mask]
         expected_positions = expected_positions[keep_mask]
         prev_slot_indices = prev_slot_indices[keep_mask]

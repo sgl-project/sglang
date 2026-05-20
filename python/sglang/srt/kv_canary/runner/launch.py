@@ -20,11 +20,6 @@ from sglang.srt.kv_canary.violation_state import ViolationLog
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# sglang's KV pool reserves slot 0 as the padded-output sink (memory_pool.py: free_slots starts at 1) and
-# zero-initializes req_to_token. Unfilled positions therefore read as slot 0; treating it as a verify
-# sentinel keeps canary launches from producing spurious chain_hash/position violations on those entries.
-_PAD_SENTINEL_SLOT: int = 0
-
 
 def invoke_plan(
     *,
@@ -102,7 +97,6 @@ def launch_endpoints_per_forward(
             expected_input_positions=expected_positions_slice,
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,
-            pad_sentinel_slot=_PAD_SENTINEL_SLOT,
         )
 
 
@@ -124,7 +118,6 @@ def launch_endpoints_sweep(
             verify_plan=verify_plan,
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,
-            pad_sentinel_slot=_PAD_SENTINEL_SLOT,
         )
 
 

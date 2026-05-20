@@ -71,7 +71,6 @@ class CanaryEndpoint:
         expected_input_positions: torch.Tensor,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
-        pad_sentinel_slot: int = -1,
     ) -> None:
         """Call canary_verify_step then canary_write_step against this endpoint's canary_buf. Both use
         the shared violation_log. Used by head and tail endpoints; sweep endpoints raise NotImplementedError.
@@ -91,7 +90,6 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
-            pad_sentinel_slot=pad_sentinel_slot,
         )
         # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
         # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". FULL endpoints pass
@@ -129,7 +127,6 @@ class CanaryEndpoint:
         verify_plan: VerifyPlan,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
-        pad_sentinel_slot: int = -1,
     ) -> None:
         """Call only canary_verify_step against this endpoint's canary_buf. Used by sweep endpoints;
         head/tail endpoints raise NotImplementedError.
@@ -149,7 +146,6 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
-            pad_sentinel_slot=pad_sentinel_slot,
         )
 
 
