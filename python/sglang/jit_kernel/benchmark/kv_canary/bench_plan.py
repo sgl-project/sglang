@@ -123,7 +123,7 @@ def _build_plan_inputs(
     if swa_window_size > 0:
         full_pool_size = bs * max_seq_len + 1
         full_to_swa: Optional[torch.Tensor] = torch.arange(
-            full_pool_size + 1, dtype=torch.int32, device=device
+            full_pool_size + 1, dtype=torch.int64, device=device
         )
         full_to_swa[-1] = -1
     else:
