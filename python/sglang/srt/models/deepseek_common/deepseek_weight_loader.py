@@ -544,10 +544,12 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
 
+                    if weight_scale.dim() == 1:
+                        weight_scale = weight_scale.unsqueeze(1)
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                     self_attn.w_scale = scale
 
-            if w.dtype == torch.int8:
+            elif w.dtype == torch.int8:
                 if hasattr(self.quant_config, "weight_block_size"):
                     # block-wise int8 need it
                     weight_block_size = self.quant_config.weight_block_size
@@ -564,11 +566,7 @@ class DeepseekV2WeightLoaderMixin:
                         torch.bfloat16
                     )
 
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-
-            if (
+            elif (
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
@@ -579,6 +577,10 @@ class DeepseekV2WeightLoaderMixin:
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
+
+            w_kc, w_vc = w.unflatten(
+                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(

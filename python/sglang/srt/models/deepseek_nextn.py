@@ -229,8 +229,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
     # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
+    #
+    # NextN-specific weights (eh_proj, enorm, hnorm, embed_tokens, shared_head)
+    # live directly under `model`, not `model.decoder`. Longer substrings are
+    # matched first by WeightsMapper, so these take priority over the generic
+    # model.layers.61 to model.decoder fallback.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
+            "model.layers.61.eh_proj": "model.eh_proj",
+            "model.layers.61.embed_tokens": "model.embed_tokens",
+            "model.layers.61.enorm": "model.enorm",
+            "model.layers.61.hnorm": "model.hnorm",
+            "model.layers.61.shared_head": "model.shared_head",
             "model.layers.61": "model.decoder",
         },
     )

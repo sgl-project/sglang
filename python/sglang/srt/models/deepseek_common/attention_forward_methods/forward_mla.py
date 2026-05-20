@@ -110,6 +110,7 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
+    from aiter import fused_qk_rmsnorm
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -178,32 +179,44 @@ class DeepseekMLAForwardMixin:
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-                        if self.use_nsa:
-                            q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
-                                q,
-                                self.q_a_layernorm.weight,
-                                self.q_a_layernorm.variance_epsilon,
-                                k_nope,
-                                self.kv_a_layernorm.weight,
-                                self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=True,
-                            )
-                            q = q_quanted
+                        if self.weight_qscheme == "per_block":
+                            if self.use_nsa:
+                                q_quanted, q_lora, k_nope, _ = (
+                                    fused_rms_fp8_group_quant(
+                                        q,
+                                        self.q_a_layernorm.weight,
+                                        self.q_a_layernorm.variance_epsilon,
+                                        k_nope,
+                                        self.kv_a_layernorm.weight,
+                                        self.kv_a_layernorm.variance_epsilon,
+                                        group_size=128,
+                                        dtype_quant=torch.float8_e4m3fn,
+                                        res1=None,
+                                        output_unquantized_inp1=True,
+                                    )
+                                )
+                                q = q_quanted
+                            else:
+                                q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                                    q,
+                                    self.q_a_layernorm.weight,
+                                    self.q_a_layernorm.variance_epsilon,
+                                    k_nope,
+                                    self.kv_a_layernorm.weight,
+                                    self.kv_a_layernorm.variance_epsilon,
+                                    group_size=128,
+                                    dtype_quant=torch.float8_e4m3fn,
+                                    res1=None,
+                                    output_unquantized_inp1=False,
+                                )
                         else:
-                            q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                            q, k_nope = fused_qk_rmsnorm(
                                 q,
                                 self.q_a_layernorm.weight,
                                 self.q_a_layernorm.variance_epsilon,
                                 k_nope,
                                 self.kv_a_layernorm.weight,
                                 self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=False,
                             )
 
                     elif _use_aiter:
@@ -602,7 +615,10 @@ class DeepseekMLAForwardMixin:
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif (
+                self.o_proj.weight.dtype == torch.float8_e4m3fn
+                and self.weight_qscheme == "per_block"
+            ):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn

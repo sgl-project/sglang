@@ -1550,6 +1550,16 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
+        self.weight_qscheme = getattr(
+            getattr(
+                getattr(self, "fused_qkv_a_proj_with_mqa", None),
+                "scheme",
+                None,
+            ),
+            "weight_qscheme",
+            "per_block",
+        )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1910,12 +1920,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         weight = getattr(
             getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
         )
+
         if weight is None:
             return ""
         if weight.dtype == torch.uint8:
             return "mxfp4"
         if weight.dtype == getattr(torch, "float8_e4m3fn", None):
-            return "fp8"
+            if self.self_attn.weight_qscheme == "per_block":
+                return "fp8"
         return ""
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
