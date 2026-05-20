@@ -19,6 +19,15 @@ xcode-select --install
 If you have the full Xcode app installed, the Command Line Tools are already
 available. You can verify with `xcode-select -p && xcrun --find metal`.
 
+Some AOT Metal kernels require the full Xcode Metal toolchain:
+
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -downloadComponent MetalToolchain
+TOOLCHAINS=metal xcrun -sdk macosx --find metal
+TOOLCHAINS=metal xcrun -sdk macosx --find metallib
+```
+
 ## Install SGLang
 
 You can install SGLang using one of the methods below.
@@ -36,7 +45,7 @@ source sglang-metal/bin/activate
 
 # (Optional) Compile sgl-kernel
 uv pip install --upgrade pip
-uv run sgl-kernel/setup_metal.py install
+TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace
 
 # Install sglang python package along with diffusion support
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
@@ -84,6 +93,9 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
+Set `SGLANG_DISABLE_CUSTOM_ROPE=1` to force the MLX RoPE fallback when the
+optional custom RoPE kernel is available. This is useful for A/B testing.
+
 
 ## Benchmarking with Requests
 
@@ -119,81 +131,4 @@ SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
   --model-path <MODEL_ID_OR_PATH> \
   --disable-cuda-graph \
   --num-prompts 1
-```
-
-## Build AOT Metal kernels
-
-`sgl-kernel` can build optional AOT Metal kernels for the MLX backend.
-These kernels are compiled with Apple's `xcrun metal` / `xcrun metallib`
-toolchain into a `.metallib`, then loaded by the Python Metal extension at
-runtime.
-
-When optional Metal kernels are not built, the MLX backend falls back to the
-standard MLX implementation. The server still runs, but without those
-kernel-specific optimizations.
-
-### Prerequisites for building
-
-Install full Xcode, not just Command Line Tools. The Metal compiler ships with
-Xcode:
-
-```bash
-# Download Xcode from the Mac App Store, then point xcode-select at it
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-```
-
-On recent Xcode versions, install the separate Apple Metal Toolchain component:
-
-```bash
-sudo xcodebuild -downloadComponent MetalToolchain
-```
-
-Verify that both `metal` and `metallib` are reachable:
-
-```bash
-TOOLCHAINS=metal xcrun -sdk macosx --find metal
-TOOLCHAINS=metal xcrun -sdk macosx --find metallib
-```
-
-### Build
-
-From the repo root, with the same virtual environment active:
-
-```bash
-TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace
-```
-
-The build:
-
-* compiles Metal shader sources under `sgl-kernel/csrc/metal/` to
-  `sgl_metal_kernels.metallib`;
-* compiles the C++/nanobind Metal extension into `sgl_kernel/_metal.so`;
-* writes both artifacts into `sgl-kernel/python/sgl_kernel/`.
-
-If the toolchain is missing, the build aborts with an error message pointing at
-the install steps above.
-
-### Disable the AOT kernel
-
-Set `SGLANG_DISABLE_CUSTOM_ROPE=1` to force the MLX RoPE fallback even when
-the custom RoPE kernel is available. This is useful for A/B testing.
-
-### Verify
-
-```bash
-# Standalone correctness
-python test/manual/models/test_rope_pool_fused.py
-
-# Wiring check: verifies the wrapper invokes the AOT kernel
-PYTHONPATH=python python test/manual/models/test_aot_wiring.py
-
-# Microbenchmark versus MLX baseline
-python test/manual/models/bench_realistic.py
-```
-
-When the server starts and a batched-decode batch with at least two concurrent
-requests flows through the MLX backend, you should see:
-
-```text
-AOT Metal RoPE kernel ENABLED: head_dim=128, n_heads=16, n_kv=8, base=1000000.0
 ```
