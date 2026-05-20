@@ -32,7 +32,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
     get_pp_group,
-    get_pp_indices,
     get_tensor_model_parallel_rank,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
