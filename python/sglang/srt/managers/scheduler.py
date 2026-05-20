@@ -1683,6 +1683,41 @@ class Scheduler(
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
+        if not self._stepping_mode:
+            return self.recv_requests_raw()
+
+        from sglang.srt.steppable_engine.messages import (
+            _OBSERVATION_TYPES,
+            StepReq,
+        )
+
+        while True:
+            self._stepping_queue.extend(self.recv_requests_raw())
+
+            i = 0
+            while i < len(self._stepping_queue):
+                msg = self._stepping_queue[i]
+                if isinstance(msg, _OBSERVATION_TYPES):
+                    self.process_input_requests([msg])
+                    self._stepping_queue.pop(i)
+                else:
+                    i += 1
+
+            for k, msg in enumerate(self._stepping_queue):
+                if isinstance(msg, StepReq):
+                    if self.recv_from_rpc is not None:
+                        self.recv_from_rpc.send_pyobj(
+                            RpcReqOutput(success=True, message="")
+                        )
+                    ret = self._stepping_queue[:k]
+                    self._stepping_queue = self._stepping_queue[k + 1 :]
+                    return ret
+
+            time.sleep(0.01)
+
+    def recv_requests_raw(
+        self,
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
@@ -1695,9 +1730,6 @@ class Scheduler(
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = self._drain_zmq_nonblock()
-
-                if self._stepping_mode:
-                    return self._recv_requests_stepping(initial_msgs=recv_reqs)
             else:
                 recv_reqs = None
         else:
@@ -1844,41 +1876,6 @@ class Scheduler(
             recv_reqs.append(recv_rpc)
 
         return recv_reqs
-
-    def _recv_requests_stepping(self, *, initial_msgs: List[Any]) -> List[Any]:
-        """Stepping-mode recv loop.
-
-        Returns only when self._stepping_queue contains a StepReq;
-        return value is the prefix before that StepReq (StepReq itself filtered out).
-        """
-        from sglang.srt.steppable_engine.messages import (
-            _OBSERVATION_TYPES,
-            StepReq,
-        )
-
-        self._stepping_queue.extend(initial_msgs)
-
-        while True:
-            i = 0
-            while i < len(self._stepping_queue):
-                msg = self._stepping_queue[i]
-                if isinstance(msg, _OBSERVATION_TYPES):
-                    self.process_input_requests([msg])
-                    self._stepping_queue.pop(i)
-                else:
-                    i += 1
-
-            for k, msg in enumerate(self._stepping_queue):
-                if isinstance(msg, StepReq):
-                    self.recv_from_rpc.send_pyobj(
-                        RpcReqOutput(success=True, message="")
-                    )
-                    ret = self._stepping_queue[:k]
-                    self._stepping_queue = self._stepping_queue[k + 1 :]
-                    return ret
-
-            time.sleep(0.01)
-            self._stepping_queue.extend(self._drain_zmq_nonblock())
 
     def _handle_enter_stepping_mode(self, req: EnterSteppingModeReq) -> RpcReqOutput:
         self._stepping_mode = True
