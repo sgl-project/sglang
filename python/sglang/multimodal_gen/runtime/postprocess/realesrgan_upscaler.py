@@ -26,6 +26,9 @@ logger = init_logger(__name__)
 # Default HuggingFace repo and filename for Real-ESRGAN weights
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
+_LOW_MEMORY_TILED_UPSCALE_FREE_BYTES = 2 * 1024**3
+_REALESRGAN_TILE_SIZE = 256
+_REALESRGAN_TILE_PAD = 32
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
@@ -263,6 +266,60 @@ class UpscalerModel:
     def device(self) -> torch.device:
         return next(self.net.parameters()).device
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.net.parameters()).dtype
+
+    def _should_use_tiled_upscale(self, h: int, w: int) -> bool:
+        if self.device.type != "cuda":
+            return False
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        output_bytes = h * w * self.scale * self.scale * 3 * 4
+        required_free_bytes = max(
+            _LOW_MEMORY_TILED_UPSCALE_FREE_BYTES,
+            output_bytes * 4,
+        )
+        return free_bytes < required_free_bytes
+
+    def _upscale_tiled_to_cpu(
+        self,
+        img_t: torch.Tensor,
+        tile_size: int = _REALESRGAN_TILE_SIZE,
+        tile_pad: int = _REALESRGAN_TILE_PAD,
+    ) -> torch.Tensor:
+        _, channels, h, w = img_t.shape
+        scale = self.scale
+        output = torch.empty(
+            (1, channels, h * scale, w * scale),
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+        for y in range(0, h, tile_size):
+            tile_h = min(tile_size, h - y)
+            in_y0 = max(y - tile_pad, 0)
+            in_y1 = min(y + tile_h + tile_pad, h)
+            out_y0 = y * scale
+            out_y1 = (y + tile_h) * scale
+            crop_y0 = (y - in_y0) * scale
+            crop_y1 = crop_y0 + tile_h * scale
+
+            for x in range(0, w, tile_size):
+                tile_w = min(tile_size, w - x)
+                in_x0 = max(x - tile_pad, 0)
+                in_x1 = min(x + tile_w + tile_pad, w)
+                out_x0 = x * scale
+                out_x1 = (x + tile_w) * scale
+                crop_x0 = (x - in_x0) * scale
+                crop_x1 = crop_x0 + tile_w * scale
+
+                tile = img_t[..., in_y0:in_y1, in_x0:in_x1]
+                out_tile = self.net(tile)
+                out_tile = out_tile[..., crop_y0:crop_y1, crop_x0:crop_x1].float()
+                output[..., out_y0:out_y1, out_x0:out_x1].copy_(out_tile.cpu())
+
+        return output
+
     def upscale(self, frame: np.ndarray, outscale: float | None = None) -> np.ndarray:
         """Upscale a single HWC uint8 frame → HWC uint8 frame.
 
@@ -276,9 +333,34 @@ class UpscalerModel:
         """
         h, w = frame.shape[:2]
         img = frame.astype(np.float32) / 255.0
-        img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img_t = (
+            torch.from_numpy(img)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.dtype)
+        )
         with torch.no_grad():
-            out = self.net(img_t)
+            if self._should_use_tiled_upscale(h, w):
+                logger.info(
+                    "Using tiled Real-ESRGAN upscale for low GPU memory: "
+                    "frame=%dx%d, tile_size=%d, tile_pad=%d",
+                    w,
+                    h,
+                    _REALESRGAN_TILE_SIZE,
+                    _REALESRGAN_TILE_PAD,
+                )
+                out = self._upscale_tiled_to_cpu(img_t)
+            else:
+                try:
+                    out = self.net(img_t)
+                except torch.cuda.OutOfMemoryError:
+                    if self.device.type != "cuda":
+                        raise
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        "Real-ESRGAN full-frame upscale OOM; retrying with tiled upscale"
+                    )
+                    out = self._upscale_tiled_to_cpu(img_t)
 
         # If the desired outscale differs from the model's native scale,
         # resize to (h * outscale, w * outscale).

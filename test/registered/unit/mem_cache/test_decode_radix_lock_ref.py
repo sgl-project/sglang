@@ -22,7 +22,7 @@ Usage:
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
@@ -333,7 +333,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
-        scheduler.stream_output = MagicMock()
+        scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
         # Initial budget says the request fits; post-lock budget says it does not.
