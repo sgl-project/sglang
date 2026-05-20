@@ -368,7 +368,7 @@ def _plan_offsets_kernel(
     # Seed slot per req. prefix_lens == 0 means no prefix → -1 sentinel. Padding row → no write contribution
     # → -1 sentinel either way; we also mask write_lens onto seed below to match the ref's "no write → -1".
     safe_prefix_pos = tl.where(prefix_lens > 0, prefix_lens - 1, 0)
-    stride_i64 = req_to_token_stride0.to(tl.int64)
+    stride_i64 = req_to_token_stride0
     seed_full = tl.load(
         req_to_token_ptr + rpi.to(tl.int64) * stride_i64 + safe_prefix_pos.to(tl.int64),
         mask=has_prefix,
@@ -490,7 +490,7 @@ def _plan_entries_kernel(
 
     positions = window_start + j_offs
     rpi_i64 = rpi.to(tl.int64)
-    stride_i64 = req_to_token_stride0.to(tl.int64)
+    stride_i64 = req_to_token_stride0
     positions_i64 = positions.to(tl.int64)
 
     slot_full = tl.load(
