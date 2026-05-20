@@ -154,8 +154,6 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
-        with runner.with_forward_pass(fb):
-            runner.launch_head_kernels(fb)
 
         sweep_calls: List[int] = []
         real_maybe = runner._sweep_orchestrator.maybe_run_sweep
