@@ -135,7 +135,7 @@ class _OracleSampler(Sampler):
     Uses req_pool_indices[r] as req_id (matches fill_expected_inputs row -> req mapping
     so both sampler and canary write_step see identical (req_id, position) pairs) and the
     forward positions tensor as the per-row position. req_pool_indices is stashed by
-    fill_expected_inputs into module-level _LAST_REQ_POOL_INDICES at forward_step_before_model.
+    fill_expected_inputs into module-level _LAST_REQ_POOL_INDICES during canary's before_forward.
     """
 
     def forward(

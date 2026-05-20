@@ -144,7 +144,6 @@ class PerturbHook:
             return []
         slot_tensor, _, _ = walk_radix_cache_for_canary(
             radix_cache=owner._radix_cache,
-            alive_running_req_pool_indices=set(),
         )
         if slot_tensor.numel() == 0:
             return []
@@ -165,13 +164,8 @@ class PerturbHook:
         excluded: set[int],
     ) -> list[int]:
         owner = self._owner
-        snapshot = owner._sweep._alive_reqs_snapshot
-        if snapshot is not None:
-            req_pool_indices = snapshot.req_pool_indices
-            seq_lens = snapshot.seq_lens
-        else:
-            req_pool_indices = forward_batch.req_pool_indices
-            seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
         if req_pool_indices is None or seq_lens is None:
             return []
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 import functools
 import logging
 from dataclasses import dataclass
@@ -10,7 +9,6 @@ import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -20,37 +18,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY: int = 1_000_000
-
-_INSIDE_REPLAY: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "kv_canary_inside_replay", default=False
-)
-_REPLAY_CLASS_PATCHED_ATTR = "_kv_canary_replay_class_patched"
-_OPTIONAL_GRAPH_RUNNER_CLASSES: tuple[tuple[str, str], ...] = (
-    (
-        "sglang.srt.speculative.eagle_draft_cuda_graph_runner",
-        "EAGLEDraftCudaGraphRunner",
-    ),
-    (
-        "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner",
-        "EAGLEDraftExtendCudaGraphRunner",
-    ),
-    (
-        "sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner",
-        "MultiLayerEagleDraftExtendCudaGraphRunner",
-    ),
-    (
-        "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner",
-        "FrozenKVMTPCudaGraphRunner",
-    ),
-    (
-        "sglang.srt.model_executor.piecewise_cuda_graph_runner",
-        "PiecewiseCudaGraphRunner",
-    ),
-    (
-        "sglang.srt.model_executor.breakable_cuda_graph_runner",
-        "BreakableCudaGraphRunner",
-    ),
-)
 
 
 def install_canary(
@@ -64,8 +31,21 @@ def install_canary(
     2. For each KV pool on model_runner (token_to_kv_pool + any aux pools): attach_canary_buffers.
     3. Build CanaryEndpoint tuples per pool.
     4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
-    5. Construct CanaryRunner and stash on model_runner.canary_runner.
-    6. Monkeypatch ModelRunner.forward to call runner.forward_step(forward_batch) wrapping the original.
+    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers) and
+       stash on model_runner.canary_runner.
+    6. Monkeypatch the model nn.Module's `.forward` to bracket the original with
+       `canary_runner.launch_head_kernels(forward_batch)` + `canary_runner.launch_tail_kernels(
+       forward_batch)`. These two calls run kernel launches only — they execute inside cuda graph
+       capture region and therefore get captured into the graph, auto-replaying every step.
+
+    NO patching of CudaGraphRunner / EAGLEDraftCudaGraphRunner / PiecewiseCudaGraphRunner /
+    BreakableCudaGraphRunner / any speculative graph runner subclass.
+
+    The host-side hooks `canary_runner.before_forward(forward_batch)` (perturb + plan-input fill)
+    and `canary_runner.end_of_step()` (sweep + D2H pump + allreduce + raise) are NOT installed
+    by install_canary. They are invoked by explicit source-level call sites in
+    `ModelRunner.forward` — one call right before the `graph_runner.replay() / model.forward()`
+    branch, one call right after it returns.
 
     Idempotent: second call on the same model_runner is an error.
     """
@@ -103,7 +83,6 @@ def install_canary(
     model_runner.canary_runner = runner
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
-    _patch_cuda_graph_runner_replay_class_method()
 
     logger.info(
         "install_canary: mode=%s tags=%d sweep_cadence=%d",
@@ -194,65 +173,12 @@ def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -
         if forward_batch is None:
             return original_forward(*args, **kwargs)
 
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return original_forward(*args, **kwargs)
-
-        if _INSIDE_REPLAY.get():
-            return original_forward(*args, **kwargs)
-
-        runner.forward_step_before_model(forward_batch)
+        runner.launch_head_kernels(forward_batch)
         output = original_forward(*args, **kwargs)
-        runner.forward_step_after_model()
-        runner.end_of_step()
+        runner.launch_tail_kernels(forward_batch)
         return output
 
     model.forward = patched_model_forward
-
-
-def _patch_cuda_graph_runner_replay_class_method() -> None:
-    classes_to_patch: list[type] = [CudaGraphRunner]
-    for module_path, class_name in _OPTIONAL_GRAPH_RUNNER_CLASSES:
-        optional_cls = _try_import_class(module_path, class_name)
-        if optional_cls is not None:
-            classes_to_patch.append(optional_cls)
-
-    for cls in classes_to_patch:
-        _patch_graph_runner_class_replay(cls)
-
-
-def _try_import_class(module_path: str, class_name: str) -> Optional[type]:
-    try:
-        module = __import__(module_path, fromlist=[class_name])
-    except ImportError:
-        logger.debug("kv-canary: %s not available; skipping", class_name)
-        return None
-    return getattr(module, class_name, None)
-
-
-def _patch_graph_runner_class_replay(cls: type) -> None:
-    if getattr(cls, _REPLAY_CLASS_PATCHED_ATTR, False):
-        return
-
-    original_replay = cls.replay
-
-    @functools.wraps(original_replay)
-    def patched_replay(self, forward_batch, *args, **kwargs):
-        runner = get_canary_runner(self.model_runner)
-        if runner is None or runner.config.mode == "off":
-            return original_replay(self, forward_batch, *args, **kwargs)
-
-        runner.forward_step_before_model(forward_batch)
-        token = _INSIDE_REPLAY.set(True)
-        try:
-            output = original_replay(self, forward_batch, *args, **kwargs)
-        finally:
-            _INSIDE_REPLAY.reset(token)
-        runner.forward_step_after_model()
-        runner.end_of_step()
-        return output
-
-    cls.replay = patched_replay
-    setattr(cls, _REPLAY_CLASS_PATCHED_ATTR, True)
 
 
 def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:

@@ -108,8 +108,9 @@ def test_per_forward_orchestrates_plan_head_tail(device, monkeypatch):
 
     runner = _make_runner(device=device)
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
-    runner.forward_step_after_model()
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
+    runner.launch_tail_kernels(fb)
 
     assert calls[0] == "plan"
     assert any(
@@ -130,7 +131,8 @@ def test_sweep_every_n_cadence(device, monkeypatch):
     )
     runner = _make_runner(device=device, config=config)
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
 
     sweep_calls: List[int] = []
     real_maybe = runner.maybe_run_sweep
@@ -148,7 +150,7 @@ def test_sweep_every_n_cadence(device, monkeypatch):
     assert sweep_calls == [0, 4, 8]
 
 
-def test_sweep_runs_both_running_and_radix_orphan(
+def test_sweep_runs_radix_path(
     device, monkeypatch, make_radix_cache, make_req_to_token_pool
 ):
     _stub_plan_and_kernels(monkeypatch)
@@ -160,7 +162,8 @@ def test_sweep_runs_both_running_and_radix_orphan(
     )
     runner = _make_runner(device=device, config=config)
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
 
     cache = make_radix_cache([[], [10, 11]])
     cache.req_to_token_pool = make_req_to_token_pool()
@@ -173,7 +176,7 @@ def test_sweep_runs_both_running_and_radix_orphan(
         lambda **kwargs: plan_calls.append("plan"),
     )
     runner.maybe_run_sweep()
-    assert plan_calls.count("plan") >= 2
+    assert plan_calls.count("plan") >= 1
 
 
 def test_violation_pump_d2h_detects_errored(device, monkeypatch):
@@ -233,8 +236,9 @@ def test_runner_disabled_short_circuits(device, monkeypatch):
         lambda **kwargs: plan_calls.append("plan"),
     )
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
-    runner.forward_step_after_model()
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
+    runner.launch_tail_kernels(fb)
     runner.maybe_run_sweep()
     runner.end_of_step()
     assert plan_calls == []
@@ -290,8 +294,9 @@ def test_per_forward_launches_both_head_and_tail(device, monkeypatch):
     monkeypatch.setattr(endpoint_module, "canary_write_step", lambda **kwargs: None)
 
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
-    runner.forward_step_after_model()
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
+    runner.launch_tail_kernels(fb)
     assert any("HEAD" in name for name in counters)
     assert any("TAIL" in name for name in counters)
 
@@ -308,7 +313,8 @@ def test_sweep_path_detects_chain_mismatch(
     )
     runner = _make_runner(device=device, config=config)
     fb = _make_forward_batch(device)
-    runner.forward_step_before_model(fb)
+    runner.before_forward(fb)
+    runner.launch_head_kernels(fb)
 
     cache = make_radix_cache([[], [10, 11, 12]])
     cache.req_to_token_pool = make_req_to_token_pool()

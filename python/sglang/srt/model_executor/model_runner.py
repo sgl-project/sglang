@@ -3140,6 +3140,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+        canary_runner = getattr(self, "canary_runner", None)
+
         with (
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
@@ -3147,6 +3149,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if canary_runner is not None:
+                canary_runner.before_forward(forward_batch)
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3154,6 +3158,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if canary_runner is not None:
+                canary_runner.end_of_step()
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

@@ -14,10 +14,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.plan_input import (
-    AliveReqSnapshot,
-    PlanInput,
-)
+from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import (
@@ -50,7 +47,9 @@ class CanaryRunner:
         endpoints_per_pool: tuple[tuple[CanaryEndpoint, ...], ...]  # one tuple per pool
         verify_plan_per_forward / write_plan_per_forward: VerifyPlan / WritePlan sized for per-forward
             capacity (= max_batch_size × max_seq_len for verify, max_batch_size for write).
-        verify_plan_sweep / write_plan_sweep: sized for sweep capacity (= total pool slots).
+        plan_input_per_forward: PlanInput with STATIC per-forward fb_* buffers (allocated once,
+            mutated in place by before_forward each step).
+        verify_plan_sweep_radix / write_plan_sweep: sized for sweep capacity (= total pool slots).
         step_counter: int, host-side, bumped per forward.
         last_sweep_step: int, host-side.
     """
@@ -160,41 +159,28 @@ class CanaryRunner:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
-    def set_alive_reqs_snapshot(self, snapshot: Optional[AliveReqSnapshot]) -> None:
-        """Bind the running-reqs snapshot used for sweep coverage.
-
-        Scheduler should call this every step (or whenever the alive set changes) so sweep covers
-        all alive running reqs (including paused) per SOT §4.1. None clears the snapshot; the
-        runner then falls back to deriving it from forward_batch (degraded coverage).
+    def before_forward(self, forward_batch: "ForwardBatch") -> None:
+        """Host-side prep (perturb + plan-input fill). Caller is ``ModelRunner.forward`` — runs
+        OUTSIDE the cuda-graph capture region.
         """
-        self._sweep.set_alive_reqs_snapshot(snapshot)
+        self._per_forward.before_forward(forward_batch)
 
-    def forward_step_before_model(self, forward_batch: "ForwardBatch") -> None:
-        """SOT §6.2 step 1: perturb hook + plan + head launches. Stashes plan for the tail launches."""
-        self._per_forward.forward_step_before_model(forward_batch)
-
-    def forward_step_after_model(self) -> None:
-        """SOT §6.2 step 3: tail launches reusing the plan stashed by forward_step_before_model."""
-        self._per_forward.forward_step_after_model()
-
-    def forward_step(
-        self,
-        forward_batch: "ForwardBatch",
-        run_model: Callable[[], object],
-    ) -> object:
-        """Convenience wrapper: head launches -> run_model() -> tail launches -> end_of_step.
-
-        SOT §6.2 sequence. Callers that need finer control (e.g. cuda-graph replay) should call
-        forward_step_before_model / forward_step_after_model / end_of_step explicitly.
+    def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
+        """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
+        ``model.forward`` — kernels here are captured into the cuda graph.
         """
-        self.forward_step_before_model(forward_batch)
-        output = run_model()
-        self.forward_step_after_model()
-        self.end_of_step()
-        return output
+        self._per_forward.launch_head_kernels(forward_batch)
+
+    def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
+        """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
+        self._per_forward.launch_tail_kernels(forward_batch)
 
     def end_of_step(self) -> None:
-        """SOT §6.4: sweep + async D2H pump + step bump + drain previous pump + allreduce + raise."""
+        """Sweep + async D2H pump + step bump + drain previous pump + allreduce + raise.
+
+        Host-side, runs in ``ModelRunner.forward`` AFTER ``graph_runner.replay()`` /
+        ``model.forward()`` returns.
+        """
         if self.config.mode == "off":
             return
 
