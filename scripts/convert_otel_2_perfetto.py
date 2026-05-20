@@ -122,6 +122,74 @@ def __find_line(graph, trans_graph_status, slot_meta_data, pid, start, end):
 
 OtelSpan = Dict[str, Any]
 
+# ---------------------------------------------------------------------------
+# HiCache module: virtual thread mapping for spans without parent hierarchy
+# ---------------------------------------------------------------------------
+
+
+def _is_hicache_span(span):
+    """Check if a span belongs to the hicache module by its module attribute."""
+    return span.get("attributes", {}).get("module") == "sglang::hicache"
+
+
+def _build_hicache_span_tree(hicache_spans):
+    """Build a virtual root→thread→slice tree for hicache spans.
+
+    HiCache spans are top-level (no parent-child nesting), so they don't
+    fit the root→thread→slice hierarchy expected by the perfetto converter.
+    This function creates virtual root and thread spans to contain them:
+      - Virtual root:  "hicache"
+      - Virtual threads: one per unique pid (each hicache thread has its own pid)
+      - Slices:        the actual hicache operation spans
+
+    Since hicache_trace sets module/pid/host_id/tp_rank/dp_rank/pp_rank on
+    every span, virtual thread attributes are inherited from the first child.
+    Spans are grouped by their actual pid so that each background thread
+    (scheduler, backup, prefetch, io_aux) lands on its own row.
+    """
+    if not hicache_spans:
+        return []
+
+    # Group by actual pid — each pid is one hicache thread
+    pid_groups = defaultdict(list)
+    for span in hicache_spans:
+        pid = span.get("attributes", {}).get("pid", 0)
+        pid_groups[pid].append(span)
+
+    root_span = {
+        "name": "hicache",
+        "spanId": "hicache_virtual_root",
+        "startTimeUnixNano": "0",
+        "endTimeUnixNano": "0",
+        "attributes": {"module": "sglang::hicache"},
+        "child": [],
+    }
+
+    for pid, spans in pid_groups.items():
+        # Inherit all thread-level attrs from the first child span
+        first_attrs = spans[0].get("attributes", {})
+        thread_attrs = {
+            "pid": pid,
+            "host_id": first_attrs.get("host_id", "hicache"),
+            "thread_label": first_attrs.get("thread_label", "hicache"),
+        }
+        for rank_key in ("tp_rank", "dp_rank", "pp_rank"):
+            if rank_key in first_attrs:
+                thread_attrs[rank_key] = first_attrs[rank_key]
+
+        thread_span = {
+            "name": f"hicache::{thread_attrs['thread_label']}",
+            "spanId": f"hicache_virtual_thread_{pid}",
+            "parentSpanId": "hicache_virtual_root",
+            "startTimeUnixNano": "0",
+            "endTimeUnixNano": "0",
+            "attributes": thread_attrs,
+            "child": spans,
+        }
+        root_span["child"].append(thread_span)
+
+    return [root_span]
+
 
 def load_otel_data(path: str | Path):
     p = Path(path)
@@ -175,11 +243,15 @@ def build_otel_span_tree(otel_spans):
         span["child"] = []
 
     root_spans = []
+    hicache_spans = []
 
     for span in otel_spans:
         parent_span_id = span.get("parentSpanId", "")
-        if span.get("attributes", {}).get("module") == "sglang::request":
+        module_name = span.get("attributes", {}).get("module", "")
+        if module_name == "sglang::request" or module_name == "sglang::mooncake":
             root_spans.append(span)
+        elif _is_hicache_span(span):
+            hicache_spans.append(span)
         elif parent_span_id in span_id_map:
             parent_span = span_id_map[parent_span_id]
             parent_span["child"].append(span)
@@ -191,6 +263,9 @@ def build_otel_span_tree(otel_spans):
                 if link_span:
                     link_spans.append(link_span)
             span["links"] = link_spans
+
+    # Build hicache virtual tree and add to root_spans
+    root_spans.extend(_build_hicache_span_tree(hicache_spans))
 
     return root_spans
 
@@ -208,6 +283,9 @@ def __convert_to_perfetto_span(span, rid, bootstrap_room, pid, host_id):
     span["endTimeUnixNano"] = int(span["endTimeUnixNano"]) - 1000
     ts = span["startTimeUnixNano"]
     dur = span["endTimeUnixNano"] - ts
+    if dur <= 0:
+        dur = 1000  # minimum 1μs for visibility (e.g. hicache instant spans)
+        span["endTimeUnixNano"] = ts + 1000
 
     perfetto_span = {
         "ph": "X",
@@ -230,7 +308,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
     for root_span in engine_root_spans:
         root_span["spans"] = []
 
-        rid = root_span["attributes"]["rid"]
+        rid = root_span["attributes"].get("rid", "")
         bootstrap_room = root_span["attributes"].get("bootstrap_room", "")
 
         for thread_span in root_span["child"]:
@@ -255,6 +333,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
     thread_meta_data[smg_pid] = new_metadata_level1("smg", smg_pid)
     for span in smg_otel_spans:
         span["pid"] = smg_pid
+        span["child"] = []
         __convert_to_perfetto_span(span, None, None, smg_pid, None)
 
 

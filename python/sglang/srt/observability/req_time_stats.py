@@ -18,10 +18,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.base_prefix_cache import EvictResult, MatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -87,12 +89,15 @@ class RequestStageConfig:
             1 = leaf stages (atomic operations, e.g. TOKENIZE, PREFILL_FORWARD),
             2 = parent/dispatch stages (e.g. API_SERVER_DISPATCH, REQUEST_PROCESS),
             3 = composite/nested stages (e.g. DECODE_LOOP, PREFILL_CHUNKED_FORWARD).
+            4 = more fine-grained stages for debugging (e.g. MATCH_PREFIX, L2_CACHE_LOAD).
         metrics_is_observed: Whether to call metrics_collector.observe_per_stage_req_latency.
     """
 
     stage_name: str
     level: int = 0
     metrics_is_observed: bool = False
+    # Explicitly specify parent stages
+    dependences: Optional[List[RequestStageConfig]] = None
 
 
 class RequestStage:
@@ -141,6 +146,10 @@ class RequestStage:
         "chunked_prefill",
         level=3,
         metrics_is_observed=True,
+    )
+    PREFILL_FINAL_FORWARD = RequestStageConfig(
+        "prefill_final_forward",
+        level=3,
     )
 
     # disaggregation prefill
@@ -211,6 +220,32 @@ class RequestStage:
     RUN_BATCH_CPU = RequestStageConfig(
         "run_batch_cpu",
         level=4,
+    )
+
+    # hicache
+    MATCH_PREFIX = RequestStageConfig(
+        "match_prefix",
+        level=4,
+        dependences=[PREFILL_WAITING],
+    )
+    L2_CACHE_LOAD = RequestStageConfig(
+        "l2_cache_load_back",
+        level=4,
+        dependences=[PREFILL_WAITING],
+    )
+    L2_CACHE_EVICT = RequestStageConfig(
+        "l2_cache_evict",
+        level=4,
+        dependences=[PREFILL_FINAL_FORWARD, PREFILL_CHUNKED_FORWARD],
+    )
+    L3_CACHE_PREFETCH = RequestStageConfig(
+        "l3_cache_prefetch",
+        level=3,
+        dependences=[PREFILL_WAITING],
+    )
+    L3_CACHE_PUT = RequestStageConfig(
+        "l3_cache_put",
+        level=3,
     )
 
     # other
@@ -298,8 +333,23 @@ class ReqTimeStatsBase:
                 end_time_ns=convert_time_to_realtime_ns(end_time),
                 level=stage.level,
                 attrs=attrs,
+                dependencies=(
+                    None
+                    if stage.dependences is None
+                    else [s.stage_name for s in stage.dependences]
+                ),
             )
             self.trace_ctx.trace_slice(_slice)
+
+    @contextmanager
+    def trace_blk(self, stage: RequestStageConfig, attrs: Optional[Dict] = None):
+        if self.trace_ctx.tracing_enable:
+            start_time = time.perf_counter()
+            yield
+            end_time = time.perf_counter()
+            self.trace_slice(stage, start_time, end_time, attrs)
+        else:
+            yield
 
     def __getstate__(self) -> object:
         # The object is propagated to other processes via serialization and deserialization methods,
@@ -554,6 +604,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # bootstrap sub-phase tracking (PD disagg)
     bootstrap_done_time: float = 0.0
 
+    # hicache
+    l3_prefetch_start_time: float = 0.0
+    l3_prefetch_finish_time: float = 0.0
+
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
@@ -745,12 +799,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)
 
             if self.trace_ctx.tracing_enable:
-                if self.last_chunked_prefill_finish_time > 0:
-                    self.trace_slice(
-                        RequestStage.PREFILL_CHUNKED_FORWARD,
-                        self.last_chunked_prefill_finish_time,
-                        ts,
-                    )
+                chunked_prefill_start_ts = self.last_chunked_prefill_finish_time
+                if self.last_chunked_prefill_finish_time == 0.0:
+                    chunked_prefill_start_ts = self.last_forward_entry_time
+                self.trace_slice(
+                    RequestStage.PREFILL_FINAL_FORWARD,
+                    chunked_prefill_start_ts,
+                    ts,
+                )
 
                 self.trace_ctx.trace_slice_end(
                     stage.stage_name, stage.level, convert_time_to_realtime_ns(ts)
@@ -767,16 +823,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         elif self.last_prefill_finished_time == 0.0:
             # retract
             self.last_prefill_finished_time = ts
-            if self.last_chunked_prefill_finish_time > 0:
-                self.trace_slice(
-                    RequestStage.PREFILL_CHUNKED_FORWARD,
-                    self.last_chunked_prefill_finish_time,
-                    ts,
-                )
-            else:
-                self.trace_slice(
-                    RequestStage.PREFILL_FORWARD, self.last_forward_entry_time, ts
-                )
+            chunked_prefill_start_ts = self.last_chunked_prefill_finish_time
+            if self.last_chunked_prefill_finish_time == 0.0:
+                chunked_prefill_start_ts = self.last_forward_entry_time
+            self.trace_slice(
+                RequestStage.PREFILL_FINAL_FORWARD,
+                chunked_prefill_start_ts,
+                ts,
+            )
 
     def set_last_decode_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -971,6 +1025,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)
         self.trace_slice(stage, self.last_forward_entry_time, ts)
 
+    def set_l3_cache_prefetch_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.l3_prefetch_start_time = ts
+
+    def set_l3_cache_prefetch_finish_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.l3_prefetch_finish_time = ts
+
+        if self.trace_ctx.tracing_enable:
+            if self.l3_prefetch_start_time != 0.0:
+                start_ts = self.l3_prefetch_start_time
+                if self.l3_prefetch_start_time < self.wait_queue_entry_time:
+                    start_ts = self.wait_queue_entry_time
+                rid = getattr(self.trace_ctx, "rid", "")
+                attrs = {"hicache.rid": rid} if rid else None
+                self.trace_slice(
+                    RequestStage.L3_CACHE_PREFETCH,
+                    start_ts,
+                    self.l3_prefetch_finish_time,
+                    attrs=attrs,
+                )
+
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
@@ -1121,6 +1197,23 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def format_wallclock(perf_counter_time: float) -> str:
         return f"{convert_time_to_realtime(perf_counter_time):.3f}"
 
+    def trace_hicache_match_prefix(self, match_result: MatchResult, start_ts):
+        if not self.trace_ctx.tracing_enable:
+            return
+
+        end_ts = time.perf_counter()
+        attrs = {"host_hit_length": match_result.host_hit_length}
+
+        self.trace_slice(RequestStage.MATCH_PREFIX, start_ts, end_ts, attrs)
+
+    def trace_hicache_load_back(self, host_hit_length: int, start_ts: float):
+        if not self.trace_ctx.tracing_enable:
+            return
+
+        end_ts = time.perf_counter()
+        attrs = {"host_hit_length": host_hit_length}
+        self.trace_slice(RequestStage.L2_CACHE_LOAD, start_ts, end_ts, attrs)
+
 
 def set_schedule_time_batch(batch: ScheduleBatch):
     # only for tracing
@@ -1159,3 +1252,35 @@ def set_time_batch(
             method(ts)
         else:
             method(ts, attrs)
+
+
+def trace_kv_cache_eviction_batch(
+    reqs: Optional[List[Any]],
+    evict_result: Optional[EvictResult],
+    start_ts: float,
+):
+    """Trace KV cache eviction event for a batch of requests."""
+    if not get_global_tracing_enabled():
+        return
+
+    if not evict_result:
+        return
+
+    if reqs is None or len(reqs) == 0:
+        return
+
+    end_ts = time.perf_counter()
+    attrs = {
+        "num_tokens_evicted": evict_result.num_tokens_evicted,
+        "swa_num_tokens_evicted": evict_result.swa_num_tokens_evicted,
+        "mamba_num_evicted": evict_result.mamba_num_evicted,
+    }
+
+    for req in reqs:
+        if req.time_stats.trace_ctx.tracing_enable:
+            req.time_stats.trace_slice(
+                RequestStage.L2_CACHE_EVICT,
+                start_ts,
+                end_ts,
+                attrs=attrs,
+            )
