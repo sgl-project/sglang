@@ -3,7 +3,7 @@
 
 //! Cache-aware-ZMQ selection policy.
 //!
-//! Combines the M3 KV-event-fed [`HashTree`] with active-load scoring and
+//! Combines the KV-event-fed [`HashTree`] with active-load scoring and
 //! tokenizer-driven block-hash lookup to pick the worker most likely to
 //! already hold the request's prefix in its KV cache.
 //!
@@ -47,7 +47,7 @@ use std::sync::Arc;
 /// doesn't have useful signal.
 pub struct CacheAwareZmqPolicy {
     config: CacheAwareConfig,
-    /// Per-process KV-event hash tree, fed by the M3 indexer. Cheap to
+    /// Per-process KV-event hash tree, fed by the indexer. Cheap to
     /// clone an `Arc`; we never write to the tree from here.
     tree: Arc<HashTree>,
     /// Tokenizer registry — selection reads `model_id` from the context

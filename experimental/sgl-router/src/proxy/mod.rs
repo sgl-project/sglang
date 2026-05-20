@@ -159,11 +159,10 @@ impl Proxy {
     /// pump task and held for the entire body lifetime (headers → last byte
     /// / client disconnect).  The proxy does not inspect the boxed value; it
     /// relies entirely on `Drop` semantics, so callers typically pack
-    /// `(LoadGuard, ActiveLoadGuard)` here. This keeps both the M2 per-worker
-    /// `active_requests` counter and the M4 per-request active-load entry
-    /// alive for the full streaming lifetime — without which a long-running
-    /// SSE response would under-report load (M2 LoadGuard had been threaded
-    /// since M2; the M4 ActiveLoadGuard is new in this commit).
+    /// `(LoadGuard, ActiveLoadGuard)` here. This keeps both the per-worker
+    /// `active_requests` counter and the per-request active-load entry alive
+    /// for the full streaming lifetime — without which a long-running SSE
+    /// response would under-report load.
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,

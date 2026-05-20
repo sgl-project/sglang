@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! M4 PD pool isolation — end-to-end at the HTTP layer using MockWorker.
+//! PD pool isolation — end-to-end at the HTTP layer using MockWorker.
 //!
 //! Drives the chat handler with:
 //!
@@ -15,8 +15,6 @@
 //! * A PD-disagg model with both pools healthy → request flows to the
 //!   prefill worker (smoke; the decode worker MUST NOT be selected for
 //!   the chat route).
-
-mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -93,7 +91,7 @@ fn chat_request() -> Request<Body> {
 /// dispatch, so a decode-only pool means partial failure.
 #[tokio::test]
 async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
-    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
         id: WorkerId("d1".into()),
         url: worker.url.clone(),
@@ -144,8 +142,8 @@ async fn no_workers_returns_no_healthy_workers() {
 /// Here we only assert the HTTP-layer wiring of the dual dispatch.
 #[tokio::test]
 async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
-    let prefill = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -209,8 +207,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
 /// Task C: PD-mode chat request carries an `x-sgl-decode-url` header
 /// pointing at the host-affinity decode peer. With two prefill workers
 /// on different hosts and a decode worker on each, the affinity helper
-/// MUST pick the decode peer co-located with the chosen prefill — pin
-/// the structural prep for M5's bootstrap dispatch.
+/// MUST pick the decode peer co-located with the chosen prefill.
 ///
 /// Round-robin will select prefill workers deterministically (alphabetic
 /// dashmap order is not guaranteed; the test fires several requests so
@@ -219,10 +216,10 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
 #[tokio::test]
 async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
     use std::collections::HashSet;
-    let prefill_a = common::mock_worker::MockWorker::start(vec![]).await;
-    let prefill_b = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode_a = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode_b = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
     // MockWorker URLs always bind to `127.0.0.1`, so every worker
     // shares the same host string and the affinity helper's
     // same-host branch is moot here — the helper still returns a
@@ -303,7 +300,7 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
 /// bootstrap nonexistent decode peers.
 #[tokio::test]
 async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
-    let plain = common::mock_worker::MockWorker::start(vec![]).await;
+    let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
         id: WorkerId("w1".into()),
         url: plain.url.clone(),
@@ -329,7 +326,7 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
 /// distinct from the existing `no_prefill_workers_available` path.
 #[tokio::test]
 async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
-    let prefill = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
         id: WorkerId("p1".into()),
         url: prefill.url.clone(),
@@ -354,9 +351,9 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
 #[tokio::test]
 async fn pd_mode_chat_response_carries_decode_affinity_header() {
     use std::collections::HashSet;
-    let prefill = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode_a = common::mock_worker::MockWorker::start(vec![]).await;
-    let decode_b = common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -409,7 +406,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
 /// response-side mirror is gated on PD-mode dispatch.
 #[tokio::test]
 async fn plain_mode_chat_response_omits_decode_affinity_header() {
-    let plain = common::mock_worker::MockWorker::start(vec![]).await;
+    let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
         id: WorkerId("w1".into()),
         url: plain.url.clone(),

@@ -94,8 +94,8 @@ class WorkerInfo:
 
     Mirrors SMG's WorkerInfo shape so test code reads the same. sgl-router
     does not currently surface a `/v1/workers` admin API — this is a
-    placeholder for the M5 surface; M4 tests scrape `/metrics` for
-    per-worker observability instead.
+    placeholder for a future admin surface; current tests scrape
+    `/metrics` for per-worker observability instead.
     """
 
     id: str

@@ -39,7 +39,7 @@ use tokio_stream::wrappers::ReceiverStream;
 /// and held for the entire body lifetime.  It is dropped only when the SSE
 /// pump finishes (stream exhausted, client disconnects, or upstream errors).
 /// The opaque `Box<dyn Send + 'static>` accepts any drop-only payload — most
-/// commonly a tuple of the M2 [`crate::workers::LoadGuard`] and the M4
+/// commonly a tuple of [`crate::workers::LoadGuard`] and
 /// [`crate::policies::active_load::ActiveLoadGuard`]. The proxy does not
 /// inspect the value; it relies entirely on `Drop` semantics, so callers can
 /// pack arbitrary cleanup state in. Pass `None` for callers that manage the

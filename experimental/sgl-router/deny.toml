@@ -6,7 +6,7 @@ yanked = "warn"
 # Unmaintained advisories are demoted to warnings: the affected crates
 # (unic-*, paste, number_prefix) are all transitive through dynamo-parsers
 # and have no available upgrades.  They pose no security risk; revisit
-# when dynamo-parsers feature-flags rustpython-parser off upstream (M5).
+# if/when dynamo-parsers feature-flags rustpython-parser off upstream.
 unmaintained = "none"
 # `ignore` left empty — we want to be notified of new CVEs.
 ignore = []
@@ -24,7 +24,7 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
-    # Both added per M0 license review:
+    # Both added per the initial license review:
     "NCSA",                 # libfuzzer-sys (transitive via rav1e) — BSD-equivalent permissive.
     "CDLA-Permissive-2.0",  # webpki-roots — Linux Foundation permissive license.
 ]
@@ -37,8 +37,8 @@ confidence-threshold = 0.93
 #   can git-clone the repo, bump a malachite version, rebuild).
 # - The malachite-* crates are pure-Rust arbitrary-precision math, used
 #   four levels deep through dynamo-parsers → rustpython-parser → malachite-bigint.
-#   They are NOT on the routing hot path; dynamo-parsers itself is only
-#   wired into chat-completions in M5.
+#   They are NOT on the routing hot path; dynamo-parsers is only wired
+#   into chat-completions for tool-call parsing.
 # - Revisit if/when: (a) a regulated-enterprise customer objects, or
 #   (b) dynamo-parsers feature-flags rustpython-parser off upstream.
 [[licenses.exceptions]]

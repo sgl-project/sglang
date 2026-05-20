@@ -1,17 +1,16 @@
-# Pytest configuration for sgl-router e2e/.
-# Lives next to conftest.py so `pytest experimental/sgl-router/e2e/`
+# Pytest configuration for sgl-router tests/e2e/.
+# Lives next to conftest.py so `pytest experimental/sgl-router/tests/e2e/`
 # picks it up automatically.
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-# Default discovery: smoke tests (top-level test_*.py) and the new
-# multi-worker M4 acceptance / chat_completions suites. k8s_integration
-# is intentionally not in the default set — it requires a kind/k8s
-# cluster and is invoked explicitly.
+# Default discovery: smoke tests (top-level test_*.py) and the
+# multi-worker chat_completions suite. k8s_integration is intentionally
+# not in the default set — it requires a kind/k8s cluster and is
+# invoked explicitly.
 testpaths = [
     ".",
     "chat_completions",
-    "m4_acceptance",
 ]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]

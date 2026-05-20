@@ -4,14 +4,14 @@
 # Prerequisites: Docker, kind, kubectl
 #
 # Usage:
-#   ./e2e/k8s_integration/setup.sh           # full setup
-#   ./e2e/k8s_integration/setup.sh teardown  # delete the cluster
+#   ./tests/e2e/k8s_integration/setup.sh           # full setup
+#   ./tests/e2e/k8s_integration/setup.sh teardown  # delete the cluster
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"  # one level above experimental/sgl-router/
-SGL_ROUTER_DIR="${REPO_ROOT}/sgl-router"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"  # repo root (above experimental/)
+SGL_ROUTER_DIR="${REPO_ROOT}/experimental/sgl-router"
 CLUSTER_NAME="${CLUSTER:-sgl-router-kind}"
 NAMESPACE="${NAMESPACE:-sgl-router-test}"
 CONTEXT="kind-${CLUSTER_NAME}"
@@ -180,7 +180,7 @@ kubectl --context "${CONTEXT}" -n "${NAMESPACE}" rollout status deployment/sgl-r
 # ---------------------------------------------------------------------------
 log ""
 log "Setup complete! Run the integration tests with:"
-log "  pytest e2e/k8s_integration/ -v -s"
+log "  pytest tests/e2e/k8s_integration/ -v -s"
 log ""
 log "To tear down:"
-log "  ./e2e/k8s_integration/setup.sh teardown"
+log "  ./tests/e2e/k8s_integration/setup.sh teardown"

@@ -77,8 +77,7 @@ pub enum PdResolveError {
     /// Surfaced as 503 `no_prefill_workers_available`.
     NoPrefillWorkersAvailable,
     /// PD-mode deployment whose decode pool is empty.
-    /// Surfaced as 503 `no_decode_workers_available` (added alongside
-    /// `no_prefill_workers_available` in M4 carry-forward).
+    /// Surfaced as 503 `no_decode_workers_available`.
     NoDecodeWorkersAvailable,
 }
 

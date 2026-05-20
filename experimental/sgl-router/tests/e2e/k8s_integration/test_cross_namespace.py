@@ -9,7 +9,7 @@ This test deploys a separate router Deployment (sgl-router-cluster) with a
 ClusterRole that grants EndpointSlice access across all namespaces.
 
 Run with:
-    pytest e2e/k8s_integration/test_cross_namespace.py -v -s
+    pytest tests/e2e/k8s_integration/test_cross_namespace.py -v -s
 """
 
 from __future__ import annotations

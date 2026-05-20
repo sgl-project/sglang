@@ -2,9 +2,9 @@
 One-shot generator for tokenizer parity fixtures.
 
 Run manually when adding a model or changing a prompt shape:
-    python3 -m venv /tmp/m1-fixture-venv
-    /tmp/m1-fixture-venv/bin/pip install transformers
-    /tmp/m1-fixture-venv/bin/python experimental/sgl-router/tests/scripts/generate_parity_fixtures.py
+    python3 -m venv /tmp/parity-fixture-venv
+    /tmp/parity-fixture-venv/bin/pip install transformers
+    /tmp/parity-fixture-venv/bin/python experimental/sgl-router/tests/scripts/generate_parity_fixtures.py
 
 CI does NOT run this — it consumes the committed JSON.
 
