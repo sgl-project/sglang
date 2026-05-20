@@ -42,14 +42,14 @@ _METRICS_REQUEST_TIMEOUT = 10
 class FwdOccupancyMixin:
     """Assert steady-state ``sglang:fwd_occupancy`` for single-batch decode.
 
-    Threshold is a percentage in [0, 100]. Default is conservative for
-    overlap scheduler + cuda graph on a decent GPU; saturated multi-batch
-    decode on H100/H200 reaches 95+, so this kit's value lives in the
-    single-batch regime where CPU overhead dominates.
+    Threshold is a percentage in [0, 100]. Default 95.0 -- single-batch
+    decode with overlap scheduler + cuda graph on a healthy GPU should
+    hold steady-state 95+; falling below this points at CPU-side
+    regressions even when batched throughput still looks fine.
     """
 
     # Threshold + detection
-    fwd_occupancy_threshold: float = 80.0
+    fwd_occupancy_threshold: float = 95.0
     fwd_occupancy_min_samples: int = 5
     fwd_occupancy_scrape_interval: float = 0.5
 
