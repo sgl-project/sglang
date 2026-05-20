@@ -434,6 +434,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    load_snapshot_publish_interval: int = 10
     use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
@@ -4802,6 +4803,12 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+        parser.add_argument(
+            "--load-snapshot-publish-interval",
+            type=int,
+            default=ServerArgs.load_snapshot_publish_interval,
+            help="Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         )
         parser.add_argument(
             "--use-ray",

@@ -1128,8 +1128,6 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1192,9 +1190,6 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
-
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -1936,158 +1931,51 @@ class BlockReqInput(BaseReq):
 class MemoryMetrics:
     """Memory breakdown metrics."""
 
-    weight_gb: float = field(
-        metadata={"metric": ("gauge", "Model weight memory in GB")}
-    )
-    kv_cache_gb: float = field(metadata={"metric": ("gauge", "KV cache memory in GB")})
-    graph_gb: float = field(metadata={"metric": ("gauge", "CUDA graph memory in GB")})
-    token_capacity: int = field(
-        metadata={"metric": ("gauge", "Max tokens in KV cache")}
-    )
+    weight_gb: float
+    kv_cache_gb: float
+    graph_gb: float
+    token_capacity: int
 
 
 @dataclass
 class SpeculativeMetrics:
     """Speculative decoding metrics."""
 
-    accept_length: float = field(
-        metadata={
-            "metric": (
-                "gauge",
-                "Mean acceptance length (accepted drafts + bonus token per forward)",
-            )
-        }
-    )
-    accept_rate: float = field(
-        metadata={"metric": ("gauge", "Speculative acceptance rate")}
-    )
+    accept_length: float
+    accept_rate: float
 
 
 @dataclass
 class LoRAMetrics:
     """LoRA adapter pool metrics."""
 
-    slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
-    slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
-    utilization: float = field(
-        metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
-    )
+    slots_used: int
+    slots_total: int
+    utilization: float
 
 
 @dataclass
 class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
-    mode: str  # "prefill", "decode", or "null" - not a metric
-    prefill_bootstrap_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
-    )
-    prefill_inflight_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
-    )
-    decode_prealloc_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
-    )
-    decode_transfer_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
-    )
-    decode_retracted_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
-    )
-    kv_transfer_speed_gb_s: float = field(
-        default=0.0, metadata={"metric": ("gauge", "KV transfer speed in GB/s")}
-    )
-    kv_transfer_latency_ms: float = field(
-        default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
-    )
+    mode: str
+    prefill_bootstrap_queue_reqs: int = 0
+    prefill_inflight_queue_reqs: int = 0
+    decode_prealloc_queue_reqs: int = 0
+    decode_transfer_queue_reqs: int = 0
+    decode_retracted_queue_reqs: int = 0
+    kv_transfer_speed_gb_s: float = 0.0
+    kv_transfer_latency_ms: float = 0.0
 
 
 @dataclass
 class QueueMetrics:
     """Detailed queue breakdown."""
 
-    waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
-    grammar: int = field(
-        metadata={"metric": ("gauge", "Grammar compilation queue size")}
-    )
-    paused: int = field(
-        metadata={"metric": ("gauge", "Requests paused by weight sync")}
-    )
-    retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
-
-
-@dataclass
-class GetLoadsReqInput(BaseReq):
-    """Request for /v1/loads endpoint."""
-
-    VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
-    )
-
-    include: List[str] = field(default_factory=lambda: ["all"])
-    dp_rank: Optional[int] = None
-
-    def __post_init__(self):
-        """Validate include sections."""
-        if self.include:
-            invalid = set(self.include) - self.VALID_SECTIONS
-            if invalid:
-                raise ValueError(
-                    f"Invalid include sections: {invalid}. "
-                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
-                )
-
-
-@dataclass
-class GetLoadsReqOutput(BaseReq):
-    """Per-DP-rank load metrics for /v1/loads endpoint."""
-
-    dp_rank: int
-    timestamp: float
-
-    num_running_reqs: int = field(
-        metadata={"metric": ("gauge", "Number of running requests")}
-    )
-    num_waiting_reqs: int = field(
-        metadata={"metric": ("gauge", "Number of waiting requests")}
-    )
-    num_used_tokens: int = field(
-        metadata={"metric": ("gauge", "Number of tokens in use")}
-    )
-    # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
-    # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
-    num_total_tokens: int = field(
-        metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
-    )
-    max_total_num_tokens: int = field(
-        metadata={"metric": ("gauge", "Maximum token capacity")}
-    )
-    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
-    # not just KV token usage. Rename requires API deprecation.
-    token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
-    gen_throughput: float = field(
-        metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
-    )
-    cache_hit_rate: float = field(
-        metadata={"metric": ("gauge", "Prefix cache hit rate")}
-    )
-    utilization: float = field(
-        metadata={"metric": ("gauge", "Overall utilization ratio")}
-    )
-    max_running_requests: int = field(
-        metadata={"metric": ("gauge", "Maximum running requests capacity")}
-    )
-
-    memory: Optional[MemoryMetrics] = None
-    speculative: Optional[SpeculativeMetrics] = None
-    lora: Optional[LoRAMetrics] = None
-    disaggregation: Optional[DisaggregationMetrics] = None
-    queues: Optional[QueueMetrics] = None
-
-
-@dataclass
-class WatchLoadUpdateReq(BaseReq):
-    loads: List[GetLoadsReqOutput]
+    waiting: int
+    grammar: int
+    paused: int
+    retracted: int
 
 
 @dataclass

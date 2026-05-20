@@ -70,8 +70,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshotReader, shm_path_for
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -360,6 +360,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        self.load_snapshot_reader = LoadSnapshotReader(
+            shm_path_for(port_args.scheduler_input_ipc_name),
+            self.server_args.dp_size,
+        )
 
     def init_running_status(self):
         # Request states
@@ -1919,16 +1924,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,

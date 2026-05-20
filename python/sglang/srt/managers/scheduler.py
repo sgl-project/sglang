@@ -106,7 +106,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -142,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshotWriter, shm_path_for
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -662,6 +662,23 @@ class Scheduler(
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
         )
 
+        self.load_snapshot_writer = None
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            try:
+                self.load_snapshot_writer = LoadSnapshotWriter(
+                    shm_path_for(port_args.scheduler_input_ipc_name),
+                    self.ps.dp_size,
+                    dp_rank,
+                    publish_interval=self.server_args.load_snapshot_publish_interval,
+                )
+            except Exception as e:
+                logger.warning("load snapshot writer init failed: %s", e)
+
         self.output_streamer = SchedulerOutputStreamer(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
@@ -671,7 +688,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
-            load_inquirer_get_loads=lambda req: self.load_inquirer.get_loads(req),
         )
 
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -1432,10 +1448,6 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (
-                    GetLoadsReqInput,
-                    lambda req: self.load_inquirer.get_loads(req),
-                ),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -2975,11 +2987,27 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def publish_load_snapshot(self, force: bool = False):
+        writer = self.load_snapshot_writer
+        if writer is None:
+            return
+        if not force:
+            writer.publish_counter += 1
+            if writer.publish_counter < writer.publish_interval:
+                return
+        writer.publish_counter = 0
+        try:
+            writer.write(self.load_inquirer.get_loads(include=["all"]))
+        except Exception as e:
+            logger.debug("load snapshot publish failed: %s", e)
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3084,6 +3112,9 @@ class Scheduler(
 
         # reset device timer window so idle time isn't counted
         self.metrics_reporter.reset_device_timer_window()
+
+        # publish load snapshot so /v1/loads and DP balancing see the idle state
+        self.publish_load_snapshot(force=True)
 
         # sleep until next event
         self.maybe_sleep_on_idle()

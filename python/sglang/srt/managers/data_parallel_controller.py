@@ -36,8 +36,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshotReader, shm_path_for
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -91,10 +91,14 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.last_timestamp = [0.0] * dp_size
 
-    def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget."""
-        for load in load_update.loads:
+    def update_budget(self, loads):
+        """Update budget from shm snapshots, skipping stale reads."""
+        for load in loads:
+            if load.timestamp == self.last_timestamp[load.dp_rank]:
+                continue
+            self.last_timestamp[load.dp_rank] = load.timestamp
             self.total_requests[load.dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
@@ -151,9 +155,17 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            LoadBalanceMethod.TOTAL_TOKENS,
+        )
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.load_snapshot_reader = LoadSnapshotReader(
+            shm_path_for(port_args.scheduler_input_ipc_name),
+            server_args.dp_size,
+        )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -198,13 +210,16 @@ class DataParallelController:
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
 
-    def handle_load_update_req(self, obj):
-        self.dp_budget.update_budget(obj)
-
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
-    def dispatching_with_trace(self, req: Req):
+    def refresh_load_budget(self):
+        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+
+    def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
+        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
+
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
@@ -212,12 +227,16 @@ class DataParallelController:
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -228,7 +247,6 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
-                (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
