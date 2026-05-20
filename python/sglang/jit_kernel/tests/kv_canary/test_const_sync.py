@@ -11,9 +11,7 @@ register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-_CSRC_DIR: Path = (
-    Path(__file__).resolve().parents[1] / "csrc" / "kv_canary"
-)
+_CSRC_DIR: Path = Path(__file__).resolve().parents[1] / "csrc" / "kv_canary"
 _CUH_FILES: tuple[str, ...] = (
     "canary_common.cuh",
     "canary_verify.cuh",
@@ -40,14 +38,23 @@ _CPP_TO_PY: dict[str, tuple[str, str] | None] = {
     "kViolationFieldPosition": (_VERIFY_MOD, "_VIOLATION_FIELD_POSITION"),
     "kViolationFieldStoredToken": (_VERIFY_MOD, "_VIOLATION_FIELD_STORED_TOKEN"),
     "kViolationFieldExpectedToken": (_VERIFY_MOD, "_VIOLATION_FIELD_EXPECTED_TOKEN"),
-    "kViolationFieldStoredChainHash": (_VERIFY_MOD, "_VIOLATION_FIELD_STORED_CHAIN_HASH"),
+    "kViolationFieldStoredChainHash": (
+        _VERIFY_MOD,
+        "_VIOLATION_FIELD_STORED_CHAIN_HASH",
+    ),
     "kViolationFieldExpectedAux": (_VERIFY_MOD, "_VIOLATION_FIELD_EXPECTED_AUX"),
     "kViolationFieldFailReasonBits": (_VERIFY_MOD, "_VIOLATION_FIELD_FAIL_REASON_BITS"),
     "kFailReasonChainHash": (_VERIFY_MOD, "_FAIL_REASON_BIT_CHAIN_HASH"),
     "kFailReasonPosition": (_VERIFY_MOD, "_FAIL_REASON_BIT_POSITION"),
     "kFailReasonRealKvHash": (_VERIFY_MOD, "_FAIL_REASON_BIT_REAL_KV_HASH"),
-    "kFailReasonWriteTokenMismatch": (_WRITE_MOD, "_FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH"),
-    "kFailReasonWritePositionMismatch": (_WRITE_MOD, "_FAIL_REASON_BIT_WRITE_POSITION_MISMATCH"),
+    "kFailReasonWriteTokenMismatch": (
+        _WRITE_MOD,
+        "_FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH",
+    ),
+    "kFailReasonWritePositionMismatch": (
+        _WRITE_MOD,
+        "_FAIL_REASON_BIT_WRITE_POSITION_MISMATCH",
+    ),
     "kMaxRealKvSources": (_VERIFY_MOD, "_MAX_REAL_KV_SOURCES"),
     "kRealKvSourceFieldsPerEntry": (_VERIFY_MOD, "_REAL_KV_SOURCE_FIELDS_PER_ENTRY"),
     "kRealKvSourceFieldPageSize": (_VERIFY_MOD, "_REAL_KV_SOURCE_FIELD_PAGE_SIZE"),
@@ -82,16 +89,16 @@ _PINNED_PY_PREFIXES: dict[str, tuple[str, ...]] = {
         "CANARY_CHAIN_ANCHOR",
         "VIOLATION_FIELDS",
     ),
-    _WRITE_MOD: (
-        "_FAIL_REASON_BIT_WRITE_",
-    ),
+    _WRITE_MOD: ("_FAIL_REASON_BIT_WRITE_",),
 }
 
 
 def _camel_to_upper_snake(camel: str) -> str:
     """``kPartial`` -> ``PARTIAL``, ``kNumBytesPerToken`` -> ``NUM_BYTES_PER_TOKEN``."""
     if not camel.startswith("k"):
-        raise AssertionError(f"kv-canary const sync: enum member {camel!r} must start with 'k'")
+        raise AssertionError(
+            f"kv-canary const sync: enum member {camel!r} must start with 'k'"
+        )
     body = camel[1:]
     snake = re.sub(r"([A-Z])", r"_\1", body).lstrip("_")
     return snake.upper()
@@ -135,10 +142,14 @@ def _parse_cpp_enum_members(*, source: str, enum_name: str) -> dict[str, int]:
     )
     match = pattern.search(source)
     if match is None:
-        raise AssertionError(f"kv-canary const sync: enum class {enum_name} not found in any cuh")
+        raise AssertionError(
+            f"kv-canary const sync: enum class {enum_name} not found in any cuh"
+        )
     members: dict[str, int] = {}
     for line in match.group(1).splitlines():
-        member_match = re.match(r"\s*(k[A-Za-z][A-Za-z0-9_]*)\s*=\s*([^,]+),?", line.strip())
+        member_match = re.match(
+            r"\s*(k[A-Za-z][A-Za-z0-9_]*)\s*=\s*([^,]+),?", line.strip()
+        )
         if member_match is None:
             continue
         name = member_match.group(1)
@@ -152,7 +163,9 @@ def _parse_cpp_enum_members(*, source: str, enum_name: str) -> dict[str, int]:
 
 
 def _read_all_cuh() -> str:
-    return "\n".join((_CSRC_DIR / fname).read_text(encoding="utf-8") for fname in _CUH_FILES)
+    return "\n".join(
+        (_CSRC_DIR / fname).read_text(encoding="utf-8") for fname in _CUH_FILES
+    )
 
 
 def _resolve_py(target: tuple[str, str]) -> int:
@@ -182,9 +195,9 @@ def test_registered_constants_value_match() -> None:
     for cpp_name, target in _CPP_TO_PY.items():
         if target is None:
             continue
-        assert cpp_name in decoded, (
-            f"kv-canary const sync: {cpp_name} could not be decoded from cuh (unrecognized literal form?)"
-        )
+        assert (
+            cpp_name in decoded
+        ), f"kv-canary const sync: {cpp_name} could not be decoded from cuh (unrecognized literal form?)"
         py_value = _resolve_py(target)
         assert decoded[cpp_name] == py_value, (
             f"kv-canary const sync: {cpp_name} = {decoded[cpp_name]} in cuh but "
@@ -214,12 +227,16 @@ def test_every_pinned_python_constant_is_registered() -> None:
 def test_cpp_enum_members_match_python() -> None:
     cuh_source = _read_all_cuh()
     for cpp_enum_name, (module_path, py_enum_name) in _CPP_ENUMS.items():
-        cpp_members = _parse_cpp_enum_members(source=cuh_source, enum_name=cpp_enum_name)
-        py_enum = getattr(importlib.import_module(module_path), py_enum_name)
-        assert issubclass(py_enum, IntEnum), (
-            f"kv-canary const sync: {module_path}.{py_enum_name} must be IntEnum to be const-sync-checked"
+        cpp_members = _parse_cpp_enum_members(
+            source=cuh_source, enum_name=cpp_enum_name
         )
-        cpp_normalized = {_camel_to_upper_snake(name): value for name, value in cpp_members.items()}
+        py_enum = getattr(importlib.import_module(module_path), py_enum_name)
+        assert issubclass(
+            py_enum, IntEnum
+        ), f"kv-canary const sync: {module_path}.{py_enum_name} must be IntEnum to be const-sync-checked"
+        cpp_normalized = {
+            _camel_to_upper_snake(name): value for name, value in cpp_members.items()
+        }
         py_normalized = {member.name: int(member.value) for member in py_enum}
         assert cpp_normalized == py_normalized, (
             f"kv-canary const sync: enum {cpp_enum_name} mismatch.\n"
