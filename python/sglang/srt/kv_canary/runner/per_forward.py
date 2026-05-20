@@ -119,6 +119,8 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             invoke_plan(
                 plan_input=self._plan_input_per_forward,
@@ -135,7 +137,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_inputs=self._expected_inputs,
+                expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,
@@ -146,6 +148,8 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -154,7 +158,7 @@ class PerForwardOrchestrator:
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
-                expected_inputs=self._expected_inputs,
+                expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,
