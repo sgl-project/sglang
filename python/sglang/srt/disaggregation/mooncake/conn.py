@@ -802,7 +802,11 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_item_len: int,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> int:
-        """Transfer DeepSeek V4 C4 KV to host and non-sparse KV to device."""
+        """Transfer DeepSeek V4 C4 KV to host and non-sparse KV to device.
+
+        dst_kv_indices are host C4 page indices; each page maps to
+        c4_page_size compressed C4 token slots.
+        """
         c4_page_size = self.kv_args.page_size // 4
         assert self.kv_args.page_size % 4 == 0
         src_c4_layer_num = self._dsv4_c4_layer_count()
@@ -853,10 +857,14 @@ class MooncakeKVManager(CommonKVManager):
             np.arange(c4_page_size, dtype=np.int64), len(prefill_kv_indices)
         )
 
-        dst_start = page_index_slice.start * c4_page_size
-        dst_end = min(page_index_slice.stop * c4_page_size, len(dst_kv_indices))
-        dst_indices = dst_kv_indices[dst_start:dst_end].astype(np.int64, copy=False)
-        return src_indices[: len(dst_indices)], dst_indices
+        dst_pages = dst_kv_indices[page_index_slice].astype(np.int64, copy=False)
+        dst_indices = np.repeat(dst_pages * c4_page_size, c4_page_size)
+        dst_indices += np.tile(
+            np.arange(c4_page_size, dtype=np.int64), len(dst_pages)
+        )
+
+        count = min(len(src_indices), len(dst_indices))
+        return src_indices[:count], dst_indices[:count]
 
     def _send_dsv4_c4_to_host(
         self,
