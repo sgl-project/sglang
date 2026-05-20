@@ -79,12 +79,7 @@ def install_canary(
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
 
-    logger.info(
-        "install_canary: mode=%s tags=%d sweep_cadence=%d",
-        config.mode,
-        runner.active_tag_count,
-        config.sweep_interval,
-    )
+    logger.info("install_canary: config=%s", config)
     return runner
 
 
