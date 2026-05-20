@@ -1,10 +1,3 @@
-"""Shared construction factories for kv_canary kernel tests.
-
-Collects input-building helpers used by ``test_<kernel>_hand.py`` / ``test_<kernel>_fuzz.py`` and
-the legacy ``test_<kernel>.py`` shims. Contents are mechanical extractions from
-``canary_helpers.py`` and ``test_plan.py``; downstream code must not import from here.
-"""
-
 from __future__ import annotations
 
 import random
@@ -269,7 +262,6 @@ def splitmix64(value: int) -> int:
 
 
 def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
-    """4-arg chain step matching the cuh + ref helpers."""
     return splitmix64((a ^ b ^ c ^ d) & _U64_MASK)
 
 
@@ -278,7 +270,6 @@ def _allocate_plan_pair(
     verify_capacity: int,
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan, VerifyPlan, WritePlan]:
-    """Allocate (triton_verify, triton_write, ref_verify, ref_write) plan tensors."""
     return (
         VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
         WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
@@ -299,7 +290,6 @@ def _build_req_to_token(*, max_reqs: int, max_seq_len: int) -> torch.Tensor:
 
 
 def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return four zero-filled length-1 int32 tensors representing an "extras absent" payload."""
     return (
         torch.zeros(1, dtype=torch.int32, device=_DEVICE),
         torch.zeros(1, dtype=torch.int32, device=_DEVICE),

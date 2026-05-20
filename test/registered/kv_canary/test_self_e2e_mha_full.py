@@ -1,12 +1,3 @@
-"""Canary self-e2e on a minimal MHA + FULL pool fixture.
-
-Qwen3-0.6B with ``num_hidden_layers=1`` baked into ``--json-model-override-args``
-gives the cheapest possible "real attention + real KV pool + canary attached"
-e2e configuration so PR CI catches integration regressions in 1-2 minutes.
-
-8 cases, all registered to ``extra-a`` / ``1-gpu-large``.
-"""
-
 from __future__ import annotations
 
 import unittest
