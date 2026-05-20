@@ -470,7 +470,7 @@ class Envs:
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    # NSA Backend (deprecated aliases — kept for existing call sites in nsa_backend.py;
+    # DSA Backend env vars (deprecated NSA aliases — kept for one release;
     # those call sites will switch to SGLANG_DSA_* when nsa_backend.py is renamed)
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
