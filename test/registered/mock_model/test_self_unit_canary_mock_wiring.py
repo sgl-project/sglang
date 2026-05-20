@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import unittest
+from test.registered.mock_model.utils import mock_model_engine_kwargs
 
 import torch
 
@@ -12,8 +13,6 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-from test.registered.mock_model.utils import mock_model_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 

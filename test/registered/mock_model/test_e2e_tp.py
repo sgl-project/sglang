@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from test.registered.mock_model.utils import mock_model_engine_kwargs
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-from test.registered.mock_model.utils import mock_model_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
