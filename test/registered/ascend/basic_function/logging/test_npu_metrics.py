@@ -43,7 +43,7 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
         if not le_list:
             return
 
-        pattern_template = r'sglang:{}{.*le="{}".*model_name="{}".*}'
+        pattern_template = r'sglang:{}{{.*le="{}".*model_name="{}".*}}'
 
         for le in le_list:
             pattern = re.compile(
