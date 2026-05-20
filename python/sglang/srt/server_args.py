@@ -97,9 +97,8 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
-_TOKEN_ORACLE_BACKEND_NAME = "token_oracle"
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-    SAMPLING_BACKEND_CHOICES.add(_TOKEN_ORACLE_BACKEND_NAME)
+    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
