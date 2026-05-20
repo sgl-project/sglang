@@ -102,7 +102,7 @@ def canary_verify_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_signed = _to_signed_int64(_splitmix64_python(CANARY_CHAIN_ANCHOR))
+    chain_anchor_signed = _to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
 
     violation_rows: list[list[int]] = []
 
@@ -129,7 +129,7 @@ def canary_verify_step_torch_reference(
                 ^ (prev_pos & _U64_MASK)
                 ^ (prev_rkv & _U64_MASK)
             )
-            expected_chain_hash = _to_signed_int64(_splitmix64_python(combined))
+            expected_chain_hash = _to_signed_int64(splitmix64(combined))
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
@@ -184,7 +184,7 @@ def canary_verify_step_torch_reference(
     violation_write_index[0] = violation_write_index[0] + num_new_violations
 
 
-def _splitmix64_python(value: int) -> int:
+def splitmix64(value: int) -> int:
     """Standard splitmix64 finalizer over a single uint64. Matches the CUDA splitmix64_finalize."""
     x = value & _U64_MASK
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
@@ -245,7 +245,7 @@ def _compute_real_kv_hash_scalar(
         source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
 
         combined = acc ^ source_hash
-        acc = _splitmix64_python(combined)
+        acc = splitmix64(combined)
 
     return acc
 
@@ -263,7 +263,7 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
         for k in range(8):
             word |= padded[w * 8 + k] << (8 * k)
         word &= _U64_MASK
-        acc = _splitmix64_python(acc ^ word)
+        acc = splitmix64(acc ^ word)
 
     return acc
 

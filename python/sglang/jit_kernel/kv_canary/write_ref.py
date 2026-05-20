@@ -27,8 +27,8 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
-    _splitmix64_python,
     _to_signed_int64,
+    splitmix64,
 )
 from sglang.jit_kernel.kv_canary.write import (
     _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
@@ -104,7 +104,7 @@ def canary_write_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_u64 = _splitmix64_python(CANARY_CHAIN_ANCHOR)
+    chain_anchor_u64 = splitmix64(CANARY_CHAIN_ANCHOR)
 
     pseudo_mode_on = int(pseudo_mode) != int(CanaryPseudoMode.OFF)
     pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(
@@ -138,7 +138,7 @@ def canary_write_step_torch_reference(
                 ^ (seed_position_signed & _U64_MASK)
                 ^ (seed_real_kv_signed & _U64_MASK)
             )
-            running_prev_hash = _splitmix64_python(seed_combined)
+            running_prev_hash = splitmix64(seed_combined)
 
         for j in range(entry_count):
             i = entry_start + j
@@ -188,7 +188,7 @@ def canary_write_step_torch_reference(
                 ^ (position & _U64_MASK)
                 ^ real_kv_hash_u64
             )
-            running_prev_hash = _splitmix64_python(combined)
+            running_prev_hash = splitmix64(combined)
 
             total_slots_written += 1
 

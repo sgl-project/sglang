@@ -82,7 +82,7 @@ struct RealKvSourceHandle {
   int32_t read_bytes;
 };
 
-// Standard splitmix64 finalizer. Bit-equivalent to the Python _splitmix64_python in
+// Standard splitmix64 finalizer. Bit-equivalent to the Python splitmix64 in
 // kv_canary/verify_ref.py.
 SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
