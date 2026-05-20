@@ -518,6 +518,31 @@ class TopK(MultiPlatformOp):
             )
         return self._apply_deepep_waterfill(topk_output, 0)
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        self.topk_config.torch_native = True
+        # [NOTE] XPU device support for topk kernels
+        #   - support 'topk_softmax' and 'topk_sigmoid'
+        #   - support up to 8 top-k and 256 experts
+        self.topk_config.torch_native = not (
+            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
+        )
+
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
 
 # ------------------------------- TopK implementation -------------------------------------
 
@@ -1407,7 +1432,9 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        if scoring_func != "sqrtsoftplus":
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+
         if scoring_func == "sqrtsoftplus":
             _biased_topk = (
                 biased_topk_jit_kernel_impl
@@ -1462,6 +1489,18 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
+        # Benchmark-only: override gating with uniform round-robin expert assignment
+        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
+        num_tokens, k = topk_ids.shape
+        num_experts = router_logits.shape[1]
+        offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
+        steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
+        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
+            topk_ids.dtype
+        )
+        topk_weights = torch.ones_like(topk_weights) / k
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,

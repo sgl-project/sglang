@@ -30,7 +30,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
-        scheduler.send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -72,7 +72,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
-        scheduler.send_to_tokenizer.send_output.assert_called_once()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
