@@ -155,19 +155,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
             if self.require_gathered_buffer:
-                if self.require_mlp_tp_gather:
-                    global_num_tokens_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
-                    )
-                    global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
-                    )
-                else:
-                    assert self.require_attn_tp_gather
-                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (1,), dtype=torch.int32
-                    )
+                assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+                global_num_tokens_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
+                global_num_tokens_for_logprob_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
             else:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
@@ -222,7 +216,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -294,7 +288,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_tokens if self.forward_mode.is_draft_extend_v2() else bs
         )
 
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
@@ -310,22 +304,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 )
             )
             global_dp_buffer_len = num_tokens * self.dp_size
-        elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens_for_logprob],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
 
@@ -421,7 +399,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs

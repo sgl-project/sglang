@@ -108,10 +108,10 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    require_attn_tp_gather: bool = False,
     skip_all_gather=False,
 ):
-    # TODO: handle the case when moe_dense_tp_size != 1
-    if not require_mlp_tp_gather:
+    if not require_mlp_tp_gather and not require_attn_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
     else:
@@ -216,7 +216,8 @@ def prepare_mlp_sync_batch_raw(
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather, mlp_sync_info, require_mlp_tp_gather,
+            require_attn_tp_gather, skip_all_gather
         )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:

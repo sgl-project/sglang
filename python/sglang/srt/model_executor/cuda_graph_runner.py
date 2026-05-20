@@ -156,6 +156,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
+        require_attn_tp_gather: bool = False,
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
@@ -204,7 +205,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             else:
                 encoder_lens = None
 
-            if require_mlp_tp_gather:
+            if require_mlp_tp_gather or require_attn_tp_gather:
                 global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
                     (dp_size,), dtype=torch.int32
@@ -630,6 +631,7 @@ class CudaGraphRunner:
             pp_size=self.pp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
+            require_attn_tp_gather=self.require_attn_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
@@ -669,7 +671,7 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -879,7 +881,7 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
@@ -895,22 +897,6 @@ class CudaGraphRunner:
                 )
             )
             global_dp_buffer_len = num_tokens * self.dp_size
-        elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
 
@@ -1091,7 +1077,7 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_attn_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
