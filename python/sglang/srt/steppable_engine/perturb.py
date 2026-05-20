@@ -64,8 +64,6 @@ def arm_one_shot(
     rank: Optional[int],
 ) -> None:
     validate_channel_kind(channel=channel, kind=kind)
-    if rank is not None and rank != 0:
-        raise NotImplementedError("rank != 0 is not supported")
     scheduler._armed_perturbation = _ArmedPerturbation(
         channel=channel,
         kind=kind,
