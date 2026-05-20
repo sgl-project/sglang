@@ -43,8 +43,42 @@ The validator uses `is_deepseek_nsa(hf_config)` as a proxy for "exposes the NSA 
 
 ## Known gaps for the integration that the deploying team must close
 
-* Production-grade Triton implementations of `compute_page_scores` and `page_signature_write` (the current torch path is correct and capture-safe but not at peak perf). The kernel shapes + ABI are stable.
 * End-to-end AC-8 SLO verification: requires a calibrated channel mask file + V3.2 FP8 weights on the deploying hardware.
 * AC-9 quality runs (NIAH / MMLU): same.
 * AC-6 conc 16/32/64 CUDA-graph capture verification: requires real V3.2 boot.
 * DEC-2 radix-cache permission: the validator gates radix cache until `_double_sparsity_radix_fixture_passed` is recorded as True (set by the M3-B page-stability fixture, which the deploying team runs alongside calibration).
+
+## meta_info integration (Round 2 wiring point)
+
+The DS stats helper lives at:
+
+```python
+from sglang.srt.layers.attention.double_sparsity.metrics import (
+    DoubleSparsityRequestStats, customized_info_for_request,
+)
+```
+
+The least-invasive surface point is `tokenizer_manager.py`'s existing `customized_info` hook (around line 1739). The DS path in the scheduler should:
+
+```python
+# scheduler side (per-request, at the point where ds stats become known):
+stats = DoubleSparsityRequestStats(
+    sparsity_rate=selected_pages / total_valid_pages,
+    selected_pages=selected_pages,
+    dense_fallback=0,
+)
+recv_obj.customized_info.setdefault(rid, {}).update({
+    "double_sparsity": customized_info_for_request(stats),
+})
+```
+
+This avoids modifying the central `meta_info` constructor; the existing tokenizer-manager loop will auto-surface the `"double_sparsity"` key inside the request's `meta_info` payload. This wiring is the deploying team's integration glue — the helper API + the docstring locator make the change one paragraph long.
+
+## Round 2 perf path (Triton kernels)
+
+`compute_page_scores` and `page_signature_write` both ship Triton kernels that auto-select on CUDA + Triton-available, with torch-reference fallback on CPU / non-CUDA / when Triton is absent. Numerical equivalence is asserted in unit tests:
+
+* `compute_page_scores_triton` vs torch reference: max diff ~2e-6 on synthetic inputs.
+* `page_signature_write_triton` vs torch reference: max diff ~2e-3 in fp16 on synthetic inputs.
+
+NSA cross-validation (`test_quant_kcache_roundtrip`) drives `nsa.quant_k_cache.quantize_k_cache_separate` end-to-end through `dequant_nope_fp8_to_bf16` and asserts ~2.6% relative L2 error per tile — i.e. the FP8 byte-layout contract DS depends on is verified against NSA's source-of-truth quantizer.

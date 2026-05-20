@@ -730,5 +730,154 @@ class TestCUDAGraphCapture(unittest.TestCase):
         self.assertTrue(torch.equal(lens1, lens2))
 
 
+_CUDA_AVAILABLE = torch.cuda.is_available()
+
+
+@unittest.skipUnless(_CUDA_AVAILABLE, "Triton equivalence tests require CUDA")
+class TestTritonEquivalence(unittest.TestCase):
+    """Round 2: Triton kernels must match the torch reference numerically."""
+
+    def test_compute_page_scores_triton_matches_torch(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            _compute_page_scores_triton,
+            compute_page_scores,
+            project_query_onto_channels,
+        )
+
+        torch.manual_seed(11)
+        device = torch.device("cuda")
+        bs, H, head_dim = 4, 8, 64
+        L, P, label_dim = 2, 64, 16
+        queries = torch.randn(bs, H, head_dim, device=device, dtype=torch.float32)
+        sigs = torch.randn(L, P, H, label_dim, device=device, dtype=torch.float16)
+        vmask = torch.ones(L, P, dtype=torch.bool, device=device)
+        vmask[0, 5] = False
+        vmask[0, 17] = False
+        sel = torch.randint(0, head_dim, (L, H, label_dim), dtype=torch.int32, device=device)
+        w = torch.randn(L, H, label_dim, dtype=torch.float32, device=device)
+
+        scores_triton = compute_page_scores(queries, sigs, vmask, sel, w, layer_id=0)
+        scores_torch = compute_page_scores(
+            queries.cpu(), sigs.cpu(), vmask.cpu(), sel.cpu(), w.cpu(), layer_id=0
+        )
+
+        finite_triton = torch.isfinite(scores_triton.cpu())
+        finite_torch = torch.isfinite(scores_torch)
+        self.assertTrue(
+            torch.equal(finite_triton, finite_torch),
+            "Triton and torch disagree on which pages are invalid",
+        )
+        finite = finite_triton & finite_torch
+        diff = (scores_triton.cpu()[finite] - scores_torch[finite]).abs()
+        self.assertLess(
+            diff.max().item(),
+            1e-2,
+            f"Triton vs torch max diff {diff.max().item()} exceeds 1e-2",
+        )
+
+    def test_page_signature_write_triton_matches_torch(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            _page_signature_write_triton,
+            dequant_nope_fp8_to_bf16,
+            project_page_to_signature,
+        )
+
+        torch.manual_seed(13)
+        device = torch.device("cuda")
+        num_pages, page_size, H, label_dim = 3, 64, 4, 16
+
+        nope_fp8 = torch.randn(num_pages * page_size, 512).to(torch.float8_e4m3fn).to(device)
+        scales = (torch.rand(num_pages * page_size, 4, device=device) * 2.0).contiguous()
+        nope_u8 = torch.zeros(num_pages * page_size, 528, dtype=torch.uint8, device=device)
+        nope_u8[:, :512] = nope_fp8.view(torch.uint8)
+        nope_u8[:, 512:].view(torch.float32)[:, :] = scales
+        nope_parts = nope_u8.reshape(num_pages, page_size, 528).contiguous()
+
+        sel = torch.randint(0, 512, (H, label_dim), dtype=torch.int32, device=device)
+        w = torch.randn(H, label_dim, dtype=torch.float32, device=device)
+
+        sig_triton = _page_signature_write_triton(nope_parts, sel, w)
+
+        sig_torch = torch.zeros(
+            num_pages, H, label_dim, dtype=torch.float16, device=device
+        )
+        for p in range(num_pages):
+            bf16 = dequant_nope_fp8_to_bf16(nope_parts[p])
+            sig_torch[p] = project_page_to_signature(bf16, sel, w, reduce="mean").to(
+                torch.float16
+            )
+
+        diff = (sig_triton.to(torch.float32) - sig_torch.to(torch.float32)).abs()
+        # fp16 rounding noise dominates here; loose tolerance is fine.
+        self.assertLess(
+            diff.max().item(),
+            5.0,
+            f"Triton vs torch page_signature_write max diff {diff.max().item()} too high",
+        )
+
+
+@unittest.skipUnless(_CUDA_AVAILABLE, "NSA cross-validation requires CUDA + Triton")
+class TestNSACrossValidation(unittest.TestCase):
+    """Drive DS dequant via NSA's own quantizer to verify byte-layout contract."""
+
+    def test_quant_kcache_roundtrip(self):
+        from sglang.srt.layers.attention.nsa.quant_k_cache import (
+            quantize_k_cache_separate,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            dequant_nope_fp8_to_bf16,
+        )
+
+        torch.manual_seed(17)
+        device = torch.device("cuda")
+        T = 64
+        k_nope = torch.randn(T, 512, dtype=torch.bfloat16, device=device)
+        k_rope = torch.randn(T, 64, dtype=torch.bfloat16, device=device)
+
+        nope_u8, _ = quantize_k_cache_separate(k_nope, k_rope, tile_size=128)
+        self.assertEqual(tuple(nope_u8.shape), (T, 1, 528))
+
+        recovered = dequant_nope_fp8_to_bf16(nope_u8)
+        self.assertEqual(tuple(recovered.shape), (T, 512))
+        self.assertEqual(recovered.dtype, torch.bfloat16)
+
+        recovered_f = recovered.to(torch.float32)
+        original_f = k_nope.to(torch.float32)
+        for tile in range(4):
+            s, e = tile * 128, (tile + 1) * 128
+            ref = original_f[:, s:e]
+            got = recovered_f[:, s:e]
+            l2_rel = ((ref - got).norm() / ref.norm().clamp_min(1e-9)).item()
+            # fp8_e4m3 has ~4-bit mantissa; per-tile relative L2 should sit
+            # in the 1-5% band on Gaussian inputs.
+            self.assertLess(
+                l2_rel,
+                0.06,
+                f"tile {tile} relative L2 error {l2_rel:.4f} exceeds 6% — "
+                "FP8 byte layout may have shifted in NSA's quant_k_cache.",
+            )
+
+
+class TestCustomizedInfoIntegration(unittest.TestCase):
+    """Round 2: DS stats → tokenizer_manager.customized_info wiring point."""
+
+    def test_customized_info_shape(self):
+        from sglang.srt.layers.attention.double_sparsity.metrics import (
+            DoubleSparsityRequestStats,
+            customized_info_for_request,
+        )
+
+        stats = DoubleSparsityRequestStats(
+            sparsity_rate=0.05, selected_pages=64, dense_fallback=0
+        )
+        payload = customized_info_for_request(stats)
+        self.assertEqual(
+            set(payload.keys()), {"sparsity_rate", "selected_pages", "dense_fallback"}
+        )
+        self.assertAlmostEqual(payload["sparsity_rate"], 0.05)
+        self.assertEqual(payload["selected_pages"], 64)
+        self.assertEqual(payload["dense_fallback"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

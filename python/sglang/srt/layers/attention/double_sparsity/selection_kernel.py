@@ -40,12 +40,133 @@ logger = logging.getLogger(__name__)
 SELECTED_PAD_VALUE = -1
 _TRITON_AVAILABLE = False
 try:
-    import triton  # noqa: F401
-    import triton.language as tl  # noqa: F401
+    import triton
+    import triton.language as tl
 
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _compute_page_scores_kernel(
+        q_proj_ptr,  # [bs, H, label_dim] fp32
+        sig_ptr,  # [P, H, label_dim] fp16 or fp32
+        valid_ptr,  # [P] bool
+        out_ptr,  # [bs, P] fp32
+        bs: tl.constexpr,
+        num_heads: tl.constexpr,
+        max_pages: tl.constexpr,
+        label_dim: tl.constexpr,
+        q_stride_b: tl.constexpr,
+        q_stride_h: tl.constexpr,
+        sig_stride_p: tl.constexpr,
+        sig_stride_h: tl.constexpr,
+        out_stride_b: tl.constexpr,
+        PAGE_BLOCK: tl.constexpr,
+    ):
+        batch_id = tl.program_id(0)
+        page_block = tl.program_id(1)
+        page_offsets = page_block * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+        page_in_range = page_offsets < max_pages
+
+        d_offsets = tl.arange(0, label_dim)
+
+        # Per-head max accumulator: start at -inf.
+        max_score = tl.full((PAGE_BLOCK,), float("-inf"), dtype=tl.float32)
+
+        for h in range(num_heads):
+            q_offsets = (
+                batch_id * q_stride_b + h * q_stride_h + d_offsets
+            )
+            q_block = tl.load(q_proj_ptr + q_offsets).to(tl.float32)
+            # [label_dim]
+
+            # Page-block × label_dim signatures: shape [PAGE_BLOCK, label_dim].
+            sig_offsets = (
+                page_offsets[:, None] * sig_stride_p
+                + h * sig_stride_h
+                + d_offsets[None, :]
+            )
+            sig_block = tl.load(
+                sig_ptr + sig_offsets,
+                mask=page_in_range[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            # [PAGE_BLOCK, label_dim]
+
+            # Dot per page = sum over d of q[d] * sig[p, d].
+            dot = tl.sum(q_block[None, :] * sig_block, axis=1)
+            # [PAGE_BLOCK]
+
+            max_score = tl.where(dot > max_score, dot, max_score)
+
+        # Mask invalid pages to -inf.
+        valid_block = tl.load(
+            valid_ptr + page_offsets, mask=page_in_range, other=0
+        ).to(tl.int1)
+        out_score = tl.where(
+            valid_block, max_score, tl.full(max_score.shape, float("-inf"), dtype=tl.float32)
+        )
+
+        out_offsets = batch_id * out_stride_b + page_offsets
+        tl.store(out_ptr + out_offsets, out_score, mask=page_in_range)
+
+
+def _compute_page_scores_triton(
+    q_proj: torch.Tensor,
+    sig_layer: torch.Tensor,
+    valid_layer: torch.Tensor,
+    *,
+    page_block: int = 64,
+) -> torch.Tensor:
+    """Triton kernel-driven page scoring.
+
+    Args:
+        q_proj: ``[bs, H, label_dim]`` fp32 (caller has already applied
+            ``project_query_onto_channels``).
+        sig_layer: ``[max_pages, H, label_dim]`` fp16/fp32 — the active
+            layer's slice of the page signature table.
+        valid_layer: ``[max_pages]`` bool — the active layer's valid mask.
+
+    Returns:
+        ``[bs, max_pages]`` fp32 page scores. Invalid pages are ``-inf``.
+    """
+
+    assert q_proj.is_cuda and sig_layer.is_cuda and valid_layer.is_cuda
+    bs, num_heads, label_dim = q_proj.shape
+    max_pages = int(sig_layer.shape[0])
+    out = torch.empty((bs, max_pages), dtype=torch.float32, device=q_proj.device)
+
+    q_proj_c = q_proj.contiguous()
+    sig_c = sig_layer.contiguous()
+    valid_c = valid_layer.contiguous()
+
+    page_block = min(page_block, max_pages)
+    if page_block <= 0:
+        page_block = max(1, max_pages)
+    num_page_blocks = (max_pages + page_block - 1) // page_block
+    grid = (bs, num_page_blocks)
+
+    _compute_page_scores_kernel[grid](
+        q_proj_c,
+        sig_c,
+        valid_c,
+        out,
+        bs=bs,
+        num_heads=num_heads,
+        max_pages=max_pages,
+        label_dim=label_dim,
+        q_stride_b=q_proj_c.stride(0),
+        q_stride_h=q_proj_c.stride(1),
+        sig_stride_p=sig_c.stride(0),
+        sig_stride_h=sig_c.stride(1),
+        out_stride_b=out.stride(0),
+        PAGE_BLOCK=page_block,
+    )
+    return out
 
 
 def project_query_onto_channels(
@@ -118,6 +239,21 @@ def compute_page_scores(
 
     # Project queries onto channel-mask channels per head.
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
+
+    # Triton fast path: fuses gather/projection/per-head max-reduce in one
+    # kernel. Falls back to the torch einsum reference on CPU or when Triton
+    # is unavailable (e.g. import-time errors in CI environments).
+    if (
+        _TRITON_AVAILABLE
+        and q_proj.is_cuda
+        and sig_layer.is_cuda
+        and valid_layer.is_cuda
+    ):
+        return _compute_page_scores_triton(
+            q_proj.to(torch.float32),
+            sig_layer,
+            valid_layer,
+        )
 
     # Score per (batch, page, head) = sum over label_dim of (q_proj * signature).
     # Reduce over heads with max (per CMT-7 / DEC-9: the reduction is the

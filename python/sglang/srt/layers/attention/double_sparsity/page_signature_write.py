@@ -45,6 +45,144 @@ _TILE_SIZE = 128
 _NUM_TILES = _NOPE_DIM // _TILE_SIZE
 _PAGE_NOPE_STRIDE_BYTES = _NOPE_BYTES + _SCALE_BYTES  # 528
 
+_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _page_signature_write_kernel(
+        nope_fp8_ptr,  # uint8 reinterpreted as fp8 — [num_pages, page_size, 512]
+        scales_ptr,  # fp32 — [num_pages, page_size, num_tiles]
+        sel_ptr,  # int32 — [H_local, label_dim]
+        w_ptr,  # fp32 — [H_local, label_dim]
+        out_ptr,  # fp16 — [num_pages, H_local, label_dim]
+        num_pages: tl.constexpr,
+        page_size: tl.constexpr,
+        num_heads: tl.constexpr,
+        label_dim: tl.constexpr,
+        tile_size: tl.constexpr,
+        num_tiles: tl.constexpr,
+        nope_dim: tl.constexpr,
+        nope_stride_page: tl.constexpr,
+        nope_stride_token: tl.constexpr,
+        scales_stride_page: tl.constexpr,
+        scales_stride_token: tl.constexpr,
+        sel_stride_head: tl.constexpr,
+        w_stride_head: tl.constexpr,
+        out_stride_page: tl.constexpr,
+        out_stride_head: tl.constexpr,
+    ):
+        page_id = tl.program_id(0)
+        head_id = tl.program_id(1)
+
+        d_offsets = tl.arange(0, label_dim)
+        sel_offsets = head_id * sel_stride_head + d_offsets
+        sel_idx = tl.load(sel_ptr + sel_offsets).to(tl.int32)  # [label_dim]
+        w = tl.load(w_ptr + head_id * w_stride_head + d_offsets).to(tl.float32)
+
+        # Derive tile id per channel index.
+        tile_idx = sel_idx // tile_size  # [label_dim] in [0, num_tiles)
+
+        acc = tl.zeros((label_dim,), dtype=tl.float32)
+
+        for tok in range(page_size):
+            # Load all scales for this token, then gather the per-channel
+            # scale by tile_idx.
+            token_scale_base = (
+                page_id * scales_stride_page + tok * scales_stride_token
+            )
+            scales = tl.load(scales_ptr + token_scale_base + tl.arange(0, num_tiles))
+            # [num_tiles] fp32
+
+            # Gather per-channel scale: scales[tile_idx[d]] for each d.
+            # Triton trick: broadcast (label_dim, num_tiles) match and reduce.
+            tile_match = (
+                tile_idx[:, None] == tl.arange(0, num_tiles)[None, :]
+            ).to(tl.float32)
+            ch_scale = tl.sum(tile_match * scales[None, :], axis=1)
+
+            # Load the per-channel FP8 nope value.
+            fp8_offsets = (
+                page_id * nope_stride_page
+                + tok * nope_stride_token
+                + sel_idx
+            )
+            ch_fp8 = tl.load(nope_fp8_ptr + fp8_offsets).to(tl.float32)
+
+            acc += ch_fp8 * ch_scale * w
+
+        acc = acc / page_size  # mean over page tokens
+
+        out_offsets = (
+            page_id * out_stride_page + head_id * out_stride_head + d_offsets
+        )
+        tl.store(out_ptr + out_offsets, acc.to(tl.float16))
+
+
+def _page_signature_write_triton(
+    nope_parts_u8: torch.Tensor,  # [num_pages, page_size, 528] uint8
+    channel_selection_layer: torch.Tensor,  # [H_local, label_dim] int32
+    channel_weights_layer: torch.Tensor,  # [H_local, label_dim] fp32
+) -> torch.Tensor:
+    """Run the Triton page_signature_write kernel. Returns [num_pages, H_local, label_dim] fp16."""
+
+    num_pages, page_size, stride = nope_parts_u8.shape
+    assert stride == _PAGE_NOPE_STRIDE_BYTES, stride
+    H, label_dim = channel_selection_layer.shape
+
+    # Reinterpret the byte tensor as fp8 (bytes 0..512) and fp32 (bytes 512..528).
+    nope_u8_flat = nope_parts_u8.contiguous()
+    nope_fp8 = (
+        nope_u8_flat[..., :_NOPE_BYTES]
+        .view(torch.float8_e4m3fn)
+        .reshape(num_pages, page_size, _NOPE_DIM)
+    )
+    scales = (
+        nope_u8_flat[..., _NOPE_BYTES:]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(num_pages, page_size, _NUM_TILES)
+    )
+
+    out = torch.empty(
+        (num_pages, H, label_dim),
+        dtype=torch.float16,
+        device=nope_parts_u8.device,
+    )
+    grid = (num_pages, H)
+
+    _page_signature_write_kernel[grid](
+        nope_fp8,
+        scales,
+        channel_selection_layer.to(torch.int32).contiguous(),
+        channel_weights_layer.to(torch.float32).contiguous(),
+        out,
+        num_pages=num_pages,
+        page_size=page_size,
+        num_heads=H,
+        label_dim=label_dim,
+        tile_size=_TILE_SIZE,
+        num_tiles=_NUM_TILES,
+        nope_dim=_NOPE_DIM,
+        nope_stride_page=nope_fp8.stride(0),
+        nope_stride_token=nope_fp8.stride(1),
+        scales_stride_page=scales.stride(0),
+        scales_stride_token=scales.stride(1),
+        sel_stride_head=channel_selection_layer.stride(0),
+        w_stride_head=channel_weights_layer.stride(0),
+        out_stride_page=out.stride(0),
+        out_stride_head=out.stride(1),
+    )
+    return out
+
 
 def dequant_nope_fp8_to_bf16(
     nope_part_u8: torch.Tensor,
@@ -171,6 +309,29 @@ def page_signature_write(
             f"page_ids length {len(page_ids)} does not match nope_parts batch dim "
             f"{num_pages_in}."
         )
+
+    # Fused Triton path when on CUDA + Triton available + the reduction is
+    # `mean` (the kernel currently bakes mean reduction in; sum is the
+    # documented fallback to the torch reference).
+    if (
+        _TRITON_AVAILABLE
+        and reduce == "mean"
+        and nope_parts_u8.is_cuda
+        and channel_selection_layer.is_cuda
+        and channel_weights_layer.is_cuda
+        and num_pages_in > 0
+    ):
+        signatures = _page_signature_write_triton(
+            nope_parts_u8,
+            channel_selection_layer,
+            channel_weights_layer,
+        )  # [num_pages_in, H, label_dim] fp16
+        for batch_idx, page_id in enumerate(page_ids):
+            table_signatures[layer_id, page_id] = signatures[batch_idx].to(
+                table_signatures.dtype
+            )
+            table_valid_mask[layer_id, page_id] = True
+        return
 
     for batch_idx, page_id in enumerate(page_ids):
         nope_u8 = nope_parts_u8[batch_idx]  # [page_size, 528]

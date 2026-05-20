@@ -148,6 +148,25 @@ def meta_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, Any]:
     }
 
 
+def customized_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, Any]:
+    """Payload to drop into ``recv_obj.customized_info["double_sparsity"]``.
+
+    The tokenizer manager's ``customized_info`` hook (see
+    ``tokenizer_manager.py`` near line 1739) auto-surfaces arbitrary
+    k/v pairs into the request's ``meta_info``. Wiring this from the
+    scheduler is the least-invasive integration point and does not
+    require touching the central ``meta_info`` constructor.
+
+    Integration shape (one line in scheduler):
+
+        recv_obj.customized_info.setdefault({}).update({
+            "double_sparsity": customized_info_for_request(stats),
+        })
+    """
+
+    return meta_info_for_request(stats)
+
+
 def reset_for_testing() -> None:
     """Clear registered metric state. Tests only."""
     global _metrics_registered
