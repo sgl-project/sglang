@@ -93,6 +93,68 @@ class AscendMemcacheConfig:
         return unknown
 
 
+def _default_memcache_device_id(
+    storage_config: Optional[HiCacheStorageConfig],
+) -> int:
+    """Infer NPU device id for the current process (respects ASCEND_RT_VISIBLE_DEVICES)."""
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return int(torch.npu.current_device())
+    except Exception:
+        pass
+    if storage_config is not None:
+        return storage_config.tp_rank
+    return 0
+
+
+def _resolve_memcache_device_id(
+    ctrl: dict,
+    storage_config: Optional[HiCacheStorageConfig],
+) -> int:
+    """Resolve memcache ``init(device_id)`` for the current scheduler process.
+
+    SGLang runs one TP worker process per card; each process constructs its own
+    ``AscendMemcacheStore`` and must call ``init`` with that process's NPU id.
+
+    Resolution order:
+    - ``device_id`` omitted: ``torch.npu.current_device()`` or ``tp_rank``
+    - ``device_id`` JSON object / JSON string: per-``tp_rank`` map (Mooncake-style)
+    - scalar ``device_id``: use as configured (caller must set correctly per node)
+    """
+    if "device_id" not in ctrl:
+        return _default_memcache_device_id(storage_config)
+
+    raw = ctrl["device_id"]
+    device_config = raw if isinstance(raw, dict) else None
+    if device_config is None and isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            device_config = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to parse device_id as JSON: %s", raw)
+            device_config = None
+
+    if isinstance(device_config, dict):
+        tp_rank = storage_config.tp_rank if storage_config is not None else 0
+        if tp_rank in device_config:
+            return int(device_config[tp_rank])
+        if str(tp_rank) in device_config:
+            return int(device_config[str(tp_rank)])
+        logger.warning(
+            "device_id map has no entry for tp_rank=%s; falling back to auto device id",
+            tp_rank,
+        )
+        return _default_memcache_device_id(storage_config)
+
+    device_id = int(raw)
+    if storage_config is not None and storage_config.tp_size > 1:
+        logger.warning(
+            "Ascend memcache device_id=%s is shared by all TP ranks; for multi-card "
+            "deployments omit device_id from config or use a per-rank JSON map.",
+            ctrl["device_id"],
+        )
+    return device_id
+
+
 class AscendMemcacheStore(HiCacheStorage):
     """HiCache storage backend backed by Ascend MemCache (`memcache_hybrid`)."""
 
@@ -127,10 +189,17 @@ class AscendMemcacheStore(HiCacheStorage):
                 )
 
             ctrl = config.ctrl
-            device_id = int(ctrl.get("device_id", 0))
+            device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
             if self.store.init(device_id, init_bm) != 0:
                 raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
+            tp_rank = storage_config.tp_rank if storage_config is not None else 0
+            logger.info(
+                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, init_bm=%s)",
+                tp_rank,
+                device_id,
+                init_bm,
+            )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
                 "memcache_metrics_url"
