@@ -1,17 +1,3 @@
-"""KV cache canary verify kernel — host wrapper, dataclasses, enums.
-
-This module defines the public API surface for the verify kernel:
-
-- module-level constants (chain anchor, slot bytes, violation row width),
-- IntEnums (CanaryLaunchTag, RealKvHashMode),
-- the VerifyPlan dataclass consumed by canary_verify_step,
-- the RealKvSource dataclass shared with canary_write_step,
-- the canary_verify_step host wrapper itself.
-
-The CUDA kernel is not wired up yet; the host wrapper raises NotImplementedError until that lands. Pin the
-behaviour through canary_verify_step_torch_reference in kv_canary/verify_ref.py.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -328,7 +314,6 @@ def canary_verify_step(
 
 @cache_once
 def _jit_canary_verify_module() -> "Module":
-    """Lazy-load the CUDA verify module via tvm-ffi."""
     return load_jit(
         "kv_canary_verify",
         cuda_files=["kv_canary/canary_verify.cuh"],

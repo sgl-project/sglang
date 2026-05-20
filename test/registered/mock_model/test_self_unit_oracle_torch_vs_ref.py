@@ -1,5 +1,3 @@
-"""Bitwise-equality cross-check: vectorized HashOracle.expected_tokens vs scalar splitmix64 ref."""
-
 from __future__ import annotations
 
 import random

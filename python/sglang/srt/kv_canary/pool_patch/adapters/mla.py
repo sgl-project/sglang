@@ -19,7 +19,6 @@ def attach_mla(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an MLA-style pool (single ``kv_buffer`` per layer, no V half)."""
     num_slots = int(pool.kv_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
     k_tail = alloc_canary_buf(num_slots=num_slots, device=device)

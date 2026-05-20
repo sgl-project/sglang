@@ -1,15 +1,3 @@
-"""KV cache canary write kernel — host wrapper, dataclasses, enums.
-
-This module defines the public API surface for the write kernel:
-
-- CanaryPseudoMode IntEnum,
-- the WritePlan dataclass consumed by canary_write_step,
-- the canary_write_step host wrapper itself.
-
-RealKvSource is owned by kv_canary/verify.py (the verify path defines it first); we re-import it here so
-the write module's API surface is self-contained for callers.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -284,7 +272,6 @@ def canary_write_step(
 
 @cache_once
 def _jit_canary_write_module() -> "Module":
-    """Lazy-load the CUDA write module via tvm-ffi. Same JIT plumbing as the verify loader."""
     return load_jit(
         "kv_canary_write",
         cuda_files=["kv_canary/canary_write.cuh"],

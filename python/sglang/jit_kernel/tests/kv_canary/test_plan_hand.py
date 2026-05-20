@@ -1,5 +1,3 @@
-"""Hand-written differential tests: Triton canary_plan_step vs the torch reference, byte-equal."""
-
 from __future__ import annotations
 
 import random

@@ -1,5 +1,3 @@
-"""Hand-written differential tests: CUDA canary_verify_step vs the torch reference, byte-equal."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

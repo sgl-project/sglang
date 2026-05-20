@@ -1,9 +1,3 @@
-"""Plan-input builders for the two canary caller paths.
-
-Two builders construct or fill a :class:`PlanInput` from sglang state; the runner feeds it into
-``canary_plan_step`` alongside the pre-allocated VerifyPlan + WritePlan out buffers.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
