@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
+    round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -934,14 +935,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        if self._resolved_backend.is_flashinfer_trtllm():
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp8_moe_weights_for_flashinfer_trtllm,
             )
 
             # ModelOpt FP8 stores weights in [Up, Gate] order, so we need to swap
             align_fp8_moe_weights_for_flashinfer_trtllm(layer, swap_w13_halves=True)
-        elif get_moe_runner_backend().is_flashinfer_cutlass():
+        elif self._resolved_backend.is_flashinfer_cutlass():
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
             )
@@ -970,10 +971,53 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
 
+            # flashinfer_cutlass kernel requires intermediate_size to be a
+            # multiple of 16.  Pad weight tensors with zeros after loading.
+            # For gated activations (swiglu), w13 is [Up, Gate] concatenated
+            # along dim 1 — we must split, pad each half separately, and
+            # re-concat so the kernel's half-split stays aligned.
+            num_shards = 2 if layer.moe_runner_config.is_gated else 1
+            isp = layer.w13_weight.shape[1] // num_shards
+            if isp % 16 != 0:
+                pad_amount = round_up(isp, 16) - isp
+                w13_data = layer.w13_weight.data
+                if num_shards == 2:
+                    up_weight = w13_data[:, :isp, :]
+                    gate_weight = w13_data[:, isp:, :]
+                    layer.w13_weight = Parameter(
+                        torch.cat(
+                            [
+                                torch.nn.functional.pad(
+                                    up_weight, (0, 0, 0, pad_amount)
+                                ),
+                                torch.nn.functional.pad(
+                                    gate_weight, (0, 0, 0, pad_amount)
+                                ),
+                            ],
+                            dim=1,
+                        ),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.w13_weight = Parameter(
+                        torch.nn.functional.pad(
+                            w13_data, (0, 0, 0, pad_amount)
+                        ),
+                        requires_grad=False,
+                    )
+                layer.w2_weight = Parameter(
+                    torch.nn.functional.pad(layer.w2_weight.data, (0, pad_amount)),
+                    requires_grad=False,
+                )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        self._resolved_backend = moe_runner_backend
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
@@ -989,7 +1033,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
 
         if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
+            self._resolved_backend.is_flashinfer_trtllm()
             and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1035,7 +1079,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 dispatch_output, quant_info, self.moe_runner_config
             )
 
-        if get_moe_runner_backend().is_flashinfer_cutlass():
+        if self._resolved_backend.is_flashinfer_cutlass():
             activation = ACT_STR_TO_TYPE_MAP[self.moe_runner_config.activation]
             assert (
                 (
