@@ -6130,9 +6130,8 @@ class ServerArgs:
             help=(
                 "KV cache canary mode. 'off' disables the canary (default). 'log' "
                 "records mismatches to a violation buffer and logs them while the "
-                "server keeps running (production-safe). 'raise' performs a "
-                "cross-rank allreduce of the error flag and raises on every rank "
-                "to avoid TP deadlocks (CI lane)."
+                "server keeps running (production-safe). 'raise' fails the server "
+                "on the first detected mismatch (CI lane)."
             ),
         )
         parser.add_argument(
@@ -6142,13 +6141,11 @@ class ServerArgs:
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
-                "chain hash. Choices are derived from the ``RealKvHashMode`` "
-                "enum (kv_canary/consts.py) so the CLI surface and the "
-                "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
+                "chain hash. 'off' (default) "
                 "leaves the real_kv_hash slot field at zero. 'partial' "
-                "splitmix64-folds the first min(16, read_bytes) bytes of "
+                "splitmix64-folds the first 16 bytes of "
                 "each real-KV slot; useful when corruption is suspected but "
-                "overhead must stay tiny (max 16B read per slot). 'all' "
+                "overhead must stay tiny. 'all' "
                 "splitmix64-folds the full real-KV slot stride for maximum "
                 "coverage at higher cost. Catches "
                 "corruption that the pure-canary path misses because the "
