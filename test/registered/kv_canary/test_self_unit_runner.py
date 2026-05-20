@@ -393,17 +393,13 @@ class TestPlanRefOverflowGate(CustomTestCase):
 
     def test_plan_ref_sets_enable_zero_and_clamps_when_overflow(self):
         # requested = sum(prefix_lens) = 8 > capacity = 4.
-        plan = self._run_plan_ref(
-            verify_capacity=4, bs=2, prefix_lens=[5, 5]
-        )
+        plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
         self.assertEqual(int(plan.enable[0].item()), 0)
         self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
 
     def test_plan_ref_sets_enable_one_when_within_capacity(self):
         # requested = 4 <= capacity = 16.
-        plan = self._run_plan_ref(
-            verify_capacity=16, bs=2, prefix_lens=[2, 2]
-        )
+        plan = self._run_plan_ref(verify_capacity=16, bs=2, prefix_lens=[2, 2])
         self.assertEqual(int(plan.enable[0].item()), 1)
         self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
 
