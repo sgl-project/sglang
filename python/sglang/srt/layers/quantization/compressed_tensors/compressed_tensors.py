@@ -492,17 +492,25 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     def _is_wNa16_group_channel(
-        self, weight_quant: BaseModel, input_quant: BaseModel
+        self,
+        weight_quant: BaseModel,
+        input_quant: Optional[BaseModel],
+        allow_asymmetric: bool = False,
     ) -> bool:
         input_quant_none = input_quant is None
-        is_symmetric = weight_quant.symmetric
+        is_supported_symmetry = weight_quant.symmetric or allow_asymmetric
         is_channel_group = (
             weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        return (
+            is_channel_group
+            and input_quant_none
+            and is_supported_symmetry
+            and is_static
+        )
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -545,7 +553,9 @@ class CompressedTensorsConfig(QuantizationConfig):
     ) -> CompressedTensorsLinearScheme:
 
         # Detect If Mixed Precision
-        if self._is_wNa16_group_channel(weight_quant, input_quant):
+        if self._is_wNa16_group_channel(
+            weight_quant, input_quant, allow_asymmetric=True
+        ):
             if (
                 self.quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
@@ -554,6 +564,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
                     actorder=weight_quant.actorder,
                 )
             else:
