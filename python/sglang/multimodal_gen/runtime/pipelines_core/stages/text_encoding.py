@@ -326,7 +326,6 @@ class TextEncodingStage(PipelineStage):
         assert len(self.text_encoders) == len(
             server_args.pipeline_config.text_encoder_configs
         )
-        self._apply_nvtx_gate(batch.is_warmup)
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None

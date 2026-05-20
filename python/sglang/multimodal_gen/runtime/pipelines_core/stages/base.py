@@ -67,6 +67,8 @@ class PipelineStage(StageDedupMixin, ABC):
         self._profile_stage_name: str | None = None
         # Layerwise NVTX hooks; registered lazily via _apply_nvtx_gate.
         self._nvtx_hooks: DiffusionNvtxHooks | None = None
+        self._nvtx_zero_warned: bool = False
+        self._current_use_nvtx: bool = False
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -220,7 +222,9 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def _maybe_register_nvtx_hooks(self) -> None:
         """Idempotently attach hooks. No-op when the flag is off or no
-        modules are available yet (retries on the next call)."""
+        modules are available yet (retries on the next call). The
+        zero-modules warning fires at most once per stage instance to
+        keep lazy-load paths from spamming logs."""
         if not self.server_args.enable_layerwise_nvtx_marker:
             return
         if self._nvtx_hooks is not None:
@@ -232,10 +236,12 @@ class PipelineStage(StageDedupMixin, ABC):
                 continue
             total += hooks.register_hooks(module, prefix=prefix)
         if total == 0:
-            logger.warning(
-                "[%s] NVTX flag set but no modules available; will retry.",
-                self.__class__.__name__,
-            )
+            if not self._nvtx_zero_warned:
+                logger.warning(
+                    "[%s] NVTX flag set but no modules available; will retry.",
+                    self.__class__.__name__,
+                )
+                self._nvtx_zero_warned = True
             return
         logger.info(
             "[%s] Registered NVTX hooks on %d submodules",
@@ -247,14 +253,26 @@ class PipelineStage(StageDedupMixin, ABC):
     def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
         """Register (if needed) and toggle hooks for this request.
 
-        Returns the resolved ``use_nvtx`` flag for callers that gate
-        additional explicit NVTX ranges on the same condition.
+        Caches the resolved ``use_nvtx`` value on ``self`` so
+        ``forward`` implementations that need to gate their own explicit
+        NVTX ranges can read it via :attr:`current_use_nvtx` instead of
+        recomputing.
         """
         self._maybe_register_nvtx_hooks()
         use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
         if self._nvtx_hooks is not None:
             self._nvtx_hooks.set_enabled(use_nvtx)
+        self._current_use_nvtx = use_nvtx
         return use_nvtx
+
+    @property
+    def current_use_nvtx(self) -> bool:
+        """Last resolved ``use_nvtx`` value from :meth:`_apply_nvtx_gate`.
+
+        ``forward`` implementations can read this to gate explicit
+        ``maybe_nvtx_range`` blocks without re-evaluating the flag.
+        """
+        return self._current_use_nvtx
 
     def _detach_nvtx_hooks(self) -> None:
         """Remove all hooks; call when the underlying module is about to
@@ -353,6 +371,11 @@ class PipelineStage(StageDedupMixin, ABC):
         except Exception as e:
             logger.error("Input verification failed for %s: %s", stage_name, str(e))
             raise
+
+        # Register and toggle layerwise NVTX hooks once per call. Stages
+        # whose components are not yet loaded (lazy load) are no-ops here
+        # and will register on the next call once modules become available.
+        self._apply_nvtx_gate(batch.is_warmup)
 
         # Execute the actual stage logic with unified profiling
         with StageProfiler(

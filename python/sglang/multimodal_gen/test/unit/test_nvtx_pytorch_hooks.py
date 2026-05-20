@@ -133,6 +133,7 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         hooks = DiffusionNvtxHooks()
         dummy = torch.nn.Linear(2, 2)
         hooks._module_to_name_map[dummy] = "dummy"
+        hooks.set_enabled(True)
         with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
             nvtx_pytorch_hooks.nvtx, "range_pop"
         ) as pop:
@@ -143,6 +144,12 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         self.assertIn("dummy", marker)
         self.assertIn("[2, 3]", marker)
         pop.assert_called_once_with()
+
+    def test_default_enabled_is_false(self) -> None:
+        """Default off so an unguarded forward (e.g. early warmup) cannot
+        emit ranges; the caller must explicitly enable via set_enabled
+        (typically through ``PipelineStage._apply_nvtx_gate``)."""
+        self.assertFalse(DiffusionNvtxHooks()._enabled)
 
     def test_post_hook_fires_on_forward_exception(self) -> None:
         """Regression: ``always_call=True`` on the registered post-hook
@@ -157,6 +164,7 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         model = _RaisingModule()
         hooks = DiffusionNvtxHooks()
         hooks.register_hooks(model, prefix="raising")
+        hooks.set_enabled(True)
         with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
             nvtx_pytorch_hooks.nvtx, "range_pop"
         ) as pop:
@@ -178,10 +186,13 @@ class _StubStage:
 
     def __init__(self, modules, enable_flag: bool) -> None:
         self._nvtx_hooks = None
+        self._nvtx_zero_warned = False
+        self._current_use_nvtx = False
         self._modules = modules
         self.server_args = type(
             "Args", (), {"enable_layerwise_nvtx_marker": enable_flag}
         )()
+        self.zero_warn_count = 0  # tracked by the stub for spam-test
 
     def _nvtx_hookable_modules(self):
         return self._modules
@@ -198,6 +209,9 @@ class _StubStage:
                 continue
             total += hooks.register_hooks(module, prefix=prefix)
         if total == 0:
+            if not self._nvtx_zero_warned:
+                self.zero_warn_count += 1  # stub tracks calls to "warning"
+                self._nvtx_zero_warned = True
             return
         self._nvtx_hooks = hooks
 
@@ -206,7 +220,12 @@ class _StubStage:
         use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
         if self._nvtx_hooks is not None:
             self._nvtx_hooks.set_enabled(use_nvtx)
+        self._current_use_nvtx = use_nvtx
         return use_nvtx
+
+    @property
+    def current_use_nvtx(self) -> bool:
+        return self._current_use_nvtx
 
     def _detach_nvtx_hooks(self):
         if self._nvtx_hooks is not None:
@@ -237,6 +256,22 @@ class TestStageMixin(unittest.TestCase):
         stage._detach_nvtx_hooks()
         stage._maybe_register_nvtx_hooks()
         self.assertIsNotNone(stage._nvtx_hooks)
+
+    def test_zero_modules_warning_fires_once(self) -> None:
+        # A lazy-loaded stage may have zero modules for several requests;
+        # the warning must not spam every call.
+        stage = _StubStage(modules=[], enable_flag=True)
+        for _ in range(5):
+            stage._maybe_register_nvtx_hooks()
+        self.assertEqual(stage.zero_warn_count, 1)
+
+    def test_current_use_nvtx_reflects_last_gate(self) -> None:
+        stage = _StubStage([(torch.nn.Linear(2, 2), "m")], enable_flag=True)
+        self.assertFalse(stage.current_use_nvtx)  # before any gate
+        stage._apply_nvtx_gate(is_warmup=False)
+        self.assertTrue(stage.current_use_nvtx)
+        stage._apply_nvtx_gate(is_warmup=True)
+        self.assertFalse(stage.current_use_nvtx)
 
 
 class TestCollectInputShapes(unittest.TestCase):
