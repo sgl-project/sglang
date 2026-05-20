@@ -74,14 +74,16 @@ def launch_endpoints_per_forward(
         input_ids = input_ids.to(torch.int32)
 
     num_tokens = int(positions.shape[0])
-    assert expected_inputs.tokens.shape[0] == num_tokens, (
-        f"kv-canary: expected_inputs.tokens shape {expected_inputs.tokens.shape[0]} "
-        f"!= num_tokens {num_tokens}; caller must slice before invoking"
-    )
-    assert expected_inputs.positions.shape[0] == num_tokens, (
-        f"kv-canary: expected_inputs.positions shape {expected_inputs.positions.shape[0]} "
-        f"!= num_tokens {num_tokens}; caller must slice before invoking"
-    )
+    if expected_inputs.tokens.shape[0] != num_tokens:
+        raise RuntimeError(
+            f"kv-canary: expected_inputs.tokens shape {expected_inputs.tokens.shape[0]} "
+            f"!= num_tokens {num_tokens}; caller must slice before invoking"
+        )
+    if expected_inputs.positions.shape[0] != num_tokens:
+        raise RuntimeError(
+            f"kv-canary: expected_inputs.positions shape {expected_inputs.positions.shape[0]} "
+            f"!= num_tokens {num_tokens}; caller must slice before invoking"
+        )
 
     for endpoint in endpoints:
         if not _endpoint_belongs_to_group(endpoint, group):

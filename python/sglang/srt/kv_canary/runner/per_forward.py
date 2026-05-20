@@ -98,17 +98,19 @@ class PerForwardOrchestrator:
 
         bs = int(forward_batch.batch_size)
         num_tokens = int(forward_batch.positions.shape[0])
-        assert bs <= self._write_req_capacity, (
-            f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
-            f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
-            f"or check install_canary._compute_launch_capacities"
-        )
-        assert num_tokens <= self._write_entry_capacity, (
-            f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
-            f"write_entry_capacity={self._write_entry_capacity}; raise "
-            f"--chunked-prefill-size / --max-prefill-tokens or check "
-            f"install_canary._compute_launch_capacities"
-        )
+        if bs > self._write_req_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
+                f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
+                f"or check install_canary._compute_launch_capacities"
+            )
+        if num_tokens > self._write_entry_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
+                f"write_entry_capacity={self._write_entry_capacity}; raise "
+                f"--chunked-prefill-size / --max-prefill-tokens or check "
+                f"install_canary._compute_launch_capacities"
+            )
 
         # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
         # group; if it exceeds verify_capacity the plan kernel masks stores past capacity while
@@ -205,10 +207,11 @@ def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
     forward_mode = forward_batch.forward_mode
     if forward_mode is not None and forward_mode.is_extend():
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        assert extend_prefix_lens_cpu is not None, (
-            "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
-            "scheduler should populate it before forward"
-        )
+        if extend_prefix_lens_cpu is None:
+            raise RuntimeError(
+                "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
+                "scheduler should populate it before forward"
+            )
         return int(sum(extend_prefix_lens_cpu[:bs]))
     return int(forward_batch.seq_lens_sum) - bs
 

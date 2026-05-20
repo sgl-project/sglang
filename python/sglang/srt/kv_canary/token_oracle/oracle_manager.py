@@ -75,10 +75,11 @@ class TokenOracleManager:
                 "(input_check_mode == ON required)"
             )
 
-        assert int(stash.shape[0]) == int(logits.shape[0]), (
-            f"TokenOracleManager.sample: stashed req_pool_indices length "
-            f"{int(stash.shape[0])} != logits batch size {int(logits.shape[0])}"
-        )
+        if int(stash.shape[0]) != int(logits.shape[0]):
+            raise RuntimeError(
+                f"TokenOracleManager.sample: stashed req_pool_indices length "
+                f"{int(stash.shape[0])} != logits batch size {int(logits.shape[0])}"
+            )
 
         return self.oracle.expected_tokens(
             req_ids=stash, positions=positions.to(torch.int64)
@@ -103,7 +104,8 @@ def _build_req_id_per_token(
     else:
         result = req_pool_indices_per_row
 
-    assert (
-        int(result.shape[0]) == num_tokens
-    ), f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
+    if int(result.shape[0]) != num_tokens:
+        raise RuntimeError(
+            f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
+        )
     return result
