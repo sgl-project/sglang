@@ -50,7 +50,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 ```{note}
 - FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
-- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend-nsa) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md) for details.
+- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32.md) for details.
 ```
 
 ```{warning}
@@ -107,7 +107,7 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
 ```
 
-### DSA Attention Backend (NSA)
+### DSA Attention Backend
 
 DSA (Deepseek Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it and is selected via `--attention-backend dsa` (the legacy alias `--attention-backend nsa` is deprecated and kept for one release).
 
