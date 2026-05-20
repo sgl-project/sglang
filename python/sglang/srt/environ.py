@@ -671,7 +671,7 @@ class Envs:
     # When >0, the canary self-test hook flips one byte of the real KV pool
     # at an alive-but-not-verified-this-step slot with this probability per
     # forward, proving the periodic sweep's independent detection value.
-    # Requires --kv-canary-real-data-sweep-every-n-steps > 0.
+    # Requires --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)

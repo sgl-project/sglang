@@ -679,7 +679,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     kv_canary: str = "off"
     kv_canary_real_data: str = "off"
-    kv_canary_real_data_sweep_every_n_steps: int = 0
+    kv_canary_sweep_interval: int = 0
     kv_canary_input_check_mode: Optional[str] = None
     kv_canary_jitter_enabled: bool = False
     kv_canary_jitter_per_slot_fire_prob: Optional[float] = None
@@ -6093,9 +6093,9 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--kv-canary-real-data-sweep-every-n-steps",
+            "--kv-canary-sweep-interval",
             type=int,
-            default=ServerArgs.kv_canary_real_data_sweep_every_n_steps,
+            default=ServerArgs.kv_canary_sweep_interval,
             help=(
                 "Every N forward steps, run a full-pool sweep that verifies "
                 "real_kv_hash on every slot owned by an alive req in the "
@@ -7167,15 +7167,15 @@ class ServerArgs:
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_canary_real_data_sweep_every_n_steps > 0:
+        if self.kv_canary_sweep_interval > 0:
             if self.kv_canary_real_data == "off":
                 raise ValueError(
-                    "--kv-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-canary-sweep-interval requires "
                     "--kv-canary-real-data in {bit, all}"
                 )
             if self.kv_canary == "off":
                 raise ValueError(
-                    "--kv-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-canary-sweep-interval requires "
                     "--kv-canary in {log, raise}"
                 )
 

@@ -192,7 +192,7 @@ def walk_radix_cache_for_canary(
     Returns three host int32 tensors (then runner H2D-copies). NOT SWA-translated — caller does
     the LUT lookup before packing into PlanInput.
 
-    Cost: O(total radix slots). Runs on host every sweep_every_n_steps; bounded by pool size.
+    Cost: O(total radix slots). Runs on host every sweep_interval; bounded by pool size.
     If profiling shows this is the sweep hot path, future work can move it to a Triton kernel —
     but for sweep cadences in the 64..1024 range, host walk is fine.
     """

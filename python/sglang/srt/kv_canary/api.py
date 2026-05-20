@@ -88,7 +88,7 @@ def install_canary(
         "install_canary: mode=%s tags=%d sweep_cadence=%d",
         config.mode,
         runner.active_tag_count,
-        config.sweep_every_n_steps,
+        config.sweep_interval,
     )
     return runner
 

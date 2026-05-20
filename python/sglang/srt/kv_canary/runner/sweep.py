@@ -71,12 +71,12 @@ class SweepOrchestrator:
         self._radix_cache = radix_cache
 
     def maybe_run_sweep(self) -> None:
-        if self._config.sweep_every_n_steps == 0:
+        if self._config.sweep_interval == 0:
             return
         step_counter = self._pump_and_allreduce.step_counter
         if (
             self._last_sweep_step >= 0
-            and step_counter - self._last_sweep_step < self._config.sweep_every_n_steps
+            and step_counter - self._last_sweep_step < self._config.sweep_interval
         ):
             return
         self._last_sweep_step = step_counter

@@ -32,7 +32,7 @@ class CanaryConfig:
             violations propagate to host as RuntimeError after the next D2H pump.
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously
             (default 1024); overflow only drops detail beyond row N, the monotonic counter still grows.
-        sweep_every_n_steps: 0 disables sweep entirely; positive N means every N-th forward step the runner
+        sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
             additionally walks all alive slots (running ∪ radix-orphan) and verifies them.
         real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Uniform across head/tail/sweep launches; if a
             workload wants per-launch granularity it bumps mode globally (BIT is cheap enough this is fine).
@@ -61,7 +61,7 @@ class CanaryConfig:
 
     mode: Literal["off", "on", "raise"]
     ring_capacity: int = 1024
-    sweep_every_n_steps: int = 64
+    sweep_interval: int = 64
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.BIT
     input_check_mode: CanaryInputCheckMode = CanaryInputCheckMode.OFF
     perturb_req_to_token_prob: float = 0.0
@@ -105,11 +105,11 @@ class CanaryConfig:
                 f"{list(CanaryInputCheckMode.__members__)}, got {input_check_raw!r}"
             )
 
-        sweep_cli = int(server_args.kv_canary_real_data_sweep_every_n_steps or 0)
+        sweep_cli = int(server_args.kv_canary_sweep_interval or 0)
         if sweep_cli > 0:
-            sweep_every_n_steps = sweep_cli
+            sweep_interval = sweep_cli
         else:
-            sweep_every_n_steps = envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get()
+            sweep_interval = envs.SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS.get()
 
         jitter_enabled_env = envs.SGLANG_KV_CANARY_JITTER_ENABLED.get()
         jitter_enabled = (
@@ -137,7 +137,7 @@ class CanaryConfig:
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
-            sweep_every_n_steps=sweep_every_n_steps,
+            sweep_interval=sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             input_check_mode=CanaryInputCheckMode[input_check_raw],
             perturb_req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),

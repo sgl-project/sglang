@@ -141,7 +141,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_DSV4FlashBase, unittest.Test
         *_DSV4_BASE_ARGS,
         "--kv-canary-real-data",
         "all",
-        "--kv-canary-real-data-sweep-every-n-steps",
+        "--kv-canary-sweep-interval",
         "1",
     ]
     allow_launch_failure: ClassVar[bool] = True
@@ -175,7 +175,7 @@ class TestSweepOrphanRadixDetectsViolation(_DSV4FlashBase, unittest.TestCase):
         *_DSV4_BASE_ARGS,
         "--kv-canary-real-data",
         "all",
-        "--kv-canary-real-data-sweep-every-n-steps",
+        "--kv-canary-sweep-interval",
         "1",
     ]
     allow_launch_failure: ClassVar[bool] = True

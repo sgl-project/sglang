@@ -120,7 +120,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "all",
-        "--kv-canary-real-data-sweep-every-n-steps",
+        "--kv-canary-sweep-interval",
         "1",
     ]
     allow_launch_failure: ClassVar[bool] = True
@@ -161,7 +161,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
         "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "all",
-        "--kv-canary-real-data-sweep-every-n-steps",
+        "--kv-canary-sweep-interval",
         "1",
     ]
     allow_launch_failure: ClassVar[bool] = True

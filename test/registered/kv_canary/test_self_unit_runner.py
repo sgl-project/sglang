@@ -156,7 +156,7 @@ class TestSelfUnitRunner(CustomTestCase):
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
-            sweep_every_n_steps=4,
+            sweep_interval=4,
             allreduce_violation_signal=False,
         )
         runner = _make_runner(device=self.device, config=config)
@@ -183,7 +183,7 @@ class TestSelfUnitRunner(CustomTestCase):
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
-            sweep_every_n_steps=1,
+            sweep_interval=1,
             allreduce_violation_signal=False,
         )
         runner = _make_runner(device=self.device, config=config)
@@ -317,7 +317,7 @@ class TestSelfUnitRunner(CustomTestCase):
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
-            sweep_every_n_steps=1,
+            sweep_interval=1,
             allreduce_violation_signal=False,
         )
         runner = _make_runner(device=self.device, config=config)
