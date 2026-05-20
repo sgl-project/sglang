@@ -1278,9 +1278,6 @@ class Scheduler(
             return
 
         self.future_map = self.spec_algorithm.create_future_map(
-            self.max_running_requests,
-            self.chunked_prefill_size,
-            self.model_config.context_len,
             self.device,
             self.req_to_token_pool,
         )

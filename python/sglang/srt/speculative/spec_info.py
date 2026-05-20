@@ -117,22 +117,12 @@ class SpeculativeAlgorithm(Enum):
 
     def create_future_map(
         self,
-        max_running_requests: int,
-        chunked_prefill_size: int,
-        context_len: int,
         device: torch.device,
         req_to_token_pool,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(
-            max_running_requests,
-            chunked_prefill_size,
-            context_len,
-            device,
-            self,
-            req_to_token_pool,
-        )
+        return FutureMap(device, self, req_to_token_pool)
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
