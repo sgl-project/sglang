@@ -454,6 +454,11 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
+            # GPU JPEG decode returns a (C, H, W) uint8 torch.Tensor;
+            # convert to PIL Image so that PIL-specific operations below work.
+            if isinstance(image, torch.Tensor):
+                image = Image.fromarray(image.permute(1, 2, 0).cpu().numpy())
+
             image_shapes.append(image.size)
 
             if image.size[0] <= 640 and image.size[1] <= 640:
