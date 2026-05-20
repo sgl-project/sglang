@@ -621,9 +621,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(
-                        x.value
-                    )
+                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(x.value)
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -635,9 +633,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
                     # tombstoned leaf. Treat it like an internal tombstone.
-                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(
-                        x.value
-                    )
+                    swa_num_evicted += self.token_to_kv_pool_allocator.free_swa(x.value)
 
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
                     self.swa_lru_list.remove_node(x)
