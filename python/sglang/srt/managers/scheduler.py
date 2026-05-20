@@ -507,7 +507,6 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
-        # steppable_engine stepping mode (see SOT §3.3)
         self._stepping_mode: bool = False
         self._stepping_queue: List[Any] = []
         self._armed_perturbation = None
@@ -1851,9 +1850,9 @@ class Scheduler(
         return recv_reqs
 
     def _recv_requests_stepping(self, *, initial_msgs: List[Any]) -> List[Any]:
-        """Stepping-mode recv loop. See steppable-engine SOT §3.3.
+        """Stepping-mode recv loop.
 
-        Invariant: returns only when self._stepping_queue contains a StepReq;
+        Returns only when self._stepping_queue contains a StepReq;
         return value is the prefix before that StepReq (StepReq itself filtered out).
         """
         from sglang.srt.steppable_engine.messages import (

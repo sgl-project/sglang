@@ -1,4 +1,4 @@
-"""Scheduler-side handlers for steppable_engine messages (SOT §3.4 / §3.5)."""
+"""Scheduler-side handlers for steppable_engine messages."""
 
 from __future__ import annotations
 
