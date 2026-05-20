@@ -218,9 +218,7 @@ def build_modelopt_nvfp4_transformer(
         patterns.extend(keep_bf16_patterns)
 
     resolved_swap_weight_nibbles = (
-        swap_weight_nibbles
-        if swap_weight_nibbles is not None
-        else (False if pattern_preset == "flux1-nvfp4" else True)
+        swap_weight_nibbles if swap_weight_nibbles is not None else False
     )
     output_config = _updated_quant_config(
         _load_config(source_dir),
@@ -373,7 +371,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Whether the runtime should swap packed FP4 nibbles before padding. "
-            "Defaults to false for --pattern-preset flux1-nvfp4 and true otherwise."
+            "Defaults to false."
         ),
     )
     parser.add_argument(

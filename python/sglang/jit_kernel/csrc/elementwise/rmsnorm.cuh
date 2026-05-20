@@ -85,17 +85,22 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_double(const RMSNormPar
   }
 
   sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto warp_id = threadIdx.x / kWarpThreads;
-  smem[warp_id] = sum_of_squares;
-  __syncthreads();
-  if (warp_id == 0) {
-    const auto tx = threadIdx.x;
-    const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
-    sum_of_squares = warp::reduce_sum(local_sum);
-    smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+  float norm_factor;
+  if constexpr (kNumWarps == 1) {
+    norm_factor = math::rsqrt(sum_of_squares / kDim + eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    smem[warp_id] = sum_of_squares;
+    __syncthreads();
+    if (warp_id == 0) {
+      const auto tx = threadIdx.x;
+      const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+      sum_of_squares = warp::reduce_sum(local_sum);
+      smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+    }
+    __syncthreads();
+    norm_factor = smem[warp_id];
   }
-  __syncthreads();
-  const float norm_factor = smem[warp_id];
 
   Storage output_first, output_second;
 #pragma unroll
@@ -147,17 +152,22 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParam
   }
 
   sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto warp_id = threadIdx.x / kWarpThreads;
-  smem[warp_id] = sum_of_squares;
-  __syncthreads();
-  if (warp_id == 0) {
-    const auto tx = threadIdx.x;
-    const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
-    sum_of_squares = warp::reduce_sum(local_sum);
-    smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+  float norm_factor;
+  if constexpr (kNumWarps == 1) {
+    norm_factor = math::rsqrt(sum_of_squares / kDim + eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    smem[warp_id] = sum_of_squares;
+    __syncthreads();
+    if (warp_id == 0) {
+      const auto tx = threadIdx.x;
+      const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+      sum_of_squares = warp::reduce_sum(local_sum);
+      smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+    }
+    __syncthreads();
+    norm_factor = smem[warp_id];
   }
-  __syncthreads();
-  const float norm_factor = smem[warp_id];
 
   Storage output_vec;
 #pragma unroll
