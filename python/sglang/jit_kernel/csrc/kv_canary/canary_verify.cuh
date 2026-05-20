@@ -116,18 +116,18 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
       fold_real_kv_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
   const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
 
-  int64_t fail_reason_bits = 0;
+  FailReason fail_reason_bits{};
   if (stored_chain_hash != expected_chain_hash) {
-    fail_reason_bits |= kFailReasonChainHash;
+    fail_reason_bits |= FailReason::kChainHash;
   }
   if (stored_position != expected_position) {
-    fail_reason_bits |= kFailReasonPosition;
+    fail_reason_bits |= FailReason::kPosition;
   }
   if (stored_real_kv_hash != expected_real_kv_hash) {
-    fail_reason_bits |= kFailReasonRealKvHash;
+    fail_reason_bits |= FailReason::kRealKvHash;
   }
 
-  if (fail_reason_bits != 0) {
+  if (fail_reason_bits != FailReason{}) {
     // Verify path has no token oracle, so the violation row's "expected_token" column is 0 (matches the
     // torch reference). The "stored_chain_hash" column carries the slot's stored prev_hash; the
     // "expected_aux" column carries the recomputed expected chain hash.
@@ -142,7 +142,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
         /* expected_token = */ 0,
         stored_chain_hash,
         /* expected_aux = */ expected_chain_hash,
-        fail_reason_bits);
+        static_cast<int64_t>(fail_reason_bits));
   }
 }
 

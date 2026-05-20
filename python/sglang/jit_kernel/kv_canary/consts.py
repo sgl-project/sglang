@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import Final
 
 CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
@@ -21,11 +21,14 @@ VIOLATION_FIELD_STORED_CHAIN_HASH: Final[int] = 5
 VIOLATION_FIELD_EXPECTED_AUX: Final[int] = 6
 VIOLATION_FIELD_FAIL_REASON_BITS: Final[int] = 7
 
-FAIL_REASON_CHAIN_HASH: Final[int] = 1 << 0
-FAIL_REASON_POSITION: Final[int] = 1 << 1
-FAIL_REASON_REAL_KV_HASH: Final[int] = 1 << 2
-FAIL_REASON_WRITE_TOKEN_MISMATCH: Final[int] = 1 << 3
-FAIL_REASON_WRITE_POSITION_MISMATCH: Final[int] = 1 << 4
+
+class FailReason(IntFlag):
+    CHAIN_HASH = 1 << 0
+    POSITION = 1 << 1
+    REAL_KV_HASH = 1 << 2
+    WRITE_TOKEN_MISMATCH = 1 << 3
+    WRITE_POSITION_MISMATCH = 1 << 4
+
 
 MAX_REAL_KV_SOURCES: Final[int] = 4
 

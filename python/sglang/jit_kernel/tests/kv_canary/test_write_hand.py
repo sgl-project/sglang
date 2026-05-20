@@ -418,7 +418,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_WRITE_TOKEN_MISMATCH)
+    assert_only_bits_set(fail_bits, consts.FailReason.WRITE_TOKEN_MISMATCH)
     # Chain advances on actual (42), not expected (99). Stored token should be 42.
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_token == 42
@@ -462,7 +462,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_WRITE_POSITION_MISMATCH)
+    assert_only_bits_set(fail_bits, consts.FailReason.WRITE_POSITION_MISMATCH)
     _, stored_position, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_position == 7
     assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
@@ -1054,8 +1054,8 @@ def test_mock_violation_bit_injection_position_matrix(
     corrupt_slot = out_cache_locs[corruption_index]
 
     expected_bit = {
-        "MOCK_TOKEN": consts.FAIL_REASON_WRITE_TOKEN_MISMATCH,
-        "MOCK_POSITION": consts.FAIL_REASON_WRITE_POSITION_MISMATCH,
+        "MOCK_TOKEN": consts.FailReason.WRITE_TOKEN_MISMATCH,
+        "MOCK_POSITION": consts.FailReason.WRITE_POSITION_MISMATCH,
     }[bit_to_trigger]
 
     cuda_buf, ref_buf = _setup_pair()
@@ -1448,7 +1448,7 @@ def test_pseudo_mode_on_catches_token_mismatch() -> None:
     assert int(cuda_log.write_index[0].item()) >= 1
     bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
     assert (
-        bits & consts.FAIL_REASON_WRITE_TOKEN_MISMATCH
+        bits & consts.FailReason.WRITE_TOKEN_MISMATCH
     ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
 
 

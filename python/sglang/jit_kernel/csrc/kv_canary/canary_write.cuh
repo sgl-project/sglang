@@ -119,14 +119,14 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     if (p.pseudo_mode == CanaryPseudoMode::kOn) {
       const int64_t expected_token = static_cast<int64_t>(p.pseudo_expected_tokens[i]);
       const int64_t expected_position = static_cast<int64_t>(p.pseudo_expected_positions[i]);
-      int64_t mismatch_bits = 0;
+      FailReason mismatch_bits{};
       if (token != expected_token) {
-        mismatch_bits |= kFailReasonWriteTokenMismatch;
+        mismatch_bits |= FailReason::kWriteTokenMismatch;
       }
       if (position != expected_position) {
-        mismatch_bits |= kFailReasonWritePositionMismatch;
+        mismatch_bits |= FailReason::kWritePositionMismatch;
       }
-      if (mismatch_bits != 0) {
+      if (mismatch_bits != FailReason{}) {
         record_violation(
             p.violation_ring,
             p.violation_write_index,
@@ -139,7 +139,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
             /* stored_chain_hash (running running_prev_hash about to be written) = */
             static_cast<int64_t>(running_prev_hash),
             /* expected_aux = expected_position */ expected_position,
-            mismatch_bits);
+            static_cast<int64_t>(mismatch_bits));
       }
     }
 

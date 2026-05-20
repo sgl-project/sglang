@@ -264,7 +264,7 @@ def test_violation_token_mismatch() -> None:
 
     assert int(cuda_log.write_index[0].item()) == 1
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_CHAIN_HASH)
+    assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -306,7 +306,7 @@ def test_violation_position_mismatch() -> None:
 
     assert int(cuda_log.write_index[0].item()) == 1
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_POSITION)
+    assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -347,7 +347,7 @@ def test_violation_position_diverges_from_plan() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_POSITION)
+    assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -405,7 +405,7 @@ def test_violation_prev_hash_mismatch() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_CHAIN_HASH)
+    assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -487,7 +487,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
     )
 
     fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_REAL_KV_HASH)
+    assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -1110,7 +1110,7 @@ def test_violation_ring_fill_once_first_row() -> None:
     first_row_fail = int(
         cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
     )
-    assert first_row_fail & consts.FAIL_REASON_POSITION
+    assert first_row_fail & consts.FailReason.POSITION
 
 
 def test_violation_ring_overflow_counter_still_increments() -> None:
@@ -1394,9 +1394,9 @@ def test_violation_bit_injection_position_ring_state_matrix(
     corrupt_slot = slot_indices[corruption_index]
 
     expected_bit = {
-        "POSITION": consts.FAIL_REASON_POSITION,
-        "PREV_HASH": consts.FAIL_REASON_CHAIN_HASH,
-        "REAL_KV": consts.FAIL_REASON_REAL_KV_HASH,
+        "POSITION": consts.FailReason.POSITION,
+        "PREV_HASH": consts.FailReason.CHAIN_HASH,
+        "REAL_KV": consts.FailReason.REAL_KV_HASH,
     }[bit_to_trigger]
 
     if bit_to_trigger == "REAL_KV":
@@ -1708,7 +1708,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
     )
 
     fail_bits = int(cuda_log2.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, consts.FAIL_REASON_REAL_KV_HASH)
+    assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
 
 
@@ -1796,7 +1796,7 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
     expected_token_val = 0
     stored_chain_hash_val = anchor_hash_signed
     expected_aux_val = anchor_hash_signed
-    fail_reason_bits_val = consts.FAIL_REASON_POSITION
+    fail_reason_bits_val = consts.FailReason.POSITION
 
     expected_bytes = struct.pack(
         "<8q",
@@ -2030,7 +2030,7 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
     assert int(cuda_log.write_index[0].item()) >= 1
     bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
     assert (
-        bits & consts.FAIL_REASON_REAL_KV_HASH
+        bits & consts.FailReason.REAL_KV_HASH
     ), f"expected REAL_KV_HASH bit, got {bits:#b}"
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
@@ -2195,7 +2195,7 @@ def test_chain_head_anchored_on_constant() -> None:
     )
     assert int(cuda_log.write_index[0].item()) == 1
     bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert bits & consts.FAIL_REASON_CHAIN_HASH
+    assert bits & consts.FailReason.CHAIN_HASH
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -2240,9 +2240,9 @@ def test_position_mismatch_sets_position_bit_only() -> None:
     )
     assert int(cuda_log.write_index[0].item()) == 1
     bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert bits & consts.FAIL_REASON_POSITION, f"expected POSITION bit, got {bits:#b}"
+    assert bits & consts.FailReason.POSITION, f"expected POSITION bit, got {bits:#b}"
     assert (
-        bits & consts.FAIL_REASON_CHAIN_HASH
+        bits & consts.FailReason.CHAIN_HASH
     ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 

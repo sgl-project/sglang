@@ -111,15 +111,15 @@ def canary_verify_step_torch_reference(
         )
         expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
 
-        fail_reason = 0
+        fail_reason = consts.FailReason(0)
         if stored_chain_hash != expected_chain_hash:
-            fail_reason |= consts.FAIL_REASON_CHAIN_HASH
+            fail_reason |= consts.FailReason.CHAIN_HASH
         if stored_position != expected_position:
-            fail_reason |= consts.FAIL_REASON_POSITION
+            fail_reason |= consts.FailReason.POSITION
         if stored_real_kv_hash != expected_real_kv_hash:
-            fail_reason |= consts.FAIL_REASON_REAL_KV_HASH
+            fail_reason |= consts.FailReason.REAL_KV_HASH
 
-        if fail_reason != 0:
+        if fail_reason != consts.FailReason(0):
             row = [0] * consts.VIOLATION_FIELDS
             row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
             row[consts.VIOLATION_FIELD_SLOT_IDX] = slot_idx
@@ -128,7 +128,7 @@ def canary_verify_step_torch_reference(
             row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = 0
             row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = stored_chain_hash
             row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_chain_hash
-            row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = fail_reason
+            row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(fail_reason)
             violation_rows.append(row)
 
     if len(violation_rows) == 0:

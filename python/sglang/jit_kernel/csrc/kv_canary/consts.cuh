@@ -22,11 +22,22 @@ constexpr int kViolationFieldStoredChainHash = 5;
 constexpr int kViolationFieldExpectedAux = 6;
 constexpr int kViolationFieldFailReasonBits = 7;
 
-constexpr int64_t kFailReasonChainHash = 1LL << 0;
-constexpr int64_t kFailReasonPosition = 1LL << 1;
-constexpr int64_t kFailReasonRealKvHash = 1LL << 2;
-constexpr int64_t kFailReasonWriteTokenMismatch = 1LL << 3;
-constexpr int64_t kFailReasonWritePositionMismatch = 1LL << 4;
+enum class FailReason : int64_t {
+  kChainHash = 1LL << 0,
+  kPosition = 1LL << 1,
+  kRealKvHash = 1LL << 2,
+  kWriteTokenMismatch = 1LL << 3,
+  kWritePositionMismatch = 1LL << 4,
+};
+
+constexpr FailReason operator|(FailReason a, FailReason b) {
+  return static_cast<FailReason>(static_cast<int64_t>(a) | static_cast<int64_t>(b));
+}
+
+constexpr FailReason& operator|=(FailReason& a, FailReason b) {
+  a = a | b;
+  return a;
+}
 
 enum class RealKvHashMode : int32_t {
   kOff = 0,

@@ -134,14 +134,14 @@ def canary_write_step_torch_reference(
             )
 
             if pseudo_mode_on:
-                mismatch_bits = 0
+                mismatch_bits = consts.FailReason(0)
                 expected_token = int(pseudo_expected_tokens_host[i].item())
                 expected_position = int(pseudo_expected_positions_host[i].item())
                 if token != expected_token:
-                    mismatch_bits |= consts.FAIL_REASON_WRITE_TOKEN_MISMATCH
+                    mismatch_bits |= consts.FailReason.WRITE_TOKEN_MISMATCH
                 if position != expected_position:
-                    mismatch_bits |= consts.FAIL_REASON_WRITE_POSITION_MISMATCH
-                if mismatch_bits != 0:
+                    mismatch_bits |= consts.FailReason.WRITE_POSITION_MISMATCH
+                if mismatch_bits != consts.FailReason(0):
                     row = [0] * consts.VIOLATION_FIELDS
                     row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
                     row[consts.VIOLATION_FIELD_SLOT_IDX] = slot
@@ -152,7 +152,7 @@ def canary_write_step_torch_reference(
                         running_prev_hash
                     )
                     row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position
-                    row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = mismatch_bits
+                    row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(mismatch_bits)
                     violation_rows.append(row)
 
             buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token

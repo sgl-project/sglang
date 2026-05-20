@@ -36,7 +36,7 @@ def _parse_enum_class(source: str, enum_name: str) -> dict[str, int]:
         r"enum\s+class\s+" + re.escape(enum_name) + r"\s*:\s*[^\{]+\{([^}]+)\}"
     )
     body = pattern.search(source).group(1)
-    member_re = re.compile(r"(k[A-Za-z]\w*)\s*=\s*([^,\s]+)")
+    member_re = re.compile(r"(k[A-Za-z]\w*)\s*=\s*([^,]+)")
     return {name: _decode(rhs) for name, rhs in member_re.findall(body)}
 
 
@@ -53,7 +53,7 @@ def test_int_consts_sync() -> None:
 
 def test_enums_sync() -> None:
     cuh = _CONSTS_CUH.read_text(encoding="utf-8")
-    for enum_name in ("RealKvHashMode", "CanaryPseudoMode"):
+    for enum_name in ("RealKvHashMode", "CanaryPseudoMode", "FailReason"):
         cpp_members = _parse_enum_class(cuh, enum_name)
         py_enum = getattr(consts, enum_name)
         cpp_normalized = {
