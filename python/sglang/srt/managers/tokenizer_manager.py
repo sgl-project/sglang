@@ -1041,6 +1041,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                agent_hints=getattr(obj, 'agent_hints', None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available

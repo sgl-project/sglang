@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.evict_policy import (
+    AgentAwareEvictionStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -227,6 +228,13 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Agent-aware fields for agentic workload optimization
+        self.workflow_ids: set = set()  # Associated workflow IDs
+        self.agent_ids: set = set()  # Associated agent IDs
+        self.steps_to_execution: int = -1  # Steps until next use (-1 = unknown)
+        self.ttl_expire_time: float = float("inf")  # TTL expiration timestamp
+        self.is_template: bool = False  # Whether this is a template node
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -306,9 +314,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
 
+        elif self.eviction_policy == "agent_aware":
+            self.eviction_strategy: EvictionStrategy = AgentAwareEvictionStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'agent_aware'."
             )
 
         self.evictable_leaves = set()
@@ -472,6 +482,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
+            # Propagate agent-aware metadata to the cached tree nodes
+            self._annotate_agent_metadata(req)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
@@ -549,6 +561,30 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+    def _annotate_agent_metadata(self, req: "Req"):
+        """Propagate agent-aware metadata from a request to its cached TreeNodes.
+
+        Walks from req.last_node up to the root, annotating each node with
+        the request's workflow_id and agent_id so that eviction strategies
+        can make workflow-aware decisions.
+        """
+        workflow_id = getattr(req, "workflow_id", None)
+        agent_id = getattr(req, "agent_id", None)
+        cache_ttl_ms = getattr(req, "cache_ttl_ms", None)
+        if not workflow_id and not agent_id:
+            return
+
+        node = getattr(req, "last_node", None)
+        while node is not None and node != self.root_node:
+            if workflow_id:
+                node.workflow_ids.add(workflow_id)
+            if agent_id:
+                node.agent_ids.add(agent_id)
+            if cache_ttl_ms is not None and cache_ttl_ms > 0:
+                expire = time.monotonic() + cache_ttl_ms / 1000.0
+                node.ttl_expire_time = max(node.ttl_expire_time, expire) if node.ttl_expire_time != float("inf") else expire
+            node = node.parent
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

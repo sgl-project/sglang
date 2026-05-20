@@ -190,6 +190,35 @@ ToolCallConstraint: TypeAlias = Union[
 ]
 
 
+class AgentHints(BaseModel):
+    """Agent-aware hints for KV cache optimization in agentic workloads.
+
+    These hints allow the serving system to understand the workflow topology,
+    make better eviction decisions, and optimize cross-agent KV cache reuse.
+    Compatible with NVIDIA Dynamo agent_hints specification.
+    """
+
+    # Workflow identification
+    workflow_id: Optional[str] = None  # Unique ID for the entire workflow/session
+    agent_id: Optional[str] = None  # Unique ID for this agent instance
+    step_id: Optional[str] = None  # Current step ID within the workflow
+    step_index: Optional[int] = None  # Step ordinal in the workflow (0-based)
+    total_steps: Optional[int] = None  # Total steps if known (for progress estimation)
+
+    # DAG topology
+    parent_step_id: Optional[str] = None  # Parent step in the workflow DAG
+    children_step_ids: Optional[List[str]] = None  # Child steps in the DAG
+
+    # Tool call hints
+    tool_name: Optional[str] = None  # Name of the tool about to be called
+    expected_tool_duration_ms: Optional[int] = None  # Expected tool call duration
+
+    # Cache management hints
+    cache_ttl_ms: Optional[int] = None  # Requested TTL for KV cache retention
+    shared_prefix_hash: Optional[str] = None  # Hash of a reusable prefix
+    reuse_hint: Optional[str] = None  # "keep" | "offload" | "evict"
+
+
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -327,6 +356,9 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # Agent-aware hints for agentic workload optimization
+    agent_hints: Optional[AgentHints] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -692,6 +724,9 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # Agent-aware hints for agentic workload optimization
+    agent_hints: Optional[AgentHints] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

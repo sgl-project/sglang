@@ -647,6 +647,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        agent_hints: Optional[Dict] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -746,6 +747,33 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+
+        # Agent-aware hints for agentic workload optimization
+        self.agent_hints = agent_hints
+        # Extracted agent-aware fields for fast access
+        self.workflow_id: Optional[str] = None
+        self.agent_id: Optional[str] = None
+        self.step_id: Optional[str] = None
+        self.step_index: Optional[int] = None
+        self.total_steps: Optional[int] = None
+        self.parent_step_id: Optional[str] = None
+        self.children_step_ids: Optional[list] = None
+        self.tool_name: Optional[str] = None
+        self.expected_tool_duration_ms: Optional[int] = None
+        self.cache_ttl_ms: Optional[int] = None
+        self.reuse_hint: Optional[str] = None
+        if agent_hints:
+            self.workflow_id = agent_hints.get("workflow_id")
+            self.agent_id = agent_hints.get("agent_id")
+            self.step_id = agent_hints.get("step_id")
+            self.step_index = agent_hints.get("step_index")
+            self.total_steps = agent_hints.get("total_steps")
+            self.parent_step_id = agent_hints.get("parent_step_id")
+            self.children_step_ids = agent_hints.get("children_step_ids")
+            self.tool_name = agent_hints.get("tool_name")
+            self.expected_tool_duration_ms = agent_hints.get("expected_tool_duration_ms")
+            self.cache_ttl_ms = agent_hints.get("cache_ttl_ms")
+            self.reuse_hint = agent_hints.get("reuse_hint")
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

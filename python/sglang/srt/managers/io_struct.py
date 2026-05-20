@@ -233,6 +233,9 @@ class GenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
+    # Agent-aware hints for agentic workload optimization
+    agent_hints: Optional[Dict] = None
+
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -778,6 +781,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # Agent-aware hints for agentic workload optimization
+    agent_hints: Optional[Dict] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
