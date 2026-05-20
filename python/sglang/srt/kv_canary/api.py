@@ -15,6 +15,7 @@ from sglang.srt.kv_canary.runner.canary_runner import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
@@ -27,18 +28,24 @@ def install_canary(
     *,
     server_args: "ServerArgs",
     model_runner: "ModelRunner",
+    oracle_sampler_hook: Optional["OracleSamplerHook"] = None,
 ) -> Optional[CanaryRunner]:
-    """Install canary on a ModelRunner. Returns None if config.mode == "off". Otherwise:
+    """Build and install canary for a ModelRunner. Returns the CanaryRunner, or None when
+    config.mode == "off". The caller is responsible for assigning the return value onto the
+    ModelRunner (``model_runner.canary_runner = install_canary(...)``).
+
+    Steps when enabled:
 
     1. Build CanaryConfig from server_args + env vars.
     2. attach_canary_buffers on model_runner.token_to_kv_pool.
     3. Build CanaryEndpoint tuple.
     4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
-    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers) and
-       stash on model_runner.canary_runner.
-    6. Monkeypatch the model nn.Module's `.forward` to bracket the original with
-       `canary_runner.launch_head_kernels(forward_batch)` +
-       `canary_runner.launch_tail_kernels(forward_batch)`. These two calls run kernel launches
+    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers).
+    6. Bind ``oracle_sampler_hook`` (when provided) so the per-forward input-check path can
+       fill expected_input_* tensors from the same oracle that drives sampling.
+    7. Monkeypatch the model nn.Module's ``.forward`` to bracket the original with
+       ``canary_runner.launch_head_kernels(forward_batch)`` +
+       ``canary_runner.launch_tail_kernels(forward_batch)``. These two calls run kernel launches
        only — they execute inside cuda graph capture region and therefore get captured into the
        graph, auto-replaying every step.
 
@@ -46,17 +53,10 @@ def install_canary(
     BreakableCudaGraphRunner / any speculative graph runner subclass.
 
     The host-side hooks are exposed as a single context manager
-    `canary_runner.with_forward_pass(forward_batch)`. `ModelRunner.forward` wraps its
-    `_forward_raw(...)` call with that context (falling back to contextlib.nullcontext when
+    ``canary_runner.with_forward_pass(forward_batch)``. ``ModelRunner.forward`` wraps its
+    ``_forward_raw(...)`` call with that context (falling back to contextlib.nullcontext when
     no canary is installed).
-
-    Idempotent: second call on the same model_runner is an error.
     """
-    if get_canary_runner(model_runner) is not None:
-        raise RuntimeError(
-            "kv-canary: install_canary called twice on the same ModelRunner"
-        )
-
     config = CanaryConfig.from_env(server_args)
     if config.mode == "off":
         return None
@@ -79,7 +79,8 @@ def install_canary(
         swa_window_size=int(model_runner.sliding_window_size or 0),
     )
 
-    model_runner.canary_runner = runner
+    if oracle_sampler_hook is not None:
+        runner.attach_oracle_sampler_hook(oracle_sampler_hook)
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
 
@@ -94,7 +95,7 @@ def install_canary(
 
 def get_canary_runner(model_runner: "ModelRunner") -> Optional[CanaryRunner]:
     """Return the runner attached to this ModelRunner, or None if canary was not installed."""
-    return getattr(model_runner, "canary_runner", None)
+    return model_runner.canary_runner
 
 
 def _resolve_tp_group():

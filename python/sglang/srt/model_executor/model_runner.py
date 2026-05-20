@@ -749,9 +749,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
-        install_canary(server_args=server_args, model_runner=self)
-        if self._mock_model_oracle_hook is not None and self.canary_runner is not None:
-            self.canary_runner.attach_oracle_sampler_hook(self._mock_model_oracle_hook)
+        self.canary_runner = install_canary(
+            server_args=server_args,
+            model_runner=self,
+            oracle_sampler_hook=self._mock_model_oracle_hook,
+        )
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -3144,10 +3146,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        canary_runner = getattr(self, "canary_runner", None)
         canary_ctx = (
-            canary_runner.with_forward_pass(forward_batch)
-            if canary_runner is not None
+            self.canary_runner.with_forward_pass(forward_batch)
+            if self.canary_runner is not None
             else contextlib.nullcontext()
         )
 
