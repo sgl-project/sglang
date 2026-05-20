@@ -503,31 +503,6 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
     )
 
 
-def test_verify_block_size_sweep_byte_equal() -> None:
-    pytest.skip(
-        "verify kernel block_size not user-configurable; block size is hardcoded as "
-        "kVerifyBlockSize=128 in canary_verify.cuh and not exposed in the Python API. "
-        "Determinism under the default config is covered by test_verify_byte_equal_across_repeated_launches_10x."
-    )
-
-
-def test_write_block_size_sweep_byte_equal() -> None:
-    pytest.skip(
-        "write kernel block_size not user-configurable; block size is hardcoded as "
-        "kWriteBlockSize=1 in canary_write.cuh (serial chain per block) and not exposed in the Python API. "
-        "Determinism under the default config is covered by test_write_byte_equal_across_repeated_launches_10x."
-    )
-
-
-def test_plan_triton_autotune_disabled_vs_enabled_byte_equal() -> None:
-    pytest.skip(
-        "plan.py Triton kernels do not use @triton.autotune; inner tile widths are fixed "
-        "module-level constants (_PLAN_BS_BLOCK_SIZE=1024, _PLAN_VERIFY_INNER_BLOCK=64, "
-        "_PLAN_EXTRAS_INNER_BLOCK=64) with no per-call override path. "
-        "Determinism under the default config is covered by test_plan_byte_equal_across_repeated_launches_10x."
-    )
-
-
 @pytest.mark.parametrize(
     "extras_present,per_req_present",
     [
@@ -602,12 +577,3 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
 
     if per_req_present and extras_present:
         assert int(triton_v.verify_num_valid[0].item()) == 10
-
-
-def test_plan_req_to_token_int64_byte_equal() -> None:
-    pytest.skip(
-        "canary_plan_step Triton kernel loads req_to_token via int32 pointer arithmetic; "
-        "passing an int64 tensor causes a dtype mismatch at the Triton ABI boundary. "
-        "The kernel is specified as int32 (docstring: 'shape [max_reqs, max_seq_len], int32'). "
-        "int64 support would require a kernel change; this skip documents the current contract."
-    )
