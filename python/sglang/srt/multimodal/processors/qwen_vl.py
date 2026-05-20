@@ -588,8 +588,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             ),
             # use the expanded token ids
             input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=getattr(ret, "image_grid_thw", None),
-            video_grid_thw=getattr(ret, "video_grid_thw", None),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
             use_audio_in_video=False,
             audio_seqlens=audio_feature_lengths,
