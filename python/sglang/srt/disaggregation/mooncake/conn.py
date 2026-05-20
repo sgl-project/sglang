@@ -859,9 +859,7 @@ class MooncakeKVManager(CommonKVManager):
 
         dst_pages = dst_kv_indices[page_index_slice].astype(np.int64, copy=False)
         dst_indices = np.repeat(dst_pages * c4_page_size, c4_page_size)
-        dst_indices += np.tile(
-            np.arange(c4_page_size, dtype=np.int64), len(dst_pages)
-        )
+        dst_indices += np.tile(np.arange(c4_page_size, dtype=np.int64), len(dst_pages))
 
         count = min(len(src_indices), len(dst_indices))
         return src_indices[:count], dst_indices[:count]
