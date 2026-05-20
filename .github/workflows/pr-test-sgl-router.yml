@@ -177,10 +177,13 @@ jobs:
 
       - name: cargo test
         working-directory: experimental/sgl-router
-        # Skip tokenizer_parity here: ubuntu-latest has no HuggingFace cache,
-        # so the matrix would hard-fail (see the test docstring). The e2e job
-        # runs it after pytest populates the Qwen3-0.6B tokenizer.json.
-        run: cargo test --release -- --skip tokenizer_parity
+        # Skip the tokenizer parity_matrix test here: ubuntu-latest has
+        # no HuggingFace cache, so the matrix would hard-fail (see the
+        # test docstring). The e2e job runs it after pytest populates
+        # the Qwen3-0.6B tokenizer.json. Filter is matched against the
+        # full test path `tokenizer::parity::parity_matrix`; substring
+        # `parity_matrix` is unique to that test.
+        run: cargo test --release -- --skip parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates
@@ -267,9 +270,19 @@ jobs:
           /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
       - name: Run E2E
         run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
-      - name: Dump router logs on failure
+      - name: Dump cluster + router diagnostics on failure
         if: failure()
-        run: kubectl -n sgl-router-test logs deploy/sgl-router --tail=200 || true
+        run: |
+          set +e
+          kubectl -n sgl-router-test get pods -o wide
+          kubectl -n sgl-router-test describe pod -l app=sgl-router
+          kubectl -n sgl-router-test describe pod -l app=sglang
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300 --previous
+          kubectl -n sgl-router-test get events --sort-by=.lastTimestamp
+          kubectl -n sgl-router-test get endpointslices -o wide
+          kubectl -n sgl-router-test get svc
+          true
 
   sgl-router-e2e:
     name: tier-3 — e2e
@@ -282,6 +295,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rust_protoc.sh
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -289,7 +304,9 @@ jobs:
           shared-key: "sgl-router-cache"
       - name: cargo build (release)
         working-directory: experimental/sgl-router
-        run: cargo build --release
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release
 
       # Install SGLang from the local checkout in editable mode (no PyPI
       # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs
@@ -316,10 +333,9 @@ jobs:
         working-directory: experimental/sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # Runs after pytest so the Qwen3-0.6B tokenizer.json is cached by the
-        # SGLang worker. Cells without a cached snapshot are skipped; if no
-        # cells could be checked, the test hard-fails under SGLANG_IS_IN_CI.
-        run: cargo test --release --test component tokenizer::parity
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --release --test component tokenizer::parity
 
   sgl-router-finish:
     name: finish
