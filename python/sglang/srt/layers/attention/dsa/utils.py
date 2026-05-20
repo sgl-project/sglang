@@ -166,7 +166,7 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     return dsa_cache_seqlens
 
 
-def can_dsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -180,7 +180,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
-        and use_nsa
+        and use_dsa
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_dsa_enable_prefill_cp()
         and sum(forward_batch.extend_seq_lens_cpu) >= cp_size

@@ -53,7 +53,7 @@ def _jit_nsa_fused_store_module(
 
 
 @cache_once
-def can_use_nsa_fused_store(
+def can_use_dsa_fused_store(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> bool:
     logger = logging.getLogger(__name__)

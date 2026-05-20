@@ -9,7 +9,7 @@ import torch
 from einops import rearrange
 
 from sglang.jit_kernel.fused_store_index_cache import (
-    can_use_nsa_fused_store,
+    can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
@@ -1088,7 +1088,7 @@ class Indexer(MultiPlatformOp):
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
-            and can_use_nsa_fused_store(
+            and can_use_dsa_fused_store(
                 key.dtype,
                 forward_batch.out_cache_loc.dtype,
                 forward_batch.token_to_kv_pool.page_size,
