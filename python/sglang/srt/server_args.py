@@ -175,6 +175,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "hpc",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -2699,6 +2700,17 @@ class ServerArgs:
             )
             self.page_size = 64
 
+        if (
+            self.attention_backend == "hpc"
+            or self.decode_attention_backend == "hpc"
+            or self.prefill_attention_backend == "hpc"
+        ):
+            if self.page_size not in [32, 64]:
+                logger.info(
+                    f"HPC attention backend requires page_size=64 or 32, "
+                    f"changing page_size from {self.page_size} to 32."
+                )
+                self.page_size = 32
         if (
             self.attention_backend == "cutlass_mla"
             or self.decode_attention_backend == "cutlass_mla"
