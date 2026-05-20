@@ -208,11 +208,13 @@ label_selector = "app=sglang"
     }
 
     #[test]
-    fn rejects_k8s_pd_discovery_until_bootstrap_port_plumbing_lands() {
-        // K8s PD mode is currently unsupported: EndpointSlice doesn't carry
-        // the per-pod `sglang.ai/bootstrap-port` annotation, so workers
-        // would be emitted with `bootstrap_port: None` and the engine
-        // would reject them at runtime. Validate at config-load.
+    fn loads_k8s_pd_discovery_with_prefill_and_decode_selectors() {
+        // K8s PD: selectors drive slice-classification; the actual
+        // bootstrap_port for each prefill worker comes from
+        // `/server_info` post-discovery (see
+        // `crate::workers::introspect`). The config layer only validates
+        // the selector combination here — successful load means PD on
+        // K8s is wired through to the manager.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.toml");
         std::fs::write(
@@ -233,12 +235,16 @@ decode_selector = "app=sglang,role=decode"
 "#,
         )
         .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("PD-disaggregation") && msg.contains("not yet supported"),
-            "expected PD-not-supported error, got: {err}"
-        );
+        let c = Config::from_path(&p).expect("k8s PD config must load");
+        match &c.discovery.backend {
+            DiscoveryBackend::K8s(k) => {
+                assert_eq!(k.namespace, "default");
+                assert_eq!(k.prefill_selector.as_deref(), Some("app=sglang,role=prefill"));
+                assert_eq!(k.decode_selector.as_deref(), Some("app=sglang,role=decode"));
+                assert!(k.label_selector.is_none());
+            }
+            _ => panic!("expected k8s backend"),
+        }
     }
 
     #[test]
@@ -353,16 +359,20 @@ namespace = "default"
     }
 
     #[test]
-    fn k8s_mode_rejects_pd_until_pod_annotation_plumbing_lands() {
-        // See [`ConfigError::PdNotImplemented`] — EndpointSlice doesn't
-        // expose pod annotations, so bootstrap_port can't be populated.
-        let err = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
+    fn k8s_mode_constructs_pd_disaggregation() {
+        // Selectors drive slice-classification only; the per-worker
+        // bootstrap_port is filled from `/server_info` by the worker
+        // manager. K8s PD is fully supported as of the
+        // /server_info-derived-disaggregation-role commit.
+        let mode = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
             .mode()
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("PD-disaggregation") && msg.contains("not yet supported"),
-            "expected PdNotImplemented, got: {err}"
+            .expect("PD mode is valid");
+        assert_eq!(
+            mode,
+            K8sDiscoveryMode::PdDisaggregation {
+                prefill_selector: "role=prefill".to_string(),
+                decode_selector: "role=decode".to_string(),
+            }
         );
     }
 
