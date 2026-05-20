@@ -290,9 +290,7 @@ def cases_to_x_vals(
 def _one_real_kv_source(
     *, num_slots: int, num_bytes: int, read_bytes: int, device: torch.device
 ) -> RealKvSource:
-    tensor = torch.zeros(
-        max(1, num_slots), num_bytes, dtype=torch.uint8, device=device
-    )
+    tensor = torch.zeros(max(1, num_slots), num_bytes, dtype=torch.uint8, device=device)
     return RealKvSource(
         tensor=tensor,
         page_size=1,
