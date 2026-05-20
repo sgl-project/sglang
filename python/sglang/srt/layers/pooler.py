@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
@@ -48,10 +49,11 @@ def pool_hidden_states(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> torch.Tensor:
-    """Pool hidden_states by PoolingType (LAST/CLS).
+    """Pool hidden_states by PoolingType (LAST/CLS/MEAN).
 
     Raw pooling only — no normalize, no dim truncation.
-    Returns shape (batch_size, hidden_size).
+    Returns shape (batch_size, hidden_size). LAST/CLS preserve the input dtype;
+    MEAN accumulates and returns float32 regardless of input dtype.
     """
     if pooling_type == PoolingType.LAST:
         last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
@@ -61,6 +63,36 @@ def pool_hidden_states(
         first_token_flat_indices = torch.zeros_like(prompt_lens)
         first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
         return hidden_states[first_token_flat_indices]
+    elif pooling_type == PoolingType.MEAN:
+        prompt_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if prompt_lens_cpu is None:
+            prompt_lens = forward_batch.extend_seq_lens
+            total_tokens = int(prompt_lens.sum())
+        elif isinstance(prompt_lens_cpu, torch.Tensor):
+            prompt_lens = prompt_lens_cpu.to(
+                device=hidden_states.device, non_blocking=True
+            )
+            total_tokens = int(prompt_lens_cpu.sum())
+        else:
+            total_tokens = sum(prompt_lens_cpu)
+            prompt_lens = torch.tensor(
+                prompt_lens_cpu,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+        batch_indices = torch.repeat_interleave(
+            torch.arange(prompt_lens.shape[0], device=hidden_states.device),
+            prompt_lens,
+            output_size=total_tokens,
+        )
+        pooled_data = torch.zeros(
+            (prompt_lens.shape[0], hidden_states.shape[-1]),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        pooled_data.index_add_(0, batch_indices, hidden_states.to(dtype=torch.float32))
+        pooled_data /= prompt_lens.to(dtype=torch.float32).unsqueeze(-1)
+        return pooled_data
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
@@ -163,7 +195,7 @@ class Pooler(nn.Module):
     2. Normalizes output if specified.
     3. Returns structured results as `PoolerOutput`.
     Attributes:
-        pooling_type: The type of pooling to use (LAST, AVERAGE, MAX).
+        pooling_type: The type of pooling to use (LAST, CLS, MEAN).
         normalize: Whether to normalize the pooled data.
     """
 
