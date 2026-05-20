@@ -17,6 +17,10 @@ def _jit_ngram_embedding_module() -> Module:
         cuda_files=["ngram_embedding.cuh"],
         cuda_wrappers=[
             ("compute_n_gram_ids", "&NgramEmbeddingKernel::compute_n_gram_ids"),
+            (
+                "compute_n_gram_ids_decode",
+                "&NgramEmbeddingKernel::compute_n_gram_ids_decode",
+            ),
             ("update_token_table", "&NgramEmbeddingKernel::update_token_table"),
         ],
     )
@@ -61,6 +65,35 @@ def compute_n_gram_ids(
         exclusive_ne_embedder_size_sums,
         tokens,
         exclusive_req_len_sums,
+        ne_token_table,
+        row_indices,
+        column_starts,
+        n_gram_ids,
+    )
+
+
+@debug_kernel_api
+def compute_n_gram_ids_decode(
+    ne_n: int,
+    ne_k: int,
+    ne_weights: torch.Tensor,
+    ne_mods: torch.Tensor,
+    exclusive_ne_embedder_size_sums: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    n_gram_ids: torch.Tensor,
+) -> None:
+    """
+    Compute n-gram IDs for decode, where each request contributes one token.
+    """
+    module = _jit_ngram_embedding_module()
+    module.compute_n_gram_ids_decode(
+        ne_n,
+        ne_k,
+        ne_weights,
+        ne_mods,
+        exclusive_ne_embedder_size_sums,
         ne_token_table,
         row_indices,
         column_starts,
