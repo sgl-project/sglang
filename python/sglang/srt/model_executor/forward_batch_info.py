@@ -425,6 +425,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
+    # CP KV-resharding (v1, prefill-only, DESIGN_kv_reshard.md §6).
+    # ``cp_owner_per_pages`` mirrors the per-request ``Req.cp_owner_per_page``
+    # tensors (one per batch entry, same order as ``req_pool_indices``); ``None``
+    # entries indicate the request was not admitted under CP-resharding.
+    # The ``cp_transient_*`` fields are populated by ``cp_alloc_forward_transient``
+    # and consumed by ``cp_free_forward_transient`` in the post-forward epilogue.
+    cp_owner_per_pages: Optional[List[Optional[torch.Tensor]]] = None
+    cp_transient_rows: Optional[torch.Tensor] = None
+    cp_transient_req_indices: Optional[torch.Tensor] = None
+    cp_transient_position_indices: Optional[torch.Tensor] = None
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -490,6 +501,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
+            # CP KV-resharding: pull per-request owner arrays from Req. ``None``
+            # for requests admitted outside CP-resharding (Req.cp_owner_per_page
+            # is initialized to None and only populated by the scheduler when
+            # --enable-cp-kv-reshard is set).
+            cp_owner_per_pages=[
+                getattr(req, "cp_owner_per_page", None) for req in batch.reqs
+            ],
         )
         device = model_runner.device
 

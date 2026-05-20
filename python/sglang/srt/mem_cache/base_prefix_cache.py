@@ -172,6 +172,12 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    # CP KV-resharding (DESIGN_kv_reshard.md §4): concatenated
+    # ``cp_owner_per_page`` along the matched chain (root -> last_device_node).
+    # Populated by ``RadixCache.match_prefix`` when the tree's CP consensus is
+    # active; ``None`` otherwise. Saves a second tree traversal in
+    # ``_populate_req_cp_owner_per_page``.
+    cp_owner_per_page: Optional[torch.Tensor] = None
 
 
 def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":

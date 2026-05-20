@@ -454,15 +454,27 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node, cp_owner_chunks = self._match_prefix_helper(
+            self.root_node, key
+        )
         if value:
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
+
+        # CP KV-resharding: concatenate per-node cp_owner_per_page chunks
+        # collected during descent. ``cp_owner_chunks`` is ``None`` outside
+        # CP consensus, so the result stays ``None`` and the field is not
+        # surfaced to non-CP callers.
+        cp_owner_concat: Optional[torch.Tensor] = None
+        if cp_owner_chunks:
+            cp_owner_concat = torch.cat(cp_owner_chunks)
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            cp_owner_per_page=cp_owner_concat,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -877,6 +889,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         value = []
+        # CP KV-resharding: collect each matched node's cp_owner_per_page
+        # during the descent so ``match_prefix`` can return them in
+        # ``MatchResult`` without a second root->leaf walk. Only collected
+        # when CP consensus is active on this tree; otherwise stays empty
+        # and the eventual concat result is None.
+        collect_cp_owner = self.cp_attn_group is not None
+        cp_owner_chunks: List[torch.Tensor] = [] if collect_cp_owner else None
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
@@ -884,17 +903,21 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
+                if collect_cp_owner and new_node.cp_owner_per_page is not None:
+                    cp_owner_chunks.append(new_node.cp_owner_per_page)
                 node = new_node
                 break
             else:
                 value.append(child.value)
+                if collect_cp_owner and child.cp_owner_per_page is not None:
+                    cp_owner_chunks.append(child.cp_owner_per_page)
                 node = child
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
-        return value, node
+        return value, node, cp_owner_chunks
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
