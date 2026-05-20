@@ -34,12 +34,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "xpu":
+        return torch.xpu.Stream(device=device)
+    return torch.cuda.Stream(device=device)
+
+
+def _device_stream_context(stream):
+    """Return the appropriate stream context manager."""
+    if hasattr(torch, "xpu") and isinstance(stream, torch.xpu.Stream):
+        return torch.xpu.stream(stream)
+    return torch.cuda.stream(stream)
+
+
 class LayerTransferCounter:
     """Minimal adapter that lets the memory pool notify LMCache per-layer.
 
     The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
     translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided CUDA stream.
+    within the provided device stream.
     """
 
     def __init__(
@@ -103,8 +119,8 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = _create_device_stream(self.device)
+        self.store_stream = _create_device_stream(self.device)
 
         self.layer_done_executor = LayerTransferCounter(
             num_layers=(
@@ -169,7 +185,7 @@ class LMCRadixCache(RadixCache):
             ]
         )
 
-        with torch.cuda.stream(self.load_stream):
+        with _device_stream_context(self.load_stream):
             num_retrieved = self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=key.token_ids,  # full page-aligned key
@@ -249,7 +265,7 @@ class LMCRadixCache(RadixCache):
             kv_indices=kv_indices,
             offset=0,
         )
-        with torch.cuda.stream(self.store_stream):
+        with _device_stream_context(self.store_stream):
             self.lmcache_connector.store_kv(store_md)
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
