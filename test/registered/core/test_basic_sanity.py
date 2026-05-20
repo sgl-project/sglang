@@ -1,51 +1,49 @@
-"""DSV4-Flash 8-GPU server sanity (TP8, no spec decoding)."""
+"""Basic sanity: small-but-broad server smoke that downstream stages
+depend on. Three sanity kits, one shared server, covering protocol
+contract, decode correctness, and scheduler stress paths."""
 
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
-
-DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-}
+register_cuda_ci(est_time=120, stage="base-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 
 
-class TestDSV4FlashTP8NoSpec(
+class TestBasicSanity(
     BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     CustomTestCase,
 ):
-    """TP8, no spec decoding."""
+    served_model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    run_accuracy_floor = True
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DSV4_FLASH_MODEL_PATH,
+            DEFAULT_MODEL_NAME_FOR_TEST,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--max-running-requests",
-                "8",
+                "--cuda-graph-max-bs",
+                "4",
                 "--mem-fraction-static",
-                "0.85",
+                "0.7",
+                "--enable-metrics",
             ],
-            env=DSV4_FLASH_ENV,
         )
 
     @classmethod

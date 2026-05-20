@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
+from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -47,7 +49,12 @@ def _gsm8k_check(test_case):
     test_case.assertGreater(metrics["score"], 0.93)
 
 
-class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4B200(
+    BasicAPIContractMixin,
+    BasicDecodeCorrectnessMixin,
+    BasicSchedulerStressMixin,
+    CustomTestCase,
+):
     """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
     @classmethod
@@ -87,7 +94,12 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
         _gsm8k_check(self)
 
 
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4B200Balanced(
+    BasicAPIContractMixin,
+    BasicDecodeCorrectnessMixin,
+    BasicSchedulerStressMixin,
+    CustomTestCase,
+):
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     @classmethod
@@ -130,7 +142,12 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
         _gsm8k_check(self)
 
 
-class TestDSV4FlashFP4B200Balanced_CP(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4B200Balanced_CP(
+    BasicAPIContractMixin,
+    BasicDecodeCorrectnessMixin,
+    BasicSchedulerStressMixin,
+    CustomTestCase,
+):
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     @classmethod
