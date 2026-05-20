@@ -28,7 +28,6 @@ class TestBasicSanity(
     CustomTestCase,
 ):
     served_model_name = DEFAULT_MODEL_NAME_FOR_TEST
-    run_accuracy_floor = True
 
     @classmethod
     def setUpClass(cls):
@@ -49,6 +48,26 @@ class TestBasicSanity(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def test_accuracy_floor(self):
+        # Stage-a-private accuracy guard: hellaswag via the frontend DSL
+        # bound to this server. Catches systematic regressions that pass
+        # every cheap probe in the mixed-in kits but tank multi-choice
+        # reasoning. Not part of any reusable mixin -- accuracy gating
+        # is the gate test's own responsibility.
+        import sglang as sgl
+        from sglang.test.test_programs import test_hellaswag_select
+
+        sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
+        try:
+            accuracy, _ = test_hellaswag_select()
+        finally:
+            sgl.set_default_backend(None)
+        self.assertGreater(
+            accuracy,
+            0.60,
+            f"hellaswag accuracy floor breached: {accuracy:.3f}",
+        )
 
 
 if __name__ == "__main__":

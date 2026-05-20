@@ -1,8 +1,9 @@
 """Basic decode correctness sanity kit.
 
 Probes that catch the model producing wrong output: weight load
-failure, sampling path bugs, KV / attention corruption, cuda graph
-edge cases, and systematic accuracy regression.
+failure, sampling path bugs, KV / attention corruption, and cuda graph
+edge cases. Single-prompt smoke only -- dataset-driven accuracy gates
+belong to the consuming test class, not this kit.
 
 Mix into any ``CustomTestCase`` subclass that exposes ``self.base_url``
 and ``self.process``. Probes complete in well under a minute after
@@ -14,17 +15,10 @@ _REQUEST_TIMEOUT = 120
 
 
 class BasicDecodeCorrectnessMixin:
-    """Output-quality probes + an opt-in mini hellaswag accuracy floor.
-
-    Set ``run_accuracy_floor = True`` on the test class to enable the
-    hellaswag probe; default is off so heavyweight model fixtures (DSV4,
-    nightly evals) only pay for the cheap probes."""
+    """Cheap output-quality probes."""
 
     sanity_max_new_tokens_short: int = 64
     sanity_max_new_tokens_long: int = 128
-
-    run_accuracy_floor: bool = False
-    accuracy_floor_threshold: float = 0.60
 
     def _decode_generate(self, prompt: str, max_new_tokens: int, stop=None) -> str:
         sampling_params = {"temperature": 0.0, "max_new_tokens": max_new_tokens}
@@ -118,25 +112,3 @@ class BasicDecodeCorrectnessMixin:
             max_new_tokens=1,
         )
         self.assertGreater(len(out), 0)
-
-    def test_accuracy_floor(self):
-        # Mini accuracy gate: hellaswag via the frontend DSL bound to
-        # this server. Catches systematic regressions that pass every
-        # cheap probe above but tank multi-choice reasoning.
-        if not self.run_accuracy_floor:
-            self.skipTest("run_accuracy_floor=False; opt in to enable hellaswag floor")
-
-        import sglang as sgl
-        from sglang.test.test_programs import test_hellaswag_select
-
-        sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
-        try:
-            accuracy, _ = test_hellaswag_select()
-        finally:
-            sgl.set_default_backend(None)
-        self.assertGreater(
-            accuracy,
-            self.accuracy_floor_threshold,
-            f"hellaswag accuracy floor breached: {accuracy:.3f} "
-            f"< {self.accuracy_floor_threshold}",
-        )
