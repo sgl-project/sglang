@@ -6058,11 +6058,12 @@ class ServerArgs:
                 "chain hash. Choices are derived from the ``RealKvHashMode`` "
                 "enum (kv_canary/verify.py) so the CLI surface and the "
                 "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
-                "leaves the real_kv_hash slot field at zero. 'bit' XOR-folds a "
-                "single bit per real-KV byte at write time and verifies on "
-                "read; useful when corruption is suspected but overhead must "
-                "stay tiny. 'all' splitmix64-folds the full real-KV slot "
-                "stride for maximum coverage at higher cost. Catches "
+                "leaves the real_kv_hash slot field at zero. 'partial' "
+                "splitmix64-folds the first min(16, read_bytes) bytes of "
+                "each real-KV slot; useful when corruption is suspected but "
+                "overhead must stay tiny (max 16B read per slot). 'all' "
+                "splitmix64-folds the full real-KV slot stride for maximum "
+                "coverage at higher cost. Catches "
                 "corruption that the pure-canary path misses because the "
                 "canary slot itself is intact but the real KV got written "
                 "wrong (attn-kernel idle-logic misconfig; PD transfer "
@@ -6085,7 +6086,7 @@ class ServerArgs:
                 "sit in the KV pool unused by the current forward — "
                 "typically radix-cached slots from completed requests that "
                 "aren't actively being verified per step. Requires "
-                "--kv-canary-real-data in {bit, all} and "
+                "--kv-canary-real-data in {partial, all} and "
                 "--kv-canary in {log, raise}."
             ),
         )
@@ -7082,7 +7083,7 @@ class ServerArgs:
             if self.kv_canary_real_data == "off":
                 raise ValueError(
                     "--kv-canary-sweep-interval requires "
-                    "--kv-canary-real-data in {bit, all}"
+                    "--kv-canary-real-data in {partial, all}"
                 )
             if self.kv_canary == "off":
                 raise ValueError(
