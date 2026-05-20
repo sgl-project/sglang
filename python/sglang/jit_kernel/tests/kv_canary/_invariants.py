@@ -125,10 +125,14 @@ class PlanInvariants:
         if n_active == 0:
             return
         rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
-        seeds_cpu = write_plan.write_seed_slot_indices[:n_active].detach().cpu().tolist()
+        seeds_cpu = (
+            write_plan.write_seed_slot_indices[:n_active].detach().cpu().tolist()
+        )
         for r in range(min(n_active, len(rpi_cpu))):
             if rpi_cpu[r] == 0:
-                assert seeds_cpu[r] == -1, f"padding row {r} has seed {seeds_cpu[r]} != -1"
+                assert (
+                    seeds_cpu[r] == -1
+                ), f"padding row {r} has seed {seeds_cpu[r]} != -1"
 
     @staticmethod
     def _assert_prev_slot_minus_one_iff_chain_head(
@@ -150,7 +154,9 @@ class PlanInvariants:
         )
         for i, (pos, prev) in enumerate(zip(positions_cpu, prevs_cpu)):
             if pos == 0:
-                assert prev == -1, f"entry {i} at position 0 must have prev=-1, got {prev}"
+                assert (
+                    prev == -1
+                ), f"entry {i} at position 0 must have prev=-1, got {prev}"
             else:
                 if swa_window_size == 0:
                     assert (
@@ -232,7 +238,9 @@ class VerifyInvariants:
         log_before: FakeViolationLog,
         plan: VerifyPlan,
     ) -> None:
-        delta = int(log_after.write_index[0].item()) - int(log_before.write_index[0].item())
+        delta = int(log_after.write_index[0].item()) - int(
+            log_before.write_index[0].item()
+        )
         n_active = int(plan.verify_num_valid[0].item())
         assert (
             0 <= delta <= n_active
@@ -430,9 +438,13 @@ class WriteInvariants:
         fb_out_cache_loc: torch.Tensor,
         plan: WritePlan,
     ) -> None:
-        delta = int(log_after.write_index[0].item()) - int(log_before.write_index[0].item())
+        delta = int(log_after.write_index[0].item()) - int(
+            log_before.write_index[0].item()
+        )
         if enable_write_verify_inputs == False:
-            assert delta == 0, f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
+            assert (
+                delta == 0
+            ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
             return
         n_active = int(plan.write_num_valid_reqs[0].item())
         if n_active == 0:
