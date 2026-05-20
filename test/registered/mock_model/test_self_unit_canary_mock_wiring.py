@@ -151,3 +151,10 @@ def test_mock_model_engine_kwargs_merges_json_override() -> None:
     merged = json.loads(kwargs["json_model_override_args"])
     assert merged["num_hidden_layers"] == 1
     assert merged["rope_theta"] == 1000.0
+
+
+def test_mock_model_engine_kwargs_speculative_disables_input_check() -> None:
+    os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
+    kwargs = mock_model_engine_kwargs(speculative_algorithm="EAGLE")
+    assert kwargs["speculative_algorithm"] == "EAGLE"
+    assert os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] == "0"

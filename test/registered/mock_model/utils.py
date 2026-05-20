@@ -25,11 +25,16 @@ def mock_model_engine_kwargs(**overrides: Any) -> dict[str, Any]:
     This is a side effect because input-check is mock-model-only and is no
     longer a server arg; the env var is the only injection path.
 
+    When ``speculative_algorithm`` is set, ``SGLANG_KV_CANARY_INPUT_CHECK`` is
+    forced off — the oracle can't predict draft-position tokens, so
+    input-check would always fire.
+
     Caller-supplied overrides win; for json_model_override_args, the override
     dict is merged on top of the default so callers can add extra keys without
     losing num_hidden_layers=1.
     """
-    os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
+    is_spec = "speculative_algorithm" in overrides
+    os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "0" if is_spec else "1"
 
     defaults: dict[str, Any] = {
         "load_format": "dummy",

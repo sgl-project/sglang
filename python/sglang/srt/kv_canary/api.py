@@ -73,6 +73,7 @@ def install_canary(
         buffer_groups=buffer_groups,
         device=device,
         tp_group=_resolve_tp_group(),
+        pp_group=_resolve_pp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
@@ -103,6 +104,15 @@ def _resolve_tp_group():
 
     try:
         return get_tp_group()
+    except (AssertionError, RuntimeError, AttributeError):
+        return None
+
+
+def _resolve_pp_group():
+    from sglang.srt.distributed.parallel_state import get_pp_group
+
+    try:
+        return get_pp_group()
     except (AssertionError, RuntimeError, AttributeError):
         return None
 
