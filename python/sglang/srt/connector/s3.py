@@ -4,10 +4,36 @@ import fnmatch
 import os
 from pathlib import Path
 from typing import Generator, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import torch
 
 from sglang.srt.connector import BaseFileConnector
+
+
+def _parse_s3_kwargs(url: str) -> tuple[str, dict]:
+    """Strip query string from s3 URL and return (clean_url, boto3_kwargs).
+
+    Recognizes ``endpoint_url``, ``region`` (alias ``region_name``),
+    ``aws_access_key_id``, ``aws_secret_access_key`` from the query string.
+    Falls back to ``AWS_ENDPOINT_URL`` / ``AWS_DEFAULT_REGION`` env vars.
+    """
+    parsed = urlparse(url)
+    qs = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    kwargs = {}
+    endpoint = qs.get("endpoint_url") or os.environ.get("AWS_ENDPOINT_URL")
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    region = qs.get("region_name") or qs.get("region") or os.environ.get(
+        "AWS_DEFAULT_REGION"
+    )
+    if region:
+        kwargs["region_name"] = region
+    for key in ("aws_access_key_id", "aws_secret_access_key"):
+        if key in qs:
+            kwargs[key] = qs[key]
+    clean = parsed._replace(query="").geturl()
+    return clean, kwargs
 
 
 def _filter_allow(paths: list[str], patterns: list[str]) -> list[str]:
@@ -68,11 +94,14 @@ def list_files(
 
 class S3Connector(BaseFileConnector):
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, **client_kwargs) -> None:
         import boto3
 
-        super().__init__(url)
-        self.client = boto3.client("s3")
+        clean_url, parsed_kwargs = _parse_s3_kwargs(url)
+        # Explicit kwargs win over query-string / env values.
+        parsed_kwargs.update({k: v for k, v in client_kwargs.items() if v is not None})
+        super().__init__(clean_url)
+        self.client = boto3.client("s3", **parsed_kwargs)
 
     def glob(self, allow_pattern: Optional[list[str]] = None) -> list[str]:
         bucket_name, _, paths = list_files(
