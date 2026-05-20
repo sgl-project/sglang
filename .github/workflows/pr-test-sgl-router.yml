@@ -177,10 +177,13 @@ jobs:
 
       - name: cargo test
         working-directory: experimental/sgl-router
-        # Skip tokenizer_parity here: ubuntu-latest has no HuggingFace cache,
-        # so the matrix would hard-fail (see the test docstring). The e2e job
-        # runs it after pytest populates the Qwen3-0.6B tokenizer.json.
-        run: cargo test --release -- --skip tokenizer_parity
+        # Skip the tokenizer parity_matrix test here: ubuntu-latest has
+        # no HuggingFace cache, so the matrix would hard-fail (see the
+        # test docstring). The e2e job runs it after pytest populates
+        # the Qwen3-0.6B tokenizer.json. Filter is matched against the
+        # full test path `tokenizer::parity::parity_matrix`; substring
+        # `parity_matrix` is unique to that test.
+        run: cargo test --release -- --skip parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates
