@@ -39,6 +39,7 @@ on:
           - jit-kernel-unit-test-amd-rocm720
           - stage-b-test-1-gpu-small-amd-rocm720
           - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
+          - stage-b-test-1-gpu-small-amd-mi35x-rocm720
           - stage-b-test-1-gpu-large-amd-rocm720
           - stage-b-test-2-gpu-large-amd-rocm720
           - multimodal-gen-test-1-gpu-amd-rocm720
@@ -427,6 +428,44 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+  stage-b-test-1-gpu-small-amd-mi35x-rocm720:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd-rocm720:
     needs: [check-changes]
@@ -1056,6 +1095,7 @@ jobs:
         jit-kernel-unit-test-amd-rocm720,
         stage-b-test-1-gpu-small-amd-rocm720,
         stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
+        stage-b-test-1-gpu-small-amd-mi35x-rocm720,
         stage-b-test-1-gpu-large-amd-rocm720,
         stage-b-test-2-gpu-large-amd-rocm720,
         stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,
