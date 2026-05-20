@@ -169,6 +169,45 @@ pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInf
         .map_err(|e| format!("Failed to parse response from {}: {}", model_info_url, e))
 }
 
+/// Get model name from /v1/models endpoint (OpenAI-compatible fallback).
+async fn get_model_name_from_v1_models(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let base_url = url.trim_end_matches('/');
+    let models_url = format!("{}/v1/models", base_url);
+
+    let mut req = HTTP_CLIENT.get(&models_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", models_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            models_url
+        ));
+    }
+
+    let json: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", models_url, e))?;
+
+    json["data"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|entry| entry["object"].as_str() == Some("model"))
+        })
+        .and_then(|entry| entry["id"].as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("No model found in response from {}", models_url))
+}
+
 /// Fetch gRPC metadata (returns labels and detected runtime type).
 async fn fetch_grpc_metadata(
     url: &str,
@@ -280,6 +319,15 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                         if let Ok(json_str) = serde_json::to_string(&architectures) {
                             labels.insert("architectures".to_string(), json_str);
                         }
+                    }
+                }
+
+                // If no model name discovered yet, try /v1/models as fallback
+                if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
+                    if let Ok(model_name) =
+                        get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
+                    {
+                        labels.insert("served_model_name".to_string(), model_name);
                     }
                 }
 
