@@ -345,11 +345,7 @@ def _plan_offsets_kernel(
 
     not_padding = (rpi != 0) & bs_mask
 
-    if SWA_WINDOW > 0:
-        clipped = prefix_lens - SWA_WINDOW
-        window_starts = tl.where(clipped > 0, clipped, 0)
-    else:
-        window_starts = tl.zeros((BS_BLOCK,), dtype=prefix_lens.dtype)
+    window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)
 
     verify_lens = prefix_lens - window_starts
     verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
@@ -471,11 +467,7 @@ def _plan_entries_kernel(
     if rpi == 0:
         return
 
-    if SWA_WINDOW > 0:
-        clipped = prefix_lens - SWA_WINDOW
-        window_start = tl.where(clipped > 0, clipped, 0)
-    else:
-        window_start = prefix_lens - prefix_lens
+    window_start = _compute_window_start(prefix_lens, SWA_WINDOW)
 
     verify_start = tl.load(verify_offsets_ptr + r)
     verify_end = tl.load(verify_offsets_ptr + r + 1)
@@ -541,6 +533,18 @@ def _plan_entries_kernel(
         prev_slot.to(tl.int32),
         mask=write_mask,
     )
+
+
+@triton.jit
+def _compute_window_start(prefix_lens, SWA_WINDOW: tl.constexpr):
+    """Per-req window start: max(prefix_lens - SWA_WINDOW, 0) when SWA, else 0.
+    Works for tile and scalar inputs (broadcasts via prefix_lens shape).
+    """
+    if SWA_WINDOW > 0:
+        clipped = prefix_lens - SWA_WINDOW
+        return tl.where(clipped > 0, clipped, 0)
+    else:
+        return prefix_lens - prefix_lens
 
 
 @triton.jit
