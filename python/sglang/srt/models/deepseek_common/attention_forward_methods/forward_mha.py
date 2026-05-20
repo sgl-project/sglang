@@ -144,7 +144,9 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
+                        transpose_scale=True,
                     )
+                    q_quanted[1]._aiter_bpreshuffle_layout = True
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -185,7 +187,9 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
+                    transpose_scale=True,
                 )
+                q[1]._aiter_bpreshuffle_layout = True
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
@@ -214,7 +218,9 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
+                transpose_scale=True,
             )
+            kv_a_quanted[1]._aiter_bpreshuffle_layout = True
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)

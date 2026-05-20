@@ -566,7 +566,9 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_nsa_needs_bf16,
+                            transpose_scale=True,
                         )
+                        hidden_states[1]._aiter_bpreshuffle_layout = True
                         if _nsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
@@ -611,8 +613,10 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_nsa_needs_bf16,
+                                transpose_scale=True,
                             )
                         )
+                        hidden_states[1]._aiter_bpreshuffle_layout = True
                         if _nsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
