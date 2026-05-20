@@ -17,12 +17,23 @@ _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 # the real attn kernel; disabling the graph silently bypasses the only path
 # that exercises that invariant end-to-end.
 
+# Cap canary install-time capacities below the 1M cuda-grid-safe ceiling
+# enforced by install_canary (max_bs * max_seq_len_per_req). Defaults
+# (cuda_graph_max_bs=4096, req_to_token_cols=40964) overshoot by 167x.
+_CANARY_CAPACITY_CAPS: List[str] = [
+    "--cuda-graph-max-bs",
+    "8",
+    "--context-length",
+    "2048",
+]
+
 
 class _MhaFullBase(CanaryE2EBase):
     model: ClassVar[str] = _QWEN3_MODEL
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
     ]
 
 
@@ -53,6 +64,7 @@ class TestRealDataOff(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
         "--kv-canary-real-data",
         "off",
     ]
@@ -67,6 +79,7 @@ class TestRealDataPartial(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
         "--kv-canary-real-data",
         "partial",
     ]
@@ -81,6 +94,7 @@ class TestRealDataAll(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
         "--kv-canary-real-data",
         "all",
     ]
@@ -95,6 +109,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
@@ -163,6 +178,7 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
+        *_CANARY_CAPACITY_CAPS,
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
