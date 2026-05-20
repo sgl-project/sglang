@@ -48,8 +48,15 @@ _DSV4_BASE_ARGS: List[str] = [
     "marlin",
     "--watchdog-timeout",
     "900",
+    # Real DSV4-Flash safetensor is ~149GB; even with 5-layer override sglang
+    # still pre-allocates KV cache against the configured mem fraction. Cap it
+    # so the loader has headroom and avoids SIGKILL on H200 (141GB HBM).
+    "--mem-fraction-static",
+    "0.5",
+    "--max-running-requests",
+    "16",
 ]
-_PER_CASE_TIMEOUT = 120.0
+_PER_CASE_TIMEOUT = 300.0
 
 
 class _DSV4FlashBase(CanaryE2EBase):
