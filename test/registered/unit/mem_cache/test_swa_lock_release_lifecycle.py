@@ -12,6 +12,7 @@ Covers:
 """
 
 import unittest
+from array import array
 
 import torch
 
@@ -110,6 +111,7 @@ def _swa_alloc(allocator, need_size):
 
 
 def _insert_chain(tree, allocator, token_ids):
+    token_ids = array("q", token_ids)
     indices = _swa_alloc(allocator, len(token_ids))
     assert indices is not None
     tree.insert(InsertParams(key=RadixKey(token_ids), value=indices))

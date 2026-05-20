@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from array import array
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -807,8 +808,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
-        return RadixKey(token_ids=list(token_ids))
+        return RadixKey(token_ids=array("q", token_ids))
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:

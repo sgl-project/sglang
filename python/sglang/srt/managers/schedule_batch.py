@@ -1036,7 +1036,7 @@ class Req(ReqDllmMixin):
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
-            token_ids_to_match = []
+            token_ids_to_match = array("q")
 
         if tree_cache is not None:
             if cow_mamba is None:
