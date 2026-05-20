@@ -175,6 +175,7 @@ def _load_active_write_entries(
     tokens_all = fb_input_ids_host[:total_entries]
     positions_all = fb_positions_host[:total_entries]
 
+    # Pre-compute real_kv_hash per write entry vectorised. The chain loop will pick the value up by index.
     real_kv_hashes_all = _compute_real_kv_hash_vec(
         slot_indices=slot_indices_all,
         real_kv_sources=real_kv_sources,
@@ -182,6 +183,7 @@ def _load_active_write_entries(
         work_device=work_device,
     )
 
+    # Pseudo-mode mismatches per entry (only used when pseudo_mode == ON).
     pseudo_mismatch_bits = _compute_pseudo_mismatch_bits(
         pseudo_mode=pseudo_mode,
         tokens_all=tokens_all,
@@ -226,6 +228,8 @@ def _compute_initial_chain_hashes(
 
     chain_anchor_signed = _to_signed_int64(_splitmix64_python(CANARY_CHAIN_ANCHOR))
 
+    # Vectorised seed-slot prev_hash gather. For seed < 0 use the chain anchor; else load the seed slot's 4
+    # fields and splitmix64-mix4 them.
     seed_is_anchor = seed_slot_indices < 0
     safe_seed = torch.where(
         seed_is_anchor, torch.zeros_like(seed_slot_indices), seed_slot_indices

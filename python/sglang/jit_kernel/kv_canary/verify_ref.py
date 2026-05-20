@@ -101,6 +101,8 @@ def canary_verify_step_torch_reference(
         is_chain_head=is_chain_head,
     )
 
+    # real-KV hash mixin. Mode dispatch handles OFF (always 0), BIT (one bit per byte XOR-folded), and ALL
+    # (splitmix64-fold of every byte). When no sources are supplied the mixin is also disabled.
     expected_real_kv_hashes = _compute_real_kv_hash_vec(
         slot_indices=slot_indices,
         real_kv_sources=real_kv_sources,

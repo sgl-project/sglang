@@ -82,6 +82,7 @@ def canary_plan_step_torch_reference(
     )
     write_lens = torch.clamp(write_lens, min=0)
 
+    # Materialize verify entries.
     total_verify = _materialize_verify_entries(
         verify_plan_out=verify_plan_out,
         req_pool_indices=req_pool_indices,
@@ -97,6 +98,7 @@ def canary_plan_step_torch_reference(
         bs=bs,
     )
 
+    # Materialize write metadata: write_offsets cumsum + per-req seed slot.
     _materialize_write_metadata(
         write_plan_out=write_plan_out,
         req_pool_indices=req_pool_indices,
@@ -111,6 +113,7 @@ def canary_plan_step_torch_reference(
         write_lens=write_lens,
     )
 
+    # Append extras at base_idx = total_verify.
     _append_extras(
         verify_plan_out=verify_plan_out,
         base_idx=total_verify,
