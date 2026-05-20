@@ -10,7 +10,6 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
-    CanaryLaunchTag,
     RealKvHashMode,
 )
 from sglang.srt.kv_canary import endpoint as endpoint_module
