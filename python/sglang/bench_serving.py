@@ -1679,55 +1679,56 @@ def check_chat_template(model_path):
         return False
 
 
+def normalize_benchmark_args(args_: argparse.Namespace):
+    if not hasattr(args_, "max_concurrency"):
+        args_.max_concurrency = None
+
+    if not hasattr(args_, "warmup_requests"):
+        args_.warmup_requests = 1
+
+    if not hasattr(args_, "output_details"):
+        args_.output_details = False
+
+    if not hasattr(args_, "tokenize_prompt"):
+        args_.tokenize_prompt = False
+
+    if not hasattr(args_, "plot_throughput"):
+        args_.plot_throughput = False
+
+    if not hasattr(args_, "top_logprobs_num"):
+        args_.top_logprobs_num = 0
+    if not hasattr(args_, "token_ids_logprob"):
+        args_.token_ids_logprob = None
+    if not hasattr(args_, "logprob_start_len"):
+        args_.logprob_start_len = -1
+    if not hasattr(args_, "return_logprob"):
+        args_.return_logprob = False
+
+    if not hasattr(args_, "use_trace_timestamps"):
+        args_.use_trace_timestamps = False
+    if not hasattr(args_, "mooncake_slowdown_factor"):
+        args_.mooncake_slowdown_factor = 1.0
+
+    if not hasattr(args_, "mooncake_num_rounds"):
+        args_.mooncake_num_rounds = 1
+
+    if not hasattr(args_, "served_model_name"):
+        args_.served_model_name = None
+
+    return args_
+
+
+
 def set_global_args(args_: argparse.Namespace):
     """Set the global args."""
     global args
-    args = args_
+    args = normalize_benchmark_args(args_)
+
 
 
 def run_benchmark(args_: argparse.Namespace):
     global args
-    args = args_
-
-    # Set default value for max_concurrency if not present
-    if not hasattr(args, "max_concurrency"):
-        args.max_concurrency = None
-
-    # Set default value for warmup_requests if not present
-    if not hasattr(args, "warmup_requests"):
-        args.warmup_requests = 1
-
-    if not hasattr(args, "output_details"):
-        args.output_details = False
-
-    if not hasattr(args, "tokenize_prompt"):
-        args.tokenize_prompt = False
-
-    if not hasattr(args, "plot_throughput"):
-        args.plot_throughput = False
-
-    if not hasattr(args, "top_logprobs_num"):
-        args.top_logprobs_num = 0
-    if not hasattr(args, "token_ids_logprob"):
-        args.token_ids_logprob = None
-    if not hasattr(args, "logprob_start_len"):
-        args.logprob_start_len = -1
-    if not hasattr(args, "return_logprob"):
-        args.return_logprob = False
-
-    if not hasattr(args, "use_trace_timestamps"):
-        args.use_trace_timestamps = False
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
-    if not hasattr(args, "mooncake_num_rounds"):
-        args.mooncake_num_rounds = 1
-
-    if not hasattr(args, "served_model_name"):
-        args.served_model_name = None
+    args = normalize_benchmark_args(args_)
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
