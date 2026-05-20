@@ -253,6 +253,20 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        # HISA pool-K cache is incompatible: this manager doesn't run the
+        # release_kv_cache hook chain, so pool pages would leak across
+        # offloaded-decode finishes.
+        from sglang.srt.mem_cache.hisa_memory_pool import (
+            HisaNSATokenToKVPool,
+        )
+
+        if isinstance(
+            self.token_to_kv_pool_allocator.get_kvcache(), HisaNSATokenToKVPool
+        ):
+            raise NotImplementedError(
+                "DecodeKVCacheOffloadManager + HisaNSATokenToKVPool not supported: "
+                "release path bypasses the pool-page free hook."
+            )
         self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
