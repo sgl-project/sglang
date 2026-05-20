@@ -77,8 +77,7 @@ SGL_DEVICE void real_kv_load_uint4(
 // >= 16 when non-zero, so PARTIAL collapses to a constant 16B prefix. Output is byte-equal to the
 // Python ref helper _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
-  const int64_t effective_read_bytes =
-      (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
+  const int64_t effective_read_bytes = (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
   for (int64_t byte_offset = 0; byte_offset < effective_read_bytes; byte_offset += 16) {
     uint64_t word_lo;
@@ -170,8 +169,7 @@ canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, in
 // ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on splitmix64(kCanaryChainAnchor).
 // Shared by the verify path (recompute expected prev_hash from a slot's predecessor) and the write path
 // (seed running_prev_hash from a chain-prefix slot).
-SGL_DEVICE uint64_t compute_slot_hash(
-    const uint8_t* canary_buf, int64_t slot_stride_bytes, int64_t source_slot_idx) {
+SGL_DEVICE uint64_t compute_slot_hash(const uint8_t* canary_buf, int64_t slot_stride_bytes, int64_t source_slot_idx) {
   if (source_slot_idx < 0) {
     return splitmix64(kCanaryChainAnchor);
   }

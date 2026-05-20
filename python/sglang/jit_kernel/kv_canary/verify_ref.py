@@ -89,9 +89,7 @@ def canary_verify_step_torch_reference(
             buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
         )
 
-        expected_chain_hash = _to_signed_int64(
-            compute_slot_hash(buf_i64, prev_slot)
-        )
+        expected_chain_hash = _to_signed_int64(compute_slot_hash(buf_i64, prev_slot))
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
@@ -169,7 +167,9 @@ def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
     token = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_TOKEN].item())
     position = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_POSITION].item())
     prev_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
-    real_kv_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item())
+    real_kv_hash = int(
+        buf_i64[source_slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
+    )
     return splitmix64_mix4(prev_hash, token, position, real_kv_hash)
 
 

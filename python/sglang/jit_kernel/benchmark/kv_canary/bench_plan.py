@@ -61,10 +61,7 @@ _X_NAMES_MATRIX = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
 def _cases_to_matrix_x_vals(
     cases: list[BenchCase],
 ) -> list[tuple[int, int, str, int, str]]:
-    return [
-        (c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
-        for c in cases
-    ]
+    return [(c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind) for c in cases]
 
 
 _X_VALS_MATRIX = _cases_to_matrix_x_vals(

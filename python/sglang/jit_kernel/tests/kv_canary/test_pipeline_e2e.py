@@ -17,11 +17,6 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _empty_extras,
-    clone_real_kv_sources,
-    make_req_to_token,
-)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -29,6 +24,11 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_canary_buf,
     make_real_kv_sources,
     write_slot_fields,
+)
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _empty_extras,
+    clone_real_kv_sources,
+    make_req_to_token,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 

@@ -16,7 +16,6 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
-from sglang.jit_kernel.tests.kv_canary._fixtures import _empty_extras
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -27,6 +26,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_verify_plan,
     make_write_plan,
 )
+from sglang.jit_kernel.tests.kv_canary._fixtures import _empty_extras
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
