@@ -13,10 +13,6 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher import (
-        CombineInput,
-        StandardDispatchOutput,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +22,22 @@ __all__ = [
 
 
 class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
+    """
+    W4A4 integer MoE scheme that creates weights for either the
+    w13 (gate+up) or w2 (down) projection group.
+
+    Two instances of this class are used per MoE layer:
+      - weight_prefix="w13"   → handles the fused gate_proj + up_proj weights
+      - weight_prefix="w2"    → handles the down_proj weights
+    """
 
     def __init__(
         self,
         quant_config: Dict[str, Any],
-        prefix: str = None,
+        weight_prefix: str,  # "w13" or "w2"
     ):
         self.quant_config = quant_config
+        self.weight_prefix = weight_prefix
         self.kernel = NPUW4A4Int4DynamicMoEMethod()
 
     def create_weights(
@@ -51,62 +56,50 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
 
-        # weight
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-        # scale
-        w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        w2_weight_scale = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-        # offset
-        w13_weight_offset = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_offset", w13_weight_offset)
-        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
-        w2_weight_offset = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_offset", w2_weight_offset)
-        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+        if self.weight_prefix == "w13":
+            prefix = "w13"
+            a_dim = 2 * intermediate_size_per_partition
+            b_dim = hidden_size
+        elif self.weight_prefix == "w2":
+            prefix = "w2"
+            a_dim = hidden_size
+            b_dim = intermediate_size_per_partition
+        else:
+            raise ValueError(
+                f"Unknown weight_prefix: {self.weight_prefix}. Use 'w13' or 'w2'."
+            )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer)
+        # Create and register weight
+        weight_name = f"{prefix}_weight"
+        weight = torch.nn.Parameter(
+            torch.empty(num_experts, a_dim, b_dim, dtype=torch.int8),
+            requires_grad=False,
+        )
+        layer.register_parameter(weight_name, weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+        # Create and register scale
+        scale_name = f"{prefix}_weight_scale"
+        scale = torch.nn.Parameter(
+            torch.empty(num_experts, a_dim, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter(scale_name, scale)
+        set_weight_attrs(scale, extra_weight_attrs)
+
+        # Create and register offset
+        offset_name = f"{prefix}_weight_offset"
+        offset = torch.nn.Parameter(
+            torch.empty(num_experts, a_dim, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter(offset_name, offset)
+        set_weight_attrs(offset, extra_weight_attrs)
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix
+    ) -> None:
+        self.kernel.process_weights_after_loading(layer, weight_prefix)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -116,9 +109,26 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
     def apply_weights(
         self,
         layer,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
-        return self.kernel.apply(layer, dispatch_output)
+        hidden_states,
+        expert_tokens,
+        pertoken_scale,
+        original_dtype,
+        weight_prefix,
+    ):
+        return self.kernel.apply(
+            layer,
+            hidden_states,
+            expert_tokens,
+            pertoken_scale,
+            original_dtype,
+            weight_prefix,
+        )
+
+    def quant_activations(
+        self,
+        hidden_states,
+    ):
+        return self.kernel.quant_activations(hidden_states)
 
     def apply_without_routing_weights(
         self,
