@@ -690,6 +690,9 @@ class ServerArgs:
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
+    enable_vit_cuda_graph: bool = False
+    vit_cuda_graph_token_budgets: Optional[List[int]] = None
+    vit_cuda_graph_max_batch_size: int = 0
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
@@ -3900,6 +3903,17 @@ class ServerArgs:
 
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
+        if self.enable_vit_cuda_graph or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            self.enable_vit_cuda_graph = True
+            envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.set("1")
+        if self.vit_cuda_graph_max_batch_size < 0:
+            raise ValueError("--vit-cuda-graph-max-batch-size must be >= 0")
+        if self.vit_cuda_graph_token_budgets is not None:
+            self.vit_cuda_graph_token_budgets = sorted(
+                set(self.vit_cuda_graph_token_budgets)
+            )
+            if any(x <= 0 for x in self.vit_cuda_graph_token_budgets):
+                raise ValueError("--vit-cuda-graph-token-budgets must be positive")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
@@ -6165,6 +6179,28 @@ class ServerArgs:
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        )
+        parser.add_argument(
+            "--enable-vit-cuda-graph",
+            action="store_true",
+            default=ServerArgs.enable_vit_cuda_graph,
+            help="Enable ViT CUDA graph pre-capture for image vision encoder batches.",
+        )
+        parser.add_argument(
+            "--vit-cuda-graph-token-budgets",
+            type=int,
+            nargs="*",
+            default=ServerArgs.vit_cuda_graph_token_budgets,
+            help="Post-merge vision token budgets for ViT CUDA graph capture. "
+            "Raw ViT token budgets are derived by multiplying by spatial_merge_size^2. "
+            "When omitted or empty, budgets are generated automatically.",
+        )
+        parser.add_argument(
+            "--vit-cuda-graph-max-batch-size",
+            type=int,
+            default=ServerArgs.vit_cuda_graph_max_batch_size,
+            help="Maximum number of images packed into one ViT CUDA graph replay. "
+            "0 lets SGLang choose a conservative automatic value.",
         )
         parser.add_argument(
             "--debug-cuda-graph",

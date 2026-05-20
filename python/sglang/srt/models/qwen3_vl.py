@@ -70,7 +70,11 @@ from sglang.srt.models.utils import (
     compute_cu_seqlens_from_grid_numpy,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.multimodal.vit_cuda_graph_runner import (
+    ViTCudaGraphRunner,
+    is_vit_cuda_graph_enabled,
+    make_image_grid_for_vision_tokens,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -422,6 +426,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.graph_runners = graph_runners_dict[self.device.type](self)
+        self.inner_rope_compiled = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -751,11 +756,21 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if _is_npu:
-                return self.forward_with_npu_graph(x, grid_thw)
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and _is_npu:
+            return self.forward_with_npu_graph(x, grid_thw)
+        if (
+            self.device.type == "cuda"
+            and is_vit_cuda_graph_enabled()
+            and self._is_image_only_grid(grid_thw)
+        ):
             return self.forward_with_cuda_graph(x, grid_thw)
+        return self.raw_forward(x, grid_thw)
 
+    def raw_forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -856,6 +871,148 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
+    def _raw_patch_dim(self) -> int:
+        return (
+            self.patch_embed.in_channels
+            * self.patch_embed.temporal_patch_size
+            * self.patch_embed.patch_size
+            * self.patch_embed.patch_size
+        )
+
+    def _grid_to_tensor(self, grid_thw) -> torch.Tensor:
+        if isinstance(grid_thw, torch.Tensor):
+            return grid_thw.cpu().to(dtype=torch.int32)
+        return torch.tensor(grid_thw, dtype=torch.int32)
+
+    def _is_image_only_grid(self, grid_thw) -> bool:
+        if isinstance(grid_thw, list):
+            return all(int(grid[0]) == 1 for grid in grid_thw)
+        return bool(torch.all(grid_thw[:, 0] == 1).item())
+
+    def _vision_token_counts(self, grid_thw) -> List[int]:
+        grid = self._grid_to_tensor(grid_thw).tolist()
+        return [
+            int(t) * int(h) * int(w) // self.spatial_merge_unit for t, h, w in grid
+        ]
+
+    def _raw_token_counts(self, grid_thw) -> List[int]:
+        grid = self._grid_to_tensor(grid_thw).tolist()
+        return [int(t) * int(h) * int(w) for t, h, w in grid]
+
+    def _pad_hidden_states(self, x: torch.Tensor, raw_budget: int) -> torch.Tensor:
+        if x.shape[0] == raw_budget:
+            return x
+        padded = x.new_zeros((raw_budget, x.shape[-1]))
+        padded[: x.shape[0]].copy_(x)
+        return padded
+
+    def _pad_rotary_embeddings(
+        self,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        raw_budget: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if rotary_pos_emb_cos.shape[0] == raw_budget:
+            return rotary_pos_emb_cos, rotary_pos_emb_sin
+        padded_cos = rotary_pos_emb_cos.new_ones(
+            (raw_budget, rotary_pos_emb_cos.shape[-1])
+        )
+        padded_sin = rotary_pos_emb_sin.new_zeros(
+            (raw_budget, rotary_pos_emb_sin.shape[-1])
+        )
+        padded_cos[: rotary_pos_emb_cos.shape[0]].copy_(rotary_pos_emb_cos)
+        padded_sin[: rotary_pos_emb_sin.shape[0]].copy_(rotary_pos_emb_sin)
+        return padded_cos, padded_sin
+
+    def _pad_full_cu_seqlens(
+        self,
+        cu_seqlens: torch.Tensor,
+        raw_budget: int,
+    ) -> Optional[torch.Tensor]:
+        runner = self.graph_runners
+        target_len = runner.max_full_cu_len
+        values = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
+        total_raw = values[-1]
+        if len(values) > target_len - 1:
+            return None
+        while len(values) < target_len - 1:
+            values.append(total_raw)
+        values.append(raw_budget)
+        return torch.tensor(values, device=self.device, dtype=torch.int32)
+
+    def _pad_cuda_graph_inputs(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        raw_budget: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        padded_cu = self._pad_full_cu_seqlens(cu_seqlens, raw_budget)
+        if padded_cu is None:
+            return None
+        padded_cos, padded_sin = self._pad_rotary_embeddings(
+            rotary_pos_emb_cos, rotary_pos_emb_sin, raw_budget
+        )
+        return self._pad_hidden_states(x, raw_budget), padded_cu, padded_cos, padded_sin
+
+    def _grid_index_select(self, grid_thw: torch.Tensor, indices: List[int]):
+        index_tensor = torch.tensor(indices, dtype=torch.long)
+        return grid_thw.index_select(0, index_tensor)
+
+    def _run_cuda_graph_batch(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        vision_token_counts: List[int],
+    ) -> torch.Tensor:
+        runner = self.graph_runners
+        total_vision_tokens = sum(vision_token_counts)
+        budget = runner.select_budget(total_vision_tokens)
+        if budget is None:
+            runner.record_fallback("over_budget")
+            return self.raw_forward(pixel_values, grid_thw)
+
+        _, raw_budget = budget
+        if raw_budget not in runner.block_graphs:
+            runner.record_fallback("graph_not_captured")
+            return self.raw_forward(pixel_values, grid_thw)
+
+        (
+            x,
+            cu_seqlens,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+        ) = self._prepare_graph_inputs(pixel_values, grid_thw)
+        if not isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
+        else:
+            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        cu_seqlens = cu_seqlens.contiguous()
+        if x.shape[0] > raw_budget:
+            runner.record_fallback("raw_tokens_over_budget")
+            return self.raw_forward(pixel_values, grid_thw)
+
+        padded = self._pad_cuda_graph_inputs(
+            x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, raw_budget
+        )
+        if padded is None:
+            runner.record_fallback("batch_metadata_capacity")
+            return self.raw_forward(pixel_values, grid_thw)
+
+        padded_x, padded_cu, padded_cos, padded_sin = padded
+        out = runner.replay(
+            graph_key=raw_budget,
+            x_3d=padded_x.unsqueeze(1),
+            position_embeddings=None,
+            rotary_pos_emb_cos=padded_cos,
+            rotary_pos_emb_sin=padded_sin,
+            cu_seqlens=padded_cu,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
+        return out[:total_vision_tokens]
+
     def forward_with_npu_graph(
         self,
         x: torch.Tensor,
@@ -882,26 +1039,143 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        (
-            x,
-            cu_seqlens,
-            rotary_pos_emb_cos,
-            rotary_pos_emb_sin,
-        ) = self._prepare_graph_inputs(x, grid_thw)
-        if not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
-        else:
-            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.contiguous()
+        runner = self.graph_runners
+        if not isinstance(runner, ViTCudaGraphRunner) or not runner.capture_completed:
+            if isinstance(runner, ViTCudaGraphRunner):
+                runner.record_fallback("graph_not_captured")
+            return self.raw_forward(x, grid_thw)
 
-        return self.graph_runners.run(
-            x=x,
-            position_embeddings=None,
-            rotary_pos_emb_cos=rotary_pos_emb_cos,
-            rotary_pos_emb_sin=rotary_pos_emb_sin,
-            cu_seqlens=cu_seqlens,
-            cu_window_seqlens=None,
-            output_indices=None,
+        grid_thw = self._grid_to_tensor(grid_thw)
+        vision_counts = self._vision_token_counts(grid_thw)
+        raw_counts = self._raw_token_counts(grid_thw)
+        pixel_chunks = list(torch.split(x, raw_counts, dim=0))
+        outputs: List[Optional[torch.Tensor]] = [None] * len(vision_counts)
+
+        def flush(indices: List[int]) -> None:
+            if not indices:
+                return
+            batch_pixels = torch.cat([pixel_chunks[i] for i in indices], dim=0)
+            batch_grid = self._grid_index_select(grid_thw, indices)
+            batch_counts = [vision_counts[i] for i in indices]
+            batch_out = self._run_cuda_graph_batch(
+                batch_pixels, batch_grid, batch_counts
+            )
+            split_out = torch.split(batch_out, batch_counts, dim=0)
+            for idx, emb in zip(indices, split_out):
+                outputs[idx] = emb
+
+        current: List[int] = []
+        current_tokens = 0
+        for idx in sorted(range(len(vision_counts)), key=lambda i: vision_counts[i]):
+            num_tokens = vision_counts[idx]
+            if num_tokens > runner.max_vision_budget:
+                flush(current)
+                current = []
+                current_tokens = 0
+                runner.record_fallback("single_image_over_budget")
+                outputs[idx] = self.raw_forward(
+                    pixel_chunks[idx], self._grid_index_select(grid_thw, [idx])
+                )
+                continue
+
+            if current and (
+                current_tokens + num_tokens > runner.max_vision_budget
+                or len(current) >= runner.max_batch_size
+            ):
+                flush(current)
+                current = []
+                current_tokens = 0
+
+            current.append(idx)
+            current_tokens += num_tokens
+
+        flush(current)
+        if any(emb is None for emb in outputs):
+            raise RuntimeError("ViT CUDA graph bin-pack did not produce all outputs")
+        return torch.cat(outputs, dim=0)
+
+    @torch.no_grad()
+    def capture_vit_cuda_graphs(self) -> None:
+        runner = self.graph_runners
+        if (
+            self.device.type != "cuda"
+            or not is_vit_cuda_graph_enabled()
+            or not isinstance(runner, ViTCudaGraphRunner)
+            or runner.capture_completed
+        ):
+            return
+
+        mm_backend = get_global_server_args().mm_attention_backend
+        if mm_backend not in ("triton_attn", "fa3"):
+            logger.warning(
+                "ViT CUDA graph supports mm_attention_backend triton_attn/fa3, "
+                "but got %s; Qwen3-VL vision encoder will use eager fallback.",
+                mm_backend,
+            )
+            return
+
+        runner.log_capture_config()
+        raw_patch_dim = self._raw_patch_dim()
+        for idx, (vision_budget, raw_budget) in enumerate(
+            zip(runner.vision_token_budgets, runner.raw_token_budgets)
+        ):
+            grid = torch.tensor(
+                [
+                    make_image_grid_for_vision_tokens(
+                        vision_budget, self.spatial_merge_size
+                    )
+                ],
+                dtype=torch.int32,
+            )
+            pixel_values = torch.zeros(
+                raw_budget,
+                raw_patch_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            if not self.inner_rope_compiled:
+                self.raw_forward(pixel_values, grid)
+                self.inner_rope_compiled = True
+
+            (
+                x,
+                cu_seqlens,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+            ) = self._prepare_graph_inputs(pixel_values, grid)
+            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32).contiguous()
+            padded = self._pad_cuda_graph_inputs(
+                x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, raw_budget
+            )
+            if padded is None:
+                raise RuntimeError(
+                    f"Failed to pad Qwen3-VL ViT CUDA graph capture inputs for "
+                    f"vision_budget={vision_budget}, raw_budget={raw_budget}"
+                )
+            padded_x, padded_cu, padded_cos, padded_sin = padded
+            runner.create_graph(
+                x_3d=padded_x.unsqueeze(1),
+                position_embeddings=None,
+                rotary_pos_emb_cos=padded_cos,
+                rotary_pos_emb_sin=padded_sin,
+                cu_seqlens=padded_cu,
+                cu_window_seqlens=None,
+                max_full_len=raw_budget,
+            )
+            logger.info(
+                "Captured Qwen3-VL ViT CUDA graph %s/%s: vision_budget=%s, raw_budget=%s",
+                idx + 1,
+                len(runner.vision_token_budgets),
+                vision_budget,
+                raw_budget,
+            )
+
+        runner.capture_completed = True
+        torch.cuda.synchronize()
+        logger.info(
+            "Captured Qwen3-VL ViT CUDA graphs for raw budgets=%s",
+            runner.raw_token_budgets,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -945,6 +1219,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw_list = grid_thw
             grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
         else:
+            grid_thw = grid_thw.cpu().to(dtype=torch.int32)
             grid_thw_list = grid_thw.tolist()
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -1198,6 +1473,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+
+        raw_patch_dim = (
+            self.visual.patch_embed.in_channels
+            * self.visual.patch_embed.temporal_patch_size
+            * self.visual.patch_embed.patch_size
+            * self.visual.patch_embed.patch_size
+        )
+        if pixel_values.shape[-1] != raw_patch_dim:
+            return pixel_values
 
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(

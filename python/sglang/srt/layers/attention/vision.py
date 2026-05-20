@@ -340,14 +340,9 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if "output_ws" not in kwargs:
-                raise RuntimeError("output_ws should be prepared for cuda-graph mode")
-
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
-
-            output = kwargs["output_ws"]
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
+            # [b * s, head, head_size]
+            output = torch.empty_like(q)
             context_attention_fwd(
                 q,
                 k,

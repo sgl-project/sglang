@@ -738,6 +738,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        # Capture ViT CUDA graphs before KV cache pool sizing so the graph memory
+        # pool is accounted for in available-memory profiling.
+        self.init_vit_cuda_graphs()
+
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
@@ -2798,6 +2802,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+    def init_vit_cuda_graphs(self):
+        """Capture image ViT CUDA graphs."""
+        self.vit_cuda_graph_mem_usage = 0
+
+        if self.device != "cuda":
+            return
+        if not (
+            getattr(self.server_args, "enable_vit_cuda_graph", False)
+            or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        ):
+            return
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+            return
+
+        capturers = []
+        seen = set()
+        for module in self.model.modules():
+            capture_fn = getattr(module, "capture_vit_cuda_graphs", None)
+            if not callable(capture_fn):
+                continue
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            capturers.append(capture_fn)
+
+        if not capturers:
+            logger.info("ViT CUDA graph is enabled, but no capturable ViT module was found.")
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            "Capture ViT CUDA graph begin. capturable modules=%s, avail mem=%.2f GB",
+            len(capturers),
+            before_mem,
+        )
+        for capture_fn in capturers:
+            capture_fn()
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.vit_cuda_graph_mem_usage = before_mem - after_mem
+        logger.info(
+            "Capture ViT CUDA graph end. Time elapsed: %.2f s. mem usage=%.2f GB. "
+            "avail mem=%.2f GB.",
+            time.perf_counter() - tic,
+            self.vit_cuda_graph_mem_usage,
+            after_mem,
         )
 
     def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
