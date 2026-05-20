@@ -57,14 +57,9 @@ class FutureMap:
         self.spec_algo = spec_algo
 
         if self.spec_algo.is_none():
-            # token_ids_buf is addressed directly by req_pool_idx (see
-            # alloc_future_indices below). Sizing follows ReqToTokenPool's
-            # allocated rows (req_to_token.shape[0] == size + 1) so slot 0
-            # is the padding row shared with the KV cache pool: CUDA-graph
-            # padded batches default req_pool_idx to 0, and dummy reads/
-            # writes here land harmlessly on that same row. Real req_pool_idx
-            # in [1, size] => `-req_pool_idx` is strictly negative and
-            # unambiguous as the resolve_future placeholder.
+            # Indexed by req_pool_idx; slot 0 mirrors the KV cache pool's
+            # padding row, so CUDA-graph padded batches (req_pool_idx == 0)
+            # read/write here harmlessly.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
                 (req_to_token_pool.req_to_token.shape[0],),
@@ -72,9 +67,6 @@ class FutureMap:
                 device=self.device,
             )
         else:
-            # Spec v2 buffers still use a ring slot allocator; sizing follows
-            # the historical worst-case formula. Follow-up will migrate spec v2
-            # buffers to the same req-indexed scheme as token_ids_buf.
             self.future_ct = 0
             max_num_chunks = (
                 (context_len + chunked_prefill_size - 1) // chunked_prefill_size
@@ -124,15 +116,6 @@ class FutureMap:
             )
 
     def alloc_future_indices(self, batch: ScheduleBatch) -> FutureIndices:
-        """Allocate future-token slot handles for this batch.
-
-        For non-spec, the slot identity is the request's req_pool_idx itself:
-        we reuse ``batch.req_pool_indices`` as the indices into
-        ``token_ids_buf``. No fresh tensor is allocated, so there is no
-        cross-stream lifetime concern for the indices tensor (the SB owns it).
-
-        For spec v2, the ring allocator is preserved.
-        """
         if self.spec_algo.is_none():
             return FutureIndices(indices=batch.req_pool_indices)
 
@@ -178,8 +161,6 @@ class FutureMap:
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         if self.spec_algo.is_none():
-            # Empty indices (e.g. DP attention idle rank) advanced-index into
-            # token_ids_buf as a natural no-op; no explicit guard needed.
             self.token_ids_buf[future_indices.indices] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
