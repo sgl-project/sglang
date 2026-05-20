@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -124,7 +124,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMLAForwardMixin:
-
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
@@ -178,7 +177,7 @@ class DeepseekMLAForwardMixin:
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-                        if self.use_nsa:
+                        if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                                 q,
                                 self.q_a_layernorm.weight,
@@ -220,7 +219,7 @@ class DeepseekMLAForwardMixin:
                         k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if self.use_nsa:
+            if self.use_dsa:
                 if q_lora is None:
                     q_lora = q
 
@@ -281,9 +280,13 @@ class DeepseekMLAForwardMixin:
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
+            (
+                q_nope_val,
+                q_nope_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
             )
@@ -362,18 +365,18 @@ class DeepseekMLAForwardMixin:
         if is_kv_b_lora_active(self):
             q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
-        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
-            and (not skip_rope_for_nsa_tilelang_fused)
+            and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -406,7 +409,7 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
+            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -430,14 +433,14 @@ class DeepseekMLAForwardMixin:
                 )
                 save_kv_cache = False
                 # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # nsa_backend.forward_decode reuses q_cat as a zero-copy view
+                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
                 # (`q.contiguous().view(...)` fast-path) instead of running the
                 # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
                 # that would otherwise rebuild a tensor byte-identical to q_cat.
                 # On ROCm tilelang decode, this eliminates the
                 # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
                 # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because nsa_backend.forward_extend
+                # Prefill keeps the split form because dsa_backend.forward_extend
                 # asserts `q_rope is not None`.
                 if forward_batch.forward_mode.is_decode_or_idle():
                     if llama_4_scaling is not None:
@@ -545,10 +548,14 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
-            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1)
-                )
+            (
+                attn_output_val,
+                attn_output_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                attn_output.transpose(0, 1)
             )
             attn_bmm_output = attn_output.new_empty(
                 (self.num_local_heads, aligned_m, self.v_head_dim)
@@ -683,10 +690,10 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
-        if self.current_attention_backend == "nsa":
+        if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().nsa_decode_backend == "trtllm"
-                or get_global_server_args().nsa_prefill_backend == "trtllm"
+                get_global_server_args().dsa_decode_backend == "trtllm"
+                or get_global_server_args().dsa_prefill_backend == "trtllm"
             ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -698,17 +705,17 @@ class DeepseekMLAForwardMixin:
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
-    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
-        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
+        Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
         server_args = get_global_server_args()
         return (
             _use_aiter_gfx95
-            and self.current_attention_backend == "nsa"
+            and self.current_attention_backend in ("dsa", "nsa")
             and (
-                server_args.nsa_decode_backend == "tilelang"
-                or server_args.nsa_prefill_backend == "tilelang"
+                server_args.dsa_decode_backend == "tilelang"
+                or server_args.dsa_prefill_backend == "tilelang"
             )
         )
 
