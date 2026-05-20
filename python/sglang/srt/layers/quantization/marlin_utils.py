@@ -55,7 +55,9 @@ GPTQ_MARLIN_MIN_THREAD_N = 64
 GPTQ_MARLIN_MIN_THREAD_K = 128
 GPTQ_MARLIN_MAX_PARALLEL = 16
 
-MARLIN_SUPPORTED_GROUP_SIZES = [-1, 16, 32, 64, 128]
+MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+# NVFP SUPPORT 16, while MXFP4 supports 32 and 16.
+FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16, 32]
 
 # In case there is a performance issue with Marlin, the variable below can be
 # changed to False, which allows Marlin to perform global reductions in fp16
@@ -137,11 +139,15 @@ def _check_marlin_supported(
             f"are supported (for group_size = {group_size}, "
             f"device_capability = {device_capability}, zp = {has_zp}).",
         )
-    if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
+    if quant_type == scalar_types.float4_e2m1f:
+        allowed_group_sizes = FP4_MARLIN_SUPPORTED_GROUP_SIZES
+    else:
+        allowed_group_sizes = MARLIN_SUPPORTED_GROUP_SIZES
+    if group_size is None or group_size not in allowed_group_sizes:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+            f"Marlin does not support group_size = {group_size} for "
+            f"quant_type = {quant_type}. Only group_sizes = {allowed_group_sizes} "
             "are supported.",
         )
 

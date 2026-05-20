@@ -50,8 +50,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
     prepare_moe_nvfp4_layer_for_marlin,
+    prepare_nvfp4_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -1390,7 +1390,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 )
             copy_or_rebind_param(layer, "input_global_scale", input_scale_2)
             copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
-            prepare_fp4_layer_for_marlin(layer)
+            prepare_nvfp4_layer_for_marlin(layer)
             layer.weights_padding_cols = 0
             return
 

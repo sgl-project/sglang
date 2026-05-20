@@ -124,7 +124,7 @@ def apply_fp4_marlin_linear(
     return output.reshape(out_shape)
 
 
-def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     if getattr(layer, "quant_config", None) is not None:
         group_size = layer.quant_config.group_size
         if group_size != 16:

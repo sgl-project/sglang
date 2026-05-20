@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
-    prepare_fp4_layer_for_marlin,
+    prepare_nvfp4_layer_for_marlin,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -175,7 +175,7 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     layer.weight_global_scale = torch.nn.Parameter(
         global_scale.reshape(1), requires_grad=False
     )
-    prepare_fp4_layer_for_marlin(layer)
+    prepare_nvfp4_layer_for_marlin(layer)
 
     output = apply_fp4_marlin_linear(
         a_input,
