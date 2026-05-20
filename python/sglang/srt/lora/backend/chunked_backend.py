@@ -219,11 +219,25 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
-        max_num_segments = (
+        # Phase 2 (chunked SGMV + PCG): widen capture-time buffers to cover both
+        # decode (max_bs * num_tokens_per_bs tokens) AND PCG token buckets
+        # (max_num_tokens_pcg up to e.g. 8192). The dynamic chunk-count problem
+        # (number of segments varies per batch) is NOT solved here — kernels
+        # using grid=bs under use_cuda_graph=True still work, but kernels that
+        # depend on num_segments will need follow-up work (Phase 2 step 11b).
+        decode_max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        pcg_max_num_tokens = max_num_tokens_pcg or 0
+        max_num_tokens = max(decode_max_num_tokens, pcg_max_num_tokens)
+
+        decode_max_num_segments = (
             (num_tokens_per_bs + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
         ) * max_bs_in_cuda_graph
-        max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        pcg_max_num_segments = (
+            (pcg_max_num_tokens + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
+        )
+        max_num_segments = max(decode_max_num_segments, pcg_max_num_segments)
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
@@ -247,7 +261,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
+        # padded_bs is for triton-backend PCG A-Lite per-bs capture; ignored here.
+        del padded_bs
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
@@ -403,6 +420,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weight_indices=weight_indices,
             permutation=permutation,
             expected_tokens=expected_tokens,
+            # lm_head LoRA pruned path runs eager (outside captured PCG region),
+            # so its batch_info must NOT advertise use_cuda_graph=True — that
+            # is what layers.py:_get_lm_head_batch_info refuses.
+            use_cuda_graph=False,
         )
 
     @staticmethod

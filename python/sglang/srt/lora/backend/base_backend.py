@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -146,6 +146,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -154,6 +155,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         Args:
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
             num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+            max_num_tokens_pcg: PCG token bucket upper bound (= max(server_args.piecewise_cuda_graph_tokens))
+                                so prefill graph capture/replay can share the same pinned buffers.
+                                Pass None when PCG is disabled. Each backend may use this to
+                                widen its capture-time buffer allocations.
         """
         pass
 
@@ -163,6 +168,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_loras: int,
         compute_dtype: torch.dtype,
         moe_layer,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -173,6 +179,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         This is backend-agnostic because MoE LoRA always uses the same
         fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
         dense LoRA backend is selected.
+
+        Args:
+            max_num_tokens_pcg: PCG token bucket upper bound. Most MoE LoRA
+                intermediate buffers are sized along the *token* axis (one
+                row per routed token). In decode num_tokens = bs, but in
+                prefill (PCG) num_tokens can be much larger (e.g. 8192).
+                Pass None when PCG is disabled.
         """
         base = moe_layer.base_layer
         top_k = base.top_k
@@ -183,8 +196,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         dtype = compute_dtype
         num_experts = base.num_experts
 
+        # Token-axis upper bound for prefill-PCG-aware allocations.
+        # weight_indices_long stays bs-axis since it is filled per-sequence.
+        max_tokens = max(max_bs, max_num_tokens_pcg or 0)
+
         block_size_m = 64
-        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
+        max_num_tokens_padded = max_tokens * top_k + num_experts * (block_size_m - 1)
         max_num_tokens_padded = (
             (max_num_tokens_padded + block_size_m - 1) // block_size_m
         ) * block_size_m
@@ -192,16 +209,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         self.moe_cg_buffers = {
             "intermediate_cache1": torch.empty(
-                (max_bs, top_k, N), device=device, dtype=dtype
+                (max_tokens, top_k, N), device=device, dtype=dtype
             ),
             "intermediate_cache2": torch.empty(
-                (max_bs * top_k, N // 2), device=device, dtype=dtype
+                (max_tokens * top_k, N // 2), device=device, dtype=dtype
             ),
             "intermediate_cache3": torch.empty(
-                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
+                (max_tokens, top_k, hidden_dim), device=device, dtype=dtype
             ),
             "out_hidden_states": torch.empty(
-                (max_bs, hidden_dim), device=device, dtype=dtype
+                (max_tokens, hidden_dim), device=device, dtype=dtype
             ),
             "sorted_token_ids_lora": torch.empty(
                 (max_loras * max_num_tokens_padded,),
@@ -220,6 +237,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             # int64 copy of weight_indices for index_fill_(), which requires
             # LongTensor.  weight_indices itself must stay int32 because the
             # CUDA moe_lora_align kernel casts it to int32_t*.
+            # weight_indices is per-sequence (filled idx_buf[:bs]=wi[:bs]) so
+            # stays sized by max_bs even under PCG.
             "weight_indices_long": torch.zeros(
                 max_bs, dtype=torch.int64, device=device
             ),
@@ -230,7 +249,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 device=device,
             ),
             "token_mask": torch.empty(
-                (max_loras * max_bs * top_k,),
+                (max_loras * max_tokens * top_k,),
                 dtype=torch.int32,
                 device=device,
             ),
@@ -245,6 +264,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
@@ -257,5 +277,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
             use_cuda_graph: whether to use CUDA Graph for this batch
+            padded_bs: when set under use_cuda_graph + EXTEND, pad seg_lens /
+                weight_indices to this size so the per-bs cuda graph capture
+                (PCG A-Lite) sees a stable batch_info.bs across captures.
         """
         pass

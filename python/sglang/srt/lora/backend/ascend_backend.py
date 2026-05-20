@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -237,7 +239,10 @@ class AscendLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
+        # padded_bs is for triton-backend PCG A-Lite per-bs capture; ignored here.
+        del padded_bs
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"

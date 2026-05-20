@@ -1999,14 +1999,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         max_bs = self.server_args.cuda_graph_max_bs
         max_loras = self.server_args.max_loras_per_batch
+        # Token-axis upper bound for prefill-PCG-aware MoE buffer sizing.
+        # When PCG is disabled this is None and the legacy max_bs-only sizing
+        # is preserved.
+        pcg_tokens = self.server_args.piecewise_cuda_graph_tokens
+        max_num_tokens_pcg = (
+            max(pcg_tokens)
+            if pcg_tokens and not self.server_args.disable_piecewise_cuda_graph
+            else None
+        )
         for module in self.model.modules():
             if isinstance(module, FusedMoEWithLoRA):
                 self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
+                    max_bs,
+                    max_loras,
+                    self.dtype,
+                    module,
+                    max_num_tokens_pcg=max_num_tokens_pcg,
                 )
                 logger.info(
                     f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                    f"(max_bs={max_bs}, max_loras={max_loras}, "
+                    f"max_num_tokens_pcg={max_num_tokens_pcg})"
                 )
                 break
 
@@ -2810,6 +2824,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Disable piecewise CUDA graph because the capture size is not set"
             )
             return
+
+        # Note: lm_head LoRA pruned path is kept compatible with PCG by forcing
+        # its dedicated lm_head_batch_info.use_cuda_graph=False in
+        # triton/chunked backends (the pruned compute runs eager OUTSIDE the
+        # captured graph region, so it does not need cuda-graph metadata).
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)

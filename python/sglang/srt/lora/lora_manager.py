@@ -108,32 +108,59 @@ class LoRAManager:
         )
 
     def init_cuda_graph_batch_info(
-        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
         Called during CudaGraphRunner.__init__(), after init_memory_pool().
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
+
+        Args:
+            max_num_tokens_pcg: PCG token bucket upper bound (max of
+                server_args.piecewise_cuda_graph_tokens) so prefill capture/replay
+                can share the pinned cuda_graph_batch_info. None = PCG disabled.
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        # When max_num_tokens_pcg is supplied, the pinned cuda_graph_batch_info
+        # is sized large enough to cover prefill (EXTEND) too. Use this to
+        # route the upstream prepare_lora_batch() call from init_new directly
+        # into the pinned buffer for EXTEND, avoiding the wasted fresh-alloc
+        # done by the non-cuda-graph path. PCG.replay can then skip a second
+        # prepare_lora_batch call.
+        self._cuda_graph_supports_extend = max_num_tokens_pcg is not None
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+            max_num_tokens_pcg=max_num_tokens_pcg,
         )
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
         Called before init_memory_pool() so memory profiling accounts for them.
         Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+
+        Args:
+            max_num_tokens_pcg: PCG token bucket upper bound so MoE LoRA
+                token-axis buffers also cover prefill capture/replay.
+                Pass None when PCG is disabled.
         """
         self.lora_backend.init_cuda_graph_moe_buffers(
             max_bs=max_bs,
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            max_num_tokens_pcg=max_num_tokens_pcg,
         )
 
     def create_lora_update_result(
@@ -302,14 +329,25 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        force_cuda_graph: bool = False,
+        padded_bs: Optional[int] = None,
+    ):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
+        # force_cuda_graph=True lets PCG (extend) drive in-place batch info updates
+        # even though ForwardMode.EXTEND is not in ForwardMode.is_cuda_graph().
+        # The auto-route via _cuda_graph_supports_extend was reverted because it
+        # caused eager EXTEND fallbacks (e.g. PCG can_run==False for batched LoRA)
+        # to read stale max_len from the pinned buffer, ballooning kernel grids.
+        # Now only PCG/BCG.replay opt in explicitly via force_cuda_graph=True.
         use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
+            and (forward_batch.forward_mode.is_cuda_graph() or force_cuda_graph)
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
@@ -331,6 +369,7 @@ class LoRAManager:
             lora_ranks=lora_ranks,
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
+            padded_bs=padded_bs,
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices

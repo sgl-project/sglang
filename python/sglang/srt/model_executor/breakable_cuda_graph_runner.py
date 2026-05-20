@@ -103,9 +103,22 @@ class BreakableCudaGraphRunner:
         )
         self.max_bs = model_runner.req_to_token_pool.size
 
+        # A-Lite for BCG: per-bs cuda graphs. Without Inductor we don't hit the
+        # batch_info.bs nn.Module-static guard, but the captured cuda graphs
+        # still bake their kernel grids (which include batch_info.bs). So we
+        # still need one cuda graph per (num_tokens, bs_bucket).
+        if model_runner.server_args.enable_lora:
+            # Mirror PCG's [1, 16] choice; see piecewise_cuda_graph_runner.py
+            # for the wider-bucket slowdown rationale.
+            self.capture_bs_buckets = sorted(set([1, 16]))
+        else:
+            self.capture_bs_buckets = [1]
+        self.max_capture_bs = max(self.capture_bs_buckets)
+
         log_info_on_rank0(
             logger,
-            f"[BCG] Capture num tokens: {self.capture_num_tokens}",
+            f"[BCG] Capture num tokens: {self.capture_num_tokens}  "
+            f"bs buckets: {self.capture_bs_buckets}",
         )
 
         self._init_buffers(model_runner)
@@ -224,13 +237,13 @@ class BreakableCudaGraphRunner:
             )
         return output
 
-    def _build_capture_forward_batch(self, num_tokens):
-        """Build a bs=1 placeholder ForwardBatch for capture.
+    def _build_capture_forward_batch(self, num_tokens, bs: int = 1):
+        """Build a (bs)-sized placeholder ForwardBatch for capture.
 
-        bs=1 here is only a placeholder for attention/mamba breaks' metadata
-        shapes; replay supplies live multi-req metadata via replay_prepare.
-        Captured kernels run only on the token-major layer stack and are
-        bs-invariant.
+        Replay supplies live multi-req metadata via replay_prepare. For
+        A-Lite per-bs captures, ``bs`` distributes the num_tokens across the
+        bucket's sequences (rounded), keeping batch_info.bs consistent at
+        replay so the captured kernel grid matches.
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.forward_batch_info import (
@@ -240,14 +253,31 @@ class BreakableCudaGraphRunner:
         )
 
         buffers = self.buffers
-        bs = 1
+        # Distribute num_tokens across bs seqs evenly (matches PCG capture).
+        base, rem = divmod(num_tokens, bs)
+        seq_lens_list = [base + (1 if i < rem else 0) for i in range(bs)]
+        prefix_lens_list = [0] * bs
+        start_loc_list = [0]
+        for v in seq_lens_list[:-1]:
+            start_loc_list.append(start_loc_list[-1] + v)
+
         with torch.device(self.device):
-            seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
-            extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
-            extend_prefix_lens = torch.zeros((bs,), dtype=torch.int64)
-            extend_start_loc = torch.zeros((bs,), dtype=torch.int64)
+            seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64)
+            extend_seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64)
+            extend_prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int64)
+            extend_start_loc = torch.tensor(start_loc_list, dtype=torch.int64)
             req_pool_indices = torch.arange(bs, dtype=torch.int64)
-            orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
+            orig_seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64)
+
+        # Mirror PCG's LoRA-aware capture: empty lora_ids drives the kernels to
+        # launch but early-return, so the captured graph records the kernel
+        # presence. Replay overwrites the pinned cuda_graph_batch_info with
+        # live lora ids.
+        capture_lora_ids = (
+            [None] * bs
+            if self.model_runner.server_args.enable_lora
+            else None
+        )
 
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -260,7 +290,7 @@ class BreakableCudaGraphRunner:
             seq_lens=seq_lens,
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
-            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            seq_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
@@ -280,9 +310,9 @@ class BreakableCudaGraphRunner:
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            extend_prefix_lens_cpu=torch.tensor(prefix_lens_list, device="cpu"),
+            extend_seq_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
+            extend_logprob_start_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
             positions=buffers.positions[:num_tokens],
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
@@ -296,18 +326,29 @@ class BreakableCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=None,
             global_forward_mode=ForwardMode.EXTEND,
-            lora_ids=None,
+            lora_ids=capture_lora_ids,
         )
+
+    def _maybe_prepare_lora(self, forward_batch, padded_bs=None):
+        """Mirror PCG: populate pinned LoRABatchInfo for the capture/replay batch."""
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True, padded_bs=padded_bs
+            )
 
     def _warmup(self):
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
-        forward_batch = self._build_capture_forward_batch(num_tokens)
+        forward_batch = self._build_capture_forward_batch(num_tokens, bs=1)
+        self._maybe_prepare_lora(forward_batch, padded_bs=1)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
-        """Capture breakable CUDA graphs for all token sizes."""
+        """Capture breakable CUDA graphs for all (num_tokens, bs_bucket) pairs."""
         with (
             freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
             graph_capture() as graph_capture_context,
@@ -316,12 +357,21 @@ class BreakableCudaGraphRunner:
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
 
+            # A-Lite: nested (num_tokens, bs_bucket). Skip combos where bs >
+            # num_tokens (can't represent bs sequences each >=1 token within
+            # num_tokens).
+            capture_pairs = [
+                (n, b)
+                for n in reversed(self.capture_num_tokens)
+                for b in reversed(self.capture_bs_buckets)
+                if b <= n
+            ]
             capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                tqdm.tqdm(capture_pairs)
                 if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_num_tokens)
+                else capture_pairs
             )
-            for num_tokens in capture_range:
+            for num_tokens, bs in capture_range:
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
                         self.model_runner.device,
@@ -329,12 +379,12 @@ class BreakableCudaGraphRunner:
                         empty_cache=False,
                     )
                     capture_range.set_description(
-                        f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
+                        f"[BCG] Capturing ({num_tokens=} bs={bs} {avail_mem=:.2f} GB)"
                     )
 
-                graph, output = self._capture_one(num_tokens, pool, stream)
-                self.graphs[num_tokens] = graph
-                self.output_buffers[num_tokens] = output
+                graph, output = self._capture_one(num_tokens, bs, pool, stream)
+                self.graphs[(num_tokens, bs)] = graph
+                self.output_buffers[(num_tokens, bs)] = output
 
     def can_run(self, forward_batch: "ForwardBatch"):
         if self.layer_model is None:
@@ -345,6 +395,13 @@ class BreakableCudaGraphRunner:
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        # A-Lite: live bs is bisect-up'd to nearest captured bs_bucket. Beyond
+        # max_capture_bs we fall back to eager (still correct).
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.batch_size > self.max_capture_bs
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -353,11 +410,24 @@ class BreakableCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
-        return num_tokens <= self.max_num_tokens
+        if num_tokens > self.max_num_tokens:
+            return False
+        # A-Lite: refuse if the bisect-up'd (token_bucket, bs_bucket) combo was
+        # skipped at capture (bs_bucket > num_tokens_bucket). Without this guard,
+        # replay would hit KeyError on self.graphs lookup.
+        if self.model_runner.server_args.enable_lora:
+            token_idx = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+            token_bucket = self.capture_num_tokens[token_idx]
+            bs_idx = bisect.bisect_left(self.capture_bs_buckets, forward_batch.batch_size)
+            bs_bucket = self.capture_bs_buckets[bs_idx]
+            if (token_bucket, bs_bucket) not in self.graphs:
+                return False
+        return True
 
-    def _capture_one(self, num_tokens, pool, stream):
-        """Capture a breakable CUDA graph for one token size."""
-        forward_batch = self._build_capture_forward_batch(num_tokens)
+    def _capture_one(self, num_tokens, bs, pool, stream):
+        """Capture a breakable CUDA graph for one (num_tokens, bs) bucket."""
+        forward_batch = self._build_capture_forward_batch(num_tokens, bs=bs)
+        self._maybe_prepare_lora(forward_batch, padded_bs=bs)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -379,12 +449,38 @@ class BreakableCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # A-Lite: bisect live bs up to nearest captured bs_bucket; pad
+        # padded_bs so batch_info.bs matches the captured kernel grid.
+        live_bs = forward_batch.batch_size
+        if self.model_runner.server_args.enable_lora:
+            bisect_idx = bisect.bisect_left(self.capture_bs_buckets, live_bs)
+            assert bisect_idx < len(
+                self.capture_bs_buckets
+            ), f"live_bs ({live_bs}) > max_capture_bs ({self.max_capture_bs}); can_run should have rejected"
+            padded_bs = self.capture_bs_buckets[bisect_idx]
+        else:
+            padded_bs = 1
+
+        # Re-run prepare_lora_batch with force_cuda_graph=True so the LoRA
+        # backend writes batch metadata into the pinned cuda_graph_batch_info
+        # baked into the captured BreakableCUDAGraph (mirrors PCG.replay).
+        if (
+            self.model_runner.server_args.enable_lora
+            and forward_batch.lora_ids is not None
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                forward_batch, force_cuda_graph=True, padded_bs=padded_bs
+            )
+            self._current_padded_bs = padded_bs
+        else:
+            self._current_padded_bs = None
+
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
 
-        captured_graph = self.graphs[static_num_tokens]
-        captured_hidden = self.output_buffers[static_num_tokens]
+        captured_graph = self.graphs[(static_num_tokens, padded_bs)]
+        captured_hidden = self.output_buffers[(static_num_tokens, padded_bs)]
 
         # Closure replaces layer_model.forward for the duration of the outer
         # model.forward call. Replays the captured CUDAGraph and hands the
