@@ -47,5 +47,10 @@ exec python3 -m sglang.launch_server \
   --page-size "${PAGE_SIZE}" \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
+  --disable-radix-cache \
   --trust-remote-code \
   2>&1 | tee "${LOG_FILE}"
+# --disable-radix-cache is required by the DS validator (DEC-2): radix cache
+# is gated until the M3-B page-stability fixture has been recorded as passing
+# for this configuration. Set SGLANG_DS_RADIX_OVERRIDE=1 in the environment
+# only if you have explicitly run that fixture on this hardware.

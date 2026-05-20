@@ -51,7 +51,7 @@ The schema written to the file (per DEC-4 / AC-4):
 
 ## CI fixture
 
-The repository's CI runs the same script with a tiny NSA-shaped model fixture (`--tp 1`, synthetic dataset, `--num-samples 4`, `--ctx-len 256`, with `--num-layers`, `--num-heads`, `--head-dim` hints) so the loader's happy path is exercised in under a minute. When `--model` points at a path that is not on disk, the script falls back to synthetic statistics and records `calibration_source=synthetic` in the file metadata — this CI artifact is suitable for unit tests but **must NOT** be used for production serving.
+The repository's CI runs the same script with a tiny NSA-shaped model fixture (`--tp 1 --allow-synthetic`, `--num-samples 4`, `--ctx-len 256`, with `--num-layers`, `--num-heads`, `--head-dim` hints) so the loader's happy path is exercised in under a minute. The `--allow-synthetic` flag is an explicit opt-in: without it, a non-local `--model` value (such as a HuggingFace repo ID) goes through `AutoModelForCausalLM.from_pretrained` and will auto-fetch the repo. Synthetic statistics are deterministic and record `calibration_source=synthetic` in the file metadata — this CI artifact is suitable for unit tests but **must NOT** be used for production serving.
 
 ## NIAH-min sanity probe
 

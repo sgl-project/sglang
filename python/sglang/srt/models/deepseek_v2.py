@@ -1769,17 +1769,22 @@ class DeepseekV2AttentionMLA(
     ):
         """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
 
-        When ``self.use_double_sparsity`` is true, dispatch to the standalone
-        Double Sparsity selector and return its
-        ``(selected_indices, valid_lengths)`` tuple. Otherwise call the existing
-        NSA ``Indexer`` and return its token-level ``topk_indices`` tensor (or
-        ``None`` when the backend skips selection for this batch).
+        When ``self.use_double_sparsity`` is false (the default and current
+        production path), this dispatches to the existing NSA ``Indexer`` and
+        returns its token-level ``topk_indices`` tensor (or ``None`` when the
+        backend skips selection for this batch).
 
-        The two return shapes are intentionally distinct so that downstream
-        code can not silently mix them. Production deployments must either
-        keep DS disabled (and consume the indexer tensor) or land the real
-        DS selection kernels + page-table adapter (a later milestone) that
-        unwrap the DS tuple into a FlashMLA-compatible page table.
+        When ``self.use_double_sparsity`` is true, the selector's page-level
+        output ``(selected_indices, valid_lengths)`` is **not yet
+        ABI-compatible** with the NSA backend that consumes ``topk_indices``
+        as a token-level int32 tensor (it calls ``.shape`` and ``!= -1`` on
+        it). The page-table adapter that translates page-level selections
+        into the backend's token-level tensor is the documented next
+        milestone (see REVIEWER_GUIDE.md "Known gaps for the integration
+        that the deploying team must close"). Until the adapter lands, the
+        DS branch raises ``NotImplementedError`` after the placeholder
+        guard, so the failure surfaces here with a clear pointer rather
+        than as an opaque shape crash inside the backend.
         """
 
         if self.use_double_sparsity:
@@ -1789,20 +1794,18 @@ class DeepseekV2AttentionMLA(
 
             assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
 
-            req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-            if req_pool_indices is None:
-                raise RuntimeError(
-                    "Double Sparsity selector requires forward_batch.req_pool_indices."
-                )
-            seq_lens = getattr(forward_batch, "seq_lens", None)
-            sparse_mask = getattr(forward_batch, "sparse_mask", None)
-            queries = q_lora if q_lora is not None else x
-            return self.double_sparsity_selector.retrieve_topk(
-                queries=queries,
-                layer_id=layer_id,
-                req_pool_indices=req_pool_indices,
-                sparse_mask=sparse_mask,
-                seq_lens=seq_lens,
+            raise NotImplementedError(
+                "Double Sparsity selector is wired into the V3.2 attention "
+                "path, but the page-table adapter that translates the "
+                "selector's (selected_indices, valid_lengths) page-level "
+                "output into the NSA backend's token-level topk_indices "
+                "tensor has not landed yet. This is the documented "
+                "next-milestone boundary (REVIEWER_GUIDE.md 'Known gaps "
+                "for the integration that the deploying team must close'). "
+                "Disable Double Sparsity (drop --enable-double-sparsity) "
+                "until the adapter is in place. The selector ABI itself is "
+                "independently testable via "
+                "DoubleSparsitySelector.retrieve_topk(...)."
             )
 
         return self.indexer(

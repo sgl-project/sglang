@@ -292,7 +292,15 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
             )
         return attn
 
-    def test_ds_branch_returns_tuple(self):
+    def test_ds_branch_raises_pending_adapter(self):
+        """With the placeholder guard satisfied, the DS branch must still
+        fail loudly because the page-table adapter that translates
+        ``(selected_indices, valid_lengths)`` to the NSA backend's
+        token-level ``topk_indices`` tensor has not landed yet. The selector
+        ABI itself is exercised independently via
+        ``DoubleSparsitySelector.retrieve_topk`` (see ``TestSelectorAbi``).
+        """
+
         os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
         try:
             attn = self._make_attn(use_ds=True)
@@ -301,20 +309,14 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
                 seq_lens=torch.tensor([100, 200], dtype=torch.int32),
                 sparse_mask=None,
             )
-            result = attn._select_topk_indices(
-                x=torch.zeros(2, 16, 128),
-                q_lora=torch.zeros(2, 16, 128),
-                positions=torch.zeros(2, dtype=torch.int32),
-                forward_batch=forward_batch,
-                layer_id=0,
-            )
-            self.assertIsInstance(result, tuple)
-            self.assertEqual(len(result), 2)
-            selected_indices, valid_lengths = result
-            self.assertEqual(selected_indices.dtype, torch.int32)
-            self.assertEqual(valid_lengths.dtype, torch.int32)
-            self.assertEqual(tuple(selected_indices.shape), (2, 2048))
-            self.assertEqual(tuple(valid_lengths.shape), (2,))
+            with self.assertRaises(NotImplementedError):
+                attn._select_topk_indices(
+                    x=torch.zeros(2, 16, 128),
+                    q_lora=torch.zeros(2, 16, 128),
+                    positions=torch.zeros(2, dtype=torch.int32),
+                    forward_batch=forward_batch,
+                    layer_id=0,
+                )
             attn.indexer.assert_not_called()
         finally:
             os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)

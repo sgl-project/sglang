@@ -22,7 +22,9 @@ Production recipe (DeepSeek-V3.2 FP8 on 2-node H200):
         --batch-size 4 \\
         --num-samples 1024
 
-CI runs against a tiny NSA-shaped fixture under one minute with ``--tp 1``.
+CI runs against a tiny NSA-shaped fixture under one minute with ``--tp 1
+--allow-synthetic`` (the synthetic fallback is opt-in; HF repo IDs without
+that flag must succeed through ``AutoModelForCausalLM.from_pretrained``).
 """
 
 from __future__ import annotations
@@ -101,31 +103,32 @@ def _collect_channel_importance(
     num_heads_hint: Optional[int],
     head_dim_hint: Optional[int],
     prompts: List[str],
+    allow_synthetic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the calibration forward pass and return ``(selection, weights)``.
 
-    The forward pass is implemented as a lightweight "stat collector": we
-    hook the K-projection layer, accumulate per-channel L2-squared
-    importance, and reduce to ``(num_layers, num_heads, head_dim)``.
+    The real path hooks K-projection layers, accumulates per-channel
+    L2-squared importance, and reduces to ``(num_layers, num_heads,
+    head_dim)``.
 
-    For environments without the model on disk (CI fixture path), the
-    function falls back to a deterministic synthetic-statistics generator
-    so the resulting file still passes the loader's schema + content-hash
-    checks. The synthetic path is marked in the file's metadata via
-    ``calibration_source=synthetic``.
+    The synthetic-statistics path is gated behind ``allow_synthetic=True``
+    and is reserved for CI fixtures + developer smoke tests. HuggingFace
+    repo IDs (e.g. ``deepseek-ai/DeepSeek-V3.2``) are NOT local directories,
+    so without the explicit opt-in this function must attempt the real
+    ``AutoModelForCausalLM.from_pretrained`` path (which fetches the repo if
+    it is a valid HF ID) rather than silently producing a behaviorally
+    invalid mask.
     """
 
-    if not os.path.isdir(model_path) and "/" in model_path and not os.path.exists(
-        model_path
+    if allow_synthetic and (
+        not os.path.isdir(model_path) and not os.path.exists(model_path)
     ):
         logger.warning(
-            "model_path %s not found on disk. Falling back to synthetic calibration "
-            "statistics — useful for CI fixtures and developer smoke tests, but the "
-            "resulting file should NOT be used for production serving.",
+            "Synthetic calibration explicitly requested (--allow-synthetic) and "
+            "model_path %s is not on disk. The resulting mask is for CI / dev "
+            "smoke tests only and must NOT be used for production serving.",
             model_path,
         )
-        # Synthetic deterministic statistics. The shape matches the V3.2-FP8
-        # operating point unless the user overrides the hints.
         L = num_layers_hint or 60
         H = num_heads_hint or 128
         D = head_dim_hint or 128
@@ -257,6 +260,7 @@ def calibrate(args: argparse.Namespace) -> str:
         num_heads_hint=args.num_heads,
         head_dim_hint=args.head_dim,
         prompts=prompts,
+        allow_synthetic=args.allow_synthetic,
     )
 
     L, H, head_dim = importance.shape
@@ -273,8 +277,9 @@ def calibrate(args: argparse.Namespace) -> str:
 
     head_dim_arg = args.head_dim or head_dim
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    used_synthetic = args.allow_synthetic and not os.path.exists(args.model)
     extra = {
-        "calibration_source": "real" if os.path.exists(args.model) else "synthetic",
+        "calibration_source": "synthetic" if used_synthetic else "real",
         "num_samples": str(len(prompts)),
         "ctx_len": str(args.ctx_len),
     }
@@ -351,6 +356,18 @@ def _make_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Head dim hint when the model is not on disk (synthetic fallback).",
+    )
+    p.add_argument(
+        "--allow-synthetic",
+        action="store_true",
+        help=(
+            "Allow the deterministic synthetic-statistics fallback when "
+            "--model is not a local path. Reserved for CI fixtures and dev "
+            "smoke tests; the resulting mask is NOT valid for production "
+            "serving. Without this flag a HuggingFace repo ID (e.g. "
+            "deepseek-ai/DeepSeek-V3.2) is loaded via "
+            "AutoModelForCausalLM.from_pretrained."
+        ),
     )
     p.add_argument(
         "-v",
