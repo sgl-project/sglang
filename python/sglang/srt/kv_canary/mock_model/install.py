@@ -16,14 +16,14 @@ if TYPE_CHECKING:
 def install_mock_model_sampler(
     *, server_args: "ServerArgs", vocab_size: int
 ) -> Optional[OracleSamplerHook]:
-    """Register the oracle sampler backend when mock_model_enabled is set.
+    """Register the oracle sampler backend when sampling_backend == "oracle".
 
     Must be called before create_sampler() so the factory is present when the
     Sampler is first constructed.  Returns the OracleSamplerHook so the caller
     can attach it to a CanaryRunner after install_canary completes; returns
-    None when mock_model_enabled is False.
+    None when sampling_backend is anything other than "oracle".
     """
-    if not server_args.mock_model_enabled:
+    if server_args.sampling_backend != "oracle":
         return None
 
     seed = envs.SGLANG_MOCK_MODEL_ORACLE_SEED.get()

@@ -1,6 +1,5 @@
 """OracleSamplerHook.fill_expected_inputs writes oracle-derived (token, position) into canary
-placeholders, and apply_mock_model_defaults pre-fills the dependent ServerArgs flags when
-mock_model is opted in.
+placeholders, and mock_model_engine_kwargs returns the right Engine kwargs for mock-model tests.
 """
 
 from __future__ import annotations
@@ -10,12 +9,11 @@ import json
 
 import torch
 
-from sglang.srt.kv_canary.mock_model.args_modifier import (
-    apply_mock_model_defaults,
-)
 from sglang.srt.kv_canary.mock_model.oracle import ScriptedOracle
 from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
+
+from .utils import mock_model_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
@@ -107,52 +105,34 @@ def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool() -> None
     assert hook._req_pool_indices_per_row == [5, 7]
 
 
-def test_apply_mock_model_defaults_no_op_when_disabled() -> None:
-    from sglang.srt.server_args import ServerArgs
+def test_mock_model_engine_kwargs_returns_defaults() -> None:
+    kwargs = mock_model_engine_kwargs()
 
-    original = ServerArgs(model_path="dummy", mock_model_enabled=False)
-    result = apply_mock_model_defaults(original)
-
-    assert result is original
-    assert result.load_format == "auto"
-
-
-def test_apply_mock_model_defaults_fills_holes_when_enabled() -> None:
-    from sglang.srt.server_args import ServerArgs
-
-    original = ServerArgs(model_path="dummy", mock_model_enabled=True)
-    result = apply_mock_model_defaults(original)
-
-    assert result.load_format == "dummy"
-    assert json.loads(result.json_model_override_args).get("num_hidden_layers") == 1
-    assert result.sampling_backend == "oracle"
-    assert result.kv_canary == "raise"
-    assert result.kv_canary_input_check is True
+    assert kwargs["load_format"] == "dummy"
+    assert json.loads(kwargs["json_model_override_args"]) == {"num_hidden_layers": 1}
+    assert kwargs["sampling_backend"] == "oracle"
+    assert kwargs["kv_canary"] == "raise"
+    assert kwargs["kv_canary_input_check"] is True
 
 
-def test_apply_mock_model_defaults_preserves_user_overrides() -> None:
-    from sglang.srt.server_args import ServerArgs
-
-    original = ServerArgs(
-        model_path="dummy",
-        mock_model_enabled=True,
-        json_model_override_args='{"num_hidden_layers":4}',
+def test_mock_model_engine_kwargs_overrides_win() -> None:
+    kwargs = mock_model_engine_kwargs(
         kv_canary="on",
+        sampling_backend="pytorch",
+        tp_size=2,
     )
-    result = apply_mock_model_defaults(original)
 
-    assert json.loads(result.json_model_override_args).get("num_hidden_layers") == 4
-    assert result.kv_canary == "on"
-    assert result.load_format == "dummy"
+    assert kwargs["kv_canary"] == "on"
+    assert kwargs["sampling_backend"] == "pytorch"
+    assert kwargs["tp_size"] == 2
+    assert kwargs["load_format"] == "dummy"
 
 
-def test_apply_mock_model_defaults_is_idempotent() -> None:
-    from sglang.srt.server_args import ServerArgs
+def test_mock_model_engine_kwargs_merges_json_override() -> None:
+    kwargs = mock_model_engine_kwargs(
+        json_model_override_args='{"rope_theta": 1000.0}',
+    )
 
-    original = ServerArgs(model_path="dummy", mock_model_enabled=True)
-    first = apply_mock_model_defaults(original)
-    second = apply_mock_model_defaults(first)
-
-    assert first.load_format == second.load_format
-    assert first.sampling_backend == second.sampling_backend
-    assert first.kv_canary == second.kv_canary
+    merged = json.loads(kwargs["json_model_override_args"])
+    assert merged["num_hidden_layers"] == 1
+    assert merged["rope_theta"] == 1000.0

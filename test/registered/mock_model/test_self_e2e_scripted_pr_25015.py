@@ -7,6 +7,8 @@ import pytest
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
+from .utils import mock_model_engine_kwargs
+
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 
@@ -18,10 +20,7 @@ def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
     monkeypatch.setenv("SGLANG_DEBUG_REVERT_PR_25015_FIX", "1")
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
-        mock_model_enabled=True,
-        speculative_algorithm="EAGLE",
-        kv_canary="raise",
-        kv_canary_input_check=True,
+        **mock_model_engine_kwargs(speculative_algorithm="EAGLE"),
     )
     try:
         with pytest.raises(Exception):
@@ -38,10 +37,7 @@ def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
 def test_eagle_positions_match_with_fix() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
-        mock_model_enabled=True,
-        speculative_algorithm="EAGLE",
-        kv_canary="raise",
-        kv_canary_input_check=True,
+        **mock_model_engine_kwargs(speculative_algorithm="EAGLE"),
     )
     try:
         engine.generate(

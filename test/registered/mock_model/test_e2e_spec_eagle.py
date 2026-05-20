@@ -7,6 +7,8 @@ import pytest
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
+from .utils import mock_model_engine_kwargs
+
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
@@ -21,10 +23,7 @@ def _fake_prompt(length: int) -> list[int]:
 def test_spec_eagle_no_canary_violation() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
-        mock_model_enabled=True,
-        kv_canary="raise",
-        kv_canary_input_check=True,
-        speculative_algorithm="EAGLE",
+        **mock_model_engine_kwargs(speculative_algorithm="EAGLE"),
     )
     try:
         engine.generate(

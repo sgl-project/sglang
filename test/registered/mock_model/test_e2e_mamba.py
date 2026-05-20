@@ -7,6 +7,8 @@ import pytest
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
+from .utils import mock_model_engine_kwargs
+
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
@@ -21,9 +23,7 @@ def _fake_prompt(length: int) -> list[int]:
 def test_mamba_no_canary_violation() -> None:
     engine = Engine(
         model_path="state-spaces/mamba-130m",
-        mock_model_enabled=True,
-        kv_canary="raise",
-        kv_canary_input_check=True,
+        **mock_model_engine_kwargs(),
     )
     try:
         engine.generate(
