@@ -324,5 +324,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             flashmla_metadata=flashmla_metadata,
         )
 
+
 # Backward-compat alias
-DeepseekSparseAttnBackendMTPPrecomputeMixin = DeepseekSparseAttnBackendMTPPrecomputeMixin
+DeepseekSparseAttnBackendMTPPrecomputeMixin = (
+    DeepseekSparseAttnBackendMTPPrecomputeMixin
+)

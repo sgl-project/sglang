@@ -1,5 +1,6 @@
 # [Deprecated] Re-export shim for backward compatibility. Use dsa.transform_index instead.
 import warnings
+
 warnings.warn(
     "sglang.srt.layers.attention.nsa.transform_index is deprecated; "
     "use sglang.srt.layers.attention.dsa.transform_index instead.",

@@ -33,14 +33,14 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.dsv4.compressor import Compressor
-from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
+    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
-    dsa_use_prefill_cp,
 )
+from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,

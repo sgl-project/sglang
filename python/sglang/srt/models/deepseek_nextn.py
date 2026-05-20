@@ -29,8 +29,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
-    is_dsa_enable_prefill_cp,
     dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,

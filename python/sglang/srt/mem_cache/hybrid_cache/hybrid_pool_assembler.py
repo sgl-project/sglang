@@ -718,13 +718,13 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            cache.components[
-                ComponentType.FULL
-            ]._full_kv_pool_host = cache.full_kv_pool_host
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
             cache.swa_kv_pool_host = host_pool_group.get_pool(PoolName.SWA)
-            cache.components[
-                ComponentType.SWA
-            ]._swa_kv_pool_host = cache.swa_kv_pool_host
+            cache.components[ComponentType.SWA]._swa_kv_pool_host = (
+                cache.swa_kv_pool_host
+            )
             for pool_name, indices_from_pool in (
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
@@ -766,13 +766,13 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            cache.components[
-                ComponentType.FULL
-            ]._full_kv_pool_host = cache.full_kv_pool_host
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
             cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
-            cache.components[
-                ComponentType.MAMBA
-            ]._mamba_pool_host = cache.mamba_pool_host
+            cache.components[ComponentType.MAMBA]._mamba_pool_host = (
+                cache.mamba_pool_host
+            )
             params.req_to_token_pool.register_layer_transfer_counter(
                 cache_controller.layer_done_counter
             )
@@ -812,13 +812,13 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            cache.components[
-                ComponentType.FULL
-            ]._full_kv_pool_host = cache.full_kv_pool_host
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
             cache.swa_kv_pool_host = host_pool_group.get_pool(PoolName.SWA)
-            cache.components[
-                ComponentType.SWA
-            ]._swa_kv_pool_host = cache.swa_kv_pool_host
+            cache.components[ComponentType.SWA]._swa_kv_pool_host = (
+                cache.swa_kv_pool_host
+            )
             transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
         elif nsa_stack:
             full_layer_mapping = {
@@ -856,9 +856,9 @@ def attach_hybrid_pool_to_unified_cache(
                     indices_from_pool=PoolName.KV,
                 )
             )
-            cache.components[
-                ComponentType.FULL
-            ]._full_kv_pool_host = cache.full_kv_pool_host
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
             transfer_layer_num = len(full_layer_mapping)
         else:
             full_layer_mapping = {
@@ -882,9 +882,9 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            cache.components[
-                ComponentType.FULL
-            ]._full_kv_pool_host = cache.full_kv_pool_host
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
             transfer_layer_num = len(full_layer_mapping)
 
         kvcache.register_layer_transfer_counter(

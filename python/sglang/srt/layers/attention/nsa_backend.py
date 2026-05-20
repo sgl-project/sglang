@@ -10,14 +10,14 @@ warnings.warn(
 )
 from sglang.srt.layers.attention.dsa_backend import *  # noqa: F401, F403
 from sglang.srt.layers.attention.dsa_backend import (  # noqa: F401
-    DeepseekSparseAttnBackend,
-    DeepseekSparseAttnMultiStepBackend,
     DSAFlashMLAMetadata,
     DSAIndexerMetadata,
     DSAMetadata,
-    NativeSparseAttnBackend,  # backward-compat alias already defined in dsa_backend
-    NativeSparseAttnMultiStepBackend,  # backward-compat alias already defined in dsa_backend
-    NSAFlashMLAMetadata,  # backward-compat alias already defined in dsa_backend
-    NSAIndexerMetadata,  # backward-compat alias already defined in dsa_backend
-    NSAMetadata,  # backward-compat alias already defined in dsa_backend
+    DeepseekSparseAttnBackend,
+    DeepseekSparseAttnMultiStepBackend,
+    NSAFlashMLAMetadata,
+    NSAIndexerMetadata,
+    NSAMetadata,
+    NativeSparseAttnBackend,
+    NativeSparseAttnMultiStepBackend,
 )

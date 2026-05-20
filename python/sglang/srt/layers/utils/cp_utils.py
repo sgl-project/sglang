@@ -67,8 +67,8 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     from sglang.srt.layers.attention.dsa.utils import (
-        is_dsa_prefill_cp_round_robin_split,
         dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
     if is_dsa_prefill_cp_round_robin_split():
@@ -89,8 +89,8 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     from sglang.srt.layers.attention.dsa.utils import (
-        is_dsa_prefill_cp_round_robin_split,
         dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
     if is_dsa_prefill_cp_round_robin_split():

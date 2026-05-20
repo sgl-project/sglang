@@ -9,9 +9,9 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
+    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
-    dsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,

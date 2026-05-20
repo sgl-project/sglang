@@ -44,7 +44,11 @@ class TestDSAChoicesAndFields(unittest.TestCase):
         self.assertIn("tilelang", self.DSA_CHOICES)
 
     def test_nsa_choices_is_alias(self):
-        self.assertIs(self.NSA_CHOICES, self.DSA_CHOICES, "NSA_CHOICES must be the same object as DSA_CHOICES")
+        self.assertIs(
+            self.NSA_CHOICES,
+            self.DSA_CHOICES,
+            "NSA_CHOICES must be the same object as DSA_CHOICES",
+        )
 
     def test_nsa_cp_split_choices_is_alias(self):
         self.assertIs(
@@ -62,8 +66,14 @@ class TestDSAChoicesAndFields(unittest.TestCase):
     def test_serverargs_no_nsa_fields(self):
         """The nsa_* attributes should no longer exist on ServerArgs."""
         sa = self.ServerArgs
-        self.assertFalse(hasattr(sa, "nsa_prefill_backend"), "nsa_prefill_backend should have been renamed")
-        self.assertFalse(hasattr(sa, "nsa_decode_backend"), "nsa_decode_backend should have been renamed")
+        self.assertFalse(
+            hasattr(sa, "nsa_prefill_backend"),
+            "nsa_prefill_backend should have been renamed",
+        )
+        self.assertFalse(
+            hasattr(sa, "nsa_decode_backend"),
+            "nsa_decode_backend should have been renamed",
+        )
         self.assertFalse(hasattr(sa, "enable_nsa_prefill_context_parallel"))
         self.assertFalse(hasattr(sa, "nsa_prefill_cp_mode"))
 
@@ -113,6 +123,7 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
 
     def setUp(self):
         import logging
+
         from sglang.srt.server_args import ServerArgs
 
         self.parser = argparse.ArgumentParser()
@@ -120,7 +131,11 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
 
         # Capture log output to detect deprecation warnings
         self.log_records = []
-        handler = logging.handlers_collector(self.log_records) if hasattr(logging, "handlers_collector") else None
+        handler = (
+            logging.handlers_collector(self.log_records)
+            if hasattr(logging, "handlers_collector")
+            else None
+        )
 
     def _parse(self, extra_args):
         return self.parser.parse_args(["--model", "dummy"] + extra_args)
@@ -142,22 +157,34 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
         return args, log_stream.getvalue()
 
     def test_nsa_prefill_backend_deprecated_writes_to_dsa(self):
-        args, log_output = self._parse_capture_warnings(["--nsa-prefill-backend", "fa3"])
+        args, log_output = self._parse_capture_warnings(
+            ["--nsa-prefill-backend", "fa3"]
+        )
         self.assertEqual(args.dsa_prefill_backend, "fa3")
-        self.assertIn("deprecated", log_output.lower(), f"Expected deprecation warning in log; got: {log_output!r}")
+        self.assertIn(
+            "deprecated",
+            log_output.lower(),
+            f"Expected deprecation warning in log; got: {log_output!r}",
+        )
 
     def test_nsa_decode_backend_deprecated_writes_to_dsa(self):
-        args, log_output = self._parse_capture_warnings(["--nsa-decode-backend", "tilelang"])
+        args, log_output = self._parse_capture_warnings(
+            ["--nsa-decode-backend", "tilelang"]
+        )
         self.assertEqual(args.dsa_decode_backend, "tilelang")
         self.assertIn("deprecated", log_output.lower())
 
     def test_enable_nsa_prefill_cp_deprecated(self):
-        args, log_output = self._parse_capture_warnings(["--enable-nsa-prefill-context-parallel"])
+        args, log_output = self._parse_capture_warnings(
+            ["--enable-nsa-prefill-context-parallel"]
+        )
         self.assertTrue(args.enable_dsa_prefill_context_parallel)
         self.assertIn("deprecated", log_output.lower())
 
     def test_nsa_prefill_cp_mode_deprecated(self):
-        args, log_output = self._parse_capture_warnings(["--nsa-prefill-cp-mode", "in-seq-split"])
+        args, log_output = self._parse_capture_warnings(
+            ["--nsa-prefill-cp-mode", "in-seq-split"]
+        )
         self.assertEqual(args.dsa_prefill_cp_mode, "in-seq-split")
         self.assertIn("deprecated", log_output.lower())
 
@@ -220,9 +247,12 @@ class TestEnvVarAliases(unittest.TestCase):
             os.environ.pop(key, None)
         # Re-import to reset descriptor state
         from importlib import reload
+
         import sglang.srt.environ as e
+
         reload(e)
         from sglang.srt.environ import envs
+
         self.envs = envs
 
     def tearDown(self):
@@ -249,10 +279,14 @@ class TestEnvVarAliases(unittest.TestCase):
             val = self.envs.SGLANG_DSA_FUSE_TOPK.get()
             self.assertFalse(val)
             dep = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            self.assertTrue(len(dep) > 0, "Expected DeprecationWarning for SGLANG_NSA_FUSE_TOPK")
+            self.assertTrue(
+                len(dep) > 0, "Expected DeprecationWarning for SGLANG_NSA_FUSE_TOPK"
+            )
 
     def test_dsa_threshold_default(self):
-        self.assertEqual(self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(), 2048)
+        self.assertEqual(
+            self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(), 2048
+        )
 
     def test_nsa_threshold_deprecated_fallback(self):
         os.environ["SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"] = "1024"

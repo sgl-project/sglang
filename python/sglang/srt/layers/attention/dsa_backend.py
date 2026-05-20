@@ -24,9 +24,9 @@ from sglang.srt.layers.attention.dsa.transform_index import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
-    is_dsa_enable_prefill_cp,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
+    is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (

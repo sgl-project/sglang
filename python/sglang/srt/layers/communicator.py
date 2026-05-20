@@ -34,8 +34,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
-    is_dsa_enable_prefill_cp,
     dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
