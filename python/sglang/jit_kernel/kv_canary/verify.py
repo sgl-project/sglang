@@ -369,7 +369,9 @@ def _build_real_kv_source_abi(
             )
         padded_bufs.append(source_u8)
         params[i, _REAL_KV_SOURCE_FIELD_PAGE_SIZE] = source.page_size
-        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = source.num_bytes_per_token
+        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = (
+            source.num_bytes_per_token
+        )
         params[i, _REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
     dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)

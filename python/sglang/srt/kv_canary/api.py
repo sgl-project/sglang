@@ -49,9 +49,6 @@ def install_canary(
        only — they execute inside cuda graph capture region and therefore get captured into the
        graph, auto-replaying every step.
 
-    NO patching of CudaGraphRunner / EAGLEDraftCudaGraphRunner / PiecewiseCudaGraphRunner /
-    BreakableCudaGraphRunner / any speculative graph runner subclass.
-
     The host-side hooks are exposed as a single context manager
     ``canary_runner.with_forward_pass(forward_batch)``. ``ModelRunner.forward`` wraps its
     ``_forward_raw(...)`` call with that context (falling back to contextlib.nullcontext when
@@ -66,7 +63,7 @@ def install_canary(
         pool=model_runner.token_to_kv_pool,
         config=config,
         device=device,
-        allocator=getattr(model_runner, "token_to_kv_pool_allocator", None),
+        allocator=model_runner.token_to_kv_pool_allocator,
     )
     runner = CanaryRunner(
         config=config,
@@ -104,7 +101,12 @@ def _resolve_tp_group():
 
     try:
         return get_tp_group()
-    except (AssertionError, RuntimeError, AttributeError):
+    except AssertionError:
+        logger.warning(
+            "kv-canary: TP group not initialized; cross-rank error allreduce disabled "
+            "(raise mode will not be globally synchronized)",
+            exc_info=True,
+        )
         return None
 
 
@@ -113,7 +115,11 @@ def _resolve_pp_group():
 
     try:
         return get_pp_group()
-    except (AssertionError, RuntimeError, AttributeError):
+    except AssertionError:
+        logger.warning(
+            "kv-canary: PP group not initialized; cross-stage error allreduce disabled",
+            exc_info=True,
+        )
         return None
 
 
