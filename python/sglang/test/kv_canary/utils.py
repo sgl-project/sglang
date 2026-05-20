@@ -35,10 +35,10 @@ class CanaryE2EBase(CustomTestCase):
     """Common scaffold for canary server-launch e2e tests.
 
     Subclasses set ``model`` and (optionally) ``extra_server_args``,
-    ``perturb_prob``. ``setUpClass`` launches the server
-    with ``--kv-canary=raise`` and ``--mem-fraction-static=0.65``
-    (canary K/V tensors need headroom); subclasses can layer more args on
-    via ``extra_server_args``.
+    ``perturb_prob``, ``kv_canary_mode``. ``setUpClass`` launches the server
+    with ``--kv-canary=<kv_canary_mode>`` (default ``raise``) and
+    ``--mem-fraction-static=0.65`` (canary K/V tensors need headroom);
+    subclasses can layer more args on via ``extra_server_args``.
 
     Use :meth:`send_parallel_requests` to fan out N concurrent
     /generate calls — that's the only way to exercise concurrent
@@ -54,6 +54,7 @@ class CanaryE2EBase(CustomTestCase):
     extra_server_args: ClassVar[List[str]] = []
     perturb_prob: ClassVar[float] = 0.0
     allow_launch_failure: ClassVar[bool] = False
+    kv_canary_mode: ClassVar[str] = "raise"
 
     base_url: ClassVar[str] = ""
     process: ClassVar[Optional[object]] = None
@@ -85,7 +86,7 @@ class CanaryE2EBase(CustomTestCase):
 
         other_args: List[str] = [
             "--kv-canary",
-            "raise",
+            cls.kv_canary_mode,
             "--mem-fraction-static",
             "0.65",
             *cls.extra_server_args,
