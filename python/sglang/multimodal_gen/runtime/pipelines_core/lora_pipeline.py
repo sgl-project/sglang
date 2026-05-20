@@ -622,12 +622,13 @@ class LoRAPipeline(ComposedPipelineBase):
 
         active_count = 0
         for name, layer in lora_layers.items():
+            if layer.merged or len(layer.lora_weights_list) != 1:
+                return None
             has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
             if not has_adapter:
                 continue
             if (
-                layer.merged
-                or layer.lora_A is None
+                layer.lora_A is None
                 or layer.lora_B is None
                 or layer.lora_path != path
                 or layer.strength != strength
