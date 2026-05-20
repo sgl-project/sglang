@@ -40,6 +40,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.dumper import dumper
+from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -702,6 +703,9 @@ class Scheduler(
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
         )
+
+        if envs.SGLANG_DEBUG_REVERT_PR.get() == "25015":
+            revert_pr_fix(25015)
 
         self.is_initializing = False
 
