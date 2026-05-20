@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=129, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -125,7 +125,10 @@ class TestEnableThinking(
         )
         text_blocks = [block for block in data["content"] if block["type"] == "text"]
         self.assertTrue(len(text_blocks) > 0)
-        self.assertTrue(all("</think>" not in block["text"] for block in text_blocks))
+        combined_text = "".join(block["text"] for block in text_blocks).lower()
+        self.assertNotIn("<think", combined_text)
+        self.assertNotIn("</think>", combined_text)
+        self.assertNotIn("thinking process", combined_text)
 
     def test_anthropic_messages_stream_without_thinking_events(self):
         response = requests.post(
@@ -151,6 +154,7 @@ class TestEnableThinking(
         event_types = []
         delta_types = []
         has_text_delta = False
+        text_deltas = []
 
         for line in response.iter_lines():
             if not line:
@@ -169,10 +173,15 @@ class TestEnableThinking(
                 delta_types.append(delta_type)
                 if delta_type == "text_delta" and delta.get("text"):
                     has_text_delta = True
+                    text_deltas.append(delta["text"])
 
         self.assertTrue(has_text_delta)
         self.assertNotIn("thinking_delta", delta_types)
         self.assertNotIn("signature_delta", delta_types)
+        combined_text = "".join(text_deltas).lower()
+        self.assertNotIn("<think", combined_text)
+        self.assertNotIn("</think>", combined_text)
+        self.assertNotIn("thinking process", combined_text)
 
     def test_anthropic_messages_with_thinking_blocks(self):
         response = requests.post(

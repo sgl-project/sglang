@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -270,6 +272,9 @@ def replace_rms_norm_class(rms_norm: nn.Module, hidden_size: int) -> nn.Module:
             kwargs["weight_dtype"] = weight_meta.dtype
         else:
             kwargs["has_weight"] = False
+        kwargs["cast_x_before_out_mul"] = (
+            True  # match HF fp16-weight-multiply semantics
+        )
         base_cls = RMSNorm
         norm = base_cls(**kwargs)
 

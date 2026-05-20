@@ -7,7 +7,7 @@ import torch
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=45, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
 
 
@@ -88,7 +88,7 @@ def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
         (64, "RMSNormWarpKernel"),
         (128, "RMSNormWarpKernel"),
         (256, "RMSNormWarpKernel"),
-        (512, "RMSNormKernel"),
+        (512, "RMSNormHalfKernel"),
         (1536, "RMSNormKernel"),
         (2048, "RMSNormHalfKernel"),
         (2304, "RMSNormKernel"),  # NOTE: not 512 aligned

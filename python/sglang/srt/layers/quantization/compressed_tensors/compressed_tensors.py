@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 import logging
@@ -182,8 +183,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
                 )
+                use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
                 return UnquantizedFusedMoEMethod(
-                    use_triton_kernels, use_flashinfer_trtllm_moe
+                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None
@@ -682,6 +684,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
+                    moe_backend = get_moe_runner_backend()
+                    if moe_backend.is_triton():
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16TritonMoE "
+                            "(moe_runner_backend=triton)"
+                        )
+                        return CompressedTensorsWNA16TritonMoE(self)
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self)
             else:
@@ -996,6 +1005,12 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         return layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_triton_quant_info(layer)
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_marlin_quant_info(layer)
 
     def apply(
         self,

@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_nsa,
+    is_deepseek_v4,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -13,18 +17,20 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
-    DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    NoOpMHATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -53,7 +59,6 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
-
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -192,6 +197,44 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _validate_prefill_only_disable_kv_cache_pool_family(
+        self: ModelRunner,
+        is_nsa_model: bool,
+        is_dsv4_model: bool,
+        current_platform,
+    ):
+        if not self.server_args.prefill_only_disable_kv_cache or self.is_draft_worker:
+            return
+
+        unsupported_pool_family = None
+        if is_dsv4_model:
+            unsupported_pool_family = "DeepSeekV4TokenToKVPool"
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            unsupported_pool_family = "out-of-tree platform KV pool"
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
+            unsupported_pool_family = "NPU/Ascend KV pool"
+        elif self.use_mla_backend and is_nsa_model:
+            unsupported_pool_family = "NSA/MLA KV pool"
+        elif self.use_mla_backend and not self.mambaish_config:
+            unsupported_pool_family = "MLA KV pool"
+        elif self.is_hybrid_swa:
+            unsupported_pool_family = "SWA KV pool"
+        elif self.mambaish_config:
+            unsupported_pool_family = "hybrid linear/Mamba KV pool"
+        elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            unsupported_pool_family = "FP4 MHA KV pool"
+
+        if unsupported_pool_family is not None:
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache is not supported for "
+                f"{unsupported_pool_family}. Supported configurations today: plain MHA "
+                "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
+                "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
+                "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
+            )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -199,9 +242,12 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+            max_spec_draft_tokens = (
+                self.server_args.effective_max_speculative_num_draft_tokens()
+            )
             extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+            if max_spec_draft_tokens is not None:
+                extra_max_context_len += max_spec_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -231,7 +277,7 @@ class ModelRunnerKVCacheMixin:
                                 if self.start_layer <= i < self.end_layer
                             ]
                         ),
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        speculative_num_draft_tokens=max_spec_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -265,7 +311,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
@@ -283,7 +329,104 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend" and not self.mambaish_config:
+        is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+
+        # Out-of-tree platform plugin system — used by elif below
+        from sglang.srt.platforms import current_platform
+
+        self._validate_prefill_only_disable_kv_cache_pool_family(
+            is_nsa_model, is_dsv4_model, current_platform
+        )
+
+        if is_dsv4_model:
+            swa_page_size = self.page_size
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+
+            if self.is_draft_worker:
+                from sglang.srt.models.deepseek_v4_nextn import (
+                    COMPRESS_RATIO_NEXTN_LAYER,
+                )
+
+                compression_ratios = [
+                    COMPRESS_RATIO_NEXTN_LAYER
+                ] * self.num_effective_layers
+            else:
+                compression_ratios = self.model_config.compress_ratios
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=self.max_running_requests,
+                swa_size=self.swa_max_total_num_tokens,
+                c4_size=self.c4_max_total_num_tokens,
+                c128_size=self.c128_max_total_num_tokens,
+                c4_state_pool_size=self.c4_state_pool_size,
+                c128_state_pool_size=self.c128_state_pool_size,
+                page_size=self.page_size,
+                swa_page_size=swa_page_size,
+                dtype=self.kv_cache_dtype,
+                state_dtype=self.state_dtype,
+                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                indexer_head_dim=self.model_config.index_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                compression_ratios=compression_ratios,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                enable_hisparse=self.enable_hisparse,
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            if self.use_mla_backend and is_nsa_model:
+                PoolCls = current_platform.get_nsa_kv_pool_cls()
+                self.token_to_kv_pool = PoolCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                )
+            elif self.use_mla_backend:
+                PoolCls = current_platform.get_mla_kv_pool_cls()
+                self.token_to_kv_pool = PoolCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_nsa_model else None
+                    ),
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            else:
+                PoolCls = current_platform.get_mha_kv_pool_cls()
+                self.token_to_kv_pool = PoolCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
             if self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
@@ -357,8 +500,18 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            nsa_pool_kwargs = dict(
-                size=self.max_total_num_tokens,
+            PoolCls = (
+                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
+            )
+            pool_kwargs = {}
+            if self.enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
+                    self.server_args
+                ).host_to_device_ratio
+            self.token_to_kv_pool = PoolCls(
+                self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
@@ -370,17 +523,8 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                **pool_kwargs,
             )
-            if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                hisparse_cfg = parse_hisparse_config(self.server_args)
-                nsa_pool_kwargs["host_to_device_ratio"] = (
-                    hisparse_cfg.host_to_device_ratio
-                )
-                self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
-            else:
-                self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -409,20 +553,6 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.server_args.enable_double_sparsity:
-            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                heavy_channel_num=self.server_args.ds_heavy_channel_num,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
         else:
             if self.is_hybrid_swa:
                 kwargs = {}
@@ -495,6 +625,7 @@ class ModelRunnerKVCacheMixin:
                             get_attention_tp_size()
                         ),
                         head_dim=self.model_config.head_dim,
+                        v_head_dim=self.model_config.v_head_dim,
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
@@ -506,7 +637,12 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    pool_cls = (
+                        NoOpMHATokenToKVPool
+                        if self.server_args.prefill_only_disable_kv_cache
+                        else MHATokenToKVPool
+                    )
+                    self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
@@ -514,6 +650,7 @@ class ModelRunnerKVCacheMixin:
                             get_attention_tp_size()
                         ),
                         head_dim=self.model_config.head_dim,
+                        v_head_dim=self.model_config.v_head_dim,
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
@@ -528,7 +665,17 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if _is_npu and (
+            if current_platform.is_out_of_tree():
+                AllocatorCls = current_platform.get_paged_allocator_cls()
+                self.token_to_kv_pool_allocator = AllocatorCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
@@ -602,16 +749,44 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
 
+            if self.enable_hisparse and is_dsv4_model:
+                assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
+                self.token_to_kv_pool_allocator = (
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                        self.token_to_kv_pool_allocator
+                    )
+                )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                swa_allocator = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "logical_attn_allocator",
+                    self.token_to_kv_pool_allocator,
                 )
+                assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
-                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                    swa_allocator.full_to_swa_index_mapping
                 )
+
+        # Defensive check: the explicit validation above should reject known
+        # unsupported pool families before allocation. Keep this guard here so
+        # future pool-selection refactors fail at boot instead of on first use.
+        if (
+            self.server_args.prefill_only_disable_kv_cache
+            and not self.is_draft_worker
+            and not isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool)
+        ):
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
+                f"runtime pool is {type(self.token_to_kv_pool).__name__}. This pool "
+                "family is not yet supported by --prefill-only-disable-kv-cache. "
+                "Supported configurations today: plain MHA models on CUDA with the FA "
+                "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
+                "--disable-radix-cache, no context-parallel attention, no HiSparse, "
+                "and --kv-cache-dtype != fp4_e2m1."
+            )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
@@ -670,6 +845,27 @@ class ModelRunnerKVCacheMixin:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+        # DSV4 compressed-attention pool sizes. Draft worker reuses target's
+        # full/swa sizes but does NOT own c4/c128/state pools (those live on
+        # the target rank only); zero them out regardless of what config holds.
+        if self.is_draft_worker:
+            self.c4_max_total_num_tokens = 0
+            self.c128_max_total_num_tokens = 0
+            self.c4_state_pool_size = 0
+            self.c128_state_pool_size = 0
+        else:
+            self.c4_max_total_num_tokens = config.c4_max_total_num_tokens
+            self.c128_max_total_num_tokens = config.c128_max_total_num_tokens
+            self.c4_state_pool_size = config.c4_state_pool_size
+            self.c128_state_pool_size = config.c128_state_pool_size
+
+        # state_dtype is a DSV4 architectural constant (fp32 for c4/c128
+        # state buffers); set unconditionally so draft workers have it before
+        # _init_pools reads it (target path also overwrites this in the
+        # configurator's resolve() for parity, harmless here).
+        if is_deepseek_v4(self.model_config.hf_config):
+            self.state_dtype = torch.float32
 
         self._init_pools()
 

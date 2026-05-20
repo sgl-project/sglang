@@ -257,11 +257,12 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
         (t.shape[0] not in (1, B)) or (t.shape[1] not in (1, S) or t.shape[2] != D)
     ):
         failed = True
-    elif t.ndim == 4 and (t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D):
+    elif t.ndim == 4:
         F = t.shape[1]
-        if S % F != 0:
+        if t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D:
+            failed = True
+        elif S % F != 0:
             raise ValueError(f"Validate failed: S({S}) must be divisible by F({F}).")
-        failed = True
     if failed:
         raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
