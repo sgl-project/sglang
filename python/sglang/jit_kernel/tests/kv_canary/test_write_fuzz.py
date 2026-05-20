@@ -22,7 +22,7 @@ from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
     run_fuzz_combo,
 )
 from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_write_invariants
-from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
     make_write_plan,

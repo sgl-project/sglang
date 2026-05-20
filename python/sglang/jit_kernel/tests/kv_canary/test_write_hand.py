@@ -12,19 +12,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
 )
 from sglang.jit_kernel.kv_canary.write import canary_write_step
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
-)
-from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write as _run_both
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _dummy_pseudo_tensors,
-    clone_real_kv_sources,
-)
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
-    _hand_fold_all,
-    _hand_fold_partial,
-)
-from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
@@ -39,6 +27,18 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     splitmix64_mix4,
     to_signed_int64,
     write_slot_fields,
+)
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
+)
+from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write as _run_both
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _dummy_pseudo_tensors,
+    clone_real_kv_sources,
+)
+from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+    _hand_fold_all,
+    _hand_fold_partial,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -249,7 +249,7 @@ def test_seed_slot_chain_link_continuous() -> None:
 
     # Step 2: verify slot[2] with prev=7 — expects no violation.
     from sglang.jit_kernel.kv_canary.verify import canary_verify_step
-    from sglang.jit_kernel.tests.kv_canary.canary_helpers import make_verify_plan
+    from sglang.jit_kernel.tests.kv_canary._canary_helpers import make_verify_plan
 
     verify_plan = make_verify_plan(
         slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
@@ -513,7 +513,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     assert int(cuda_log.write_index[0].item()) == 3
     # Run a downstream verify — it must see no chain mismatch because chain advanced on actuals.
     from sglang.jit_kernel.kv_canary.verify import canary_verify_step
-    from sglang.jit_kernel.tests.kv_canary.canary_helpers import make_verify_plan
+    from sglang.jit_kernel.tests.kv_canary._canary_helpers import make_verify_plan
 
     verify_plan = make_verify_plan(
         slot_indices=[1, 2, 3],
@@ -1784,3 +1784,51 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         assert torch.equal(
             after[slot], untouched_snapshot[slot]
         ), f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
+
+
+def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
+    """``enable_write_verify_inputs=False`` must short-circuit before any expected_input_* dereference;
+    poison those tensors with 0x7F7F7F7F and assert nothing records a violation."""
+    cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+
+    garbage_expected_tokens = torch.full(
+        (1,), 0x7F7F7F7F, dtype=torch.int32, device=_DEVICE
+    )
+    garbage_expected_positions = torch.full(
+        (1,), 0x7F7F7F7F, dtype=torch.int32, device=_DEVICE
+    )
+
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=garbage_expected_tokens,
+        expected_input_positions=garbage_expected_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 0
+    assert int(ref_log.write_index[0].item()) == 0

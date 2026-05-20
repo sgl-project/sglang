@@ -22,7 +22,7 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     make_req_to_token,
 )
-from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,

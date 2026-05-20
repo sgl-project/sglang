@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Callable
 
@@ -15,18 +16,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_and_assert_verify_state_equal as _run_both_and_assert_state_equal,
-)
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_verify as _run_both,
-)
-from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
-    _hand_fold_all,
-    _hand_fold_partial,
-)
-from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     assert_only_bits_set,
@@ -43,6 +33,17 @@ from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     stamp_clean_chain,
     to_signed_int64,
     write_slot_fields,
+)
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _run_both_and_assert_verify_state_equal as _run_both_and_assert_state_equal,
+)
+from sglang.jit_kernel.tests.kv_canary._differential import (
+    _run_both_verify as _run_both,
+)
+from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
+from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+    _hand_fold_all,
+    _hand_fold_partial,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -2207,3 +2208,321 @@ def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
         slot = int(cuda_log.ring[row, 1].item())
         assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
+# ---------------------------------------------------------------------------
+# Kernel-contract invariants (counter accounting, OFF-mode short-circuit,
+# chain-anchor, ring-reset). Each test asserts an absolute property of the
+# verify kernel that a CUDA-vs-ref diff cannot catch on its own.
+# ---------------------------------------------------------------------------
+
+
+def test_slot_run_counter_delta_equals_active_entries_across_random_plans() -> None:
+    random.seed(0)
+    num_slots = 32
+    cuda_buf = make_canary_buf(
+        num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
+    )
+    ref_buf = cuda_buf.clone()
+
+    anchor_signed = chain_anchor_signed()
+    for slot_idx in range(num_slots):
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=slot_idx + 10,
+                position=slot_idx,
+                prev_hash=anchor_signed,
+                real_kv_hash=0,
+            )
+
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    for _ in range(50):
+        bs = random.randint(1, 16)
+        entries_per_req = random.randint(1, 8)
+        n_entries = bs * entries_per_req
+        if n_entries > num_slots:
+            n_entries = num_slots
+        slot_indices = random.sample(range(num_slots), n_entries)
+        positions = [random.randint(0, 99) for _ in range(n_entries)]
+        prev_slot_indices = [-1] * n_entries
+
+        plan_cuda = make_verify_plan(
+            slot_indices=slot_indices,
+            positions=positions,
+            prev_slot_indices=prev_slot_indices,
+            device=_DEVICE,
+        )
+        plan_ref = make_verify_plan(
+            slot_indices=slot_indices,
+            positions=positions,
+            prev_slot_indices=prev_slot_indices,
+            device=_DEVICE,
+        )
+
+        before = int(cuda_log.slot_run_counter[0].item())
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=plan_cuda,
+            plan_ref=plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+        after = int(cuda_log.slot_run_counter[0].item())
+        assert after - before == n_entries
+
+
+def test_kernel_run_counter_per_call_invariant_50_calls() -> None:
+    cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=1,
+            token=42,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    for n in range(1, 51):
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=plan_cuda,
+            plan_ref=plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+        assert int(cuda_log.kernel_run_counter[0].item()) == n
+
+
+def test_empty_plan_keeps_slot_counter_unchanged() -> None:
+    cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=1,
+            token=7,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=0,
+        )
+
+    nonempty_plan_cuda = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    nonempty_plan_ref = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    empty_plan_cuda = make_verify_plan(
+        slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
+    )
+    empty_plan_ref = make_verify_plan(
+        slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    for _ in range(30):
+        slot_before = int(cuda_log.slot_run_counter[0].item())
+        kernel_before = int(cuda_log.kernel_run_counter[0].item())
+
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=empty_plan_cuda,
+            plan_ref=empty_plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+
+        assert int(cuda_log.slot_run_counter[0].item()) == slot_before
+        assert int(cuda_log.kernel_run_counter[0].item()) == kernel_before + 1
+
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=nonempty_plan_cuda,
+            plan_ref=nonempty_plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+
+
+def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50() -> None:
+    random.seed(0)
+    expected_prev_hash_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
+
+    for _ in range(50):
+        token = random.randint(0, 0x7FFFFFFF)
+        position = random.randint(0, 0x7FFFFFFF)
+        slot_idx = random.randint(0, 15)
+
+        cuda_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        ref_buf = cuda_buf.clone()
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=token,
+                position=position,
+                prev_hash=expected_prev_hash_signed,
+                real_kv_hash=0,
+            )
+
+        plan_cuda = make_verify_plan(
+            slot_indices=[slot_idx],
+            positions=[position],
+            prev_slot_indices=[-1],
+            device=_DEVICE,
+        )
+        plan_ref = make_verify_plan(
+            slot_indices=[slot_idx],
+            positions=[position],
+            prev_slot_indices=[-1],
+            device=_DEVICE,
+        )
+        cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+        ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=plan_cuda,
+            plan_ref=plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+
+        assert (
+            int(cuda_log.write_index[0].item()) == 0
+        ), f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
+
+
+def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
+    cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=1,
+            token=1,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=0,
+        )
+
+    garbage_source = make_real_kv_source(
+        num_slots=8,
+        num_bytes_per_token=16,
+        page_size=1,
+        read_bytes=16,
+        device=_DEVICE,
+        fill=0xDE,
+    )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(garbage_source,),
+        real_kv_sources_ref=(garbage_source,),
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 0
+    assert int(ref_log.write_index[0].item()) == 0
+
+
+def test_clear_resets_ring_and_write_index_zero() -> None:
+    cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        for slot_idx in range(1, 4):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=slot_idx,
+                token=1,
+                position=99,
+                prev_hash=anchor_signed,
+                real_kv_hash=0,
+            )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[1, 2, 3],
+        positions=[0, 0, 0],
+        prev_slot_indices=[-1, -1, -1],
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[1, 2, 3],
+        positions=[0, 0, 0],
+        prev_slot_indices=[-1, -1, -1],
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
+    )
+
+    assert int(cuda_log.write_index[0].item()) > 0
+
+    cuda_log_fresh = FakeViolationLog.allocate(device=_DEVICE)
+    assert int(cuda_log_fresh.write_index[0].item()) == 0
+    assert torch.all(cuda_log_fresh.ring == 0).item()

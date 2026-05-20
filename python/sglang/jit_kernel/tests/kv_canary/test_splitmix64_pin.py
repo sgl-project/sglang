@@ -4,7 +4,7 @@ import random
 
 from sglang.jit_kernel.kv_canary.consts import CANARY_CHAIN_ANCHOR
 from sglang.jit_kernel.kv_canary.consts import splitmix64 as splitmix64_consts
-from sglang.jit_kernel.tests.kv_canary.canary_helpers import splitmix64
+from sglang.jit_kernel.tests.kv_canary._canary_helpers import splitmix64
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
