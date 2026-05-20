@@ -3,19 +3,8 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar, List
 
-import pytest
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.utils import CanaryE2EBase
-
-_PERTURB_RACE_REASON = (
-    "Inherent race: at prob>=0.5 the perturb fires during sglang warmup and the "
-    "garbage write trips a CUDA error before the canary's deferred D2H violation "
-    "pump can log the canary_kind line; at prob<=0.1 perturb may not fire often "
-    "enough to surface a violation inside the test traffic window. Needs a kernel-"
-    "side fix that traps perturb-induced errors and routes them through the "
-    "violation log, not server SIGQUIT. Tracked in lab Task #10 follow-up."
-)
 
 register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-large")
 
@@ -23,14 +12,17 @@ register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-large")
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 
+# DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
+# canary e2e test. user-instruction.md b 段 requires the canary kernel to run
+# inside the cuda graph alongside the real attn kernel; disabling the graph
+# silently bypasses the only path that exercises that invariant end-to-end.
+
 
 class _MhaFullBase(CanaryE2EBase):
     model: ClassVar[str] = _QWEN3_MODEL
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
     ]
 
 
@@ -45,7 +37,6 @@ class TestNoPerturbNoViolation(_MhaFullBase, unittest.TestCase):
         self.assert_health_ok()
 
 
-@pytest.mark.skip(reason=_PERTURB_RACE_REASON)
 class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
     kv_canary_mode: ClassVar[str] = "log"
     perturb_prob: ClassVar[float] = 0.1
@@ -62,8 +53,6 @@ class TestRealDataOff(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "off",
     ]
@@ -78,8 +67,6 @@ class TestRealDataPartial(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "partial",
     ]
@@ -94,8 +81,6 @@ class TestRealDataAll(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "all",
     ]
@@ -110,8 +95,6 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
@@ -145,7 +128,6 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
         )
 
 
-@pytest.mark.skip(reason=_PERTURB_RACE_REASON)
 class TestLogModeKeepsServerAlive(_MhaFullBase, unittest.TestCase):
     perturb_prob: ClassVar[float] = 0.1
     kv_canary_mode: ClassVar[str] = "log"
@@ -181,8 +163,6 @@ class TestSweepOrphanRadixDetectsViolation(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",

@@ -29,7 +29,10 @@ _DSV4_BASE_ARGS: List[str] = [
     "--trust-remote-code",
     "--json-model-override-args",
     _NUM_LAYERS_OVERRIDE,
-    "--disable-cuda-graph",
+    # DO NOT add --disable-cuda-graph or --disable-piecewise-cuda-graph here.
+    # user-instruction.md b 段 requires the canary kernel to run inside the cuda
+    # graph alongside the real attn kernel; disabling the graph silently bypasses
+    # the only path that exercises that invariant end-to-end.
     "--page-size",
     "128",
     "--moe-runner-backend",
@@ -246,25 +249,6 @@ class TestSwaWindowClipOnlyLast128(_DSV4FlashBase, unittest.TestCase):
         for r in results:
             self.assertEqual(r.get("status_code"), 200, r)
         self.assert_health_ok()
-
-
-@unittest.skip("DSV4 packed-pool byte-offset table not yet derived.")
-class TestDsv4PackedPoolRealKvSourceLayout(_DSV4FlashBase, unittest.TestCase):
-    """Special pool axis: packed pool layout, byte-hit assertion.
-
-    The assertion shape is "I read bytes X-Y from the packed slot at index Z",
-    which requires hardcoded byte offsets derived from the DSV4 packed layout
-    formula. Those offsets have not yet been derived.
-    """
-
-    extra_server_args: ClassVar[List[str]] = [
-        *_DSV4_BASE_ARGS,
-        "--kv-canary-real-data",
-        "all",
-    ]
-
-    def test_dsv4_packed_pool_real_kv_source_layout(self) -> None:
-        self.skipTest("hardcoded packed-pool byte offsets pending DSV4 layout review")
 
 
 class TestDsv4PgSz128SwaGroup(_DSV4FlashBase, unittest.TestCase):
