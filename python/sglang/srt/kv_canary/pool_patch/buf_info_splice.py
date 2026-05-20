@@ -52,31 +52,23 @@ def splice_segmented_buf_info(
     """For multi-segment packed pools (DSV4): prepend/append head + tail canary entries around EACH
     segment, using only ``group.k_head`` / ``group.k_tail`` (these pools have no V half).
     """
-    head_entry = _entry_triple(group.k_head, page_size=page_size)
-    tail_entry = _entry_triple(group.k_tail, page_size=page_size)
+    entries = list(zip(ptrs, lens, item_lens))
+    head = _entry_triple(group.k_head, page_size=page_size)
+    tail = _entry_triple(group.k_tail, page_size=page_size)
 
-    out_ptrs: List[int] = []
-    out_lens: List[int] = []
-    out_item_lens: List[int] = []
-
+    out: List[Tuple[int, int, int]] = []
     for seg_idx in range(len(segment_offsets)):
         start = segment_offsets[seg_idx]
         stop = (
             segment_offsets[seg_idx + 1]
             if seg_idx + 1 < len(segment_offsets)
-            else len(ptrs)
+            else len(entries)
         )
-        out_ptrs.append(head_entry[0])
-        out_lens.append(head_entry[1])
-        out_item_lens.append(head_entry[2])
-        out_ptrs.extend(ptrs[start:stop])
-        out_lens.extend(lens[start:stop])
-        out_item_lens.extend(item_lens[start:stop])
-        out_ptrs.append(tail_entry[0])
-        out_lens.append(tail_entry[1])
-        out_item_lens.append(tail_entry[2])
+        out.append(head)
+        out.extend(entries[start:stop])
+        out.append(tail)
 
-    return out_ptrs, out_lens, out_item_lens
+    return _untranspose_entries(out)
 
 
 def _splice_kv_buf_info(
@@ -88,42 +80,24 @@ def _splice_kv_buf_info(
     has_v_half: bool,
     page_size: int,
 ) -> BufInfoTriple:
-    k_head_entry = _entry_triple(group.k_head, page_size=page_size)
-    k_tail_entry = _entry_triple(group.k_tail, page_size=page_size)
+    entries = list(zip(ptrs, lens, item_lens))
+    k_head = _entry_triple(group.k_head, page_size=page_size)
+    k_tail = _entry_triple(group.k_tail, page_size=page_size)
 
     if not has_v_half:
-        return (
-            [k_head_entry[0]] + list(ptrs) + [k_tail_entry[0]],
-            [k_head_entry[1]] + list(lens) + [k_tail_entry[1]],
-            [k_head_entry[2]] + list(item_lens) + [k_tail_entry[2]],
-        )
+        out = [k_head, *entries, k_tail]
+    else:
+        assert group.v_head is not None and group.v_tail is not None
+        v_head = _entry_triple(group.v_head, page_size=page_size)
+        v_tail = _entry_triple(group.v_tail, page_size=page_size)
+        if len(entries) % 2 != 0:
+            raise RuntimeError(
+                f"kv-canary: K/V split adapter expects even-length buf_info list, got {len(entries)}"
+            )
+        mid = len(entries) // 2
+        out = [k_head, *entries[:mid], k_tail, v_head, *entries[mid:], v_tail]
 
-    assert group.v_head is not None and group.v_tail is not None
-    v_head_entry = _entry_triple(group.v_head, page_size=page_size)
-    v_tail_entry = _entry_triple(group.v_tail, page_size=page_size)
-
-    if len(ptrs) % 2 != 0:
-        raise RuntimeError(
-            f"kv-canary: K/V split adapter expects even-length buf_info list, got {len(ptrs)}"
-        )
-    mid = len(ptrs) // 2
-    return (
-        [k_head_entry[0]]
-        + list(ptrs[:mid])
-        + [k_tail_entry[0], v_head_entry[0]]
-        + list(ptrs[mid:])
-        + [v_tail_entry[0]],
-        [k_head_entry[1]]
-        + list(lens[:mid])
-        + [k_tail_entry[1], v_head_entry[1]]
-        + list(lens[mid:])
-        + [v_tail_entry[1]],
-        [k_head_entry[2]]
-        + list(item_lens[:mid])
-        + [k_tail_entry[2], v_head_entry[2]]
-        + list(item_lens[mid:])
-        + [v_tail_entry[2]],
-    )
+    return _untranspose_entries(out)
 
 
 def _entry_triple(buf: torch.Tensor, *, page_size: int) -> Tuple[int, int, int]:
@@ -132,3 +106,8 @@ def _entry_triple(buf: torch.Tensor, *, page_size: int) -> Tuple[int, int, int]:
         buf.nbytes,
         buf[0].nbytes * page_size,
     )
+
+
+def _untranspose_entries(entries: List[Tuple[int, int, int]]) -> BufInfoTriple:
+    out_ptrs, out_lens, out_item_lens = (list(col) for col in zip(*entries))
+    return out_ptrs, out_lens, out_item_lens
