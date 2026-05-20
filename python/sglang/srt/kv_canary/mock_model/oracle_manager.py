@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -23,7 +23,7 @@ class TokenIdOracleManager:
 
     def __init__(self, *, oracle: TokenIdOracle) -> None:
         self.oracle = oracle
-        self._req_pool_indices_per_row: Optional[List[int]] = None
+        self._req_pool_indices_per_row: Optional[torch.Tensor] = None
 
     def fill_expected_inputs(
         self,
@@ -47,85 +47,50 @@ class TokenIdOracleManager:
         input_ids = forward_batch.input_ids
         num_tokens = int(input_ids.shape[0])
 
-        req_pool_indices_per_row = [
-            int(v) for v in forward_batch.req_pool_indices.detach().to("cpu").tolist()
-        ]
-        self._req_pool_indices_per_row = req_pool_indices_per_row
+        self._req_pool_indices_per_row = forward_batch.req_pool_indices.to(torch.int64)
 
         if num_tokens == 0:
             return
 
-        req_id_per_token = _build_req_id_per_token(
+        req_ids = _build_req_id_per_token(
             forward_batch=forward_batch,
             num_tokens=num_tokens,
-            req_pool_indices_per_row=req_pool_indices_per_row,
+            req_pool_indices_per_row=self._req_pool_indices_per_row,
         )
-        positions_cpu = positions.detach().to("cpu", dtype=torch.int64).tolist()
-
-        expected_tokens: List[int] = [0] * num_tokens
-        expected_positions: List[int] = [0] * num_tokens
-        for i in range(num_tokens):
-            req_id = req_id_per_token[i]
-            position = positions_cpu[i]
-            expected_tokens[i] = int(
-                self.oracle.expected_token(req_id=req_id, position=position)
-            )
-            expected_positions[i] = position
-
-        tokens_tensor = torch.tensor(
-            expected_tokens,
-            dtype=torch.int32,
-            device=expected_inputs_out.tokens.device,
+        expected_tokens = self.oracle.expected_tokens(
+            req_ids=req_ids, positions=positions.to(torch.int64)
         )
-        positions_tensor = torch.tensor(
-            expected_positions,
-            dtype=torch.int32,
-            device=expected_inputs_out.tokens.device,
-        )
-        expected_inputs_out.tokens[:num_tokens].copy_(tokens_tensor)
-        expected_inputs_out.positions[:num_tokens].copy_(positions_tensor)
+        expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens)
+        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int32))
 
     def sample(self, *, logits: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Produce one token per row from the oracle, using the row -> req-id stash filled by
         fill_expected_inputs. Caller is _OracleSampler.forward.
         """
-        req_pool_indices_per_row = self._req_pool_indices_per_row
-        if req_pool_indices_per_row is None:
+        stash = self._req_pool_indices_per_row
+        if stash is None:
             raise RuntimeError(
                 "TokenIdOracleManager.sample: req_pool_indices not stashed; "
                 "fill_expected_inputs must be called before sampling "
                 "(input_check_mode == ON required)"
             )
 
-        device = logits.device
-        bs = int(logits.shape[0])
-
-        assert len(req_pool_indices_per_row) == bs, (
+        assert int(stash.shape[0]) == int(logits.shape[0]), (
             f"TokenIdOracleManager.sample: stashed req_pool_indices length "
-            f"{len(req_pool_indices_per_row)} != logits batch size {bs}"
+            f"{int(stash.shape[0])} != logits batch size {int(logits.shape[0])}"
         )
 
-        positions_cpu = positions.detach().to("cpu", dtype=torch.int64).tolist()
-        token_ids: List[int] = [0] * bs
-        for r in range(bs):
-            token_ids[r] = int(
-                self.oracle.expected_token(
-                    req_id=int(req_pool_indices_per_row[r]),
-                    position=int(positions_cpu[r]),
-                )
-            )
-
-        return torch.tensor(token_ids, dtype=torch.int32, device=device)
+        return self.oracle.expected_tokens(
+            req_ids=stash, positions=positions.to(torch.int64)
+        )
 
 
 def _build_req_id_per_token(
     *,
     forward_batch: "ForwardBatch",
     num_tokens: int,
-    req_pool_indices_per_row: List[int],
-) -> List[int]:
-    bs = len(req_pool_indices_per_row)
-
+    req_pool_indices_per_row: torch.Tensor,
+) -> torch.Tensor:
     forward_mode = forward_batch.forward_mode
     if forward_mode is not None and forward_mode.is_extend():
         extend_seq_lens = forward_batch.extend_seq_lens
@@ -133,14 +98,12 @@ def _build_req_id_per_token(
             raise RuntimeError(
                 "fill_expected_inputs: extend_seq_lens is None in extend mode"
             )
-        lens = extend_seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+        lens = extend_seq_lens.to(torch.int64)
+        result = torch.repeat_interleave(req_pool_indices_per_row, lens)
     else:
-        lens = [1] * bs
+        result = req_pool_indices_per_row
 
-    out: List[int] = []
-    for r in range(bs):
-        out.extend([int(req_pool_indices_per_row[r])] * int(lens[r]))
     assert (
-        len(out) == num_tokens
-    ), f"fill_expected_inputs: sum(lens)={len(out)} != num_tokens={num_tokens}"
-    return out
+        int(result.shape[0]) == num_tokens
+    ), f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
+    return result
