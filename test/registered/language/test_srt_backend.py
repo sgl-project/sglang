@@ -1,6 +1,7 @@
 import unittest
 
 import sglang as sgl
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_programs import (
     test_decode_int,
@@ -18,7 +19,13 @@ from sglang.test.test_programs import (
     test_stream_logprobs,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 register_cuda_ci(est_time=79, stage="base-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
@@ -26,22 +33,31 @@ register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 
 class TestSRTBackend(CustomTestCase):
     backend = None
+    process = None
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(
-            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-            cuda_graph_max_bs=4,
-            mem_fraction_static=0.7,
-            incremental_streaming_output=True,
-            log_level="info",
-            enable_metrics=True,
+        cls.process = popen_launch_server(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--cuda-graph-max-bs",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--incremental-streaming-output",
+                "--log-level",
+                "info",
+                "--enable-metrics",
+            ],
         )
+        cls.backend = sgl.RuntimeEndpoint(DEFAULT_URL_FOR_TEST)
         sgl.set_default_backend(cls.backend)
 
     @classmethod
     def tearDownClass(cls):
-        cls.backend.shutdown()
+        kill_process_tree(cls.process.pid)
 
     def test_few_shot_qa(self):
         test_few_shot_qa()
