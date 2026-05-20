@@ -1,8 +1,10 @@
-"""Scripted-PR regression self-e2e for #25015 EAGLE positions misalign."""
+"""Regression for PR #25015 EAGLE positions misalign: revert the fix and expect canary fire."""
 
 from __future__ import annotations
 
-from sglang.srt.steppable_engine import SteppableEngine
+import pytest
+
+from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
@@ -12,38 +14,41 @@ def _fake_prompt(length: int) -> list[int]:
     return list(range(1, length + 1))
 
 
-def test_eagle_positions_misalign_regression() -> None:
-    engine = SteppableEngine.launch(
+def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_DEBUG_REVERT_PR_25015_FIX", "1")
+    engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
         num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
-        apply_pr_25015_fix=False,
+        kv_canary_input_check_mode="ON",
     )
-    req = engine.admit(prompt=_fake_prompt(64), max_new_tokens=4)
-
-    engine.step()
-    engine.step_until(req, n=2)
-    violations = engine.canary_violations()
-
-    assert any("POSITION_MISMATCH" in v.fail_reason_name for v in violations)
-    engine.shutdown()
+    try:
+        with pytest.raises(Exception):
+            engine.generate(
+                input_ids=_fake_prompt(64),
+                sampling_params={"max_new_tokens": 4, "temperature": 0.0},
+            )
+        captured = capfd.readouterr()
+        assert "POSITION_MISMATCH" in captured.err
+    finally:
+        engine.shutdown()
 
 
 def test_eagle_positions_match_with_fix() -> None:
-    engine = SteppableEngine.launch(
+    engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
         num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
-        apply_pr_25015_fix=True,
+        kv_canary_input_check_mode="ON",
     )
-    req = engine.admit(prompt=_fake_prompt(64), max_new_tokens=4)
-
-    engine.step()
-    engine.step_until(req, n=4)
-    engine.assert_no_canary_violations()
-
-    engine.shutdown()
+    try:
+        engine.generate(
+            input_ids=_fake_prompt(64),
+            sampling_params={"max_new_tokens": 4, "temperature": 0.0},
+        )
+    finally:
+        engine.shutdown()
