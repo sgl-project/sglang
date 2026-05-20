@@ -413,7 +413,7 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120:
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or is_sm120_supported():
             fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
