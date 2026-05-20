@@ -16,8 +16,11 @@ from dashboard.db import connect, init_db
 from dashboard.models import (
     CommitRunsResult,
     CompareResult,
+    ConfigSparkline,
     ConfigSummary,
     HealthStatus,
+    LatestNightlyConfigResult,
+    LatestNightlySummary,
     Metric,
     RegressionDetail,
     RegressionSummary,
@@ -25,8 +28,10 @@ from dashboard.models import (
     RunMetricDelta,
     RunSummary,
     RunSummaryAI,
+    SparklineSeries,
     TrendPoint,
 )
+from dashboard.reconciler import load_expected_matrix
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -435,6 +440,221 @@ def config_trend(
         )
         for r in rows
     ]
+
+
+@app.get("/api/configs/{config_name}/sparkline", response_model=ConfigSparkline)
+def config_sparkline(
+    config_name: str,
+    metric: str = Query(default="total_token_throughput"),
+    window_days: int = Query(default=14, ge=1, le=90),
+) -> ConfigSparkline:
+    """Compact multi-concurrency trend for home-page sparklines.
+
+    Returns one series per concurrency observed at this config over the
+    window. Only `passed` runs contribute points — failed/partial show as
+    gaps in the timeline.
+    """
+    with connect(settings.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT r.id AS run_id, r.github_run_id, r.commit_short_sha,
+                   r.commit_author, r.started_at, r.concurrency, m.value
+            FROM runs r
+            JOIN metrics m ON m.run_id = r.id
+            WHERE r.config_name = ?
+              AND m.name = ?
+              AND r.started_at > datetime('now', ?)
+              AND r.status = 'passed'
+            ORDER BY r.concurrency, r.started_at
+            """,
+            (config_name, metric, f"-{window_days} day"),
+        ).fetchall()
+
+    by_conc: dict[int, list[TrendPoint]] = {}
+    for r in rows:
+        by_conc.setdefault(r["concurrency"], []).append(
+            TrendPoint(
+                run_id=r["run_id"],
+                github_run_id=r["github_run_id"],
+                commit_short_sha=r["commit_short_sha"],
+                commit_author=r["commit_author"],
+                started_at=r["started_at"],
+                value=r["value"],
+            )
+        )
+    return ConfigSparkline(
+        config_name=config_name,
+        metric=metric,
+        series=[
+            SparklineSeries(concurrency=c, points=pts)
+            for c, pts in sorted(by_conc.items())
+        ],
+    )
+
+
+@app.get("/api/latest-nightly", response_model=LatestNightlySummary | None)
+def latest_nightly() -> LatestNightlySummary | None:
+    """The most recent cron workflow, summarized per config.
+
+    Aggregates each config's outcome (passed/failed/partial concurrencies),
+    a representative run_id to link into, and a headline metric for the
+    highest passed concurrency with a 7-day delta.
+    """
+    with connect(settings.db_path) as conn:
+        latest = conn.execute("""
+            SELECT github_run_id, github_run_attempt, MAX(started_at) AS started_at
+            FROM runs
+            WHERE trigger = 'cron'
+            GROUP BY github_run_id, github_run_attempt
+            ORDER BY started_at DESC
+            LIMIT 1
+            """).fetchone()
+        if latest is None:
+            return None
+
+        run_id, attempt = latest["github_run_id"], latest["github_run_attempt"]
+
+        meta = conn.execute(
+            """
+            SELECT github_run_url, commit_sha, commit_short_sha, commit_author,
+                   commit_message, pr_number
+            FROM runs
+            WHERE github_run_id = ? AND github_run_attempt = ?
+            ORDER BY started_at LIMIT 1
+            """,
+            (run_id, attempt),
+        ).fetchone()
+
+        try:
+            expected = load_expected_matrix(
+                settings.nightly_configs_path, settings.nightly_runner
+            )
+        except Exception:
+            expected = {}
+
+        rows = conn.execute(
+            """
+            SELECT id, config_name, concurrency, status, started_at
+            FROM runs
+            WHERE github_run_id = ? AND github_run_attempt = ?
+            ORDER BY config_name, concurrency
+            """,
+            (run_id, attempt),
+        ).fetchall()
+
+        by_config: dict[str, list[sqlite3.Row]] = {}
+        for r in rows:
+            by_config.setdefault(r["config_name"], []).append(r)
+
+        configs: list[LatestNightlyConfigResult] = []
+        for cfg_name, cfg_rows in by_config.items():
+            passed = sorted(
+                r["concurrency"] for r in cfg_rows if r["status"] == "passed"
+            )
+            failed = sorted(
+                r["concurrency"] for r in cfg_rows if r["status"] == "failed"
+            )
+            partial = sorted(
+                r["concurrency"] for r in cfg_rows if r["status"] == "partial"
+            )
+
+            # Representative row: prefer failed > partial > passed (drill in to
+            # what needs attention).
+            representative = sorted(
+                cfg_rows,
+                key=lambda r: (
+                    {"failed": 0, "partial": 1}.get(r["status"], 2),
+                    r["concurrency"],
+                ),
+            )[0]
+
+            # Headline metric: at the highest passed concurrency, if any.
+            headline_metric = headline_value = headline_unit = headline_delta = None
+            if passed:
+                top_conc = passed[-1]
+                row_with_metric = conn.execute(
+                    """
+                    SELECT m.value, m.unit
+                    FROM runs r JOIN metrics m ON m.run_id = r.id
+                    WHERE r.github_run_id = ? AND r.github_run_attempt = ?
+                      AND r.config_name = ? AND r.concurrency = ?
+                      AND m.name = 'total_token_throughput'
+                    LIMIT 1
+                    """,
+                    (run_id, attempt, cfg_name, top_conc),
+                ).fetchone()
+                if row_with_metric:
+                    headline_metric = "total_token_throughput"
+                    headline_value = row_with_metric["value"]
+                    headline_unit = row_with_metric["unit"]
+                    baseline = conn.execute(
+                        """
+                        WITH window_vals AS (
+                            SELECT m.value
+                            FROM runs r JOIN metrics m ON m.run_id = r.id
+                            WHERE r.config_name = ?
+                              AND r.concurrency = ?
+                              AND m.name = 'total_token_throughput'
+                              AND r.status = 'passed'
+                              AND r.started_at > datetime('now', '-7 day')
+                              AND r.id != (
+                                  SELECT id FROM runs
+                                  WHERE github_run_id = ? AND github_run_attempt = ?
+                                    AND config_name = ? AND concurrency = ?
+                              )
+                        )
+                        SELECT AVG(value) AS median FROM (
+                            SELECT value FROM window_vals
+                            ORDER BY value
+                            LIMIT 2 - (SELECT COUNT(*) FROM window_vals) % 2
+                            OFFSET (SELECT (COUNT(*) - 1) / 2 FROM window_vals)
+                        )
+                        """,
+                        (
+                            cfg_name,
+                            top_conc,
+                            run_id,
+                            attempt,
+                            cfg_name,
+                            top_conc,
+                        ),
+                    ).fetchone()
+                    if baseline and baseline["median"]:
+                        headline_delta = (
+                            (headline_value - baseline["median"])
+                            / baseline["median"]
+                            * 100
+                        )
+
+            configs.append(
+                LatestNightlyConfigResult(
+                    config_name=cfg_name,
+                    expected_concurrencies=expected.get(cfg_name, []),
+                    passed_concurrencies=passed,
+                    failed_concurrencies=failed,
+                    partial_concurrencies=partial,
+                    representative_run_id=representative["id"],
+                    headline_metric=headline_metric,
+                    headline_value=headline_value,
+                    headline_unit=headline_unit,
+                    headline_delta_pct_7d=headline_delta,
+                )
+            )
+
+        configs.sort(key=lambda c: c.config_name)
+
+    return LatestNightlySummary(
+        github_run_id=run_id,
+        github_run_attempt=attempt,
+        github_run_url=meta["github_run_url"] if meta else "",
+        started_at=latest["started_at"],
+        commit_sha=meta["commit_sha"] if meta else None,
+        commit_short_sha=meta["commit_short_sha"] if meta else None,
+        commit_author=meta["commit_author"] if meta else None,
+        commit_message=meta["commit_message"] if meta else None,
+        pr_number=meta["pr_number"] if meta else None,
+        configs=configs,
+    )
 
 
 @app.get("/api/regressions", response_model=list[RegressionSummary])

@@ -163,3 +163,48 @@ class RunSummaryAI(BaseModel):
     model: str | None
     tokens_used: int | None
     generated_at: str
+
+
+class SparklineSeries(BaseModel):
+    """One concurrency's time-series, used inside ConfigSparkline."""
+
+    concurrency: int
+    points: list[TrendPoint]
+
+
+class ConfigSparkline(BaseModel):
+    """All concurrencies' trends for one config, used on the home page."""
+
+    config_name: str
+    metric: str
+    series: list[SparklineSeries]
+
+
+class LatestNightlyConfigResult(BaseModel):
+    """One config's outcome within the latest cron workflow."""
+
+    config_name: str
+    expected_concurrencies: list[int]
+    passed_concurrencies: list[int]
+    failed_concurrencies: list[int]
+    partial_concurrencies: list[int]
+    representative_run_id: int
+    headline_metric: str | None
+    headline_value: float | None
+    headline_unit: str | None
+    headline_delta_pct_7d: float | None  # vs 7-day median at same (config, conc)
+
+
+class LatestNightlySummary(BaseModel):
+    """Summary of the most recent cron workflow run, for the home-page hero."""
+
+    github_run_id: str
+    github_run_attempt: int
+    github_run_url: str
+    started_at: str
+    commit_sha: str | None
+    commit_short_sha: str | None
+    commit_author: str | None
+    commit_message: str | None
+    pr_number: int | None
+    configs: list[LatestNightlyConfigResult]

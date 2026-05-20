@@ -1,37 +1,66 @@
 import Link from "next/link";
-import { api, type ConfigSummary, type RunSummary } from "@/lib/api";
+import {
+  api,
+  type ConfigSparkline,
+  type ConfigSummary,
+  type LatestNightlySummary,
+  type RegressionSummary,
+} from "@/lib/api";
 import { formatRelative } from "@/lib/format";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { AutoRefresh } from "@/components/auto-refresh";
 import { StatusTooltip } from "@/components/status-tooltip";
+import { Sparkline } from "@/components/sparkline";
+import { LatestNightlyCard } from "@/components/latest-nightly";
 
 export const dynamic = "force-dynamic";
 
 async function loadHomeData() {
   try {
-    const [recentRuns, configs, health] = await Promise.all([
-      api.listRuns({ limit: 20 }),
+    const [configs, health, latest, regressions] = await Promise.all([
       api.listConfigs(),
       api.health(),
+      api.latestNightly().catch(() => null),
+      api.listRegressions("active").catch(() => [] as RegressionSummary[]),
     ]);
-    return { recentRuns, configs, health, error: null };
+    const sparklines = await Promise.all(
+      configs.map((c) =>
+        api
+          .configSparkline(c.config_name, { metric: "total_token_throughput", window_days: 14 })
+          .catch(() => null),
+      ),
+    );
+    const sparklineByConfig: Record<string, ConfigSparkline | null> = {};
+    configs.forEach((c, i) => (sparklineByConfig[c.config_name] = sparklines[i]));
+    return { configs, health, latest, regressions, sparklineByConfig, error: null };
   } catch (err) {
     return {
-      recentRuns: [],
       configs: [],
       health: null,
+      latest: null as LatestNightlySummary | null,
+      regressions: [] as RegressionSummary[],
+      sparklineByConfig: {} as Record<string, ConfigSparkline | null>,
       error: err instanceof Error ? err.message : String(err),
     };
   }
 }
 
 export default async function HomePage() {
-  const { recentRuns, configs, health, error } = await loadHomeData();
+  const { configs, health, latest, regressions, sparklineByConfig, error } =
+    await loadHomeData();
+
+  const failedConfigsLastNight =
+    latest?.configs.filter((c) => c.failed_concurrencies.length > 0).length ?? 0;
+  const partialConfigsLastNight =
+    latest?.configs.filter((c) => c.partial_concurrencies.length > 0).length ?? 0;
+  const needsAttentionCount =
+    regressions.length + failedConfigsLastNight + partialConfigsLastNight;
 
   return (
-    <div className="space-y-10 animate-fade-in-up">
+    <div className="space-y-8 animate-fade-in-up">
       <AutoRefresh />
+
       {/* Header */}
       <section className="flex flex-wrap items-end justify-between gap-4">
         <div className="space-y-1">
@@ -88,12 +117,17 @@ export default async function HomePage() {
 
       {error && <ErrorBanner message={error} />}
 
-      {/* Configs */}
-      <section className="space-y-3">
-        <SectionHeader
-          title="Configs"
-          hint={`${configs.length} tracked`}
+      {needsAttentionCount > 0 && (
+        <NeedsAttentionBanner
+          regressions={regressions.length}
+          failedConfigs={failedConfigsLastNight}
+          partialConfigs={partialConfigsLastNight}
         />
+      )}
+
+      {/* Configs grid with sparklines */}
+      <section className="space-y-3">
+        <SectionHeader title="Configs" hint={`${configs.length} tracked`} />
         {configs.length === 0 ? (
           <EmptyState
             title="No configs yet"
@@ -102,35 +136,62 @@ export default async function HomePage() {
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {configs.map((c) => (
-              <ConfigCard key={c.config_name} config={c} />
+              <ConfigCard
+                key={c.config_name}
+                config={c}
+                sparkline={sparklineByConfig[c.config_name]}
+              />
             ))}
           </div>
         )}
       </section>
 
-      {/* Recent runs */}
+      {/* Latest nightly hero */}
       <section className="space-y-3">
-        <SectionHeader
-          title="Recent runs"
-          hint={recentRuns.length > 0 ? `${recentRuns.length} shown` : undefined}
-          action={
-            recentRuns.length > 0 ? (
-              <Link
-                href="/runs"
-                className="text-[12px] text-muted-foreground transition hover:text-foreground"
-              >
-                view all →
-              </Link>
-            ) : null
-          }
-        />
-        {recentRuns.length === 0 ? (
-          <EmptyState title="No runs yet" hint="Runs appear here as they complete." />
+        <SectionHeader title="Latest nightly" hint={latest ? "cron" : undefined} />
+        {latest ? (
+          <LatestNightlyCard summary={latest} />
         ) : (
-          <RunsTable runs={recentRuns} />
+          <EmptyState
+            title="No nightly runs yet"
+            hint="First scheduled run will appear here at 02:00 UTC."
+          />
         )}
       </section>
     </div>
+  );
+}
+
+function NeedsAttentionBanner({
+  regressions,
+  failedConfigs,
+  partialConfigs,
+}: {
+  regressions: number;
+  failedConfigs: number;
+  partialConfigs: number;
+}) {
+  const parts: string[] = [];
+  if (regressions > 0)
+    parts.push(`${regressions} unresolved regression${regressions === 1 ? "" : "s"}`);
+  if (failedConfigs > 0)
+    parts.push(`${failedConfigs} config${failedConfigs === 1 ? "" : "s"} failed last nightly`);
+  if (partialConfigs > 0)
+    parts.push(`${partialConfigs} config${partialConfigs === 1 ? "" : "s"} partial last nightly`);
+
+  const triageHref = regressions > 0 ? "/regressions" : "/runs?status=failed&trigger=cron";
+
+  return (
+    <Link
+      href={triageHref}
+      className="flex flex-wrap items-center gap-2 rounded-xl border border-warning/40 bg-warning/5 px-4 py-2.5 text-[13px] transition hover:border-warning/60"
+    >
+      <span className="text-warning">⚠</span>
+      <span className="font-medium text-foreground">{parts.join(" · ")}</span>
+      <span className="ml-auto text-[12px] text-muted-foreground transition group-hover:text-foreground">
+        triage →
+      </span>
+    </Link>
   );
 }
 
@@ -156,17 +217,24 @@ function SectionHeader({
   );
 }
 
-function ConfigCard({ config }: { config: ConfigSummary }) {
+function ConfigCard({
+  config,
+  sparkline,
+}: {
+  config: ConfigSummary;
+  sparkline: ConfigSparkline | null | undefined;
+}) {
   const isPassing = config.latest_status === "passed";
   const isPartial = config.latest_status === "partial";
+  const hasData = sparkline && sparkline.series.some((s) => s.points.length > 0);
   return (
     <Link href={`/configs/${config.config_name}`} className="group block">
       <Card className="h-full">
-        <CardHeader>
+        <CardContent className="space-y-3 p-4">
           <div className="flex items-start justify-between gap-3">
-            <CardTitle className="font-mono text-[13px] leading-tight text-foreground/90">
+            <p className="font-mono text-[12.5px] leading-tight text-foreground/90">
               {config.config_name}
-            </CardTitle>
+            </p>
             <StatusTooltip status={config.latest_status ?? ""}>
               <Badge variant={isPassing ? "success" : isPartial ? "warning" : "destructive"}>
                 <StatusDot passing={isPassing} />
@@ -174,91 +242,28 @@ function ConfigCard({ config }: { config: ConfigSummary }) {
               </Badge>
             </StatusTooltip>
           </div>
-          <CardDescription>
-            {config.concurrency_levels.length} concurrency level
-            {config.concurrency_levels.length === 1 ? "" : "s"} · latest{" "}
-            {formatRelative(config.latest_started_at)}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-1">
-          {config.concurrency_levels.map((c) => (
-            <Badge key={c} variant="secondary" className="font-mono text-[11px]">
-              {c}
-            </Badge>
-          ))}
+
+          {hasData ? (
+            <Sparkline
+              series={sparkline.series}
+              ariaLabel={`14-day total_token_throughput trend for ${config.config_name}`}
+            />
+          ) : (
+            <div className="flex h-9 items-center text-[10px] text-muted-foreground/60">
+              no recent passed data
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-baseline justify-between gap-2 text-[11px] text-muted-foreground">
+            <span>
+              {config.concurrency_levels.length} conc level
+              {config.concurrency_levels.length === 1 ? "" : "s"}
+            </span>
+            <span>latest {formatRelative(config.latest_started_at)}</span>
+          </div>
         </CardContent>
       </Card>
     </Link>
-  );
-}
-
-function RunsTable({ runs }: { runs: RunSummary[] }) {
-  return (
-    <div className="overflow-hidden rounded-xl border border-border/60">
-      <table className="w-full text-[13px]">
-        <thead className="bg-muted/30 text-left text-[11px] font-medium uppercase tracking-[0.05em] text-muted-foreground">
-          <tr>
-            <th className="px-4 py-2.5">Time</th>
-            <th className="px-4 py-2.5">Trigger</th>
-            <th className="px-4 py-2.5">Config</th>
-            <th className="px-4 py-2.5 text-right">Conc.</th>
-            <th className="px-4 py-2.5">Commit</th>
-            <th className="px-4 py-2.5">Author</th>
-            <th className="px-4 py-2.5">Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((r) => (
-            <tr
-              key={r.id}
-              className="group border-t border-border/60 transition-colors hover:bg-muted/30"
-            >
-              <td className="px-4 py-2.5">
-                <Link
-                  href={`/runs/${r.id}`}
-                  className="font-medium transition group-hover:text-primary"
-                >
-                  {formatRelative(r.started_at)}
-                </Link>
-              </td>
-              <td className="px-4 py-2.5">
-                <Badge variant="outline" className="font-mono lowercase">
-                  {r.trigger}
-                </Badge>
-              </td>
-              <td className="px-4 py-2.5 font-mono text-[12px] text-foreground/80">
-                {r.config_name}
-              </td>
-              <td className="px-4 py-2.5 text-right font-mono tabular-numbers text-[12px]">
-                {r.concurrency.toLocaleString()}
-              </td>
-              <td className="px-4 py-2.5 font-mono text-[12px] text-muted-foreground">
-                {r.commit_short_sha ?? "—"}
-              </td>
-              <td className="px-4 py-2.5 text-muted-foreground">
-                {r.commit_author ?? "—"}
-              </td>
-              <td className="px-4 py-2.5">
-                <StatusTooltip status={r.status}>
-                  <Badge
-                    variant={
-                      r.status === "passed"
-                        ? "success"
-                        : r.status === "partial"
-                          ? "warning"
-                          : "destructive"
-                    }
-                  >
-                    <StatusDot passing={r.status === "passed"} />
-                    {r.status}
-                  </Badge>
-                </StatusTooltip>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   );
 }
 

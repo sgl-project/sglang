@@ -78,6 +78,43 @@ export interface RunSummaryAI {
   generated_at: string;
 }
 
+export interface SparklineSeries {
+  concurrency: number;
+  points: TrendPoint[];
+}
+
+export interface ConfigSparkline {
+  config_name: string;
+  metric: string;
+  series: SparklineSeries[];
+}
+
+export interface LatestNightlyConfigResult {
+  config_name: string;
+  expected_concurrencies: number[];
+  passed_concurrencies: number[];
+  failed_concurrencies: number[];
+  partial_concurrencies: number[];
+  representative_run_id: number;
+  headline_metric: string | null;
+  headline_value: number | null;
+  headline_unit: string | null;
+  headline_delta_pct_7d: number | null;
+}
+
+export interface LatestNightlySummary {
+  github_run_id: string;
+  github_run_attempt: number;
+  github_run_url: string;
+  started_at: string;
+  commit_sha: string | null;
+  commit_short_sha: string | null;
+  commit_author: string | null;
+  commit_message: string | null;
+  pr_number: number | null;
+  configs: LatestNightlyConfigResult[];
+}
+
 export interface HealthStatus {
   status: string;
   runs: number;
@@ -187,6 +224,14 @@ export const api = {
   getRun: (id: number) => request<RunDetail>(`/runs/${id}`),
   getRunSummary: (id: number) => request<RunSummaryAI>(`/runs/${id}/summary`),
   listConfigs: () => request<ConfigSummary[]>("/configs"),
+  configSparkline: (config: string, params?: { metric?: string; window_days?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.metric) qs.set("metric", params.metric);
+    if (params?.window_days) qs.set("window_days", String(params.window_days));
+    const q = qs.toString();
+    return request<ConfigSparkline>(`/configs/${config}/sparkline${q ? `?${q}` : ""}`);
+  },
+  latestNightly: () => request<LatestNightlySummary | null>("/latest-nightly"),
   configTrend: (
     config: string,
     params: { metric: string; concurrency: number; window_days?: number },
