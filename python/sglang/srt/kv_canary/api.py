@@ -74,7 +74,7 @@ def install_canary(
         req_to_token_pool=model_runner.req_to_token_pool,
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
-        swa_window_size=int(model_runner.sliding_window_size or 0),
+        swa_window_size=model_runner.sliding_window_size or 0,
         token_oracle_manager=token_oracle_manager,
     )
 
@@ -97,20 +97,20 @@ def _compute_launch_capacities(
     spec_num_draft_tokens = server_args.speculative_num_draft_tokens
     num_tokens_per_bs = 1
     if spec_num_draft_tokens:
-        num_tokens_per_bs = max(num_tokens_per_bs, int(spec_num_draft_tokens))
-    max_running_requests = int(model_runner.req_to_token_pool.size)
-    max_bs = max(int(cuda_graph_max_bs), max_running_requests)
+        num_tokens_per_bs = max(num_tokens_per_bs, spec_num_draft_tokens)
+    max_running_requests = model_runner.req_to_token_pool.size
+    max_bs = max(cuda_graph_max_bs, max_running_requests)
     chunked_prefill_size = server_args.chunked_prefill_size
-    max_prefill_tokens = int(server_args.max_prefill_tokens)
+    max_prefill_tokens = server_args.max_prefill_tokens
     if chunked_prefill_size is None or chunked_prefill_size < 0:
         max_extend_tokens_per_forward = max_prefill_tokens
     else:
-        max_extend_tokens_per_forward = int(chunked_prefill_size)
-    pool_slot_count = int(model_runner.max_total_num_tokens)
+        max_extend_tokens_per_forward = chunked_prefill_size
+    pool_slot_count = model_runner.max_total_num_tokens
     write_entry_capacity = max(
         1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
     )
-    max_seq_len_per_req = int(model_runner.req_to_token_pool.req_to_token.shape[1])
+    max_seq_len_per_req = model_runner.req_to_token_pool.req_to_token.shape[1]
     # Per-forward verify entries = sum_r (prefix_lens[r] - SWA_window_start[r]); the FULL group
     # never clips with a window, so the upper bound is sum_r prefix_lens[r]. Under radix prefix
     # sharing reqs can collectively reference more tokens than the pool holds, so the hard bound

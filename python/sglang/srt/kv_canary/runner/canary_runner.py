@@ -86,7 +86,7 @@ class CanaryRunner:
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
-        self._swa_window_size = int(swa_window_size)
+        self._swa_window_size = swa_window_size
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
