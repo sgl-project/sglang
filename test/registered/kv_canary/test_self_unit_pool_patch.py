@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import (
-    _MAX_REAL_KV_SOURCES,
     CANARY_SLOT_BYTES,
     RealKvSource,
 )
@@ -59,13 +59,12 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         attach_canary_buffers(pool=pool, config=self.config, device=self.device)
         groups = get_canary_buffer_groups(pool)
         for group in groups.values():
-            self.assertLessEqual(len(group.real_kv_sources_k), _MAX_REAL_KV_SOURCES)
-            self.assertLessEqual(len(group.real_kv_sources_v), _MAX_REAL_KV_SOURCES)
+            self.assertLessEqual(len(group.real_kv_sources_k), MAX_REAL_KV_SOURCES)
+            self.assertLessEqual(len(group.real_kv_sources_v), MAX_REAL_KV_SOURCES)
 
     def test_real_kv_sources_above_4_raises(self):
         from sglang.jit_kernel.kv_canary.verify import (
             CanaryLaunchTag,
-            RealKvHashMode,
             VerifyPlan,
             canary_verify_step,
         )
@@ -75,7 +74,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
             RealKvSource(
                 tensor=tensor, page_size=1, num_bytes_per_token=16, read_bytes=16
             )
-            for _ in range(_MAX_REAL_KV_SOURCES + 1)
+            for _ in range(MAX_REAL_KV_SOURCES + 1)
         )
         canary_buf = torch.zeros(
             4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=self.device

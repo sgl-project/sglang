@@ -8,10 +8,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_SLOT_BYTES,
-    RealKvHashMode,
-)
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
