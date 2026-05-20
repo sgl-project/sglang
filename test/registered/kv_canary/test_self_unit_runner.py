@@ -29,7 +29,7 @@ from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
-    CPU_DEVICE,
+    DEFAULT_DEVICE,
     make_radix_cache,
     make_req_to_token_pool,
 )
@@ -114,7 +114,7 @@ def _make_runner(
 
 class TestSelfUnitRunner(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
             patch.object(launch_module, "canary_plan_step", lambda **kwargs: None),

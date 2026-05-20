@@ -21,7 +21,7 @@ class PumpAndAllreduce:
         device_state: CanaryDeviceState,
         tp_group: Optional["GroupCoordinator"],
         pp_group: Optional["GroupCoordinator"],
-        d2h_stream: Optional[torch.cuda.Stream],
+        d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state

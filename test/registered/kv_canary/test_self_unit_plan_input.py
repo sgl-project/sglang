@@ -12,7 +12,7 @@ from sglang.srt.kv_canary.plan_input import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
-    CPU_DEVICE,
+    DEFAULT_DEVICE,
     make_forward_batch,
     make_radix_cache,
     make_req_to_token_pool,
@@ -36,7 +36,7 @@ def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
 
 class TestSelfUnitPlanInput(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
 
     def test_fill_plan_input_per_forward_extend(self):
         fb = make_forward_batch(

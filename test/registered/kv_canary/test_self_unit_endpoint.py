@@ -24,7 +24,7 @@ from sglang.srt.kv_canary.state import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
-    CPU_DEVICE,
+    DEFAULT_DEVICE,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -72,7 +72,7 @@ def _make_kernel_args(device):
 
 class TestSelfUnitEndpoint(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
 
     def test_launch_per_forward_calls_verify_then_write(self):
         calls: List = []
