@@ -80,7 +80,20 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
     ):
         """Initialize the online model parameter update group."""
+        if recv_req.transfer_mode == "relay":
+            return self.init_relay_weights_update_group(recv_req)
+        if recv_req.transfer_mode != "broadcast":
+            message = f"Unsupported distributed weight transfer_mode={recv_req.transfer_mode}."
+            logger.error(message)
+            return InitWeightsUpdateGroupReqOutput(False, message)
         success, message = self.tp_worker.init_weights_update_group(recv_req)
+        return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def init_relay_weights_update_group(
+        self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
+    ):
+        """Initialize the relay-only online model parameter update group."""
+        success, message = self.tp_worker.init_relay_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
 
     def destroy_weights_update_group(
@@ -95,10 +108,50 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if recv_req.transfer_mode == "relay":
+            return self.update_relay_weights_from_distributed(recv_req)
+        if recv_req.transfer_mode != "broadcast":
+            message = f"Unsupported distributed weight transfer_mode={recv_req.transfer_mode}."
+            logger.error(message)
+            return UpdateWeightsFromDistributedReqOutput(False, message)
+
         self._quiesce_for_weight_update()
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromDistributedReqOutput(success, message)
+
+    def update_relay_weights_from_distributed(
+        self,
+        recv_req: UpdateWeightsFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
+        """Receive relay weights and load them into this inference instance."""
+        if recv_req.weight_version is not None:
+            message = (
+                "relay distributed weight transfer does not accept weight_version. "
+                "The version is committed after relay load, fanout, and post-processing finish."
+            )
+            logger.error(message)
+            return UpdateWeightsFromDistributedReqOutput(False, message)
+        if recv_req.load_format is not None:
+            message = (
+                "relay distributed weight transfer does not support "
+                f"load_format={recv_req.load_format}."
+            )
+            logger.error(message)
+            return UpdateWeightsFromDistributedReqOutput(False, message)
+
+        self._quiesce_for_weight_update()
+        success, message = self.tp_worker.update_relay_weights_from_distributed(
+            recv_req
+        )
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)

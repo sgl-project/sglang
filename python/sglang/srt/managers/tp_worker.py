@@ -110,7 +110,17 @@ class BaseTpWorker(ABC):
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
-            recv_req.transfer_mode,
+        )
+        return success, message
+
+    def init_relay_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.init_relay_weights_update_group(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.rank_offset,
+            recv_req.world_size,
+            recv_req.group_name,
+            recv_req.backend,
         )
         return success, message
 
@@ -154,7 +164,29 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
-            recv_req.transfer_mode,
+        )
+        return success, message
+
+    def update_relay_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        if recv_req.weight_version is not None:
+            return (
+                False,
+                "relay distributed weight transfer does not accept weight_version. "
+                "The version is committed after relay load, fanout, and post-processing finish.",
+            )
+        if recv_req.load_format is not None:
+            return (
+                False,
+                "relay distributed weight transfer does not support "
+                f"load_format={recv_req.load_format}.",
+            )
+        success, message = self.model_runner.update_relay_weights_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
         )
         return success, message
 
