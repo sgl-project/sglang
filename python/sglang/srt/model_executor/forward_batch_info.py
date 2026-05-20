@@ -296,8 +296,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The indices of output tokens in the token_to_kv_pool_swa
-    out_cache_loc_swa: Optional[torch.Tensor] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -652,13 +650,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Precompute SWA cache location once for all SWA layers
-        if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
-            ret.out_cache_loc_swa = (
-                model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    ret.out_cache_loc
-                )
-            )
+
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -1012,10 +1004,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
-        if self.out_cache_loc_swa is not None:
-            self.out_cache_loc_swa = self._pad_tensor_to_size(
-                self.out_cache_loc_swa, num_tokens
-            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
