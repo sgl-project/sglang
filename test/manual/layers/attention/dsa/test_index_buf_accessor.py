@@ -1,5 +1,5 @@
 """
-Correctness tests for NSA Indexer K/S Buffer Access with Fused Triton Kernels.
+Correctness tests for DSA Indexer K/S Buffer Access with Fused Triton Kernels.
 
 This test verifies that the optimized Triton implementations (GetK, GetS, GetKAndS)
 produce identical results to the torch_fast baseline implementations.
@@ -520,7 +520,7 @@ class TestEdgeCases:
 def print_test_summary():
     """Print a summary message about the test suite."""
     print("\n" + "=" * 80)
-    print("NSA Indexer K/S Buffer Accessor Correctness Tests")
+    print("DSA Indexer K/S Buffer Accessor Correctness Tests")
     print("=" * 80)
     print("Testing Triton implementations against torch_fast baseline:")
     print("  - GetK.triton() vs GetK.torch_fast()")

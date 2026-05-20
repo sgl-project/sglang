@@ -179,7 +179,7 @@ class MockModelRunner:
         max_context_len = self.config["context_len"]
         max_batch_size = self.config["max_bs"]
 
-        # Create mock hf_config for NSA - instantiate it as an object, not a type
+        # Create mock hf_config for DSA - instantiate it as an object, not a type
         hf_config = type(
             "HfConfig",
             (),

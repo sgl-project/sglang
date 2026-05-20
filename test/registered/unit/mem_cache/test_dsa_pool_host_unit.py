@@ -18,9 +18,9 @@ register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 class TestNSAHiCacheTransfer(unittest.TestCase):
     def setUp(self):
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for NSA host transfer tests.")
+            self.skipTest("CUDA is required for DSA host transfer tests.")
         if is_npu() or is_xpu():
-            self.skipTest("NSA host transfer tests only support CUDA/ROCm.")
+            self.skipTest("DSA host transfer tests only support CUDA/ROCm.")
         if not (is_cuda() or is_hip()):
             self.skipTest("CUDA/ROCm not available.")
 
