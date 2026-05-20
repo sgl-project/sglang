@@ -862,12 +862,12 @@ class PrefillAdder:
 
         if (
             self.rem_chunk_tokens is None
-            and real_input_tokens >= self.rem_input_tokens
             and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
-            # - if the can_run_list is empty, accept any first prefill requests
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, accept any first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
