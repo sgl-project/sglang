@@ -519,6 +519,28 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.transfer_mode == "relay" and obj.weight_version is not None:
+            return (
+                False,
+                "relay distributed weight transfer does not accept weight_version. "
+                "The version is committed after relay load, fanout, and post-processing finish.",
+            )
+
+        if obj.transfer_mode == "relay":
+            async with self.is_pause_cond:
+                if not self.is_pause:
+                    return (
+                        False,
+                        "relay distributed weight transfer requires paused generation. "
+                        "Pause generation before receiving relay weights so the asynchronous load "
+                        "cannot race with active inference.",
+                    )
+                if obj.abort_all_requests:
+                    self.abort_request(abort_all=True)
+                results = await self.update_weights_from_distributed_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+            return success, message
+
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -531,8 +553,10 @@ class TokenizerCommunicatorMixin:
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await self.update_weights_from_distributed_communicator(obj)
+                success, message = _Communicator.merge_results(results)
+        else:
+            success, message = _Communicator.merge_results(results)
 
-        success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
