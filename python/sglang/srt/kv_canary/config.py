@@ -66,11 +66,6 @@ class CanaryConfig:
             )
 
         real_kv_raw = (server_args.kv_canary_real_data or "").strip().upper()
-        if real_kv_raw not in RealKvHashMode.__members__:
-            raise ValueError(
-                f"kv-canary: kv_canary_real_data must be one of "
-                f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
-            )
 
         input_check_mode = bool(envs.SGLANG_KV_CANARY_INPUT_CHECK.get())
 
