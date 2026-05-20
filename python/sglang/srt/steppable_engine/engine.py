@@ -63,7 +63,7 @@ class SteppableEngineConfig:
     pp_size: int = 1
     mem_fraction_static: float = 0.65
     cuda_graph: bool = True
-    enable_overlap: bool = False
+    enable_overlap: bool = True
     multimodal: bool = False
     radix_cache: bool = False
     speculative_algorithm: Optional[str] = None
@@ -119,8 +119,6 @@ class SteppableEngine:
 
     @staticmethod
     def _validate_config(config: SteppableEngineConfig) -> None:
-        if config.enable_overlap:
-            raise NotImplementedError("enable_overlap=True is not supported")
         if config.tp_size != 1 or config.pp_size != 1:
             raise NotImplementedError(
                 "tp_size>1 / pp_size>1 is not supported (single-GPU only)"
@@ -149,6 +147,7 @@ class SteppableEngine:
             "pp_size": config.pp_size,
             "disable_cuda_graph": not config.cuda_graph,
             "disable_radix_cache": not config.radix_cache,
+            "disable_overlap_schedule": not config.enable_overlap,
             "skip_tokenizer_init": True,
         }
         if config.speculative_algorithm is not None:
