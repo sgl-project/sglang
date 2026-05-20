@@ -194,5 +194,4 @@ class _OracleSampler(Sampler):
             logits=logits_output.next_token_logits,
             positions=positions,
         )
-        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         return batch_next_token_ids
