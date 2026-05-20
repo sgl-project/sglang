@@ -725,7 +725,7 @@ class VisionAscendAttention(nn.Module):
             num_heads=num_heads,
             num_key_value_heads=num_kv_heads,
             sparse_mode=0,
-            input_layout="TND"
+            input_layout="TND",
         )[0]
         return output
 
