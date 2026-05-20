@@ -264,6 +264,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
@@ -276,5 +277,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
             use_cuda_graph: whether to use CUDA Graph for this batch
+            padded_bs: when set under use_cuda_graph + EXTEND, pad seg_lens /
+                weight_indices to this size so the per-bs cuda graph capture
+                (PCG A-Lite) sees a stable batch_info.bs across captures.
         """
         pass

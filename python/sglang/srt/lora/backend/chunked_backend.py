@@ -261,7 +261,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
+        # padded_bs is for triton-backend PCG A-Lite per-bs capture; ignored here.
+        del padded_bs
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(

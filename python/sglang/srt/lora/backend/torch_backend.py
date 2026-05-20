@@ -197,7 +197,10 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
+        # padded_bs is for triton-backend PCG A-Lite per-bs capture; ignored here.
+        del padded_bs
         # Do not use merge optimization for graph mode
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         original_seq_lens_cpu = generate_sequence_lengths(forward_batch, device="cpu")

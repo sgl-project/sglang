@@ -333,6 +333,7 @@ class LoRAManager:
         self,
         forward_batch: ForwardBatch,
         force_cuda_graph: bool = False,
+        padded_bs: Optional[int] = None,
     ):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -368,6 +369,7 @@ class LoRAManager:
             lora_ranks=lora_ranks,
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
+            padded_bs=padded_bs,
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices

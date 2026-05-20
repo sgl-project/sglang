@@ -238,10 +238,33 @@ class TritonLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        padded_bs: Optional[int] = None,
     ):
+        bs = forward_batch.batch_size
+
+        # PCG A-Lite: when padded_bs is supplied under use_cuda_graph, pad
+        # seg_lens / weight_indices up to padded_bs so the captured kernel
+        # grid (which is parameterized by batch_info.bs as a Python int and
+        # therefore an Inductor specialization guard) stays constant across
+        # captures with different live batch sizes. Padded slots receive
+        # seg_lens=0 / weight_indices=0 and the sgemm_lora kernel early-
+        # returns on those segments.
+        if use_cuda_graph and padded_bs is not None:
+            assert (
+                padded_bs >= bs
+            ), f"padded_bs ({padded_bs}) must be >= live bs ({bs})"
+            bs_eff = padded_bs
+        else:
+            bs_eff = bs
+
+        if bs_eff > bs:
+            weight_indices_padded = list(weight_indices) + [0] * (bs_eff - bs)
+        else:
+            weight_indices_padded = weight_indices
+
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
-            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+            weight_indices_padded, dtype=torch.int32, pin_memory=True, device="cpu"
         )
         lora_ranks_tensor = torch.tensor(
             lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
@@ -250,15 +273,13 @@ class TritonLoRABackend(BaseLoRABackend):
             scalings, dtype=torch.float, pin_memory=True, device="cpu"
         )
 
-        bs = forward_batch.batch_size
-
         if use_cuda_graph:
             assert (
                 self.cuda_graph_batch_info is not None
             ), "CUDA Graph batch info is not initialized."
             batch_info = self.cuda_graph_batch_info
-            batch_info.bs = forward_batch.batch_size
-            batch_info.num_segments = forward_batch.batch_size
+            batch_info.bs = bs_eff
+            batch_info.num_segments = bs_eff
             # SILENT-BUG FIX (PCG/BCG + LoRA + EXTEND): previously the
             # cuda_graph path left seg_lens / seg_indptr / max_len at their
             # init defaults ([num_tokens_per_bs]*max_bs, cumsum-of-defaults,
@@ -269,19 +290,21 @@ class TritonLoRABackend(BaseLoRABackend):
             # to a single token regardless of actual prompt length. Update
             # those fields here to reflect the live batch.
             if forward_batch.forward_mode.is_extend():
-                extend_lens_cpu = list(forward_batch.extend_seq_lens_cpu)
+                extend_lens_cpu = list(forward_batch.extend_seq_lens_cpu)[:bs]
+                if bs_eff > bs:
+                    extend_lens_cpu = extend_lens_cpu + [0] * (bs_eff - bs)
                 seg_lens_tensor = torch.tensor(
-                    extend_lens_cpu[:bs],
+                    extend_lens_cpu,
                     dtype=torch.int32,
                     pin_memory=True,
                     device="cpu",
                 )
-                batch_info.seg_lens[:bs].copy_(seg_lens_tensor, non_blocking=True)
+                batch_info.seg_lens[:bs_eff].copy_(seg_lens_tensor, non_blocking=True)
                 batch_info.seg_indptr[0:1].zero_()
                 torch.cumsum(
-                    batch_info.seg_lens[:bs],
+                    batch_info.seg_lens[:bs_eff],
                     dim=0,
-                    out=batch_info.seg_indptr[1 : bs + 1],
+                    out=batch_info.seg_indptr[1 : bs_eff + 1],
                 )
                 # NOTE: do NOT update batch_info.max_len here. max_len is a
                 # Python int used in the sgemm kernel grid (cdiv(max_len, BLOCK_S))
@@ -334,7 +357,7 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.scalings[: self.max_loras_per_batch].copy_(
             scalings_tensor, non_blocking=True
         )
-        batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+        batch_info.weight_indices[:bs_eff].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
 

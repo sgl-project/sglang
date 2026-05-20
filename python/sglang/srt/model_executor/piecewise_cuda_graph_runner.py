@@ -150,6 +150,15 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    # A-Lite: by default Dynamo treats integer attributes of nn.Modules as static,
+    # so `lora_backend.batch_info.bs` (read inside sgemm_lora kernel grids)
+    # becomes a specialization guard that fails when bs changes between
+    # capture and replay (or between captures). Setting this to True lets
+    # Dynamo treat such ints as dynamic — a single captured graph handles
+    # multiple bs values at replay via tensor-backed int parameters.
+    if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
     if _is_musa:
         from sglang.srt.hardware_backend.musa.utils.patch_torch import (
             patch_fx_custom_device,
@@ -234,6 +243,25 @@ class PiecewiseCudaGraphRunner:
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
         self.max_bs = model_runner.req_to_token_pool.size
+
+        # A-Lite: per-bs cuda graph capture for LoRA.
+        #
+        # Without LoRA, the captured region is bs-invariant (input flows as a
+        # flat (num_tokens, hidden) tensor) so a single bs=1 capture covers
+        # every bs at replay. With LoRA, the sgemm_lora* triton kernels grid
+        # on `batch_info.bs` (a Python int and therefore an Inductor
+        # specialization guard); a single bs=1 capture would recompile when
+        # replayed with bs>1, hitting `PCG capture stream is not set`.
+        #
+        # We capture one cuda graph per `bs_bucket` so that the live bs at
+        # replay is bisect-up'd to the nearest captured bucket and slots
+        # beyond live bs are padded with seg_lens=0 / weight_indices=0
+        # (handled by triton_backend.prepare_lora_batch).
+        if model_runner.server_args.enable_lora:
+            self.capture_bs_buckets = sorted(set([1, 16]))
+        else:
+            self.capture_bs_buckets = [1]
+        self.max_capture_bs = max(self.capture_bs_buckets)
 
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
@@ -445,8 +473,9 @@ class PiecewiseCudaGraphRunner:
             )
 
         if warmup_lora_ids is not None:
+            # bs=1 for warmup; padded_bs=1 keeps batch_info.bs consistent.
             self.model_runner.lora_manager.prepare_lora_batch(
-                forward_batch, force_cuda_graph=True
+                forward_batch, force_cuda_graph=True, padded_bs=1
             )
 
         # Attention backend
@@ -493,20 +522,13 @@ class PiecewiseCudaGraphRunner:
         # triton/chunked_backend._build_lm_head_batch_info). No need to
         # blacklist whole batches here.
         #
-        # PCG capture is performed with batch_size=1 (one logical sequence
-        # carrying all num_tokens tokens). LoRA triton kernels launch with a
-        # grid of `(_, batch_info.bs)` (sgemm_lora_a/b at lines 150-155), so
-        # a live batch_size != 1 changes the kernel grid shape — Dynamo's
-        # specialization guard fails, a runtime recompile fires, and the
-        # captured PCG stream is no longer in scope, hitting the
-        # `AssertionError: PCG capture stream is not set` in
-        # cuda_piecewise_backend.py. Refuse PCG for batched LoRA requests so
-        # the engine falls back to eager prefill (still correct, no crash).
-        # BCG (BreakableCudaGraphRunner) does not have this limitation
-        # because it does not go through Inductor / Dynamo.
+        # A-Lite: per-bs cuda graph capture lets LoRA run with bs up to
+        # self.max_capture_bs. Live bs is bisect-up'd to the nearest captured
+        # bucket and padded slots are seg_lens=0 / weight_indices=0. Beyond
+        # max_capture_bs we fall back to eager (still correct).
         if (
             self.model_runner.server_args.enable_lora
-            and forward_batch.batch_size > 1
+            and forward_batch.batch_size > self.max_capture_bs
         ):
             return False
         num_tokens = len(forward_batch.input_ids)
@@ -537,12 +559,21 @@ class PiecewiseCudaGraphRunner:
                     empty_cache=False,
                 )
                 # Reverse the order to enable better memory sharing across cuda graphs.
+                # A-Lite: nested (num_tokens, bs_bucket) so each bs bucket gets its own
+                # cuda graph capture. Skip combos where bs > num_tokens (can't represent
+                # bs sequences each >=1 token within num_tokens).
+                capture_pairs = [
+                    (n, b)
+                    for n in reversed(self.capture_num_tokens)
+                    for b in reversed(self.capture_bs_buckets)
+                    if b <= n
+                ]
                 capture_range = (
-                    tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                    tqdm.tqdm(capture_pairs)
                     if get_tensor_model_parallel_rank() == 0
-                    else reversed(self.capture_num_tokens)
+                    else capture_pairs
                 )
-                for i, num_tokens in enumerate(capture_range):
+                for i, (num_tokens, bs_capture) in enumerate(capture_range):
                     if get_tensor_model_parallel_rank() == 0:
                         avail_mem = get_available_gpu_memory(
                             self.model_runner.device,
@@ -550,14 +581,13 @@ class PiecewiseCudaGraphRunner:
                             empty_cache=False,
                         )
                         capture_range.set_description(
-                            f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                            f"Capturing num tokens ({num_tokens=} bs={bs_capture} {avail_mem=:.2f} GB)"
                         )
 
-                    self.capture_one_batch_size(num_tokens)
+                    self.capture_one_batch_size(num_tokens, bs_capture)
 
-    def capture_one_batch_size(self, num_tokens: int):
+    def capture_one_batch_size(self, num_tokens: int, bs: int = 1):
         buffers = self.buffers
-        bs = 1
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -598,6 +628,17 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        # A-Lite: distribute num_tokens across bs sequences for capture-time
+        # ForwardBatch metadata. Each captured graph is keyed by (num_tokens, bs)
+        # so the kernel grid (parameterized by batch_info.bs) stays constant
+        # at replay when live bs is bisect-up'd to the bucket.
+        base, rem = divmod(num_tokens, bs)
+        seq_lens_list = [base + (1 if i < rem else 0) for i in range(bs)]
+        prefix_lens_list = [0] * bs
+        start_loc_list = [0]
+        for v in seq_lens_list[:-1]:
+            start_loc_list.append(start_loc_list[-1] + v)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -605,10 +646,10 @@ class PiecewiseCudaGraphRunner:
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
-                seq_lens=torch.tensor([num_tokens], device=self.device),
+                seq_lens=torch.tensor(seq_lens_list, device=self.device),
                 next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                orig_seq_lens=torch.tensor(seq_lens_list, device=self.device),
+                seq_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
@@ -621,12 +662,12 @@ class PiecewiseCudaGraphRunner:
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
-                extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([0], device=self.device),
-                extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_seq_lens=torch.tensor(seq_lens_list, device=self.device),
+                extend_prefix_lens=torch.tensor(prefix_lens_list, device=self.device),
+                extend_start_loc=torch.tensor(start_loc_list, device=self.device),
+                extend_prefix_lens_cpu=torch.tensor(prefix_lens_list, device="cpu"),
+                extend_seq_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
+                extend_logprob_start_lens_cpu=torch.tensor(seq_lens_list, device="cpu"),
                 positions=positions,
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
@@ -645,8 +686,10 @@ class PiecewiseCudaGraphRunner:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
+            # A-Lite: pad padded_bs=bs so batch_info.bs is fixed to bs_capture,
+            # matching what replay will use after bisect-up.
             self.model_runner.lora_manager.prepare_lora_batch(
-                forward_batch, force_cuda_graph=True
+                forward_batch, force_cuda_graph=True, padded_bs=bs
             )
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -710,7 +753,15 @@ class PiecewiseCudaGraphRunner:
             if forward_batch.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
-        bs = forward_batch.batch_size
+        # A-Lite: when LoRA + replay used a padded_bs bucket, the captured
+        # graph saw forward_batch.batch_size = padded_bs (Python int guard for
+        # Inductor). Use that here so the static_forward_batch attribute
+        # matches the captured specialization and no recompile fires.
+        live_bs = forward_batch.batch_size
+        if getattr(self, "_current_padded_bs", None) is not None:
+            bs = self._current_padded_bs
+        else:
+            bs = live_bs
 
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
@@ -865,9 +916,21 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.enable_lora
             and forward_batch.lora_ids is not None
         ):
+            # A-Lite: bisect live bs up to nearest captured bs_bucket and pad
+            # padded_bs so batch_info.bs in the captured kernel grid matches
+            # what Inductor specialized on at capture (no recompile).
+            live_bs = forward_batch.batch_size
+            bisect_idx = bisect.bisect_left(self.capture_bs_buckets, live_bs)
+            assert bisect_idx < len(
+                self.capture_bs_buckets
+            ), f"live_bs ({live_bs}) > max_capture_bs ({self.max_capture_bs}); can_run should have rejected"
+            padded_bs = self.capture_bs_buckets[bisect_idx]
             self.model_runner.lora_manager.prepare_lora_batch(
-                forward_batch, force_cuda_graph=True
+                forward_batch, force_cuda_graph=True, padded_bs=padded_bs
             )
+            self._current_padded_bs = padded_bs
+        else:
+            self._current_padded_bs = None
 
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
