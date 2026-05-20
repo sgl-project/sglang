@@ -89,10 +89,22 @@ class TestSentinelFilter(unittest.TestCase):
         self.assertIsNone(_filter_pool_rows(None))
 
     def test_evict_skips_sentinels(self):
-        """End-to-end: a TreeNode whose value mixes sentinels (slot 0) and
-        real rows. evict() must only free the real rows, never slot 0."""
+        """End-to-end: with CP consensus enabled, evicting a TreeNode whose
+        value mixes sentinels (slot 0) and real rows must free only the
+        real rows, never slot 0. The filter lives on the CP-consensus
+        path (``_apply_cp_eviction``); the non-CP ``_evict_local`` is
+        reached only when sentinels do not exist in the first place."""
         mock = _make_mock_allocator()
         cache = RadixCache.create_simulated(page_size=1, mock_allocator=mock)
+
+        # Single-process stand-in for the CP attention group: rank 0 with
+        # cp_size=2 routes evict() through _evict_cp_consensus, and the
+        # passthrough broadcast_object lets _apply_cp_eviction run locally
+        # with the same paths rank 0 picked.
+        cp_group = unittest.mock.Mock()
+        cp_group.broadcast_object.side_effect = lambda obj, src=0: obj
+        cache.enable_cp_consensus(cp_group, cp_rank=0, cp_size=2)
+
         cache.insert(
             InsertParams(
                 key=RadixKey([1, 2, 3, 4]),

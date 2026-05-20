@@ -187,6 +187,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.mirrored_cp_availability import MirroredCpAvailability
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -948,6 +949,21 @@ class Scheduler(
             and not self.tree_cache.supports_streaming_session()
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
+
+        # CP KV-resharding: when enabled (validated in server_args), activate
+        # the rank-0 IPC eviction consensus on the radix tree and stand up
+        # the per-rank pool availability mirror. The class is instantiated
+        # but not yet wired into admission/free paths -- those hooks are
+        # the next chunk of work (DESIGN_kv_reshard.md §7).
+        self.mirrored_cp_availability: Optional[MirroredCpAvailability] = None
+        if server_args.enable_cp_kv_reshard:
+            self.tree_cache.enable_cp_consensus(
+                self.attn_cp_group, self.attn_cp_rank, self.attn_cp_size
+            )
+            self.mirrored_cp_availability = MirroredCpAvailability(
+                cp_size=self.attn_cp_size,
+                size_local=self.max_total_num_tokens,
+            )
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
