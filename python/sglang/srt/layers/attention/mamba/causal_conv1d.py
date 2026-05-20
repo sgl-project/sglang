@@ -117,6 +117,8 @@ def causal_conv1d_update(
     activation: Optional[str] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
+    conv_state_src_indices: Optional[torch.Tensor] = None,
+    conv_state_dst_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = PAD_SLOT_ID,
 ):
     """
@@ -141,7 +143,11 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
-    use_triton = not _HAS_SGL_KERNEL
+    use_triton = (
+        not _HAS_SGL_KERNEL
+        or conv_state_src_indices is not None
+        or conv_state_dst_indices is not None
+    )
     if use_triton:
         return _causal_conv1d_update_triton(
             x,
@@ -151,6 +157,8 @@ def causal_conv1d_update(
             activation=activation,
             cache_seqlens=cache_seqlens,
             conv_state_indices=conv_state_indices,
+            conv_state_src_indices=conv_state_src_indices,
+            conv_state_dst_indices=conv_state_dst_indices,
             pad_slot_id=pad_slot_id,
         )
     if activation not in [None, "silu", "swish"]:

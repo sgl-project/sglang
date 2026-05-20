@@ -353,9 +353,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
             if is_decoupled_draft:
-                self.checkpoint_draft_mamba_tail_tokens(
-                    batch, draft_prefill_reqs_to_flush_idxs
-                )
+                self.commit_draft_mamba_ckpts(batch, draft_prefill_reqs_to_flush_idxs)
                 self.flush_draft_updates(batch, draft_prefill_reqs_to_flush_idxs)
 
         else:  # embedding or reward model
@@ -651,7 +649,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         if is_decoupled_draft:
-            self.checkpoint_draft_mamba_tail_tokens(batch)
+            self.commit_draft_mamba_ckpts(batch)
             self.flush_draft_updates(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob)

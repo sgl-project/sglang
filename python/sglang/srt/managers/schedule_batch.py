@@ -1429,6 +1429,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
+    mamba_cache_src_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2476,6 +2478,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
+        if self.mamba_cache_src_indices is not None:
+            self.mamba_cache_src_indices = self.mamba_cache_src_indices[
+                keep_indices_device
+            ]
+        if self.mamba_cache_dst_indices is not None:
+            self.mamba_cache_dst_indices = self.mamba_cache_dst_indices[
+                keep_indices_device
+            ]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
@@ -2532,6 +2542,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
+        if (
+            (self.mamba_cache_src_indices is None)
+            != (self.mamba_cache_dst_indices is None)
+            or (other.mamba_cache_src_indices is None)
+            != (other.mamba_cache_dst_indices is None)
+            or (self.mamba_cache_src_indices is None)
+            != (other.mamba_cache_src_indices is None)
+        ):
+            raise ValueError(
+                "Cannot merge batches with partially populated mamba cache routing indices."
+            )
+        if self.mamba_cache_src_indices is not None:
+            self.mamba_cache_src_indices = torch.cat(
+                [self.mamba_cache_src_indices, other.mamba_cache_src_indices]
+            )
+            self.mamba_cache_dst_indices = torch.cat(
+                [self.mamba_cache_dst_indices, other.mamba_cache_dst_indices]
+            )
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2635,6 +2663,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            mamba_cache_src_indices=self.mamba_cache_src_indices,
+            mamba_cache_dst_indices=self.mamba_cache_dst_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2662,6 +2692,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            mamba_cache_src_indices=self.mamba_cache_src_indices,
+            mamba_cache_dst_indices=self.mamba_cache_dst_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2870,6 +2902,8 @@ class ModelWorkerBatch:
     return_hidden_states_before_norm: bool = False
 
     # For mamba state tracking
+    mamba_cache_src_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64

@@ -292,7 +292,7 @@ class JetBlock(nn.Module):
         v, new_conv_state = self.dynamic_conv1d(
             v,
             conv_state=conv_cache[
-                forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
+                forward_metadata.mamba_cache_dst_indices, -self.total_v_dim :, :
             ],
             generator_input=hidden_states,
             seq_lens=(
@@ -304,7 +304,7 @@ class JetBlock(nn.Module):
                 )
             ),
         )
-        conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
+        conv_cache[forward_metadata.mamba_cache_dst_indices, -self.total_v_dim :, :] = (
             new_conv_state
         )
         v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
@@ -320,7 +320,7 @@ class JetBlock(nn.Module):
             g=g.unsqueeze(0),
             beta=beta.unsqueeze(0),
             initial_state_source=layer_cache.temporal,
-            initial_state_indices=forward_metadata.mamba_cache_indices,
+            initial_state_indices=forward_metadata.mamba_cache_dst_indices,
             cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
             use_qk_l2norm_in_kernel=True,
         ).squeeze(0)

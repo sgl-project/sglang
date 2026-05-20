@@ -3048,6 +3048,8 @@ class Scheduler(
 
         if self.spec_algorithm.is_decoupled_verify():
             self.prepare_verify_inputs(batch)
+        if self.spec_algorithm.is_decoupled_draft():
+            self.prepare_draft_mamba_routing(batch)
 
         decoupled_forward_start_ns = self.start_forward_timer(batch)
 

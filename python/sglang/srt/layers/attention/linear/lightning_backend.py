@@ -71,7 +71,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = BailingLinearMetadata.prepare_mixed(
             metadata.query_start_loc,
-            metadata.mamba_cache_indices,
+            metadata.mamba_cache_src_indices,
+            metadata.mamba_cache_dst_indices,
             forward_batch,
         )
 
@@ -87,7 +88,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+            metadata.query_start_loc,
+            metadata.mamba_cache_src_indices,
+            metadata.mamba_cache_dst_indices,
+            bs,
+            seq_lens,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -105,7 +110,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+            metadata.query_start_loc,
+            metadata.mamba_cache_src_indices,
+            metadata.mamba_cache_dst_indices,
+            bs,
+            seq_lens,
         )
 
     @staticmethod
@@ -289,7 +298,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_indices = self.forward_metadata.mamba_cache_dst_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
@@ -356,7 +365,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         # Do linear attention
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_indices = self.forward_metadata.mamba_cache_dst_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":

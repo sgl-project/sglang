@@ -145,6 +145,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
+    mamba_cache_src_indices: torch.Tensor
+    mamba_cache_dst_indices: torch.Tensor
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -196,6 +198,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             next_token_logits_buffer = torch.zeros(
                 (max_num_token, vocab_size),
                 dtype=torch.float,
+            )
+            mamba_cache_src_indices = torch.full(
+                (max_bs,), -1, dtype=torch.int64
+            )
+            mamba_cache_dst_indices = torch.full(
+                (max_bs,), -1, dtype=torch.int64
             )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
@@ -263,6 +271,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
             next_token_logits_buffer=next_token_logits_buffer,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             encoder_lens=encoder_lens,
@@ -299,6 +309,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            self.mamba_cache_src_indices.fill_(-1)
+            self.mamba_cache_dst_indices.fill_(-1)
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -337,6 +349,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ):
             dsts.append(self.mamba_track_mask[:raw_bs])
             srcs.append(forward_batch.mamba_track_mask)
+
+        mamba_cache_src_indices = forward_batch.mamba_cache_src_indices
+        mamba_cache_dst_indices = forward_batch.mamba_cache_dst_indices
+        if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
+            raise ValueError(
+                "`mamba_cache_src_indices` and `mamba_cache_dst_indices` must be passed together."
+            )
+        if mamba_cache_src_indices is not None:
+            dsts.append(self.mamba_cache_src_indices[:raw_bs])
+            srcs.append(mamba_cache_src_indices)
+            dsts.append(self.mamba_cache_dst_indices[:raw_bs])
+            srcs.append(mamba_cache_dst_indices)
+        else:
+            self.mamba_cache_src_indices[:raw_bs].fill_(-1)
+            self.mamba_cache_dst_indices[:raw_bs].fill_(-1)
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
             dsts.append(self.encoder_lens[:raw_bs])
@@ -1087,6 +1114,8 @@ class CudaGraphRunner:
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_cache_src_indices=buffers.mamba_cache_src_indices[:bs],
+            mamba_cache_dst_indices=buffers.mamba_cache_dst_indices[:bs],
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=None,  # Prefill only

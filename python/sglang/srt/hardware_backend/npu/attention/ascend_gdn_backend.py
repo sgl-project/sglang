@@ -53,7 +53,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_src_indices = self.forward_metadata.mamba_cache_src_indices
+        cache_indices = self.forward_metadata.mamba_cache_dst_indices
+        if cache_src_indices is not cache_indices and not torch.equal(
+            cache_src_indices, cache_indices
+        ):
+            raise NotImplementedError(
+                "GDN decode mamba state routing is only supported on CUDA."
+            )
         self.num_accept_tokens = torch.ones(
             [bs], dtype=torch.int32, device=cache_indices.device
         )
@@ -146,7 +153,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_src_indices = self.forward_metadata.mamba_cache_src_indices
+        cache_indices = self.forward_metadata.mamba_cache_dst_indices
+        if cache_src_indices is not cache_indices and not torch.equal(
+            cache_src_indices, cache_indices
+        ):
+            raise NotImplementedError(
+                "GDN decode mamba state routing is only supported on CUDA."
+            )
 
         assert isinstance(mixed_qkv, torch.Tensor)
         conv_states_tmp = conv_states.transpose(1, 2).clone()
@@ -203,7 +217,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
+        cache_indices = forward_metadata.mamba_cache_dst_indices
         retrieve_next_token = forward_metadata.retrieve_next_token
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token

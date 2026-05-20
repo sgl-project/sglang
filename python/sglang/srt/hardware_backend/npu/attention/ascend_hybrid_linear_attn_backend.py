@@ -111,7 +111,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -119,7 +120,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
             )
 
@@ -188,7 +190,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -196,7 +199,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
             )
 
@@ -236,7 +240,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+            self.linear_attn_backend.forward_metadata.mamba_cache_dst_indices[
                 :request_number
             ]
         )

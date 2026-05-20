@@ -24,6 +24,7 @@ class LinearAttnKernelBase(ABC):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor: ...
 

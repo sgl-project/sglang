@@ -262,7 +262,7 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size + mamba_evictable_size
         )
         decoupled_drafter_mamba_checkpoint_num_used = (
-            self._decoupled_drafter_mamba_checkpoint_slot_count()
+            self._decoupled_drafter_mamba_ckpt_slot_count()
         )
         full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
         mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
@@ -282,7 +282,7 @@ class SchedulerRuntimeCheckerMixin:
             ),
         )
 
-    def _decoupled_drafter_mamba_checkpoint_slot_count(self: Scheduler) -> int:
+    def _decoupled_drafter_mamba_ckpt_slot_count(self: Scheduler) -> int:
         if not self.spec_algorithm.is_decoupled_draft():
             return 0
 

@@ -135,6 +135,7 @@ class GDNKernelDispatcher:
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Attempt packed decode. Returns output tensor or None if
@@ -150,6 +151,7 @@ class GDNKernelDispatcher:
             scale=scale,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
+            final_state_indices=final_state_indices,
             num_v_heads=num_v_heads,
             head_v_dim=head_v_dim,
             **kwargs,
@@ -168,6 +170,7 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.decode_kernel.decode(
@@ -180,6 +183,7 @@ class GDNKernelDispatcher:
             dt_bias=dt_bias,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
+            final_state_indices=final_state_indices,
             query_start_loc=query_start_loc,
             **kwargs,
         )
@@ -284,16 +288,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_src_indices = self.forward_metadata.mamba_cache_src_indices
+        cache_dst_indices = self.forward_metadata.mamba_cache_dst_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
+        if is_cpu() or is_npu():
+            if cache_src_indices is not cache_dst_indices and not torch.equal(
+                cache_src_indices, cache_dst_indices
+            ):
+                raise NotImplementedError(
+                    "GDN decode mamba state routing is only supported on CUDA."
+                )
+            conv_state_kwargs = {"conv_state_indices": cache_dst_indices}
+        else:
+            conv_state_kwargs = {
+                "conv_state_src_indices": cache_src_indices,
+                "conv_state_dst_indices": cache_dst_indices,
+            }
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
             layer.conv_weights,
             layer.bias,
             layer.activation,
-            conv_state_indices=cache_indices,
+            **conv_state_kwargs,
         )
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -307,12 +325,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dt_bias=layer.dt_bias,
                 scale=layer.head_k_dim**-0.5,
                 ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                cache_indices=cache_src_indices,
+                final_state_indices=cache_dst_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
             )
             self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
+                forward_batch, conv_states, ssm_states, cache_dst_indices
             )
             return core_attn_out
 
@@ -336,12 +355,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
-            cache_indices=cache_indices,
+            cache_indices=cache_src_indices,
+            final_state_indices=cache_dst_indices,
             query_start_loc=query_start_loc,
         )
 
         self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
+            forward_batch, conv_states, ssm_states, cache_dst_indices
         )
 
         return core_attn_out
@@ -362,7 +382,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
+        cache_indices = forward_metadata.mamba_cache_dst_indices
         retrieve_next_token = forward_metadata.retrieve_next_token
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token

@@ -417,7 +417,7 @@ class MambaMixer2(torch.nn.Module):
         # kernels to operate in continuous batching and in chunked prefill
         # modes; they are computed at top-level model forward since they
         # stay the same and reused for all mamba layers in the same iteration
-        state_indices_tensor = metadata.mamba_cache_indices
+        state_indices_tensor = metadata.mamba_cache_dst_indices
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
 

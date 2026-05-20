@@ -142,11 +142,13 @@ class MambaAttnBackendBase(AttentionBackend):
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
-        self.state_indices_list = []
+        self.state_src_indices_list = []
+        self.state_dst_indices_list = []
         self.query_start_loc_list = []
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
+        self._replay_forward_batch: Optional[ForwardBatch] = None
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -163,9 +165,17 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
+        mamba_cache_src_indices = forward_batch.mamba_cache_src_indices
+        mamba_cache_dst_indices = forward_batch.mamba_cache_dst_indices
+        if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
+            raise ValueError(
+                "`mamba_cache_src_indices` and `mamba_cache_dst_indices` must be passed together."
+            )
+        if mamba_cache_src_indices is None:
+            mamba_cache_src_indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            )
+            mamba_cache_dst_indices = mamba_cache_src_indices
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -216,7 +226,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(
+                        mamba_cache_dst_indices, forward_batch
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -227,7 +239,8 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
-            mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
@@ -285,7 +298,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
-        self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
+        self, mamba_cache_dst_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
         """
         Compute source and destination indices for tracking SSM states for prefix caching.
@@ -324,7 +337,7 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
         mamba_track_indices = forward_batch.mamba_track_indices.cpu()
-        mamba_cache_indices = mamba_cache_indices.cpu()
+        mamba_cache_dst_indices = mamba_cache_dst_indices.cpu()
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
@@ -345,7 +358,7 @@ class MambaAttnBackendBase(AttentionBackend):
         is_aligned = (lens_masked % FLA_CHUNK_SIZE) == 0
 
         # Case 1: Aligned. Use last_recurrent_state from ssm_states.
-        track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
+        track_ssm_final_src = mamba_cache_dst_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Case 2: Unaligned. Use intermediate state from h.
@@ -413,7 +426,12 @@ class MambaAttnBackendBase(AttentionBackend):
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
         for i in range(max_bs):
-            self.state_indices_list.append(
+            self.state_src_indices_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.state_dst_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
@@ -452,7 +470,12 @@ class MambaAttnBackendBase(AttentionBackend):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         for i in range(max_bs):
-            self.state_indices_list.append(
+            self.state_src_indices_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.state_dst_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
@@ -482,7 +505,8 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        self.state_src_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        self.state_dst_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
@@ -491,7 +515,8 @@ class MambaAttnBackendBase(AttentionBackend):
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_src_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_dst_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -499,7 +524,8 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_src_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_dst_indices_list[bs - 1],
             )
 
     def _replay_metadata(
@@ -517,7 +543,35 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        mamba_cache_src_indices = mamba_indices
+        mamba_cache_dst_indices = mamba_indices
+        replay_forward_batch = self._replay_forward_batch
+        if replay_forward_batch is not None:
+            mamba_cache_src_indices = replay_forward_batch.mamba_cache_src_indices
+            mamba_cache_dst_indices = replay_forward_batch.mamba_cache_dst_indices
+            if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
+                raise ValueError(
+                    "`mamba_cache_src_indices` and `mamba_cache_dst_indices` must be passed together."
+                )
+            if mamba_cache_src_indices is None:
+                mamba_cache_src_indices = mamba_indices
+                mamba_cache_dst_indices = mamba_indices
+        if mamba_cache_src_indices.shape != mamba_cache_dst_indices.shape:
+            raise ValueError(
+                "`mamba_cache_src_indices` and `mamba_cache_dst_indices` must have the same shape."
+            )
+        if mamba_cache_src_indices.ndim != 1:
+            raise ValueError("Mamba cache routing indices must be 1D tensors.")
+
+        self.state_src_indices_list[bs - 1].fill_(self.pad_slot_id)
+        self.state_dst_indices_list[bs - 1].fill_(self.pad_slot_id)
+        copy_len = min(mamba_cache_src_indices.shape[0], bs)
+        self.state_src_indices_list[bs - 1][:copy_len].copy_(
+            mamba_cache_src_indices[:copy_len]
+        )
+        self.state_dst_indices_list[bs - 1][:copy_len].copy_(
+            mamba_cache_dst_indices[:copy_len]
+        )
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -556,7 +610,8 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_src_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_dst_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -564,7 +619,8 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=self.state_src_indices_list[bs - 1],
+                mamba_cache_dst_indices=self.state_dst_indices_list[bs - 1],
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -737,6 +793,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        self._replay_forward_batch: Optional[ForwardBatch] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
@@ -803,17 +860,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        replay_forward_batch = self._replay_forward_batch
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
+            attn_backend._replay_forward_batch = replay_forward_batch
+            try:
+                attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                    seq_lens_cpu,
+                )
+            finally:
+                attn_backend._replay_forward_batch = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -953,7 +1015,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+            self.linear_attn_backend.forward_metadata.mamba_cache_dst_indices[
                 :request_number
             ]
         )

@@ -26,7 +26,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 @dataclass(kw_only=True)
 class ForwardMetadata:
     query_start_loc: torch.Tensor
-    mamba_cache_indices: torch.Tensor
+    mamba_cache_src_indices: torch.Tensor
+    mamba_cache_dst_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
@@ -165,7 +166,8 @@ class Mamba2Metadata(ForwardMetadata):
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
-            mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_src_indices=forward_metadata.mamba_cache_src_indices,
+            mamba_cache_dst_indices=forward_metadata.mamba_cache_dst_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
@@ -233,7 +235,8 @@ class Mamba2Metadata(ForwardMetadata):
         )
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
-            mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_src_indices=forward_metadata.mamba_cache_src_indices,
+            mamba_cache_dst_indices=forward_metadata.mamba_cache_dst_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,

@@ -18,7 +18,8 @@ class BailingLinearMetadata(ForwardMetadata):
     @staticmethod
     def prepare_decode(
         query_start_loc: torch.Tensor,
-        mamba_cache_indices: torch.Tensor,
+        mamba_cache_src_indices: torch.Tensor,
+        mamba_cache_dst_indices: torch.Tensor,
         bs: int,
         seq_lens: torch.Tensor,
     ) -> "BailingLinearMetadata":
@@ -26,7 +27,8 @@ class BailingLinearMetadata(ForwardMetadata):
         return BailingLinearMetadata(
             batch_size=bs,
             query_start_loc=query_start_loc,
-            mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             num_decodes=seq_lens.shape[0],
             num_prefills=0,
             num_prefill_tokens=0,
@@ -38,14 +40,16 @@ class BailingLinearMetadata(ForwardMetadata):
     def prepare_mixed(
         cls,
         query_start_loc: torch.Tensor,
-        mamba_cache_indices: torch.Tensor,
+        mamba_cache_src_indices: torch.Tensor,
+        mamba_cache_dst_indices: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> "BailingLinearMetadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
         if forward_batch.extend_num_tokens is None:
             return cls.prepare_decode(
                 query_start_loc=query_start_loc,
-                mamba_cache_indices=mamba_cache_indices,
+                mamba_cache_src_indices=mamba_cache_src_indices,
+                mamba_cache_dst_indices=mamba_cache_dst_indices,
                 bs=forward_batch.batch_size,
                 seq_lens=forward_batch.seq_lens,
             )
@@ -61,7 +65,8 @@ class BailingLinearMetadata(ForwardMetadata):
         return BailingLinearMetadata(
             batch_size=forward_batch.batch_size,
             query_start_loc=query_start_loc,
-            mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

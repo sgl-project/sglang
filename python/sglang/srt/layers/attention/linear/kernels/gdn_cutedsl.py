@@ -24,6 +24,12 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        final_state_indices = kwargs.get("final_state_indices")
+        if final_state_indices is not None and final_state_indices is not cache_indices:
+            if not torch.equal(final_state_indices, cache_indices):
+                raise NotImplementedError(
+                    "GDN state routing with different src/dst indices is not supported by CuteDSLGDNKernel."
+                )
         return cutedsl_fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

@@ -300,6 +300,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # Optional source/destination slots for routed Mamba state updates.
+    mamba_cache_src_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -453,6 +456,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_cache_src_indices=batch.mamba_cache_src_indices,
+            mamba_cache_dst_indices=batch.mamba_cache_dst_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -958,6 +963,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.out_cache_loc_swa is not None:
             self.out_cache_loc_swa = self._pad_tensor_to_size(
                 self.out_cache_loc_swa, num_tokens
+            )
+        if self.mamba_cache_src_indices is not None:
+            self.mamba_cache_src_indices = self._pad_tensor_to_size(
+                self.mamba_cache_src_indices, bs, value=-1
+            )
+        if self.mamba_cache_dst_indices is not None:
+            self.mamba_cache_dst_indices = self._pad_tensor_to_size(
+                self.mamba_cache_dst_indices, bs, value=-1
             )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)

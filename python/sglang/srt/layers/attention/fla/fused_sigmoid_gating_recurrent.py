@@ -19,6 +19,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    h0_final_indices,
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
@@ -226,7 +227,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_final_indices + i_n)
             if idx >= 0:
                 p_h0 = (
                     h0_source
@@ -250,6 +251,7 @@ def fused_sigmoid_gating_delta_rule_update(
     b: torch.Tensor,
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
+    final_state_indices: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
@@ -271,6 +273,16 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if final_state_indices is None:
+        final_state_indices = initial_state_indices
+    if initial_state_indices is not None:
+        if initial_state_indices.ndim != 1 or final_state_indices.ndim != 1:
+            raise ValueError("State indices must be 1D tensors.")
+        if initial_state_indices.shape != final_state_indices.shape:
+            raise ValueError(
+                "`initial_state_indices` and `final_state_indices` must have the same shape."
+            )
+
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
@@ -320,6 +332,7 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        h0_final_indices=final_state_indices,
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,

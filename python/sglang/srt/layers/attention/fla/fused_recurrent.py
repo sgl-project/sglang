@@ -193,13 +193,15 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     h0,
     ht,
     ssm_state_indices,
+    final_state_indices,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
+    stride_state_indices_seq: tl.constexpr,
+    stride_final_indices_seq: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -219,10 +221,15 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
 
-    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    state_idx = tl.load(ssm_state_indices + i_n * stride_state_indices_seq).to(
+        tl.int64
+    )
+    final_state_idx = tl.load(
+        final_state_indices + i_n * stride_final_indices_seq
+    ).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    if state_idx < 0:
+    if state_idx < 0 or final_state_idx < 0:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
@@ -260,7 +267,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     b_o = tl.sum(b_h * b_q[None, :], 1)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-    p_ht = ht + state_idx * stride_final_state_token
+    p_ht = ht + final_state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
@@ -275,8 +282,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     initial_state: torch.Tensor,
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
+    final_state_indices: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if final_state_indices is None:
+        final_state_indices = ssm_state_indices
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -297,13 +307,26 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"`ssm_state_indices` must be 1D for packed decode (got ndim={ssm_state_indices.ndim})."
         )
+    if final_state_indices.ndim != 1:
+        raise ValueError(
+            f"`final_state_indices` must be 1D for packed decode (got ndim={final_state_indices.ndim})."
+        )
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
 
     dev = mixed_qkv.device
     if any(
         t.device != dev
-        for t in (a, b, A_log, dt_bias, initial_state, out, ssm_state_indices)
+        for t in (
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+            final_state_indices,
+        )
     ):
         raise ValueError("All inputs must be on the same device.")
 
@@ -316,6 +339,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if ssm_state_indices.shape[0] != B:
         raise ValueError(
             f"`ssm_state_indices` must have shape [B] (got {tuple(ssm_state_indices.shape)}; expected ({B},))."
+        )
+    if final_state_indices.shape[0] != B:
+        raise ValueError(
+            f"`final_state_indices` must have shape [B] (got {tuple(final_state_indices.shape)}; expected ({B},))."
         )
 
     if initial_state.ndim != 4:
@@ -367,7 +394,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_b_tok = b.stride(0)
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = initial_state.stride(0)
-    stride_indices_seq = ssm_state_indices.stride(0)
+    stride_state_indices_seq = ssm_state_indices.stride(0)
+    stride_final_indices_seq = final_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
@@ -381,13 +409,15 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
+        final_state_indices=final_state_indices,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
-        stride_indices_seq=stride_indices_seq,
+        stride_state_indices_seq=stride_state_indices_seq,
+        stride_final_indices_seq=stride_final_indices_seq,
         H=H,
         HV=HV,
         K=K,

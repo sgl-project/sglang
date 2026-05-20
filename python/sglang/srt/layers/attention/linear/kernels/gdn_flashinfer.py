@@ -122,8 +122,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
+        if final_state_indices is None:
+            final_state_indices = cache_indices
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -136,7 +139,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
-        if self.use_state_pool:
+        if self.use_state_pool and final_state_indices is cache_indices:
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -151,6 +154,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 initial_state_indices=cache_indices,
             )
         else:
+            raise NotImplementedError("not support src != dst")
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
             state_batch = ssm_states[cache_indices]
@@ -167,7 +171,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            ssm_states[final_state_indices] = new_state
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
