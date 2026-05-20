@@ -1733,16 +1733,15 @@ def test_chain_advance_formula_matches_spec() -> None:
         h = splitmix64(h ^ (position & u64_mask))
         expected = splitmix64(h ^ (real_kv_hash & u64_mask))
 
-        from sglang.jit_kernel.kv_canary.verify_ref import _splitmix64_mix4_vec
-
-        prev_t = torch.tensor([to_signed_int64(prev_hash)], dtype=torch.int64)
-        token_t = torch.tensor([to_signed_int64(token)], dtype=torch.int64)
-        pos_t = torch.tensor([to_signed_int64(position)], dtype=torch.int64)
-        rkv_t = torch.tensor([to_signed_int64(real_kv_hash)], dtype=torch.int64)
-        actual_signed = int(
-            _splitmix64_mix4_vec(prev_t, token_t, pos_t, rkv_t)[0].item()
+        actual = (
+            splitmix64_mix4(
+                prev_hash & u64_mask,
+                token & u64_mask,
+                position & u64_mask,
+                real_kv_hash & u64_mask,
+            )
+            & u64_mask
         )
-        actual = actual_signed & u64_mask
         assert actual == expected, (
             f"chain advance mismatch: prev={prev_hash:#x} token={token:#x} pos={position:#x} "
             f"rkv={real_kv_hash:#x} expected={expected:#x} actual={actual:#x}"
