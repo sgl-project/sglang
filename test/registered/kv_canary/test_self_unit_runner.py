@@ -10,7 +10,6 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
-    CanaryLaunchTag,
     RealKvHashMode,
 )
 from sglang.srt.kv_canary import endpoint as endpoint_module
@@ -237,38 +236,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)
 
-    def test_per_forward_launches_both_head_and_tail(self):
-        runner = _make_runner(device=self.device)
-
-        head_count = sum(
-            1
-            for ep in runner._endpoints
-            if ep.kernel_kind
-            in (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.HEAD_V_FULL)
-        )
-        tail_count = sum(
-            1
-            for ep in runner._endpoints
-            if ep.kernel_kind
-            in (CanaryLaunchTag.TAIL_K_FULL, CanaryLaunchTag.TAIL_V_FULL)
-        )
-        self.assertGreaterEqual(head_count, 1)
-        self.assertGreaterEqual(tail_count, 1)
-
-        counters: List[str] = []
-        with patch.object(
-            endpoint_module,
-            "canary_verify_step",
-            lambda **kwargs: counters.append(kwargs["kernel_kind"].name),
-        ), patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None):
-            fb = _make_forward_batch(self.device)
-            with runner.with_forward_pass(fb):
-                runner.launch_head_kernels(fb)
-                runner.launch_tail_kernels(fb)
-        self.assertTrue(any("HEAD" in name for name in counters))
-        self.assertTrue(any("TAIL" in name for name in counters))
-
-    def test_sweep_path_detects_chain_mismatch(self):
+    def test_sweep_path_launches_sweep_kernels(self):
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,

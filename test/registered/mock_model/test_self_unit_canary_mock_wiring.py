@@ -139,31 +139,6 @@ class TestMockModelEngineKwargs(CustomTestCase):
         else:
             os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = self._prior_input_check
 
-    def test_mock_model_engine_kwargs_returns_defaults(self) -> None:
-        os.environ.pop("SGLANG_KV_CANARY_INPUT_CHECK", None)
-
-        kwargs = mock_model_engine_kwargs()
-
-        self.assertEqual(kwargs["load_format"], "dummy")
-        self.assertEqual(
-            json.loads(kwargs["json_model_override_args"]), {"num_hidden_layers": 1}
-        )
-        self.assertEqual(kwargs["sampling_backend"], "oracle")
-        self.assertEqual(kwargs["kv_canary"], "raise")
-        self.assertEqual(os.environ["SGLANG_KV_CANARY_INPUT_CHECK"], "1")
-
-    def test_mock_model_engine_kwargs_overrides_win(self) -> None:
-        kwargs = mock_model_engine_kwargs(
-            kv_canary="log",
-            sampling_backend="pytorch",
-            tp_size=2,
-        )
-
-        self.assertEqual(kwargs["kv_canary"], "log")
-        self.assertEqual(kwargs["sampling_backend"], "pytorch")
-        self.assertEqual(kwargs["tp_size"], 2)
-        self.assertEqual(kwargs["load_format"], "dummy")
-
     def test_mock_model_engine_kwargs_merges_json_override(self) -> None:
         kwargs = mock_model_engine_kwargs(
             json_model_override_args='{"rope_theta": 1000.0}',

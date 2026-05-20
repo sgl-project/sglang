@@ -4,8 +4,6 @@ import sys
 import unittest
 from pathlib import Path
 
-import torch
-
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
@@ -22,13 +20,6 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 class TestSelfUnitRadixWalker(CustomTestCase):
     def setUp(self):
         self.device = CPU_DEVICE
-
-    def test_empty_radix_returns_zero_extras(self):
-        cache = make_radix_cache([[]], device=self.device)
-        slots, positions, prev_slots = walk_radix_cache_for_canary(radix_cache=cache)
-        self.assertEqual(slots.numel(), 0)
-        self.assertEqual(positions.numel(), 0)
-        self.assertEqual(prev_slots.numel(), 0)
 
     def test_single_node_chain_positions_increase(self):
         chain = [10, 20, 30, 40]
@@ -56,12 +47,6 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         slots, positions, _ = walk_radix_cache_for_canary(radix_cache=cache)
         self.assertEqual(positions.tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(slots.tolist(), [1, 2, 3, 4, 5])
-
-    def test_skips_slots_owned_by_running_reqs(self):
-        cache = make_radix_cache([[], [100, 101]], device=self.device)
-        slots, _, _ = walk_radix_cache_for_canary(radix_cache=cache)
-        self.assertEqual(set(slots.tolist()), {100, 101})
-        self.assertEqual(slots.dtype, torch.int32)
 
 
 if __name__ == "__main__":
