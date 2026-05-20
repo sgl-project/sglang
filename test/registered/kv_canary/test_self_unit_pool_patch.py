@@ -70,10 +70,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
             canary_verify_step,
         )
 
-        tensor = torch.zeros(4, 4, dtype=torch.uint8, device=self.device)
+        tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
         sources = tuple(
             RealKvSource(
-                tensor=tensor, page_size=1, num_bytes_per_token=4, read_bytes=2
+                tensor=tensor, page_size=1, num_bytes_per_token=16, read_bytes=16
             )
             for _ in range(_MAX_REAL_KV_SOURCES + 1)
         )

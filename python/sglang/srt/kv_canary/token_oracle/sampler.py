@@ -7,7 +7,6 @@ import torch
 from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
-from sglang.srt.server_args import _TOKEN_ORACLE_BACKEND_NAME
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -18,7 +17,7 @@ def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
     """Calling twice replaces the previously registered manager."""
     manager = TokenOracleManager(oracle=oracle)
     register_sampler_backend(
-        _TOKEN_ORACLE_BACKEND_NAME,
+        "token_oracle",
         lambda: _OracleSampler(token_oracle_manager=manager),
     )
     return manager

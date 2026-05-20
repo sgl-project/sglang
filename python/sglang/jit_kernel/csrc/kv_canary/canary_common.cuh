@@ -42,48 +42,52 @@ SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t
   return h;
 }
 
-// Read one byte from a source following the RealKvSource access invariant. The invariant (from
-// kv_canary/verify.py docstring) is:
+// Read 16 aligned bytes from a source as two uint64 little-endian words, following the RealKvSource access
+// invariant. The invariant (from kv_canary/verify.py docstring) is:
 //
 //     tensor[slot_idx // page_size,
 //            (slot_idx % page_size) * num_bytes_per_token + byte_offset]
 //
 // row_stride_bytes is the dim-1 size of the underlying tensor in bytes (which may exceed
 // page_size * num_bytes_per_token; trailing bytes are skipped).
-SGL_DEVICE uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset) {
+//
+// 16B-alignment precondition (enforced host-side in kv_canary/verify.py::RealKvSource.__post_init__):
+// num_bytes_per_token, row_stride_bytes, and read_bytes are all multiples of 16, and byte_offset is always a
+// multiple of 16. Combined with PyTorch's CUDA-allocator alignment (>= 256B) of src.tensor, every flat_index
+// computed here is 16B-aligned, so the uint4 load below is a single coalesced LDG.E.128.
+SGL_DEVICE void real_kv_load_uint4(
+    const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset, uint64_t& word_lo, uint64_t& word_hi) {
   const int64_t row = slot_idx / src.page_size;
   const int64_t col_within_page = slot_idx % src.page_size;
   const int64_t col = col_within_page * src.num_bytes_per_token + byte_offset;
   const int64_t flat_index = row * static_cast<int64_t>(src.row_stride_bytes) + col;
-  return src.tensor[flat_index];
+  const uint4 vec = *reinterpret_cast<const uint4*>(src.tensor + flat_index);
+  word_lo = static_cast<uint64_t>(vec.x) | (static_cast<uint64_t>(vec.y) << 32);
+  word_hi = static_cast<uint64_t>(vec.z) | (static_cast<uint64_t>(vec.w) << 32);
 }
 
 // Fold one source's read_bytes into a uint64 hash, mode-dispatching.
 //
-// PARTIAL mode: pack the first min(read_bytes, 16) bytes little-endian into 8-byte words and
-// splitmix64-fold them (at most 2 words). When read_bytes <= 16, PARTIAL produces the same hash as ALL.
-// ALL mode: pack bytes little-endian into 8-byte words (zero-padded if read_bytes is not a multiple of 8)
-// and splitmix64-fold them iteratively.
+// PARTIAL mode: pack exactly the first 16 bytes (one 16B chunk = two 8B little-endian words) and
+// splitmix64-fold them. ALL mode: pack every 16 bytes little-endian and splitmix64-fold iteratively.
+//
+// Loads run in 16B (uint4) chunks; the host-side __post_init__ guarantees read_bytes % 16 == 0 so no
+// tail-padding logic is needed inside the kernel. With the 16B-aligned contract, read_bytes is always
+// >= 16 when non-zero, so PARTIAL collapses to a constant 16B prefix. Output is byte-equal to the
+// Python ref helper _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   if (src.read_bytes <= 0) {
     return 0ULL;
   }
   const int64_t effective_read_bytes =
-      (mode == RealKvHashMode::kPartial) ? (src.read_bytes < 16 ? src.read_bytes : 16) : src.read_bytes;
-  // ALL mode (and PARTIAL, which shares the same word-pack + splitmix64 loop with a capped length).
+      (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
-  int64_t i = 0;
-  while (i < effective_read_bytes) {
-    uint64_t word = 0ULL;
-    const int64_t take = (effective_read_bytes - i) >= 8 ? 8 : (effective_read_bytes - i);
-#pragma unroll
-    for (int b = 0; b < 8; ++b) {
-      if (b < take) {
-        word |= static_cast<uint64_t>(real_kv_load_byte(src, slot_idx, i + b)) << (b * 8);
-      }
-    }
-    acc = splitmix64(acc ^ word);
-    i += 8;
+  for (int64_t i = 0; i < effective_read_bytes; i += 16) {
+    uint64_t word_lo;
+    uint64_t word_hi;
+    real_kv_load_uint4(src, slot_idx, i, word_lo, word_hi);
+    acc = splitmix64(acc ^ word_lo);
+    acc = splitmix64(acc ^ word_hi);
   }
   return acc;
 }
@@ -115,38 +119,47 @@ fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
   return acc;
 }
 
-// Append a violation row to the ring (fill-once) and bump the monotonic counter unconditionally.
+// Kernel-wide sink for violation rows. ``ring`` / ``write_index`` are device pointers, ``ring_capacity``
+// caps how many rows physically land in the ring (overflow rows bump ``write_index`` but are not stored),
+// and ``kernel_kind`` is stamped into every row so a host observer can attribute it to its source launch.
+struct ViolationSink {
+  int64_t* __restrict__ ring;
+  int32_t* __restrict__ write_index;
+  int32_t ring_capacity;
+  int32_t kernel_kind;
+};
+
+// One violation row's payload. Field order is meaning-only (not the on-ring column order — that is set by
+// kViolationField* in consts.cuh). ``expected_aux`` is reason-agnostic: verify launches pass
+// expected_chain_hash, write launches pass expected_position. ``stored_chain_hash`` carries
+// running_prev_hash on the write path.
+struct ViolationRow {
+  int64_t slot_idx;
+  int64_t position;
+  int64_t stored_token;
+  int64_t expected_token;
+  int64_t stored_chain_hash;
+  int64_t expected_aux;
+  int64_t fail_reason_bits;
+};
+
+// Append a violation row to the sink's ring (fill-once) and bump the monotonic counter unconditionally.
 //
-// Ordering of columns must match kViolationField* in consts.cuh exactly. The "ExpectedAux"
-// column (index 6) is reason-agnostic: verify launches pass expected_chain_hash, write launches pass
-// expected_position. The "StoredChainHash" column (index 5) carries running_prev_hash on the write path.
-//
-// atomicAdd on violation_write_index serializes arrivals; only writers with idx < ring_capacity store a
-// row. The __threadfence_system after the store guarantees any host observer that reads the post-increment
+// atomicAdd on ``sink.write_index`` serializes arrivals; only writers with idx < ring_capacity store a row.
+// The __threadfence_system after the store guarantees any host observer that reads the post-increment
 // counter also sees the committed row.
-SGL_DEVICE void record_violation(
-    int64_t* __restrict__ violation_ring,
-    int32_t* __restrict__ violation_write_index,
-    int32_t ring_capacity,
-    int32_t kernel_kind,
-    int64_t slot_idx,
-    int64_t position,
-    int64_t stored_token,
-    int64_t expected_token,
-    int64_t stored_chain_hash,
-    int64_t expected_aux,
-    int64_t fail_reason_bits) {
-  const int32_t seq = atomicAdd(violation_write_index, 1);
-  if (seq < ring_capacity) {
-    int64_t* row = violation_ring + static_cast<int64_t>(seq) * kViolationFields;
-    row[kViolationFieldKernelKind] = static_cast<int64_t>(kernel_kind);
-    row[kViolationFieldSlotIdx] = slot_idx;
-    row[kViolationFieldPosition] = position;
-    row[kViolationFieldStoredToken] = stored_token;
-    row[kViolationFieldExpectedToken] = expected_token;
-    row[kViolationFieldStoredChainHash] = stored_chain_hash;
-    row[kViolationFieldExpectedAux] = expected_aux;
-    row[kViolationFieldFailReasonBits] = fail_reason_bits;
+SGL_DEVICE void record_violation(const ViolationSink& sink, const ViolationRow& row) {
+  const int32_t seq = atomicAdd(sink.write_index, 1);
+  if (seq < sink.ring_capacity) {
+    int64_t* dst = sink.ring + static_cast<int64_t>(seq) * kViolationFields;
+    dst[kViolationFieldKernelKind] = static_cast<int64_t>(sink.kernel_kind);
+    dst[kViolationFieldSlotIdx] = row.slot_idx;
+    dst[kViolationFieldPosition] = row.position;
+    dst[kViolationFieldStoredToken] = row.stored_token;
+    dst[kViolationFieldExpectedToken] = row.expected_token;
+    dst[kViolationFieldStoredChainHash] = row.stored_chain_hash;
+    dst[kViolationFieldExpectedAux] = row.expected_aux;
+    dst[kViolationFieldFailReasonBits] = row.fail_reason_bits;
     __threadfence_system();
   }
 }

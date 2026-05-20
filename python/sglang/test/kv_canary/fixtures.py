@@ -215,8 +215,8 @@ def make_real_kv_source(
     device: torch.device = CPU_DEVICE,
     *,
     num_slots: int = 16,
-    num_bytes_per_token: int = 8,
-    read_bytes: int = 4,
+    num_bytes_per_token: int = 32,
+    read_bytes: int = 16,
     page_size: int = 1,
 ) -> RealKvSource:
     tensor = torch.zeros(

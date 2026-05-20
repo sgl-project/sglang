@@ -39,7 +39,6 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
-from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -452,8 +451,9 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
-        canary_runner = get_canary_runner(self.tp_worker.model_runner)
-        if canary_runner is not None:
+        if (
+            canary_runner := get_canary_runner(self.tp_worker.model_runner)
+        ) is not None:
             canary_runner.attach_radix_cache(self.tree_cache)
 
         if self.enable_hisparse:
@@ -704,8 +704,8 @@ class Scheduler(
             abort_request=self.abort_request,
         )
 
-        if envs.SGLANG_DEBUG_REVERT_PR.get() == "25015":
-            revert_pr_fix(25015)
+        if pr_num := envs.SGLANG_DEBUG_REVERT_PR.get():
+            revert_pr_fix(pr_num)
 
         self.is_initializing = False
 
@@ -3622,6 +3622,8 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        from sglang.srt.debug_utils.dumper import dumper
+
         try:
             response: list = []
             if (

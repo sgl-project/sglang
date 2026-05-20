@@ -297,20 +297,20 @@ def make_real_kv_sources(
     if kind == "small_1src":
         return (
             _one_real_kv_source(
-                num_slots=num_slots, num_bytes=8, read_bytes=4, device=device
+                num_slots=num_slots, num_bytes=16, read_bytes=16, device=device
             ),
         )
     if kind == "med_2src":
         return tuple(
             _one_real_kv_source(
-                num_slots=num_slots, num_bytes=16, read_bytes=8, device=device
+                num_slots=num_slots, num_bytes=32, read_bytes=16, device=device
             )
             for _ in range(2)
         )
     if kind == "max_4src":
         return tuple(
             _one_real_kv_source(
-                num_slots=num_slots, num_bytes=32, read_bytes=16, device=device
+                num_slots=num_slots, num_bytes=64, read_bytes=32, device=device
             )
             for _ in range(4)
         )

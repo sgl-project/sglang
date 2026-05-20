@@ -80,20 +80,66 @@ class RealKvSource:
     - leaving any per-row padding / non-canary bytes in the trailing portion of each row (they will simply be
       skipped).
 
+    16-byte alignment precondition: the CUDA fold kernel issues 128-bit aligned loads, so ``read_bytes``,
+    ``num_bytes_per_token``, and the row stride (``tensor.shape[1]`` in bytes) must all be multiples of 16.
+    ``read_bytes == 0`` is the sentinel for "skip this source" and is exempt from the modulo check.
+
     Fields:
         tensor: The source tensor, any shape such that the access pattern above yields ``num_bytes_per_token``
             uint8 bytes per slot. Dtype is whatever the underlying pool uses; the canary views the relevant
             bytes via ``.view(torch.uint8)``.
         page_size: Number of slots packed into one row of dim 0. ``>= 1``.
-        num_bytes_per_token: Bytes per slot in the dim-1 strip the canary reads.
+        num_bytes_per_token: Bytes per slot in the dim-1 strip the canary reads. Must be a multiple of 16.
         read_bytes: Leading bytes (out of ``num_bytes_per_token``) per slot folded into the fingerprint.
-            ``0 <= read_bytes <= num_bytes_per_token``; ``0`` skips this source's contribution this call.
+            ``0 <= read_bytes <= num_bytes_per_token``; ``0`` skips this source's contribution this call. When
+            non-zero, must be a multiple of 16.
     """
 
     tensor: torch.Tensor
     page_size: int
     num_bytes_per_token: int
     read_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.page_size < 1:
+            raise ValueError(
+                f"kv-canary: RealKvSource.page_size must be >= 1, got {self.page_size}"
+            )
+        if self.num_bytes_per_token <= 0:
+            raise ValueError(
+                f"kv-canary: RealKvSource.num_bytes_per_token must be positive, got {self.num_bytes_per_token}"
+            )
+        if self.read_bytes < 0 or self.read_bytes > self.num_bytes_per_token:
+            raise ValueError(
+                f"kv-canary: RealKvSource.read_bytes must satisfy 0 <= read_bytes <= num_bytes_per_token "
+                f"(={self.num_bytes_per_token}), got {self.read_bytes}"
+            )
+        # ``read_bytes == 0`` is the "skip this source" sentinel and exempts the source from the 16B-alignment
+        # contract — the kernel short-circuits before any address arithmetic, so the dummy tensor / stride
+        # shape do not matter.
+        if self.read_bytes == 0:
+            return
+        if self.read_bytes % 16 != 0:
+            raise ValueError(
+                f"kv-canary: RealKvSource.read_bytes must be 0 or a multiple of 16 (the CUDA fold kernel "
+                f"loads in 128-bit chunks), got {self.read_bytes}"
+            )
+        if self.num_bytes_per_token % 16 != 0:
+            raise ValueError(
+                f"kv-canary: RealKvSource.num_bytes_per_token must be a multiple of 16 when "
+                f"read_bytes > 0, got {self.num_bytes_per_token}"
+            )
+        if self.tensor.ndim < 2:
+            raise ValueError(
+                f"kv-canary: RealKvSource.tensor must be at least 2-D, got shape {tuple(self.tensor.shape)}"
+            )
+        row_stride_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
+        if row_stride_bytes % 16 != 0:
+            raise ValueError(
+                f"kv-canary: RealKvSource.tensor dim-1 byte width must be a multiple of 16, "
+                f"got {row_stride_bytes} bytes (shape={tuple(self.tensor.shape)}, "
+                f"dtype={self.tensor.dtype})"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

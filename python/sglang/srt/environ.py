@@ -236,7 +236,7 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
-    SGLANG_DEBUG_REVERT_PR = EnvStr("")
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -718,8 +718,8 @@ class Envs:
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
-    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(0)
-    SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(True)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(False)
     # Input-id / position verification inside canary_write_step. Only useful
     # when a token_oracle is feeding expected_input_* tensors per forward;
     # production users never set this. Test harnesses flip it on via
@@ -741,7 +741,6 @@ class Envs:
     # detection value. Requires --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
-    SGLANG_KV_CANARY_ORACLE_SEED = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
