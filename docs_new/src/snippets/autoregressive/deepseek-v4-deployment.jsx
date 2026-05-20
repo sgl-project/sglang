@@ -650,8 +650,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --tp ${tp}`);
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      flags.push("  --enable-nsa-prefill-context-parallel");
-      flags.push("  --nsa-prefill-cp-mode round-robin-split");
+      flags.push("  --enable-dsa-prefill-context-parallel");
+      flags.push("  --dsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
       // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
       // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative

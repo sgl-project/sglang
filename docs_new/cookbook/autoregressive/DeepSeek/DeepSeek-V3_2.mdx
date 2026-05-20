@@ -349,11 +349,11 @@ sglang_args=$(echo serve \
   --moe-a2a-backend deepep --ep-size 16  \
   --page-size 128 \
   --chunked-prefill-size 16384 \
-  --attention-backend nsa \
-  --nsa-prefill-backend flashmla_sparse \
-  --nsa-decode-backend flashmla_sparse \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split \
+  --attention-backend dsa \
+  --dsa-prefill-backend flashmla_sparse \
+  --dsa-decode-backend flashmla_sparse \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split \
   --cuda-graph-max-bs 128 \
   --max-running-requests 128 \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
@@ -361,7 +361,7 @@ sglang_args=$(echo serve \
   --context-length 65536 \
   --allow-auto-truncate --enable-metrics \
   --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3 \
-  --served-model-name DeepSeek-V3.2-nsa-pp-cp-ep-dp
+  --served-model-name DeepSeek-V3.2-dsa-pp-cp-ep-dp
 )
 
 sglang_args=($sglang_args)
@@ -382,20 +382,20 @@ dp_config=" \
 "
 
 cp_config=" \
-  --enable-nsa-prefill-context-parallel \
+  --enable-dsa-prefill-context-parallel \
 "
 
 if [ "$dp" -eq 1 ]; then
 
 cp_config=" \
   $cp_config \
-  --nsa-prefill-cp-mode round-robin-split \
+  --dsa-prefill-cp-mode round-robin-split \
 "
 
 else
 cp_config=" \
   $cp_config \
-  --nsa-prefill-cp-mode in-seq-split \
+  --dsa-prefill-cp-mode in-seq-split \
 "
 fi
 
