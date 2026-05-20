@@ -76,18 +76,20 @@ This avoids modifying the central `meta_info` constructor; the existing tokenize
 
 ## Review-infrastructure deadlock (loop history)
 
-The RLCR loop rounds 1 and 2 came back with verdict **STALLED**, but the verdict reflected a Codex-sandbox failure, not code drift. The Codex error in both rounds was:
+This branch was assembled across two RLCR loops, and **every** automated Codex review attempt during loop execution was blocked by the same sandbox-startup failure:
 
 ```
 bwrap: No permissions to create a new namespace
 ```
 
-In that state Codex cannot read any file in the workspace, run any test, or write its `round-N-review-result.md`. The "Goal Alignment Summary: 0/12 verified" line in those review outputs means Codex never saw anything to verify — not that nothing was verified. Round 3 added an explicit end-to-end pipeline test (`TestEndToEndPipeline`) that composes NSA quantizer → Triton page_signature_write → DoubleSparsitySelector → retrieve_topk → m3b_page_stability_fixture on synthetic V3.2-shape inputs, so the next review (when the sandbox is repaired) has fresh end-to-end signal in addition to the unit-test surface.
+Loop 1 (`.humanize/rlcr/2026-05-19_23-59-32/`) saw three consecutive STALLED verdicts on this and tripped the Mainline Drift Circuit Breaker. Loop 2 (`.humanize/rlcr/2026-05-20_03-14-29/`, run in skip-implementation mode) also hit the same error but Codex returned a low-confidence "could not inspect the diff" verdict that the loop misclassified as a clean pass and exited via Finalize Phase. Over the two loops, **all five Codex review attempts on commits `09f6da94d`, `fbe9fd64f`, `13fd92977`, `6c11fbf3e`, and `3c29a4d41` produced zero substantive review signal.**
 
-If you (the upstream reviewer) hit this same sandbox failure when running automated review tooling against this branch, the implementation evidence lives in:
+Post-loop, the root cause was traced to a humanize-plugin bug: `loop-codex-stop-hook.sh` reads the `HUMANIZE_CODEX_BYPASS_SANDBOX` env-var gate but only applies the bypass to `codex exec` (summary review), not to `codex review` (code review). The local plugin was patched to mirror the gate into the review path via `-c sandbox_mode="danger-full-access"`; verified by running `codex review` post-patch and getting `SHELL_OK` plus the full diff list. Bitlesson `BL-20260520-humanize-codex-bypass-sandbox-review-leak` (in `.humanize/bitlesson.md`) captures the patch shape and the upstream-fix path.
 
-- Git log: `09f6da94d` (Round 0 backbone), `fbe9fd64f` (Round 1 package + kernels + ship-gate), `13fd92977` (Round 2 Triton + NSA cross-validation), and Round 3's commit (this round).
-- Unit tests: `python -m pytest test/registered/unit/layers/attention/test_double_sparsity_unit.py` — 52/52 pass on the H200 box, including the new `TestEndToEndPipeline` integration suite.
+**For the upstream reviewer**: treat this branch as un-machine-reviewed. Apply normal human review. The only review signal that's load-bearing is:
+
+- Git log: `09f6da94d` (Round 0 backbone), `fbe9fd64f` (Round 1 package + kernels + ship-gate), `13fd92977` (Round 2 Triton + NSA cross-validation), `6c11fbf3e` (Round 3 end-to-end pipeline), `3c29a4d41` (post-review finalize-phase simplifications: drop dead field, inline 1-use helper, prefer `masked_fill`).
+- Unit tests: `python -m pytest test/registered/unit/layers/attention/test_double_sparsity_unit.py` — 52/52 pass on the H200 box, including the `TestEndToEndPipeline` integration suite.
 - Documentation: this guide, `PR_DESCRIPTION.md`, `kernel_audit_memo.md`, `docs/advanced_features/double_sparsity_calibration.md`, `docs/advanced_features/double_sparsity_schema_memo.md`.
 
 ## Round 2 perf path (Triton kernels)
