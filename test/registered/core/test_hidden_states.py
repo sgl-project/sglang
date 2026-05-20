@@ -37,6 +37,12 @@ class TestHiddenState(CustomTestCase):
     def tearDownClass(cls):
         cls.engine.shutdown()
 
+    def setUp(self):
+        # Tests share one Engine; flush radix cache so each test sees a
+        # cold prefill (test_return_hidden_states asserts on the prefill
+        # hidden-state shape, which collapses to 0 on a full cache hit).
+        self.engine.flush_cache()
+
     def test_return_hidden_states(self):
         outputs = self.engine.generate(
             input_ids=self.input_ids,
