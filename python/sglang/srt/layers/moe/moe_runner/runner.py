@@ -47,6 +47,11 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 
             self.runner_core = AiterRunnerCore(config)
+        elif runner_backend.is_ifmoe():
+            # Side-effect import: registers the ("none", "ifmoe") fused func.
+            from sglang.srt.layers.moe.moe_runner import ifmoe  # noqa: F401
+
+            self.runner_core = None  # IFMoe only supports fused path
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
