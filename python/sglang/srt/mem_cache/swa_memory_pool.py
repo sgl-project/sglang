@@ -92,6 +92,16 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        # Per-batch translation cache keyed on Python object identity.
+        # Same ForwardBatch.out_cache_loc object → same batch → reuse result.
+        # Different object → different batch → recompute. Safe against allocator
+        # address reuse (unlike data_ptr()) because object identity is never
+        # reused while the old reference is alive.
+        # In full CUDA-graph mode, Python does not re-run at replay; the gather
+        # CUDA kernel recorded at capture fires every replay, keeping the result
+        # tensor fresh without any Python involvement.
+        self._cached_swa_loc: Optional[torch.Tensor] = None
+        self._cached_kv_ref: Optional[torch.Tensor] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -160,9 +170,17 @@ class SWAKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
+        # Cache on object identity: all N SWA layers in one forward receive the
+        # same ForwardBatch.out_cache_loc Python object, so only the first layer
+        # triggers a gather; the rest are O(1) cache hits.
         # Note: kv_indices could have -1 values (from alloc_extend), which will
         # be mapped to -1 since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        if self._cached_kv_ref is not kv_indices:
+            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
+                torch.int32
+            )
+            self._cached_kv_ref = kv_indices
+        return self._cached_swa_loc
 
     def set_kv_buffer(
         self,
