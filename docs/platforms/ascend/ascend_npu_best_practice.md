@@ -127,7 +127,6 @@ do
         echo "${P_IP[$i]}"
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -136,7 +135,7 @@ do
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.778 --attention-backend ascend --device npu --quantization modelslim \
+        --tp-size 16 --mem-fraction-static 0.778 --attention-backend ascend --device npu \
         --disaggregation-transfer-backend ascend --max-running-requests 16 --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 60000 --moe-a2a-backend ascend_fuseep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
@@ -248,7 +247,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_SOCKET_IFNAME=lo
@@ -375,7 +373,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -501,7 +498,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
@@ -690,7 +686,6 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 MODEL_PATH=xxx
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -781,7 +776,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=2600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -888,7 +882,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export HCCL_BUFFSIZE=1200
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -981,7 +974,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=3500
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -1099,7 +1091,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1200
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -1122,8 +1113,8 @@ do
         --nnodes 2 --node-rank $i \
         --disaggregation-bootstrap-port 8995 \
         --moe-dense-tp-size 1 \
-	    --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+	    --enable-dsa-prefill-context-parallel \
+        --dsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
         --dist-init-addr ${P_IP[0]}:10000
@@ -1266,7 +1257,6 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         export STREAMS_PER_DEVICE=32
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         # P节点
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
@@ -2202,7 +2192,6 @@ do
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
@@ -2299,7 +2288,6 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
@@ -3213,7 +3201,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3260,7 +3247,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3308,7 +3294,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3703,7 +3688,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
