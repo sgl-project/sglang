@@ -264,13 +264,7 @@ def compute_page_scores(
         "bhd,phd->bph", q_proj.to(torch.float32), sig_layer.to(torch.float32)
     )
     scores = scores_full.amax(dim=-1)  # [bs, P]
-
-    scores = torch.where(
-        valid_layer.unsqueeze(0).expand_as(scores),
-        scores,
-        torch.full_like(scores, float("-inf")),
-    )
-    return scores
+    return scores.masked_fill(~valid_layer.unsqueeze(0), float("-inf"))
 
 
 def all_reduce_page_scores(

@@ -131,7 +131,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     # hook surface that Double Sparsity replaces. is_deepseek_nsa() recognises
     # DeepSeek V3.2 today; GLM-5.1 should also pass once it ships the same
     # interface (DEC-6 deferred-but-hard requirement).
-    if _has_method(server_args, "get_model_config"):
+    if callable(getattr(server_args, "get_model_config", None)):
         try:
             hf_config = server_args.get_model_config().hf_config  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
@@ -207,7 +207,3 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
 
     setattr(server_args, "_double_sparsity_parsed_config", config)
     setattr(server_args, "_double_sparsity_channel_mask", mask)
-
-
-def _has_method(obj, name: str) -> bool:
-    return callable(getattr(obj, name, None))

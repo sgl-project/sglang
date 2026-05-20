@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import torch
 
@@ -44,9 +44,6 @@ class PageSignatureTable:
     valid_mask: torch.Tensor  # bool [L, P]
     page_size: int
 
-    # Bookkeeping for fast invalidation of pages that move through the
-    # eviction / retraction path; not used in the hot path.
-    _layer_ids: List[int] = field(default_factory=list)
     _hot_page_per_layer: Dict[int, Optional[int]] = field(default_factory=dict)
 
     def bytes_per_rank(self) -> int:
@@ -159,7 +156,6 @@ def allocate_page_signature_table(
         signatures=signatures,
         valid_mask=valid_mask,
         page_size=page_size,
-        _layer_ids=list(range(num_layers_local)),
         _hot_page_per_layer={i: None for i in range(num_layers_local)},
     )
 
