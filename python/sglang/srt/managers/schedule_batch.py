@@ -2510,10 +2510,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        # Avoid GPU .sum().item() D2H here; consolidated sync is at forward
-        # entry (scheduler.py). seq_lens_cpu may be one iter stale in spec_v2
-        # overlap, but it gets refreshed before any forward consumer reads.
-        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
+        if self.is_spec_v2 and self.enable_overlap:
+            # spec_v2 overlap: seq_lens_cpu is one iter stale here; mark None
+            # so accidental reads fail loudly. Refreshed at forward_stream entry.
+            self.seq_lens_sum = None
+        else:
+            self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2573,7 +2575,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
+        if self.seq_lens_sum is None or other.seq_lens_sum is None:
+            self.seq_lens_sum = None  # refreshed at forward_stream entry
+        else:
+            self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
