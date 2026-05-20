@@ -611,6 +611,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
+    def clear_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        """Clear full->SWA mapping without freeing SWA allocator pages."""
+        if full_indices.numel() == 0:
+            return
+
+        if _is_npu:
+            full_indices = full_indices.to(torch.int64)
+        self.full_to_swa_index_mapping[full_indices] = 0
+
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
