@@ -49,7 +49,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -57,7 +56,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -398,9 +396,7 @@ class SchedulerDisaggregationPrefillMixin:
         can pass it through the last send_layer call.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
-        state_types = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-        )
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
 
         for req in batch.reqs:
             state_indices = None
