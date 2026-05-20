@@ -44,7 +44,7 @@ class TestNoPerturbNoViolation(_MhaFullBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.5
+    perturb_prob: ClassVar[float] = 0.05
     allow_launch_failure: ClassVar[bool] = True
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
