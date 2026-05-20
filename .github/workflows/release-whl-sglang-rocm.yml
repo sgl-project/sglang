@@ -123,7 +123,7 @@ jobs:
         id: build
         run: |
           ROCM_VER="${{ matrix.rocm-version }}"
-          AITER_COMMIT="${{ needs.check-aiter-version.outputs.aiter_commit }}"
+          AITER_COMMIT="${{ matrix.rocm-version == '700' && needs.check-aiter-version.outputs.aiter_commit_700 || needs.check-aiter-version.outputs.aiter_commit_720 }}"
 
           # Determine base image and GPU arch based on ROCm version
           if [[ "${ROCM_VER}" == "700" ]]; then
@@ -273,7 +273,7 @@ jobs:
           export SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}"
 
           # Update sglang-kernel dependency URL to match ROCm version
-          KERNEL_VERSION="0.4.1"  # TODO: Make this dynamic or read from a config
+          KERNEL_VERSION=$(cat ../sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)
           sed -i "s|sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v.*|sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v${KERNEL_VERSION}/sglang_kernel-${KERNEL_VERSION}+rocm${ROCM_VER}-cp310-abi3-manylinux2014_x86_64.whl\",|g" pyproject.toml
 
           # Build wheel
@@ -320,7 +320,9 @@ jobs:
           path: dist/sglang/
 
       - name: Download AITER wheel artifact (if built)
-        if: needs.check-aiter-version.outputs.rebuild_needed == 'true'
+        if: |
+          (matrix.rocm-version == '700' && needs.check-aiter-version.outputs.rebuild_needed_700 == 'true') ||
+          (matrix.rocm-version == '720' && needs.check-aiter-version.outputs.rebuild_needed_720 == 'true')
         uses: actions/download-artifact@v4
         with:
           name: aiter-wheel-rocm${{ matrix.rocm-version }}

@@ -59,11 +59,11 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
+  "mistral_common>=1.11.0",
+  "transformers==5.8.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.32",
+  "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -94,11 +94,12 @@ test = [
   "addict",
   "bitsandbytes",
   "expecttest",
+  "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
   "parameterized",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "polars",
   "pytest",
   "pytest-cov",
@@ -116,7 +117,7 @@ rocm700 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2/sglang_kernel-0.4.2+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2.post2/sglang_kernel-0.4.2.post2+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
   "amd-aiter",
 ]
 
@@ -127,7 +128,7 @@ rocm720 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2/sglang_kernel-0.4.2+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2.post2/sglang_kernel-0.4.2.post2+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
   "amd-aiter",
 ]
 
@@ -144,7 +145,7 @@ srt_hip = [
 
 diffusion_hip = [
   "sglang[diffusion_common]",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.7",
