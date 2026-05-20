@@ -135,7 +135,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
-    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -169,7 +168,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
-        is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
@@ -178,11 +176,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int32)
-                if is_hybrid_swa
-                else None
-            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -260,7 +253,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -292,12 +284,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
-            # Padded SWA indices left over from a previous replay would point
-            # into real SWA slots, so set_kv_buffer on padded tokens would
-            # corrupt active requests' KV. Zero the whole buffer so padded
-            # positions map to the sentinel slot (matches piecewise runner).
-            if self.out_cache_loc_swa is not None:
-                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -373,14 +359,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
-
-        # SWA cache location (int32, separate from the int64 batch above).
-        if (
-            self.out_cache_loc_swa is not None
-            and forward_batch.out_cache_loc_swa is not None
-        ):
-            dsts.append(self.out_cache_loc_swa[:raw_num_token])
-            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
@@ -692,7 +670,6 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
