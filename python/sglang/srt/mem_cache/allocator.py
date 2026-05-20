@@ -63,7 +63,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return ""
 
     def available_size(self):
-        return (len(self.free_pages) + len(self.release_pages)) * self.page_size
+        return min(
+            (len(self.free_pages) + len(self.release_pages)) * self.page_size, self.size
+        )
 
     def get_kvcache(self):
         return self._kvcache
@@ -86,6 +88,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
+            self.free_pages = torch.unique(self.free_pages)
             self.free_pages, _ = torch.sort(self.free_pages)
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
@@ -143,7 +146,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
-        return len(self.free_pages) + len(self.release_pages)
+        return min(len(self.free_pages) + len(self.release_pages), self.size)
 
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
@@ -503,6 +506,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
+                self.release_pages = torch.unique(self.release_pages)
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
