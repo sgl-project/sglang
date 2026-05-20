@@ -18,11 +18,16 @@ class PerturbConfig:
         real_kv_require_orphan: when True the real-KV perturb hook skips this step if no
             radix-cache orphan is currently available (no fallback to running-req slots). Used by
             sweep-only self-tests that must guarantee any fired violation has kernel_kind=SWEEP_*.
+        warmup_steps: number of initial forward steps to gate off all perturb hooks. Prevents
+            perturb from firing during sglang warmup, where a garbage write can trip a CUDA error
+            before the canary's deferred D2H violation pump has a chance to log the canary_kind
+            line.
     """
 
     req_to_token_prob: float = 0.0
     real_kv_prob: float = 0.0
     real_kv_require_orphan: bool = False
+    warmup_steps: int = 50
 
     @classmethod
     def from_env(cls) -> "PerturbConfig":
@@ -30,4 +35,5 @@ class PerturbConfig:
             req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
             real_kv_prob=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get(),
             real_kv_require_orphan=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN.get(),
+            warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS.get(),
         )

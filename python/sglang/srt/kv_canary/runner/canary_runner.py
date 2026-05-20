@@ -140,6 +140,7 @@ class CanaryRunner:
             config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
+            pump_and_allreduce=self._pump_and_allreduce,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,

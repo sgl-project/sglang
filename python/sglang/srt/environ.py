@@ -730,6 +730,11 @@ class Envs:
     # should fire. Combined with ``--kv-canary=raise`` this gives a fault-injection
     # harness for regression-testing the canary itself.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    # Number of initial forward steps during which all perturb hooks are
+    # gated off. Prevents perturb from firing during sglang warmup, where a
+    # garbage write can trip a CUDA error before the canary's deferred D2H
+    # violation pump has a chance to log the canary_kind line.
+    SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
     # Real-KV-byte perturbation. When >0, the canary self-test hook flips one
     # byte of the real KV pool at an alive-but-not-verified-this-step slot with
     # this probability per forward, proving the periodic sweep's independent
