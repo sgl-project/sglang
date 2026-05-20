@@ -188,6 +188,7 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         real_kv_sources_ref=inputs.real_kv_sources_ref,
         real_kv_hash_mode=inputs.real_kv_hash_mode,
         kernel_kind=inputs.kernel_kind,
+        assert_equal=False,
     )
     assert torch.equal(
         inputs.cuda_canary_buf, inputs.ref_canary_buf

@@ -150,6 +150,7 @@ def _run_one(inputs: VerifyFuzzInputs) -> None:
         real_kv_sources_ref=inputs.real_kv_sources_ref,
         real_kv_hash_mode=inputs.real_kv_hash_mode,
         kernel_kind=inputs.kernel_kind,
+        assert_equal=False,
     )
     assert int(cuda_log.kernel_run_counter[0].item()) == int(
         ref_log.kernel_run_counter[0].item()

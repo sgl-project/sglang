@@ -43,6 +43,9 @@ def _run_both_plan(
     extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
+    assert_equal: bool = True,
+    active_verify_entries: Optional[int] = None,
+    active_write_reqs: Optional[int] = None,
 ) -> None:
     extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
     canary_plan_step(
@@ -75,44 +78,15 @@ def _run_both_plan(
     )
     torch.cuda.synchronize()
 
-
-def _run_both_and_assert_plan_byte_equal(
-    *,
-    triton_verify: VerifyPlan,
-    triton_write: WritePlan,
-    ref_verify: VerifyPlan,
-    ref_write: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    swa_window_size: int,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-    active_verify_entries: Optional[int] = None,
-    active_write_reqs: Optional[int] = None,
-) -> None:
-    _run_both_plan(
-        triton_verify=triton_verify,
-        triton_write=triton_write,
-        ref_verify=ref_verify,
-        ref_write=ref_write,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        req_to_token=req_to_token,
-        extras=extras,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
-    )
-    _assert_plans_byte_equal(
-        triton_verify=triton_verify,
-        triton_write=triton_write,
-        ref_verify=ref_verify,
-        ref_write=ref_write,
-        active_verify_entries=active_verify_entries,
-        active_write_reqs=active_write_reqs,
-    )
+    if assert_equal:
+        _assert_plans_byte_equal(
+            triton_verify=triton_verify,
+            triton_write=triton_write,
+            ref_verify=ref_verify,
+            ref_write=ref_write,
+            active_verify_entries=active_verify_entries,
+            active_write_reqs=active_write_reqs,
+        )
 
 
 def _assert_plans_byte_equal(
@@ -184,6 +158,7 @@ def _run_both_verify(
     real_kv_sources_ref: tuple[RealKvSource, ...],
     real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+    assert_equal: bool = True,
 ) -> None:
     canary_verify_step(
         canary_buf=cuda_canary_buf,
@@ -209,33 +184,8 @@ def _run_both_verify(
     )
     torch.cuda.synchronize()
 
-
-def _run_both_and_assert_verify_state_equal(
-    *,
-    cuda_canary_buf: torch.Tensor,
-    ref_canary_buf: torch.Tensor,
-    plan_cuda,
-    plan_ref,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-    real_kv_sources_cuda: tuple[RealKvSource, ...],
-    real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-) -> None:
-    _run_both_verify(
-        cuda_canary_buf=cuda_canary_buf,
-        ref_canary_buf=ref_canary_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=real_kv_sources_cuda,
-        real_kv_sources_ref=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
-        kernel_kind=kernel_kind,
-    )
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+    if assert_equal:
+        assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def _run_both_write(
@@ -256,6 +206,7 @@ def _run_both_write(
     real_kv_sources_ref: tuple[RealKvSource, ...],
     real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+    assert_equal: bool = True,
 ) -> None:
     canary_write_step(
         canary_buf=cuda_canary_buf,
@@ -293,46 +244,9 @@ def _run_both_write(
     )
     torch.cuda.synchronize()
 
-
-def _run_both_and_assert_write_buf_and_state_equal(
-    *,
-    cuda_canary_buf: torch.Tensor,
-    ref_canary_buf: torch.Tensor,
-    plan_cuda,
-    plan_ref,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
-    enable_write_verify_inputs: bool,
-    expected_input_tokens: torch.Tensor,
-    expected_input_positions: torch.Tensor,
-    cuda_log: FakeViolationLog,
-    ref_log: FakeViolationLog,
-    real_kv_sources_cuda: tuple[RealKvSource, ...],
-    real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-) -> None:
-    _run_both_write(
-        cuda_canary_buf=cuda_canary_buf,
-        ref_canary_buf=ref_canary_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        enable_write_verify_inputs=enable_write_verify_inputs,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=real_kv_sources_cuda,
-        real_kv_sources_ref=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
-        kernel_kind=kernel_kind,
-    )
-    assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+    if assert_equal:
+        assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)
+        assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

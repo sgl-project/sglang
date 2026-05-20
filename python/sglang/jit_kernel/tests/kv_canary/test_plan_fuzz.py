@@ -7,9 +7,7 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_and_assert_plan_byte_equal,
-)
+from sglang.jit_kernel.tests.kv_canary._differential import _run_both_plan
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _allocate_plan_pair,
     derive_plan_capacity,
@@ -186,7 +184,7 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         inputs.extras_prev_slot_indices,
         inputs.extras_num_valid,
     )
-    _run_both_and_assert_plan_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,

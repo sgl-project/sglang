@@ -9,9 +9,7 @@ from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_and_assert_plan_byte_equal as _run_both_and_assert_byte_equal,
-)
+from sglang.jit_kernel.tests.kv_canary._differential import _run_both_plan
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _allocate_plan_pair,
     _empty_extras,
@@ -43,7 +41,7 @@ def test_single_req_extend_basic() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -78,7 +76,7 @@ def test_single_req_decode() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -110,7 +108,7 @@ def test_multi_req_mixed_extend_decode() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -144,7 +142,7 @@ def test_prefix_zero_seed_is_minus_one() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -174,7 +172,7 @@ def test_padding_rows_contribute_zero() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -213,7 +211,7 @@ def test_swa_window_clip_prefix_less_than_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=256, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -244,7 +242,7 @@ def test_swa_window_clip_prefix_gt_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=512, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -282,7 +280,7 @@ def test_swa_lut_translates_verify_slots() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -319,7 +317,7 @@ def test_swa_lut_translates_seed_slot() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -349,7 +347,7 @@ def test_prev_slot_minus_one_at_chain_head() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -380,7 +378,7 @@ def test_prev_slot_is_self_minus_one() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -418,7 +416,7 @@ def test_extra_verify_entries_appended_after_per_req() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -462,7 +460,7 @@ def test_extra_verify_num_valid_zero_no_op() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -491,7 +489,7 @@ def test_sweep_caller_writes_dummy_write_plan() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -534,7 +532,7 @@ def test_verify_num_valid_aggregate() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -567,7 +565,7 @@ def test_verify_covers_all_tokens_no_skip() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=128, write_req_capacity=8
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -596,7 +594,7 @@ def test_plan_verify_positions_strictly_increment_per_req() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -634,7 +632,7 @@ def test_verify_covers_all_tokens_in_swa_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=1024, write_req_capacity=8
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -665,7 +663,7 @@ def test_write_num_valid_reqs_excludes_padding() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -703,7 +701,7 @@ def test_byte_equal_python_reference() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=128, write_req_capacity=8
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -736,7 +734,7 @@ def test_byte_equal_python_reference_hardcoded() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -801,7 +799,7 @@ def test_bs_boundary_byte_equal_sweep(bs: int) -> None:
         verify_capacity=max(total_verify + 64, 256),
         write_req_capacity=bs + 4,
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -835,7 +833,7 @@ def test_prefix_lens_boundary_byte_equal_sweep(prefix_val: int) -> None:
         verify_capacity=max(total_verify + 64, 256),
         write_req_capacity=8,
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -868,7 +866,7 @@ def test_extend_seq_lens_boundary_byte_equal_sweep(extend_val: int) -> None:
         verify_capacity=64,
         write_req_capacity=4,
     )
-    _run_both_and_assert_byte_equal(
+    _run_both_plan(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,

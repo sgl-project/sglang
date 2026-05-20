@@ -28,10 +28,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     to_signed_int64,
     write_slot_fields,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
-    _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
-)
-from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write as _run_both
+from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _dummy_pseudo_tensors,
     clone_real_kv_sources,
@@ -79,7 +76,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
     sources_ref = clone_real_kv_sources(sources_cuda)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -114,7 +111,7 @@ def test_seed_slot_idx_negative_uses_anchor() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -138,8 +135,6 @@ def test_seed_slot_idx_negative_uses_anchor() -> None:
     assert stored_token == 42
     assert stored_position == 0
     assert stored_prev_hash == chain_anchor_signed()
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_seed_slot_idx_loads_predecessor() -> None:
@@ -172,7 +167,7 @@ def test_seed_slot_idx_loads_predecessor() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -195,8 +190,6 @@ def test_seed_slot_idx_loads_predecessor() -> None:
     )
     _, _, stored_prev_hash, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=2)
     assert stored_prev_hash == to_signed_int64(expected_prev_hash)
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_seed_slot_chain_link_continuous() -> None:
@@ -229,7 +222,7 @@ def test_seed_slot_chain_link_continuous() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -245,6 +238,7 @@ def test_seed_slot_chain_link_continuous() -> None:
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        assert_equal=False,
     )
 
     # Step 2: verify slot[2] with prev=7 — expects no violation.
@@ -286,7 +280,7 @@ def test_chain_link_byte_equal_5_step() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -323,7 +317,7 @@ def test_mock_mode_off_ignores_expected() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -342,8 +336,6 @@ def test_mock_mode_off_ignores_expected() -> None:
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_mock_mode_on_match_no_violation() -> None:
@@ -363,7 +355,7 @@ def test_mock_mode_on_match_no_violation() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -382,8 +374,6 @@ def test_mock_mode_on_match_no_violation() -> None:
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_mock_mode_on_token_mismatch_records_violation() -> None:
@@ -403,7 +393,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -426,8 +416,6 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
     # Chain advances on actual (42), not expected (99). Stored token should be 42.
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_token == 42
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_mock_mode_on_position_mismatch_records_violation() -> None:
@@ -447,7 +435,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -469,8 +457,6 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
     assert_only_bits_set(fail_bits, consts.FailReason.WRITE_POSITION_MISMATCH)
     _, stored_position, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_position == 7
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
@@ -491,7 +477,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -535,8 +521,6 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     )
     torch.cuda.synchronize()
     assert int(verify_log.write_index[0].item()) == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_negative_slot_skips_entry() -> None:
@@ -559,7 +543,7 @@ def test_negative_slot_skips_entry() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -581,8 +565,6 @@ def test_negative_slot_skips_entry() -> None:
     assert stored_token == 42
     # slot_run_counter counts only non-skipped entries (1, not 2).
     assert int(cuda_log.slot_run_counter.item()) == 1
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_pre_translated_slot_writes_normally() -> None:
@@ -606,7 +588,7 @@ def test_pre_translated_slot_writes_normally() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -626,8 +608,6 @@ def test_pre_translated_slot_writes_normally() -> None:
 
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=4)
     assert stored_token == 55
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_real_kv_mode_off_writes_zero() -> None:
@@ -648,7 +628,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -670,8 +650,6 @@ def test_real_kv_mode_off_writes_zero() -> None:
     _, _, _, real_kv_1 = read_slot_fields(canary_buf=cuda_buf, slot_idx=1)
     assert real_kv_0 == 0
     assert real_kv_1 == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
@@ -692,7 +670,7 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -739,7 +717,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -810,7 +788,7 @@ def test_kernel_run_counter_per_call() -> None:
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
     for _ in range(3):
-        _run_both(
+        _run_both_write(
             cuda_canary_buf=cuda_buf,
             ref_canary_buf=ref_buf,
             plan_cuda=plan_cuda,
@@ -826,6 +804,7 @@ def test_kernel_run_counter_per_call() -> None:
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
             real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            assert_equal=False,
         )
 
     assert int(cuda_log.kernel_run_counter[0].item()) == 3
@@ -854,7 +833,7 @@ def test_slot_run_counter_sums_entries() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -873,8 +852,6 @@ def test_slot_run_counter_sums_entries() -> None:
     )
 
     assert int(cuda_log.slot_run_counter[0].item()) == 5
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_empty_plan_no_op() -> None:
@@ -901,7 +878,7 @@ def test_empty_plan_no_op() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -922,8 +899,6 @@ def test_empty_plan_no_op() -> None:
     assert int(cuda_log.write_index[0].item()) == 0
     assert int(cuda_log.slot_run_counter[0].item()) == 0
     assert int(cuda_log.kernel_run_counter[0].item()) == 1
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_padding_block_skipped() -> None:
@@ -951,7 +926,7 @@ def test_padding_block_skipped() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -977,8 +952,6 @@ def test_padding_block_skipped() -> None:
             canary_buf=cuda_buf, slot_idx=slot_idx
         )
         assert stored_token_other == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_chain_link_byte_equal_5_step_hardcoded() -> None:
@@ -1010,7 +983,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1039,8 +1012,6 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
         assert stored_position == expected_position
         assert stored_prev_hash == expected_prev_signed
         assert stored_real_kv_hash == 0
-    assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 @pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
@@ -1090,7 +1061,7 @@ def test_mock_violation_bit_injection_position_matrix(
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1106,6 +1077,7 @@ def test_mock_violation_bit_injection_position_matrix(
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        assert_equal=False,
     )
 
     found = False
@@ -1188,7 +1160,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1258,7 +1230,7 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1333,7 +1305,7 @@ def test_pseudo_mode_on_catches_token_mismatch() -> None:
 
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1391,7 +1363,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1449,7 +1421,7 @@ def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
 
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1520,7 +1492,7 @@ def test_seed_continues_existing_chain() -> None:
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1576,7 +1548,7 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1672,7 +1644,7 @@ def test_pseudo_mode_off_skips_token_check() -> None:
 
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both_and_assert_buf_and_state_equal(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1720,7 +1692,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
     pseudo_tokens_big, pseudo_positions_big = _dummy_pseudo_tensors(8)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda_big,
@@ -1736,6 +1708,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        assert_equal=False,
     )
 
     untouched_snapshot = cuda_buf.view(torch.int64).clone()
@@ -1761,7 +1734,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         small_slots, dtype=torch.int32, device=_DEVICE
     )
     pseudo_tokens_small, pseudo_positions_small = _dummy_pseudo_tensors(3)
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda_small,
@@ -1777,6 +1750,7 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        assert_equal=False,
     )
 
     after = cuda_buf.view(torch.int64)
@@ -1812,7 +1786,7 @@ def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_write(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -1828,6 +1802,7 @@ def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        assert_equal=False,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
