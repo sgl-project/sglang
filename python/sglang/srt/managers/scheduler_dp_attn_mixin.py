@@ -11,7 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import require_attn_tp_gather, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -137,6 +137,7 @@ def prepare_mlp_sync_batch_raw(
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
+    require_attn_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
 ):
@@ -237,6 +238,7 @@ class SchedulerDPAttnMixin:
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            require_attn_tp_gather=require_attn_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
         )
