@@ -1039,6 +1039,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         if get_moe_runner_backend().is_flashinfer_cutlass():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+
             activation_str = self.moe_runner_config.activation
             assert activation_str in _SUPPORTED_ACT_STRS, (
                 f"Activation {activation_str!r} is not supported for "
