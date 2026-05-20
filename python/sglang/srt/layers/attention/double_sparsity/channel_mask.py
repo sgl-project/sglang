@@ -285,6 +285,56 @@ def save_channel_mask(
     return content_sha256
 
 
+def slice_per_rank(
+    mask: ChannelMask,
+    *,
+    num_local_heads: int,
+    rank: int,
+    tp_size: int,
+) -> ChannelMask:
+    """Return a per-rank head-sliced view of a TP-agnostic channel mask.
+
+    The calibration artifact records ``channel_selection[L, H_full, label_dim]``
+    where ``H_full = num_attention_heads``. At serving time each TP rank owns
+    ``num_local_heads = H_full / tp_size`` consecutive heads, so the selector's
+    binding requires ``[L, num_local_heads, label_dim]``. This helper performs
+    that slice; the deploying team should call it on the loaded mask before
+    passing it into ``DoubleSparsitySelector.bind_runtime_data``.
+
+    The returned ``ChannelMask`` carries the SAME ``content_sha256`` as the
+    source file (the on-disk hash is unchanged; this is an in-memory view).
+    """
+
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}.")
+    if not (0 <= rank < tp_size):
+        raise ValueError(f"rank={rank} must be in [0, {tp_size}).")
+    if num_local_heads <= 0:
+        raise ValueError(
+            f"num_local_heads must be positive, got {num_local_heads}."
+        )
+    h_full = int(mask.channel_selection.shape[1])
+    if h_full != num_local_heads * tp_size:
+        raise ValueError(
+            f"channel mask H_full={h_full} is not divisible into "
+            f"num_local_heads={num_local_heads} × tp_size={tp_size}."
+        )
+    start = rank * num_local_heads
+    stop = start + num_local_heads
+    return ChannelMask(
+        channel_selection=mask.channel_selection[:, start:stop, :].contiguous(),
+        channel_weights=mask.channel_weights[:, start:stop, :].contiguous(),
+        schema_version=mask.schema_version,
+        dtype=mask.dtype,
+        head_dim=mask.head_dim,
+        page_size=mask.page_size,
+        label_dim=mask.label_dim,
+        content_sha256=mask.content_sha256,
+        created_at=mask.created_at,
+        raw_metadata=mask.raw_metadata,
+    )
+
+
 def validate_against_runtime(
     mask: ChannelMask,
     *,

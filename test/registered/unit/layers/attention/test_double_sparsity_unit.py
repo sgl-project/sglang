@@ -667,6 +667,125 @@ class TestSelectorRealMode(unittest.TestCase):
         # max_top_k=2048 from default _valid_payload; output shape matches
         self.assertEqual(tuple(indices.shape), (2, 2048))
 
+    def test_per_request_mask_isolates_pages(self):
+        """Round-2 fix [P2]: a request must not select pages owned by a
+        different request in the same batch, even if those pages are
+        globally valid in the signature table.
+        """
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
+        )
+        table = allocate_page_signature_table(
+            num_layers_local=1, max_pages=8, num_heads_local=2, label_dim=8,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+        table.signatures.uniform_(-1, 1)
+        # Globally all 8 pages are valid (e.g. two different requests
+        # occupy disjoint slices of the same table).
+        table.valid_mask.fill_(True)
+        mask = ChannelMask(
+            channel_selection=torch.randint(0, 64, (1, 2, 8), dtype=torch.int32),
+            channel_weights=torch.randn(1, 2, 8, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=64, page_size=64,
+            label_dim=8, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+        # Override max_top_k for a sharp test: only 4 slots, 8 candidate
+        # pages, and we'll prove request 0 never gets pages 4..7.
+        sel.max_top_k = 4
+
+        queries = torch.randn(2, 2, 64)
+        req_pool = torch.tensor([0, 1], dtype=torch.int32)
+        seq_lens = torch.tensor([256, 256], dtype=torch.int32)
+        # Request 0 owns pages [0, 1, 2, 3]; request 1 owns pages [4, 5, 6, 7].
+        per_request = torch.tensor([
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 1],
+        ], dtype=torch.int32)
+        indices, lengths = sel.retrieve_topk(
+            queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=per_request, seq_lens=seq_lens,
+        )
+        self.assertEqual(tuple(indices.shape), (2, 4))
+        row0 = [int(v) for v in indices[0].tolist() if v >= 0]
+        row1 = [int(v) for v in indices[1].tolist() if v >= 0]
+        self.assertTrue(all(p in {0, 1, 2, 3} for p in row0),
+                        f"request 0 selected foreign pages: {row0}")
+        self.assertTrue(all(p in {4, 5, 6, 7} for p in row1),
+                        f"request 1 selected foreign pages: {row1}")
+
+
+class TestChannelMaskSlicePerRank(unittest.TestCase):
+    """Round-2 fix [P2]: TP head sharding helper."""
+
+    def test_slice_per_rank_returns_local_block(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, slice_per_rank,
+        )
+        sel = torch.arange(2 * 16 * 8, dtype=torch.int32).reshape(2, 16, 8)
+        wts = torch.arange(2 * 16 * 8, dtype=torch.float32).reshape(2, 16, 8)
+        mask = ChannelMask(
+            channel_selection=sel, channel_weights=wts,
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=8, content_sha256="abc",
+        )
+        # TP=4 → num_local_heads=4; rank 2 owns heads [8, 12).
+        sliced = slice_per_rank(mask, num_local_heads=4, rank=2, tp_size=4)
+        self.assertEqual(tuple(sliced.channel_selection.shape), (2, 4, 8))
+        self.assertTrue(torch.equal(sliced.channel_selection, sel[:, 8:12, :]))
+        self.assertTrue(torch.equal(sliced.channel_weights, wts[:, 8:12, :]))
+        # Metadata is carried forward unchanged.
+        self.assertEqual(sliced.content_sha256, "abc")
+        self.assertEqual(sliced.head_dim, 128)
+        self.assertEqual(sliced.label_dim, 8)
+
+    def test_slice_per_rank_rejects_uneven_split(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, slice_per_rank,
+        )
+        mask = ChannelMask(
+            channel_selection=torch.zeros(1, 10, 4, dtype=torch.int32),
+            channel_weights=torch.zeros(1, 10, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        with self.assertRaises(ValueError):
+            slice_per_rank(mask, num_local_heads=4, rank=0, tp_size=2)
+
+    def test_bind_rejects_unsliced_full_mask(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+        # Mask is still at H_full=32 (un-sliced) — must be rejected.
+        full_mask = ChannelMask(
+            channel_selection=torch.zeros(2, 32, 8, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 32, 8, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=8, content_sha256="x",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            sel.bind_runtime_data(table, full_mask)
+        self.assertIn("slice_per_rank", str(ctx.exception))
+
 
 class TestMetrics(unittest.TestCase):
     def test_meta_info_shape(self):

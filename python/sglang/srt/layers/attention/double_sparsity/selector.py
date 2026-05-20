@@ -100,6 +100,15 @@ class DoubleSparsitySelector:
                 f"page_signature_table.num_heads_local={page_signature_table.num_heads_local} "
                 f"does not match selector.num_local_heads={self.num_local_heads}."
             )
+        mask_num_heads = int(channel_mask.channel_selection.shape[1])
+        if mask_num_heads != self.num_local_heads:
+            raise ValueError(
+                f"channel_mask num_heads={mask_num_heads} does not match "
+                f"selector.num_local_heads={self.num_local_heads}. The calibration "
+                "artifact is TP-agnostic (H_full); call "
+                "channel_mask.slice_per_rank(mask, num_local_heads=..., rank=..., "
+                "tp_size=...) before bind_runtime_data."
+            )
 
         self.page_signature_table = page_signature_table
         self.channel_mask = channel_mask
@@ -147,6 +156,7 @@ class DoubleSparsitySelector:
                 max_top_k=self.max_top_k,
                 hot_pages=hot_pages,
                 process_group=self.process_group,
+                per_request_valid=sparse_mask,
             )
 
         batch_size = req_pool_indices.shape[0]

@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.double_sparsity.channel_mask import (
     SanityProbeResult,
     load_channel_mask,
     save_channel_mask,
+    slice_per_rank,
     startup_sanity_probe,
     validate_against_runtime,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "load_channel_mask",
     "parse_double_sparsity_config",
     "save_channel_mask",
+    "slice_per_rank",
     "startup_sanity_probe",
     "validate_against_runtime",
     "validate_double_sparsity",

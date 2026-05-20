@@ -65,6 +65,25 @@ Per DEC-4: **not** in the SGLang repo. The deploying team owns artifact storage 
 
 The calibration step is per-rank-agnostic. At serving time, ranks compute scalar page scores from their local head shards, all-reduce SUM, and run independent top-K — so the channel mask file can be reused across any TP topology without recalibration.
 
+## TP head sharding at bind time
+
+The calibration artifact stores `channel_selection[L, H_full, label_dim]` where `H_full = num_attention_heads`. The runtime selector expects `[L, num_local_heads, label_dim]`. Before passing the loaded mask into `DoubleSparsitySelector.bind_runtime_data`, the deploying team's integration glue must slice the per-rank head block:
+
+```python
+from sglang.srt.layers.attention.double_sparsity import slice_per_rank, load_channel_mask
+
+mask = load_channel_mask("/models/dsv32-fp8-channel-mask.safetensors")
+rank_mask = slice_per_rank(
+    mask,
+    num_local_heads=num_local_heads,  # = num_attention_heads // tp_size
+    rank=current_tp_rank,
+    tp_size=tp_size,
+)
+selector.bind_runtime_data(page_signature_table, rank_mask)
+```
+
+`bind_runtime_data` rejects an un-sliced (H_full) mask with a clear error message that names this helper.
+
 ## Future-compat (per the schema memo)
 
 The schema admits GLM-5.1, 128K ISL, and FP4 weights without rewrite (see `docs/advanced_features/double_sparsity_schema_memo.md`). Recalibration is needed when migrating between model revisions but not when changing TP or context length.

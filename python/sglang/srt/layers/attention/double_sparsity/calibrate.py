@@ -175,38 +175,68 @@ def _collect_channel_importance(
 
     num_layers = int(getattr(config, "num_hidden_layers", num_layers_hint or 0))
     num_heads = int(getattr(config, "num_attention_heads", num_heads_hint or 0))
+    # For DeepSeek MLA the per-head K-noPE width is `qk_nope_head_dim`; for
+    # plain Llama/GLM-style attention there is no such split and the per-head
+    # K width equals `head_dim`. The selector's channel mask must index K
+    # channels only, so use `qk_nope_head_dim` when present.
+    qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim", 0))
+    v_head_dim = int(getattr(config, "v_head_dim", 0))
     head_dim = int(getattr(config, "head_dim", head_dim_hint or 0)) or (
         getattr(config, "hidden_size", 0) // max(num_heads, 1)
     )
-    if num_layers <= 0 or num_heads <= 0 or head_dim <= 0:
+    k_head_dim = qk_nope_head_dim if qk_nope_head_dim > 0 else head_dim
+    if num_layers <= 0 or num_heads <= 0 or k_head_dim <= 0:
         raise RuntimeError(
             f"Could not derive calibration shape from {model_path!r}: "
-            f"L={num_layers} H={num_heads} D={head_dim}."
+            f"L={num_layers} H={num_heads} D={k_head_dim}."
         )
 
-    importance = torch.zeros((num_layers, num_heads, head_dim), dtype=torch.float32)
+    importance = torch.zeros((num_layers, num_heads, k_head_dim), dtype=torch.float32)
     seen = [0] * num_layers
 
     # Best-effort hook registration: try several common attribute names that
-    # DSV3.2 / GLM-5 / Llama might expose.
+    # DSV3.2 / GLM-5 / Llama might expose. When the K source is MLA's
+    # `kv_b_proj` we must slice the K-noPE prefix off the [K-noPE | V] output
+    # before reshaping, otherwise V channels leak into the K importance.
     handles = []
     for layer_idx, layer in enumerate(getattr(model, "model", model).layers):
         attn = getattr(layer, "self_attn", layer)
-        kproj = (
-            getattr(attn, "k_proj", None)
-            or getattr(attn, "kv_b_proj", None)
-            or getattr(attn, "wk", None)
-        )
-        if kproj is None:
+        k_proj = getattr(attn, "k_proj", None)
+        kv_b_proj = getattr(attn, "kv_b_proj", None)
+        wk = getattr(attn, "wk", None)
+        if k_proj is not None:
+            kproj, source = k_proj, "k_proj"
+        elif kv_b_proj is not None:
+            kproj, source = kv_b_proj, "kv_b_proj"
+        elif wk is not None:
+            kproj, source = wk, "wk"
+        else:
             continue
 
-        def _make_hook(idx):
+        is_mla = source == "kv_b_proj"
+        # MLA's kv_b_proj output last-dim = num_heads * (qk_nope + v_head_dim).
+        k_prefix_width = num_heads * k_head_dim
+        full_mla_width = num_heads * (k_head_dim + v_head_dim) if is_mla else None
+
+        def _make_hook(idx, is_mla=is_mla, k_prefix_width=k_prefix_width,
+                       full_mla_width=full_mla_width):
             def _hook(_module, _inputs, output):
                 tensor = output[0] if isinstance(output, tuple) else output
                 if tensor.dim() < 2:
                     return
+                if is_mla:
+                    if v_head_dim > 0 and tensor.shape[-1] == full_mla_width:
+                        tensor = tensor[..., :k_prefix_width]
+                    elif tensor.shape[-1] != k_prefix_width:
+                        # Unexpected width — skip rather than mix V into K.
+                        logger.warning(
+                            "kv_b_proj output last-dim=%d does not match expected "
+                            "K-noPE prefix=%d or [K|V] total=%s; skipping layer %d hook.",
+                            tensor.shape[-1], k_prefix_width, full_mla_width, idx,
+                        )
+                        return
                 squared = tensor.detach().to(torch.float32).pow(2)
-                squared = squared.reshape(-1, num_heads, head_dim).sum(dim=0)
+                squared = squared.reshape(-1, num_heads, k_head_dim).sum(dim=0)
                 importance[idx] += squared.cpu()
                 seen[idx] += 1
 

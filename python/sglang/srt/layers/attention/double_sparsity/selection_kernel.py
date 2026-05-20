@@ -390,8 +390,17 @@ def retrieve_topk_via_signatures(
     max_top_k: int,
     hot_pages: Optional[Sequence[Sequence[int]]] = None,
     process_group=None,
+    per_request_valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """End-to-end real-selector flow: score → all-reduce → top-K → ascend."""
+    """End-to-end real-selector flow: score → all-reduce → per-request mask → top-K → ascend.
+
+    ``per_request_valid``: optional ``[bs, max_pages]`` bool/int tensor flagging
+    the pages each request actually owns. The global ``valid_mask`` only says
+    which pages are currently live across the whole table; without a per-row
+    mask, a request would be free to pick globally-valid pages owned by other
+    requests in a mixed batch. ``None`` disables the per-row gate (single-
+    request / unit-test paths).
+    """
 
     scores = compute_page_scores(
         queries=queries,
@@ -402,4 +411,13 @@ def retrieve_topk_via_signatures(
         layer_id=layer_id,
     )
     scores = all_reduce_page_scores(scores, process_group=process_group)
+    if per_request_valid is not None:
+        if per_request_valid.shape != scores.shape:
+            raise ValueError(
+                f"per_request_valid shape {tuple(per_request_valid.shape)} must "
+                f"match page_scores shape {tuple(scores.shape)}."
+            )
+        scores = scores.masked_fill(
+            ~per_request_valid.to(torch.bool), float("-inf")
+        )
     return select_topk_sequence_order(scores, max_top_k, hot_pages=hot_pages)
