@@ -529,9 +529,8 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
-    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-
+    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

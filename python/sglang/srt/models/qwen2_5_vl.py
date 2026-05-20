@@ -49,7 +49,11 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -79,9 +83,8 @@ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
-_is_cuda = is_cuda()
-
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -183,6 +186,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
         output_ws=None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -196,6 +200,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
             output_ws=output_ws,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -326,7 +331,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             use_data_parallel=use_data_parallel,
         )
 
-        # Resource prepared for vit cuda graph
         self.tp_size = (
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
@@ -464,6 +468,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
             cu_window_seqlens = cu_window_seqlens.to("cpu")
+
+        # pre-compute attention metadata once for all layers (two variants)
+        full_metadata = prepare_vision_attention_metadata(cu_seqlens, device=x.device)
+        window_metadata = prepare_vision_attention_metadata(
+            cu_window_seqlens, device=x.device
+        )
+
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
@@ -472,10 +483,15 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 fullatt_indexes = fullatt_indexes.tolist()
             if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
+                metadata_now = full_metadata
             else:
                 cu_seqlens_now = cu_window_seqlens
+                metadata_now = window_metadata
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                forward_metadata=metadata_now,
             )
 
         # adapter
@@ -513,8 +529,8 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         # [G, M, hidden]
         x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-        x = x[window_index, :, :]  # [G, M, hidden]
-        x = x.reshape(seq_len, -1)  # [seq_len, hidden]
+        x = x[window_index, :, :]
+        x = x.reshape(seq_len, -1)
 
         rotary_pos_emb = rotary_pos_emb.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
@@ -524,8 +540,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
-        # After building position_embeddings, make sure both cos and sin are on
-        # the same device/dtype as the attention input
         position_embeddings = (
             position_embeddings[0].to(x.device, x.dtype),
             position_embeddings[1].to(x.device, x.dtype),
