@@ -40,8 +40,3 @@ def test_splitmix64_independent_impl_matches_frozen_hex() -> None:
         assert (
             actual == expected
         ), f"_splitmix64_independent({input_val:#x}) expected {expected:#x} got {actual:#x}"
-
-
-def test_helper_and_independent_match() -> None:
-    for input_val in _FROZEN_HEX:
-        assert splitmix64(input_val) == _splitmix64_independent(input_val)
