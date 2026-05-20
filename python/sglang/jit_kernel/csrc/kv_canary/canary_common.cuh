@@ -56,11 +56,7 @@ SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t
 // multiple of 16. Combined with PyTorch's CUDA-allocator alignment (>= 256B) of src.tensor, every flat_index
 // computed here is 16B-aligned, so the uint4 load below is a single coalesced LDG.E.128.
 SGL_DEVICE void real_kv_load_uint4(
-    const RealKvSourceHandle& src,
-    int64_t slot_idx,
-    int64_t byte_offset,
-    uint64_t& word_lo,
-    uint64_t& word_hi) {
+    const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset, uint64_t& word_lo, uint64_t& word_hi) {
   const int64_t row = slot_idx / src.page_size;
   const int64_t col_within_page = slot_idx % src.page_size;
   const int64_t col = col_within_page * src.num_bytes_per_token + byte_offset;
