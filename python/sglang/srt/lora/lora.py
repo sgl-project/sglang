@@ -198,6 +198,10 @@ class LoRAAdapter(nn.Module):
 
     def _normalize_weights(self):
         for layer in self.layers:
+            # Convert PEFT 0.18+ ParamWrapper batched-MoE-expert LoRAs into
+            # SGLang's 3D-per-expert layout (must run before the others so
+            # downstream normalizers see the canonical `experts.<leaf>` names).
+            self._normalize_peft_paramwrapper_moe(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
@@ -205,10 +209,132 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            self._replicate_merged_in_proj_lora_a(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
+
+    # PEFT 0.18+ `target_parameters` save paths for batched-MoE-expert LoRA:
+    #   <parent>.experts.lora_<A|B>(.<adapter>).weight              (outer wrap)
+    #   <parent>.experts.base_layer.lora_<A|B>(.<adapter>).weight   (inner wrap)
+    # `<parent>` varies by model (LFM2 → `feed_forward`, DeepSeek → `mlp`,
+    # Mixtral → `block_sparse_moe`) so we don't anchor on it. Mixtral-style
+    # adapters that save per-expert (`...experts.<N>.<module>.lora_*`) don't
+    # match here and take SGLang's existing per-expert load path.
+    _PEFT_EXPERTS_PARAMWRAPPER_RE = re.compile(
+        r"(?P<prefix>.+?)\.experts(?P<base_layer>\.base_layer)?\.lora_(?P<ab>[AB])"
+        r"(?:\.[^.]+)?\.weight$"
+    )
+
+    # Stacked-shard count per target — for fused targets like gate_up_proj
+    # SGLang stores LoRA A with rank tiled c× along the rank dim.
+    _PEFT_LORA_STACKED_MULTIPLY = {"gate_up_proj": 2, "down_proj": 1}
+
+    def _normalize_peft_paramwrapper_moe(self, weights: Dict[str, torch.Tensor]):
+        """Rewrite PEFT 0.18+ batched-MoE-expert LoRAs into SGLang's 3D-per-expert form.
+
+        PEFT 0.18 added ``target_parameters`` for LoRA-training arbitrary
+        ``nn.Parameter`` tensors — including the batched 3D MoE expert weights
+        used by HF transformers >= 5.8 (Mixtral, DeepSeek-V2, LFM2-MoE via
+        ``@use_experts_implementation``). PEFT saves these via ``ParamWrapper``
+        as flat 2D tensors (A: ``(E*r, in)`` with experts outer; B:
+        ``(out, r*E)`` with experts inner) under names that don't match the
+        standard ``experts.<leaf>.lora_*`` convention SGLang's MoE-LoRA path
+        expects.
+
+        With two ``target_parameters``, PEFT nests the wrappers, so the first
+        listed param lands at the inner ``base_layer`` slot and the second at
+        the outer slot. We use ``adapter_config.target_parameters`` to map
+        each slot back to a leaf module name, reshape A to
+        ``(E, c*r, in)`` (c-tiled for stacked targets like ``gate_up_proj``)
+        and B to ``(E, out, r)``, and rename the key to
+        ``...experts.<leaf>.lora_*.weight`` so the existing 3D MoE load path
+        picks it up natively.
+        """
+        target_parameters = self.config.hf_config.get("target_parameters") or []
+        if not target_parameters:
+            return
+        if len(target_parameters) > 2:
+            raise ValueError(
+                "PEFT ParamWrapper compatibility supports at most 2 "
+                f"target_parameters per parent module, got: {target_parameters}"
+            )
+
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        num_experts = (
+            getattr(cfg, "num_experts", None)
+            or getattr(cfg, "num_local_experts", None)
+            or getattr(cfg, "n_routed_experts", None)
+        )
+        if num_experts is None:
+            raise ValueError(
+                "Cannot determine num_experts from base model config; needed to "
+                "reshape PEFT ParamWrapper MoE LoRA weights."
+            )
+        rank = self.config.r
+
+        for name in list(weights.keys()):
+            m = self._PEFT_EXPERTS_PARAMWRAPPER_RE.match(name)
+            if m is None:
+                continue
+            is_inner = bool(m.group("base_layer"))
+            if is_inner:
+                target_param = target_parameters[0]
+            elif len(target_parameters) >= 2:
+                target_param = target_parameters[-1]
+            else:
+                # Outer-slot weight present but only one target_parameter listed
+                # — ambiguous, leave for the loader to flag.
+                continue
+            leaf = target_param.rsplit(".", 1)[-1]
+            is_lora_A = m.group("ab") == "A"
+
+            w = weights.pop(name)
+            if is_lora_A:
+                # PEFT layout (E*r, in_features) → (E, r, in)
+                in_features = w.shape[1]
+                w = w.reshape(num_experts, rank, in_features).contiguous()
+                c = self._PEFT_LORA_STACKED_MULTIPLY.get(leaf, 1)
+                if c > 1:
+                    # SGLang's stacked-LoRA A holds [shard_0; shard_1; ...].
+                    # PEFT's fused-parameter LoRA is equivalent to stacked-LoRA
+                    # with identical A across shards — tile along the rank dim.
+                    w = w.repeat(1, c, 1).contiguous()
+            else:
+                # PEFT layout (out_features, r*E) → (E, out, r)
+                out_features = w.shape[0]
+                w = (
+                    w.reshape(out_features, rank, num_experts)
+                    .permute(2, 0, 1)
+                    .contiguous()
+                )
+            new_name = f"{m.group('prefix')}.experts.{leaf}.lora_{m.group('ab')}.weight"
+            weights[new_name] = w
+
+    def _replicate_merged_in_proj_lora_a(self, weights: Dict[str, torch.Tensor]):
+        """Tile lora_A for adapters trained against a single in_proj that the
+        base model exposes as a 3-partition ``MergedColumnParallelLinear``.
+
+        When the base model packs three equal-width projections into one
+        ``in_proj`` (e.g. a B/C/x ShortConv gate stack), the LoRA buffer
+        expects three stacked rank-r slices: A is ``(3r, hidden)``, B is
+        ``(3*hidden, r)``. Adapters trained against the merged in_proj as a
+        single Linear instead carry one shared rank-r LoRA whose B is already
+        full-width ``(3*hidden, r)`` but whose A is just ``(r, hidden)``.
+        Replicating A three times along the rank dim makes the stacked-LoRA
+        computation ``(x@A)·B`` produce an identical contribution per slice.
+        """
+        for weight_name in list(weights.keys()):
+            if ".conv.in_proj." not in weight_name or "lora_A" not in weight_name:
+                continue
+            tensor = weights[weight_name]
+            ndim = tensor.dim()
+            repeat_dims = [1] * ndim
+            repeat_dims[ndim - 2] = 3
+            weights[weight_name] = tensor.repeat(*repeat_dims)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

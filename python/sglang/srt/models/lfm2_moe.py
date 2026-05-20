@@ -525,6 +525,19 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 
+    # LoRA targets covered: attention, leading dense MLP layers, ShortConv,
+    # and the MoE router. FusedMoE expert weights are auto-wrapped via
+    # FusedMoEWithLoRA when gate_up_proj + down_proj are in target_modules
+    # (the LoRA system maps them to gate_up_proj_moe / down_proj_moe buffers).
+    supported_lora_modules = [
+        "qkv_proj",
+        "out_proj",
+        "gate_up_proj",
+        "down_proj",
+        "in_proj",
+        "gate",
+    ]
+
     def __init__(
         self,
         config: Lfm2MoeConfig,
@@ -552,6 +565,54 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return (input_dim, output_dim) for each LoRA-supported module.
+
+        Covers attention, the leading dense MLP layers (Lfm2MoeMLP), and
+        ShortConv. Does NOT cover FusedMoE experts.
+        """
+        config = self.config
+        hidden_size = config.hidden_size
+        head_dim = hidden_size // config.num_attention_heads
+        intermediate_size = config.intermediate_size
+
+        if module_name == "qkv_proj":
+            q_dim = head_dim * config.num_attention_heads
+            kv_dim = head_dim * config.num_key_value_heads
+            return hidden_size, q_dim + 2 * kv_dim
+        elif module_name == "out_proj":
+            # Same shape for attention out_proj and ShortConv out_proj.
+            return hidden_size, hidden_size
+        elif module_name == "gate_up_proj":
+            return hidden_size, 2 * intermediate_size
+        elif module_name == "down_proj":
+            return intermediate_size, hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return hidden_size, 2 * config.moe_intermediate_size
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, hidden_size
+        elif module_name == "in_proj":
+            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked).
+            return hidden_size, 3 * hidden_size
+        elif module_name == "gate":
+            # MoE router (ReplicatedLinear): hidden -> num_experts.
+            return hidden_size, config.num_experts
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        """Override the global stacked_rank for LFM2-MoE-specific shapes."""
+        if module_name == "in_proj":
+            # ShortConv in_proj packs 3 sub-projections (B, C, x). The
+            # adapter's B matrix is full-width (3*hidden); its single A
+            # gets replicated 3× by lora.py's _replicate_merged_in_proj_lora_a.
+            return 3
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
 
     @torch.no_grad()
     def forward(
