@@ -17,6 +17,23 @@ from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
 
 
 def _dsv4_packed_nope_rope_bytes_per_token(pool: object) -> int:
+    """Per-token byte width of segment A (nope_fp8 + rope_bf16) inside a DSv4 packed page.
+
+    Each DSv4 page stores tokens in a field-major two-segment layout, NOT token-major contiguous bytes:
+
+        [page i]
+          segment A: [0, page_size * 576):
+            token0 nope+rope(576B) | token1 nope+rope | ... | token_{ps-1} nope+rope
+          segment B: [page_size * 576, page_size * 584):
+            token0 scale(8B) | token1 scale | ... | token_{ps-1} scale
+          + trailing per-page padding to bytes_per_page_padded
+
+    Only segment A is token-major and therefore satisfies the RealKvSource access formula
+    (``tensor[slot // page_size, (slot % page_size) * N : ((slot % page_size) + 1) * N]``). Canary fingerprints
+    only segment A; segment B + padding fall in the trailing portion of each row and are ignored per the
+    RealKvSource contract. Corruption inside the scale segment is by design a false negative — scale is 8 of
+    584 bytes per token (~1.4%) and detecting it would require extending RealKvSource with an in-row offset.
+    """
     nbytes = (
         pool.qk_nope_head_dim + pool.qk_rope_head_dim * pool.rope_storage_dtype.itemsize
     )
@@ -32,8 +49,10 @@ def attach_dsv4(
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to a DSV4 packed pool.
 
-    FULL group covers three segments (c4 / indexer / c128) and splices into ``get_contiguous_buf_infos``;
-    SWA group is a single-segment row pool and splices into ``get_state_buf_infos``.
+    FULL group covers three sub-pools (c4 / indexer / c128) and splices into ``get_contiguous_buf_infos``;
+    SWA group covers swa_kv_pool and splices into ``get_state_buf_infos``. All real-KV sources use the
+    page-aware ``make_packed_source`` and target only the token-major segment A of each page — see
+    ``_dsv4_packed_nope_rope_bytes_per_token`` for the layout that motivates this.
     """
     full_group = _build_full_group(pool=pool, device=device, read_bytes=read_bytes)
     swa_group = _build_swa_group(pool=pool, device=device, read_bytes=read_bytes)
@@ -67,6 +86,8 @@ def _build_full_group(
             bytes_per_token=_dsv4_packed_nope_rope_bytes_per_token(c4_pool),
             read_bytes=read_bytes,
         )
+        # Indexer page mirrors c4/c128's two-segment layout: [token-major K (index_head_dim bytes/token) | scale | pad].
+        # index_head_dim is segment A's per-token byte width (K is fp8, 1B/elem); scale segment is trailing-ignored.
         + make_packed_source(
             page_buffer=indexer_buf,
             page_size=indexer_pool.page_size,
