@@ -1,8 +1,7 @@
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip

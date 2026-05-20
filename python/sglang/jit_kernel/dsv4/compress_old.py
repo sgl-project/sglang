@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+@cache_once
 def _jit_common_module() -> Module:
     return load_jit(
         make_name("common"),
