@@ -1,14 +1,3 @@
-"""Triton host wrapper for the canary plan accumulator.
-
-Defines :func:`canary_plan_step` — the single-launch Triton plan kernel
-that fills a :class:`~sglang.jit_kernel.kv_canary.verify.VerifyPlan`
-and a :class:`~sglang.jit_kernel.kv_canary.write.WritePlan` from
-ForwardBatch primitives plus optional pre-walked flat verify extras.
-
-Byte-equal pinned by
-:func:`sglang.jit_kernel.kv_canary.plan_ref.canary_plan_step_torch_reference`.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

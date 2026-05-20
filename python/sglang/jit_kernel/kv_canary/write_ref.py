@@ -1,11 +1,3 @@
-"""Torch reference implementation of canary_write_step.
-
-Per-entry Python for-loops + scalar ops. fb_out_cache_loc is consumed opaquely (SWA translation is the
-caller's responsibility); entries with slot < 0 are skipped. When pseudo_mode == ON, mismatches between
-actual fb_input_ids[i] / fb_positions[i] and the caller-supplied expected tensors record a violation but the
-chain still advances on the actual values.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -64,7 +56,6 @@ def canary_write_step_torch_reference(
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: RealKvHashMode,
 ) -> None:
-    """Torch reference for :func:`canary_write_step`. Same signature & byte-equal semantics."""
     work_device = torch.device("cpu")
 
     kernel_run_counter.add_(1)

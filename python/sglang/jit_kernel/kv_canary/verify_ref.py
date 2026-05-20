@@ -1,13 +1,3 @@
-"""Torch reference implementation of canary_verify_step.
-
-Per-entry Python for-loops + scalar ops. The CUDA kernel that eventually lands must reproduce this output
-byte-for-byte (violation_ring contents, write-index increment, counter increments).
-
-The violation row schema (8 int64 fields in fixed order) is documented at module scope in
-kv_canary/verify.py via the _VIOLATION_FIELD_* constants; readers should consume those names rather than
-indexing positionally.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -54,7 +44,6 @@ def canary_verify_step_torch_reference(
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: RealKvHashMode,
 ) -> None:
-    """Torch reference for :func:`canary_verify_step`. Same signature & byte-equal semantics."""
     work_device = torch.device("cpu")
 
     kernel_run_counter.add_(1)
@@ -185,7 +174,6 @@ def canary_verify_step_torch_reference(
 
 
 def splitmix64(value: int) -> int:
-    """Standard splitmix64 finalizer over a single uint64. Matches the CUDA splitmix64_finalize."""
     x = value & _U64_MASK
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
     x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
@@ -193,7 +181,6 @@ def splitmix64(value: int) -> int:
 
 
 def _to_signed_int64(value: int) -> int:
-    """Reinterpret an unsigned uint64 as signed int64 for torch.int64 storage."""
     value &= _U64_MASK
     if value >= _I64_SIGN_BIT:
         value -= 1 << 64
@@ -251,7 +238,6 @@ def _compute_real_kv_hash_scalar(
 
 
 def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
-    """ALL-mode fold: pack bytes into 8-byte little-endian words, splitmix64-mix into accumulator."""
     read_bytes = len(raw_bytes)
     pad = (8 - read_bytes % 8) % 8
     padded = raw_bytes + [0] * pad
@@ -273,7 +259,6 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
 
 
 def _splitmix64_finalize_vec(words: torch.Tensor) -> torch.Tensor:
-    """Vectorised splitmix64 finalizer on a flat int64 tensor."""
     x = words
     x = _xor_shift_mul(x, 30, _to_signed_int64(0xBF58476D1CE4E5B9))
     x = _xor_shift_mul(x, 27, _to_signed_int64(0x94D049BB133111EB))
@@ -282,14 +267,12 @@ def _splitmix64_finalize_vec(words: torch.Tensor) -> torch.Tensor:
 
 
 def _xor_shift_mul(x: torch.Tensor, shift: int, multiplier_signed: int) -> torch.Tensor:
-    """Compute ((x ^ (x >>L shift)) * multiplier) mod 2**64, returning signed int64."""
     shifted = _logical_shr(x, shift)
     mixed = x ^ shifted
     return mixed * multiplier_signed
 
 
 def _logical_shr(x: torch.Tensor, shift: int) -> torch.Tensor:
-    """Logical (unsigned) right shift on a signed int64 tensor."""
     if shift == 0:
         return x
     mask = (1 << (64 - shift)) - 1
@@ -302,7 +285,6 @@ def _splitmix64_mix4_vec(
     position: torch.Tensor,
     real_kv_hash: torch.Tensor,
 ) -> torch.Tensor:
-    """4-arg chain step: XOR all four uint64 inputs, then splitmix64-finalize."""
     combined = prev_hash ^ token ^ position ^ real_kv_hash
     return _splitmix64_finalize_vec(combined)
 
@@ -314,7 +296,6 @@ def _compute_real_kv_hash_vec(
     real_kv_hash_mode: RealKvHashMode,
     work_device: torch.device,
 ) -> torch.Tensor:
-    """Compute one int64 real-KV fingerprint per slot, delegating to scalar helper per entry."""
     num_entries = int(slot_indices.shape[0])
     acc = torch.zeros(num_entries, dtype=torch.int64, device=work_device)
     mode = int(real_kv_hash_mode)

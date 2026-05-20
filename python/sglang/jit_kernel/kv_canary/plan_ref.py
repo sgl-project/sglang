@@ -1,9 +1,3 @@
-"""Python reference for :func:`canary_plan_step`.
-
-Per-req Python for-loops + scalar ops. Pinned byte-for-byte against the Triton implementation in
-:mod:`sglang.jit_kernel.kv_canary.plan`.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -110,7 +104,6 @@ def canary_plan_step_torch_reference(
 
 
 def _swa_translate_slot(*, slot: int, lut: torch.Tensor) -> int:
-    """Translate a single full-pool slot index to its SWA-pool equivalent via lut."""
     if slot < 0:
         return slot
     lut_len = int(lut.shape[0])
