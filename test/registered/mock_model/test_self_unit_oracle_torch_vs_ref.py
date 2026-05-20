@@ -26,8 +26,7 @@ class TestHashOracleTorchVsRef(CustomTestCase):
             positions.append(rng.randrange(0, 1 << 60))
 
         ref_tokens: list[int] = [
-            splitmix64(req_ids[i] ^ positions[i]) % vocab_size
-            for i in range(num_cases)
+            splitmix64(req_ids[i] ^ positions[i]) % vocab_size for i in range(num_cases)
         ]
 
         oracle = HashOracle(vocab_size=vocab_size)
@@ -57,8 +56,7 @@ class TestHashOracleTorchVsRef(CustomTestCase):
         req_ids = [rng.randrange(0, 1 << 60) for _ in range(num_cases)]
         positions = [rng.randrange(0, 1 << 60) for _ in range(num_cases)]
         ref_tokens = [
-            splitmix64(req_ids[i] ^ positions[i]) % vocab_size
-            for i in range(num_cases)
+            splitmix64(req_ids[i] ^ positions[i]) % vocab_size for i in range(num_cases)
         ]
 
         oracle = HashOracle(vocab_size=vocab_size)
