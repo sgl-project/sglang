@@ -44,17 +44,9 @@ class TestNoPerturbNoViolation(_MhaFullBase, unittest.TestCase):
 
 
 class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
-    # Override base --kv-canary "raise" → "on" so the perturb-triggered violation
-    # is captured in server stderr without SIGQUIT killing the process mid-flush
-    # (extra_server_args is appended after base --kv-canary, argparse last wins).
-    extra_server_args: ClassVar[List[str]] = [
-        "--json-model-override-args",
-        _NUM_LAYERS_OVERRIDE,
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
-        "--kv-canary",
-        "on",
-    ]
+    # Use --kv-canary log (not raise) so the perturb-triggered violation is
+    # captured in server stderr without SIGQUIT killing the process mid-flush.
+    kv_canary_mode: ClassVar[str] = "log"
     perturb_prob: ClassVar[float] = 0.05
 
     def test_perturb_req_to_token_detects_violation(self) -> None:

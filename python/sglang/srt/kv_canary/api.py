@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
-from sglang.srt.kv_canary.pool_patch.utils import _wrap_method
+from sglang.srt.kv_canary.pool_patch.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
@@ -152,7 +152,7 @@ def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -
         runner.launch_tail_kernels(forward_batch)
         return output
 
-    _wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
+    wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
 
 
 def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:

@@ -14,7 +14,7 @@ from sglang.srt.kv_canary.pool_patch.api import (
     attach_canary_buffers,
     get_canary_buffer_groups,
 )
-from sglang.srt.kv_canary.pool_patch.utils import _make_row_source
+from sglang.srt.kv_canary.pool_patch.utils import make_row_source
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,
@@ -23,7 +23,6 @@ from sglang.test.kv_canary.fixtures import (
     make_mha_pool,
     make_mla_pool,
     make_swa_pool,
-    patch_fake_pool_helpers,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,9 +33,6 @@ class TestSelfUnitPoolPatch(CustomTestCase):
     def setUp(self):
         self.device = CPU_DEVICE
         self.config = make_base_config()
-        self._patch_ctx = patch_fake_pool_helpers()
-        self._patch_ctx.__enter__()
-        self.addCleanup(self._patch_ctx.__exit__, None, None, None)
 
     def test_canary_buffer_group_allocate_full_only(self):
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
@@ -79,7 +75,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
 
     def test_real_kv_sources_below_4(self):
         layer = torch.zeros(8, 16, dtype=torch.float16, device=self.device)
-        sources = _make_row_source(layer_buffer=layer, read_bytes=4)
+        sources = make_row_source(layer_buffer=layer, read_bytes=4)
         self.assertGreater(len(sources), 0)
         self.assertLessEqual(len(sources), _MAX_REAL_KV_SOURCES)
 
