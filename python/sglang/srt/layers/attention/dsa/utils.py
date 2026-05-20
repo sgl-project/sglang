@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     get_attention_dp_rank,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -35,14 +36,15 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
     The result is cached so the cost is paid once per process.
 
-    Set ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
+    Set ``SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
     the gluon kernel would otherwise be available (useful for CI bisection).
+    ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE`` is a deprecated alias.
     """
     if not is_hip():
         return False
     if not get_bool_env_var("SGLANG_USE_AITER"):
         return False
-    if get_bool_env_var("SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"):
+    if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
         return False
     if get_bool_env_var("AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS"):
         return True

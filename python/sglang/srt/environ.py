@@ -469,6 +469,9 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
+    )
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
 
     # sgl-kernel

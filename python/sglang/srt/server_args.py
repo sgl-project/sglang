@@ -1838,7 +1838,7 @@ class ServerArgs:
                     if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
                         # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
-                        # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
+                        # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
                         self.page_size = 1
                         logger.warning(
                             "Setting page size to 1 for DeepSeek DSA on ROCm "
