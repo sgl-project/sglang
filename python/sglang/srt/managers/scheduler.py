@@ -2245,7 +2245,7 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        batch.output_ids = torch.tensor(
+        batch.input_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
 
@@ -2862,8 +2862,9 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                # Placeholder for next iter's resolve_future to look up the
+                # real token from token_ids_buf via the negated indices.
+                batch.input_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
@@ -2877,7 +2878,8 @@ class Scheduler(
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                future_indices_or_next_token_ids = batch_result.next_token_ids
+                if isinstance(batch_result.next_token_ids, torch.Tensor):
+                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -2887,14 +2889,11 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                future_indices_or_next_token_ids = batch_result.next_token_ids
+                # PP intermediate ranks return None; DLLM returns a per-req list.
+                # Only the tensor case maps onto batch.input_ids as next-iter input.
+                if isinstance(batch_result.next_token_ids, torch.Tensor):
+                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
-
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3433,16 +3432,12 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        decode_req.req.finished_reason = FINISH_ABORT()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        decode_req.req.finished_reason = FINISH_ABORT()
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
