@@ -13,6 +13,15 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.lora.deepseek_mla_correction import (
+    apply_q_correction as apply_kv_b_lora_q_correction,
+)
+from sglang.srt.lora.deepseek_mla_correction import (
+    apply_v_correction as apply_kv_b_lora_v_correction,
+)
+from sglang.srt.lora.deepseek_mla_correction import (
+    is_kv_b_lora_active,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -26,6 +35,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
@@ -61,9 +73,39 @@ if _is_cuda:
 
 
 if _use_aiter:
-    from aiter.ops.fused_qk_norm_rope_cache_quant import (
-        fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-    )
+    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+    # requiring the docker pin to be bumped atomically.
+    try:
+        from aiter.ops.enum import QuantType as _AiterQuantType
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+        )
+
+        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+            q_out = torch.empty_like(q)
+            k_out = torch.empty_like(k)
+            _aiter_fused_qk_rmsnorm_unified(
+                q_out_quantized=q_out,
+                k_out=k_out,
+                q=q,
+                q_weight=q_weight,
+                q_epsilon=q_eps,
+                k=k,
+                k_weight=k_weight,
+                k_epsilon=k_eps,
+                quant_type=_AiterQuantType.No,
+            )
+            return q_out, k_out
+
+    except ImportError:
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+        )
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
@@ -205,7 +247,11 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    topk_indices = prev_topk_indices
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -220,7 +266,9 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = prev_topk_indices
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -311,12 +359,16 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+        if is_kv_b_lora_active(self):
+            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+        skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
+            and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -376,25 +428,55 @@ class DeepseekMLAForwardMixin:
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
                 )
-                q_nope_fused = q_cat[..., : self.kv_lora_rank]
-                q_pe_fused = q_cat[..., self.kv_lora_rank :]
                 save_kv_cache = False
-                if llama_4_scaling is not None:
-                    q_nope_fused *= llama_4_scaling
-                attn_output = self.attn_mqa(
-                    q_nope_fused,
-                    None,
-                    None,
-                    forward_batch,
-                    q_rope=q_pe_fused,
-                    k_rope=k_pe_fused,
-                    save_kv_cache=save_kv_cache,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
-                )
+                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
+                # nsa_backend.forward_decode reuses q_cat as a zero-copy view
+                # (`q.contiguous().view(...)` fast-path) instead of running the
+                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
+                # that would otherwise rebuild a tensor byte-identical to q_cat.
+                # On ROCm tilelang decode, this eliminates the
+                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
+                # fire once per layer per decode step (~2.6 us / layer saved).
+                # Prefill keeps the split form because nsa_backend.forward_extend
+                # asserts `q_rope is not None`.
+                if forward_batch.forward_mode.is_decode_or_idle():
+                    if llama_4_scaling is not None:
+                        # llama_4_scaling applies only to the q_nope portion;
+                        # mutate in place via the slice view of q_cat.
+                        q_cat[..., : self.kv_lora_rank] *= llama_4_scaling
+                    attn_output = self.attn_mqa(
+                        q_cat,
+                        None,
+                        None,
+                        forward_batch,
+                        q_rope=None,
+                        k_rope=k_pe_fused,
+                        save_kv_cache=save_kv_cache,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
+                else:
+                    q_nope_fused = q_cat[..., : self.kv_lora_rank]
+                    q_pe_fused = q_cat[..., self.kv_lora_rank :]
+                    if llama_4_scaling is not None:
+                        q_nope_fused *= llama_4_scaling
+                    attn_output = self.attn_mqa(
+                        q_nope_fused,
+                        None,
+                        None,
+                        forward_batch,
+                        q_rope=q_pe_fused,
+                        k_rope=k_pe_fused,
+                        save_kv_cache=save_kv_cache,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
             else:
                 extra_args = {}
                 if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -580,6 +662,10 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        if is_kv_b_lora_active(self):
+            attn_bmm_output = apply_kv_b_lora_v_correction(
+                self, attn_output, attn_bmm_output
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
@@ -604,7 +690,7 @@ class DeepseekMLAForwardMixin:
             ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
 
         return (
-            self.current_attention_backend == "trtllm_mla"
+            self.current_attention_backend in ("trtllm_mla", "tokenspeed_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -624,4 +710,16 @@ class DeepseekMLAForwardMixin:
                 server_args.nsa_decode_backend == "tilelang"
                 or server_args.nsa_prefill_backend == "tilelang"
             )
+        )
+
+    def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
+        when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
+        that calls fused_qk_rope_cat_and_cache_mla).
+        """
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )

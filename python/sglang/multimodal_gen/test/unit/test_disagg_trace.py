@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import unittest
 
+import torch
+
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
     extract_transfer_fields,
@@ -74,6 +76,43 @@ def _roundtrip_scalar_fields(scalar_fields: dict) -> dict:
 
 
 class TestDisaggTracePropagation(unittest.TestCase):
+    def test_transfer_keeps_seed_needed_to_rebuild_generator(self):
+        req = Req(request_id="test-seed", prompt="x")
+        req.generator = torch.Generator(device="cpu").manual_seed(req.seed)
+
+        _, scalar_fields = extract_transfer_fields(req)
+
+        self.assertEqual(scalar_fields["seed"], 42)
+
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(None, dict(scalar_fields), {})
+        self.assertIsInstance(rebuilt.generator, torch.Generator)
+        self.assertEqual(rebuilt.seed, 42)
+
+        expected = torch.rand(
+            (), generator=torch.Generator(device="cpu").manual_seed(42)
+        )
+        actual = torch.rand((), generator=rebuilt.generator)
+        self.assertEqual(actual.item(), expected.item())
+
+    def test_build_disagg_req_rebuilds_generator_list(self):
+        scalar_fields = {
+            "request_id": "test-seed-list",
+            "prompt": "x",
+            "num_outputs_per_prompt": 2,
+            "seed": [11, 12],
+        }
+
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(None, dict(scalar_fields), {})
+
+        self.assertEqual(rebuilt.seed, [11, 12])
+        self.assertEqual(len(rebuilt.generator), 2)
+        for seed, generator in zip(rebuilt.seed, rebuilt.generator):
+            expected = torch.rand(
+                (), generator=torch.Generator(device="cpu").manual_seed(seed)
+            )
+            actual = torch.rand((), generator=generator)
+            self.assertEqual(actual.item(), expected.item())
+
     def test_tracing_disabled_omits_trace_state(self):
         """With a default TraceNullContext Req, no _trace_state is emitted and
         the JSON codec does not encounter any live OTel objects."""

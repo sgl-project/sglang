@@ -150,3 +150,12 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
         )
         return radio_config
+
+
+class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
+    model_type = "NemotronH_Nano_Omni_Reasoning_V3"
+
+    def __init__(self, *args, **kwargs):
+        # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
+        # replacing the parent's custom __init__ with a dataclass-generated one.
+        super().__init__(*args, **kwargs)

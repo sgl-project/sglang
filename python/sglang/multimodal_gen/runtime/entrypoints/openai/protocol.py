@@ -44,7 +44,7 @@ class ImageGenerationsRequest(BaseModel):
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
-    seed: Optional[Union[int, List[int]]] = 1024
+    seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     negative_prompt: Optional[str] = None
     output_quality: Optional[str] = "default"
@@ -93,7 +93,7 @@ class VideoGenerationsRequest(BaseModel):
     size: Optional[str] = ""
     fps: Optional[int] = None
     num_frames: Optional[int] = None
-    seed: Optional[Union[int, List[int]]] = 1024
+    seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     width: Optional[int] = None

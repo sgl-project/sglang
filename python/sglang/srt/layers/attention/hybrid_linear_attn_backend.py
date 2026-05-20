@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -140,6 +141,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -150,6 +152,28 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
+        """Run deferred clear/COW ops on the forward stream to avoid races."""
+        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+            return
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.clear_slots(
+                forward_batch.mamba_clear_indices
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.copy_from(
+                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
+            )
+        forward_batch.mamba_clear_indices = None
+        forward_batch.mamba_cow_src_indices = None
+        forward_batch.mamba_cow_dst_indices = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -240,6 +264,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
     def _init_track_conv_indices(
@@ -645,6 +670,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self.mamba_chunk_size = config.mamba_chunk_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,
@@ -737,6 +763,20 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+
+    def _is_full_attn(
+        self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
+    ) -> bool:
+        # Dispatch by the layer's runtime type
+        if isinstance(layer, RadixLinearAttention):
+            return False
+        if isinstance(layer, RadixAttention):
+            return True
+
+        if layer is not None:
+            layer_id = layer.layer_id
+        assert layer_id is not None, "either layer or layer_id must be provided"
+        return layer_id in self.full_attn_layers
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
@@ -839,8 +879,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        if layer_id in self.full_attn_layers:
+        if self._is_full_attn(layer, kwargs.get("layer_id")):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
@@ -871,8 +910,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        if layer_id in self.full_attn_layers:
+        if self._is_full_attn(layer, kwargs.get("layer_id")):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
@@ -903,8 +941,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        is_linear_attn = layer_id not in self.full_attn_layers
+        is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
@@ -941,7 +978,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        accepted_steps: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
@@ -955,7 +992,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = accepted_steps.shape[0]
+        request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -978,13 +1015,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             ssm_states,
             intermediate_state_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
 
         # Track indices used for tracking mamba states for prefix cache

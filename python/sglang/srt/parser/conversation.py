@@ -35,7 +35,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, read_system_prompt_from_file
+from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -97,7 +97,7 @@ class Conversation:
     audio_token: str = "<audio>"
 
     image_data: Optional[List[ImageData]] = None
-    video_data: Optional[List[str]] = None
+    video_data: Optional[List[Union[str, VideoData]]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -413,9 +413,14 @@ class Conversation:
         """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str):
+    def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
-        self.video_data.append(video)
+        if preprocess_kwargs:
+            self.video_data.append(
+                VideoData(video, preprocess_kwargs=preprocess_kwargs)
+            )
+        else:
+            self.video_data.append(video)
 
     def append_audio(self, audio: str):
         """Append a new audio."""
@@ -1145,10 +1150,19 @@ def match_qwen_chat_ml(model_path: str):
 
 @register_conv_template_matching_function
 def match_minicpm(model_path: str):
+    # MiniCPM-V 4.6+ uses its own chat_template.jinja with `<|image_pad|>` and
+    # must NOT fall back to the legacy `minicpmv` conv template (which encodes
+    # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
+    model_type = get_model_type(model_path)
+    if model_type == "minicpmv4_6":
+        return None
+    # For HF-hub paths (where config.json isn't on local disk yet), fall back
+    # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
+    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+        return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
-    model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 

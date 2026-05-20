@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
 
 # Copyright 2023 The vLLM team.
@@ -250,6 +252,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        recovered_rank: bool = False,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -288,13 +291,13 @@ class GroupCoordinator:
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks),
+                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
                     timeout=subgroup_timeout,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
                     timeout=subgroup_timeout,
                 )
             else:
@@ -443,7 +446,8 @@ class GroupCoordinator:
         )
 
         self.mq_broadcaster: Optional[MessageQueue] = None
-        if use_message_queue_broadcaster and self.world_size > 1:
+        if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
+            # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
@@ -627,6 +631,20 @@ class GroupCoordinator:
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
+        else:
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
+
+    def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """
+        User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            return self.npu_communicator.quant_all_reduce(input_)
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
@@ -1385,7 +1403,7 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1399,6 +1417,7 @@ def init_world_group(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="world",
+        recovered_rank=recovered_rank,
     )
 
 
@@ -1412,6 +1431,7 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    recovered_rank: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1436,6 +1456,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        recovered_rank=recovered_rank,
     )
 
 
@@ -1540,9 +1561,10 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+    ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
             for group in (_MOE_EP, _MOE_TP):
@@ -1579,7 +1601,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "xpu": "xccl",
     "hpu": "hccl",
     "cpu": "gloo",
-    "npu": "hccl",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
 }
 
@@ -1651,6 +1673,7 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: Optional[int] = None,
     moe_a2a_backend: Optional[str] = None,
+    recovered_rank: bool = False,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1681,8 +1704,17 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
+
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
-        pg_options = get_torch_distributed_pg_options()
+
+        if backend == "mooncake":
+            from mooncake.ep import MooncakeBackendOptions
+
+            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
+            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
+            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+        else:
+            pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(
@@ -1711,7 +1743,9 @@ def init_distributed_environment(
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, local_rank, backend)
+        _WORLD = init_world_group(
+            ranks, local_rank, backend, recovered_rank=recovered_rank
+        )
     else:
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
@@ -1728,6 +1762,7 @@ def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
+    recovered_rank: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1806,6 +1841,7 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
+        recovered_rank=recovered_rank,
     )
 
     if duplicate_tp_group:
@@ -1819,6 +1855,7 @@ def initialize_model_parallel(
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
+            recovered_rank=recovered_rank,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1857,6 +1894,7 @@ def initialize_model_parallel(
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
+            recovered_rank=recovered_rank,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -1892,6 +1930,7 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -1922,6 +1961,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="moe_dp",
+            recovered_rank=recovered_rank,
         )
 
     global _MOE_EP
@@ -1948,6 +1988,7 @@ def initialize_model_parallel(
             use_pynccl=False,
             use_custom_allreduce=False,
             group_name="moe_ep",
+            recovered_rank=recovered_rank,
         )
 
     global _MOE_TP
@@ -1975,6 +2016,7 @@ def initialize_model_parallel(
             use_pynccl=False,
             use_custom_allreduce=False,
             group_name="moe_tp",
+            recovered_rank=recovered_rank,
         )
 
     # Build the pipeline model-parallel groups.
@@ -1994,6 +2036,7 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+        recovered_rank=recovered_rank,
     )
 
 
