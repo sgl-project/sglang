@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import pickle
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Type
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import zmq
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
@@ -38,48 +39,13 @@ from sglang.srt.steppable_engine.views import (
     CanaryWritePlanView,
     SteppableReqHandle,
 )
-from sglang.utils import TypeBasedDispatcher
 
 logger = logging.getLogger(__name__)
 
 
-_MSG_TO_RESP: Dict[Type, Type] = {
-    CanaryViolationsReq: CanaryViolationsResp,
-    AllocatorStatsReq: AllocatorStatsResp,
-    BlockTableReq: BlockTableResp,
-    OutputHistoryReq: OutputHistoryResp,
-    IsActiveReq: IsActiveResp,
-    ActiveReqsReq: ActiveReqsResp,
-    LastWritePlanReq: LastWritePlanResp,
-    CanaryOverheadPctReq: CanaryOverheadPctResp,
-}
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SteppableEngineConfig:
-    model: str = "Qwen/Qwen3-0.6B"
-    num_hidden_layers: int = 1
-    tp_size: int = 1
-    pp_size: int = 1
-    mem_fraction_static: float = 0.65
-    cuda_graph: bool = True
-    enable_overlap: bool = True
-    multimodal: bool = False
-    radix_cache: bool = False
-    speculative_algorithm: Optional[str] = None
-    disagg_prefill_decode: bool = False
-
-    mock_model: bool = True
-    oracle_seed: int = 0xC0FFEE
-
-    canary_full: bool = False
-    canary_real_data: str = "off"
-    sweep_every_n: int = 0
-
     apply_pr_25015_fix: Optional[bool] = None
-
-    scripted_pr_scenario: Optional[int] = None
-    extra_server_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 class SteppableEngine:
@@ -88,45 +54,29 @@ class SteppableEngine:
         self._config = config
         self._engine = engine
         self._shutdown_done = False
-        self._pending_resps: Dict[Type, asyncio.Future] = {}
-        self._install_response_dispatchers()
 
     @classmethod
     def launch(
         cls,
-        config: Optional[SteppableEngineConfig] = None,
-        /,
-        **kwargs: Any,
+        *,
+        apply_pr_25015_fix: Optional[bool] = None,
+        **engine_kwargs: Any,
     ) -> "SteppableEngine":
-        if config is not None and kwargs:
-            raise ValueError("launch: pass either config OR kwargs, not both")
-        if config is None:
-            config = SteppableEngineConfig(**kwargs)
-
-        cls._validate_config(config)
-
-        server_kwargs = cls._build_server_kwargs(config)
-        engine = Engine(**server_kwargs)
+        engine = Engine(**engine_kwargs)
         cls._validate_server_args(engine)
 
+        config = SteppableEngineConfig(apply_pr_25015_fix=apply_pr_25015_fix)
         instance = cls(config=config, engine=engine)
         instance._enter_stepping_mode()
         return instance
 
     @staticmethod
-    def _validate_config(config: SteppableEngineConfig) -> None:
-        if config.tp_size != 1 or config.pp_size != 1:
+    def _validate_server_args(engine: Engine) -> None:
+        server_args = engine.server_args
+        if server_args.tp_size != 1 or server_args.pp_size != 1:
             raise NotImplementedError(
                 "tp_size>1 / pp_size>1 is not supported (single-GPU only)"
             )
-        if config.multimodal:
-            raise NotImplementedError("multimodal=True is not supported")
-        if config.disagg_prefill_decode:
-            raise NotImplementedError("disagg_prefill_decode=True is not supported")
-
-    @staticmethod
-    def _validate_server_args(engine: Engine) -> None:
-        server_args = engine.server_args
         if server_args.attn_cp_size != 1:
             raise NotImplementedError(
                 "attn_cp_size>1 is not supported (single-GPU only)"
@@ -134,62 +84,15 @@ class SteppableEngine:
         if server_args.enable_dp_attention:
             raise NotImplementedError("enable_dp_attention=True is not supported")
 
-    @staticmethod
-    def _build_server_kwargs(config: SteppableEngineConfig) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {
-            "model_path": config.model,
-            "mem_fraction_static": config.mem_fraction_static,
-            "tp_size": config.tp_size,
-            "pp_size": config.pp_size,
-            "disable_cuda_graph": not config.cuda_graph,
-            "disable_radix_cache": not config.radix_cache,
-            "disable_overlap_schedule": not config.enable_overlap,
-            "skip_tokenizer_init": True,
-        }
-        if config.speculative_algorithm is not None:
-            kwargs["speculative_algorithm"] = config.speculative_algorithm
-        if config.mock_model:
-            kwargs["mock_model_enabled"] = True
-            kwargs["num_hidden_layers_override"] = config.num_hidden_layers
-        if config.canary_full:
-            kwargs["kv_canary"] = "raise"
-        kwargs["kv_canary_real_data"] = config.canary_real_data
-        kwargs["kv_canary_real_data_sweep_every_n_steps"] = config.sweep_every_n
-        kwargs.update(config.extra_server_kwargs)
-        return kwargs
-
-    def _install_response_dispatchers(self) -> None:
-        tm = self._engine.tokenizer_manager
-        pairs = [
-            (resp_type, self._make_resp_handler(resp_type))
-            for resp_type in _MSG_TO_RESP.values()
-        ]
-        tm._result_dispatcher += TypeBasedDispatcher(pairs)
-
-    def _make_resp_handler(self, resp_type: Type):
-        def handler(resp: Any) -> None:
-            future = self._pending_resps.pop(resp_type, None)
-            if future is None:
-                logger.warning(
-                    "received unexpected %s with no pending future", resp_type.__name__
-                )
-                return
-            if not future.done():
-                future.set_result(resp)
-
-        return handler
-
     def _enter_stepping_mode(self) -> None:
         self._apply_pr_fix_toggles()
-        self._send_to_scheduler(EnterSteppingModeReq())
+        self._rpc(EnterSteppingModeReq())
 
     def _apply_pr_fix_toggles(self) -> None:
         if self._config.apply_pr_25015_fix is None:
             return
         choices: Dict[int, Optional[bool]] = {25015: self._config.apply_pr_25015_fix}
-        self._send_to_scheduler(
-            _ApplyPrFixTogglesReq(choices_pickled=pickle.dumps(choices))
-        )
+        self._rpc(_ApplyPrFixTogglesReq(choices_pickled=pickle.dumps(choices)))
 
     def __enter__(self) -> "SteppableEngine":
         return self
@@ -204,10 +107,6 @@ class SteppableEngine:
             self._engine.shutdown()
         finally:
             self._shutdown_done = True
-            for future in list(self._pending_resps.values()):
-                if not future.done():
-                    future.cancel()
-            self._pending_resps.clear()
 
     def _check_alive(self) -> None:
         if self._shutdown_done:
@@ -229,7 +128,7 @@ class SteppableEngine:
             token_ids_logprob=[],
             stream=False,
         )
-        self._send_to_scheduler(req)
+        self._engine.tokenizer_manager.send_to_scheduler.send_pyobj(req)
         return SteppableReqHandle(
             rid=rid,
             prompt_len=len(prompt),
@@ -238,7 +137,7 @@ class SteppableEngine:
 
     def step(self) -> None:
         self._check_alive()
-        self._send_to_scheduler(StepReq())
+        self._rpc(StepReq())
 
     def step_until(self, handle: SteppableReqHandle, n: int) -> None:
         self._check_alive()
@@ -322,36 +221,9 @@ class SteppableEngine:
         from sglang.srt.steppable_engine.perturb import validate_channel_kind
 
         validate_channel_kind(channel=channel, kind=kind)
-        self._send_to_scheduler(
-            InjectPerturbationReq(channel=channel, kind=kind, rank=rank)
-        )
+        self._rpc(InjectPerturbationReq(channel=channel, kind=kind, rank=rank))
 
-    def _send_to_scheduler(self, msg: Any) -> None:
-        self._engine.tokenizer_manager.send_to_scheduler.send_pyobj(msg)
-
-    def _rpc(self, msg: Any, timeout_s: float = 30.0) -> Any:
-        resp_type = _MSG_TO_RESP[type(msg)]
-        return self._engine.loop.run_until_complete(
-            self._rpc_async(msg=msg, resp_type=resp_type, timeout_s=timeout_s)
-        )
-
-    async def _rpc_async(self, *, msg: Any, resp_type: Type, timeout_s: float) -> Any:
-        tm = self._engine.tokenizer_manager
-        tm.auto_create_handle_loop()
-        if resp_type in self._pending_resps:
-            raise RuntimeError(
-                f"_rpc: a previous {resp_type.__name__} is still pending"
-            )
-
-        future: asyncio.Future = self._engine.loop.create_future()
-        self._pending_resps[resp_type] = future
-
-        self._send_to_scheduler(msg)
-
-        try:
-            return await asyncio.wait_for(future, timeout=timeout_s)
-        except asyncio.TimeoutError as exc:
-            self._pending_resps.pop(resp_type, None)
-            raise TimeoutError(
-                f"_rpc: timed out waiting for {resp_type.__name__} after {timeout_s}s"
-            ) from exc
+    def _rpc(self, msg: Any) -> Any:
+        sock = self._engine.send_to_rpc
+        sock.send_pyobj(msg)
+        return sock.recv_pyobj(zmq.BLOCKY)

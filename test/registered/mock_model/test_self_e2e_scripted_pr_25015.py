@@ -14,9 +14,11 @@ def _fake_prompt(length: int) -> list[int]:
 
 def test_eagle_positions_misalign_regression() -> None:
     engine = SteppableEngine.launch(
-        model="Qwen/Qwen3-0.6B",
-        num_hidden_layers=1,
+        model_path="Qwen/Qwen3-0.6B",
+        mock_model_enabled=True,
+        num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
+        kv_canary="raise",
         apply_pr_25015_fix=False,
     )
     req = engine.admit(prompt=_fake_prompt(64), max_new_tokens=4)
@@ -31,9 +33,11 @@ def test_eagle_positions_misalign_regression() -> None:
 
 def test_eagle_positions_match_with_fix() -> None:
     engine = SteppableEngine.launch(
-        model="Qwen/Qwen3-0.6B",
-        num_hidden_layers=1,
+        model_path="Qwen/Qwen3-0.6B",
+        mock_model_enabled=True,
+        num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
+        kv_canary="raise",
         apply_pr_25015_fix=True,
     )
     req = engine.admit(prompt=_fake_prompt(64), max_new_tokens=4)

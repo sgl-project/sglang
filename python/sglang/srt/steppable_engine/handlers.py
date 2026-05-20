@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import pickle
 import types
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.api import get_canary_runner
+from sglang.srt.managers.io_struct import RpcReqOutput
 from sglang.srt.steppable_engine.messages import (
     ActiveReqsReq,
     ActiveReqsResp,
@@ -62,11 +63,27 @@ def install_steppable_handlers(scheduler: "Scheduler") -> None:
     ]
 
     bound_pairs = [
-        (msg_type, types.MethodType(fn, scheduler)) for msg_type, fn in handler_specs
+        (msg_type, _wrap_steppable_handler(scheduler, fn))
+        for msg_type, fn in handler_specs
     ]
     scheduler._request_dispatcher += TypeBasedDispatcher(bound_pairs)
 
     scheduler._steppable_handlers_installed = True
+
+
+def _wrap_steppable_handler(
+    scheduler: "Scheduler", fn: Callable[["Scheduler", Any], Any]
+) -> Callable[[Any], None]:
+    bound = types.MethodType(fn, scheduler)
+
+    def wrapper(req: Any) -> None:
+        resp = bound(req)
+        if resp is None:
+            resp = RpcReqOutput(success=True, message="")
+        scheduler.recv_from_rpc.send_pyobj(resp)
+        return None
+
+    return wrapper
 
 
 def _handle_canary_violations(

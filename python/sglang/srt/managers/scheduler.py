@@ -1870,6 +1870,9 @@ class Scheduler(
 
             for k, msg in enumerate(self._stepping_queue):
                 if isinstance(msg, StepReq):
+                    self.recv_from_rpc.send_pyobj(
+                        RpcReqOutput(success=True, message="")
+                    )
                     ret = self._stepping_queue[:k]
                     self._stepping_queue = self._stepping_queue[k + 1 :]
                     return ret
@@ -1877,8 +1880,9 @@ class Scheduler(
             time.sleep(0.01)
             self._stepping_queue.extend(self._drain_zmq_nonblock())
 
-    def _handle_enter_stepping_mode(self, req: EnterSteppingModeReq) -> None:
+    def _handle_enter_stepping_mode(self, req: EnterSteppingModeReq) -> RpcReqOutput:
         self._stepping_mode = True
+        return RpcReqOutput(success=True, message="")
 
     def _steppable_lookup_req(self, rid: str) -> Optional[Req]:
         for r in self.waiting_queue:
