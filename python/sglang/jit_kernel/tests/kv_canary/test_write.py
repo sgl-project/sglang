@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Callable
+
 import pytest
 import torch
 
@@ -152,6 +155,58 @@ def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
         torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _WriteSingleSlotInput:
+    token: int = 42
+    position: int = 0
+    pseudo_mode: CanaryPseudoMode = CanaryPseudoMode.OFF
+    real_kv_sources: tuple[RealKvSource, ...] = ()
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
+
+
+def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
+    cuda_buf, ref_buf = _setup_pair()
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor([case.token], dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor([case.position], dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    sources_cuda = case.real_kv_sources
+    sources_ref = tuple(
+        RealKvSource(
+            tensor=s.tensor.clone(),
+            page_size=s.page_size,
+            num_bytes_per_token=s.num_bytes_per_token,
+            read_bytes=s.read_bytes,
+        )
+        for s in case.real_kv_sources
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=case.pseudo_mode,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=case.real_kv_hash_mode,
     )
 
 
@@ -1185,7 +1240,9 @@ def test_mock_violation_bit_injection_position_matrix(
 
     found = False
     for row_idx in range(int(cuda_log.write_index[0].item())):
-        fail_bits = int(cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+        fail_bits = int(
+            cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item()
+        )
         row_slot = int(cuda_log.ring[row_idx, 1].item())
         if (fail_bits & expected_bit) and row_slot == corrupt_slot:
             found = True
@@ -1261,15 +1318,15 @@ def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
         stored_token, stored_position, stored_prev_hash, _ = read_slot_fields(
             canary_buf=cuda_buf, slot_idx=i
         )
-        assert stored_token == tokens_int[i], (
-            f"slot {i}: stored_token={stored_token} expected={tokens_int[i]}"
-        )
-        assert stored_position == positions_int[i], (
-            f"slot {i}: stored_position={stored_position} expected={positions_int[i]}"
-        )
-        assert stored_prev_hash == expected_signed[i], (
-            f"slot {i}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
-        )
+        assert (
+            stored_token == tokens_int[i]
+        ), f"slot {i}: stored_token={stored_token} expected={tokens_int[i]}"
+        assert (
+            stored_position == positions_int[i]
+        ), f"slot {i}: stored_position={stored_position} expected={positions_int[i]}"
+        assert (
+            stored_prev_hash == expected_signed[i]
+        ), f"slot {i}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
 
 
 def _hand_fold_bit_write(raw_bytes: bytes) -> int:
@@ -1306,15 +1363,24 @@ def _hand_fold_all_write(raw_bytes: bytes) -> int:
     return _sm64(0 ^ source_hash)
 
 
-@pytest.mark.parametrize("hardcoded", [True])
-def test_real_kv_hash_bit_mode_writes_expected_hash_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
+@pytest.mark.parametrize(
+    "mode,fold_fn,expected_hash",
+    [
+        (RealKvHashMode.BIT, _hand_fold_bit_write, 0x5692161D100B05E5),
+        (RealKvHashMode.ALL, _hand_fold_all_write, 0xC4C41792E6578644),
+    ],
+    ids=["bit", "all"],
+)
+def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
+    mode: RealKvHashMode,
+    fold_fn: Callable[[bytes], int],
+    expected_hash: int,
+) -> None:
     # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
     _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
-    _EXPECTED_HASH: int = 0x5692161D100B05E5
 
     # Step 2: verify hand-computed fold matches the hex literal.
-    assert _hand_fold_bit_write(_PATTERN) == _EXPECTED_HASH
+    assert fold_fn(_PATTERN) == expected_hash
 
     cuda_buf, ref_buf = _setup_pair()
     source_cuda = make_real_kv_source(
@@ -1328,7 +1394,7 @@ def test_real_kv_hash_bit_mode_writes_expected_hash_hardcoded(hardcoded: bool) -
         read_bytes=source_cuda.read_bytes,
     )
 
-    # Step 3: run write kernel on slot 0 with BIT mode.
+    # Step 3: run write kernel on slot 0 with the given mode.
     plan_cuda = make_write_plan(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
     )
@@ -1357,75 +1423,14 @@ def test_real_kv_hash_bit_mode_writes_expected_hash_hardcoded(hardcoded: bool) -
         ref_log=ref_log,
         real_kv_sources_cuda=(source_cuda,),
         real_kv_sources_ref=(source_ref,),
-        real_kv_hash_mode=RealKvHashMode.BIT,
+        real_kv_hash_mode=mode,
     )
 
     # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
     _, _, _, stored_real_kv_hash = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
-    assert stored_real_kv_hash == to_signed_int64(_EXPECTED_HASH), (
-        f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(_EXPECTED_HASH):#x}"
-    )
-
-
-@pytest.mark.parametrize("hardcoded", [True])
-def test_real_kv_hash_all_mode_writes_expected_hash_hardcoded(hardcoded: bool) -> None:
-    assert hardcoded
-    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
-    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
-    _EXPECTED_HASH: int = 0xC4C41792E6578644
-
-    # Step 2: verify hand-computed fold matches the hex literal.
-    assert _hand_fold_all_write(_PATTERN) == _EXPECTED_HASH
-
-    cuda_buf, ref_buf = _setup_pair()
-    source_cuda = make_real_kv_source(
-        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
-    )
-    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
-    source_ref = RealKvSource(
-        tensor=source_cuda.tensor.clone(),
-        page_size=source_cuda.page_size,
-        num_bytes_per_token=source_cuda.num_bytes_per_token,
-        read_bytes=source_cuda.read_bytes,
-    )
-
-    # Step 3: run write kernel on slot 0 with ALL mode.
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    fb_input_ids = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
-    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
-
-    _run_both_and_assert_buf_and_state_equal(
-        cuda_canary_buf=cuda_buf,
-        ref_canary_buf=ref_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=(source_cuda,),
-        real_kv_sources_ref=(source_ref,),
-        real_kv_hash_mode=RealKvHashMode.ALL,
-    )
-
-    # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
-    _, _, _, stored_real_kv_hash = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
-    assert stored_real_kv_hash == to_signed_int64(_EXPECTED_HASH), (
-        f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(_EXPECTED_HASH):#x}"
-    )
+    assert stored_real_kv_hash == to_signed_int64(
+        expected_hash
+    ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
 
 
 @pytest.mark.parametrize("hardcoded", [True])
@@ -1447,7 +1452,9 @@ def test_seed_slot_resume_5_step_hardcoded(hardcoded: bool) -> None:
             real_kv_hash=0,
         )
 
-    predecessor_advance = splitmix64_mix4(splitmix64(CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0)
+    predecessor_advance = splitmix64_mix4(
+        splitmix64(CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
+    )
 
     tokens = [101, 202, 303, 404, 505]
     positions = [11, 12, 13, 14, 15]
@@ -1511,37 +1518,7 @@ def test_seed_slot_resume_5_step_hardcoded(hardcoded: bool) -> None:
 )
 def test_token_boundary_byte_equal_sweep(token_val: int) -> None:
     """Sweep token boundary values; assert CUDA write vs ref buf + state byte-equal."""
-    cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    fb_input_ids = torch.tensor([token_val], dtype=torch.int32, device=_DEVICE)
-    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
-
-    _run_both_and_assert_buf_and_state_equal(
-        cuda_canary_buf=cuda_buf,
-        ref_canary_buf=ref_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=(),
-        real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
-    )
+    _run_write_single_slot_byte_equal(_WriteSingleSlotInput(token=token_val))
 
 
 @pytest.mark.parametrize(
@@ -1550,34 +1527,4 @@ def test_token_boundary_byte_equal_sweep(token_val: int) -> None:
 )
 def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
     """Sweep position boundary values; assert CUDA write vs ref buf + state byte-equal."""
-    cuda_buf, ref_buf = _setup_pair()
-    plan_cuda = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    plan_ref = make_write_plan(
-        write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
-    )
-    fb_input_ids = torch.tensor([42], dtype=torch.int32, device=_DEVICE)
-    fb_positions = torch.tensor([position_val], dtype=torch.int32, device=_DEVICE)
-    fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
-
-    _run_both_and_assert_buf_and_state_equal(
-        cuda_canary_buf=cuda_buf,
-        ref_canary_buf=ref_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=(),
-        real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
-    )
+    _run_write_single_slot_byte_equal(_WriteSingleSlotInput(position=position_val))
