@@ -59,9 +59,7 @@ impl Config {
                         ));
                     }
                     let parsed = url::Url::parse(trimmed).map_err(|e| {
-                        anyhow!(
-                            "discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}"
-                        )
+                        anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
                     })?;
                     match parsed.scheme() {
                         "http" | "https" => {}
