@@ -54,6 +54,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -605,7 +606,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 self.current_attention_backend == "fa3"
                 and self.kv_cache_dtype != "auto"
             ):
-                attn_dtype = forward_batch.token_to_kv_pool.dtype
+                attn_dtype = get_token_to_kv_pool().dtype
             else:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
@@ -671,7 +672,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        get_token_to_kv_pool().set_mla_kv_buffer(
             self.attn_mha,
             forward_batch.out_cache_loc,
             k_nope,

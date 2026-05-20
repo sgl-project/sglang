@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -126,12 +127,10 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # save current latent cache.
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        get_token_to_kv_pool().set_kv_buffer(
             self.attn_mqa, forward_batch.out_cache_loc, k_input, None
         )
-        key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mqa.layer_id
-        )
+        key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
         return (
@@ -194,7 +193,7 @@ class DeepseekMLARocmForwardMixin:
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
 
