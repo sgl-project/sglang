@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -19,7 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, kernel_shape_profiler
 from sglang.srt.utils.profile_merger import ProfileMerger
 
 if TYPE_CHECKING:
@@ -73,6 +74,9 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
 
+        self.shape_discovery: bool = False
+        self.roofline_annotations: bool = False
+
         # For ROCM
         self.rpd_profiler = None
 
@@ -88,6 +92,8 @@ class SchedulerProfilerManager:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        shape_discovery: bool = False,
+        roofline_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
@@ -103,6 +109,7 @@ class SchedulerProfilerManager:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                shape_discovery=shape_discovery,
             )
 
         if self.profile_in_progress:
@@ -125,6 +132,8 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.shape_discovery = shape_discovery
+        self.roofline_annotations = roofline_annotations
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -214,6 +223,11 @@ class SchedulerProfilerManager:
                     )
                 ),
             )
+
+            # Enable shape metadata for Triton & FlashInfer kernels
+            if record_shapes and self.shape_discovery:
+                kernel_shape_profiler.enable()
+
             self.torch_profiler.start()
             self.profile_in_progress = True
 
@@ -346,6 +360,10 @@ class SchedulerProfilerManager:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        if self.torch_profiler_record_shapes and self.shape_discovery:
+            # Disable kernel shape profiling instrumentation
+            kernel_shape_profiler.disable()
+
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
@@ -388,6 +406,84 @@ class SchedulerProfilerManager:
             ):
                 self._start_profile()
 
+    def _build_profile_annotation(self, batch: ScheduleBatch):
+        """Return a context manager that annotates the profiler trace with
+        iteration details and roofline-analysis aggregates.
+
+        The annotation encodes aggregate statistics needed for roofline
+        analysis of paged attention **without** per-request details:
+
+        For context (prefill) requests (prefix ``c_``):
+            R_C           — number of context requests
+            Σ N_Q         — total query tokens          (sq)
+            Σ N_KV        — total KV tokens             (sk)
+            Σ N_Q²        — sum of sq² per request      (sqsq)
+            Σ N_Q·N_KV    — sum of sq·sk per request    (sqsk)
+
+        For generation (decode) requests (prefix ``g_``):
+            R_G           — number of generation requests
+            Σ N_Q         — total query tokens          (sq)
+            Σ N_KV        — total KV tokens             (sk)
+            Σ N_Q²        — sum of sq² per request      (sqsq)
+            Σ N_Q·N_KV    — sum of sq·sk per request    (sqsk)
+
+        bs = total scheduled tokens across both phases.
+        """
+        # Only annotate when a torch profiler is actually active.
+        has_profiler = getattr(self, "torch_profiler", None) is not None or (
+            getattr(self, "_profile_manager", None) is not None
+            and getattr(self._profile_manager, "profiler", None) is not None
+        )
+        if not has_profiler or not self.roofline_annotations:
+            return nullcontext()
+
+        # ── Roofline aggregates ──────────────────────────────────────
+        # Context (prefill) phase
+        p_nq = 0  # Σ N_Q
+        p_nkv = 0  # Σ N_KV
+        p_sqsq = 0  # Σ N_Q²
+        p_sqsk = 0  # Σ N_Q·N_KV
+        # Generation (decode) phase
+        g_nq = 0
+        g_nkv = 0
+        g_sqsq = 0
+        g_sqsk = 0
+
+        num_ctx_requests = 0
+        num_gen_requests = 0
+        bs = 0
+
+        # Identify decode requests in MIXED mode
+        decoding_req_ids = set()
+        if batch.forward_mode == ForwardMode.MIXED:
+            decoding_req_ids = {req.rid for req in (batch.decoding_reqs or [])}
+
+        for req in batch.reqs:
+            is_decode = (
+                batch.forward_mode == ForwardMode.DECODE or req.rid in decoding_req_ids
+            )
+            if is_decode:
+                # N_Q = 1 for standard autoregressive decode
+                nq = 1
+                nkv = req.seqlen  # full sequence length
+                num_gen_requests += 1
+                g_nq += nq
+                g_nkv += nkv
+                g_sqsq += nq * nq
+                g_sqsk += nq * nkv
+            else:
+                nq = req.extend_input_len
+                nkv = len(req.prefix_indices) + req.extend_input_len
+                num_ctx_requests += 1
+                p_nq += nq
+                p_nkv += nkv
+                p_sqsq += nq * nq
+                p_sqsk += nq * nkv
+            bs += nq
+
+        annotation = f"execute_{bs}_context_{num_ctx_requests}(sq{p_nq}sk{p_nkv}sqsq{p_sqsq}sqsk{p_sqsk})_generation_{num_gen_requests}(sq{g_nq}sk{g_nkv}sqsq{g_sqsq}sqsk{g_sqsk})"
+        return torch.profiler.record_function(annotation)
+
     def _profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
@@ -402,6 +498,8 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.shape_discovery,
+                    recv_req.roofline_annotations,
                     recv_req.profile_stages,
                 )
             else:
@@ -416,6 +514,8 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.shape_discovery,
+                    recv_req.roofline_annotations,
                 )
                 return self._start_profile()
         else:
