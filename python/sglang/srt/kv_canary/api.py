@@ -105,7 +105,7 @@ def _compute_launch_capacities(
     if chunked_prefill_size is None or chunked_prefill_size < 0:
         max_extend_tokens_per_forward = max_prefill_tokens
     else:
-        max_extend_tokens_per_forward = chunked_prefill_size
+        max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_prefill_size)
     pool_slot_count = model_runner.max_total_num_tokens
     write_entry_capacity = max(
         1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
