@@ -6,12 +6,12 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
 )
-from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
@@ -48,19 +48,23 @@ class WriteFuzzInputs:
     fb_positions: torch.Tensor
     fb_out_cache_loc: torch.Tensor
     kernel_kind: CanaryLaunchTag
-    pseudo_mode: CanaryPseudoMode
+    pseudo_mode: consts.CanaryPseudoMode
     pseudo_expected_tokens: torch.Tensor
     pseudo_expected_positions: torch.Tensor
     real_kv_sources_cuda: tuple[RealKvSource, ...]
     real_kv_sources_ref: tuple[RealKvSource, ...]
-    real_kv_hash_mode: RealKvHashMode
+    real_kv_hash_mode: consts.RealKvHashMode
     ring_capacity: int
 
 
 def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
-    pseudo_mode = rng.choice([CanaryPseudoMode.OFF, CanaryPseudoMode.ON])
+    pseudo_mode = rng.choice([consts.CanaryPseudoMode.OFF, consts.CanaryPseudoMode.ON])
     hash_mode = rng.choice(
-        [RealKvHashMode.OFF, RealKvHashMode.PARTIAL, RealKvHashMode.ALL]
+        [
+            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])

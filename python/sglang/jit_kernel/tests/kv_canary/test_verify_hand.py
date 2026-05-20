@@ -6,19 +6,12 @@ from typing import Callable
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    _FAIL_REASON_BIT_CHAIN_HASH,
-    _FAIL_REASON_BIT_POSITION,
-    _FAIL_REASON_BIT_REAL_KV_HASH,
-    _VIOLATION_FIELD_FAIL_REASON_BITS,
-    _VIOLATION_FIELD_KERNEL_KIND,
-    CANARY_CHAIN_ANCHOR,
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
@@ -78,7 +71,7 @@ class _VerifySingleSlotInput:
     stored_prev_hash_signed: int
     stored_real_kv_hash_signed: int = 0
     real_kv_sources: tuple[RealKvSource, ...] = ()
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
 
 
 def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
@@ -122,8 +115,8 @@ def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
 
 
 def test_chain_head_anchor() -> None:
-    """``prev_slot_idx == -1`` → kernel uses ``splitmix64(CANARY_CHAIN_ANCHOR)`` as the expected prev_hash."""
-    # Step 1: stamp slot 5 such that stored.prev_hash already equals splitmix64(CANARY_CHAIN_ANCHOR).
+    """``prev_slot_idx == -1`` → kernel uses ``splitmix64(consts.CANARY_CHAIN_ANCHOR)`` as the expected prev_hash."""
+    # Step 1: stamp slot 5 such that stored.prev_hash already equals splitmix64(consts.CANARY_CHAIN_ANCHOR).
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     anchor_signed = chain_anchor_signed()
     for buf in (cuda_buf, ref_buf):
@@ -155,7 +148,7 @@ def test_chain_head_anchor() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -201,7 +194,7 @@ def test_chain_link_byte_equal_5_step() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -266,12 +259,12 @@ def test_violation_token_mismatch() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 1
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_CHAIN_HASH)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -308,12 +301,12 @@ def test_violation_position_mismatch() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 1
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_POSITION)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -350,11 +343,11 @@ def test_violation_position_diverges_from_plan() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_POSITION)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_POSITION)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -408,11 +401,11 @@ def test_violation_prev_hash_mismatch() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_CHAIN_HASH)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_CHAIN_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -450,7 +443,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         violation_ring=write_log.ring,
@@ -458,7 +451,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
         slot_run_counter=write_log.slot_run_counter,
         kernel_run_counter=write_log.kernel_run_counter,
         real_kv_sources=sources_cuda,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     ref_buf.copy_(cuda_buf)
 
@@ -490,11 +483,11 @@ def test_violation_real_kv_hash_mismatch() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -532,14 +525,14 @@ def test_real_kv_mode_off_yields_zero() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources,
         real_kv_sources_ref=sources,
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
+def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
@@ -564,7 +557,7 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         violation_ring=log.ring,
@@ -608,11 +601,11 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
 
 
 def test_real_kv_mode_partial_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.PARTIAL)
+    _run_real_kv_mode_byte_equal_case(consts.RealKvHashMode.PARTIAL)
 
 
 def test_real_kv_mode_all_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.ALL)
+    _run_real_kv_mode_byte_equal_case(consts.RealKvHashMode.ALL)
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
@@ -641,7 +634,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         violation_ring=log.ring,
@@ -649,7 +642,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         slot_run_counter=log.slot_run_counter,
         kernel_run_counter=log.kernel_run_counter,
         real_kv_sources=sources_cuda,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     ref_buf.copy_(cuda_buf)
 
@@ -677,7 +670,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -723,7 +716,7 @@ def test_real_kv_source_read_bytes_zero_skipped() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(dummy,),
         real_kv_sources_ref=(dummy,),
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -763,7 +756,7 @@ def test_real_kv_source_padding_below_4() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources,
         real_kv_sources_ref=sources,
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
 
@@ -788,7 +781,7 @@ def test_real_kv_source_above_4_raises() -> None:
             slot_run_counter=log.slot_run_counter,
             kernel_run_counter=log.kernel_run_counter,
             real_kv_sources=too_many,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
 
@@ -827,7 +820,7 @@ def test_real_kv_source_holey_dim1() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         violation_ring=log.ring,
@@ -835,7 +828,7 @@ def test_real_kv_source_holey_dim1() -> None:
         slot_run_counter=log.slot_run_counter,
         kernel_run_counter=log.kernel_run_counter,
         real_kv_sources=sources,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     ref_buf.copy_(cuda_buf)
 
@@ -863,7 +856,7 @@ def test_real_kv_source_holey_dim1() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -910,7 +903,7 @@ def test_page_size_gt_1_access_pattern() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         violation_ring=log.ring,
@@ -918,7 +911,7 @@ def test_page_size_gt_1_access_pattern() -> None:
         slot_run_counter=log.slot_run_counter,
         kernel_run_counter=log.kernel_run_counter,
         real_kv_sources=sources,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     ref_buf.copy_(cuda_buf)
 
@@ -946,7 +939,7 @@ def test_page_size_gt_1_access_pattern() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -988,7 +981,7 @@ def test_swa_translated_slot_indices() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -1017,7 +1010,7 @@ def test_kernel_run_counter_per_call() -> None:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     assert int(cuda_log.kernel_run_counter[0].item()) == 3
@@ -1062,7 +1055,7 @@ def test_slot_run_counter_per_entry() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.slot_run_counter[0].item()) == 4
@@ -1109,13 +1102,15 @@ def test_violation_ring_fill_once_first_row() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 3
     # row 0 is filled (slot 1 → POSITION bit).
-    first_row_fail = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert first_row_fail & _FAIL_REASON_BIT_POSITION
+    first_row_fail = int(
+        cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
+    )
+    assert first_row_fail & consts.FAIL_REASON_POSITION
 
 
 def test_violation_ring_overflow_counter_still_increments() -> None:
@@ -1159,7 +1154,7 @@ def test_violation_ring_overflow_counter_still_increments() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == n_violations
@@ -1201,10 +1196,10 @@ def test_kernel_kind_stamped_into_row() -> None:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
             kernel_kind=tag,
         )
-        kk = int(cuda_log.ring[0, _VIOLATION_FIELD_KERNEL_KIND].item())
+        kk = int(cuda_log.ring[0, consts.VIOLATION_FIELD_KERNEL_KIND].item())
         assert kk == int(tag)
         assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
@@ -1230,7 +1225,7 @@ def test_empty_plan_no_op() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -1248,7 +1243,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
 
     # Step 1: compute the expected stored prev_hash sequence in pure Python via splitmix64.
     expected_prev_hashes_u64: list[int] = []
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
         expected_prev_hashes_u64.append(running)
         running = splitmix64_mix4(running, token, position, real_kv_hash)
@@ -1294,7 +1289,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -1367,7 +1362,7 @@ def test_chain_link_byte_equal_100_step_hardcoded() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -1399,9 +1394,9 @@ def test_violation_bit_injection_position_ring_state_matrix(
     corrupt_slot = slot_indices[corruption_index]
 
     expected_bit = {
-        "POSITION": _FAIL_REASON_BIT_POSITION,
-        "PREV_HASH": _FAIL_REASON_BIT_CHAIN_HASH,
-        "REAL_KV": _FAIL_REASON_BIT_REAL_KV_HASH,
+        "POSITION": consts.FAIL_REASON_POSITION,
+        "PREV_HASH": consts.FAIL_REASON_CHAIN_HASH,
+        "REAL_KV": consts.FAIL_REASON_REAL_KV_HASH,
     }[bit_to_trigger]
 
     if bit_to_trigger == "REAL_KV":
@@ -1427,7 +1422,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            pseudo_mode=CanaryPseudoMode.OFF,
+            pseudo_mode=consts.CanaryPseudoMode.OFF,
             pseudo_expected_tokens=pseudo_tokens,
             pseudo_expected_positions=pseudo_positions,
             violation_ring=write_log.ring,
@@ -1435,14 +1430,14 @@ def test_violation_bit_injection_position_ring_state_matrix(
             slot_run_counter=write_log.slot_run_counter,
             kernel_run_counter=write_log.kernel_run_counter,
             real_kv_sources=sources_cuda,
-            real_kv_hash_mode=RealKvHashMode.ALL,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
         ref_buf.copy_(cuda_buf)
         sources_ref = clone_real_kv_sources(sources_cuda)
 
         sources_cuda[0].tensor[corrupt_slot, 0] ^= 0xFF
         sources_ref[0].tensor.copy_(sources_cuda[0].tensor)
-        real_kv_hash_mode = RealKvHashMode.ALL
+        real_kv_hash_mode = consts.RealKvHashMode.ALL
         real_kv_sources_cuda = sources_cuda
         real_kv_sources_ref = sources_ref
     else:
@@ -1454,7 +1449,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
             positions=positions,
             slot_indices=slot_indices,
         )
-        real_kv_hash_mode = RealKvHashMode.OFF
+        real_kv_hash_mode = consts.RealKvHashMode.OFF
         real_kv_sources_cuda = ()
         real_kv_sources_ref = ()
 
@@ -1524,7 +1519,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
         assert int(cuda_log.write_index[0].item()) == ring_capacity
 
@@ -1560,7 +1555,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
         found = False
         for row_idx in range(rows_stored):
             fail_bits = int(
-                cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item()
+                cuda_log.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
             )
             if fail_bits & expected_bit:
                 found = True
@@ -1623,13 +1618,13 @@ def _hand_fold_all(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (RealKvHashMode.PARTIAL, _hand_fold_partial, 0xC4C41792E6578644),
-        (RealKvHashMode.ALL, _hand_fold_all, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.ALL, _hand_fold_all, 0xC4C41792E6578644),
     ],
     ids=["partial", "all"],
 )
 def test_real_kv_hash_fold_mode_hardcoded(
-    mode: RealKvHashMode,
+    mode: consts.RealKvHashMode,
     fold_fn: Callable[[bytes], int],
     expected_hash: int,
 ) -> None:
@@ -1712,8 +1707,8 @@ def test_real_kv_hash_fold_mode_hardcoded(
         real_kv_hash_mode=mode,
     )
 
-    fail_bits = int(cuda_log2.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_REAL_KV_HASH)
+    fail_bits = int(cuda_log2.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_REAL_KV_HASH)
     assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
 
 
@@ -1721,7 +1716,7 @@ def test_chain_advance_formula_matches_spec() -> None:
     """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
     # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
     cases = [
-        (CANARY_CHAIN_ANCHOR, 0, 0, 0),
+        (consts.CANARY_CHAIN_ANCHOR, 0, 0, 0),
         (0x1234567890ABCDEF, 100, 5, 0xDEADBEEF),
         (0, 0xFFFF, 0x7FFFFFFF, 0xCAFEBABE),
         (0x123, 1, 1, 1),
@@ -1783,13 +1778,13 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
     )
 
     assert int(cuda_log.write_index[0].item()) == 1
 
-    # splitmix64(CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
+    # splitmix64(consts.CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
     # Slot 5 was stamped with position=0 (stored); plan claims position=99 → POSITION mismatch.
     # stored_chain_hash == expected_chain_hash (both splitmix64(ANCHOR)) → no CHAIN_HASH bit.
     # verify path has no token oracle → expected_token field is always 0.
@@ -1801,7 +1796,7 @@ def test_violation_ring_row_byte_layout_hardcoded() -> None:
     expected_token_val = 0
     stored_chain_hash_val = anchor_hash_signed
     expected_aux_val = anchor_hash_signed
-    fail_reason_bits_val = _FAIL_REASON_BIT_POSITION
+    fail_reason_bits_val = consts.FAIL_REASON_POSITION
 
     expected_bytes = struct.pack(
         "<8q",
@@ -1896,7 +1891,7 @@ def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
             stored_prev_hash_signed=chain_anchor_signed(),
             stored_real_kv_hash_signed=to_signed_int64(stored_rkv_val),
             real_kv_sources=sources_cuda,
-            real_kv_hash_mode=RealKvHashMode.PARTIAL,
+            real_kv_hash_mode=consts.RealKvHashMode.PARTIAL,
         )
     )
 
@@ -1917,7 +1912,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
     tokens = [100, 200, 300]
     positions = [0, 1, 2]
 
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     real_kv_hashes: list[int] = []
     for slot_idx in slot_indices:
         rkv = 0
@@ -1974,7 +1969,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     assert int(cuda_log.write_index[0].item()) == 0
 
@@ -2029,13 +2024,13 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.PARTIAL,
+        real_kv_hash_mode=consts.RealKvHashMode.PARTIAL,
     )
 
     assert int(cuda_log.write_index[0].item()) >= 1
-    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
     assert (
-        bits & _FAIL_REASON_BIT_REAL_KV_HASH
+        bits & consts.FAIL_REASON_REAL_KV_HASH
     ), f"expected REAL_KV_HASH bit, got {bits:#b}"
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
@@ -2056,7 +2051,7 @@ def test_paged_layout_page_size_16() -> None:
     slot_indices = [15, 16]
     tokens = [77, 88]
     positions = [0, 1]
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     rkv_values: list[int] = []
     for slot_idx in slot_indices:
         page_id = slot_idx // sources_cuda[0].page_size
@@ -2113,7 +2108,7 @@ def test_paged_layout_page_size_16() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
     assert int(cuda_log.write_index[0].item()) == 0
 
@@ -2152,7 +2147,7 @@ def test_violation_ring_atomic_with_many_violations() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == n
@@ -2196,11 +2191,11 @@ def test_chain_head_anchored_on_constant() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     assert int(cuda_log.write_index[0].item()) == 1
-    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert bits & _FAIL_REASON_BIT_CHAIN_HASH
+    bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert bits & consts.FAIL_REASON_CHAIN_HASH
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
@@ -2241,13 +2236,13 @@ def test_position_mismatch_sets_position_bit_only() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     assert int(cuda_log.write_index[0].item()) == 1
-    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert bits & _FAIL_REASON_BIT_POSITION, f"expected POSITION bit, got {bits:#b}"
+    bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert bits & consts.FAIL_REASON_POSITION, f"expected POSITION bit, got {bits:#b}"
     assert (
-        bits & _FAIL_REASON_BIT_CHAIN_HASH
+        bits & consts.FAIL_REASON_CHAIN_HASH
     ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
@@ -2290,7 +2285,7 @@ def test_replay_does_not_double_count_run_counters() -> None:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     assert int(cuda_log.slot_run_counter[0].item()) == 2 * len(slot_indices)
@@ -2327,13 +2322,13 @@ def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
         kernel_kind=launch_tag,
     )
     n_violations = int(cuda_log.write_index[0].item())
     plan_slot_set = set(slot_indices)
     for row in range(n_violations):
-        kind = int(cuda_log.ring[row, _VIOLATION_FIELD_KERNEL_KIND].item())
+        kind = int(cuda_log.ring[row, consts.VIOLATION_FIELD_KERNEL_KIND].item())
         assert kind == int(launch_tag), f"row {row} kind {kind} != {int(launch_tag)}"
         slot = int(cuda_log.ring[row, 1].item())
         assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"

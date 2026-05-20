@@ -13,65 +13,10 @@
 
 #include <sgl_kernel/utils.cuh>  // For SGL_DEVICE
 
+#include "consts.cuh"
 #include <cstdint>
 
 namespace canary {
-
-// Frozen chain anchor used wherever a slot has no predecessor. Mirror of the Python CANARY_CHAIN_ANCHOR
-// in kv_canary/verify.py.
-constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
-
-// Canary slot field offsets within the 4-int64 layout.
-constexpr int kCanaryFieldsPerSlot = 4;
-constexpr int kCanaryFieldToken = 0;
-constexpr int kCanaryFieldPosition = 1;
-constexpr int kCanaryFieldPrevHash = 2;
-constexpr int kCanaryFieldRealKvHash = 3;
-
-// Violation-row column layout. Mirrors _VIOLATION_FIELD_* in kv_canary/verify.py. Column 6
-// (ExpectedAux) is reason-agnostic: verify launches store expected_chain_hash there, write launches store
-// expected_position.
-constexpr int kViolationFields = 8;
-constexpr int kViolationFieldKernelKind = 0;
-constexpr int kViolationFieldSlotIdx = 1;
-constexpr int kViolationFieldPosition = 2;
-constexpr int kViolationFieldStoredToken = 3;
-constexpr int kViolationFieldExpectedToken = 4;
-constexpr int kViolationFieldStoredChainHash = 5;
-constexpr int kViolationFieldExpectedAux = 6;
-constexpr int kViolationFieldFailReasonBits = 7;
-
-// Fail-reason bit positions. Bitfield (not enum) because a single verify entry may set multiple reasons.
-// Verify-launch bits mirror _FAIL_REASON_BIT_* in kv_canary/verify.py; write-launch bits mirror
-// _FAIL_REASON_BIT_WRITE_* in kv_canary/write.py.
-constexpr int64_t kFailReasonChainHash = 1LL << 0;
-constexpr int64_t kFailReasonPosition = 1LL << 1;
-constexpr int64_t kFailReasonRealKvHash = 1LL << 2;
-constexpr int64_t kFailReasonWriteTokenMismatch = 1LL << 3;
-constexpr int64_t kFailReasonWritePositionMismatch = 1LL << 4;
-
-// Mirror of the Python RealKvHashMode IntEnum in kv_canary/verify.py. Values must match exactly.
-enum class RealKvHashMode : int32_t {
-  kOff = 0,
-  kPartial = 1,
-  kAll = 2,
-};
-
-// Mirror of the Python CanaryPseudoMode IntEnum in kv_canary/write.py.
-enum class CanaryPseudoMode : int32_t {
-  kOff = 0,
-  kOn = 1,
-};
-
-// Maximum number of real-KV sources the C++ ABI supports per launch. Host wrapper pads any shorter tuple
-// up to this length with dummy entries (read_bytes = 0) and rejects longer tuples.
-constexpr int kMaxRealKvSources = 4;
-
-// Per-source ABI fields packed into a length-(kMaxRealKvSources * 3) int32 tensor.
-constexpr int kRealKvSourceFieldsPerEntry = 3;
-constexpr int kRealKvSourceFieldPageSize = 0;
-constexpr int kRealKvSourceFieldNumBytesPerToken = 1;
-constexpr int kRealKvSourceFieldReadBytes = 2;
 
 // Device-side handle for one real-KV source.
 struct RealKvSourceHandle {
@@ -171,7 +116,7 @@ fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
 
 // Append a violation row to the ring (fill-once) and bump the monotonic counter unconditionally.
 //
-// Ordering of columns must match _VIOLATION_FIELD_* in kv_canary/verify.py exactly. The "ExpectedAux"
+// Ordering of columns must match kViolationField* in consts.cuh exactly. The "ExpectedAux"
 // column (index 6) is reason-agnostic: verify launches pass expected_chain_hash, write launches pass
 // expected_position. The "StoredChainHash" column (index 5) carries running_prev_hash on the write path.
 //

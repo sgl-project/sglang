@@ -2,23 +2,9 @@ from __future__ import annotations
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    _FIELD_POSITION,
-    _FIELD_PREV_HASH,
-    _FIELD_REAL_KV_HASH,
-    _FIELD_TOKEN,
-    _VIOLATION_FIELD_EXPECTED_AUX,
-    _VIOLATION_FIELD_EXPECTED_TOKEN,
-    _VIOLATION_FIELD_FAIL_REASON_BITS,
-    _VIOLATION_FIELD_KERNEL_KIND,
-    _VIOLATION_FIELD_POSITION,
-    _VIOLATION_FIELD_SLOT_IDX,
-    _VIOLATION_FIELD_STORED_CHAIN_HASH,
-    _VIOLATION_FIELD_STORED_TOKEN,
-    CANARY_CHAIN_ANCHOR,
-    VIOLATION_FIELDS,
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
@@ -26,12 +12,7 @@ from sglang.jit_kernel.kv_canary.verify_ref import (
     _to_signed_int64,
     splitmix64,
 )
-from sglang.jit_kernel.kv_canary.write import (
-    _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
-    _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
-    CanaryPseudoMode,
-    WritePlan,
-)
+from sglang.jit_kernel.kv_canary.write import WritePlan
 
 _U64_MASK: int = (1 << 64) - 1
 
@@ -44,7 +25,7 @@ def canary_write_step_torch_reference(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
     violation_ring: torch.Tensor,
@@ -52,7 +33,7 @@ def canary_write_step_torch_reference(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     work_device = torch.device("cpu")
 
@@ -93,9 +74,9 @@ def canary_write_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_u64 = splitmix64(CANARY_CHAIN_ANCHOR)
+    chain_anchor_u64 = splitmix64(consts.CANARY_CHAIN_ANCHOR)
 
-    pseudo_mode_on = int(pseudo_mode) != int(CanaryPseudoMode.OFF)
+    pseudo_mode_on = int(pseudo_mode) != int(consts.CanaryPseudoMode.OFF)
     pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(
         device=work_device, dtype=torch.int64
     )
@@ -117,10 +98,18 @@ def canary_write_step_torch_reference(
         if seed_slot < 0:
             running_prev_hash = chain_anchor_u64
         else:
-            seed_prev_hash_signed = int(buf_i64[seed_slot, _FIELD_PREV_HASH].item())
-            seed_token_signed = int(buf_i64[seed_slot, _FIELD_TOKEN].item())
-            seed_position_signed = int(buf_i64[seed_slot, _FIELD_POSITION].item())
-            seed_real_kv_signed = int(buf_i64[seed_slot, _FIELD_REAL_KV_HASH].item())
+            seed_prev_hash_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_PREV_HASH].item()
+            )
+            seed_token_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_TOKEN].item()
+            )
+            seed_position_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
+            )
+            seed_real_kv_signed = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_REAL_KV_HASH].item()
+            )
             seed_combined = (
                 (seed_prev_hash_signed & _U64_MASK)
                 ^ (seed_token_signed & _U64_MASK)
@@ -149,27 +138,31 @@ def canary_write_step_torch_reference(
                 expected_token = int(pseudo_expected_tokens_host[i].item())
                 expected_position = int(pseudo_expected_positions_host[i].item())
                 if token != expected_token:
-                    mismatch_bits |= _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH
+                    mismatch_bits |= consts.FAIL_REASON_WRITE_TOKEN_MISMATCH
                 if position != expected_position:
-                    mismatch_bits |= _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH
+                    mismatch_bits |= consts.FAIL_REASON_WRITE_POSITION_MISMATCH
                 if mismatch_bits != 0:
-                    row = [0] * VIOLATION_FIELDS
-                    row[_VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
-                    row[_VIOLATION_FIELD_SLOT_IDX] = slot
-                    row[_VIOLATION_FIELD_POSITION] = position
-                    row[_VIOLATION_FIELD_STORED_TOKEN] = token
-                    row[_VIOLATION_FIELD_EXPECTED_TOKEN] = expected_token
-                    row[_VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                    row = [0] * consts.VIOLATION_FIELDS
+                    row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
+                    row[consts.VIOLATION_FIELD_SLOT_IDX] = slot
+                    row[consts.VIOLATION_FIELD_POSITION] = position
+                    row[consts.VIOLATION_FIELD_STORED_TOKEN] = token
+                    row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = expected_token
+                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
                         running_prev_hash
                     )
-                    row[_VIOLATION_FIELD_EXPECTED_AUX] = expected_position
-                    row[_VIOLATION_FIELD_FAIL_REASON_BITS] = mismatch_bits
+                    row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position
+                    row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = mismatch_bits
                     violation_rows.append(row)
 
-            buf_i64[slot, _FIELD_TOKEN] = token
-            buf_i64[slot, _FIELD_POSITION] = position
-            buf_i64[slot, _FIELD_PREV_HASH] = _to_signed_int64(running_prev_hash)
-            buf_i64[slot, _FIELD_REAL_KV_HASH] = _to_signed_int64(real_kv_hash_u64)
+            buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token
+            buf_i64[slot, consts.CANARY_FIELD_POSITION] = position
+            buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = _to_signed_int64(
+                running_prev_hash
+            )
+            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = _to_signed_int64(
+                real_kv_hash_u64
+            )
 
             combined = (
                 running_prev_hash

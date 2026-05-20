@@ -12,13 +12,13 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.plan_ref import (
     canary_plan_step_torch_reference,
 )
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     VerifyPlan,
     canary_verify_step,
@@ -26,11 +26,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import (
     canary_verify_step_torch_reference,
 )
-from sglang.jit_kernel.kv_canary.write import (
-    CanaryPseudoMode,
-    WritePlan,
-    canary_write_step,
-)
+from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
@@ -193,7 +189,7 @@ def _run_both_verify(
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
     real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
 ) -> None:
     canary_verify_step(
@@ -231,7 +227,7 @@ def _run_both_and_assert_verify_state_equal(
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
     real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
 ) -> None:
     _run_both_verify(
@@ -258,14 +254,14 @@ def _run_both_write(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
     real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
 ) -> None:
     canary_write_step(
@@ -314,14 +310,14 @@ def _run_both_and_assert_write_buf_and_state_equal(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
     real_kv_sources_ref: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
 ) -> None:
     _run_both_write(

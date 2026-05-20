@@ -6,19 +6,12 @@ from typing import Callable
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    _VIOLATION_FIELD_FAIL_REASON_BITS,
-    CANARY_CHAIN_ANCHOR,
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
 )
-from sglang.jit_kernel.kv_canary.write import (
-    _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
-    _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
-    CanaryPseudoMode,
-    canary_write_step,
-)
+from sglang.jit_kernel.kv_canary.write import canary_write_step
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
 )
@@ -61,9 +54,9 @@ def _setup_pair() -> tuple[torch.Tensor, torch.Tensor]:
 class _WriteSingleSlotInput:
     token: int = 42
     position: int = 0
-    pseudo_mode: CanaryPseudoMode = CanaryPseudoMode.OFF
+    pseudo_mode: consts.CanaryPseudoMode = consts.CanaryPseudoMode.OFF
     real_kv_sources: tuple[RealKvSource, ...] = ()
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
 
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
@@ -102,7 +95,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
 
 
 def test_seed_slot_idx_negative_uses_anchor() -> None:
-    """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(CANARY_CHAIN_ANCHOR)``."""
+    """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(consts.CANARY_CHAIN_ANCHOR)``."""
     cuda_buf, ref_buf = _setup_pair()
     plan_cuda = make_write_plan(
         write_offsets=[0, 1], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
@@ -125,14 +118,14 @@ def test_seed_slot_idx_negative_uses_anchor() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     stored_token, stored_position, stored_prev_hash, _ = read_slot_fields(
@@ -151,7 +144,7 @@ def test_seed_slot_idx_loads_predecessor() -> None:
 
     # Step: pre-stamp slot 7 with a known chain link.
     seed_token, seed_position = 100, 4
-    seed_prev_signed = to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -183,18 +176,18 @@ def test_seed_slot_idx_loads_predecessor() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     expected_prev_hash = splitmix64_mix4(
-        splitmix64(CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
+        splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
     )
     _, _, stored_prev_hash, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=2)
     assert stored_prev_hash == to_signed_int64(expected_prev_hash)
@@ -208,7 +201,7 @@ def test_seed_slot_chain_link_continuous() -> None:
     # assert no violation — i.e., slot[2].prev_hash is the correct splitmix64-mix of seed's 4 fields.
     cuda_buf, ref_buf = _setup_pair()
     seed_token, seed_position = 11, 0
-    seed_prev_signed = to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -240,14 +233,14 @@ def test_seed_slot_chain_link_continuous() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # Step 2: verify slot[2] with prev=7 — expects no violation.
@@ -267,7 +260,7 @@ def test_seed_slot_chain_link_continuous() -> None:
         slot_run_counter=verify_log.slot_run_counter,
         kernel_run_counter=verify_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
     assert int(verify_log.write_index[0].item()) == 0
@@ -297,14 +290,14 @@ def test_chain_link_byte_equal_5_step() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
 
@@ -334,14 +327,14 @@ def test_mock_mode_off_ignores_expected() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -374,14 +367,14 @@ def test_mock_mode_on_match_no_violation() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -414,18 +407,18 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_WRITE_TOKEN_MISMATCH)
     # Chain advances on actual (42), not expected (99). Stored token should be 42.
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_token == 42
@@ -458,18 +451,18 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
-    fail_bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
-    assert_only_bits_set(fail_bits, _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH)
+    fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert_only_bits_set(fail_bits, consts.FAIL_REASON_WRITE_POSITION_MISMATCH)
     _, stored_position, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
     assert stored_position == 7
     assert_canary_buf_equal(buf_a=cuda_buf, buf_b=ref_buf)
@@ -502,14 +495,14 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # All 3 entries should fire a violation row.
@@ -534,7 +527,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
         slot_run_counter=verify_log.slot_run_counter,
         kernel_run_counter=verify_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
     assert int(verify_log.write_index[0].item()) == 0
@@ -570,14 +563,14 @@ def test_negative_slot_skips_entry() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=4)
@@ -617,14 +610,14 @@ def test_pre_translated_slot_writes_normally() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     stored_token, _, _, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=4)
@@ -634,7 +627,7 @@ def test_pre_translated_slot_writes_normally() -> None:
 
 
 def test_real_kv_mode_off_writes_zero() -> None:
-    """``RealKvHashMode.OFF`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
+    """``consts.RealKvHashMode.OFF`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
     cuda_buf, ref_buf = _setup_pair()
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
@@ -659,14 +652,14 @@ def test_real_kv_mode_off_writes_zero() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=sources,
         real_kv_sources_ref=sources,
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     _, _, _, real_kv_0 = read_slot_fields(canary_buf=cuda_buf, slot_idx=0)
@@ -677,7 +670,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
+def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
     cuda_buf, ref_buf = _setup_pair()
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
@@ -703,7 +696,7 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
@@ -715,11 +708,11 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
 
 
 def test_real_kv_mode_partial_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.PARTIAL)
+    _run_real_kv_mode_byte_equal_case(consts.RealKvHashMode.PARTIAL)
 
 
 def test_real_kv_mode_all_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.ALL)
+    _run_real_kv_mode_byte_equal_case(consts.RealKvHashMode.ALL)
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
@@ -750,14 +743,14 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
 
@@ -784,7 +777,7 @@ def test_real_kv_source_above_4_raises() -> None:
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            pseudo_mode=CanaryPseudoMode.OFF,
+            pseudo_mode=consts.CanaryPseudoMode.OFF,
             pseudo_expected_tokens=pseudo_tokens,
             pseudo_expected_positions=pseudo_positions,
             violation_ring=log.ring,
@@ -792,7 +785,7 @@ def test_real_kv_source_above_4_raises() -> None:
             slot_run_counter=log.slot_run_counter,
             kernel_run_counter=log.kernel_run_counter,
             real_kv_sources=too_many,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
 
@@ -821,14 +814,14 @@ def test_kernel_run_counter_per_call() -> None:
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
-            pseudo_mode=CanaryPseudoMode.OFF,
+            pseudo_mode=consts.CanaryPseudoMode.OFF,
             pseudo_expected_tokens=pseudo_tokens,
             pseudo_expected_positions=pseudo_positions,
             cuda_log=cuda_log,
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     assert int(cuda_log.kernel_run_counter[0].item()) == 3
@@ -865,14 +858,14 @@ def test_slot_run_counter_sums_entries() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.slot_run_counter[0].item()) == 5
@@ -912,14 +905,14 @@ def test_empty_plan_no_op() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     assert int(cuda_log.write_index[0].item()) == 0
@@ -962,14 +955,14 @@ def test_padding_block_skipped() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # Only slot 0 should have been written; padding blocks 1..3 must not touch the buffer.
@@ -1000,7 +993,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
 
     # Step 1: compute the expected stored prev_hash sequence in pure Python via splitmix64.
     expected_prev_hashes_u64: list[int] = []
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
         expected_prev_hashes_u64.append(running)
         running = splitmix64_mix4(running, token, position, real_kv_hash)
@@ -1021,14 +1014,14 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # Step 2: verify every slot's stored 4 fields match the hardcoded expected sequence.
@@ -1061,8 +1054,8 @@ def test_mock_violation_bit_injection_position_matrix(
     corrupt_slot = out_cache_locs[corruption_index]
 
     expected_bit = {
-        "MOCK_TOKEN": _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
-        "MOCK_POSITION": _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
+        "MOCK_TOKEN": consts.FAIL_REASON_WRITE_TOKEN_MISMATCH,
+        "MOCK_POSITION": consts.FAIL_REASON_WRITE_POSITION_MISMATCH,
     }[bit_to_trigger]
 
     cuda_buf, ref_buf = _setup_pair()
@@ -1101,20 +1094,20 @@ def test_mock_violation_bit_injection_position_matrix(
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     found = False
     for row_idx in range(int(cuda_log.write_index[0].item())):
         fail_bits = int(
-            cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item()
+            cuda_log.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
         row_slot = int(cuda_log.ring[row_idx, 1].item())
         if (fail_bits & expected_bit) and row_slot == corrupt_slot:
@@ -1175,14 +1168,14 @@ def test_chain_link_byte_equal_100_step_hardcoded() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     for i in range(100):
@@ -1248,13 +1241,13 @@ def _hand_fold_all_write(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (RealKvHashMode.PARTIAL, _hand_fold_partial_write, 0xC4C41792E6578644),
-        (RealKvHashMode.ALL, _hand_fold_all_write, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.PARTIAL, _hand_fold_partial_write, 0xC4C41792E6578644),
+        (consts.RealKvHashMode.ALL, _hand_fold_all_write, 0xC4C41792E6578644),
     ],
     ids=["partial", "all"],
 )
 def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
-    mode: RealKvHashMode,
+    mode: consts.RealKvHashMode,
     fold_fn: Callable[[bytes], int],
     expected_hash: int,
 ) -> None:
@@ -1298,7 +1291,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
@@ -1321,7 +1314,7 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
 
     seed_token = 7
     seed_position = 10
-    seed_prev_hash_signed = to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    seed_prev_hash_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -1333,7 +1326,7 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
         )
 
     predecessor_advance = splitmix64_mix4(
-        splitmix64(CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
+        splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
     )
 
     tokens = [101, 202, 303, 404, 505]
@@ -1368,14 +1361,14 @@ def test_seed_slot_resume_5_step_hardcoded() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     for slot_idx, expected_token, expected_position, expected_prev_u64 in zip(
@@ -1443,19 +1436,19 @@ def test_pseudo_mode_on_catches_token_mismatch() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     assert int(cuda_log.write_index[0].item()) >= 1
-    bits = int(cuda_log.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
     assert (
-        bits & _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH
+        bits & consts.FAIL_REASON_WRITE_TOKEN_MISMATCH
     ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
 
 
@@ -1501,17 +1494,17 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
-    running = splitmix64(CANARY_CHAIN_ANCHOR)
+    running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     for slot_idx, token, position in zip(slot_indices, tokens, positions):
         rkv = 0
         for src in sources_cuda:
@@ -1559,14 +1552,14 @@ def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     after = cuda_buf.view(torch.int64)
@@ -1585,7 +1578,7 @@ def test_seed_continues_existing_chain() -> None:
     seed_token = 7
     seed_position = 1
     seed_real_kv = 0
-    expected_seed_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)
+    expected_seed_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -1630,14 +1623,14 @@ def test_seed_continues_existing_chain() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     new_stored = read_slot_fields(canary_buf=cuda_buf, slot_idx=new_slot)
@@ -1686,14 +1679,14 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.ALL,
+        real_kv_hash_mode=consts.RealKvHashMode.ALL,
     )
 
     slot3 = read_slot_fields(canary_buf=cuda_buf, slot_idx=3)
@@ -1731,7 +1724,7 @@ def test_multi_source_real_kv_fold_order_matters() -> None:
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            pseudo_mode=CanaryPseudoMode.OFF,
+            pseudo_mode=consts.CanaryPseudoMode.OFF,
             pseudo_expected_tokens=pseudo_tokens,
             pseudo_expected_positions=pseudo_positions,
             violation_ring=log.ring,
@@ -1739,7 +1732,7 @@ def test_multi_source_real_kv_fold_order_matters() -> None:
             slot_run_counter=log.slot_run_counter,
             kernel_run_counter=log.kernel_run_counter,
             real_kv_sources=srcs,
-            real_kv_hash_mode=RealKvHashMode.ALL,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
         torch.cuda.synchronize()
         return read_slot_fields(canary_buf=buf, slot_idx=2)
@@ -1782,14 +1775,14 @@ def test_pseudo_mode_off_skips_token_check() -> None:
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens,
         pseudo_expected_positions=pseudo_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     assert int(cuda_log.write_index[0].item()) == 0
 
@@ -1830,14 +1823,14 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         fb_input_ids=fb_input_ids_big,
         fb_positions=fb_positions_big,
         fb_out_cache_loc=fb_out_cache_loc_big,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens_big,
         pseudo_expected_positions=pseudo_positions_big,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     untouched_snapshot = cuda_buf.view(torch.int64).clone()
@@ -1871,14 +1864,14 @@ def test_shrink_active_reqs_does_not_write_stale_slots() -> None:
         fb_input_ids=fb_input_ids_small,
         fb_positions=fb_positions_small,
         fb_out_cache_loc=fb_out_cache_loc_small,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tokens_small,
         pseudo_expected_positions=pseudo_positions_small,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=(),
         real_kv_sources_ref=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     after = cuda_buf.view(torch.int64)

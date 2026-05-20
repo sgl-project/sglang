@@ -5,9 +5,9 @@ from typing import Tuple
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
-    RealKvHashMode,
     RealKvSource,
 )
 from sglang.srt.kv_canary.config import CanaryConfig

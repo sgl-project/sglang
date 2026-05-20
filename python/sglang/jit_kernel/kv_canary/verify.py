@@ -6,57 +6,14 @@ from typing import TYPE_CHECKING, Final
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Maximum number of RealKvSource entries the C++ ABI supports per launch. Mirrors kMaxRealKvSources in
-# canary_common.cuh. The host wrapper pads any shorter tuple up to this length with dummy entries and
-# rejects longer tuples.
-_MAX_REAL_KV_SOURCES: Final[int] = 4
-
-# Per-source ABI fields packed into a length-(_MAX_REAL_KV_SOURCES * _REAL_KV_SOURCE_FIELDS_PER_ENTRY) int32
-# tensor. Mirrors kRealKvSourceField* / kRealKvSourceFieldsPerEntry in canary_common.cuh.
-_REAL_KV_SOURCE_FIELDS_PER_ENTRY: Final[int] = 3
-_REAL_KV_SOURCE_FIELD_PAGE_SIZE: Final[int] = 0
-_REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN: Final[int] = 1
-_REAL_KV_SOURCE_FIELD_READ_BYTES: Final[int] = 2
-
-# Chain hash anchor. Hardcoded at the jit_kernel layer; no runtime seed parameter exists. Mirrored in C++ as
-# kCanaryChainAnchor; const-sync test pins them together.
-CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
-
-# Canary slot layout: 4 int64 fields per slot (token_id, position, prev_hash, real_kv_hash). Mirrors
-# kCanaryFieldsPerSlot / kCanaryField* in canary_common.cuh.
-_CANARY_FIELDS_PER_SLOT: Final[int] = 4
-_FIELD_TOKEN: Final[int] = 0
-_FIELD_POSITION: Final[int] = 1
-_FIELD_PREV_HASH: Final[int] = 2
-_FIELD_REAL_KV_HASH: Final[int] = 3
-
 # Bytes per canary slot. Derived from the int64 field count above.
-CANARY_SLOT_BYTES: Final[int] = _CANARY_FIELDS_PER_SLOT * 8
-
-# Width of one violation_ring row in int64 fields.
-VIOLATION_FIELDS: Final[int] = 8
-
-# Violation-row field offsets. C++ counterpart (kViolationField*) lives in canary_common.cuh. These constants are
-# private to this module + the torch reference; downstream readers should consume the schema through
-# sglang.srt.kv_canary.state helpers, not by indexing positionally.
-#
-# Column 6 (_VIOLATION_FIELD_EXPECTED_AUX) is reason-agnostic: its interpretation depends on
-# (kernel_kind, fail_reason_bits). Verify launches store ``expected_chain_hash`` there; write launches
-# store ``expected_position`` (when pseudo-mode write detects a position mismatch). Callers must dispatch
-# on the row's kernel_kind / fail_reason_bits before decoding this field.
-_VIOLATION_FIELD_KERNEL_KIND: Final[int] = 0
-_VIOLATION_FIELD_SLOT_IDX: Final[int] = 1
-_VIOLATION_FIELD_POSITION: Final[int] = 2
-_VIOLATION_FIELD_STORED_TOKEN: Final[int] = 3
-_VIOLATION_FIELD_EXPECTED_TOKEN: Final[int] = 4
-_VIOLATION_FIELD_STORED_CHAIN_HASH: Final[int] = 5
-_VIOLATION_FIELD_EXPECTED_AUX: Final[int] = 6
-_VIOLATION_FIELD_FAIL_REASON_BITS: Final[int] = 7
+CANARY_SLOT_BYTES: Final[int] = consts.CANARY_FIELDS_PER_SLOT * 8
 
 
 class CanaryLaunchTag(IntEnum):
@@ -79,25 +36,6 @@ class CanaryLaunchTag(IntEnum):
     TAIL_V_SWA = 9
     SWEEP_K_SWA = 10
     SWEEP_V_SWA = 11
-
-
-class RealKvHashMode(IntEnum):
-    """Selector for the real-KV hash mixin.
-
-    Mirrored in C++ (canary_common.cuh) as kRealKvHashMode*; value parity enforced by
-    test_const_sync.py.
-    """
-
-    OFF = 0  # mixin disabled; real_kv_hash field is always 0 in the canary slot.
-    PARTIAL = 1  # splitmix64-fold first min(16, read_bytes) bytes (cheap: max 16B read, high entropy).
-    ALL = 2  # splitmix64-fold all read_bytes (thorough, slower).
-
-
-# Fail-reason bit positions. Bitfield (not enum) because the verify kernel may set multiple reasons on the
-# same violation row.
-_FAIL_REASON_BIT_CHAIN_HASH: Final[int] = 1 << 0
-_FAIL_REASON_BIT_POSITION: Final[int] = 1 << 1
-_FAIL_REASON_BIT_REAL_KV_HASH: Final[int] = 1 << 2
 
 
 def _assert_contiguous(tensor: torch.Tensor, name: str) -> None:
@@ -221,7 +159,7 @@ def canary_verify_step(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     """Verify one canary buffer against a VerifyPlan.
 
@@ -285,9 +223,9 @@ def canary_verify_step(
     :func:`sglang.jit_kernel.kv_canary.verify_ref.canary_verify_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
-    if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:
+    if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
-            f"kv-canary: at most {_MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
+            f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
 
@@ -343,18 +281,18 @@ def _build_real_kv_source_abi(
     real_kv_sources: tuple[RealKvSource, ...],
     device: torch.device,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Pad a RealKvSource tuple up to _MAX_REAL_KV_SOURCES dummy entries and build the (bufs, params) ABI.
+    """Pad a RealKvSource tuple up to consts.MAX_REAL_KV_SOURCES dummy entries and build the (bufs, params) ABI.
 
     Returns:
-        padded_bufs: list of length _MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Unused trailing
+        padded_bufs: list of length consts.MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Unused trailing
             slots are tiny 1-byte placeholders that the kernel never dereferences (their read_bytes is 0).
-        source_params: int32 tensor on CPU, shape [_MAX_REAL_KV_SOURCES, 3]. Per row: (page_size,
+        source_params: int32 tensor on CPU, shape [consts.MAX_REAL_KV_SOURCES, 3]. Per row: (page_size,
             num_bytes_per_token, read_bytes). Padding rows are all zeros except page_size = 1 and
             num_bytes_per_token = 1 to keep the device-side address arithmetic well-defined.
     """
     padded_bufs: list[torch.Tensor] = []
     params = torch.zeros(
-        (_MAX_REAL_KV_SOURCES, _REAL_KV_SOURCE_FIELDS_PER_ENTRY),
+        (consts.MAX_REAL_KV_SOURCES, consts.REAL_KV_SOURCE_FIELDS_PER_ENTRY),
         dtype=torch.int32,
         device="cpu",
     )
@@ -368,17 +306,17 @@ def _build_real_kv_source_abi(
                 f"got {source_u8.dim()}-D"
             )
         padded_bufs.append(source_u8)
-        params[i, _REAL_KV_SOURCE_FIELD_PAGE_SIZE] = source.page_size
-        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = (
+        params[i, consts.REAL_KV_SOURCE_FIELD_PAGE_SIZE] = source.page_size
+        params[i, consts.REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = (
             source.num_bytes_per_token
         )
-        params[i, _REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
+        params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
     dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
-    for i in range(len(real_kv_sources), _MAX_REAL_KV_SOURCES):
+    for i in range(len(real_kv_sources), consts.MAX_REAL_KV_SOURCES):
         padded_bufs.append(dummy)
-        params[i, _REAL_KV_SOURCE_FIELD_PAGE_SIZE] = 1
-        params[i, _REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = 1
-        params[i, _REAL_KV_SOURCE_FIELD_READ_BYTES] = 0  # kernel skips this slot
+        params[i, consts.REAL_KV_SOURCE_FIELD_PAGE_SIZE] = 1
+        params[i, consts.REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN] = 1
+        params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = 0  # kernel skips this slot
 
     return padded_bufs, params
