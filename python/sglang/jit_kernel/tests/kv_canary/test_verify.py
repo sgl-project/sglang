@@ -1399,6 +1399,79 @@ def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
+@pytest.mark.parametrize("hardcoded", [True])
+def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    import json
+    from pathlib import Path
+
+    raw = json.loads(
+        (Path(__file__).parent / "testdata" / "chain_100_steps.json").read_text()
+    )
+    assert len(raw["tokens"]) == 100
+    assert len(raw["positions"]) == 100
+    assert len(raw["real_kv_hashes"]) == 100
+    assert len(raw["expected_prev_hashes"]) == 100
+
+    tokens_int: list[int] = [int(v, 16) for v in raw["tokens"]]
+    positions_int: list[int] = raw["positions"]
+    real_kv_int: list[int] = [int(v, 16) for v in raw["real_kv_hashes"]]
+    expected_u64: list[int] = [int(v, 16) for v in raw["expected_prev_hashes"]]
+    expected_signed: list[int] = [to_signed_int64(v) for v in expected_u64]
+
+    cuda_buf = make_canary_buf(num_slots=100, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+
+    for i in range(100):
+        for buf in (cuda_buf, ref_buf):
+            write_slot_fields(
+                canary_buf=buf,
+                slot_idx=i,
+                token=tokens_int[i],
+                position=positions_int[i],
+                prev_hash=expected_signed[i],
+                real_kv_hash=to_signed_int64(real_kv_int[i]),
+            )
+
+    slot_indices = list(range(100))
+    prev_slot_indices = [-1] + list(range(99))
+
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions_int,
+        prev_slot_indices=prev_slot_indices,
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions_int,
+        prev_slot_indices=prev_slot_indices,
+        device=_DEVICE,
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 0
+
+    for i in range(100):
+        _, _, stored_prev_hash, _ = read_slot_fields(canary_buf=cuda_buf, slot_idx=i)
+        assert stored_prev_hash == expected_signed[i], (
+            f"slot {i}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
+        )
+
+
 def test_chain_advance_formula_matches_spec() -> None:
     """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
     # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
