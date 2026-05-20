@@ -1,18 +1,30 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
+    from sgl_kernel import moe_sum_reduce
+
+    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
-def get_scalar_type(num_bits: int, has_zp: bool):
+def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None):
     from sgl_kernel.scalar_type import scalar_types
 
+    if (
+        not has_zp
+        and num_bits == 4
+        and scales is not None
+        and scales.dtype == torch.float8_e8m0fnu
+    ):
+        return scalar_types.float4_e2m1f
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
@@ -20,6 +32,23 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
+def swiglu_limit_func(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    swiglu_limit: float = 0.0,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d]
+    up = input[:, d:]
+
+    if swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+
+    output.copy_(F.silu(gate) * up)
+
+
+@register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -41,7 +70,8 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -81,12 +111,25 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
-    assert (
-        hidden_states.dtype == w1_scale.dtype
-    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
-    assert (
-        hidden_states.dtype == w2_scale.dtype
-    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+    is_mxfp4_marlin = (
+        num_bits == 4
+        and w1_zeros is None
+        and w2_zeros is None
+        and w1_scale.dtype == torch.float8_e8m0fnu
+        and w2_scale.dtype == torch.float8_e8m0fnu
+    )
+    if is_mxfp4_marlin:
+        assert hidden_states.dtype == torch.bfloat16, (
+            "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
+            f"activations, got {hidden_states.dtype}"
+        )
+    else:
+        assert (
+            hidden_states.dtype == w1_scale.dtype
+        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+        assert (
+            hidden_states.dtype == w2_scale.dtype
+        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -117,8 +160,8 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None, w1_scale)
+    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None, w2_scale)
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),
@@ -138,9 +181,9 @@ def fused_marlin_moe(
     use_atomic_add = (
         hidden_states.dtype == torch.half
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    )
+    ) and (not is_mxfp4_marlin)
 
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
         w1,
@@ -159,7 +202,7 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type1.id,
+        b_q_type=scalar_type1,
         size_m=M,
         size_n=2 * N,
         size_k=K,
@@ -169,12 +212,19 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    if clamp_limit is not None:
+        swiglu_limit_func(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, 2 * N),
+            clamp_limit,
+        )
+    else:
+        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
         w2,
@@ -193,7 +243,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type2.id,
+        b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
         size_k=N,
@@ -204,30 +254,16 @@ def fused_marlin_moe(
     ).view(-1, topk, K)
 
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    torch.sum(intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output)
-    if routed_scaling_factor is not None:
-        output *= routed_scaling_factor
-    return output
 
+    if is_mxfp4_marlin:
+        return torch.sum(intermediate_cache3, dim=1, out=output)
+    else:
+        if routed_scaling_factor is None:
+            routed_scaling_factor = 1.0
 
-def fused_marlin_moe_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    g_idx1: Optional[torch.Tensor] = None,
-    g_idx2: Optional[torch.Tensor] = None,
-    sort_indices1: Optional[torch.Tensor] = None,
-    sort_indices2: Optional[torch.Tensor] = None,
-    w1_zeros: Optional[torch.Tensor] = None,
-    w2_zeros: Optional[torch.Tensor] = None,
-    num_bits: int = 8,
-    is_k_full: bool = True,
-    inplace: bool = False,
-    routed_scaling_factor: float = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+        moe_sum_reduce(
+            intermediate_cache3,
+            output,
+            routed_scaling_factor,
+        )
+        return output

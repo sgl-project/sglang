@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
+from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
+from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
+from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
+from sglang.srt.kv_canary.runner.launch import (
+    invoke_plan,
+    launch_endpoints_per_forward,
+)
+from sglang.srt.kv_canary.runner.perturb import PerturbHook
+from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class PerForwardOrchestrator:
+    """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
+    capture boundary:
+
+    - ``before_forward(forward_batch)`` runs HOST-SIDE (called by ModelRunner.forward outside the
+      captured region): perturb hooks, fill the static expected_input buffers, fill the static
+      per-forward PlanInput buffers.
+    - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region (called by the
+      monkey-patched model.forward, before the original forward): canary_plan_step kernel +
+      HEAD endpoint launches.
+    - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region (called by the
+      monkey-patched model.forward, after the original forward): TAIL endpoint launches reusing
+      the plan staged in launch_head_kernels.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: CanaryConfig,
+        device: torch.device,
+        device_state: CanaryDeviceState,
+        buffer_groups: tuple[CanaryBufferGroup, ...],
+        endpoints: tuple[CanaryEndpoint, ...],
+        req_to_token_pool: "ReqToTokenPool",
+        swa_window_size: int,
+        perturb_hook: PerturbHook,
+        per_forward_verify_capacity: int,
+        per_forward_write_req_capacity: int,
+        per_forward_write_entry_capacity: int,
+    ) -> None:
+        self._config = config
+        self._device_state = device_state
+        self._buffer_groups = buffer_groups
+        self._endpoints = endpoints
+        self._req_to_token_pool = req_to_token_pool
+        self._swa_window_size = swa_window_size
+        self._perturb_hook = perturb_hook
+        self._token_oracle_manager: Optional[TokenOracleManager] = None
+
+        self._verify_plan_per_forward = VerifyPlan.allocate(
+            verify_capacity=max(1, per_forward_verify_capacity), device=device
+        )
+        write_req_capacity = max(1, per_forward_write_req_capacity)
+        self._write_plan_per_forward = WritePlan.allocate(
+            write_req_capacity=write_req_capacity, device=device
+        )
+
+        write_entry_capacity = max(1, per_forward_write_entry_capacity)
+        self._expected_inputs = ExpectedInputs.allocate(
+            capacity=write_entry_capacity, device=device
+        )
+
+        self._plan_input_per_forward = PlanInput.allocate(
+            bs_capacity=write_req_capacity,
+            extra_verify_capacity=0,
+            device=device,
+        )
+
+        self._write_req_capacity = write_req_capacity
+        self._write_entry_capacity = write_entry_capacity
+        self._verify_capacity = max(1, per_forward_verify_capacity)
+
+        self._last_forward_batch: Optional["ForwardBatch"] = None
+
+    def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
+        self._token_oracle_manager = manager
+
+    def before_forward(self, forward_batch: "ForwardBatch") -> None:
+        if self._config.mode == "off":
+            return
+
+        bs = int(forward_batch.batch_size)
+        num_tokens = int(forward_batch.positions.shape[0])
+        if bs > self._write_req_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
+                f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
+                f"or check install_canary._compute_launch_capacities"
+            )
+        if num_tokens > self._write_entry_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
+                f"write_entry_capacity={self._write_entry_capacity}; raise "
+                f"--chunked-prefill-size / --max-prefill-tokens or check "
+                f"install_canary._compute_launch_capacities"
+            )
+
+        # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
+        # group; if it exceeds verify_capacity the plan kernel masks stores past capacity while
+        # the kernel grid's tail threads still read up to active, OOB-loading verify_slot_indices.
+        # Fail loudly host-side using the ForwardBatch CPU mirrors so it never reaches the kernel
+        # (RuntimeError, not assert, so `python -O` cannot strip the check).
+        prefix_lens_sum = _sum_prefix_lens(forward_batch=forward_batch, bs=bs)
+        if prefix_lens_sum > self._verify_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds "
+                f"pre-allocated per_forward_verify_capacity={self._verify_capacity}; raise the "
+                f"verify capacity in install_canary._compute_launch_capacities (or "
+                f"_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
+            )
+
+        self._perturb_hook.perturb_hook(forward_batch)
+        self._perturb_hook.perturb_real_kv_hook(forward_batch)
+        self._last_forward_batch = forward_batch
+
+        if self._config.input_check_mode == CanaryInputCheckMode.ON:
+            manager = self._token_oracle_manager
+            if manager is None:
+                raise RuntimeError(
+                    "kv-canary: input_check_mode=ON requires a TokenOracleManager; call "
+                    "CanaryRunner.attach_token_oracle_manager(manager) where manager is "
+                    "the return value of install_oracle_sampler(oracle=...)"
+                )
+            manager.fill_expected_inputs(
+                forward_batch=forward_batch,
+                expected_inputs_out=self._expected_inputs,
+            )
+
+        fill_plan_input_per_forward(
+            forward_batch=forward_batch,
+            plan_input_out=self._plan_input_per_forward,
+        )
+
+    def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
+        if self._config.mode == "off":
+            return
+
+        violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
+        for group in self._buffer_groups:
+            invoke_plan(
+                plan_input=self._plan_input_per_forward,
+                verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
+                group=group,
+                req_to_token=self._req_to_token_pool.req_to_token,
+                swa_window_size=self._swa_window_size,
+            )
+            launch_endpoints_per_forward(
+                endpoints=self._endpoints,
+                group=group,
+                tag_filter=_is_head_tag,
+                verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
+                forward_batch=forward_batch,
+                expected_inputs=expected_inputs_slice,
+                violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
+                input_check_mode=self._config.input_check_mode,
+            )
+
+    def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
+        if self._config.mode == "off":
+            return
+
+        violation_log = self._device_state.violation_log
+        num_tokens = int(forward_batch.positions.shape[0])
+        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
+        for group in self._buffer_groups:
+            launch_endpoints_per_forward(
+                endpoints=self._endpoints,
+                group=group,
+                tag_filter=_is_tail_tag,
+                verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
+                forward_batch=forward_batch,
+                expected_inputs=expected_inputs_slice,
+                violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
+                input_check_mode=self._config.input_check_mode,
+            )
+
+
+def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
+    """Host-side sum of per-req prefix lens, matching the prefix_lens computed by
+    fill_plan_input_per_forward: extend → sum(extend_prefix_lens_cpu); decode → seq_lens_sum - bs.
+    The scheduler always populates these CPU mirrors, so this never triggers a D2H sync.
+    """
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is not None and forward_mode.is_extend():
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if extend_prefix_lens_cpu is None:
+            raise RuntimeError(
+                "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
+                "scheduler should populate it before forward"
+            )
+        return int(sum(extend_prefix_lens_cpu[:bs]))
+    return int(forward_batch.seq_lens_sum) - bs
+
+
+def _is_head_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.HEAD_K_FULL,
+        CanaryLaunchTag.HEAD_V_FULL,
+        CanaryLaunchTag.HEAD_K_SWA,
+        CanaryLaunchTag.HEAD_V_SWA,
+    )
+
+
+def _is_tail_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.TAIL_K_FULL,
+        CanaryLaunchTag.TAIL_V_FULL,
+        CanaryLaunchTag.TAIL_K_SWA,
+        CanaryLaunchTag.TAIL_V_SWA,
+    )

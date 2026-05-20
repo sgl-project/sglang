@@ -13,9 +13,10 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 
 ScalarType, scalar_types = get_scalar_types()
 
-
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 class AutoRoundConfig(QuantizationConfig):
@@ -217,11 +218,13 @@ class AutoRoundConfig(QuantizationConfig):
         return weight_bits < 16
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
@@ -255,8 +258,8 @@ class AutoRoundConfig(QuantizationConfig):
             use_marlin = False
         if use_marlin:
             from sglang.srt.layers.quantization.awq import (
+                AWQLinearMethod,
                 AWQMarlinConfig,
-                AWQMarlinLinearMethod,
                 AWQMoEMethod,
             )
 
@@ -279,6 +282,7 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
+                layer.scheme = quant_args_marlin.get_moe_scheme(layer)
                 return AWQMoEMethod(quant_args_marlin)
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -293,17 +297,26 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
-                return AWQMarlinLinearMethod(quant_args_marlin)
+                layer.scheme = quant_args_marlin.get_linear_scheme(layer)
+                return AWQLinearMethod(quant_args_marlin)
             else:
+                layer.scheme = quant_args.get_linear_scheme(layer)
                 return AWQLinearMethod(quant_args)
         return None
 
     def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.gptq import (
+            GPTQConfig,
+            GPTQLinearAscendMethod,
+            GPTQMoEAscendMethod,
+        )
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
@@ -321,6 +334,24 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        if _is_npu:
+            quant_args = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                lm_head_quantized=False,
+                desc_act=False,
+                dynamic={},
+            )
+            quant_args.sym = sym
+
+            if isinstance(layer, FusedMoE):
+                return GPTQMoEAscendMethod(quant_args)
+
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return GPTQLinearAscendMethod(quant_args)
+
+            return None
+
         if backend == "auto" or "marlin" in backend:
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,

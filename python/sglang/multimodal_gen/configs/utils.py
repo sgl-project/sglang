@@ -19,6 +19,7 @@ def update_config_from_args(
     # Handle top-level attributes (no prefix)
     args_not_to_remove = [
         "model_path",
+        "disable_autocast",
     ]
     args_to_remove = []
     if prefix.strip() == "":

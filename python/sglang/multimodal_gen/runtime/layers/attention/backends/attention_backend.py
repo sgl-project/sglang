@@ -12,6 +12,9 @@ if TYPE_CHECKING:
 
 import torch
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
 
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
@@ -23,7 +26,7 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_name() -> str:
+    def get_enum() -> AttentionBackendEnum:
         raise NotImplementedError
 
     @staticmethod
@@ -137,12 +140,6 @@ class AttentionImpl(ABC, Generic[T]):
 
         Called AFTER all_to_all for distributed attention
 
-        Args:
-            qkv: The query-key-value tensor
-            attn_metadata: Metadata for the attention operation
-
-        Returns:
-            Processed QKV tensor
         """
         return qkv
 
@@ -159,12 +156,6 @@ class AttentionImpl(ABC, Generic[T]):
 
         Called BEFORE all_to_all for distributed attention
 
-        Args:
-            output: The output tensor from the attention operation
-            attn_metadata: Metadata for the attention operation
-
-        Returns:
-            Postprocessed output tensor
         """
 
         return output
@@ -178,3 +169,11 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
+    return wrap_method_with_debug_kernel_once(
+        attn_impl,
+        "forward",
+        op_name=f"diffusion.attn_impl.{attn_impl.__class__.__name__}.forward",
+    )
