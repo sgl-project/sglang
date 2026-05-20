@@ -48,6 +48,13 @@ constexpr uint32_t kClusterSize = Large::kClusterSize;
 constexpr uint32_t kMax2PassLength = Small::kMax2PassLength;
 constexpr uint32_t kMaxSupportedLength = Large::kMaxLength;
 
+SGL_DEVICE void init_topk_indices(int32_t* indices) {
+  if (threadIdx.x < K) {
+    indices[threadIdx.x] = -1;
+  }
+  __syncthreads();
+}
+
 /// Common metadata lives at metadata[0] (first row of the [batch_size+1, 4] tensor).
 /// Per-item metadata starts at metadata[1..batch_size]. The plan kernel writes both.
 struct alignas(16) GlobalMetadata {
@@ -238,6 +245,7 @@ topk_short_transform(const __grid_constant__ TopKParams params) {
   if (seq_len <= K) {
     impl::trivial_transform(transform, seq_len, K);
   } else {
+    init_topk_indices(s_topk_indices);
     Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
     device::PDLTriggerSecondary<true>();
     Small::transform(transform);
@@ -284,6 +292,7 @@ topk_combine_preprocess(const __grid_constant__ TopKParams params) {
     const auto transform = params.get_transform(batch_id, s_topk_indices);
     const auto ws = params.workspace + batch_id * params.workspace_stride;
     if (need_prefetch) prefetch_metadata();
+    init_topk_indices(s_topk_indices);
     Large::stage1(s_topk_indices, this_length, smem, /*reuse=*/true);
     if (need_prefetch) launch_prologue();
     Large::stage1_epilogue(transform, this_offset, ws, smem);
@@ -302,6 +311,7 @@ topk_combine_transform(const __grid_constant__ TopKParams params) {
   if (seq_len <= K) {
     impl::trivial_transform(transform, seq_len, K);
   } else if (seq_len <= kMax2PassLength) {
+    init_topk_indices(s_topk_indices);
     if (seq_len <= Small::kMax1PassLength) {
       Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem);
     } else {
@@ -310,6 +320,7 @@ topk_combine_transform(const __grid_constant__ TopKParams params) {
     }
     Small::transform(transform);
   } else if (seq_len <= cluster_threshold) {
+    init_topk_indices(s_topk_indices);
     Medium::run(params.get_scores(batch_id), seq_len, s_topk_indices, smem);
     Medium::transform(transform, smem);
   } else {
@@ -332,11 +343,13 @@ topk_fused_transform(const __grid_constant__ TopKParams params) {
     impl::trivial_transform(transform, seq_len, K);
   } else if (seq_len <= Small::kMax1PassLength) {
     if (cluster_rank != 0) return;  // only first rank work
+    init_topk_indices(s_topk_indices);
     Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
     Small::transform(transform);
   } else {
     const auto [offset, length] = partition_work(seq_len, cluster_rank);
     const auto ws = params.workspace + batch_id * params.workspace_stride;
+    init_topk_indices(s_topk_indices);
     Large::stage1_init(smem);
     device::PDLWaitPrimary<true>();
     Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
