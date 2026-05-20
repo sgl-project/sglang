@@ -818,26 +818,33 @@ class MooncakeKVManager(CommonKVManager):
         # and scales after that, so each C4 token maps to two transfer blocks.
         max_tokens_per_batch = 256
         for start in range(0, len(src_indices), max_tokens_per_batch):
-            transfer_blocks = []
             src_chunk = src_indices[start : start + max_tokens_per_batch]
             dst_chunk = dst_indices[start : start + max_tokens_per_batch]
+            src_pages = src_chunk // c4_page_size
+            src_offsets = src_chunk % c4_page_size
+            src_value_offsets = src_pages * gpu_page_bytes + src_offsets * value_bytes
+            src_scale_offsets = (
+                src_pages * gpu_page_bytes
+                + gpu_scale_page_offset
+                + src_offsets * scale_bytes
+            )
+            dst_offsets = dst_chunk * dst_kv_item_len
+
+            src_addrs = []
+            dst_addrs = []
+            lengths = []
             for src_ptr, dst_ptr in zip(src_ptrs, dst_ptrs):
-                for src_idx, dst_idx in zip(src_chunk, dst_chunk):
-                    src_page = int(src_idx) // c4_page_size
-                    src_offset = int(src_idx) % c4_page_size
-                    src_base = int(src_ptr) + src_page * gpu_page_bytes
-                    dst_base = int(dst_ptr) + int(dst_idx) * dst_kv_item_len
-                    transfer_blocks.append(
-                        (src_base + src_offset * value_bytes, dst_base, value_bytes)
-                    )
-                    transfer_blocks.append(
-                        (
-                            src_base + gpu_scale_page_offset + src_offset * scale_bytes,
-                            dst_base + value_bytes,
-                            scale_bytes,
-                        )
-                    )
-            ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+                src_addrs.extend((int(src_ptr) + src_value_offsets).tolist())
+                dst_addrs.extend((int(dst_ptr) + dst_offsets).tolist())
+                lengths.extend([value_bytes] * len(src_chunk))
+                src_addrs.extend((int(src_ptr) + src_scale_offsets).tolist())
+                dst_addrs.extend((int(dst_ptr) + dst_offsets + value_bytes).tolist())
+                lengths.extend([scale_bytes] * len(src_chunk))
+            if not src_addrs:
+                continue
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
             if ret != 0:
                 return ret
         return 0
