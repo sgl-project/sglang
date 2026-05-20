@@ -17,6 +17,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from typing import Dict, Tuple
 from unittest.mock import MagicMock
 
 import torch
@@ -415,13 +416,12 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
                 layer_id=0,
             )
 
-    def test_ds_branch_propagates_out_of_range_page(self):
-        """AC-2 live path: a selector returning an out-of-range page ID
-        triggers DSAdapterPageOutOfRange BEFORE transform runs."""
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPageOutOfRange,
-        )
-
+    def test_ds_branch_sanitizes_out_of_range_row_and_records_error(self):
+        """AC-2 + AC-9 live path: a selector returning an out-of-range
+        page ID does NOT abort the batch; instead the row is sanitized
+        to all -1 and the per-request summary records the typed error
+        class. The DS branch returns normally.
+        """
         attn = self._make_attn_real()
         # Replace retrieve_topk with a stub that returns an out-of-range page
         # (logical page 1000) with seq_lens=128 → only 2 logical pages exist.
@@ -440,14 +440,22 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
                 req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
             ),
         )
-        with self.assertRaises(DSAdapterPageOutOfRange):
-            attn._select_topk_indices(
-                x=torch.zeros(1, 16, 128),
-                q_lora=torch.zeros(1, 16, 128),
-                positions=torch.zeros(1, dtype=torch.int32),
-                forward_batch=forward_batch,
-                layer_id=0,
-            )
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+        # The row is sanitized to all -1, so the returned topk_indices is
+        # all -1 for that row.
+        self.assertTrue(torch.all(result == -1).item())
+        # The per-request summary records the typed error class for the
+        # failed row.
+        summary = forward_batch.ds_per_request_summary["double_sparsity"]
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["error_class"], "DSAdapterPageOutOfRange")
+        self.assertEqual(summary[0]["dense_fallback"], 1)
 
 
 class TestPageTableAdapter(unittest.TestCase):
@@ -3181,6 +3189,192 @@ class TestPreflightScript(unittest.TestCase):
             "--cuda-arch-major", "8",
         )
         self.assertEqual(rc, 6)
+
+
+class TestR3Coverage(unittest.TestCase):
+    """R3 behavioral coverage: AC-2 FlashMLA probe, mixed-batch summary
+    indexing, bind INFO log, 3-row sanitization.
+    """
+
+    def test_ds_decode_reaches_flashmla_kv_sparse_path(self):
+        """AC-2 anchor: DS-expanded topk_indices is what downstream
+        `transform_index_page_table_decode` would consume on the NSA
+        flashmla_kv path. We assert the adapter produces the exact
+        token-index input shape and content that the NSA pipeline
+        accepts, AND that the unified transform consumes them.
+        """
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            expand_ds_selection_to_topk_indices,
+        )
+        from sglang.srt.layers.attention.nsa.transform_index import (
+            transform_index_page_table_decode_ref,
+        )
+
+        max_top_k = 2048
+        bs = 2
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        # row 0 picks pages [0, 2]; row 1 picks pages [1, 3, 5]
+        sel[0, 0:2] = torch.tensor([0, 2], dtype=torch.int32)
+        sel[1, 0:3] = torch.tensor([1, 3, 5], dtype=torch.int32)
+        vl = torch.tensor([2, 3], dtype=torch.int32)
+        topk = expand_ds_selection_to_topk_indices(
+            selected_indices=sel,
+            valid_lengths=vl,
+            page_size=64,
+        )
+        # Build a synthetic page_table[bs, max_seqlen_k] that maps
+        # token_position → physical page. Then run the transform and
+        # verify the DS-expanded output matches what the existing
+        # NSA flashmla_kv path consumes.
+        max_seqlen_k = 1024
+        page_table = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
+        # Token position p*64 maps to physical page p+100 (offset so values are
+        # distinct from the page IDs).
+        for token_pos in range(max_seqlen_k):
+            page_table[:, token_pos] = (token_pos // 64) + 100
+        physical = transform_index_page_table_decode_ref(
+            page_table, topk, page_size=1
+        )
+        # row 0: physical pages for token_pos {0, 128} = {100, 102}
+        self.assertEqual(int(physical[0, 0].item()), 100)
+        self.assertEqual(int(physical[0, 1].item()), 102)
+        self.assertEqual(int(physical[0, 2].item()), -1)
+        # row 1: physical pages for token_pos {64, 192, 320} = {101, 103, 105}
+        self.assertEqual(int(physical[1, 0].item()), 101)
+        self.assertEqual(int(physical[1, 1].item()), 103)
+        self.assertEqual(int(physical[1, 2].item()), 105)
+        self.assertEqual(int(physical[1, 3].item()), -1)
+
+    def test_mixed_batch_per_request_summary_no_index_error(self):
+        """AC-3 mixed-batch safety: the scheduler collation must
+        backfill None for prior reqs when a new summary key first
+        appears mid-batch. The tokenizer's v[i] indexing then never
+        raises IndexError.
+        """
+        # Simulate the per-batch loop with three reqs: only req 1 has a
+        # per_request_summary, reqs 0 and 2 don't.
+        per_request_summary: Dict[str, list] = {}
+
+        def _per_req(rids_so_far_len: int, req_summary):
+            # Mirror the production loop logic (post fix).
+            _pos = rids_so_far_len - 1
+            if req_summary is not None:
+                new_keys = set(req_summary.keys())
+                existing_keys = set(per_request_summary.keys())
+                for k in new_keys - existing_keys:
+                    per_request_summary[k] = [None] * _pos
+                for k in existing_keys - new_keys:
+                    per_request_summary[k].append(None)
+                for k in new_keys:
+                    per_request_summary[k].append(req_summary[k])
+            else:
+                for k in per_request_summary:
+                    per_request_summary[k].append(None)
+
+        # req 0: no summary
+        _per_req(1, None)
+        # req 1: introduces "double_sparsity"
+        _per_req(2, {"double_sparsity": {"sparsity_rate": 0.7}})
+        # req 2: no summary
+        _per_req(3, None)
+
+        self.assertEqual(len(per_request_summary["double_sparsity"]), 3)
+        self.assertIsNone(per_request_summary["double_sparsity"][0])
+        self.assertEqual(
+            per_request_summary["double_sparsity"][1],
+            {"sparsity_rate": 0.7},
+        )
+        self.assertIsNone(per_request_summary["double_sparsity"][2])
+        # Tokenizer-side: v[i] must be safe for i in 0..2.
+        for i in range(3):
+            _ = per_request_summary["double_sparsity"][i]
+
+    def test_bind_runtime_data_emits_info_log_with_structured_fields(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        import logging as _logging
+
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg,
+            num_local_heads=4,
+            head_dim=128,
+            device=torch.device("cpu"),
+        )
+        label_dim = 16
+        pst = allocate_page_signature_table(
+            num_layers_local=4,
+            max_pages=16,
+            num_heads_local=4,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        cm = ChannelMask(
+            channel_selection=torch.zeros(
+                (4, 4, label_dim), dtype=torch.int32
+            ),
+            channel_weights=torch.ones(
+                (4, 4, label_dim), dtype=torch.float32
+            ),
+            schema_version="1",
+            dtype="bfloat16",
+            head_dim=128,
+            page_size=64,
+            label_dim=label_dim,
+            created_at="2026-01-01T00:00:00Z",
+            content_sha256="x" * 64,
+        )
+
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.selector",
+            level="INFO",
+        ) as cm_log:
+            sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm)
+
+        msg = "\n".join(cm_log.output)
+        self.assertIn("bind_runtime_data completed", msg)
+        self.assertIn("selector_id=", msg)
+        self.assertIn("num_local_heads=4", msg)
+        self.assertIn("label_dim=16", msg)
+
+    def test_three_row_sanitization_only_bad_row_fails(self):
+        """AC-9 anchor: three rows, only row 1 fails the contract; rows
+        0 and 2 produce valid topk_indices and row_errors records only
+        row 1's typed exception."""
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            expand_ds_selection_to_topk_indices,
+        )
+
+        max_top_k = 16
+        sel = torch.full((3, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)  # ok
+        sel[1, 0:2] = torch.tensor([2000, 2001], dtype=torch.int32)  # OOR
+        sel[2, 0:3] = torch.tensor([1, 2, 3], dtype=torch.int32)  # ok
+        vl = torch.tensor([2, 2, 3], dtype=torch.int32)
+        row_errors: Dict[int, Tuple[str, str]] = {}
+        out = expand_ds_selection_to_topk_indices(
+            selected_indices=sel,
+            valid_lengths=vl,
+            page_size=64,
+            max_logical_pages=10,
+            row_errors=row_errors,
+        )
+        self.assertIn(1, row_errors)
+        self.assertEqual(row_errors[1][0], "DSAdapterPageOutOfRange")
+        # Row 1 sanitized to -1
+        self.assertTrue(torch.all(out[1] == -1).item())
+        # Rows 0 and 2 produce expected token positions
+        self.assertEqual(int(out[0, 0].item()), 0)
+        self.assertEqual(int(out[0, 1].item()), 64)
+        self.assertEqual(int(out[2, 0].item()), 64)
+        self.assertEqual(int(out[2, 1].item()), 128)
+        self.assertEqual(int(out[2, 2].item()), 192)
 
 
 if __name__ == "__main__":

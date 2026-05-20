@@ -13,10 +13,13 @@ The class does NOT inherit from any HiSparse base and is NOT registered in
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
@@ -168,6 +171,37 @@ class DoubleSparsitySelector:
         self.channel_mask = channel_mask
         self.process_group = process_group
         self.IS_PLACEHOLDER = False
+
+        # Structured bind-time INFO log: operators rely on this to confirm
+        # every DS-enabled layer has been bound on every TP rank.
+        pg_size = 0
+        pg_rank = 0
+        if process_group is not None:
+            try:
+                pg_size = int(torch.distributed.get_world_size(group=process_group))
+                pg_rank = int(torch.distributed.get_rank(group=process_group))
+            except Exception:
+                pg_size = 0
+                pg_rank = 0
+        logger.info(
+            "double_sparsity bind_runtime_data completed: "
+            "selector_id=%s num_local_heads=%d label_dim=%d page_size=%d "
+            "process_group_size=%d process_group_rank=%d",
+            id(self),
+            self.num_local_heads,
+            page_signature_table.label_dim,
+            self.page_size,
+            pg_size,
+            pg_rank,
+            extra={
+                "ds_selector_id": id(self),
+                "ds_num_local_heads": self.num_local_heads,
+                "ds_label_dim": page_signature_table.label_dim,
+                "ds_page_size": self.page_size,
+                "ds_process_group_size": pg_size,
+                "ds_process_group_rank": pg_rank,
+            },
+        )
 
     def retrieve_topk(
         self,

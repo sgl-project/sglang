@@ -93,10 +93,19 @@ probe_gpu_count() {
     fi
 }
 
-# Fill in probed values if --check-only is set.
+# Fill in probed values if --check-only is set. Backend / dtype / page-size /
+# top-k cannot be probed from the running system; they come from the launcher's
+# emitted environment (DS_PREFLIGHT_*). When --check-only is set and a value
+# is missing from BOTH the explicit flag AND the env, we fall back to the
+# launcher defaults baked into serve_double_sparsity.sh so the runbook's
+# `bash preflight.sh --check-only` invocation can succeed on a matching node.
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    : "${CUDA_ARCH_MAJOR:=$(probe_cuda_arch_major)}"
-    : "${TP_SIZE:=$(probe_gpu_count)}"
+    : "${BACKEND:=${DS_PREFLIGHT_BACKEND:-flashmla_kv}}"
+    : "${DTYPE:=${DS_PREFLIGHT_DTYPE:-fp8_e4m3}}"
+    : "${PAGE_SIZE:=${DS_PREFLIGHT_PAGE_SIZE:-64}}"
+    : "${TOP_K:=${DS_PREFLIGHT_TOP_K:-2048}}"
+    : "${TP_SIZE:=${DS_PREFLIGHT_TP_SIZE:-$(probe_gpu_count)}}"
+    : "${CUDA_ARCH_MAJOR:=${DS_PREFLIGHT_CUDA_ARCH_MAJOR:-$(probe_cuda_arch_major)}}"
 fi
 
 # 1. Backend

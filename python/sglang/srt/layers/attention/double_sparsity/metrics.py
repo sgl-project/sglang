@@ -1,7 +1,7 @@
 """Prometheus metrics + per-request meta_info for Double Sparsity.
 
 All metric names live under the ``sglang_double_sparsity_*`` namespace per
-AC-10 (deliberately distinct from any ``sglang_hisparse_*`` namespace,
+(deliberately distinct from any ``sglang_hisparse_*`` namespace,
 because DS is standalone).
 
 Surfaces:
@@ -194,7 +194,7 @@ def reset_for_testing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Error taxonomy (AC-3 observability)
+# Error taxonomy for DS production failures (Prometheus counter + log labels).
 # ---------------------------------------------------------------------------
 
 DS_ERROR_CLASSES = (

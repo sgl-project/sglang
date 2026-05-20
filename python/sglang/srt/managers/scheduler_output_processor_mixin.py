@@ -1254,14 +1254,25 @@ class SchedulerOutputProcessorMixin:
 
                 # Per-request summary (one dict per request; the latest
                 # value the model emitted for this request wins).
+                #
+                # Invariant: for every emitted request emit_index `j`, every
+                # key in `per_request_summary` must have a value at index `j`
+                # (possibly None). When a new key first appears at req j,
+                # backfill `None` for all prior emitted reqs so the
+                # tokenizer's `v[i]` indexing never raises.
+                _pos = len(rids) - 1  # index of the just-appended req
                 if req.per_request_summary is not None:
-                    for k, v in req.per_request_summary.items():
-                        per_request_summary.setdefault(k, []).append(v)
+                    new_keys = set(req.per_request_summary.keys())
+                    existing_keys = set(per_request_summary.keys())
+                    for k in new_keys - existing_keys:
+                        per_request_summary[k] = [None] * _pos
+                    for k in existing_keys - new_keys:
+                        per_request_summary[k].append(None)
+                    for k in new_keys:
+                        per_request_summary[k].append(
+                            req.per_request_summary[k]
+                        )
                 else:
-                    # Keep the per-key list shape consistent across the batch:
-                    # if other reqs in the batch have summaries, append a
-                    # None placeholder so list indices match. The tokenizer
-                    # hook treats None entries as absent.
                     for k in per_request_summary:
                         per_request_summary[k].append(None)
 

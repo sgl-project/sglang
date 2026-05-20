@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1798,7 +1799,7 @@ class DeepseekV2AttentionMLA(
         if full_mask is None:
             # The validator loads the mask before attention construction; if it
             # is missing the validator should have raised. Surface as a typed
-            # error class for consistency with the other AC-1 cases.
+            # error class for consistency with the other startup errors.
             raise RuntimeError(
                 "Double Sparsity attention init: server_args has no "
                 "_double_sparsity_channel_mask. validate_double_sparsity must "
@@ -1862,6 +1863,70 @@ class DeepseekV2AttentionMLA(
             self.double_sparsity_selector, tp_world_size=max(attn_tp_size, 1)
         )
 
+    def _publish_ds_request_summary(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        row_errors: Dict[int, Tuple[str, str]],
+        layer_id: int,
+    ) -> None:
+        """Publish per-row DS stats onto ``forward_batch.ds_per_request_summary``.
+
+        The scheduler reads this side-channel into ``Req.per_request_summary``
+        so the tokenizer surfaces a single dict per request in
+        ``meta_info["double_sparsity"]``. Stores the latest layer's
+        snapshot (last layer's stats win the per-request summary).
+        """
+        from sglang.srt.layers.attention.double_sparsity.metrics import (
+            meta_info_for_request,
+        )
+
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is None:
+            return
+        page_size = int(self.double_sparsity_selector.page_size)
+        bs = int(valid_lengths.shape[0])
+        # CPU copy: this side-channel is a host-side scalar publication,
+        # not a hot-path tensor; one .tolist() per layer per batch.
+        vl_cpu = valid_lengths.detach().to("cpu").tolist()
+        sl_cpu = seq_lens.detach().to("cpu").tolist()
+
+        records: List[Optional[Dict[str, Any]]] = []
+        for b in range(bs):
+            if b in row_errors:
+                cls, msg = row_errors[b]
+                records.append(
+                    {
+                        "sparsity_rate": 0.0,
+                        "selected_pages": 0,
+                        "dense_fallback": 1,
+                        "error_class": cls,
+                        "error_message": msg,
+                    }
+                )
+                continue
+            selected = int(vl_cpu[b])
+            total_pages = max(
+                1, (int(sl_cpu[b]) + page_size - 1) // page_size
+            )
+            stats = SimpleNamespace(
+                sparsity_rate=float(1.0 - selected / total_pages),
+                selected_pages=selected,
+                dense_fallback=0,
+            )
+            records.append(meta_info_for_request(stats))
+
+        # Stash on forward_batch; the scheduler reads this when assembling
+        # BatchTokenIDOutput. We overwrite per layer; the last layer to
+        # publish wins (consistent with "latest snapshot per request").
+        summary = getattr(forward_batch, "ds_per_request_summary", None)
+        if summary is None:
+            summary = {}
+            setattr(forward_batch, "ds_per_request_summary", summary)
+        summary["double_sparsity"] = records
+
     def _select_topk_indices(
         self,
         x: torch.Tensor,
@@ -1918,21 +1983,42 @@ class DeepseekV2AttentionMLA(
                     if req_to_token_pool is not None
                     else None
                 )
-                return expand_ds_selection_to_topk_indices(
+                # Per-row error sanitization: the adapter now writes the
+                # failed row indices into `row_errors` and clamps those
+                # rows to -1 instead of raising for the whole batch.
+                row_errors: Dict[int, Tuple[str, str]] = {}
+                # Honor an NSA-metadata-owned out= buffer when present.
+                # This keeps the captured path allocation-free: the
+                # buffer is allocated once by `init_forward_metadata`
+                # and reused across steps.
+                ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
+                if ds_out is not None:
+                    # Slice to the current batch dimension if the buffer
+                    # was over-allocated.
+                    bs = int(selected_indices.shape[0])
+                    if ds_out.shape[0] != bs:
+                        ds_out = ds_out[:bs]
+                topk_out = expand_ds_selection_to_topk_indices(
                     selected_indices=selected_indices,
                     valid_lengths=valid_lengths,
                     page_size=self.double_sparsity_selector.page_size,
                     req_to_token=req_to_token,
                     req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
                     seq_lens=getattr(forward_batch, "seq_lens", None),
+                    out=ds_out,
+                    row_errors=row_errors,
                 )
+                # Publish per-row DS stats + per-row failure classes to
+                # the scheduler via a forward_batch side-channel.
+                self._publish_ds_request_summary(
+                    forward_batch=forward_batch,
+                    selected_indices=selected_indices,
+                    valid_lengths=valid_lengths,
+                    row_errors=row_errors,
+                    layer_id=layer_id,
+                )
+                return topk_out
 
-            # Run under the containment primitive so DS-typed exceptions
-            # increment the Prometheus error counter and emit structured
-            # logs. The primitive returns (success, value); on failure we
-            # still re-raise to preserve the current batch semantics
-            # (full per-request abort plumbing through the scheduler is a
-            # follow-up — this seam at least makes the failure observable).
             error_state: Dict[str, Any] = {}
             ok, result = try_run_ds_step(
                 _run,
@@ -1942,10 +2028,11 @@ class DeepseekV2AttentionMLA(
                 selector_id=f"layer{layer_id}",
             )
             if not ok:
-                # Preserve the original typed exception so AC-2 negative
-                # tests still see e.g. DSAdapterPageOutOfRange; the
-                # counter / log have already been recorded by
-                # try_run_ds_step.
+                # Non-row-level DS exceptions (e.g. selector RuntimeError
+                # before retrieve_topk produces output) are still
+                # batch-fatal — they cannot be sanitized per-row because
+                # we have no per-row tensor to clamp. Re-raise the
+                # original typed exception so callers see it.
                 original = error_state.get("ds_original_exception")
                 if original is not None:
                     raise original

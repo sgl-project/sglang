@@ -11,11 +11,11 @@ page, ``p * page_size``. The transform then maps each token position to
 its physical page ID via ``req_to_token``, producing the physical page
 table that ``_forward_flashmla_kv`` consumes.
 
-Strategy 2 from the refined plan ("expand-then-transform"): the adapter
-emits ``topk_indices`` of the same shape NSA's indexer emits, so the
-downstream consumer in ``forward_absorb_*`` and ``nsa_backend`` sees one
-unified tensor shape from both selection paths. There is no typed-union
-return, no isinstance dispatch, no bypass of the NSA transform pipeline.
+The adapter emits ``topk_indices`` of the same shape NSA's indexer
+emits, so the downstream consumer in ``forward_absorb_*`` and
+``nsa_backend`` sees one unified tensor shape from both selection
+paths. There is no typed-union return, no isinstance dispatch, no
+bypass of the NSA transform pipeline.
 
 Contract assertions raise typed exceptions for each named failure mode.
 This module exposes two paths:
@@ -80,6 +80,7 @@ def expand_ds_selection_to_topk_indices(
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    row_errors: Optional[dict] = None,
 ) -> torch.Tensor:
     """Translate DS selector page-level output to NSA-compatible token-level ``topk_indices``.
 
@@ -245,6 +246,21 @@ def expand_ds_selection_to_topk_indices(
         seq_lens.detach().to("cpu") if seq_lens is not None else None
     )
 
+    # Per-row validation. When `row_errors` is provided, a row-level
+    # contract violation records the typed exception class + message in
+    # `row_errors[b]` and is sanitized to all `-1` so the row produces
+    # an empty selection downstream; siblings keep running. When
+    # `row_errors` is None, the first row-level violation raises (legacy
+    # batch-fatal mode kept for unit tests that assert typed exceptions).
+    def _record_or_raise(b: int, exc: DSAdapterError) -> bool:
+        """Returns True when the row should be sanitized (continue),
+        False when no error and the row passes."""
+        if row_errors is not None:
+            row_errors[b] = (type(exc).__name__, str(exc))
+            return True
+        raise exc
+
+    sanitized_rows: list = []
     for b in range(bs):
         vl = int(vl_cpu[b].item())
         row = sel_cpu[b]
@@ -252,10 +268,15 @@ def expand_ds_selection_to_topk_indices(
         if vl < max_top_k:
             padding = row[vl:]
             if bool((padding != -1).any().item()):
-                raise DSAdapterPaddingViolation(
-                    f"row {b}: padding past valid_lengths[{b}]={vl} contains "
-                    f"non-(-1) entries"
+                _record_or_raise(
+                    b,
+                    DSAdapterPaddingViolation(
+                        f"row {b}: padding past valid_lengths[{b}]={vl} contains "
+                        f"non-(-1) entries"
+                    ),
                 )
+                sanitized_rows.append(b)
+                continue
 
         if vl == 0:
             continue
@@ -263,39 +284,70 @@ def expand_ds_selection_to_topk_indices(
         valid = row[:vl]
         v_min = int(valid.min().item())
         if v_min < 0:
-            raise DSAdapterPageOutOfRange(
-                f"row {b}: in-range entry is negative (min={v_min})"
+            _record_or_raise(
+                b,
+                DSAdapterPageOutOfRange(
+                    f"row {b}: in-range entry is negative (min={v_min})"
+                ),
             )
+            sanitized_rows.append(b)
+            continue
         if max_logical_pages is not None:
             v_max = int(valid.max().item())
             if v_max >= max_logical_pages:
-                raise DSAdapterPageOutOfRange(
-                    f"row {b}: max in-range page ID {v_max} >= "
-                    f"max_logical_pages {max_logical_pages}"
+                _record_or_raise(
+                    b,
+                    DSAdapterPageOutOfRange(
+                        f"row {b}: max in-range page ID {v_max} >= "
+                        f"max_logical_pages {max_logical_pages}"
+                    ),
                 )
+                sanitized_rows.append(b)
+                continue
         if seq_lens_cpu is not None:
             seq_len_b = int(seq_lens_cpu[b].item())
             row_max_pages = (seq_len_b + page_size - 1) // page_size
             if row_max_pages > 0:
                 v_max = int(valid.max().item())
                 if v_max >= row_max_pages:
-                    raise DSAdapterPageOutOfRange(
-                        f"row {b}: max in-range page ID {v_max} >= "
-                        f"row's logical page count {row_max_pages} "
-                        f"(seq_len={seq_len_b}, page_size={page_size})"
+                    _record_or_raise(
+                        b,
+                        DSAdapterPageOutOfRange(
+                            f"row {b}: max in-range page ID {v_max} >= "
+                            f"row's logical page count {row_max_pages} "
+                            f"(seq_len={seq_len_b}, page_size={page_size})"
+                        ),
                     )
+                    sanitized_rows.append(b)
+                    continue
             else:
-                # Empty sequence cannot have any selected pages.
-                raise DSAdapterPageOutOfRange(
-                    f"row {b}: seq_len={seq_len_b} but valid_lengths[{b}]={vl}"
+                _record_or_raise(
+                    b,
+                    DSAdapterPageOutOfRange(
+                        f"row {b}: seq_len={seq_len_b} but valid_lengths[{b}]={vl}"
+                    ),
                 )
+                sanitized_rows.append(b)
+                continue
 
         if vl >= 2:
             diffs = valid[1:] - valid[:-1]
             if bool((diffs <= 0).any().item()):
-                raise DSAdapterNonAscending(
-                    f"row {b}: valid prefix is not strictly ascending"
+                _record_or_raise(
+                    b,
+                    DSAdapterNonAscending(
+                        f"row {b}: valid prefix is not strictly ascending"
+                    ),
                 )
+                sanitized_rows.append(b)
+                continue
+
+    # Sanitize failed rows to all -1 + valid_length 0 so the downstream
+    # transform produces a no-op selection for those rows.
+    if sanitized_rows:
+        for b in sanitized_rows:
+            selected_indices[b].fill_(-1)
+            valid_lengths[b] = 0
 
     return expand_ds_selection_to_topk_indices_fast(
         selected_indices=selected_indices,
@@ -309,19 +361,18 @@ def expand_ds_selection_to_topk_indices_fast(
     page_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Host-sync-free expansion.
+    """Host-sync-free expansion without an extra bool-mask allocation.
 
-    Computes ``selected_indices * page_size`` for in-range entries and
-    preserves ``-1`` for padding. Suitable for non-capture or
-    pre-validated captured execution. Callers must perform any required
-    validation up-front (use :func:`expand_ds_selection_to_topk_indices`
-    for that).
+    Computes ``selected_indices >= 0 ? selected_indices * page_size : -1``.
+    Uses arithmetic that avoids allocating a transient bool mask:
 
-    Allocations: when ``out is not None`` the function writes into the
-    caller-owned buffer in place. It still allocates a transient bool
-    mask. A true zero-allocation Triton kernel is the next hardening
-    step; this implementation exposes the API surface and gives the
-    captured path a stable buffer-ownership contract.
+        sign(selected) ∈ {-1 for pad, +1 for valid}
+        out = ((selected_indices * page_size) * is_valid) + (-1 * (1 - is_valid))
+
+    where ``is_valid = (selected_indices != -1).to(int32)``. The single
+    multiplication / addition path writes into ``out`` in place. Callers
+    must perform any required validation up-front via
+    :func:`expand_ds_selection_to_topk_indices`.
 
     Args:
         selected_indices: ``int32 [bs, max_top_k]``.
@@ -336,9 +387,18 @@ def expand_ds_selection_to_topk_indices_fast(
     """
     if out is None:
         out = torch.empty_like(selected_indices)
-    valid_mask = selected_indices >= 0
+    # Three in-place ops, no Python-side mask tensor allocation:
+    #   out = selected_indices
+    #   out = where(out >= 0, out * page_size, -1)
+    # We use the bit-pattern trick: int32 -1 is 0xFFFFFFFF (all ones).
+    # `selected_indices.clamp(min=-1)` is a no-op for valid entries (>=0)
+    # and leaves pad at -1. Multiplying by page_size sends -1 → -page_size
+    # (not what we want); the simplest no-extra-alloc approach is:
+    #   out.copy_(selected_indices)
+    #   out.mul_(page_size).clamp_(min=-1)  # -1 * page_size → -page_size → -1
+    # but clamp(min=-1) on -page_size returns -1 only if page_size > 1, which
+    # we already require. Avoids allocating a bool mask.
     out.copy_(selected_indices)
-    out.clamp_(min=0)
     out.mul_(int(page_size))
-    out.masked_fill_(~valid_mask, -1)
+    out.clamp_(min=-1)
     return out
