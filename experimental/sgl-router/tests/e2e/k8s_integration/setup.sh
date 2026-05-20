@@ -153,6 +153,11 @@ port = 8090
 id = \"tiny\"
 tokenizer_path = \"/etc/tokenizer/tiny.json\"
 policy = \"round_robin\"
+# Aggressive breaker so a terminating pod's connection-refused
+# immediately excludes it from the next request's candidate set —
+# the reconciliation tests scale workers rapidly and depend on
+# fast worker eviction to absorb the churn.
+circuit_breaker = { threshold = 1, cool_down_secs = 5 }
 
 [discovery]
 backend = \"k8s\"
