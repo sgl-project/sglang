@@ -566,8 +566,12 @@ def _plan_extras_kernel(
     cap_mask = out_offs < verify_capacity
     write_mask = in_range_mask & cap_mask
 
-    tl.store(out_verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask)
-    tl.store(out_verify_positions_ptr + out_offs, positions.to(tl.int32), mask=write_mask)
+    tl.store(
+        out_verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask
+    )
+    tl.store(
+        out_verify_positions_ptr + out_offs, positions.to(tl.int32), mask=write_mask
+    )
     tl.store(
         out_verify_prev_slot_indices_ptr + out_offs, prevs.to(tl.int32), mask=write_mask
     )
