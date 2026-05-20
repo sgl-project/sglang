@@ -426,6 +426,12 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 requires_grad=False,
             )
 
+        # Quantizes in int4 separately from the dispatcher
+        # since deep_ep does not support quantization in int4
+        # dispatching works in bf16
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 8 int4 to int32, we use a int32 to represent a int4
         assert (
@@ -460,6 +466,48 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_quant(
+            hidden_states, dst_type=torch.quint4x2
+        )
+        # gmm1: up_gate_proj
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w13_weight],
+            scale=[layer.w13_weight_scale],
+            per_token_scale=[hidden_states_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=output_dtype,
+        )[0]
+        # act_fn: swiglu
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+
+        # gmm2: down_proj
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w2_weight],
+            scale=[layer.w2_weight_scale.to(output_dtype)],
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=output_dtype,
+        )[0]
+        return hidden_states
+
 
 class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
@@ -489,6 +537,9 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "int8"})
 
     def apply(
         self,
@@ -655,6 +706,9 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
         layer.w13_weight.data = self._pack_to_int32(layer.w13_weight.data)
         layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "int8"})
 
     def _process_weights_without_clip(
         self, layer: torch.nn.Module, is_per_channel_weight
@@ -959,6 +1013,9 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def apply(
         self,
