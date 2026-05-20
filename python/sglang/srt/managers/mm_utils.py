@@ -1560,7 +1560,6 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1599,6 +1598,19 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
+def _wrap_tensor_or_list(value):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        return ShmPointerMMData(value)
+    elif isinstance(value, (list, tuple)):
+        wrapped = [
+            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            for t in value
+        ]
+        return type(value)(wrapped) if isinstance(value, tuple) else wrapped
+    return value
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
@@ -1608,22 +1620,14 @@ def wrap_shm_features(obj):
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            if not hasattr(item, "feature"):
-                continue
-            feat = item.feature
-            if isinstance(feat, torch.Tensor) and feat.is_cpu:
-                item.feature = ShmPointerMMData(feat)
-            elif isinstance(feat, (list, tuple)):
-                wrapped = [
-                    (
-                        ShmPointerMMData(t)
-                        if isinstance(t, torch.Tensor) and t.is_cpu
-                        else t
-                    )
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _wrap_tensor_or_list(item.feature)
+            if (
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
+            ):
+                item.precomputed_embeddings = _wrap_tensor_or_list(
+                    item.precomputed_embeddings
                 )
     return obj
 
@@ -1647,7 +1651,21 @@ def has_shm_features(recv_reqs):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
+                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                    return True
     return False
+
+
+def _unwrap_tensor_or_list(value):
+    """Restore ShmPointerMMData wrappers back into standard torch.Tensors."""
+    if isinstance(value, ShmPointerMMData):
+        return value.materialize()
+    elif isinstance(value, (list, tuple)):
+        unwrapped = [
+            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
+        ]
+        return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+    return value
 
 
 def unwrap_shm_features(obj):
@@ -1664,17 +1682,14 @@ def unwrap_shm_features(obj):
         return obj
     # Handle single requests
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
-        mm_items = obj.mm_inputs.mm_items
-        for item in mm_items:
-            feat = item.feature
-            if isinstance(feat, ShmPointerMMData):
-                item.feature = feat.materialize()
-            elif isinstance(feat, (list, tuple)):
-                unwrapped = [
-                    t.materialize() if isinstance(t, ShmPointerMMData) else t
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
+        for item in obj.mm_inputs.mm_items:
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _unwrap_tensor_or_list(item.feature)
+            if (
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
+            ):
+                item.precomputed_embeddings = _unwrap_tensor_or_list(
+                    item.precomputed_embeddings
                 )
     return obj

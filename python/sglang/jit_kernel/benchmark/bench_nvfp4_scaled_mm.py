@@ -10,7 +10,7 @@ from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max

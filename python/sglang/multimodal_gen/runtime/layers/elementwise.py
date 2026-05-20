@@ -39,6 +39,12 @@ class MulAdd(CustomOp):
     ):
         return self.forward_native(a, b, c, k=k)
 
+    @torch.compile
+    def forward_musa(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        return self.forward_native(a, b, c, k=k)
+
     def forward_npu(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ):

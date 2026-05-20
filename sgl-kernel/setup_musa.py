@@ -108,6 +108,7 @@ sources = [
     "csrc/memory/weak_ref_tensor.cpp",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
+    str(_FLASHINFER_REPO.source_dir / "csrc/sampling.cu"),
     # XXX (MUSA): The following files contain MUSA-specific implementations.
     "csrc/musa/pos_encoding_contiguous.mu",
     "csrc/musa/moe_gemv_swiglu.mu",

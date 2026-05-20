@@ -14,8 +14,8 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 import logging
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -23,7 +23,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -52,6 +51,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
+
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
 
         # The MTP model is unquantized in the nvfp4 checkpoint.
         if quant_config and quant_config.get_name() == "modelopt_fp4":
@@ -138,17 +140,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        exit_stack = ExitStack()
-        if (
-            is_npu()
-            and self.quant_config is None
-            and get_global_server_args().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
 
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
@@ -181,8 +172,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 forward_batch,
                 hidden_states,
             )
-
-        exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

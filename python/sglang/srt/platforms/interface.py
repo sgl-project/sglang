@@ -7,15 +7,10 @@ and adds SRT-specific subsystem factory methods, capability flags, and
 configuration lifecycle hooks.
 
 Out-of-tree platforms register via setuptools entry_points under the
-"sglang.platform_plugins" group and should subclass SRTPlatform.
+"sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
-from typing import TYPE_CHECKING
-
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
-
-if TYPE_CHECKING:
-    pass
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]

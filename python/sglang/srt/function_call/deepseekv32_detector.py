@@ -1,10 +1,11 @@
 import json
 import logging
 import re
+from typing import List, Literal, Optional, Union
 
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -14,7 +15,29 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
+try:
+    from xgrammar import StructuralTag
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        ConstStringFormat,
+        JSONSchemaFormat,
+        SequenceFormat,
+        TagFormat,
+        TagsWithSeparatorFormat,
+        TriggeredTagsFormat,
+    )
+except ImportError:
+    StructuralTag = None  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+# Names mirror the DeepSeek-V3.2 official chat template tokens
+# (see encoding_dsv32.TOOLS_SYSTEM_TEMPLATE).
+_INVOKE_BEGIN_PREFIX = '<｜DSML｜invoke name="'
+_INVOKE_BEGIN_SUFFIX = '">\n'
+_THINK_TAG_END = "</think>"
+_THINK_EXCLUDE_TOKENS = ["<think>", "</think>"]
+_XML_STYLE = "deepseek_xml"
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -368,5 +391,94 @@ class DeepSeekV32Detector(BaseFormatDetector):
             trigger="<｜DSML｜invoke",
         )
 
-    def get_structural_tag_name(self) -> str:
-        return "deepseek_v3_2"
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional["StructuralTag"]:
+        """
+        Build an xgrammar StructuralTag locally for DeepSeek-V3.2.
+
+        Both layers — the outer `<｜DSML｜function_calls｜>...` wrapper and
+        the inner `<｜DSML｜invoke>...</｜DSML｜invoke>` blocks — are encoded
+        directly in the grammar with a single-newline join between
+        consecutive invokes, matching DeepSeek-V3.2's official chat
+        template. This avoids two layered defects that surfaced with the
+        prior `xgrammar.get_model_structural_tag("deepseek_v3_2")` path:
+
+        - the xgrammar builtin template (pre mlc-ai/xgrammar#638) forced
+          a double-newline join, which deterministically collapsed
+          parallel tool calls to one at greedy decoding.
+        - falling back to the legacy structural tag (built from
+          `structure_info()`) only constrains the inner invoke block;
+          the outer wrapper is off-grammar and the model can skip it
+          under `at_least_one=True`, leaving `detect_and_parse` with no
+          `<｜DSML｜function_calls>` marker to anchor on.
+
+        Returning a fully-formed StructuralTag from the detector keeps
+        both fixes local to sglang and decoupled from the xgrammar
+        release cadence.
+        """
+        if not tools or StructuralTag is None:
+            return None
+
+        # `INVOKE_END` and the empty separator together yield a single `\n`
+        # between consecutive invokes — matching DeepSeek-V3.2's chat template
+        # `"\n".join(invoke_blocks)`.
+        function_calls_begin = self.bot_token + "\n"
+        invoke_end = self.invoke_end_token + "\n"
+
+        def _invoke_tag(tool: Tool) -> TagFormat:
+            return TagFormat(
+                begin=_INVOKE_BEGIN_PREFIX + tool.function.name + _INVOKE_BEGIN_SUFFIX,
+                content=JSONSchemaFormat(
+                    json_schema=tool.function.parameters or {},
+                    style=_XML_STYLE,
+                ),
+                end=invoke_end,
+            )
+
+        if isinstance(tool_choice, ToolChoice):
+            target = next(
+                (t for t in tools if t.function.name == tool_choice.function.name),
+                None,
+            )
+            if target is None:
+                return None
+            invoke_tags = [_invoke_tag(target)]
+            is_required = True
+        else:
+            invoke_tags = [_invoke_tag(t) for t in tools]
+            is_required = tool_choice == "required"
+
+        inner_tool_calls = TagsWithSeparatorFormat(
+            tags=invoke_tags, separator="", at_least_one=True
+        )
+
+        if is_required:
+            suffix_tag = SequenceFormat(
+                elements=[
+                    ConstStringFormat(value=function_calls_begin),
+                    inner_tool_calls,
+                    ConstStringFormat(value=self.eot_token),
+                ]
+            )
+        else:
+            suffix_tag = TriggeredTagsFormat(
+                triggers=[self.bot_token],
+                tags=[
+                    TagFormat(
+                        begin=function_calls_begin,
+                        content=inner_tool_calls,
+                        end=self.eot_token,
+                    )
+                ],
+                excludes=_THINK_EXCLUDE_TOKENS,
+            )
+
+        if not thinking_mode:
+            return StructuralTag(format=suffix_tag)
+
+        prefix_tag = TagFormat(begin="", content=AnyTextFormat(), end=_THINK_TAG_END)
+        return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))

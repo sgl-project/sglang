@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
@@ -11,7 +12,47 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+
+@lru_cache(maxsize=1)
+def aiter_can_use_preshuffle_paged_mqa() -> bool:
+    """Whether aiter's preshuffle paged MQA / cache kernels can be used on this runtime.
+
+    aiter's ``deepgemm_fp8_paged_mqa_logits`` only supports ``KVBlockSize > 1`` and
+    ``Preshuffle=True`` on its gluon kernel path. The gluon path is enabled when
+    Triton >= 3.5.0, OR when ``AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1`` is set
+    (which additionally requires that the AOT gluon kernel artifacts ship inside
+    the aiter wheel/image). Otherwise aiter asserts ``KVBlockSize == 1`` and
+    refuses ``Preshuffle=True``.
+
+    sglang's NSA indexer uses this single decision to pick:
+      * ``page_size``: 64 (preshuffle) vs 1 (legacy) on ROCm
+      * ``Preshuffle`` / ``preshuffle`` flags on the aiter MQA + cache kernels
+      * ``get_page_table_64`` vs ``get_page_table_1`` on the metadata
+      * whether ``GetKAndS.execute`` uses the aiter or the triton implementation
+
+    The result is cached so the cost is paid once per process.
+
+    Set ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
+    the gluon kernel would otherwise be available (useful for CI bisection).
+    """
+    if not is_hip():
+        return False
+    if not get_bool_env_var("SGLANG_USE_AITER"):
+        return False
+    if get_bool_env_var("SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"):
+        return False
+    if get_bool_env_var("AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS"):
+        return True
+    try:
+        from packaging.version import Version
+
+        return Version(Version(triton.__version__).base_version) >= Version("3.5.0")
+    except Exception:
+        return False
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

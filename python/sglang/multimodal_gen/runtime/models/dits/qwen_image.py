@@ -45,7 +45,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -652,9 +654,14 @@ class QwenImageCrossAttention(nn.Module):
             "encoder_hidden_states_mask"
         )
 
-        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
-        )
+        (
+            img_query,
+            img_key,
+            img_value,
+            txt_query,
+            txt_key,
+            txt_value,
+        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -1118,7 +1125,7 @@ def to_hashable(obj):
     return obj
 
 
-class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
 

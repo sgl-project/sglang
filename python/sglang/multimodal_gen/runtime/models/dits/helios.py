@@ -47,7 +47,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     TimestepEmbedder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -525,7 +527,7 @@ class HeliosTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class HeliosTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     Helios Transformer 3D model for video generation.
 
@@ -671,9 +673,13 @@ class HeliosTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # 1. Patch embed the noisy latents
         hidden_states = self.patch_embedding(hidden_states)
-        _, _, post_patch_num_frames, post_patch_height, post_patch_width = (
-            hidden_states.shape
-        )
+        (
+            _,
+            _,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+        ) = hidden_states.shape
 
         if indices_hidden_states is None:
             indices_hidden_states = (

@@ -9,7 +9,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 # NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
 # per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
-# have been migrated to stage-c suites in test/registered/ using the CI registry system.
+# have been migrated to base-c suites in test/registered/ using the CI registry system.
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/

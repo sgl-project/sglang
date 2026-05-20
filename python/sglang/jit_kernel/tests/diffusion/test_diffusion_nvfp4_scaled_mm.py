@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # B200-only correctness coverage for diffusion NVFP4 scaled mm.
-register_cuda_ci(est_time=15, suite="stage-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=15, suite="base-b-kernel-unit-1-gpu-b200")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16

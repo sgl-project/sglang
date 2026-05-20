@@ -71,7 +71,13 @@ class QuarkConfig(QuantizationConfig):
         return "quark"
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper):
-        self.exclude_layers = hf_to_sglang_mapper.apply_list(self.exclude_layers)
+        mapped = hf_to_sglang_mapper.apply_list(self.exclude_layers)
+        expanded = []
+        for name in mapped:
+            expanded.append(name)
+            if name.startswith("language_model."):
+                expanded.append(name.removeprefix("language_model."))
+        self.exclude_layers = list(dict.fromkeys(expanded))
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

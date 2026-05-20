@@ -278,6 +278,16 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kMUSA, &top_p_renorm_probs);
 
+  m.def(
+      "min_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_min_p_arr, float "
+      "min_p_val, bool deterministic, Generator? gen) -> ()");
+  m.impl("min_p_sampling_from_probs", torch::kMUSA, &min_p_sampling_from_probs);
+
+  m.def(
+      "top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_top_p_arr, "
+      "float top_p_val, bool deterministic, Generator? gen) -> ()");
+  m.impl("top_p_sampling_from_probs", torch::kMUSA, &top_p_sampling_from_probs);
+
   /*
    * From csrc/musa
    */

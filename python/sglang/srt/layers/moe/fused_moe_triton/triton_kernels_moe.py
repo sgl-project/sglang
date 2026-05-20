@@ -11,11 +11,13 @@ from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
     FusedActivation,
+    GatherIndx,
     PrecisionConfig,
+    RoutingData,
+    ScatterIndx,
     matmul_ogs,
 )
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
 
 from sglang.srt.utils import is_cuda
@@ -297,9 +299,8 @@ def triton_kernel_fused_experts_with_bias(
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
         (gemm1_alpha, gemm1_clamp_limit),
-        2,
     )
 
     intermediate_cache = torch.empty(

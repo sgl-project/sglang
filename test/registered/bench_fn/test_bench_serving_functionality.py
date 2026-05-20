@@ -74,9 +74,13 @@ class TestBenchServingFunctionality(CustomTestCase):
     def _verify_multi_turn_logs(self, content: str):
         reqs = []
         for line in content.splitlines():
-            if not line.startswith("{"):
+            idx = line.find("{")
+            if idx == -1:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line[idx:])
+            except json.JSONDecodeError:
+                continue
             if obj.get("event") != "request.finished":
                 continue
             text = obj.get("obj", {}).get("text")

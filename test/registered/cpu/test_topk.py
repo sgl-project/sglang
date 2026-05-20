@@ -2,16 +2,18 @@ import unittest
 
 import torch
 
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
+from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 torch.manual_seed(1234)
 
@@ -136,6 +138,38 @@ class TestBiasedGroupedTopK(CustomTestCase):
                                 bias_dtype,
                                 routed_scaling_factor,
                             )
+
+
+class TestBiasedTopK(CustomTestCase):
+    def test_biased_topk_returns_logical_ids_with_eplb_info(self):
+        hidden_states = torch.ones(1, 4)
+        gating_output = torch.tensor([[10.0, 9.0, 1.0, 0.0]])
+        correction_bias = torch.zeros(4)
+        dispatch_info = ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=torch.tensor(
+                [2, 3, 0, 1], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map=torch.tensor(
+                [[2], [3], [0], [1]], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map_num_valid=torch.ones(
+                4, dtype=torch.int64
+            ),
+            num_physical_experts=4,
+        )
+
+        _, topk_ids = native_biased_topk(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            correction_bias=correction_bias,
+            topk=2,
+            renormalize=False,
+            scoring_func="sqrtsoftplus",
+            expert_location_dispatch_info=dispatch_info,
+        )
+
+        torch.testing.assert_close(topk_ids, torch.tensor([[0, 1]], dtype=torch.int32))
 
 
 class TestTopK(CustomTestCase):

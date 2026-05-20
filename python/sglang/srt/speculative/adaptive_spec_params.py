@@ -73,6 +73,35 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
+def _resolve_candidate_steps(initial_steps: int, cfg: dict[str, object]) -> list[int]:
+    """Return sorted, deduplicated candidate steps; inserts *initial_steps* when missing."""
+    raw = cfg.get("candidate_steps") or (1, 3, 7)
+    candidates: set[int] = set(raw)
+
+    # Ensure the worker's initial speculative_num_steps is itself a candidate.
+    # Otherwise AdaptiveController.register() would store the worker's pre-built
+    # runtime state under a key that _activate() never queries, leaking that
+    # state's draft attn backend and cuda graph buffers for the process lifetime.
+    if initial_steps not in candidates:
+        log_info_on_rank0(
+            logger,
+            f"Adding initial speculative_num_steps={initial_steps} to "
+            f"candidate_steps={sorted(candidates)} so the pre-built "
+            f"runtime state is reused.",
+        )
+        candidates.add(initial_steps)
+
+    return sorted(candidates)
+
+
+def resolve_candidate_steps_from_config(
+    initial_steps: int, cfg_path: str | None
+) -> list[int]:
+    """Load adaptive config and resolve candidate steps."""
+    cfg = load_adaptive_config(cfg_path)
+    return _resolve_candidate_steps(initial_steps, cfg)
+
+
 class AdaptiveSpeculativeParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -88,32 +117,15 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        config: dict[str, object] | None = None,
+        cfg_path: str | None = None,
     ):
-        cfg = config or {}
+        cfg = load_adaptive_config(cfg_path)
         # TODO: Wider range of candidate_steps (once lazy init is supported).
-        candidates = set(cfg.get("candidate_steps", [1, 3, 7]))
-
-        # Ensure the worker's initial speculative_num_steps is itself a candidate.
-        # Otherwise AdaptiveController.register() would store the worker's pre-built
-        # runtime state under a key that _activate() never queries, leaking that
-        # state's draft attn backend and cuda graph buffers for the process lifetime.
-        if initial_steps not in candidates:
-            log_info_on_rank0(
-                logger,
-                f"Adding initial speculative_num_steps={initial_steps} to "
-                f"candidate_steps={sorted(candidates)} so the pre-built "
-                f"runtime state is reused.",
-            )
-            candidates.add(initial_steps)
-
-        self.candidate_steps = sorted(candidates)
+        self.candidate_steps = _resolve_candidate_steps(initial_steps, cfg)
         assert (
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
 
-        self.min_steps = self.candidate_steps[0]
-        self.max_steps = self.candidate_steps[-1]
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
         self.warmup_batches = cfg.get("warmup_batches", 10)

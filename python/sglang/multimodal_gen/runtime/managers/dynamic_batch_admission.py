@@ -160,7 +160,7 @@ class BatchAdmissionController:
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
-        self._offload = bool(server_args.dit_layerwise_offload)
+        self._offload = bool(server_args.layerwise_offload_components)
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config

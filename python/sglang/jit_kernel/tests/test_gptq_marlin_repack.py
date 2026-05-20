@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
-register_cuda_ci(est_time=16, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=16, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 MARLIN_K_CHUNKS = [128]

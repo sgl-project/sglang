@@ -93,14 +93,14 @@ struct ActivationKernel {
 
   template <bool kFilterExpert>
   static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+      -> decltype(ActivationKernel::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kGELU, kFilterExpert>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
     } else {
       Panic("unsupported activation type: ", type);
     }

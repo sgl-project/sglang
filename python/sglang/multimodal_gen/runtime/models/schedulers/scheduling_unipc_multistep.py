@@ -492,7 +492,11 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 )
             sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
+        # Keep sigmas on the same device as the sampling tensors.
+        # If `device` is None, keep them on CPU.
         self.sigmas = torch.from_numpy(sigmas)
+        if device is not None:
+            self.sigmas = self.sigmas.to(device=device)
         self.timesteps = torch.from_numpy(timesteps).to(
             device=device, dtype=torch.int64
         )
@@ -510,7 +514,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        # Keep CPU sigmas only for CPU inference; for GPU/MPS this would cause device mismatch.
+        if device is None or torch.device(device).type == "cpu":
+            self.sigmas = self.sigmas.to("cpu")
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:

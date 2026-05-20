@@ -27,7 +27,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import NDRotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTimeTextImageEmbedding
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
@@ -89,7 +91,6 @@ class ModulateWan(nn.Module):
 
 
 class MMDoubleStreamBlock(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -328,7 +329,7 @@ class MMDoubleStreamBlock(nn.Module):
         return img, txt
 
 
-class JoyTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     JoyImage Transformer 3D Model for image generation.
 

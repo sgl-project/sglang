@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 # TODO(will): move PRECISION_TO_TYPE to better place
 
@@ -122,6 +123,10 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 model_path=self.model_path,
+                vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
+                text_encoder_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.text_encoder_precisions[0]
+                ],
             )
         )
 

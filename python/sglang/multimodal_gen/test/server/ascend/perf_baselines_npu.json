@@ -147,7 +147,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 101.91,
+                "0": 330.0,
                 "1": 303.37,
                 "2": 548.94,
                 "3": 542.02,
@@ -200,7 +200,8 @@
             },
             "expected_e2e_ms": 29360.56,
             "expected_avg_denoise_ms": 524.67,
-            "expected_median_denoise_ms": 537.54
+            "expected_median_denoise_ms": 537.54,
+            "estimated_full_test_time_s": 157.8
         },
        "wan2_2_t2v_14b_w8a8_8npu": {
             "stages_ms": {

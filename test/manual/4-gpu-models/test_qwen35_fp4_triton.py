@@ -1,7 +1,6 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
@@ -10,8 +9,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     ModelLaunchSettings,
 )
-
-register_cuda_ci(est_time=720, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}

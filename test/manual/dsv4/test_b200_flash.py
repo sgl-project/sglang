@@ -100,7 +100,6 @@ class TestB200FlashCP(DSV4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }
 

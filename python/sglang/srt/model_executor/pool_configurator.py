@@ -110,7 +110,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = getattr(mr, "dflash_draft_num_layers", None)
+            draft_num_layers = mr.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
@@ -319,7 +319,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.compression_ratios = cfg.compress_ratios
+        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+        self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+        if mr.pp_size > 1:
+            logger.info(
+                f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
+                f"layers=[{mr.start_layer},{mr.end_layer}) "
+                f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
+            )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None

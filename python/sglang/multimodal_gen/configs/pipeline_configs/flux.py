@@ -48,6 +48,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=FluxConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    vae_precision: str = "bf16"
 
     enable_autocast: bool = False
 

@@ -9,13 +9,19 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -61,8 +68,20 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def supports_aiter(self) -> bool:
+        return self in (
+            MoeA2ABackend.NONE,
+            MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.MOONCAKE,
+            MoeA2ABackend.NIXL,
+            MoeA2ABackend.MORI,
+        )
 
 
 class MoeRunnerBackend(Enum):
@@ -148,11 +167,80 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+class DeepEPOutputDtype(Enum):
+    """
+    Describes the dispatch output data type for DeepEP.
+
+    - BF16: dispatch hidden states in bf16
+    - FP8: dispatch hidden states in fp8
+    - INT8: dispatch hidden states in int8
+    - NVFP4: dispatch hidden states in nvfp4
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    INT8 = "int8"
+    NVFP4 = "nvfp4"
+
+
+def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
+    """
+    Automatically choose the dispatch output dtype for DeepEP.
+
+    The decision follows several checks in priority order:
+    0. Parse server argument.
+    1. Parse deprecated environment variables.
+    2. If quant_config contains input_global_scale → NVFP4 path.
+    3. Parse quant config
+    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    5. Otherwise default for NPU → BF16 (the default for NPU).
+    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    """
+
+    # 0. Parse server argument.
+    server_args = get_global_server_args()
+    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
+        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
+
+    # 1. Parse deprecated environment variables.
+    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        logger.warning_once(
+            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype bf16` argument instead."
+        )
+        return DeepEPOutputDtype.BF16
+
+    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    if self.quant_config is not None:
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            return DeepEPOutputDtype.NVFP4
+
+        # 3. Parse quant config to determine the output dtype of dispatcher
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return DeepEPOutputDtype(dispatcher_output_dtype)
+
+    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
+    if (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        or get_moe_runner_backend().is_cutlass()
+    ):
+        return DeepEPOutputDtype.BF16
+
+    # 5. Default on NPU → BF16
+    if _is_npu:
+        return DeepEPOutputDtype.BF16
+
+    # 6. Default → FP8
+    return DeepEPOutputDtype.FP8
+
+
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-RECORD_NOLORA_GRAPH: bool = False
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -167,7 +255,6 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_A2A_BACKEND
-    global RECORD_NOLORA_GRAPH
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -178,25 +265,6 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-    # Dual CUDA graphs only validated for triton MoE backends.
-    _triton_ok = MOE_RUNNER_BACKEND in (
-        MoeRunnerBackend.TRITON,
-        MoeRunnerBackend.TRITON_KERNELS,
-    )
-    if (
-        bool(server_args.record_nolora_graph)
-        and bool(server_args.enable_lora)
-        and not _triton_ok
-    ):
-        logger.warning(
-            f"record_nolora_graph only validated for triton MoE backend, "
-            f"but moe_runner_backend={server_args.moe_runner_backend}. Disabling."
-        )
-    RECORD_NOLORA_GRAPH = (
-        bool(server_args.record_nolora_graph)
-        and bool(server_args.enable_lora)
-        and _triton_ok
-    )
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
@@ -211,6 +279,11 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
+    if IS_SBO_ENABLED and torch.cuda.is_available():
+        if torch.cuda.get_device_capability()[0] == 9:
+            raise ValueError(
+                "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
+            )
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -250,10 +323,6 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return SPECULATIVE_MOE_A2A_BACKEND
-
-
-def should_record_nolora_graph() -> bool:
-    return RECORD_NOLORA_GRAPH
 
 
 def get_deepep_mode() -> DeepEPMode:

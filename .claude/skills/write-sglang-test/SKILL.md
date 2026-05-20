@@ -27,10 +27,10 @@ JIT kernel exception:
 
 | Scenario | Model | CI Registration | Suite |
 |----------|-------|-----------------|-------|
-| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `stage-a-test-cpu` or `stage-b-test-1-gpu-small` |
-| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `stage-b-test-1-gpu-small` |
-| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `stage-b-test-1-gpu-small` |
-| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `stage-b-test-1-gpu-large` |
+| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `base-a-test-cpu` or `base-b-test-1-gpu-small` |
+| **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `base-b-test-1-gpu-small` |
+| **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `base-b-test-1-gpu-small` |
+| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-large` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See suite table below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
@@ -50,7 +50,7 @@ Defined in `python/sglang/test/test_utils.py`:
 
 ### Naming Conventions
 
-- **Suite**: `stage-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `stage-b-test-1-gpu-small`)
+- **Suite**: `base-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `base-b-test-1-gpu-small`)
 - **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
 
 ### All CI Suites
@@ -59,25 +59,24 @@ Defined in `python/sglang/test/test_utils.py`:
 
 | Suite | Runner (label) | Description |
 |-------|----------------|-------------|
-| `stage-a-test-1-gpu-small` | `1-gpu-5090` | Quick checks on a small NVIDIA GPU before heavier stages |
-| `stage-a-test-cpu` | `ubuntu-latest` | CPU-only unit tests |
-| `stage-b-test-1-gpu-small` | `1-gpu-5090` | Core engine tests that fit a 5090-class card |
-| `stage-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
-| `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
-| `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
-| `stage-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
-| `stage-b-kernel-unit-1-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
-| `stage-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
-| `stage-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
-| `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
-| `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
-| `stage-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
-| `stage-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and networking on four H100s |
-| `stage-c-test-deepep-8-gpu-h200` | `8-gpu-h200` | DeepEP at 8-GPU H200 scale |
-| `stage-c-test-8-gpu-b200` | `8-gpu-b200` | 8-GPU B200 suite (registered but not yet wired to a workflow) |
-| `stage-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on Blackwell |
-| `stage-c-test-4-gpu-b200-small` | `4-gpu-b200` | Smaller 4-GPU B200 suite split onto low-disk B200 runners |
-| `stage-c-test-4-gpu-gb200` | `4-gpu-gb200` | 4-GPU GB200 suite for Grace Blackwell; registered in `run_suite.py`, but the PR workflow is currently disabled until a runner is provisioned |
+| `base-a-test-1-gpu-small` | `1-gpu-5090` | Quick checks on a small NVIDIA GPU before heavier stages |
+| `base-a-test-cpu` | `ubuntu-latest` | CPU-only unit tests |
+| `base-b-test-1-gpu-small` | `1-gpu-5090` | Core engine tests that fit a 5090-class card |
+| `base-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
+| `base-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
+| `base-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
+| `base-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `base-b-kernel-unit-1-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
+| `base-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `base-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
+| `base-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
+| `base-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
+| `base-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
+| `base-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and networking on four H100s |
+| `base-c-test-8-gpu-b200` | `8-gpu-b200` | 8-GPU B200 suite (registered but not yet wired to a workflow) |
+| `base-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on Blackwell |
+| `base-c-test-4-gpu-b200-small` | `4-gpu-b200` | Smaller 4-GPU B200 suite split onto low-disk B200 runners |
+| `base-c-test-4-gpu-gb200` | `4-gpu-gb200` | 4-GPU GB200 suite for Grace Blackwell; registered in `run_suite.py`, but the PR workflow is currently disabled until a runner is provisioned |
 
 #### Per-commit (AMD)
 
@@ -130,12 +129,12 @@ Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../
 
 Use the lightest suite that meets your test's needs:
 
-- **No GPU required** → `stage-a-test-cpu`
-- **Most small GPU tests** → `stage-b-test-1-gpu-small` (default choice)
-- **Need H100 memory or Hopper features** → `stage-b-test-1-gpu-large`
-- **JIT kernel correctness** → `stage-b-kernel-unit-1-gpu-large`
-- **JIT kernel correctness for B200 / SM100 paths** → `stage-b-kernel-unit-1-gpu-b200`
-- **JIT kernel benchmarks** → `stage-b-kernel-benchmark-1-gpu-large`
+- **No GPU required** → `base-a-test-cpu`
+- **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
+- **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
+- **JIT kernel correctness** → `base-b-kernel-unit-1-gpu-large`
+- **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-1-gpu-b200`
+- **JIT kernel benchmarks** → `base-b-kernel-benchmark-1-gpu-large`
 - **Multi-GPU** → only when the test actually needs multiple GPUs
 
 ---
@@ -156,7 +155,7 @@ from sglang.srt.<module> import TargetClass
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # Prefer CPU. Only use register_cuda_ci when the test truly needs a GPU.
 
 class TestTargetClass(CustomTestCase):
@@ -196,7 +195,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
 
 
 class TestMyFeature(CustomTestCase):
@@ -246,7 +245,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=300, suite="base-b-test-1-gpu-large")
 
 
 class TestMyFeaturePerf(CustomTestCase):
@@ -321,21 +320,21 @@ from sglang.test.ci.ci_register import (
 )
 
 # Per-commit test (small 1-gpu, runs on 5090)
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small")
 
 # Per-commit test (large 1-gpu, runs on H100)
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=120, suite="base-b-test-1-gpu-large")
 
 # Nightly-only test
 register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 
 # Multi-backend test (only when testing backend-specific code paths)
-register_cuda_ci(est_time=80, suite="stage-a-test-1-gpu-small")
+register_cuda_ci(est_time=80, suite="base-a-test-1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky - see #12345")
+register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small", disabled="flaky - see #12345")
 ```
 
 Parameters:
@@ -354,12 +353,12 @@ JIT kernel files live outside `test/registered/` but still use registration:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in python/sglang/jit_kernel/tests/
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-b200")
-register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-8-gpu-h200")
+register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=120, suite="base-b-kernel-unit-8-gpu-h200")
 
 # Benchmarks in python/sglang/jit_kernel/benchmark/
-register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
 
 # Optional nightly registration
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)

@@ -20,7 +20,7 @@ from sglang.jit_kernel.fused_qknorm_rope import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
 
 try:
     from sgl_kernel import fused_qk_norm_rope as fused_qk_norm_rope_aot

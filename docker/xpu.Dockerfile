@@ -54,6 +54,8 @@ RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
+    conda install libsqlite=3.48.0 -y && \
+    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
 RUN --mount=type=secret,id=github_token \
@@ -66,8 +68,8 @@ RUN --mount=type=secret,id=github_token \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps xgrammar==0.1.33 && \
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
-    conda install libsqlite=3.48.0 -y && \
+    # index will change after torch 2.12 release
+    pip install triton-xpu --index-url https://download.pytorch.org/whl/test/xpu --force-reinstall && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc
 

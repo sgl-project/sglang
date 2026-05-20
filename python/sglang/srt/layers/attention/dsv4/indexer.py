@@ -22,7 +22,6 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )
@@ -100,7 +99,7 @@ def topk_transform_512_pytorch_vectorized(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
 
-    TOPK = 512
+    TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
     device = scores.device
@@ -332,11 +331,6 @@ class C4IndexerBackendMixin:
         indexer_metadata = metadata.indexer_metadata
         core_metadata = metadata.core_metadata
 
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DSV4AttnMetadata,
-        )
-
-        assert isinstance(core_metadata, DSV4AttnMetadata)
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         if enable_multi_stream:
@@ -374,7 +368,7 @@ class C4IndexerBackendMixin:
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
@@ -383,7 +377,8 @@ class C4IndexerBackendMixin:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
+        _use_tilelang = envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+        if _c4sl.dim() == 1 and not _use_tilelang:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
@@ -479,6 +474,7 @@ class C4Indexer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        rotary_emb=None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -486,6 +482,7 @@ class C4Indexer(nn.Module):
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
@@ -514,7 +511,9 @@ class C4Indexer(nn.Module):
             head_dim=self.head_dim,
             rotate=True,
             prefix=add_prefix("compressor", prefix),
+            rotary_emb=rotary_emb,
         )
+        self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
@@ -545,8 +544,6 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
-        if TYPE_CHECKING:
-            assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
         return forward_batch.attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,

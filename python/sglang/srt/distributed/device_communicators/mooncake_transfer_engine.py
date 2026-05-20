@@ -254,6 +254,9 @@ class MooncakeTransferEngine:
     def get_session_id(self):
         return self.session_id
 
+    def send_probe(self, peer_session_id: str) -> int:
+        return self.engine.send_probe(peer_session_id)
+
     def get_engine(self):
         return self.engine.get_engine()
 

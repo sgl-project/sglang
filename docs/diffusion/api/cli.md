@@ -160,6 +160,21 @@ HTTP server-only arguments are ignored by `sglang generate`.
 
 For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../performance/cache/cache_dit.md).
 
+### Layerwise Offload
+
+Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` only applies to legacy DiT components. Use `--layerwise-offload-components` to select pipeline component names explicitly (`--layerwise-offload-modules` is accepted as an alias):
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --dit-layerwise-offload \
+  --layerwise-offload-components transformer text_encoder \
+  --dit-offload-prefetch-size 0 \
+  --prompt "A quiet city street after rain"
+```
+
+The values must match keys in the selected pipeline's `pipeline.modules`, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Use `all` to select every layerwise-offloadable component. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+
 ## Serve
 
 `sglang serve` starts the HTTP server and keeps the model loaded for repeated requests.

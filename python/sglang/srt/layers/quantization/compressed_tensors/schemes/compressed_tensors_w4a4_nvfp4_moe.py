@@ -311,10 +311,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
 
-            # Quantize input hidden states using fp4_quantize
+            # global_scale must be shape [1] (strict in cute-dsl backend).
             hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
                 x,
-                layer.w13_input_scale_quant,
+                layer.w13_input_scale_quant[:1],
                 self.group_size,  # sf_vec_size
                 False,  # use_ue8m0
                 False,  # is_sf_swizzled_layout

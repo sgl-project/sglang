@@ -278,6 +278,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
         return query_out, key_out
 
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert positions.ndim in (1, 2)
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+
     @staticmethod
     def get_rope_index(
         spatial_merge_size,

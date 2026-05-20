@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
@@ -128,12 +128,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
         # with separate index spaces. We maintain a translated page_table for SWA
         # layers so the trtllm kernel reads from the correct pool.
-        allocator = model_runner.token_to_kv_pool_allocator
-        self.use_sliding_window_kv_pool = isinstance(
-            allocator, SWATokenToKVPoolAllocator
-        )
+        kv_pool = model_runner.token_to_kv_pool
+        self.use_sliding_window_kv_pool = isinstance(kv_pool, SWAKVPool)
         self._swa_kv_pool: Optional[SWAKVPool] = (
-            allocator.get_kvcache() if self.use_sliding_window_kv_pool else None
+            kv_pool if self.use_sliding_window_kv_pool else None
         )
 
         # Forward metadata

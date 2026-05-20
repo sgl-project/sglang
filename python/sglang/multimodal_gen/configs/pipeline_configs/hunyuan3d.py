@@ -40,7 +40,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     shape_octree_resolution: int = 384
     shape_mc_level: float = 0.0
     shape_mc_algo: Optional[str] = "mc"
-    shape_num_chunks: int = 8000
+    shape_num_chunks: int = 32000
     shape_output_type: str = "trimesh"
 
     # Delight model configuration

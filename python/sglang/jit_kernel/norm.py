@@ -46,6 +46,8 @@ def _is_supported_rmsnorm_hidden_size(d: int) -> bool:
 def _rmsnorm_kernel_class(hidden_size: int) -> str:
     if hidden_size in _RMSNORM_WARP_SIZES:
         return "RMSNormWarpKernel"
+    if hidden_size == 512:
+        return "RMSNormHalfKernel"
     if hidden_size >= _RMSNORM_HALF_BLOCK_MIN_SIZE:
         if hidden_size % 512 == 0:
             return "RMSNormHalfKernel"

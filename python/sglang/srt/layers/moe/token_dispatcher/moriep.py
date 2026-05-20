@@ -1011,11 +1011,26 @@ class MoriEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
 
+        # Mori dispatch produces global topk_ids in [0, num_experts); mask out
+        # experts that are not local to this rank.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_experts is not None and num_local_experts is not None:
+            ep_rank = get_moe_expert_parallel_rank()
+            expert_mask = torch.zeros(
+                num_experts,
+                device=torch.cuda.current_device(),
+                dtype=torch.int32,
+            )
+            start = ep_rank * num_local_experts
+            expert_mask[start : start + num_local_experts] = 1
+            self.expert_mask_gpu = expert_mask
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> DispatchOutput:
+        self._num_tokens = hidden_states.shape[0]
         self.dispatch_a(hidden_states, topk_output)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
@@ -1045,8 +1060,8 @@ class MoriEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> Tuple:
         self.combine_a(combine_input)
-        ret = self.combine_b()
-        return ret
+        hidden_states = self.combine_b()
+        return hidden_states[: self._num_tokens]
 
     def combine_a(
         self,
