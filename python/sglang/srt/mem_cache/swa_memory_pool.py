@@ -182,11 +182,24 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            if self.swa_loc is not None:
-                loc = self.swa_loc
-            else:
-                if self.full_to_swa_index_mapping is not None:
-                    loc = self.translate_loc_from_full_to_swa(loc)
+            # Prefer swa_loc from piecewise forward context (already narrowed by
+            # radix_attention.unified_attention_with_output). Fall back to self.swa_loc
+            # which is set in model_runner / cuda_graph_runner prepare phase for
+            # non-piecewise paths (eager decode, full cuda graph).
+            from sglang.srt.compilation.piecewise_context_manager import (
+                get_forward_context,
+            )
+
+            _ctx = get_forward_context()
+            swa_loc = (
+                _ctx.forward_batch.out_cache_loc_swa
+                if _ctx is not None and _ctx.forward_batch is not None
+                else self.swa_loc
+            )
+            if swa_loc is not None:
+                loc = swa_loc
+            elif self.full_to_swa_index_mapping is not None:
+                loc = self.translate_loc_from_full_to_swa(loc)
 
             self.swa_kv_pool.set_kv_buffer(
                 None,
