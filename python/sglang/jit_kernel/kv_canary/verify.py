@@ -88,7 +88,7 @@ class RealKvHashMode(IntEnum):
     """
 
     OFF = 0  # mixin disabled; real_kv_hash field is always 0 in the canary slot.
-    BIT = 1  # XOR-fold a single bit per byte (cheap, catches gross corruption).
+    PARTIAL = 1  # splitmix64-fold first min(16, read_bytes) bytes (cheap: max 16B read, high entropy).
     ALL = 2  # splitmix64-fold all read_bytes (thorough, slower).
 
 
@@ -250,7 +250,7 @@ def canary_verify_step(
         real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
             tuple disables the mixin. Multiple sources are folded sequentially via splitmix64. Each source's
             buf is shape [num_slots, slot_stride_bytes], uint8.
-        real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Applies uniformly across all sources.
+        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
 
     Slot 0 is unconditionally skipped by the verify kernel — it is sglang's reserved padding sink per
     ``memory_pool.py:152``. All canary-attached pools MUST reserve slot 0 (free_slots starts at 1).

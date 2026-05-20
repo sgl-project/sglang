@@ -672,8 +672,8 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def test_real_kv_mode_bit_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.BIT)
+def test_real_kv_mode_partial_byte_equal() -> None:
+    _run_real_kv_mode_byte_equal_case(RealKvHashMode.PARTIAL)
 
 
 def test_real_kv_mode_all_byte_equal() -> None:
@@ -1673,16 +1673,27 @@ def test_violation_bit_injection_position_ring_state_matrix(
         ), "write_index did not advance beyond ring_capacity after overflow"
 
 
-def _hand_fold_bit(raw_bytes: bytes) -> int:
-    """BIT-mode fold: parity of low bits across all read bytes, then splitmix64 mix into acc=0."""
+def _hand_fold_partial(raw_bytes: bytes) -> int:
+    """PARTIAL-mode fold: first min(16, len) bytes, little-endian word-pack + splitmix64, same as ALL."""
     _u64 = (1 << 64) - 1
-    parity = sum(b & 1 for b in raw_bytes) & 1
-    source_hash = parity
-    combined = 0 ^ source_hash
-    x = combined & _u64
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _u64
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _u64
-    return (x ^ (x >> 31)) & _u64
+
+    def _sm64(v: int) -> int:
+        v = v & _u64
+        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
+        return (v ^ (v >> 31)) & _u64
+
+    truncated = raw_bytes[: min(16, len(raw_bytes))]
+    pad = (8 - len(truncated) % 8) % 8
+    padded = bytes(truncated) + bytes(pad)
+    num_words = len(padded) // 8
+    acc = 0
+    for w in range(num_words):
+        chunk = padded[w * 8 : (w + 1) * 8]
+        word = sum(b << (8 * k) for k, b in enumerate(chunk))
+        acc = _sm64(acc ^ word)
+    source_hash = acc
+    return _sm64(0 ^ source_hash)
 
 
 def _hand_fold_all(raw_bytes: bytes) -> int:
@@ -1710,10 +1721,10 @@ def _hand_fold_all(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (RealKvHashMode.BIT, _hand_fold_bit, 0x5692161D100B05E5),
+        (RealKvHashMode.PARTIAL, _hand_fold_partial, 0xC4C41792E6578644),
         (RealKvHashMode.ALL, _hand_fold_all, 0xC4C41792E6578644),
     ],
-    ids=["bit", "all"],
+    ids=["partial", "all"],
 )
 def test_real_kv_hash_fold_mode_hardcoded(
     mode: RealKvHashMode,

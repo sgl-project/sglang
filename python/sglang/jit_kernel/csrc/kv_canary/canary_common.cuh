@@ -53,7 +53,7 @@ constexpr int64_t kFailReasonWritePositionMismatch = 1LL << 4;
 // Mirror of the Python RealKvHashMode IntEnum in kv_canary/verify.py. Values must match exactly.
 enum class RealKvHashMode : int32_t {
   kOff = 0,
-  kBit = 1,
+  kPartial = 1,
   kAll = 2,
 };
 
@@ -114,26 +114,22 @@ SGL_DEVICE uint8_t real_kv_load_byte(const RealKvSourceHandle& src, int64_t slot
 
 // Fold one source's read_bytes into a uint64 hash, mode-dispatching.
 //
-// BIT mode: XOR-fold the low bit of every byte into a single bit, returned as 0 or 1 in a uint64.
+// PARTIAL mode: pack the first min(read_bytes, 16) bytes little-endian into 8-byte words and
+// splitmix64-fold them (at most 2 words). When read_bytes <= 16, PARTIAL produces the same hash as ALL.
 // ALL mode: pack bytes little-endian into 8-byte words (zero-padded if read_bytes is not a multiple of 8)
 // and splitmix64-fold them iteratively.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   if (src.read_bytes <= 0) {
     return 0ULL;
   }
-  if (mode == RealKvHashMode::kBit) {
-    uint64_t parity = 0;
-    for (int64_t i = 0; i < src.read_bytes; ++i) {
-      parity ^= static_cast<uint64_t>(real_kv_load_byte(src, slot_idx, i) & 1);
-    }
-    return parity & 1ULL;
-  }
-  // ALL mode.
+  const int64_t effective_read_bytes =
+      (mode == RealKvHashMode::kPartial) ? (src.read_bytes < 16 ? src.read_bytes : 16) : src.read_bytes;
+  // ALL mode (and PARTIAL, which shares the same word-pack + splitmix64 loop with a capped length).
   uint64_t acc = 0ULL;
   int64_t i = 0;
-  while (i < src.read_bytes) {
+  while (i < effective_read_bytes) {
     uint64_t word = 0ULL;
-    const int64_t take = (src.read_bytes - i) >= 8 ? 8 : (src.read_bytes - i);
+    const int64_t take = (effective_read_bytes - i) >= 8 ? 8 : (effective_read_bytes - i);
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       if (b < take) {

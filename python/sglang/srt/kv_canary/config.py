@@ -33,8 +33,8 @@ class CanaryConfig:
             (default 1024); overflow only drops detail beyond row N, the monotonic counter still grows.
         sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
             additionally walks all alive slots (running ∪ radix-orphan) and verifies them.
-        real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Uniform across head/tail/sweep launches; if a
-            workload wants per-launch granularity it bumps mode globally (BIT is cheap enough this is fine).
+        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Uniform across head/tail/sweep launches;
+            PARTIAL (first 16B, hard cap) is cheap enough to be the default.
         input_check_mode: CanaryInputCheckMode (OFF / ON). ON = canary_write_step additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. ON is only useful when something
@@ -50,7 +50,7 @@ class CanaryConfig:
     mode: Literal["off", "on", "raise"]
     ring_capacity: int = 1024
     sweep_interval: int = 64
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.BIT
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.PARTIAL
     input_check_mode: CanaryInputCheckMode = CanaryInputCheckMode.OFF
     stats_print_every_n_steps: int = 0
     allreduce_violation_signal: bool = True

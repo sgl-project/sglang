@@ -389,10 +389,11 @@ def test_pipeline_sweep_no_write() -> None:
 
 
 @pytest.mark.parametrize(
-    "real_kv_hash_mode", [RealKvHashMode.OFF, RealKvHashMode.BIT, RealKvHashMode.ALL]
+    "real_kv_hash_mode",
+    [RealKvHashMode.OFF, RealKvHashMode.PARTIAL, RealKvHashMode.ALL],
 )
 def test_pipeline_real_kv_mode(real_kv_hash_mode: RealKvHashMode) -> None:
-    """real_kv_hash_mode OFF/BIT/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
+    """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
     max_seq_len = 16
     req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)

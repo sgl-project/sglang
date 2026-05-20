@@ -55,14 +55,20 @@ def canary_plan_step_torch_reference(
         )
         return
 
-    req_pool_indices_host = fb_req_pool_indices.detach().to(device=work_device, dtype=torch.int64)
+    req_pool_indices_host = fb_req_pool_indices.detach().to(
+        device=work_device, dtype=torch.int64
+    )
     prefix_lens_host = fb_prefix_lens.detach().to(device=work_device, dtype=torch.int64)
-    extend_seq_lens_host = fb_extend_seq_lens.detach().to(device=work_device, dtype=torch.int64)
+    extend_seq_lens_host = fb_extend_seq_lens.detach().to(
+        device=work_device, dtype=torch.int64
+    )
     req_to_token_host = req_to_token.detach().to(device=work_device, dtype=torch.int64)
 
     lut: Optional[torch.Tensor] = None
     if full_to_swa_index_mapping is not None:
-        lut = full_to_swa_index_mapping.detach().to(device=work_device, dtype=torch.int64)
+        lut = full_to_swa_index_mapping.detach().to(
+            device=work_device, dtype=torch.int64
+        )
 
     total_verify = _materialize_verify_entries(
         verify_plan_out=verify_plan_out,
@@ -214,14 +220,22 @@ def _materialize_verify_entries(
 
     capped = min(total_verify, verify_capacity)
     slots_t = torch.tensor(out_slots[:capped], dtype=torch.int64, device=work_device)
-    positions_t = torch.tensor(out_positions[:capped], dtype=torch.int64, device=work_device)
-    prev_slots_t = torch.tensor(out_prev_slots[:capped], dtype=torch.int64, device=work_device)
+    positions_t = torch.tensor(
+        out_positions[:capped], dtype=torch.int64, device=work_device
+    )
+    prev_slots_t = torch.tensor(
+        out_prev_slots[:capped], dtype=torch.int64, device=work_device
+    )
 
     verify_plan_out.verify_slot_indices[:capped].copy_(
-        slots_t.to(verify_plan_out.verify_slot_indices.dtype).to(verify_plan_out.verify_slot_indices.device)
+        slots_t.to(verify_plan_out.verify_slot_indices.dtype).to(
+            verify_plan_out.verify_slot_indices.device
+        )
     )
     verify_plan_out.verify_positions[:capped].copy_(
-        positions_t.to(verify_plan_out.verify_positions.dtype).to(verify_plan_out.verify_positions.device)
+        positions_t.to(verify_plan_out.verify_positions.dtype).to(
+            verify_plan_out.verify_positions.device
+        )
     )
     verify_plan_out.verify_prev_slot_indices[:capped].copy_(
         prev_slots_t.to(verify_plan_out.verify_prev_slot_indices.dtype).to(
@@ -267,9 +281,13 @@ def _materialize_write_metadata(
     write_offsets_list.append(running_offset)
 
     copy_len = min(bs + 1, out_write_offsets_len)
-    write_offsets_t = torch.tensor(write_offsets_list[:copy_len], dtype=torch.int64, device=work_device)
+    write_offsets_t = torch.tensor(
+        write_offsets_list[:copy_len], dtype=torch.int64, device=work_device
+    )
     write_plan_out.write_offsets[:copy_len].copy_(
-        write_offsets_t.to(write_plan_out.write_offsets.dtype).to(write_plan_out.write_offsets.device)
+        write_offsets_t.to(write_plan_out.write_offsets.dtype).to(
+            write_plan_out.write_offsets.device
+        )
     )
     if copy_len < out_write_offsets_len:
         write_plan_out.write_offsets[copy_len:].zero_()
@@ -299,7 +317,9 @@ def _materialize_write_metadata(
         seed_slots_list.append(seed_slot)
 
     if len(seed_slots_list) > 0:
-        seed_slots_t = torch.tensor(seed_slots_list, dtype=torch.int64, device=work_device)
+        seed_slots_t = torch.tensor(
+            seed_slots_list, dtype=torch.int64, device=work_device
+        )
         write_plan_out.write_seed_slot_indices[:capped_reqs].copy_(
             seed_slots_t.to(write_plan_out.write_seed_slot_indices.dtype).to(
                 write_plan_out.write_seed_slot_indices.device

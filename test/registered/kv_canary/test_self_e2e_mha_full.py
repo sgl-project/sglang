@@ -80,17 +80,17 @@ class TestRealDataOff(_MhaFullBase, unittest.TestCase):
             self.assertEqual(r.get("status_code"), 200, r)
 
 
-class TestRealDataBit(_MhaFullBase, unittest.TestCase):
+class TestRealDataPartial(_MhaFullBase, unittest.TestCase):
     extra_server_args: ClassVar[List[str]] = [
         "--json-model-override-args",
         _NUM_LAYERS_OVERRIDE,
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--kv-canary-real-data",
-        "bit",
+        "partial",
     ]
 
-    def test_real_data_bit(self) -> None:
+    def test_real_data_partial(self) -> None:
         results = self.send_parallel_requests(n=8, max_new_tokens=16)
         for r in results:
             self.assertEqual(r.get("status_code"), 200, r)
