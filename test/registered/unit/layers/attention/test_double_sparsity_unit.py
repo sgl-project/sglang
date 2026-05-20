@@ -795,6 +795,61 @@ class TestSelectorRealMode(unittest.TestCase):
                         f"request 1 selected foreign pages: {row1}")
 
 
+class TestRealSelectorMetrics(unittest.TestCase):
+    """Round-10 fix [P2]: ``retrieve_topk_via_signatures`` must call
+    ``metrics.record_selection`` so DS observability counters move on
+    healthy traffic.
+    """
+
+    def test_real_selector_records_metrics(self):
+        try:
+            import prometheus_client  # noqa: F401
+        except ImportError:
+            self.skipTest("prometheus_client not installed")
+
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_signatures,
+        )
+        m.reset_for_testing()
+
+        bs = 2
+        num_layers, max_pages, num_heads, label_dim = 1, 8, 2, 4
+        head_dim = 16
+        signatures = torch.randn(num_layers, max_pages, num_heads, label_dim)
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim,
+                                         dtype=torch.int32)
+        for h in range(num_heads):
+            for d in range(label_dim):
+                channel_selection[0, h, d] = (h * label_dim + d) % head_dim
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                      dtype=torch.float32)
+        queries = torch.randn(bs, num_heads, head_dim)
+        per_request = torch.ones(bs, max_pages, dtype=torch.int32)
+
+        _, valid_lengths = retrieve_topk_via_signatures(
+            queries=queries,
+            page_signatures=signatures,
+            valid_mask=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0,
+            max_top_k=4,
+            per_request_valid=per_request,
+        )
+        expected_selected = int(valid_lengths.sum().item())
+        self.assertGreater(expected_selected, 0,
+                            "selector should have produced at least one valid page")
+        # One selection call → count incremented by 1; sum incremented by the
+        # total selected pages across the batch.
+        cnt = m._metric_objs["selected_pages_count"]._value.get()
+        sps = m._metric_objs["selected_pages_sum"]._value.get()
+        self.assertEqual(cnt, 1)
+        self.assertEqual(sps, expected_selected)
+        m.reset_for_testing()
+
+
 class TestHotPagesIntersectPerRequest(unittest.TestCase):
     """Round-7 fix [P2]: hot-page forcing must not re-introduce pages that
     a row's per_request_valid mask excluded.
@@ -1322,13 +1377,35 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             self.assertEqual(ctx.page_size, 64)
             self.assertEqual(ctx.disable_radix_cache, True)
             self.assertEqual(ctx.concurrency, 32)
-            # P50 of 100/(0.5+0.99)=~67 tok/s for each row -> P50 close to 67.
+            # Generation rate only (TTFT is evaluated separately by _slo_verdict).
+            # Row 0: 100 tokens / (99 * 0.01 s itls) ≈ 101 tok/s. Similar shape
+            # for the other rows.
             self.assertIsNotNone(m.output_tps_p50)
             self.assertGreater(m.output_tps_p50, 50)
             self.assertLess(m.output_tps_p50, 120)
             # TTFT P50 / P99 in seconds.
             self.assertAlmostEqual(m.ttft_p50_s, 0.8, places=3)
             self.assertAlmostEqual(m.ttft_p99_s, 21.0, places=3)
+
+    def test_per_request_tps_excludes_ttft(self):
+        """Round-10 fix [P2]: ``_per_request_output_tps`` measures generation
+        rate only. Codex's example: 512 tokens, TTFT=21 s, ITL=10 ms each
+        ⇒ expect ~100 tok/s, not ~20.
+        """
+
+        bc = self._import_compare()
+        summary = {
+            "output_lens": [512],
+            "ttfts": [21.0],
+            "itls": [[0.01] * 511],
+        }
+        p50, p99 = bc._per_request_output_tps(summary)
+        self.assertIsNotNone(p50)
+        # 512 / (511 * 0.01) ≈ 100.2 tok/s.
+        self.assertGreater(p50, 95.0)
+        self.assertLess(p50, 110.0)
+        # Sanity: the same fixture should NOT report sub-30 (the old bug).
+        self.assertGreater(p50, 30.0)
 
     def test_match_refuse_treats_none_context_as_missing(self):
         """Round-5 fix [P2]: required-context field that is None on either

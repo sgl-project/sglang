@@ -441,9 +441,25 @@ def retrieve_topk_via_signatures(
             )
         pr_bool = per_request_valid.to(torch.bool)
         scores = scores.masked_fill(~pr_bool, float("-inf"))
-    return select_topk_sequence_order(
+    indices, valid_lengths = select_topk_sequence_order(
         scores,
         max_top_k,
         hot_pages=hot_pages,
         per_request_valid=pr_bool,
     )
+    # Best-effort observability emit. This requires a .item() sync on
+    # valid_lengths (and per_request_valid when supplied); it is intentionally
+    # outside any CUDA-graph capture region today. The page-table adapter
+    # milestone will hoist this above the captured decode region.
+    from sglang.srt.layers.attention.double_sparsity import metrics as _metrics
+
+    selected_pages = int(valid_lengths.sum().item())
+    if pr_bool is not None:
+        total_valid_pages = int(pr_bool.to(torch.int64).sum().item())
+    else:
+        total_valid_pages = int(valid_lengths.shape[0]) * int(scores.shape[-1])
+    _metrics.record_selection(
+        selected_pages=selected_pages,
+        total_valid_pages=total_valid_pages,
+    )
+    return indices, valid_lengths

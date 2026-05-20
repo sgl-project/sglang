@@ -95,20 +95,24 @@ def _percentile(values: List[float], pct: float) -> Optional[float]:
 
 
 def _per_request_output_tps(summary: Dict) -> Tuple[Optional[float], Optional[float]]:
-    """Derive per-request output tok/s P50/P99 from bench_serving arrays.
+    """Derive per-request *generation-rate* tok/s P50/P99 from bench_serving arrays.
 
-    bench_serving with --output-details emits ``output_lens``, ``itls``, and
-    ``ttfts`` arrays. Per-request TPS = ``output_lens[i] / (ttfts[i] +
-    sum(itls[i]))``. Returns (None, None) if any required array is missing.
+    bench_serving with --output-details emits ``output_lens`` and ``itls``.
+    Per-request TPS = ``output_lens[i] / sum(itls[i])`` — generation rate
+    only. TTFT is intentionally NOT in the denominator: it has its own
+    threshold via ``_slo_verdict``, and conflating it here would falsely
+    fail runs with high-but-passing TTFT (e.g. 512 tokens, 21 s TTFT, 10 ms
+    ITL reports ~100 tok/s as expected, not ~20).
+
+    Returns (None, None) when the required arrays are missing or produce
+    no usable rows.
     """
 
     output_lens = summary.get("output_lens")
     itls = summary.get("itls")
-    ttfts = summary.get("ttfts")
-    if not (isinstance(output_lens, list) and isinstance(itls, list)
-            and isinstance(ttfts, list)):
+    if not (isinstance(output_lens, list) and isinstance(itls, list)):
         return None, None
-    n = min(len(output_lens), len(itls), len(ttfts))
+    n = min(len(output_lens), len(itls))
     if n == 0:
         return None, None
     per_req: List[float] = []
@@ -116,12 +120,10 @@ def _per_request_output_tps(summary: Dict) -> Tuple[Optional[float], Optional[fl
         olen = output_lens[i]
         if not isinstance(olen, (int, float)) or olen <= 0:
             continue
-        ttft = ttfts[i] if isinstance(ttfts[i], (int, float)) else 0.0
         itl_row = itls[i] if isinstance(itls[i], list) else []
         itl_sum = sum(v for v in itl_row if isinstance(v, (int, float)))
-        duration = float(ttft) + float(itl_sum)
-        if duration > 0:
-            per_req.append(float(olen) / duration)
+        if itl_sum > 0:
+            per_req.append(float(olen) / float(itl_sum))
     if not per_req:
         return None, None
     return _percentile(per_req, 50.0), _percentile(per_req, 99.0)
