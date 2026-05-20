@@ -191,7 +191,9 @@ class EagleDraftWorker(BaseDraftWorker):
         ):
             self.init_attention_backend()
             if server_args.enable_breakable_cuda_graph:
-                self.draft_runner.init_piecewise_cuda_graphs(force=True)
+                self.draft_runner.init_piecewise_cuda_graphs(
+                    force_for_draft_worker=True
+                )
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
