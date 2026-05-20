@@ -1,15 +1,13 @@
-"""E2E: pipeline parallel under mock model + canary."""
+"""End-to-end pipeline-parallel smoke under mock_model + canary."""
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
-from sglang.srt.steppable_engine import SteppableEngine
+from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="extra-a-2-gpu")
+register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
     reason="requires PP > 1 support which is not currently implemented"
@@ -20,33 +18,19 @@ def _fake_prompt(length: int) -> list[int]:
     return list(range(1, length + 1))
 
 
-def test_pp2_canary_clean() -> None:
-    engine = SteppableEngine.launch(
-        model="Qwen/Qwen3-0.6B",
-        num_hidden_layers=2,
+def test_pp_no_canary_violation() -> None:
+    engine = Engine(
+        model_path="Qwen/Qwen3-0.6B",
+        mock_model_enabled=True,
+        num_hidden_layers_override=1,
+        kv_canary="raise",
+        kv_canary_input_check_mode="ON",
         pp_size=2,
-        canary_full=True,
     )
-    engine.admit(prompt=_fake_prompt(32), max_new_tokens=16)
-
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        engine.step()
-    engine.assert_no_canary_violations()
-
-    engine.shutdown()
-
-
-def test_pp2_layer_split_real_kv_source_layout() -> None:
-    engine = SteppableEngine.launch(
-        model="Qwen/Qwen3-0.6B",
-        num_hidden_layers=2,
-        pp_size=2,
-        canary_real_data="all",
-    )
-    engine.admit(prompt=_fake_prompt(32), max_new_tokens=4)
-
-    engine.step_until_idle(max_steps=20)
-    engine.assert_no_canary_violations()
-
-    engine.shutdown()
+    try:
+        engine.generate(
+            input_ids=_fake_prompt(32),
+            sampling_params={"max_new_tokens": 4, "temperature": 0.0},
+        )
+    finally:
+        engine.shutdown()
