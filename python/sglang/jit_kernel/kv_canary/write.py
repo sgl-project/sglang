@@ -98,7 +98,7 @@ def canary_write_step(
 
     - ``slot`` = ``fb_out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
     - ``token / position`` = ``fb_input_ids[i] / fb_positions[i]``.
-    - ``real_kv_hash`` = ``fold_real_kv_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
+    - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
     - Advance ``running_prev_hash = splitmix64_mix4(prev, token, position, real_kv_hash)``, where
       splitmix64_mix4 folds each input via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev)``.
@@ -168,7 +168,7 @@ def canary_write_step(
               slot = fb_out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
               if (slot < 0) continue;       // -1 sentinel = skip (SWA out-of-window or padding)
               token = fb_input_ids[i]; position = fb_positions[i];
-              real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : fold_real_kv_sources(real_kv_sources, slot);
+              real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
               if pseudo_mode == ON:
                   if token != pseudo_expected_tokens[i] or position != pseudo_expected_positions[i]:

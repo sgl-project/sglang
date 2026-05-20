@@ -3,7 +3,7 @@
 // Real-KV source ABI (tvm-ffi cannot pass tuple[RealKvSource, ...] directly): the host wrapper unpacks the
 // tuple into a fixed-size array of 4 sources and passes 4 separate uint8 tensors plus a single int32 array
 // of (page_size, num_bytes_per_token, read_bytes) triplets of length 12 (4 sources x 3 fields). Unused
-// padding sources have read_bytes = 0 so fold_real_kv_sources skips them.
+// padding sources have read_bytes = 0 so real_kv_fold_sources skips them.
 
 #pragma once
 
@@ -104,7 +104,7 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
 // helper must skip the splitmix64 step entirely for read_bytes == 0 sources rather than treating them as
 // "fold 0".
 SGL_DEVICE uint64_t
-fold_real_kv_sources(const RealKvSourceHandle* sources, int num_sources, int64_t slot_idx, RealKvHashMode mode) {
+real_kv_fold_sources(const RealKvSourceHandle* sources, int num_sources, int64_t slot_idx, RealKvHashMode mode) {
   if (mode == RealKvHashMode::kOff || num_sources <= 0) {
     return 0ULL;
   }

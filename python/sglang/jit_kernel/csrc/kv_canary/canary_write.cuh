@@ -108,7 +108,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     const int64_t token = static_cast<int64_t>(p.fb_input_ids[i]);
     const int64_t position = static_cast<int64_t>(p.fb_positions[i]);
 
-    const uint64_t real_kv_hash_u64 = fold_real_kv_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
+    const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
 
     // Pseudo-mode comparison. Mismatch records a single violation row carrying both bits OR'd together;

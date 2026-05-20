@@ -110,7 +110,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   const int64_t expected_chain_hash = static_cast<int64_t>(expected_chain_hash_u64);
 
   const uint64_t expected_real_kv_hash_u64 =
-      fold_real_kv_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
+      real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
   const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
 
   FailReason fail_reason_bits{};

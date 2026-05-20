@@ -289,7 +289,7 @@ def make_real_kv_sources(
     """Map a ``real_kv_kind`` axis label to a tuple of ``RealKvSource`` configs.
 
     Byte-volume ladder (none -> small_1src -> med_2src -> max_4src) so the bench exposes the
-    ``fold_real_kv_sources`` PARTIAL/ALL cost gradient. ``max_4src`` hits the
+    ``real_kv_fold_sources`` PARTIAL/ALL cost gradient. ``max_4src`` hits the
     ``consts.MAX_REAL_KV_SOURCES = 4`` ABI ceiling.
     """
     if kind == "none":
