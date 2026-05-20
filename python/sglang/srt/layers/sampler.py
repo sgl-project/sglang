@@ -53,6 +53,8 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
+cfg_lyrics = 1.3
+
 
 class Sampler(nn.Module):
     def __init__(self):
@@ -78,6 +80,14 @@ class Sampler(nn.Module):
         # Apply the custom logit processors if registered in the sampling info
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+
+        USE_MUSIC_PREPROCESSOR = get_bool_env_var("USE_MUSIC_PREPROCESSOR")
+
+        if USE_MUSIC_PREPROCESSOR:
+            batch = logits.size(0) // 2
+            logits_cond = logits[:batch, :]
+            logits_uncond = logits[batch : 2 * batch, :]
+            logits = logits_uncond + cfg_lyrics * (logits_cond - logits_uncond)
 
         # Detect and handle NaN values in logits
         if self.use_nan_detection and torch.any(torch.isnan(logits)):
