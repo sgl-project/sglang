@@ -185,6 +185,7 @@ def benchmark(
         hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
 
         def fn() -> None:
+            violation_write_index.zero_()
             canary_verify_step(
                 canary_buf=canary_buf,
                 plan=plan,
@@ -244,6 +245,7 @@ def benchmark_kernel_kind(
     hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
 
     def fn() -> None:
+        violation_write_index.zero_()
         canary_verify_step(
             canary_buf=canary_buf,
             plan=plan,
