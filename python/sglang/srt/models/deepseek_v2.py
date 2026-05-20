@@ -49,6 +49,7 @@ from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -2509,6 +2510,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 
+        # When input_embeds is provided externally (e.g., from multimodal models
+        # via general_mm_embed_routine), embeddings are full (all_reduced) on every
+        # TP rank. To enable scattered mode, zero out non-rank-0 copies so that
+        # reduce_scatter in the first layer correctly produces the scattered state:
+        #   sum(full, 0, 0, ...) = full → scatter across ranks.
+        if (
+            input_embeds is not None
+            and get_attn_tp_context().use_input_scattered(forward_batch)
+        ):
+            if get_tensor_model_parallel_rank() != 0:
+                input_embeds = torch.zeros_like(input_embeds)
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
