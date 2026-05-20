@@ -113,13 +113,16 @@ class PerForwardOrchestrator:
         # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
         # group; if it exceeds verify_capacity the plan kernel masks stores past capacity while
         # the kernel grid's tail threads still read up to active, OOB-loading verify_slot_indices.
-        # Fail fast host-side using the ForwardBatch CPU mirrors so it never reaches the kernel.
+        # Fail loudly host-side using the ForwardBatch CPU mirrors so it never reaches the kernel
+        # (RuntimeError, not assert, so `python -O` cannot strip the check).
         prefix_lens_sum = _sum_prefix_lens(forward_batch=forward_batch, bs=bs)
-        assert prefix_lens_sum <= self._verify_capacity, (
-            f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds pre-allocated "
-            f"per_forward_verify_capacity={self._verify_capacity}; raise the verify capacity in "
-            f"install_canary._compute_launch_capacities (or _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
-        )
+        if prefix_lens_sum > self._verify_capacity:
+            raise RuntimeError(
+                f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds "
+                f"pre-allocated per_forward_verify_capacity={self._verify_capacity}; raise the "
+                f"verify capacity in install_canary._compute_launch_capacities (or "
+                f"_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
+            )
 
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)

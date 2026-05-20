@@ -272,14 +272,15 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
 
-    def test_before_forward_asserts_when_sum_prefix_lens_exceeds_verify_capacity(self):
+    def test_before_forward_throws_when_sum_prefix_lens_exceeds_verify_capacity(self):
         # Multi-req batch whose summed prefix lens exceeds any single req's length: with the old
         # sizing (per_forward_verify_capacity = max_seq_len_per_req) this slipped past the plan
-        # kernel's silent cap_mask and OOB-read the verify kernel's tail threads.
+        # kernel's silent cap_mask and OOB-read the verify kernel's tail threads. The runtime
+        # check must throw (not silently execute) so the kernel never launches with a busted plan.
         runner = _make_runner(device=self.device, per_forward_verify_capacity=4)
         # decode: sum(prefix_lens) = (5 - 1) + (5 - 1) = 8 > capacity=4
         fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with self.assertRaisesRegex(AssertionError, "sum\\(prefix_lens\\)=8"):
+        with self.assertRaisesRegex(RuntimeError, "sum\\(prefix_lens\\)=8"):
             with runner.with_forward_pass(fb):
                 pass
 
