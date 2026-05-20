@@ -277,3 +277,6 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
+
+# Humanize local loop state (never committed)
+.humanize*
