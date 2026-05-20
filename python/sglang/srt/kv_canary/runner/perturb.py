@@ -52,22 +52,26 @@ class PerturbHook:
 
         req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
         seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+        rows, cols = int(table.shape[0]), int(table.shape[1])
         active_pairs: list[tuple[int, int]] = []
         for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
             req_pool_idx_int = int(req_pool_idx)
             seq_len_int = int(seq_len)
             if seq_len_int <= 0:
                 continue
-            for pos in range(seq_len_int):
+            if req_pool_idx_int < 0 or req_pool_idx_int >= rows:
+                continue
+            upper = min(seq_len_int, cols)
+            row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+            for pos, raw_slot in enumerate(row_slots):
+                if int(raw_slot) < 1:
+                    continue
                 active_pairs.append((req_pool_idx_int, pos))
         if not active_pairs:
             return
 
         pick = int(torch.randint(0, len(active_pairs), (1,)).item())
         req_pool_idx, position = active_pairs[pick]
-        rows, cols = int(table.shape[0]), int(table.shape[1])
-        if req_pool_idx < 0 or req_pool_idx >= rows or position < 0 or position >= cols:
-            return
 
         original = int(table[req_pool_idx, position].item())
         slot_upper = rows * cols
