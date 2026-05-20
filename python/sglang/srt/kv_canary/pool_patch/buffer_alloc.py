@@ -12,7 +12,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.srt.kv_canary.config import CanaryConfig
 
-_PARTIAL_REAL_KV_READ_BYTES = 32
+_PARTIAL_REAL_KV_READ_BYTES = 16
 _REAL_KV_READ_ALIGN = 16
 
 
