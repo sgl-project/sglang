@@ -471,12 +471,15 @@ class VLChatProcessor(ProcessorMixin):
 
         sft_format = prompt
         # tokenize
-        input_ids = self.tokenizer.encode(sft_format)
-        input_ids = torch.LongTensor(input_ids)
+        token_ids = self.tokenizer.encode(sft_format)
+        image_indices = [
+            index
+            for index, token_id in enumerate(token_ids)
+            if token_id == self.image_id
+        ]
+        input_ids = torch.LongTensor(token_ids)
 
         # add image tokens to the input_ids
-        image_token_mask: torch.Tensor = (input_ids == self.image_id).to(torch.bool)
-        image_indices = image_token_mask.nonzero()
         input_ids, num_image_tokens = self.add_image_token(
             image_indices=image_indices,
             input_ids=input_ids,
