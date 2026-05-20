@@ -23,11 +23,13 @@ from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
-from sglang.srt.kv_canary.pool_patch.utils import (
+from sglang.srt.kv_canary.pool_patch.buf_info_splice import patch_buf_info_method
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
-    ensure_swa_lut_int32,
     make_row_source,
-    patch_buf_info_method,
+)
+from sglang.srt.kv_canary.pool_patch.swa_lut_mirror import (
+    ensure_swa_lut_int32,
     swa_index_lut,
 )
 

@@ -38,7 +38,7 @@ class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
     # Use --kv-canary log (not raise) so the perturb-triggered violation is
     # captured in server stderr without SIGQUIT killing the process mid-flush.
     kv_canary_mode: ClassVar[str] = "log"
-    perturb_prob: ClassVar[float] = 0.05
+    perturb_prob: ClassVar[float] = 0.5
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
         # Drive traffic; perturb fires per-step at perturb_prob, canary logs.
@@ -136,7 +136,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
 
 
 class TestLogModeKeepsServerAlive(_MhaFullBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.05
+    perturb_prob: ClassVar[float] = 0.5
     kv_canary_mode: ClassVar[str] = "log"
 
     def test_log_mode_keeps_server_alive(self) -> None:
