@@ -518,6 +518,31 @@ class TopK(MultiPlatformOp):
             )
         return self._apply_deepep_waterfill(topk_output, 0)
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        self.topk_config.torch_native = True
+        # [NOTE] XPU device support for topk kernels
+        #   - support 'topk_softmax' and 'topk_sigmoid'
+        #   - support up to 8 top-k and 256 experts
+        self.topk_config.torch_native = not (
+            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
+        )
+
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
 
 # ------------------------------- TopK implementation -------------------------------------
 
