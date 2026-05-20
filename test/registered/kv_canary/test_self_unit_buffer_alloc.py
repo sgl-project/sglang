@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 
-import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import RealKvHashMode
