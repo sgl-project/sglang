@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import disable, enable, is_enabled
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -581,6 +582,9 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
+        )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -817,6 +821,8 @@ class CudaGraphRunner:
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+        if self.enable_shape_discovery_for_cuda_graph_profile:
+            disable()
 
     def capture(self) -> None:
         profile_context = empty_context()
@@ -1136,6 +1142,12 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+            if self.enable_profile_cuda_graph:
+                if (
+                    self.enable_shape_discovery_for_cuda_graph_profile
+                    and not is_enabled()
+                ):
+                    enable()
             attn_backend.on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
