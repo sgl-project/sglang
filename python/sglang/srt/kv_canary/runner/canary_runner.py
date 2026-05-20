@@ -78,11 +78,7 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=device)
-            if device.type == "cuda" and torch.cuda.is_available()
-            else None
-        )
+        self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,

@@ -36,7 +36,7 @@ class HealthAndStats:
         active_tags: tuple[CanaryLaunchTag, ...],
         pump_and_allreduce: PumpAndAllreduce,
         sweep_orchestrator: SweepOrchestrator,
-        d2h_stream: Optional[torch.cuda.Stream],
+        d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state

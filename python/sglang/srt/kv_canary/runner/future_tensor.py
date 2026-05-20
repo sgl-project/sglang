@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -9,20 +8,17 @@ import torch
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FutureTensor:
     _tensor: torch.Tensor
-    _event: Optional[torch.cuda.Event]
+    _event: torch.cuda.Event
 
     @classmethod
     def create(
-        cls, *, src_device: torch.Tensor, stream: Optional[torch.cuda.Stream]
+        cls, *, src_device: torch.Tensor, stream: torch.cuda.Stream
     ) -> "FutureTensor":
         host = torch.empty(
             src_device.shape,
             dtype=src_device.dtype,
-            pin_memory=(stream is not None),
+            pin_memory=True,
         )
-        if stream is None:
-            host.copy_(src_device)
-            return cls(_tensor=host, _event=None)
         stream.wait_stream(torch.cuda.current_stream(src_device.device))
         with torch.cuda.stream(stream):
             host.copy_(src_device, non_blocking=True)
@@ -31,6 +27,5 @@ class FutureTensor:
         return cls(_tensor=host, _event=event)
 
     def wait(self) -> torch.Tensor:
-        if self._event is not None:
-            self._event.synchronize()
+        self._event.synchronize()
         return self._tensor
