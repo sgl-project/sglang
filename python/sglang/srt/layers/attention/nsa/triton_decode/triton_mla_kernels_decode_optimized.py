@@ -160,20 +160,14 @@ def _triton_sparse_attn_decode_dsv4(
     # This check is BEFORE the chunking check because the fused kernel does NOT
     # allocate the intermediate gathered_kv buffer, so buffer size limits don't apply.
     if _should_use_fused_nosplitk(total_tokens, h_q, total_topk):
-        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
-        if not q_reshaped.is_contiguous():
-            q_reshaped = q_reshaped.contiguous()
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
 
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-        if not indices_main.is_contiguous():
-            indices_main = indices_main.contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
 
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
             total_tokens, topk_extra
-        )
-        if not indices_extra.is_contiguous():
-            indices_extra = indices_extra.contiguous()
+        ).contiguous()
 
         output, lse = fused_gather_attn_decode_dsv4_dual_scope(
             q_reshaped,
@@ -203,20 +197,14 @@ def _triton_sparse_attn_decode_dsv4(
 
     # Use fused dual-scope kernel with low-overhead buffer pool
     if _should_use_fused_dual_scope(total_tokens, h_q, total_topk):
-        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
-        if not q_reshaped.is_contiguous():
-            q_reshaped = q_reshaped.contiguous()
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
 
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-        if not indices_main.is_contiguous():
-            indices_main = indices_main.contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
 
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
             total_tokens, topk_extra
-        )
-        if not indices_extra.is_contiguous():
-            indices_extra = indices_extra.contiguous()
+        ).contiguous()
 
         output, lse = fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             q_reshaped,
