@@ -14,10 +14,9 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _allocate_plan_pair,
-    _build_req_to_token,
     _empty_extras,
-    _make_extras,
     derive_plan_capacity,
+    make_extras_explicit,
     make_lut,
     make_req_to_token,
 )
@@ -37,7 +36,7 @@ def test_single_req_extend_basic() -> None:
     fb_req_pool_indices = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([5], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -70,7 +69,7 @@ def test_single_req_decode() -> None:
     fb_prefix_lens = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -100,7 +99,7 @@ def test_multi_req_mixed_extend_decode() -> None:
     fb_prefix_lens = torch.tensor([0, 4, 10], dtype=torch.int32, device=_DEVICE)
     # req0: prefill extend=8; req1: decode extend=1; req2: decode extend=1.
     fb_extend_seq_lens = torch.tensor([8, 1, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
@@ -132,7 +131,7 @@ def test_prefix_zero_seed_is_minus_one() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -160,7 +159,7 @@ def test_padding_rows_contribute_zero() -> None:
     fb_req_pool_indices = torch.tensor([1, 0, 2], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([5, 99, 3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 99, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -194,7 +193,7 @@ def test_swa_window_clip_prefix_less_than_window() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=512)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=512, device=_DEVICE)
     # Identity LUT keeps slot indices unchanged after SWA translation.
     full_pool_size = 4 * 512
     lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
@@ -224,7 +223,7 @@ def test_swa_window_clip_prefix_gt_window() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([200], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=512)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=512, device=_DEVICE)
     full_pool_size = 4 * 512
     lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
 
@@ -256,7 +255,7 @@ def test_swa_lut_translates_verify_slots() -> None:
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     full_pool_size = 4 * max_seq_len
     # Build a LUT that maps FULL slot S → SWA slot (S + 100) for every S; chosen so we can distinguish a
     # translated value from a raw full slot.
@@ -293,7 +292,7 @@ def test_swa_lut_translates_seed_slot() -> None:
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     full_pool_size = 4 * max_seq_len
     lut = (
         torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE) + 100
@@ -325,7 +324,7 @@ def test_prev_slot_minus_one_at_chain_head() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -354,7 +353,7 @@ def test_prev_slot_is_self_minus_one() -> None:
     fb_prefix_lens = torch.tensor([4], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -384,8 +383,8 @@ def test_extra_verify_entries_appended_after_per_req() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
-    extras = _make_extras(
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
+    extras = make_extras_explicit(
         slot_indices=[77, 78],
         positions=[5, 6],
         prev_slot_indices=[-1, 77],
@@ -424,9 +423,9 @@ def test_extra_verify_num_valid_zero_no_op() -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
     # Extras buffer is non-empty but extra_verify_num_valid = 0; kernel must not append anything.
-    extras = _make_extras(
+    extras = make_extras_explicit(
         slot_indices=[999, 999],
         positions=[999, 999],
         prev_slot_indices=[999, 999],
@@ -459,7 +458,7 @@ def test_sweep_caller_writes_dummy_write_plan() -> None:
     fb_req_pool_indices = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([4, 6], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([0, 0], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -494,8 +493,8 @@ def test_verify_num_valid_aggregate() -> None:
     fb_req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([2, 5, 4], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 1, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
-    extras = _make_extras(
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
+    extras = make_extras_explicit(
         slot_indices=[80, 81, 82],
         positions=[10, 11, 12],
         prev_slot_indices=[-1, 80, 81],
@@ -531,7 +530,7 @@ def test_verify_covers_all_tokens_no_skip() -> None:
     fb_req_pool_indices = torch.tensor([1, 2, 3, 1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor(prefix_values, dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor(extend_values, dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=32)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=32, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=128, write_req_capacity=8
@@ -558,7 +557,7 @@ def test_plan_verify_positions_strictly_increment_per_req() -> None:
     fb_req_pool_indices = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([5, 8], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=32)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=32, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -592,7 +591,7 @@ def test_verify_covers_all_tokens_in_swa_window() -> None:
     fb_prefix_lens = torch.tensor(prefix_values, dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 1, 1, 1], dtype=torch.int32, device=_DEVICE)
     max_seq_len = 2048
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     full_pool_size = 4 * max_seq_len
     lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
 
@@ -623,7 +622,7 @@ def test_write_num_valid_reqs_excludes_padding() -> None:
     fb_req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([3, 5, 99, 99], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 1, 99, 99], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
@@ -653,8 +652,8 @@ def test_byte_equal_python_reference() -> None:
     fb_req_pool_indices = torch.tensor([1, 2, 3, 1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0, 3, 8, 15], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([4, 1, 1, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=32)
-    extras = _make_extras(
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=32, device=_DEVICE)
+    extras = make_extras_explicit(
         slot_indices=[50, 51],
         positions=[100, 101],
         prev_slot_indices=[-1, 50],
@@ -690,7 +689,7 @@ def test_byte_equal_python_reference_hardcoded() -> None:
     fb_req_pool_indices = torch.tensor(rps, dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor(prefixes, dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor(extends, dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
@@ -751,7 +750,7 @@ def test_bs_boundary_byte_equal_sweep(bs: int) -> None:
     fb_extend_seq_lens = torch.tensor(
         extend_seq_lens, dtype=torch.int32, device=_DEVICE
     )
-    req_to_token = _build_req_to_token(max_reqs=bs + 1, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=bs + 1, max_seq_len=max_seq_len, device=_DEVICE)
 
     total_verify = sum(min(p, max_seq_len) for p in prefix_lens)
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
@@ -783,7 +782,7 @@ def test_prefix_lens_boundary_byte_equal_sweep(prefix_val: int) -> None:
     fb_req_pool_indices = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([prefix_val, 10], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1, 1], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     total_verify = prefix_val + 10
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
@@ -815,7 +814,7 @@ def test_extend_seq_lens_boundary_byte_equal_sweep(extend_val: int) -> None:
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([extend_val], dtype=torch.int32, device=_DEVICE)
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64,
@@ -906,7 +905,7 @@ def test_seed_translated_through_permuted_lut() -> None:
     max_reqs = 4
     pool_size = max_reqs * max_seq_len
     lut = make_lut(kind="permutation", pool_size=pool_size, device=_DEVICE, rng=rng)
-    rtt = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+    rtt = make_req_to_token(kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE)
 
     rp = 2
     prefix = 5
@@ -1000,13 +999,13 @@ def test_extras_capacity_just_fits() -> None:
     fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
     fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
     fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     extras_slot_list = [500, 501, 502]
     extras_position_list = [10, 11, 12]
     extras_prev_list = [-1, 500, 501]
     extras_count = len(extras_slot_list)
-    extras = _make_extras(
+    extras = make_extras_explicit(
         slot_indices=extras_slot_list,
         positions=extras_position_list,
         prev_slot_indices=extras_prev_list,
@@ -1052,13 +1051,13 @@ def test_extras_capacity_undershoot_by_one() -> None:
     fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
     fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
     fb_ext = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
 
     extras_slot_list = [600, 601, 602]
     extras_position_list = [20, 21, 22]
     extras_prev_list = [-1, 600, 601]
     extras_count = len(extras_slot_list)
-    extras = _make_extras(
+    extras = make_extras_explicit(
         slot_indices=extras_slot_list,
         positions=extras_position_list,
         prev_slot_indices=extras_prev_list,
@@ -1115,7 +1114,7 @@ def test_swa_window_head_prev_slot_is_real_predecessor() -> None:
     prefix = 200
     rp = 1
     lut = make_lut(kind="permutation", pool_size=pool_size, device=_DEVICE, rng=rng)
-    rtt = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+    rtt = make_req_to_token(kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE)
 
     fb_rpi = torch.tensor([rp], dtype=torch.int32, device=_DEVICE)
     fb_pfx = torch.tensor([prefix], dtype=torch.int32, device=_DEVICE)
@@ -1157,7 +1156,7 @@ def test_replay_same_inputs_yields_same_outputs() -> None:
     fb_rpi = torch.tensor([1, 2, 3], dtype=torch.int32, device=_DEVICE)
     fb_pfx = torch.tensor([4, 7, 2], dtype=torch.int32, device=_DEVICE)
     fb_ext = torch.tensor([2, 1, 3], dtype=torch.int32, device=_DEVICE)
-    rtt = _build_req_to_token(max_reqs=8, max_seq_len=16)
+    rtt = make_req_to_token(kind="linear", max_reqs=8, max_seq_len=16, device=_DEVICE)
     extras = _empty_extras()
     verify_capacity, write_req_capacity = derive_plan_capacity(
         kind="loose", total_verify=13, extras_count=0, bs=3
@@ -1210,7 +1209,7 @@ def test_padding_row_with_garbage_prefix_does_not_oob() -> None:
     fb_rpi = torch.tensor([1, 0, 2], dtype=torch.int32, device=_DEVICE)
     fb_pfx = torch.tensor([5, 99999, 3], dtype=torch.int32, device=_DEVICE)
     fb_ext = torch.tensor([1, 99999, 1], dtype=torch.int32, device=_DEVICE)
-    rtt = _build_req_to_token(max_reqs=4, max_seq_len=16)
+    rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
     extras = _empty_extras()
     verify_capacity, write_req_capacity = derive_plan_capacity(
         kind="loose", total_verify=8, extras_count=0, bs=3
@@ -1249,7 +1248,7 @@ def test_padding_row_with_garbage_prefix_does_not_oob() -> None:
 
 def test_shrink_bs_clears_stale_write_offsets() -> None:
     """Reusing a WritePlan with smaller bs: write_offsets beyond new bs must be zeroed by the kernel."""
-    rtt = _build_req_to_token(max_reqs=16, max_seq_len=16)
+    rtt = make_req_to_token(kind="linear", max_reqs=16, max_seq_len=16, device=_DEVICE)
     extras = _empty_extras()
     verify_capacity, write_req_capacity = derive_plan_capacity(
         kind="loose", total_verify=80, extras_count=0, bs=8

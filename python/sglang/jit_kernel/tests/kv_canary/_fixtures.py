@@ -263,17 +263,6 @@ def _allocate_plan_pair(
     )
 
 
-def _build_req_to_token(*, max_reqs: int, max_seq_len: int) -> torch.Tensor:
-    """Construct a deterministic [max_reqs, max_seq_len] req_to_token table.
-
-    Slot index = rp * max_seq_len + pos so every (rp, pos) maps to a distinct slot, which lets per-entry
-    assertions reason about which req contributed which slot.
-    """
-    rp_axis = torch.arange(max_reqs, device=_DEVICE, dtype=torch.int32).unsqueeze(1)
-    pos_axis = torch.arange(max_seq_len, device=_DEVICE, dtype=torch.int32).unsqueeze(0)
-    return (rp_axis * max_seq_len + pos_axis).contiguous()
-
-
 def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(1, dtype=torch.int32, device=_DEVICE),
@@ -283,7 +272,7 @@ def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
     )
 
 
-def _make_extras(
+def make_extras_explicit(
     *,
     slot_indices: list[int],
     positions: list[int],
