@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -49,9 +49,8 @@ fn config() -> Config {
             cache_aware: None,
         }],
         discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                path: "/tmp/x.toml".into(),
-                poll_interval_ms: 200,
+            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
             }),
         },
         proxy: ProxyConfig::default(),

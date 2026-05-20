@@ -527,8 +527,8 @@ mod tests {
 
     /// Older SGLang doesn't expose `disaggregation_mode`. The
     /// introspector must not invent a classification — the discovery
-    /// backend (K8s labels, static-file TOML) still drives mode for
-    /// these workers.
+    /// backend's seed (K8s labels, static-urls Plain default) still
+    /// drives mode for these workers.
     #[tokio::test]
     async fn fetch_defers_to_backend_when_mode_field_is_absent() {
         let (url, _shutdown) = spawn_fake_worker(json!({

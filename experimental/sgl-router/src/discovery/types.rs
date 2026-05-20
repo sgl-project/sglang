@@ -43,13 +43,13 @@ pub enum WorkerMode {
 ///
 /// `bootstrap_port` is the SGLang disagg bootstrap server port for
 /// prefill workers (set via `--disaggregation-bootstrap-port` at worker
-/// startup, surfaced through K8s annotation `sglang.ai/bootstrap-port`
-/// or the static-config bootstrap_port field). `None` for decode and
-/// plain workers — they don't own a bootstrap server. The router copies
-/// the selected prefill worker's `bootstrap_host`/`bootstrap_port` plus
-/// a random `bootstrap_room` u64 onto every PD-disagg request body so
-/// the prefill engine can match incoming KV-transfer requests from the
-/// decode peer.
+/// startup). Resolved from each worker's `/server_info` response (see
+/// [`crate::workers::introspect`]); discovery backends seed it as
+/// `None`. `None` for decode and plain workers — they don't own a
+/// bootstrap server. The router copies the selected prefill worker's
+/// `bootstrap_host`/`bootstrap_port` plus a random `bootstrap_room`
+/// u64 onto every PD-disagg request body so the prefill engine can
+/// match incoming KV-transfer requests from the decode peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,

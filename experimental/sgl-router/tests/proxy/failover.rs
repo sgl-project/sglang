@@ -18,41 +18,12 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn failover_when_one_worker_dies() {
-    // Three mock workers.
+    // Three mock workers. Each advertises served_model_name = "tiny" on
+    // /server_info, so the worker manager's introspect step resolves the
+    // registry's model_ids without us having to hand-declare them here.
     let w1 = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let w2 = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let w3 = crate::common::mock_worker::MockWorker::start(vec![]).await;
-
-    // Write a workers.toml with all 3.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("workers.toml");
-    tokio::fs::write(
-        &path,
-        format!(
-            r#"
-[[workers]]
-id = "w1"
-url = "{}"
-mode = "plain"
-model_ids = ["tiny"]
-
-[[workers]]
-id = "w2"
-url = "{}"
-mode = "plain"
-model_ids = ["tiny"]
-
-[[workers]]
-id = "w3"
-url = "{}"
-mode = "plain"
-model_ids = ["tiny"]
-"#,
-            w1.url, w2.url, w3.url
-        ),
-    )
-    .await
-    .unwrap();
 
     let cfg = Config {
         server: ServerConfig {
@@ -71,9 +42,8 @@ model_ids = ["tiny"]
             cache_aware: None,
         }],
         discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                path: path.to_string_lossy().into_owned(),
-                poll_interval_ms: 50,
+            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
             }),
         },
         proxy: ProxyConfig::default(),
@@ -93,12 +63,23 @@ model_ids = ["tiny"]
         None,
     ));
 
-    // Give time for the registry to receive Added events.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        registry.workers_for(&ModelId("tiny".into())).len(),
-        3,
-        "registry should contain all 3 workers after discovery"
+    // Poll for the registry to converge — `register_one` introspect is
+    // a per-task spawn (manager.rs:127), so order of registration is
+    // non-deterministic under load. Cap the wait so a real hang surfaces
+    // instead of becoming a flake.
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("tiny".into())).len() == 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        converged.is_ok(),
+        "registry should contain all 3 workers after discovery; have {}",
+        registry.workers_for(&ModelId("tiny".into())).len()
     );
 
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
@@ -112,10 +93,23 @@ model_ids = ["tiny"]
     ctx.mark_ready();
     let app = build_router(ctx);
 
-    // Kill w2 by dropping its handle.
+    // Kill w2 by dropping its handle, then poll until its socket
+    // actually refuses connections. Without this, the first request
+    // routed to w2 can race against the listener's graceful shutdown
+    // and succeed, masking the failover assertion below.
+    let w2_url = w2.url.clone();
     drop(w2);
-    // Give time for OS to release the port.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let host_port = w2_url.trim_start_matches("http://");
+    let down = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::net::TcpStream::connect(host_port).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(down.is_ok(), "w2 socket never went down");
 
     // Send 6 requests; round-robin would route 2 to w2 → connection refused →
     // breaker opens (threshold=1); subsequent round-robin picks rotate among

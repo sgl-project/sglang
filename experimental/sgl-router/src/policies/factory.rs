@@ -112,7 +112,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ProxyConfig,
-        ServerConfig, StaticFileDiscoveryConfig,
+        ServerConfig, StaticUrlsDiscoveryConfig,
     };
 
     use crate::config::PolicyKind;
@@ -135,9 +135,8 @@ mod tests {
                 })
                 .collect(),
             discovery: DiscoveryConfig {
-                backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                    path: "/tmp/w".into(),
-                    poll_interval_ms: 200,
+                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
                 }),
             },
             proxy: ProxyConfig::default(),

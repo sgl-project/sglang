@@ -73,10 +73,9 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             cache_aware: None,
         }],
         discovery: sgl_router::config::DiscoveryConfig {
-            backend: sgl_router::config::DiscoveryBackend::StaticFile(
-                sgl_router::config::StaticFileDiscoveryConfig {
-                    path: "/tmp/x.toml".into(),
-                    poll_interval_ms: 200,
+            backend: sgl_router::config::DiscoveryBackend::StaticUrls(
+                sgl_router::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
                 },
             ),
         },

@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Json;
 use bytes::Bytes;
 use serde_json::Value;
@@ -54,8 +54,12 @@ impl MockWorker {
             captured: captured.clone(),
             stream_chunks: Arc::new(stream_chunks),
         };
+        // /server_info advertises served_model_name="tiny" so the
+        // worker-manager introspect step resolves model_ids for the
+        // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -122,6 +126,7 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(hang_handler))
+            .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -201,6 +206,7 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(slow_chat))
+            .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -230,6 +236,12 @@ impl MockWorker {
     /// but drops the connection mid-body. We can't build this with axum
     /// directly (it owns the response lifecycle); raw TCP gives us frame-level
     /// control to short-write the body and close.
+    ///
+    /// NOTE: unlike the axum-based variants, this helper does NOT serve
+    /// `/server_info` (one-shot raw-TCP accept, no path routing). Callers
+    /// that wire this through `spawn_discovery` will see introspect fail
+    /// with empty `model_ids`. All current callers inject the worker via
+    /// `registry.add()` directly, which bypasses introspect.
     #[allow(dead_code)]
     pub async fn start_returning_partial_body(
         status: StatusCode,
@@ -347,6 +359,7 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))
+            .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -367,6 +380,18 @@ impl MockWorker {
             _shutdown: tx,
         }
     }
+}
+
+/// Stateless `/server_info` handler shared by every axum-based
+/// `MockWorker::start_*` variant. Advertising `served_model_name="tiny"`
+/// lets the worker manager's introspect step resolve `model_ids` for any
+/// variant that flows through `spawn_discovery`, instead of burning 3 ×
+/// `SERVER_INFO_TIMEOUT` of retries before registering with empty
+/// `model_ids`. Adding it unconditionally is cheaper than tracking which
+/// variants do or don't get introspected.
+#[allow(dead_code)] // shared across all axum variants
+async fn serve_tiny_server_info() -> Json<Value> {
+    Json(serde_json::json!({"served_model_name": "tiny"}))
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.

@@ -227,7 +227,7 @@ async fn register_one(
     // self-disclosed its PD role: the server's own ServerArgs is the
     // authoritative source for `disaggregation_mode` and
     // `disaggregation_bootstrap_port`. The backend's mode (from K8s
-    // labels, static-file TOML, etc.) was a best-guess seed; if the
+    // labels, static-urls seed, etc.) was a best-guess seed; if the
     // server says it's actually a prefill peer on port 8998, that wins.
     // `None` here means the worker didn't tell us — keep the backend's
     // classification (older SGLang without the field, partial response,
@@ -280,7 +280,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig,
-        ModelConfig, PolicyKind, ProxyConfig, ServerConfig, StaticFileDiscoveryConfig,
+        ModelConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
@@ -307,9 +307,8 @@ mod tests {
                 cache_aware: None,
             }],
             discovery: DiscoveryConfig {
-                backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                    path: "/tmp/w".into(),
-                    poll_interval_ms: 200,
+                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://test:30000".into()],
                 }),
             },
             proxy: ProxyConfig::default(),
