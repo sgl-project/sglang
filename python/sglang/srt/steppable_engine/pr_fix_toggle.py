@@ -1,75 +1,74 @@
 """Reverse-apply historical PR fixes for regression-style tests.
 
-Uses sglang.srt.debug_utils.source_patcher to do precise text-level edits on
-the affected function source, compile, and swap __code__. Reverts on
-scheduler shutdown / on explicit reapply.
+Each registered PR is a YAML config consumed by
+sglang.srt.debug_utils.source_patcher.apply_patches_from_config which does
+text-level edits on the function source, compiles, and swaps __code__.
+PatchState.restore() puts back the original __code__.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
-from sglang.srt.debug_utils.source_patcher import CodePatcher, EditSpec, PatchSpec
+from sglang.srt.debug_utils.source_patcher import (
+    PatchState,
+    apply_patches_from_config,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
-def _pr_25015_revert_patches() -> List[PatchSpec]:
-    eager_edit_move_add_to_loop_top = EditSpec(
-        match=(
-            "forward_batch.out_cache_loc = out_cache_loc[i]\n"
-            "            forward_batch.attn_backend"
-        ),
-        replacement=(
-            "forward_batch.out_cache_loc = out_cache_loc[i]\n"
-            "            forward_batch.positions.add_(1)\n"
-            "            forward_batch.attn_backend"
-        ),
-    )
-    eager_edit_drop_post_loop_add = EditSpec(
-        match=(
-            "hidden_states = logits_output.hidden_states\n"
-            "            forward_batch.positions.add_(1)\n"
-        ),
-        replacement="hidden_states = logits_output.hidden_states\n",
-    )
+# Reverts PR #25015 ("Fix Eagle draft decode positions"). Re-introduces the
+# pre-fix positions.add_(1) location (start of inner loop body) and removes
+# the post-fix positions.add_(1) at the loop bottom and the cuda-graph
+# capture-side positions.sub_ tail compensation.
+_PR_25015_REVERT_YAML = """
+patches:
+  - target: sglang.srt.speculative.eagle_worker.EAGLEWorker.draft_forward
+    edits:
+      - match: |
+          forward_batch.out_cache_loc = out_cache_loc[i]
+          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+        replacement: |
+          forward_batch.out_cache_loc = out_cache_loc[i]
+          forward_batch.positions.add_(1)
+          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+      - match: |
+          hidden_states = logits_output.hidden_states
+          forward_batch.positions.add_(1)
+        replacement: |
+          hidden_states = logits_output.hidden_states
 
-    return [
-        PatchSpec(
-            target="sglang.srt.speculative.eagle_worker.EAGLEWorker.draft_forward",
-            edits=[eager_edit_move_add_to_loop_top, eager_edit_drop_post_loop_add],
-        ),
-        PatchSpec(
-            target=(
-                "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward"
-            ),
-            edits=[eager_edit_move_add_to_loop_top, eager_edit_drop_post_loop_add],
-        ),
-        PatchSpec(
-            target=(
-                "sglang.srt.speculative.eagle_draft_cuda_graph_runner."
-                "EAGLEDraftCudaGraphRunner.capture_one_batch_size"
-            ),
-            edits=[
-                EditSpec(
-                    match=(
-                        "forward_batch.spec_info.hidden_states = hidden_states_backup\n"
-                        "            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)\n"
-                        "            return ret"
-                    ),
-                    replacement=(
-                        "forward_batch.spec_info.hidden_states = hidden_states_backup\n"
-                        "            return ret"
-                    ),
-                ),
-            ],
-        ),
-    ]
+  - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
+    edits:
+      - match: |
+          forward_batch.out_cache_loc = out_cache_loc[i]
+          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+        replacement: |
+          forward_batch.out_cache_loc = out_cache_loc[i]
+          forward_batch.positions.add_(1)
+          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+      - match: |
+          hidden_states = logits_output.hidden_states
+          forward_batch.positions.add_(1)
+        replacement: |
+          hidden_states = logits_output.hidden_states
+
+  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_batch_size
+    edits:
+      - match: |
+          forward_batch.spec_info.hidden_states = hidden_states_backup
+          forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+          return ret
+        replacement: |
+          forward_batch.spec_info.hidden_states = hidden_states_backup
+          return ret
+"""
 
 
-_PR_FIX_REVERT_PATCHES: Dict[int, Callable[[], List[PatchSpec]]] = {
-    25015: _pr_25015_revert_patches,
+_PR_FIX_REVERT_YAML: Dict[int, str] = {
+    25015: _PR_25015_REVERT_YAML,
 }
 
 
@@ -80,22 +79,22 @@ def apply_pr_fix_toggles(
         if choice is None:
             continue
 
-        attr = f"_pr_{pr_num}_patcher"
+        attr = f"_pr_{pr_num}_patch_states"
 
         if choice is True:
-            patcher: Optional[CodePatcher] = getattr(scheduler, attr, None)
-            if patcher is not None:
-                patcher.__exit__(None, None, None)
+            states: Optional[List[PatchState]] = getattr(scheduler, attr, None)
+            if states is not None:
+                for state in reversed(states):
+                    state.restore()
                 delattr(scheduler, attr)
             continue
 
-        if pr_num not in _PR_FIX_REVERT_PATCHES:
+        if pr_num not in _PR_FIX_REVERT_YAML:
             raise NotImplementedError(
                 f"PR #{pr_num} revert is not registered; "
-                f"available: {sorted(_PR_FIX_REVERT_PATCHES.keys())}"
+                f"available: {sorted(_PR_FIX_REVERT_YAML.keys())}"
             )
         if hasattr(scheduler, attr):
             continue
-        patcher = CodePatcher(patches=_PR_FIX_REVERT_PATCHES[pr_num]())
-        patcher.__enter__()
-        setattr(scheduler, attr, patcher)
+        states = apply_patches_from_config(_PR_FIX_REVERT_YAML[pr_num])
+        setattr(scheduler, attr, states)
