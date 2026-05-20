@@ -93,8 +93,8 @@ suite_xpu = {
     "per-commit-xpu": [
         TestFile("xpu/test_deepseek_ocr.py", 360),
         TestFile("xpu/test_deepseek_ocr_triton.py", 360),
-        # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
+        TestFile("xpu/test_gemma_4_e2b.py"),
     ],
 }
 
