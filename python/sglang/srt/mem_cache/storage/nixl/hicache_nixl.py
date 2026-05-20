@@ -10,6 +10,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -82,9 +86,17 @@ class HiCacheNixl(HiCacheStorage):
 
         self.registration = NixlRegistration(self.agent)
         self.is_zero_copy = False
+        self.registered_pools = {}
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _get_component_key(
+        self, key: str, component_name: Optional[PoolName] = None
+    ) -> str:
+        if component_name in (None, PoolName.KV):
+            return self._get_suffixed_key(key)
+        return f"{self._get_suffixed_key(key)}.{component_name}"
 
     def register_buffers(
         self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
@@ -218,6 +230,79 @@ class HiCacheNixl(HiCacheStorage):
             for fd in file_fds:
                 self.file_manager.close_file(fd)
 
+    def _transfer_by_keys(
+        self,
+        buffers: List[torch.Tensor | tuple],
+        keys: List[str],
+        direction: str,
+    ) -> bool:
+        if self.backend_selector.mem_type == "FILE":
+            file_paths = []
+            for key in keys:
+                file_path = self.file_manager.get_file_path(key)
+                if direction == "WRITE" and not self.file_manager.create_file(file_path):
+                    logger.error(f"Failed to create file {file_path}")
+                    return False
+                file_paths.append(file_path)
+            return self._execute_transfer(buffers, file_paths, direction)
+        return self._execute_transfer(buffers, keys, direction)
+
+    def _query_keys_exist(self, keys: List[str]) -> List[bool]:
+        if not keys:
+            return []
+        tuples = []
+        for key in keys:
+            tuples += self.registration.create_query_tuples(
+                key,
+                self.backend_selector.mem_type,
+                self.file_manager if self.backend_selector.mem_type == "FILE" else None,
+            )
+        query_res = self.agent.query_memory(
+            tuples,
+            self.backend_selector.backend_name,
+            mem_type=self.backend_selector.mem_type,
+        )
+        return [res is not None for res in query_res]
+
+    def _get_component_keys(
+        self, keys: List[str], pool_name: Optional[PoolName] = None
+    ) -> List[str]:
+        return [self._get_component_key(key, pool_name) for key in keys]
+
+    def _prepare_pool_transfer(
+        self, transfer: PoolTransfer, for_write: bool
+    ) -> tuple[Optional[HostKVCache], List[str], List[torch.Tensor], List[int]]:
+        host_pool = self.registered_pools.get(transfer.name)
+        if host_pool is None:
+            logger.error("Host pool %s is not registered in HiCacheNixl", transfer.name)
+            return None, [], [], []
+
+        keys = transfer.keys or []
+        host_indices = transfer.host_indices
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        expected = len(keys) * page_size
+        if host_indices is None or host_indices.numel() != expected:
+            logger.error(
+                "Pool %s indices length mismatch: expected %s, got %s",
+                transfer.name,
+                expected,
+                host_indices.numel() if host_indices is not None else 0,
+            )
+            return host_pool, [], [], []
+
+        page_offsets = [
+            host_indices[i * page_size].item() for i in range(len(keys))
+        ]
+        if for_write:
+            buffers = [
+                host_pool.get_data_page(page_offset, flat=True).contiguous()
+                for page_offset in page_offsets
+            ]
+        else:
+            buffers = [host_pool.get_dummy_flat_data_page() for _ in page_offsets]
+
+        return host_pool, self._get_component_keys(keys, transfer.name), buffers, page_offsets
+
     def get(
         self,
         key: str,
@@ -258,11 +343,7 @@ class HiCacheNixl(HiCacheStorage):
         # Add suffix to keys
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in suffixed_keys]
-            success = self._execute_transfer(dest, file_paths, "READ")
-        else:
-            success = self._execute_transfer(dest, suffixed_keys, "READ")
+        success = self._transfer_by_keys(dest, suffixed_keys, "READ")
         return target_locations if success and not target_sizes else [None] * len(keys)
 
     def set(
@@ -294,18 +375,7 @@ class HiCacheNixl(HiCacheStorage):
         # Add suffix to keys
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in suffixed_keys:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(f"Failed to create file {file_path}")
-                    return False
-                file_paths.append(file_path)
-            return self._execute_transfer(values, file_paths, "WRITE")
-        else:  # mem_type == "OBJ"
-            return self._execute_transfer(values, suffixed_keys, "WRITE")
+        return self._transfer_by_keys(values, suffixed_keys, "WRITE")
 
     ############################################################################
     # batch_*_v1 functions
@@ -313,7 +383,8 @@ class HiCacheNixl(HiCacheStorage):
     ############################################################################
 
     def clear(self) -> None:
-        self.file_manager.clear()
+        if self.file_manager is not None:
+            self.file_manager.clear()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -327,6 +398,9 @@ class HiCacheNixl(HiCacheStorage):
         logger.info(
             f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}"
         )
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
     def exists(self, key: str) -> bool:
         results = self.batch_exists([key])
@@ -342,31 +416,60 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
             key_denominator = (
-                1 if not self.is_mla_model else 2
-            )  # MLA model only has k buffer, no separate v buffer
+                1 if self.is_mla_model else 2
+            )  # MLA has one interleaved buffer; non-MLA has separate k/v buffers
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
 
-        # obtain list of tuples by calling self.registration.create_query_tuples()
-        tuples = []
-        for key in key_list:
-            tuples += self.registration.create_query_tuples(
-                key,
-                self.backend_selector.mem_type,
-                self.file_manager if self.backend_selector.mem_type == "FILE" else None,
-            )
+        exists_results = self._query_keys_exist(key_list)
 
-        query_res = self.agent.query_memory(
-            tuples,
-            self.backend_selector.backend_name,
-            mem_type=self.backend_selector.mem_type,
-        )
-
-        for i in range(len(query_res)):
-            if query_res[i] is None:
+        for i, exists in enumerate(exists_results):
+            if not exists:
                 return i // key_denominator
-        return len(query_res) // key_denominator
+        return len(exists_results) // key_denominator
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            if transfer.name not in self.registered_pools:
+                final_pages = 0
+                break
+
+            component_keys = self._get_component_keys(keys[:kv_pages], transfer.name)
+            exists_results = self._query_keys_exist(component_keys)
+
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = exists_results.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        exists_results[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
 
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
         # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
@@ -452,11 +555,7 @@ class HiCacheNixl(HiCacheStorage):
         else:
             dest = target_tensors
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._execute_transfer(dest, file_paths, "READ")
-        else:
-            success = self._execute_transfer(dest, key_strs, "READ")
+        success = self._transfer_by_keys(dest, key_strs, "READ")
 
         return [True] * len(key_strs) if success else [False] * len(key_strs)
 
@@ -579,20 +678,7 @@ class HiCacheNixl(HiCacheStorage):
         else:
             src = target_tensors
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in key_strs:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(
-                        f"******** Failed to create file {file_path} *********"
-                    )
-                    return [False] * len(keys)
-                file_paths.append(file_path)
-            success = self._execute_transfer(src, file_paths, "WRITE")
-        else:  # mem_type == "OBJ"
-            success = self._execute_transfer(src, key_strs, "WRITE")
+        success = self._transfer_by_keys(src, key_strs, "WRITE")
 
         return [True] * len(keys) if success else [False] * len(keys)
 
@@ -630,3 +716,47 @@ class HiCacheNixl(HiCacheStorage):
         )
 
         return results_set
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool, key_strs, buffers, page_offsets = self._prepare_pool_transfer(
+                transfer, for_write=False
+            )
+            if host_pool is None or not key_strs:
+                results[transfer.name] = [False] * len(transfer.keys or [])
+                continue
+
+            success = self._transfer_by_keys(buffers, key_strs, "READ")
+            if not success:
+                results[transfer.name] = [False] * len(key_strs)
+                continue
+
+            for page_offset, data_page in zip(page_offsets, buffers):
+                host_pool.set_from_flat_data_page(page_offset, data_page)
+            results[transfer.name] = [True] * len(key_strs)
+        return results
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            _, key_strs, buffers, _ = self._prepare_pool_transfer(
+                transfer, for_write=True
+            )
+            if not key_strs:
+                results[transfer.name] = [False] * len(transfer.keys or [])
+                continue
+
+            success = self._transfer_by_keys(buffers, key_strs, "WRITE")
+            results[transfer.name] = [True] * len(key_strs) if success else [False] * len(
+                key_strs
+            )
+        return results
