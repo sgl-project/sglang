@@ -62,7 +62,6 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         else:
-            # Spec v2 buffer shapes follow the first draft input we see.
             self.buf_initialized = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -111,6 +110,10 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            # FIXME: redundant. `indices` = batch.req_pool_indices, pinned via
+            # record_batch_in_overlap's attr_snapshot for 2 iters; refcount > 0
+            # across forward's read, allocator can't reclaim. Safe to remove.
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
