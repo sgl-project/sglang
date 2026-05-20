@@ -67,12 +67,10 @@ class CanaryConfig:
 
         real_kv_raw = (server_args.kv_canary_real_data or "").strip().upper()
 
-        sweep_interval = int(server_args.kv_canary_sweep_interval or 0)
-
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
-            sweep_interval=sweep_interval,
+            sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             input_check_mode=envs.SGLANG_KV_CANARY_INPUT_CHECK.get(),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
