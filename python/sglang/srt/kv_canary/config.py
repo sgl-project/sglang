@@ -59,13 +59,13 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
-        mode_raw = (server_args.kv_canary or "").strip().lower()
+        mode_raw = server_args.kv_canary.strip().lower()
         if mode_raw not in ("off", "log", "raise"):
             raise ValueError(
                 f"kv-canary: kv_canary must be one of off/log/raise, got {mode_raw!r}"
             )
 
-        real_kv_raw = (server_args.kv_canary_real_data or "").strip().upper()
+        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
 
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
