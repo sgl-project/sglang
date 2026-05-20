@@ -1068,9 +1068,7 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            extend_kv_indices = pool.translate_loc_from_full_to_swa(
-                extend_kv_indices
-            )
+            extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
