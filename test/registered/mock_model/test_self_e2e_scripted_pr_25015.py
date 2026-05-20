@@ -38,13 +38,18 @@ def _spec_eagle_server_args() -> List[str]:
         "raise",
         "--speculative-algorithm",
         "EAGLE",
-        # Cap canary's per-forward verify capacity below the 1M cuda-grid-safe
-        # ceiling: default cuda_graph_max_bs=256 * req_to_token_cols=40968 blows
-        # past install_canary()'s capacity guard, so shrink both to fit.
+        # Cap canary's per-forward + sweep capacities below the 1M
+        # cuda-grid-safe ceiling enforced by install_canary():
+        #   per-forward: cuda_graph_max_bs * req_to_token_cols
+        #   sweep:       max_total_num_tokens
+        # EAGLE defaults blow past both with 256 * 40968 = 10.4M and KV-pool
+        # auto-sized to ~32M slots. Pin them small.
         "--cuda-graph-max-bs",
         "8",
         "--context-length",
         "2048",
+        "--max-total-tokens",
+        "16384",
     ]
 
 
