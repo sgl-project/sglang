@@ -231,25 +231,38 @@ def make_forward_batch(
     *,
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    seq_lens_sum: Optional[int] = None,
     extend_prefix_lens: Optional[torch.Tensor] = None,
+    extend_prefix_lens_cpu: Optional[list] = None,
     extend_seq_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens_cpu: Optional[list] = None,
     is_extend: bool = False,
+    is_target_verify: bool = False,
     is_draft_extend_v2: bool = False,
+    spec_info: Optional[object] = None,
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
 ) -> SimpleNamespace:
+    is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
     mode = SimpleNamespace(
         is_extend=lambda include_draft_extend_v2=False: is_extend
         or (include_draft_extend_v2 and is_draft_extend_v2),
         is_mixed=lambda: False,
+        is_decode_or_idle=lambda: is_decode_or_idle,
+        is_target_verify=lambda: is_target_verify,
+        is_draft_extend_v2=lambda: is_draft_extend_v2,
     )
     return SimpleNamespace(
         forward_mode=mode,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
+        seq_lens_sum=seq_lens_sum,
         extend_prefix_lens=extend_prefix_lens,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        spec_info=spec_info,
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,

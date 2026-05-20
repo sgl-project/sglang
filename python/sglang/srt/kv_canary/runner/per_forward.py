@@ -195,21 +195,30 @@ class PerForwardOrchestrator:
 
 def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
     """Host-side sum of per-req prefix lens, matching the prefix_lens computed by
-    fill_plan_input_per_forward: extend → sum(extend_prefix_lens_cpu); decode → seq_lens_sum - bs.
-    The scheduler always populates these CPU mirrors, so this never triggers a D2H sync.
+    fill_plan_input_per_forward. Dispatches per forward_mode for the same reason as the device
+    builder (see plan_input.py:fill_plan_input_per_forward comment). The scheduler always
+    populates the CPU mirrors used here, so this never triggers a D2H sync.
     """
     forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend(
-        include_draft_extend_v2=True
-    ):
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        if extend_prefix_lens_cpu is None:
+    if forward_mode is None or forward_mode.is_decode_or_idle():
+        return int(forward_batch.seq_lens_sum) - bs
+    if forward_mode.is_target_verify():
+        return int(forward_batch.seq_lens_sum)
+    if forward_mode.is_draft_extend_v2():
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None:
             raise RuntimeError(
-                "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
-                "scheduler should populate it before forward"
+                "kv-canary: DRAFT_EXTEND_V2 forward_batch is missing extend_seq_lens_cpu; "
+                "scheduler / draft cuda-graph runner should populate it before forward"
             )
-        return int(sum(extend_prefix_lens_cpu[:bs]))
-    return int(forward_batch.seq_lens_sum) - bs
+        return int(forward_batch.seq_lens_sum) - int(sum(extend_seq_lens_cpu[:bs]))
+    extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+    if extend_prefix_lens_cpu is None:
+        raise RuntimeError(
+            "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
+            "scheduler should populate it before forward"
+        )
+    return int(sum(extend_prefix_lens_cpu[:bs]))
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
