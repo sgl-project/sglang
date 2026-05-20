@@ -293,12 +293,11 @@ class TestSelfUnitRunner(CustomTestCase):
 
 
 class TestComputeLaunchCapacities(CustomTestCase):
-    def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self):
-        from sglang.srt.kv_canary.api import _compute_launch_capacities
-
-        max_bs = 8
-        max_seq_len = 64
-        model_runner = SimpleNamespace(
+    @staticmethod
+    def _make_model_runner(*, max_bs, max_seq_len, max_total_num_tokens=None):
+        if max_total_num_tokens is None:
+            max_total_num_tokens = max_bs * max_seq_len
+        return SimpleNamespace(
             server_args=SimpleNamespace(
                 cuda_graph_max_bs=max_bs,
                 speculative_num_draft_tokens=0,
@@ -309,14 +308,49 @@ class TestComputeLaunchCapacities(CustomTestCase):
                 size=max_bs,
                 req_to_token=torch.zeros(max_bs, max_seq_len, dtype=torch.int32),
             ),
-            max_total_num_tokens=max_bs * max_seq_len,
+            max_total_num_tokens=max_total_num_tokens,
         )
+
+    def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self):
+        from sglang.srt.kv_canary.api import _compute_launch_capacities
+
+        max_bs = 8
+        max_seq_len = 64
+        model_runner = self._make_model_runner(max_bs=max_bs, max_seq_len=max_seq_len)
         capacities = _compute_launch_capacities(model_runner=model_runner)
         # Old buggy sizing was max_seq_len (= 64); new sizing must fit the full table extent so a
         # multi-req batch with sum(prefix_lens) up to max_bs * max_seq_len never OOBs.
         self.assertGreaterEqual(
             capacities.per_forward_verify_capacity, max_bs * max_seq_len
         )
+
+    def test_per_forward_install_throws_when_upper_exceeds_safe_ceiling(self):
+        from sglang.srt.kv_canary import api as api_module
+
+        # Pick dims so max_bs * max_seq_len > the safe ceiling but pool stays under it.
+        ceiling = api_module._MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY
+        max_bs = 2
+        max_seq_len = ceiling  # upper = 2 * ceiling > ceiling
+        model_runner = self._make_model_runner(
+            max_bs=max_bs, max_seq_len=max_seq_len, max_total_num_tokens=ceiling
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "per-forward verify capacity .* exceeds the cuda-grid-safe ceiling"
+        ):
+            api_module._compute_launch_capacities(model_runner=model_runner)
+
+    def test_sweep_install_throws_when_pool_exceeds_safe_ceiling(self):
+        from sglang.srt.kv_canary import api as api_module
+
+        ceiling = api_module._MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY
+        # Per-forward stays safe (max_bs * max_seq_len = 8 < ceiling), but pool is bigger.
+        model_runner = self._make_model_runner(
+            max_bs=2, max_seq_len=4, max_total_num_tokens=ceiling + 1
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "sweep verify capacity .* exceeds the cuda-grid-safe ceiling"
+        ):
+            api_module._compute_launch_capacities(model_runner=model_runner)
 
 
 if __name__ == "__main__":

@@ -147,21 +147,42 @@ def _compute_launch_capacities(
     # Per-forward verify entries = sum_r (prefix_lens[r] - SWA_window_start[r]); the FULL group
     # never clips with a window, so the upper bound is sum_r prefix_lens[r]. Under radix prefix
     # sharing reqs can collectively reference more tokens than the pool holds, so the hard bound
-    # is the req_to_token table size (max_bs rows * max_seq_len_per_req cols), capped by the
-    # cuda-grid-safe ceiling. PerForwardOrchestrator.before_forward asserts the per-step actual
-    # sum stays within this capacity.
+    # is the req_to_token table extent (max_bs rows * max_seq_len_per_req cols). Throw at install
+    # when the safe ceiling is exceeded — refuse to silently shrink the buffer and let runtime
+    # decide whether the canary actually has enough room.
     per_forward_verify_capacity_upper = max_bs * max_seq_len_per_req
+    if per_forward_verify_capacity_upper > _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY:
+        raise RuntimeError(
+            f"kv-canary: per-forward verify capacity "
+            f"{per_forward_verify_capacity_upper} (= max_bs {max_bs} * max_seq_len_per_req "
+            f"{max_seq_len_per_req}) exceeds the cuda-grid-safe ceiling "
+            f"{_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY}. To enable canary, choose one: "
+            f"(a) lower --cuda-graph-max-bs / --max-running-requests so max_bs drops below "
+            f"{_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY // max_seq_len_per_req + 1}; "
+            f"(b) lower the per-req sequence cap (req_to_token cols, currently "
+            f"{max_seq_len_per_req}) so max_seq_len_per_req drops below "
+            f"{_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY // max_bs + 1}; "
+            f"(c) raise _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY in "
+            f"python/sglang/srt/kv_canary/api.py if the extra device memory is acceptable."
+        )
+
+    if pool_slot_count > _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY:
+        raise RuntimeError(
+            f"kv-canary: sweep verify capacity {pool_slot_count} "
+            f"(= max_total_num_tokens) exceeds the cuda-grid-safe ceiling "
+            f"{_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY}. To enable canary, choose one: "
+            f"(a) reduce the KV pool size (--mem-fraction-static, --max-total-tokens, or shrink "
+            f"the model footprint) so max_total_num_tokens drops below "
+            f"{_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY}; "
+            f"(b) raise _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY in "
+            f"python/sglang/srt/kv_canary/api.py if the extra device memory is acceptable."
+        )
 
     return CanaryLaunchCapacities(
-        per_forward_verify_capacity=max(
-            1,
-            min(per_forward_verify_capacity_upper, _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY),
-        ),
+        per_forward_verify_capacity=max(1, per_forward_verify_capacity_upper),
         per_forward_write_req_capacity=max(1, max_bs),
         per_forward_write_entry_capacity=write_entry_capacity,
-        sweep_verify_capacity=max(
-            1, min(pool_slot_count, _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)
-        ),
+        sweep_verify_capacity=max(1, pool_slot_count),
     )
 
 
