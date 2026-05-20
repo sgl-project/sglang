@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y libssl-dev pkg-config \
 WORKDIR /build
 
 # Copy just the sgl-router crate (context is the repo root)
-COPY sgl-router /build/sgl-router
+COPY experimental/sgl-router /build/experimental/sgl-router
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cd experimental/sgl-router \
+    --mount=type=cache,target=/build/experimental/sgl-router/target \
+    cd /build/experimental/sgl-router \
     && cargo build --release --bin sgl-router \
     && cp target/release/sgl-router /usr/local/bin/sgl-router
 
