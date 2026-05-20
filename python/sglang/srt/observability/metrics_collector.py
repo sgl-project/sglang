@@ -1342,6 +1342,11 @@ class TokenizerMetricsCollector:
             documentation="Number of generation tokens processed.",
             labelnames=labels.keys(),
         )
+        self.spec_verify_calls_total = Counter(
+            name="sglang:spec_verify_calls_total",
+            documentation="Number of speculative decoding verification calls.",
+            labelnames=labels.keys(),
+        )
 
         default_bucket_prompt_tokens = [
             100,
@@ -1542,9 +1547,12 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
+        spec_verify_ct: int = 0,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+        if spec_verify_ct > 0:
+            self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:

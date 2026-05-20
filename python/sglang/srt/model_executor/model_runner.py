@@ -110,7 +110,7 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -246,7 +246,8 @@ MLA_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "tokenspeed_mla",
     "ascend",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "intel_xpu",
 ]
 
@@ -2422,10 +2423,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens, self.is_draft_worker
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -3061,7 +3066,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
         # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -3237,7 +3242,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
-            and not is_nsa_enable_prefill_cp()
+            and not is_dsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
