@@ -9,7 +9,7 @@ run-name: >-
 
 on:
   schedule:
-    - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
+    - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
     branches: [main]
   workflow_dispatch:
