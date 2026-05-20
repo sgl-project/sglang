@@ -149,3 +149,10 @@ def _make_extras(
         prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int32, device=_DEVICE)
     num_valid = torch.tensor([n], dtype=torch.int32, device=_DEVICE)
     return slots, pos, prevs, num_valid
+
+
+def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
+        torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
+    )
