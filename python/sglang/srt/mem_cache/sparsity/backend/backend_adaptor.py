@@ -46,7 +46,7 @@ class BackendAdaptor(ABC):
         pass
 
 
-class NSABackendAdaptor(BackendAdaptor):
+class DSABackendAdaptor(BackendAdaptor):
     """Adaptor for DSA (DeepSeek Sparse Attention) backend."""
 
     def __init__(

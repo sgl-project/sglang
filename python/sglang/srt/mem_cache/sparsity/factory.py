@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlg
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
-    NSABackendAdaptor,
+    DSABackendAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
@@ -50,7 +50,7 @@ def _create_backend_adaptor(
 ):
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekDSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+        return DSABackendAdaptor(device, req_to_token_pool)
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device)
