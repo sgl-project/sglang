@@ -5,20 +5,16 @@ from typing import Optional
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
-    RealKvHashMode,
     VerifyPlan,
     canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
-from sglang.jit_kernel.kv_canary.write import (
-    CanaryPseudoMode,
-    WritePlan,
-    canary_write_step,
-)
+from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
@@ -61,7 +57,7 @@ def _run_verify_both(
         slot_run_counter=cuda_log.slot_run_counter,
         kernel_run_counter=cuda_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     canary_verify_step_torch_reference(
         canary_buf=ref_buf,
@@ -72,7 +68,7 @@ def _run_verify_both(
         slot_run_counter=ref_log.slot_run_counter,
         kernel_run_counter=ref_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 
@@ -97,7 +93,7 @@ def _run_write_both(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tok,
         pseudo_expected_positions=pseudo_pos,
         violation_ring=cuda_log.ring,
@@ -105,7 +101,7 @@ def _run_write_both(
         slot_run_counter=cuda_log.slot_run_counter,
         kernel_run_counter=cuda_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     canary_write_step_torch_reference(
         canary_buf=ref_buf,
@@ -114,7 +110,7 @@ def _run_write_both(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=pseudo_tok,
         pseudo_expected_positions=pseudo_pos,
         violation_ring=ref_log.ring,
@@ -122,7 +118,7 @@ def _run_write_both(
         slot_run_counter=ref_log.slot_run_counter,
         kernel_run_counter=ref_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 
@@ -489,7 +485,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
             slot_run_counter=cuda_log.slot_run_counter,
             kernel_run_counter=cuda_log.kernel_run_counter,
             real_kv_sources=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     torch.cuda.synchronize()

@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    _MAX_REAL_KV_SOURCES,
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     _assert_contiguous,
     _build_real_kv_source_abi,
@@ -18,20 +16,6 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-
-class CanaryPseudoMode(IntEnum):
-    """Toggle for caller-driven (token, position) expectation checks in canary_write_step.
-
-    The kernel itself knows no oracle. When ON, the caller supplies pseudo_expected_tokens /
-    pseudo_expected_positions tensors (computed by whatever oracle the caller chose) and the kernel
-    compares actuals against them per chain step; mismatch → violation, chain still advances on actuals.
-
-    Mirrored in C++ as kCanaryPseudoMode*; value parity enforced by test_const_sync.py.
-    """
-
-    OFF = 0  # No comparison; pseudo_expected_* tensors ignored (may be unallocated / cuda-graph dummies).
-    ON = 1  # Compare fb_input_ids[i] / fb_positions[i] vs pseudo_expected_tokens[i] / pseudo_expected_positions[i].
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -93,14 +77,6 @@ class WritePlan:
         self.write_num_valid_reqs.zero_()
 
 
-# Write-launch fail-reason bits. Distinct from the verify-launch bits in
-# kv_canary.verify (CHAIN_HASH=1<<0, POSITION=1<<1, REAL_KV_HASH=1<<2) because
-# both launches share the same violation ring; a single bit must unambiguously
-# identify the failing field across kernel kinds.
-_FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH: int = 1 << 3
-_FAIL_REASON_BIT_WRITE_POSITION_MISMATCH: int = 1 << 4
-
-
 def canary_write_step(
     *,
     canary_buf: torch.Tensor,
@@ -109,7 +85,7 @@ def canary_write_step(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
     violation_ring: torch.Tensor,
@@ -117,7 +93,7 @@ def canary_write_step(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     """Write canary fingerprints into one canary buffer per a WritePlan.
 
@@ -219,9 +195,9 @@ def canary_write_step(
     :func:`sglang.jit_kernel.kv_canary.write_ref.canary_write_step_torch_reference`; CUDA must match
     byte-for-byte.
     """
-    if len(real_kv_sources) > _MAX_REAL_KV_SOURCES:
+    if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
-            f"kv-canary: at most {_MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
+            f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
 

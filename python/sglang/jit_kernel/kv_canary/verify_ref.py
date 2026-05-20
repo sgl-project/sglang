@@ -2,26 +2,9 @@ from __future__ import annotations
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    _FAIL_REASON_BIT_CHAIN_HASH,
-    _FAIL_REASON_BIT_POSITION,
-    _FAIL_REASON_BIT_REAL_KV_HASH,
-    _FIELD_POSITION,
-    _FIELD_PREV_HASH,
-    _FIELD_REAL_KV_HASH,
-    _FIELD_TOKEN,
-    _VIOLATION_FIELD_EXPECTED_AUX,
-    _VIOLATION_FIELD_EXPECTED_TOKEN,
-    _VIOLATION_FIELD_FAIL_REASON_BITS,
-    _VIOLATION_FIELD_KERNEL_KIND,
-    _VIOLATION_FIELD_POSITION,
-    _VIOLATION_FIELD_SLOT_IDX,
-    _VIOLATION_FIELD_STORED_CHAIN_HASH,
-    _VIOLATION_FIELD_STORED_TOKEN,
-    CANARY_CHAIN_ANCHOR,
-    VIOLATION_FIELDS,
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     VerifyPlan,
 )
@@ -40,7 +23,7 @@ def canary_verify_step_torch_reference(
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     work_device = torch.device("cpu")
 
@@ -89,7 +72,7 @@ def canary_verify_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    chain_anchor_signed = _to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    chain_anchor_signed = _to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
 
     violation_rows: list[list[int]] = []
 
@@ -98,18 +81,20 @@ def canary_verify_step_torch_reference(
         expected_position = expected_positions_list[k]
         prev_slot = prev_slot_indices_list[k]
 
-        stored_token = int(buf_i64[slot_idx, _FIELD_TOKEN].item())
-        stored_position = int(buf_i64[slot_idx, _FIELD_POSITION].item())
-        stored_chain_hash = int(buf_i64[slot_idx, _FIELD_PREV_HASH].item())
-        stored_real_kv_hash = int(buf_i64[slot_idx, _FIELD_REAL_KV_HASH].item())
+        stored_token = int(buf_i64[slot_idx, consts.CANARY_FIELD_TOKEN].item())
+        stored_position = int(buf_i64[slot_idx, consts.CANARY_FIELD_POSITION].item())
+        stored_chain_hash = int(buf_i64[slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
+        stored_real_kv_hash = int(
+            buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
+        )
 
         if prev_slot < 0:
             expected_chain_hash = chain_anchor_signed
         else:
-            prev_ph = int(buf_i64[prev_slot, _FIELD_PREV_HASH].item())
-            prev_tok = int(buf_i64[prev_slot, _FIELD_TOKEN].item())
-            prev_pos = int(buf_i64[prev_slot, _FIELD_POSITION].item())
-            prev_rkv = int(buf_i64[prev_slot, _FIELD_REAL_KV_HASH].item())
+            prev_ph = int(buf_i64[prev_slot, consts.CANARY_FIELD_PREV_HASH].item())
+            prev_tok = int(buf_i64[prev_slot, consts.CANARY_FIELD_TOKEN].item())
+            prev_pos = int(buf_i64[prev_slot, consts.CANARY_FIELD_POSITION].item())
+            prev_rkv = int(buf_i64[prev_slot, consts.CANARY_FIELD_REAL_KV_HASH].item())
             combined = (
                 (prev_ph & _U64_MASK)
                 ^ (prev_tok & _U64_MASK)
@@ -128,22 +113,22 @@ def canary_verify_step_torch_reference(
 
         fail_reason = 0
         if stored_chain_hash != expected_chain_hash:
-            fail_reason |= _FAIL_REASON_BIT_CHAIN_HASH
+            fail_reason |= consts.FAIL_REASON_CHAIN_HASH
         if stored_position != expected_position:
-            fail_reason |= _FAIL_REASON_BIT_POSITION
+            fail_reason |= consts.FAIL_REASON_POSITION
         if stored_real_kv_hash != expected_real_kv_hash:
-            fail_reason |= _FAIL_REASON_BIT_REAL_KV_HASH
+            fail_reason |= consts.FAIL_REASON_REAL_KV_HASH
 
         if fail_reason != 0:
-            row = [0] * VIOLATION_FIELDS
-            row[_VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
-            row[_VIOLATION_FIELD_SLOT_IDX] = slot_idx
-            row[_VIOLATION_FIELD_POSITION] = stored_position
-            row[_VIOLATION_FIELD_STORED_TOKEN] = stored_token
-            row[_VIOLATION_FIELD_EXPECTED_TOKEN] = 0
-            row[_VIOLATION_FIELD_STORED_CHAIN_HASH] = stored_chain_hash
-            row[_VIOLATION_FIELD_EXPECTED_AUX] = expected_chain_hash
-            row[_VIOLATION_FIELD_FAIL_REASON_BITS] = fail_reason
+            row = [0] * consts.VIOLATION_FIELDS
+            row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
+            row[consts.VIOLATION_FIELD_SLOT_IDX] = slot_idx
+            row[consts.VIOLATION_FIELD_POSITION] = stored_position
+            row[consts.VIOLATION_FIELD_STORED_TOKEN] = stored_token
+            row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = 0
+            row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = stored_chain_hash
+            row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_chain_hash
+            row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = fail_reason
             violation_rows.append(row)
 
     if len(violation_rows) == 0:
@@ -155,9 +140,11 @@ def canary_verify_step_torch_reference(
     )
     ring_capacity = int(violation_ring.shape[0])
 
-    new_rows = torch.zeros((num_new_violations, VIOLATION_FIELDS), dtype=torch.int64)
+    new_rows = torch.zeros(
+        (num_new_violations, consts.VIOLATION_FIELDS), dtype=torch.int64
+    )
     for v, row in enumerate(violation_rows):
-        for f in range(VIOLATION_FIELDS):
+        for f in range(consts.VIOLATION_FIELDS):
             new_rows[v, f] = row[f]
 
     write_count_in_ring = max(0, min(num_new_violations, ring_capacity - base_idx))
@@ -189,7 +176,7 @@ def _compute_real_kv_hash_scalar(
     *,
     slot_idx: int,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     work_device: torch.device,
 ) -> int:
     """Compute one uint64 real-KV fingerprint for a single slot index.
@@ -200,7 +187,7 @@ def _compute_real_kv_hash_scalar(
     splitmix64(acc ^ source_hash). When read_bytes <= 16, PARTIAL and ALL produce identical hashes.
     """
     mode = int(real_kv_hash_mode)
-    if mode == int(RealKvHashMode.OFF) or len(real_kv_sources) == 0:
+    if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
         return 0
 
     acc: int = 0
@@ -221,7 +208,9 @@ def _compute_real_kv_hash_scalar(
         col_start = col_within_page * num_bytes_per_token
 
         effective_read_bytes = (
-            min(16, read_bytes) if mode == int(RealKvHashMode.PARTIAL) else read_bytes
+            min(16, read_bytes)
+            if mode == int(consts.RealKvHashMode.PARTIAL)
+            else read_bytes
         )
         raw_bytes: list[int] = []
         for b in range(effective_read_bytes):
@@ -291,13 +280,13 @@ def _compute_real_kv_hash_vec(
     *,
     slot_indices: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     work_device: torch.device,
 ) -> torch.Tensor:
     num_entries = int(slot_indices.shape[0])
     acc = torch.zeros(num_entries, dtype=torch.int64, device=work_device)
     mode = int(real_kv_hash_mode)
-    if mode == int(RealKvHashMode.OFF) or len(real_kv_sources) == 0:
+    if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
         return acc
 
     for k in range(num_entries):

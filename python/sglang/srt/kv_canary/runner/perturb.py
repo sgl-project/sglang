@@ -8,6 +8,7 @@ import torch
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
 from sglang.srt.kv_canary.runner.perturb_config import PerturbConfig
+from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -24,18 +25,47 @@ class PerturbHook:
         config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
+        pump_and_allreduce: PumpAndAllreduce,
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
+        self._pump_and_allreduce = pump_and_allreduce
         self._radix_cache: Optional["BasePrefixCache"] = None
         self._perturb_undo: Optional[tuple[int, int, int]] = None
+        self._warmup_disable_logged: bool = False
+        self._warmup_enable_logged: bool = False
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
+    def _is_in_warmup(self) -> bool:
+        """Return True if the perturb hook should skip this step because the canary is still
+        inside the configured warmup window. Emits the disable/enable transition logs exactly
+        once across the lifetime of the hook (idempotent under multiple per-step calls).
+        """
+        step = self._pump_and_allreduce.step_counter
+        warmup_steps = self._config.warmup_steps
+        if step < warmup_steps:
+            if not self._warmup_disable_logged:
+                logger.info(
+                    "kv_canary perturb: disabled during warmup window "
+                    "(first %d forward steps)",
+                    warmup_steps,
+                )
+                self._warmup_disable_logged = True
+            return True
+        if not self._warmup_enable_logged:
+            logger.info(
+                "kv_canary perturb: enabled after warmup window at step=%d", step
+            )
+            self._warmup_enable_logged = True
+        return False
+
     def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.req_to_token_prob <= 0.0:
+            return
+        if self._is_in_warmup():
             return
         table = self._req_to_token_pool.req_to_token
         if not isinstance(table, torch.Tensor) or table.numel() == 0:
@@ -92,6 +122,8 @@ class PerturbHook:
 
     def perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.real_kv_prob <= 0.0:
+            return
+        if self._is_in_warmup():
             return
         if forward_batch is None:
             return

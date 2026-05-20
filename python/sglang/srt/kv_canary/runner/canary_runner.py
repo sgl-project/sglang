@@ -43,16 +43,18 @@ class CanaryLaunchCapacities:
         per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
             launches. Sized to the total verify entries the per-forward path may produce in one
             step (= sum_r prefix_lens[r] for the FULL group), upper-bounded by max_bs *
-            max_seq_len_per_req (the req_to_token table extent) and capped by the cuda grid safe
-            ceiling. PerForwardOrchestrator.before_forward asserts the per-step actual sum stays
-            within this capacity, so an undersized capacity fails fast instead of OOB-reading the
-            tail threads of the verify kernel grid.
+            max_seq_len_per_req (the req_to_token table extent). install_canary refuses to silently
+            cap this value: if the upper exceeds _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY it raises with
+            an actionable knob list. PerForwardOrchestrator.before_forward additionally throws on
+            the per-step actual sum so an undersized capacity fails fast instead of OOB-reading
+            the tail threads of the verify kernel grid.
         per_forward_write_req_capacity: WritePlan row capacity for per-forward writes, also used
             to size the static fb_* PlanInput buffers (= max batch size under cuda graph).
         per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,
             one entry per token written in a single forward.
         sweep_verify_capacity: VerifyPlan row capacity for the radix sweep launch, sized to the
-            pool slot count bounded by the cuda grid safe upper limit.
+            pool slot count. install_canary throws when this exceeds
+            _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY for the same reason as per-forward.
     """
 
     per_forward_verify_capacity: int
@@ -140,6 +142,7 @@ class CanaryRunner:
             config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
+            pump_and_allreduce=self._pump_and_allreduce,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     VerifyPlan,
 )
@@ -48,13 +48,17 @@ class VerifyFuzzInputs:
     kernel_kind: CanaryLaunchTag
     real_kv_sources_cuda: tuple[RealKvSource, ...]
     real_kv_sources_ref: tuple[RealKvSource, ...]
-    real_kv_hash_mode: RealKvHashMode
+    real_kv_hash_mode: consts.RealKvHashMode
     ring_capacity: int
 
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
     hash_mode = rng.choice(
-        [RealKvHashMode.OFF, RealKvHashMode.PARTIAL, RealKvHashMode.ALL]
+        [
+            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])
@@ -91,7 +95,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
         else:
             prev_slot_indices.append(slot_indices[i - 1])
 
-    if hash_mode == RealKvHashMode.OFF and plan_size > 0:
+    if hash_mode == consts.RealKvHashMode.OFF and plan_size > 0:
         stamp_clean_chain(
             cuda_buf=cuda_buf,
             ref_buf=ref_buf,
