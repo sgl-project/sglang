@@ -137,10 +137,21 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
+        # Slice assignment used to coerce src dtype to buf dtype implicitly;
+        # advanced index requires an explicit cast. bonus_tokens / new_seq_lens
+        # in particular differ across disagg (int64) and forward (int32) paths.
         indices = future_indices.indices
-        self.topk_p_buf[indices] = draft_input.topk_p
-        self.topk_index_buf[indices] = draft_input.topk_index
-        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens
-        self.new_seq_lens_buf[indices] = draft_input.new_seq_lens
+        self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
+        self.topk_index_buf[indices] = draft_input.topk_index.to(
+            self.topk_index_buf.dtype
+        )
+        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            self.bonus_tokens_buf.dtype
+        )
+        self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
+            self.new_seq_lens_buf.dtype
+        )
         if spec_need_hidden_states():
-            self.hidden_states_buf[indices] = draft_input.hidden_states
+            self.hidden_states_buf[indices] = draft_input.hidden_states.to(
+                self.hidden_states_buf.dtype
+            )
