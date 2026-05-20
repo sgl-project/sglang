@@ -85,6 +85,9 @@ class DecodingStage(PipelineStage):
             )
         ]
 
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        return [(self.vae, self.component_name or "vae")]
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
@@ -212,6 +215,7 @@ class DecodingStage(PipelineStage):
         """
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
+        self._apply_nvtx_gate(batch.is_warmup)
 
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         with self.use_declared_component(

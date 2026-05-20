@@ -168,6 +168,77 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         self.assertEqual(push.call_count, 1)
 
 
+class _StubStage:
+    """Pipeline-stage stand-in that exercises the shared NVTX helpers.
+
+    Importing the real ``PipelineStage`` would drag in unrelated runtime
+    dependencies (server_args, residency manager); the copies below are
+    deliberately byte-identical to the methods in ``stages/base.py``.
+    """
+
+    def __init__(self, modules, enable_flag: bool) -> None:
+        self._nvtx_hooks = None
+        self._modules = modules
+        self.server_args = type(
+            "Args", (), {"enable_layerwise_nvtx_marker": enable_flag}
+        )()
+
+    def _nvtx_hookable_modules(self):
+        return self._modules
+
+    def _maybe_register_nvtx_hooks(self):
+        if not self.server_args.enable_layerwise_nvtx_marker:
+            return
+        if self._nvtx_hooks is not None:
+            return
+        hooks = DiffusionNvtxHooks()
+        total = 0
+        for module, prefix in self._nvtx_hookable_modules():
+            if module is None:
+                continue
+            total += hooks.register_hooks(module, prefix=prefix)
+        if total == 0:
+            return
+        self._nvtx_hooks = hooks
+
+    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
+        self._maybe_register_nvtx_hooks()
+        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.set_enabled(use_nvtx)
+        return use_nvtx
+
+    def _detach_nvtx_hooks(self):
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
+
+
+class TestStageMixin(unittest.TestCase):
+    def test_disabled_flag_is_noop(self) -> None:
+        stage = _StubStage([(torch.nn.Linear(2, 2), "m")], enable_flag=False)
+        stage._maybe_register_nvtx_hooks()
+        self.assertIsNone(stage._nvtx_hooks)
+
+    def test_apply_nvtx_gate_registers_and_toggles(self) -> None:
+        stage = _StubStage([(torch.nn.Linear(2, 2), "linear")], enable_flag=True)
+        self.assertTrue(stage._apply_nvtx_gate(is_warmup=False))
+        self.assertTrue(stage._nvtx_hooks._enabled)
+        # Warmup flips the toggle but keeps hooks registered.
+        self.assertFalse(stage._apply_nvtx_gate(is_warmup=True))
+        self.assertFalse(stage._nvtx_hooks._enabled)
+
+    def test_detach_clears_state_and_allows_reregister(self) -> None:
+        stage = _StubStage([(torch.nn.Linear(2, 2), "linear")], enable_flag=True)
+        stage._maybe_register_nvtx_hooks()
+        stage._detach_nvtx_hooks()
+        self.assertIsNone(stage._nvtx_hooks)
+        # Idempotent + re-registration still works.
+        stage._detach_nvtx_hooks()
+        stage._maybe_register_nvtx_hooks()
+        self.assertIsNotNone(stage._nvtx_hooks)
+
+
 class TestCollectInputShapes(unittest.TestCase):
     def test_flat_positional_tensors(self) -> None:
         a = torch.zeros(2, 3)

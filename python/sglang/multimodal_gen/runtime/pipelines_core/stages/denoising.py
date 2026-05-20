@@ -98,10 +98,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
-    DiffusionNvtxHooks,
-    maybe_nvtx_range,
-)
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
@@ -211,11 +208,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.profiler = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
-
-        # Layerwise NVTX profiling state; hooks are attached lazily once the
-        # transformer is fully loaded, cache-dit wrapped, and torch.compile
-        # applied (see ``_maybe_register_nvtx_hooks``).
-        self._nvtx_hooks: DiffusionNvtxHooks | None = None
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
         backends = {
@@ -353,43 +345,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
-    def _maybe_register_nvtx_hooks(self) -> None:
-        """Register layerwise NVTX hooks on the transformer modules, once.
-
-        Called from ``_prepare_denoising_loop`` after the transformer is
-        loaded, cache-dit is mounted, and ``torch.compile`` has been applied,
-        so the hooks land on the final module tree. Idempotent: subsequent
-        calls are no-ops.
-
-        See ``DiffusionNvtxHooks`` for the marker format and the
-        duplicate-instance handling.
-        """
-        if not self.server_args.enable_layerwise_nvtx_marker:
-            return
-        if self._nvtx_hooks is not None:
-            return
-        self._nvtx_hooks = DiffusionNvtxHooks()
-        total = 0
-        for transformer, prefix in (
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # Registered from ``_prepare_denoising_loop`` after cache-dit and
+        # torch.compile finalize the transformer tree.
+        return [
             (self.transformer, "transformer"),
             (self.transformer_2, "transformer_2"),
-        ):
-            if transformer is None:
-                continue
-            total += self._nvtx_hooks.register_hooks(transformer, prefix=prefix)
-        if total == 0:
-            # Zero hooks while the flag is set means we reached registration
-            # before any transformer was actually loaded. Surface as a warning
-            # and clear the cached instance so the next request retries
-            # registration once a transformer becomes available, rather than
-            # latching into a permanent empty-hooks state.
-            self._nvtx_hooks = None
-            logger.warning(
-                "NVTX flag is set but no transformer modules were available "
-                "at registration time; will retry on the next request."
-            )
-        else:
-            logger.info("Registered NVTX hooks on %d transformer submodules", total)
+        ]
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -686,10 +648,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-
-        # Attach NVTX hooks after cache-dit / torch.compile have finalized the
-        # transformer tree. Idempotent across requests.
-        self._maybe_register_nvtx_hooks()
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -1129,11 +1087,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
             # Detach NVTX hooks so the next lazy-load re-registers them
-            # against the freshly loaded transformer (handles attached to the
-            # about-to-be-deleted module would otherwise go stale).
-            if self._nvtx_hooks is not None:
-                self._nvtx_hooks.remove_hooks()
-                self._nvtx_hooks = None
+            # against the freshly loaded transformer.
+            self._detach_nvtx_hooks()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1324,13 +1279,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        # NVTX markers are skipped during warmup runs to keep the captured
-        # timeline clean (warmup is dominated by compilation / autotuning).
-        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not ctx.is_warmup
-        # Mirror the gate onto the always-on module forward hooks so the
-        # per-layer NVTX ranges also stay quiet during warmup forwards.
-        if self._nvtx_hooks is not None:
-            self._nvtx_hooks.set_enabled(use_nvtx)
+        # Register layer hooks (idempotent, after cache-dit / torch.compile
+        # have finalized the transformer tree) and gate every NVTX range —
+        # including the explicit ones below — on warmup-exclusion.
+        use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with torch.autocast(
             device_type=current_platform.device_type,

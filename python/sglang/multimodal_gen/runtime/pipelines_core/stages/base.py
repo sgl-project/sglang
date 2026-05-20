@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
@@ -64,6 +65,8 @@ class PipelineStage(StageDedupMixin, ABC):
         self._component_residency_manager = None
         self._registered_stage_name: str | None = None
         self._profile_stage_name: str | None = None
+        # Layerwise NVTX hooks; registered lazily via _apply_nvtx_gate.
+        self._nvtx_hooks: DiffusionNvtxHooks | None = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -205,6 +208,60 @@ class PipelineStage(StageDedupMixin, ABC):
     ) -> list[ComponentUse]:
         """Declares component uses of current stage for unified residency scheduling."""
         return []
+
+    # ---- Layerwise NVTX instrumentation (--enable-layerwise-nvtx-marker) ----
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        """Modules to instrument with layerwise NVTX hooks; default none.
+
+        Override in stages that own forward-able components. Each entry is
+        ``(module, prefix)`` where ``prefix`` is the marker-name prefix.
+        """
+        return []
+
+    def _maybe_register_nvtx_hooks(self) -> None:
+        """Idempotently attach hooks. No-op when the flag is off or no
+        modules are available yet (retries on the next call)."""
+        if not self.server_args.enable_layerwise_nvtx_marker:
+            return
+        if self._nvtx_hooks is not None:
+            return
+        hooks = DiffusionNvtxHooks()
+        total = 0
+        for module, prefix in self._nvtx_hookable_modules():
+            if module is None:
+                continue
+            total += hooks.register_hooks(module, prefix=prefix)
+        if total == 0:
+            logger.warning(
+                "[%s] NVTX flag set but no modules available; will retry.",
+                self.__class__.__name__,
+            )
+            return
+        logger.info(
+            "[%s] Registered NVTX hooks on %d submodules",
+            self.__class__.__name__,
+            total,
+        )
+        self._nvtx_hooks = hooks
+
+    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
+        """Register (if needed) and toggle hooks for this request.
+
+        Returns the resolved ``use_nvtx`` flag for callers that gate
+        additional explicit NVTX ranges on the same condition.
+        """
+        self._maybe_register_nvtx_hooks()
+        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.set_enabled(use_nvtx)
+        return use_nvtx
+
+    def _detach_nvtx_hooks(self) -> None:
+        """Remove all hooks; call when the underlying module is about to
+        be deallocated or replaced (e.g. MPS dealloc)."""
+        if self._nvtx_hooks is not None:
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property
