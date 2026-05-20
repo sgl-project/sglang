@@ -94,6 +94,13 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 For frame interpolation and upscaling, see [Post-Processing](post_processing.md).
 
+### Request logging
+
+- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
+- `--log-requests-level {0|1|2|3}`: Verbosity level for request logging (default: `2`). 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial prompt. 3: Log all user-facing fields including full prompt.
+- `--log-requests-format {text|json}`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
+- `--log-requests-target {TARGET...}`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+
 ### Quantized transformers
 
 For quantized transformer checkpoints, prefer:
