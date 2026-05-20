@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -127,11 +126,11 @@ class PerForwardOrchestrator:
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
 
-        if self._config.input_check_mode == CanaryInputCheckMode.ON:
+        if self._config.input_check_mode:
             manager = self._token_oracle_manager
             if manager is None:
                 raise RuntimeError(
-                    "kv-canary: input_check_mode=ON requires a TokenOracleManager; call "
+                    "kv-canary: input_check_mode=True requires a TokenOracleManager; call "
                     "CanaryRunner.attach_token_oracle_manager(manager) where manager is "
                     "the return value of install_oracle_sampler(oracle=...)"
                 )

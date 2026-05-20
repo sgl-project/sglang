@@ -247,9 +247,9 @@ def _run_both_write(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
@@ -264,9 +264,9 @@ def _run_both_write(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         violation_ring=cuda_log.ring,
         violation_write_index=cuda_log.write_index,
         slot_run_counter=cuda_log.slot_run_counter,
@@ -281,9 +281,9 @@ def _run_both_write(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         violation_ring=ref_log.ring,
         violation_write_index=ref_log.write_index,
         slot_run_counter=ref_log.slot_run_counter,
@@ -303,9 +303,9 @@ def _run_both_and_assert_write_buf_and_state_equal(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
     real_kv_sources_cuda: tuple[RealKvSource, ...],
@@ -321,9 +321,9 @@ def _run_both_and_assert_write_buf_and_state_equal(
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=real_kv_sources_cuda,
@@ -405,8 +405,8 @@ def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
                 "fb_input_ids",
                 "fb_positions",
                 "fb_out_cache_loc",
-                "pseudo_expected_tokens",
-                "pseudo_expected_positions",
+                "expected_input_tokens",
+                "expected_input_positions",
             ):
                 t = fields.get(name)
                 if (
@@ -442,11 +442,11 @@ def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
         if isinstance(srcs, tuple) and len(srcs) > 1:
             yield from emit("sources_to_one", real_kv_sources=srcs[:1])
 
-    if "pseudo_mode" in fields:
-        cur = fields["pseudo_mode"]
+    if "enable_write_verify_inputs" in fields:
+        cur = fields["enable_write_verify_inputs"]
         if hasattr(cur, "value") and int(cur) != 0:
             cls = cur.__class__
-            yield from emit("pseudo_off", pseudo_mode=cls(0))
+            yield from emit("pseudo_off", enable_write_verify_inputs=cls(0))
 
     for name in ("verify_capacity", "write_req_capacity"):
         if name in fields and isinstance(fields[name], int):

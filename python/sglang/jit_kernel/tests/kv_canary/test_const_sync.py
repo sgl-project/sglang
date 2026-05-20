@@ -53,7 +53,7 @@ def test_int_consts_sync() -> None:
 
 def test_enums_sync() -> None:
     cuh = _CONSTS_CUH.read_text(encoding="utf-8")
-    for enum_name in ("RealKvHashMode", "CanaryPseudoMode", "FailReason"):
+    for enum_name in ("RealKvHashMode", "FailReason"):
         cpp_members = _parse_enum_class(cuh, enum_name)
         py_enum = getattr(consts, enum_name)
         cpp_normalized = {

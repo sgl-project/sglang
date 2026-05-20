@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY: int = 1_000_000
+_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY: int = 4_000_000
 
 
 def install_canary(

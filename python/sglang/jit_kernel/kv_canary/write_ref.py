@@ -24,9 +24,9 @@ def canary_write_step_torch_reference(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -73,11 +73,11 @@ def canary_write_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    pseudo_mode_on = int(pseudo_mode) != int(consts.CanaryPseudoMode.OFF)
-    pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(
+    enable_write_verify_inputs = int(enable_write_verify_inputs) != int(False)
+    expected_input_tokens_host = expected_input_tokens.detach().to(
         device=work_device, dtype=torch.int64
     )
-    pseudo_expected_positions_host = pseudo_expected_positions.detach().to(
+    expected_input_positions_host = expected_input_positions.detach().to(
         device=work_device, dtype=torch.int64
     )
 
@@ -109,10 +109,10 @@ def canary_write_step_torch_reference(
                 work_device=work_device,
             )
 
-            if pseudo_mode_on:
+            if enable_write_verify_inputs:
                 mismatch_bits = consts.FailReason(0)
-                expected_token = int(pseudo_expected_tokens_host[fb_idx].item())
-                expected_position = int(pseudo_expected_positions_host[fb_idx].item())
+                expected_token = int(expected_input_tokens_host[fb_idx].item())
+                expected_position = int(expected_input_positions_host[fb_idx].item())
                 if token != expected_token:
                     mismatch_bits |= consts.FailReason.WRITE_TOKEN_MISMATCH
                 if position != expected_position:

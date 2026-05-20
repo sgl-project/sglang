@@ -58,9 +58,9 @@ def _run_pipeline(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: consts.RealKvHashMode,
     verify_capacity: int,
@@ -91,9 +91,9 @@ def _run_pipeline(
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         violation_ring=log.ring,
         violation_write_index=log.write_index,
         slot_run_counter=log.slot_run_counter,
@@ -132,9 +132,9 @@ def _run_both_and_assert_pipeline_equal(
     swa_window_size: int = 0,
     full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-    pseudo_mode: consts.CanaryPseudoMode = consts.CanaryPseudoMode.OFF,
-    pseudo_expected_tokens: Optional[torch.Tensor] = None,
-    pseudo_expected_positions: Optional[torch.Tensor] = None,
+    enable_write_verify_inputs: bool = False,
+    expected_input_tokens: Optional[torch.Tensor] = None,
+    expected_input_positions: Optional[torch.Tensor] = None,
     real_kv_sources_real: tuple[RealKvSource, ...] = (),
     real_kv_sources_ref: tuple[RealKvSource, ...] = (),
     real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
@@ -153,12 +153,12 @@ def _run_both_and_assert_pipeline_equal(
     WritePlan,
 ]:
     total_tokens = int(fb_input_ids.shape[0])
-    if pseudo_expected_tokens is None:
-        pseudo_expected_tokens = torch.zeros(
+    if expected_input_tokens is None:
+        expected_input_tokens = torch.zeros(
             total_tokens, dtype=torch.int32, device=_DEVICE
         )
-    if pseudo_expected_positions is None:
-        pseudo_expected_positions = torch.zeros(
+    if expected_input_positions is None:
+        expected_input_positions = torch.zeros(
             total_tokens, dtype=torch.int32, device=_DEVICE
         )
 
@@ -179,9 +179,9 @@ def _run_both_and_assert_pipeline_equal(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         real_kv_hash_mode=real_kv_hash_mode,
         verify_capacity=verify_capacity,
         write_req_capacity=write_req_capacity,
@@ -424,7 +424,7 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None
 
 
 def test_pipeline_pseudo_mode_on_match() -> None:
-    """pseudo_mode=ON, expected==actual: zero violations, buf byte-equal."""
+    """enable_write_verify_inputs=ON, expected==actual: zero violations, buf byte-equal."""
     max_seq_len = 16
     req_to_token = make_req_to_token(
         kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
@@ -444,8 +444,8 @@ def test_pipeline_pseudo_mode_on_match() -> None:
         dtype=torch.int32,
         device=_DEVICE,
     )
-    pseudo_expected_tokens = fb_input_ids.clone()
-    pseudo_expected_positions = fb_positions.clone()
+    expected_input_tokens = fb_input_ids.clone()
+    expected_input_positions = fb_positions.clone()
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
         fb_req_pool_indices=fb_req_pool_indices,
@@ -457,9 +457,9 @@ def test_pipeline_pseudo_mode_on_match() -> None:
         req_to_token=req_to_token,
         num_slots=64,
         extras=_empty_extras(),
-        pseudo_mode=consts.CanaryPseudoMode.ON,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=True,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
     )
 
     assert int(log_real.write_index[0].item()) == 0
@@ -467,7 +467,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
 
 
 def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
-    """pseudo_mode=ON, expected tokens all wrong: write records N violations, verify does not cascade CHAIN_HASH."""
+    """enable_write_verify_inputs=ON, expected tokens all wrong: write records N violations, verify does not cascade CHAIN_HASH."""
     max_seq_len = 16
     req_to_token = make_req_to_token(
         kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
@@ -483,10 +483,10 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
         dtype=torch.int32,
         device=_DEVICE,
     )
-    pseudo_expected_tokens = torch.tensor(
+    expected_input_tokens = torch.tensor(
         [99, 99, 99], dtype=torch.int32, device=_DEVICE
     )
-    pseudo_expected_positions = fb_positions.clone()
+    expected_input_positions = fb_positions.clone()
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
         fb_req_pool_indices=fb_req_pool_indices,
@@ -498,9 +498,9 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
         req_to_token=req_to_token,
         num_slots=64,
         extras=_empty_extras(),
-        pseudo_mode=consts.CanaryPseudoMode.ON,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=True,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         ring_capacity=64,
     )
 

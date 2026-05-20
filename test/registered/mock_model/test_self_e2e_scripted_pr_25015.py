@@ -36,12 +36,10 @@ def _spec_eagle_server_args() -> List[str]:
         "raise",
         "--speculative-algorithm",
         "EAGLE",
-        # Cap canary's per-forward + sweep capacities below the 1M
-        # cuda-grid-safe ceiling enforced by install_canary():
-        #   per-forward: cuda_graph_max_bs * req_to_token_cols
-        #   sweep:       max_total_num_tokens
-        # EAGLE defaults blow past both with 256 * 40968 = 10.4M and KV-pool
-        # auto-sized to ~32M slots. Pin them small.
+        # Cap canary's per-forward + sweep capacities under the cuda-grid-safe
+        # ceiling (4M, see api.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
+        # max_bs = max(cuda_graph_max_bs, max_running_requests); both must be
+        # capped or the pool sizing blows past the ceiling.
         "--cuda-graph-max-bs",
         "8",
         "--max-running-requests",
@@ -50,13 +48,10 @@ def _spec_eagle_server_args() -> List[str]:
         "2048",
         "--max-total-tokens",
         "16384",
-        # Workaround: sglang piecewise CUDA graph hits FusedAddRMSNorm illegal
-        # memory access during warmup_compile under EAGLE + Qwen3-0.6B(1 layer).
-        # Reproduces with --kv-canary off (verified in repro test), so this is an
-        # upstream sglang piecewise bug, not a canary issue. sglang itself prints
-        # the suggested workaround in its error message. This is the ONLY canary
-        # e2e test allowed to pass --disable-piecewise-cuda-graph; the rest must
-        # exercise the in-graph canary kernel path per user-instruction b 段.
+        # sglang piecewise CUDA graph crashes on 1-layer Qwen3 with FusedAddRMSNorm
+        # IMA during warmup_compile (reproduces with --kv-canary off). Disable
+        # piecewise only; the main cuda graph is still on and still exercises the
+        # in-graph canary kernel path.
         "--disable-piecewise-cuda-graph",
     ]
 

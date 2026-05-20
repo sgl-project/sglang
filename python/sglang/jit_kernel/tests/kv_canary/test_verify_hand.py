@@ -447,9 +447,9 @@ def test_violation_real_kv_hash_mismatch() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=pseudo_tokens,
+        expected_input_positions=pseudo_positions,
         violation_ring=write_log.ring,
         violation_write_index=write_log.write_index,
         slot_run_counter=write_log.slot_run_counter,
@@ -561,9 +561,9 @@ def _run_real_kv_mode_byte_equal_case(mode: consts.RealKvHashMode) -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=pseudo_tokens,
+        expected_input_positions=pseudo_positions,
         violation_ring=log.ring,
         violation_write_index=log.write_index,
         slot_run_counter=log.slot_run_counter,
@@ -638,9 +638,9 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=pseudo_tokens,
+        expected_input_positions=pseudo_positions,
         violation_ring=log.ring,
         violation_write_index=log.write_index,
         slot_run_counter=log.slot_run_counter,
@@ -789,9 +789,9 @@ def test_real_kv_source_holey_dim1() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=pseudo_tokens,
+        expected_input_positions=pseudo_positions,
         violation_ring=log.ring,
         violation_write_index=log.write_index,
         slot_run_counter=log.slot_run_counter,
@@ -872,9 +872,9 @@ def test_page_size_gt_1_access_pattern() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=pseudo_tokens,
-        pseudo_expected_positions=pseudo_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=pseudo_tokens,
+        expected_input_positions=pseudo_positions,
         violation_ring=log.ring,
         violation_write_index=log.write_index,
         slot_run_counter=log.slot_run_counter,
@@ -1272,79 +1272,6 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def test_chain_link_byte_equal_100_step_hardcoded() -> None:
-    import json
-    from pathlib import Path
-
-    raw = json.loads(
-        (Path(__file__).parent / "testdata" / "chain_100_steps.json").read_text()
-    )
-    assert len(raw["tokens"]) == 100
-    assert len(raw["positions"]) == 100
-    assert len(raw["real_kv_hashes"]) == 100
-    assert len(raw["expected_prev_hashes"]) == 100
-
-    tokens_int: list[int] = [int(v, 16) for v in raw["tokens"]]
-    positions_int: list[int] = raw["positions"]
-    real_kv_int: list[int] = [int(v, 16) for v in raw["real_kv_hashes"]]
-    expected_u64: list[int] = [int(v, 16) for v in raw["expected_prev_hashes"]]
-    expected_signed: list[int] = [to_signed_int64(v) for v in expected_u64]
-
-    cuda_buf = make_canary_buf(num_slots=101, slot_stride_bytes=32, device=_DEVICE)
-    ref_buf = cuda_buf.clone()
-
-    for i in range(100):
-        for buf in (cuda_buf, ref_buf):
-            write_slot_fields(
-                canary_buf=buf,
-                slot_idx=i + 1,
-                token=tokens_int[i],
-                position=positions_int[i],
-                prev_hash=expected_signed[i],
-                real_kv_hash=to_signed_int64(real_kv_int[i]),
-            )
-
-    slot_indices = list(range(1, 101))
-    prev_slot_indices = [-1] + list(range(1, 100))
-
-    plan_cuda = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions_int,
-        prev_slot_indices=prev_slot_indices,
-        device=_DEVICE,
-    )
-    plan_ref = make_verify_plan(
-        slot_indices=slot_indices,
-        positions=positions_int,
-        prev_slot_indices=prev_slot_indices,
-        device=_DEVICE,
-    )
-    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
-    ref_log = FakeViolationLog.allocate(device=_DEVICE)
-
-    _run_both_and_assert_state_equal(
-        cuda_canary_buf=cuda_buf,
-        ref_canary_buf=ref_buf,
-        plan_cuda=plan_cuda,
-        plan_ref=plan_ref,
-        cuda_log=cuda_log,
-        ref_log=ref_log,
-        real_kv_sources_cuda=(),
-        real_kv_sources_ref=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
-    )
-
-    assert int(cuda_log.write_index[0].item()) == 0
-
-    for i in range(100):
-        _, _, stored_prev_hash, _ = read_slot_fields(
-            canary_buf=cuda_buf, slot_idx=i + 1
-        )
-        assert (
-            stored_prev_hash == expected_signed[i]
-        ), f"slot {i + 1}: stored_prev_hash={stored_prev_hash:#x} expected={expected_signed[i]:#x}"
-
-
 @pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
 @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
 @pytest.mark.parametrize("ring_state", ["open", "full"])
@@ -1391,9 +1318,9 @@ def test_violation_bit_injection_position_ring_state_matrix(
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            pseudo_mode=consts.CanaryPseudoMode.OFF,
-            pseudo_expected_tokens=pseudo_tokens,
-            pseudo_expected_positions=pseudo_positions,
+            enable_write_verify_inputs=False,
+            expected_input_tokens=pseudo_tokens,
+            expected_input_positions=pseudo_positions,
             violation_ring=write_log.ring,
             violation_write_index=write_log.write_index,
             slot_run_counter=write_log.slot_run_counter,

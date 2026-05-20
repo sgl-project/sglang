@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
 )
@@ -38,10 +37,10 @@ class CanaryConfig:
             redundancy) and verifies them.
         real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Uniform across head/tail/sweep launches;
             PARTIAL (first 16B, hard cap) is cheap enough to be the default.
-        input_check_mode: CanaryInputCheckMode (OFF / ON). ON = canary_write_step additionally compares
+        input_check_mode: bool. True = canary_write_step additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
-            expected_input_positions[i]; mismatch records a violation. ON is only useful when something
-            else (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
+            expected_input_positions[i]; mismatch records a violation. Only useful when something else
+            (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
@@ -54,7 +53,7 @@ class CanaryConfig:
     ring_capacity: int = 1024
     sweep_interval: int = 64
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.PARTIAL
-    input_check_mode: CanaryInputCheckMode = CanaryInputCheckMode.OFF
+    input_check_mode: bool = False
     stats_print_every_n_steps: int = 100
     allreduce_violation_signal: bool = False
 
@@ -73,11 +72,7 @@ class CanaryConfig:
                 f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
             )
 
-        input_check_mode = (
-            CanaryInputCheckMode.ON
-            if envs.SGLANG_KV_CANARY_INPUT_CHECK.get()
-            else CanaryInputCheckMode.OFF
-        )
+        input_check_mode = bool(envs.SGLANG_KV_CANARY_INPUT_CHECK.get())
 
         sweep_interval = int(server_args.kv_canary_sweep_interval or 0)
 

@@ -49,11 +49,9 @@ _X_VALS = cases_to_x_vals(
     )
 )
 
-_KERNEL_KIND_X_NAMES = ["kernel_kind_name", "pseudo_mode_name"]
+_KERNEL_KIND_X_NAMES = ["kernel_kind_name", "enable_write_verify_inputs_name"]
 _KERNEL_KIND_X_VALS = [
-    (tag.name, pseudo.name)
-    for tag in CanaryLaunchTag
-    for pseudo in consts.CanaryPseudoMode
+    (tag.name, str(enable)) for tag in CanaryLaunchTag for enable in (False, True)
 ]
 
 
@@ -70,7 +68,7 @@ def _write_num_slots(case: BenchCase) -> int:
 
 
 def _build_write_inputs(
-    case: BenchCase, *, device: torch.device, mirror_pseudo: bool = False
+    case: BenchCase, *, device: torch.device, mirror_expected_inputs: bool = False
 ) -> dict:
     total_entries = _write_entry_count(case)
     num_tokens_padded = max(1, total_entries)
@@ -133,14 +131,14 @@ def _build_write_inputs(
         full_to_swa[-1] = -1
         fb_out_cache_loc = full_to_swa[fb_out_cache_loc.to(torch.int64)].to(torch.int32)
 
-    if mirror_pseudo:
-        pseudo_expected_tokens = fb_input_ids.clone()
-        pseudo_expected_positions = fb_positions.clone()
+    if mirror_expected_inputs:
+        expected_input_tokens = fb_input_ids.clone()
+        expected_input_positions = fb_positions.clone()
     else:
-        pseudo_expected_tokens = torch.zeros(
+        expected_input_tokens = torch.zeros(
             num_tokens_padded, dtype=torch.int32, device=device
         )
-        pseudo_expected_positions = torch.zeros(
+        expected_input_positions = torch.zeros(
             num_tokens_padded, dtype=torch.int32, device=device
         )
 
@@ -161,8 +159,8 @@ def _build_write_inputs(
         fb_input_ids=fb_input_ids,
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         violation_ring=violation_ring,
         violation_write_index=violation_write_index,
         slot_run_counter=slot_run_counter,
@@ -217,9 +215,9 @@ def benchmark(
                 fb_positions=inputs["fb_positions"],
                 fb_out_cache_loc=inputs["fb_out_cache_loc"],
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                pseudo_mode=consts.CanaryPseudoMode.OFF,
-                pseudo_expected_tokens=inputs["pseudo_expected_tokens"],
-                pseudo_expected_positions=inputs["pseudo_expected_positions"],
+                enable_write_verify_inputs=False,
+                expected_input_tokens=inputs["expected_input_tokens"],
+                expected_input_positions=inputs["expected_input_positions"],
                 violation_ring=inputs["violation_ring"],
                 violation_write_index=inputs["violation_write_index"],
                 slot_run_counter=inputs["slot_run_counter"],
@@ -249,7 +247,7 @@ def benchmark(
 )
 def benchmark_kernel_kind(
     kernel_kind_name: str,
-    pseudo_mode_name: str,
+    enable_write_verify_inputs_name: str,
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
@@ -263,9 +261,10 @@ def benchmark_kernel_kind(
     )
     device = torch.device(DEFAULT_DEVICE)
 
-    pseudo_mode = consts.CanaryPseudoMode[pseudo_mode_name]
-    mirror_pseudo = pseudo_mode == consts.CanaryPseudoMode.ON
-    inputs = _build_write_inputs(case, device=device, mirror_pseudo=mirror_pseudo)
+    enable_write_verify_inputs = enable_write_verify_inputs_name == "True"
+    inputs = _build_write_inputs(
+        case, device=device, mirror_expected_inputs=enable_write_verify_inputs
+    )
     kernel_kind = CanaryLaunchTag[kernel_kind_name]
     hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
 
@@ -277,9 +276,9 @@ def benchmark_kernel_kind(
             fb_positions=inputs["fb_positions"],
             fb_out_cache_loc=inputs["fb_out_cache_loc"],
             kernel_kind=kernel_kind,
-            pseudo_mode=pseudo_mode,
-            pseudo_expected_tokens=inputs["pseudo_expected_tokens"],
-            pseudo_expected_positions=inputs["pseudo_expected_positions"],
+            enable_write_verify_inputs=enable_write_verify_inputs,
+            expected_input_tokens=inputs["expected_input_tokens"],
+            expected_input_positions=inputs["expected_input_positions"],
             violation_ring=inputs["violation_ring"],
             violation_write_index=inputs["violation_write_index"],
             slot_run_counter=inputs["slot_run_counter"],

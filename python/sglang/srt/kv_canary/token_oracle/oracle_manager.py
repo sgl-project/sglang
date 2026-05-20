@@ -58,7 +58,7 @@ class TokenOracleManager:
             raise RuntimeError(
                 "TokenOracleManager.sample: req_pool_indices not stashed; "
                 "fill_expected_inputs must be called before sampling "
-                "(input_check_mode == ON required)"
+                "(input_check_mode is True required)"
             )
 
         if int(stash.shape[0]) != int(logits.shape[0]):
