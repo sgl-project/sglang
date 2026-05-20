@@ -75,12 +75,6 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   }
 
   const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[tid]);
-  // sglang reserves KV slot 0 as the padded-output sink (free_slots starts at 1
-  // in memory_pool.py). req_to_token entries of 0 mean "unfilled position"
-  // (e.g. page-padded range beyond real tokens); skip those entries.
-  if (slot_idx == 0) {
-    return;
-  }
   const int64_t expected_position = static_cast<int64_t>(p.verify_positions[tid]);
   const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[tid]);
 
