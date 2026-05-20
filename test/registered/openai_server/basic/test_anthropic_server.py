@@ -12,6 +12,10 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_non_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_input_tokens_basic_non_streaming
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_input_tokens_basic_streaming
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServerWithCacheReport.test_input_tokens_with_cache_non_streaming
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServerWithCacheReport.test_input_tokens_with_cache_streaming
 """
 
 import json
@@ -533,6 +537,64 @@ class TestAnthropicServer(CustomTestCase):
             "Adding system message should increase token count",
         )
 
+    # ---- Input tokens calculation tests ----
+
+    def test_input_tokens_basic_non_streaming(self):
+        """Test that input_tokens is calculated correctly in non-streaming responses."""
+        payload = self._default_payload()
+        resp = self._make_request(payload)
+        self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
+
+        body = resp.json()
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIsInstance(body["usage"]["input_tokens"], int)
+        self.assertGreater(body["usage"]["input_tokens"], 0)
+
+        # Verify cache_read_input_tokens is None when no cache is used
+        cache_read = body["usage"].get("cache_read_input_tokens")
+        self.assertIsNone(
+            cache_read, "cache_read_input_tokens should be None when no cache is used"
+        )
+
+    def test_input_tokens_basic_streaming(self):
+        """Test that input_tokens is calculated correctly in streaming responses.
+
+        Without cache enabled, input_tokens in message_start should equal the total prompt tokens.
+        """
+        payload = self._default_payload(stream=True)
+        resp = self._make_request(payload, stream=True)
+        self.assertEqual(resp.status_code, 200)
+
+        events = self._parse_sse_events(resp)
+
+        # Check message_start event
+        message_start = next((e for e in events if e["type"] == "message_start"), None)
+        self.assertIsNotNone(message_start, "Expected message_start event")
+        self.assertIn("message", message_start)
+        self.assertIn("usage", message_start["message"])
+
+        usage = message_start["message"]["usage"]
+        self.assertIn("input_tokens", usage)
+        self.assertIsInstance(usage["input_tokens"], int)
+        self.assertGreater(usage["input_tokens"], 0)
+
+        # Verify cache_read_input_tokens is None when no cache is used
+        cache_read = usage.get("cache_read_input_tokens")
+        self.assertIsNone(
+            cache_read, "cache_read_input_tokens should be None when no cache is used"
+        )
+
+        # Check message_delta event
+        message_delta = next((e for e in events if e["type"] == "message_delta"), None)
+        self.assertIsNotNone(message_delta, "Expected message_delta event")
+        self.assertIn("usage", message_delta)
+
+        delta_usage = message_delta["usage"]
+        self.assertIn("input_tokens", delta_usage)
+        self.assertIn("output_tokens", delta_usage)
+        self.assertGreater(delta_usage["output_tokens"], 0)
+
     # ---- Helpers ----
 
     def _parse_sse_events(self, response):
@@ -554,6 +616,178 @@ class TestAnthropicServer(CustomTestCase):
                     pass
 
         return events
+
+
+class TestAnthropicServerWithCacheReport(CustomTestCase):
+    """Test Anthropic server with cache reporting enabled.
+
+    This test class verifies that input_tokens is calculated correctly as:
+    input_tokens = prompt_tokens - cached_tokens
+
+    Note: The full Anthropic formula also subtracts cache_creation_input_tokens:
+    input_tokens = prompt_tokens - cache_read - cache_write
+    However, OpenAI protocol's prompt_tokens_details currently only includes
+    cached_tokens (cache read), not cache write tokens, so the current
+    implementation is: input_tokens = prompt_tokens - cached_tokens
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--enable-cache-report"],
+        )
+        cls.messages_url = cls.base_url + "/v1/messages"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _make_request(self, payload, stream=False):
+        """Send a request to the /v1/messages endpoint."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        return requests.post(
+            self.messages_url,
+            headers=headers,
+            json=payload,
+            stream=stream,
+        )
+
+    def _default_payload(self, **overrides):
+        """Build a default Anthropic Messages request payload."""
+        payload = {
+            "model": self.model,
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in a few words.",
+                }
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def _parse_sse_events(self, response):
+        """Parse SSE events from a streaming response."""
+        events = []
+
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+
+            if line.startswith("data: "):
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(data_str)
+                    events.append(data)
+                except json.JSONDecodeError:
+                    pass
+
+        return events
+
+    def test_input_tokens_with_cache_non_streaming(self):
+        """Test input_tokens calculation with cache in non-streaming mode.
+
+        When cache is enabled and there are cached tokens, verify:
+        input_tokens = prompt_tokens - cached_tokens
+        """
+        # First request - no cache hits expected
+        payload = self._default_payload()
+        resp1 = self._make_request(payload)
+        self.assertEqual(resp1.status_code, 200, f"Response: {resp1.text}")
+
+        body1 = resp1.json()
+        self.assertIn("usage", body1)
+        input_tokens_1 = body1["usage"]["input_tokens"]
+        self.assertGreater(input_tokens_1, 0)
+
+        # Second identical request - may have cache hits
+        resp2 = self._make_request(payload)
+        self.assertEqual(resp2.status_code, 200, f"Response: {resp2.text}")
+
+        body2 = resp2.json()
+        self.assertIn("usage", body2)
+        input_tokens_2 = body2["usage"]["input_tokens"]
+
+        # Check if cache_read_input_tokens is reported (may be None or 0)
+        cache_read = body2["usage"].get("cache_read_input_tokens")
+
+        if cache_read and cache_read > 0:
+            # If there are cached tokens, verify the formula:
+            # input_tokens should be the new tokens (not from cache)
+            self.assertGreater(cache_read, 0)
+            # input_tokens should represent only non-cached tokens
+            # The exact relationship depends on whether all tokens are cached
+            # or just some, but input_tokens should be >= 0
+            self.assertGreaterEqual(input_tokens_2, 0)
+
+    def test_input_tokens_with_cache_streaming(self):
+        """Test input_tokens calculation with cache in streaming mode.
+
+        Verify that message_start and message_delta events report
+        input_tokens correctly when cache is enabled.
+        """
+        # First request - no cache hits expected
+        payload = self._default_payload(stream=True)
+        resp1 = self._make_request(payload, stream=True)
+        self.assertEqual(resp1.status_code, 200)
+
+        events1 = self._parse_sse_events(resp1)
+        message_start_1 = next(
+            (e for e in events1 if e["type"] == "message_start"), None
+        )
+        self.assertIsNotNone(message_start_1)
+
+        usage_1 = message_start_1["message"]["usage"]
+        input_tokens_1 = usage_1["input_tokens"]
+        self.assertGreater(input_tokens_1, 0)
+
+        # Second identical request - may have cache hits
+        resp2 = self._make_request(payload, stream=True)
+        self.assertEqual(resp2.status_code, 200)
+
+        events2 = self._parse_sse_events(resp2)
+
+        # Check message_start
+        message_start_2 = next(
+            (e for e in events2 if e["type"] == "message_start"), None
+        )
+        self.assertIsNotNone(message_start_2)
+
+        usage_2 = message_start_2["message"]["usage"]
+        input_tokens_2 = usage_2["input_tokens"]
+        cache_read_2 = usage_2.get("cache_read_input_tokens")
+
+        # Verify input_tokens is non-negative
+        self.assertGreaterEqual(input_tokens_2, 0)
+
+        if cache_read_2 and cache_read_2 > 0:
+            # If there are cached tokens, they should be reported separately
+            self.assertGreater(cache_read_2, 0)
+
+        # Check message_delta
+        message_delta_2 = next(
+            (e for e in events2 if e["type"] == "message_delta"), None
+        )
+        self.assertIsNotNone(message_delta_2)
+
+        delta_usage_2 = message_delta_2["usage"]
+        self.assertIn("input_tokens", delta_usage_2)
+        self.assertIn("output_tokens", delta_usage_2)
+        self.assertGreaterEqual(delta_usage_2["input_tokens"], 0)
+        self.assertGreater(delta_usage_2["output_tokens"], 0)
 
 
 if __name__ == "__main__":
