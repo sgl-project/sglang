@@ -132,7 +132,7 @@ def _state_passing_fwd(
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty(
-        (batch, nheads, dim), device=states.device, dtype=torch.float32
+        (batch, nheads, dim), device=states.device, dtype=out_dtype
     )
 
     initial_states_strides = (

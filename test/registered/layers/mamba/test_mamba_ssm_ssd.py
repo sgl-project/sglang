@@ -796,6 +796,7 @@ def test_mamba_chunk_scan_intermediate_states(
     num_chunks = seqlen // chunk_size
     assert states.shape == (num_chunks, n_heads, d_head, d_head)
     assert ref_states.shape == states.shape
+    assert final_state.dtype == itype
 
     torch.testing.assert_close(
         final_state[:, -1].to(torch.float32),
