@@ -2842,6 +2842,12 @@ class Scheduler(
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
+                        # Last-minute D2H sync for spec_v2 seq_lens_cpu/sum
+                        # (moved here from prepare_for_decode so schedule path
+                        # doesn't block on prev verify).
+                        if batch.is_spec_v2:
+                            batch.seq_lens_cpu = batch.seq_lens.cpu()
+                            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(batch)
                         # Park any refs the worker wants kept alive 2 iters

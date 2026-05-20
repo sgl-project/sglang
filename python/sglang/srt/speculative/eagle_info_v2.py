@@ -173,9 +173,10 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        if not batch.enable_overlap:
+            # Overlap path defers this D2H to forward_stream entry (scheduler.py).
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
