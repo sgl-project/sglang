@@ -20,7 +20,7 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_lut,
     make_req_to_token,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_plan_invariants
+from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -1284,7 +1284,7 @@ def test_padding_row_with_garbage_prefix_does_not_oob() -> None:
         assert (
             int(w_plan.write_seed_slot_indices[1].item()) == -1
         ), f"[{label}] padding row seed must be -1"
-        assert_all_plan_invariants(
+        PlanInvariants.assert_all(
             verify_plan=v_plan,
             write_plan=w_plan,
             fb_req_pool_indices=fb_rpi,

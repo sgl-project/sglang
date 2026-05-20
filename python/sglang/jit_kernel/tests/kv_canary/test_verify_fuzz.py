@@ -21,7 +21,7 @@ from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_verify_invariants
+from sglang.jit_kernel.tests.kv_canary._invariants import VerifyInvariants
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
@@ -158,7 +158,7 @@ def _run_one(inputs: VerifyFuzzInputs) -> None:
         ref_log.slot_run_counter[0].item()
     )
     assert int(cuda_log.write_index[0].item()) == int(ref_log.write_index[0].item())
-    assert_all_verify_invariants(
+    VerifyInvariants.assert_all(
         canary_buf_before=cuda_buf_before,
         canary_buf_after=inputs.cuda_canary_buf,
         log_before=log_before,

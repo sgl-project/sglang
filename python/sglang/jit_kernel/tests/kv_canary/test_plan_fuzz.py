@@ -21,7 +21,7 @@ from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import assert_all_plan_invariants
+from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -199,7 +199,7 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         swa_window_size=inputs.swa_window_size,
         full_to_swa_index_mapping=inputs.full_to_swa_index_mapping,
     )
-    assert_all_plan_invariants(
+    PlanInvariants.assert_all(
         verify_plan=triton_v,
         write_plan=triton_w,
         fb_req_pool_indices=inputs.fb_req_pool_indices,
