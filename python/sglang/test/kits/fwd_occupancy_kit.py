@@ -36,6 +36,12 @@ class FwdOccupancyMixin:
     fwd_occupancy_min_samples: int = 5
     fwd_occupancy_scrape_interval: float = 0.5
 
+    # Spec-decoding accept-length floor. Only enforced when the server
+    # is running with a spec algorithm (avg_spec_accept_length present
+    # in /server_info); silently skipped otherwise. Below ~2.0 means
+    # spec barely accepts -- effectively falling back to vanilla.
+    spec_accept_length_threshold: float = 2.0
+
     # Warmup: one short request to fill cuda graphs + get the
     # device-timer past its first NaN window.
     fwd_occupancy_warmup_max_new_tokens: int = 64
@@ -182,3 +188,23 @@ class FwdOccupancyMixin:
             f"threshold {self.fwd_occupancy_threshold} "
             f"(peak={peak:.2f}, p10={p10:.2f}, n={len(samples)})",
         )
+
+        # The 2048-token decode above populates the spec running average
+        # if a spec algorithm is enabled; absent otherwise (vanilla
+        # decode skips this check).
+        try:
+            info = requests.get(
+                self.base_url + "/server_info", timeout=_METRICS_REQUEST_TIMEOUT
+            ).json()
+            avg_accept = info["internal_states"][0].get("avg_spec_accept_length")
+        except (requests.RequestException, KeyError, IndexError):
+            avg_accept = None
+        if avg_accept is not None:
+            print(f"avg_spec_accept_length = {avg_accept:.3f}")
+            self.assertGreater(
+                avg_accept,
+                self.spec_accept_length_threshold,
+                f"avg_spec_accept_length={avg_accept:.3f} did not exceed "
+                f"threshold {self.spec_accept_length_threshold} -- spec "
+                "barely accepted, possibly degraded to vanilla decode",
+            )
