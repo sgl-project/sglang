@@ -130,6 +130,42 @@ export const Playground = ({ config }) => {
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
+  // Cross-cell verified-match lookup: after applying the playground's
+  // overrides, the resulting (env, flags) tuple may equal SOME OTHER cell
+  // in the catalog (e.g. low-latency + MTP-1-1-2 == balanced on H200/FP4).
+  // Scope the search to cells sharing the same (hw, variant, quant, nodes)
+  // — the playground can't override those four axes (they're set in §3.1),
+  // so any match must agree on them. The remaining dimension (`strategy`)
+  // is the natural axis across which two cells can render the same
+  // command. Returns the matched cell or null.
+  //
+  // Matching policy:
+  //   - flags : ordered-array equality (order matters — both for the
+  //             rendered command's readability and for the diff display).
+  //   - env   : set equality (env vars are essentially key=value bindings
+  //             at runtime; their order in the cell array doesn't change
+  //             behavior).
+  const findMatchingCell = (cells, sel, pgEnv, pgFlags) => {
+    const flagsEq = (a, b) =>
+      a.length === b.length && a.every((x, i) => x === b[i]);
+    const envEq = (a, b) => {
+      if (a.length !== b.length) return false;
+      const set = new Set(a);
+      for (const x of b) if (!set.has(x)) return false;
+      return true;
+    };
+    for (const c of cells) {
+      if (c.match.hw !== sel.hw) continue;
+      if (c.match.variant !== sel.variant) continue;
+      if (c.match.quant !== sel.quant) continue;
+      if (c.match.nodes !== sel.nodes) continue;
+      if (flagsEq(c.flags || [], pgFlags || []) && envEq(c.env || [], pgEnv || [])) {
+        return c;
+      }
+    }
+    return null;
+  };
+
   // Layered lookup: hw|variant|quant → variant|quant → "".
   const resolveModelName = (sel) => {
     const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
@@ -1427,6 +1463,28 @@ export const Playground = ({ config }) => {
       color: isDark ? "#FDBA74" : "#C2410C",
       cursor: "pointer",
     },
+    // Inline annotation that appears next to the verified pill when the
+    // playground's command matches a SIBLING verified cell (different
+    // strategy). The hint stays subdued — it's informational, not the
+    // primary status indicator. The "switch base" link sits inside the
+    // hint and uses the orange brand color to advertise as an action.
+    matchedHint: {
+      fontSize: "11px",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      marginLeft: "8px",
+      display: "inline-flex", alignItems: "center", gap: "4px",
+    },
+    matchedSwitchBtn: {
+      marginLeft: "4px",
+      background: "transparent",
+      border: "none",
+      padding: 0,
+      color: isDark ? "#FDBA74" : "#C2410C",
+      cursor: "pointer",
+      fontSize: "11px", fontWeight: 600,
+      textDecoration: "underline",
+      textUnderlineOffset: "2px",
+    },
   });
 
   // ==========================================================================
@@ -1630,15 +1688,22 @@ export const Playground = ({ config }) => {
     playgroundCommand = renderCommandLines(baseCell, pgFlags, pgEnv, base, env, pdMode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
-  // The playground inherits the base cell's verified status when no overrides
-  // are in play — i.e. when applying every axis's delta produced no added or
-  // removed lines vs base. Any user override (or a derived-but-mismatched
-  // base, like speculative falling back to "current" with no preset match)
-  // flips back to Auto-Estimated.
-  const playgroundVerified =
-    !!(baseCell && baseCell.verified)
-    && diffLines.length > 0
-    && diffLines.every((d) => d.kind === "unchanged");
+  // Cross-cell verified detection: search the catalog for any cell whose
+  // (env, flags) tuple equals what the playground would emit. The match can
+  // be the base cell itself (untouched playground — current behavior) OR a
+  // sibling with a different `strategy` (e.g. low-latency + MTP-1-1-2 on
+  // H200/FP4 produces the same command as the balanced cell).
+  //
+  // When the match is a different cell, we still show the green Verified
+  // badge — the recipe IS in the verified catalog — but annotate which
+  // cell it matches and offer a "switch base" link so the user can align
+  // §3.1's selection with the cell they've actually built.
+  const matchedCell = baseCell
+    ? findMatchingCell(config.cells, base, pgEnvLatest, pgFlagsLatest)
+    : null;
+  const playgroundVerified = !!(matchedCell && matchedCell.verified);
+  const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
+    ? matchedCell : null;
 
   // Submission snippets — the proposed cell to add to the cookbook config,
   // plus the existing one at the same match (for the maintainer's diff).
@@ -1776,7 +1841,7 @@ export const Playground = ({ config }) => {
     <div style={s.container} className="not-prose">
       {/* Inherited base summary */}
       <div style={s.baseStrip}>
-        <span style={{ fontWeight: 600 }}>Inherited base from §3:</span>
+        <span style={{ fontWeight: 600 }}>Inherited base from §3.1:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
         {/* Scroll back to §3.1 (the Interactive Command Generator). Use
             scrollIntoView so the URL hash — which carries the base cell
@@ -1821,6 +1886,34 @@ export const Playground = ({ config }) => {
                 <span style={s.badgeDot(playgroundVerified)} />
                 {playgroundVerified ? "Verified" : "Auto-Estimated"}
               </div>
+              {/* When the playground matches a sibling cell (different
+                  `strategy`) — e.g. low-latency + MTP-1-1-2 on H200/FP4
+                  matches the balanced cell — surface that fact and offer
+                  to switch §3.1's base over to the matched cell. Updating
+                  the URL hash propagates via the existing hashchange
+                  listener; clearing deltas restores the clean
+                  inherit-from-base state at the new selection. */}
+              {matchedSiblingCell && (
+                <span style={s.matchedHint}>
+                  matches <code style={{ fontFamily: "Menlo, monospace" }}>
+                    {matchedSiblingCell.match.strategy}
+                  </code>
+                  <button
+                    type="button"
+                    style={s.matchedSwitchBtn}
+                    onClick={() => {
+                      const m = matchedSiblingCell.match;
+                      setDeltas(initialDeltas());
+                      const hash = new URLSearchParams(m).toString();
+                      window.location.hash = hash;
+                      window.dispatchEvent(new CustomEvent("sglang-deploy-sel",
+                        { detail: m }));
+                    }}
+                  >
+                    switch base →
+                  </button>
+                </span>
+              )}
               <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                 <span
                   style={s.runModeChip(runMode === "python")}
