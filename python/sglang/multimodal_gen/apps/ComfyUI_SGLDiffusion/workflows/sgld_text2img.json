@@ -1,0 +1,109 @@
+{
+    "1": {
+      "inputs": {
+        "base_url": "http://localhost:3000/v1",
+        "api_key": "sk-proj-1234567890"
+      },
+      "class_type": "SGLDiffusionServerModel",
+      "_meta": {
+        "title": "SGLDiffusion Server Model"
+      }
+    },
+    "3": {
+      "inputs": {
+        "prompt": "a bicycle, illustration in the style of SMPL, thick black lines on a white background",
+        "main": "none",
+        "lighting": "none",
+        "speak_and_recognation": {
+          "__value__": [
+            false,
+            true
+          ]
+        }
+      },
+      "class_type": "easy prompt",
+      "_meta": {
+        "title": "Prompt"
+      }
+    },
+    "4": {
+      "inputs": {
+        "text": "",
+        "anything": [
+          "1",
+          1
+        ]
+      },
+      "class_type": "easy showAnything",
+      "_meta": {
+        "title": "Show Any"
+      }
+    },
+    "5": {
+      "inputs": {
+        "filename_prefix": "ComfyUI",
+        "images": [
+          "6",
+          0
+        ]
+      },
+      "class_type": "SaveImage",
+      "_meta": {
+        "title": "save image"
+      }
+    },
+    "6": {
+      "inputs": {
+        "positive_prompt": [
+          "3",
+          0
+        ],
+        "negative_prompt": "",
+        "seed": 4215918563,
+        "steps": 50,
+        "cfg": 4,
+        "width": 512,
+        "height": 512,
+        "enable_teacache": false,
+        "sgld_client": [
+          "11",
+          0
+        ],
+        "image": [
+          "14",
+          0
+        ]
+      },
+      "class_type": "SGLDiffusionGenerateImage",
+      "_meta": {
+        "title": "SGLDiffusion Generate Image"
+      }
+    },
+    "11": {
+      "inputs": {
+        "lora_name": "dvyio/flux-lora-simple-illustration",
+        "lora_nickname": "",
+        "target": "all",
+        "sgld_client": [
+          "1",
+          0
+        ]
+      },
+      "class_type": "SGLDiffusionSetLora",
+      "_meta": {
+        "title": "SGLDiffusion Set LoRA"
+      }
+    },
+    "14": {
+      "inputs": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1,
+        "color": 0
+      },
+      "class_type": "EmptyImage",
+      "_meta": {
+        "title": "empty image"
+      }
+    }
+  }

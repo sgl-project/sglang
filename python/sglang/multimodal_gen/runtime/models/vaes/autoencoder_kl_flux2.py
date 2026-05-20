@@ -22,7 +22,7 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
-class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
+class AutoencoderKLFlux2(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -39,7 +39,7 @@ class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
         self,
         config: Flux2VAEConfig,
     ):
-        super().__init__()
+        super().__init__(config=config)
 
         self.config = config
         arch_config = config.arch_config
@@ -49,6 +49,9 @@ class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
         down_block_types: Tuple[str, ...] = arch_config.down_block_types
         up_block_types: Tuple[str, ...] = arch_config.up_block_types
         block_out_channels: Tuple[int, ...] = arch_config.block_out_channels
+        decoder_block_out_channels: Optional[Tuple[int, ...]] = getattr(
+            arch_config, "decoder_block_out_channels", None
+        )
         layers_per_block: int = arch_config.layers_per_block
         act_fn: str = arch_config.act_fn
         latent_channels: int = arch_config.latent_channels
@@ -79,7 +82,7 @@ class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
             in_channels=latent_channels,
             out_channels=out_channels,
             up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
+            block_out_channels=decoder_block_out_channels or block_out_channels,
             layers_per_block=layers_per_block,
             norm_num_groups=norm_num_groups,
             act_fn=act_fn,

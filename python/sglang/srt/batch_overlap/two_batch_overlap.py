@@ -20,6 +20,7 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -29,6 +30,8 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    MoriEPDispatcher,
+    NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -78,7 +81,7 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
@@ -217,24 +220,26 @@ def split_spec_info(
         positions = spec_info.positions[start_token_index:end_token_index]
     else:
         positions = None
-    if spec_info.retrive_index is not None:
-        retrive_index = spec_info.retrive_index[start_seq_index:end_seq_index]
+    if spec_info.retrieve_index is not None:
+        retrieve_index = spec_info.retrieve_index[start_seq_index:end_seq_index]
     else:
-        retrive_index = None
-    if spec_info.retrive_next_token is not None:
-        retrive_next_token = spec_info.retrive_next_token[start_seq_index:end_seq_index]
-    else:
-        retrive_next_token = None
-    if spec_info.retrive_next_sibling is not None:
-        retrive_next_sibling = spec_info.retrive_next_sibling[
+        retrieve_index = None
+    if spec_info.retrieve_next_token is not None:
+        retrieve_next_token = spec_info.retrieve_next_token[
             start_seq_index:end_seq_index
         ]
     else:
-        retrive_next_sibling = None
-    if spec_info.retrive_cum_len is not None:
-        retrive_cum_len = spec_info.retrive_cum_len[start_seq_index:end_seq_index]
+        retrieve_next_token = None
+    if spec_info.retrieve_next_sibling is not None:
+        retrieve_next_sibling = spec_info.retrieve_next_sibling[
+            start_seq_index:end_seq_index
+        ]
     else:
-        retrive_cum_len = None
+        retrieve_next_sibling = None
+    if spec_info.retrieve_cum_len is not None:
+        retrieve_cum_len = spec_info.retrieve_cum_len[start_seq_index:end_seq_index]
+    else:
+        retrieve_cum_len = None
 
     if spec_info.seq_lens_cpu is not None:
         seq_lens_cpu = spec_info.seq_lens_cpu[start_seq_index:end_seq_index]
@@ -249,10 +254,10 @@ def split_spec_info(
         custom_mask=custom_mask,
         draft_token=draft_token,
         positions=positions,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        retrive_cum_len=retrive_cum_len,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_cum_len=retrieve_cum_len,
         seq_lens_cpu=seq_lens_cpu,
         seq_lens_sum=seq_lens_sum,
     )
@@ -265,7 +270,7 @@ def compute_split_token_index(
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_seq_lens is not None
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
@@ -414,8 +419,10 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
-        forward_modes = partial_global_info[:, 1].tolist()
+        # Perform only one Device-to-Host (D2H) memory copy
+        cpu_data = partial_global_info[:, :2].cpu()
+        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
+        forward_modes = cpu_data[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -439,18 +446,23 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        forward_modes_excluding_idle = [
-            x for x in forward_modes if x != ForwardMode.IDLE.value
+        forward_modes_excluding_idle_and_prebuilt = [
+            x
+            for x in forward_modes
+            if x != ForwardMode.IDLE.value and x != ForwardMode.PREBUILT.value
         ]
 
-        if not forward_modes_excluding_idle:
+        if not forward_modes_excluding_idle_and_prebuilt:
             return ForwardMode.IDLE, False
 
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            forward_modes_excluding_idle
+            forward_modes_excluding_idle_and_prebuilt
         )
+
         global_forward_mode = (
-            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+            ForwardMode(forward_modes_excluding_idle_and_prebuilt[0])
+            if forward_mode_agree
+            else None
         )
         return global_forward_mode, forward_mode_agree
 
@@ -630,6 +642,11 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        attention_tp_size = get_attention_tp_size()
+        output_dict["tbo_padded_len"] = (
+            (end_token_index - start_token_index - 1) // attention_tp_size + 1
+        ) * attention_tp_size
+
         for key in [
             "req_pool_indices",
             "seq_lens",
@@ -641,6 +658,7 @@ class TboForwardBatchPreparer:
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
             "lora_ids",
+            "rids",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -672,6 +690,7 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "all_extend_in_batch",
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",
@@ -682,11 +701,20 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
+            "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
+
+        mrope_positions = getattr(batch, "mrope_positions")
+        if mrope_positions is not None:
+            output_dict["mrope_positions"] = mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
@@ -722,6 +750,7 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
+                original_global_num_tokens_cpu=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -737,6 +766,7 @@ class TboForwardBatchPreparer:
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
+                return_hidden_states_before_norm=False,
             )
         )
 
@@ -840,6 +870,7 @@ def _model_forward_tbo(
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
     )
+    original_hidden_states_len = inputs["hidden_states"].shape[0]
     del inputs
 
     context = (
@@ -857,7 +888,7 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(*outputs_arr)
+    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -951,23 +982,49 @@ def _model_forward_filter_inputs(
     tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    hidden_states = hidden_states[token_slice]
+    residual = None if residual is None else residual[token_slice]
+    positions = positions[token_slice]
+
+    assert output_forward_batch.tbo_padded_len is not None
+    padded_len = output_forward_batch.tbo_padded_len
+
+    def _pad(x):
+        nonlocal padded_len
+        if x is None:
+            return None
+        if x.shape[0] == padded_len:
+            return x
+        res = torch.zeros((padded_len, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        res[: x.shape[0]] = x
+        return res
+
     return dict(
-        hidden_states=hidden_states[token_slice],
-        residual=None if residual is None else residual[token_slice],
-        positions=positions[token_slice],
+        hidden_states=_pad(hidden_states),
+        residual=_pad(residual),
+        positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
 
 
-def _model_forward_tbo_merge_outputs(output_a, output_b):
+def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
         assert (value_a is None) == (value_b is None)
         if value_a is None:
             return None
-        return torch.concat([value_a, value_b], dim=0)
+        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+        res = torch.zeros(
+            (original_len, *value_a.shape[1:]),
+            dtype=value_a.dtype,
+            device=value_a.device,
+        )
+        res[slice(s0, t0)] = value_a[: t0 - s0]
+        res[slice(s1, t1)] = value_b[: t1 - s1]
+        return res
 
     return _handle_key("hidden_states"), _handle_key("residual")
 
@@ -987,6 +1044,19 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
+        elif get_moe_a2a_backend().is_mori():
+            self._inners = [
+                MoriEPDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nixl():
+            self._inners = [
+                NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+
+    @property
+    def expert_mask_gpu(self):
+        return self._inners[0].expert_mask_gpu
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)

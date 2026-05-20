@@ -16,7 +16,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     let mut expositions = vec![];
     for metric_pack in metric_packs {
         let metrics_text = &metric_pack.metrics_text;
-        // Hacky workaround since the parser do not understand `:`, should improve later
+        // openmetrics_parser doesn't handle colons in metric names; replace with underscores
         let metrics_text = metrics_text.replace(":", "_");
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
@@ -76,7 +76,7 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
         .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))
 }
 
-pub fn try_reduce<I, T, E, F>(iterable: I, f: F) -> Result<Option<T>, E>
+fn try_reduce<I, T, E, F>(iterable: I, f: F) -> Result<Option<T>, E>
 where
     I: IntoIterator<Item = T>,
     F: FnMut(T, T) -> Result<T, E>,

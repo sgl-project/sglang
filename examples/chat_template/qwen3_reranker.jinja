@@ -1,0 +1,7 @@
+<|im_start|>system
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+<|im_start|>user
+<Instruct>: {{ instruct | default("Given a web search query, retrieve relevant passages that answer the query.") }}
+<Query>: {{ messages[0]["content"] }}
+<Document>: {{ messages[1]["content"] }}<|im_end|>
+<|im_start|>assistant{{ '\n' }}

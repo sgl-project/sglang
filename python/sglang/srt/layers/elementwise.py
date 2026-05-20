@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import direct_register_custom_op, is_hip
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 
@@ -229,7 +230,7 @@ def fused_rmsnorm_kernel(
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     input_start = pid * hidden_dim
 
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -358,6 +359,7 @@ def experts_combine_kernel(
     tl.store(out_hidden_states + start_index_mlp + offsets, combined_x, mask=mask)
 
 
+@register_custom_op(out_shape="mlp_hidden_states")
 def experts_combine_triton(
     moe_hidden_states: torch.Tensor,
     mlp_hidden_states: torch.Tensor,
@@ -399,22 +401,6 @@ def experts_combine_triton(
     )
 
     return out_hidden_states
-
-
-def experts_combine_triton_fake(
-    moe_hidden_states: torch.Tensor,
-    mlp_hidden_states: torch.Tensor,
-    output_buffer: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return torch.empty_like(mlp_hidden_states)
-
-
-direct_register_custom_op(
-    op_name="experts_combine_triton",
-    op_func=experts_combine_triton,
-    mutates_args=[],
-    fake_impl=experts_combine_triton_fake,
-)
 
 
 # gelu on first half of vector

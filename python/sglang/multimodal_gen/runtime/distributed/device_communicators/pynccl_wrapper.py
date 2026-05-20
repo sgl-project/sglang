@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/pynccl_wrapper.py
 
 # This file is a pure Python wrapper for the NCCL library.
@@ -277,7 +278,7 @@ class NCCLLibrary:
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s ."
-                "It is expected if you are not running on NVIDIA/AMD GPUs."
+                "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs."
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s."
                 "If you already have the library, please set the "

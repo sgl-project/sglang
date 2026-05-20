@@ -8,7 +8,10 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.amx_utils import (
+    CPUQuantMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
@@ -25,9 +28,11 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -35,9 +40,24 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+
+    @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
+    def _int8_scaled_mm_abstract(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
+        bias=None,
+    ):
+        M = mat_a.shape[-2]
+        N = mat_b.shape[-1]
+        return mat_a.new_empty((M, N), dtype=out_dtype)
+
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +161,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["weight"])
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["weight"])
+            elif _is_cpu_arm64:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            else:
+                assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -186,7 +208,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or _is_cpu_arm64:
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -292,10 +314,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+        if _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
@@ -313,6 +332,18 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_int8_w8a8=True,
+            per_channel_quant=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -323,10 +354,11 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or _is_cpu_arm64:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
+            topk_ids = topk_ids.int()
             x, topk_weights = apply_topk_weights_cpu(
                 self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
@@ -337,25 +369,15 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                True,  # use_int8_w8a8
-                False,  # use_fp8_w8a16
+                CPUQuantMethod.INT8_W8A8,
                 layer.w13_weight_scale,  # w1_scale
                 layer.w2_weight_scale,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
                 None,  # block_size
-                layer.w13_input_scale,  # a1_scale
-                layer.w2_input_scale,  # a2_scale
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
 
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            use_int8_w8a8=True,
-            per_channel_quant=True,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-        )
+        quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

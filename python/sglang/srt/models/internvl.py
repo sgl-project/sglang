@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -13,9 +15,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -36,9 +40,15 @@ from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
+    InternViTCudaGraphRunner,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda
 from sglang.utils import logger
+
+_is_cuda = is_cuda()
 
 
 class InternAttention(nn.Module):
@@ -47,6 +57,7 @@ class InternAttention(nn.Module):
         config,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -69,6 +80,7 @@ class InternAttention(nn.Module):
             or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -77,8 +89,9 @@ class InternAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out = self.attn(hidden_states, cu_seqlens=cu_seqlens)
+        out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
         outs = self.proj_drop(out)
         return outs
 
@@ -103,7 +116,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -222,6 +235,7 @@ class InternVisionEncoderLayer(nn.Module):
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -231,6 +245,7 @@ class InternVisionEncoderLayer(nn.Module):
             config=config,
             quant_config=quant_config,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
         self.mlp = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -249,6 +264,7 @@ class InternVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         Optional[torch.FloatTensor],
@@ -261,7 +277,9 @@ class InternVisionEncoderLayer(nn.Module):
 
         hidden_states = hidden_states + self.drop_path1(
             self.attn(
-                self.norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens
+                self.norm1(hidden_states).to(hidden_states.dtype),
+                cu_seqlens=cu_seqlens,
+                output_ws=output_ws,
             )
             * self.ls1
         )
@@ -296,18 +314,28 @@ class InternVisionEncoder(nn.Module):
             x.item()
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
+
+        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        aux_stream = (
+            None if self.enable_cg else (torch.cuda.Stream() if _is_cuda else None)
+        )
         self.layers = nn.ModuleList(
             [
                 InternVisionEncoderLayer(
-                    config, dpr[idx], quant_config, use_data_parallel
+                    config, dpr[idx], quant_config, use_data_parallel, aux_stream
                 )
                 for idx in range(config.num_hidden_layers)
             ]
         )
 
+        self.cuda_graph_runner: Optional[InternViTCudaGraphRunner] = None
+        if self.enable_cg:
+            self.cuda_graph_runner = InternViTCudaGraphRunner(self)
+
     def forward(
         self,
         inputs_embeds,
+        cu_seqlens=None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
@@ -321,6 +349,14 @@ class InternVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
+        if self.enable_cg and (not output_hidden_states):
+            # graph path only returns last_hidden_state
+            hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
+            hidden_states = self.cuda_graph_runner.run(hidden_states)
+            if not return_dict:
+                return (hidden_states,)
+            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -333,7 +369,8 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        cu_seqlens = SingletonCache()
+        if cu_seqlens is None:
+            cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -531,6 +568,7 @@ class InternVLChatModel(nn.Module):
 
         self.external_mm_data_embedding_funcs = {
             Modality.IMAGE: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
         }
 
         self.model = self.language_model.model
@@ -583,8 +621,22 @@ class InternVLChatModel(nn.Module):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         pixel_values = torch.cat([item.feature for item in items])
+        # If already precomputed embeddings (not raw pixel values), skip vision encoder.
+        # Normal pixel_values are 4D [N, C, H, W]; precomputed embeddings are 2D or 3D.
+        if pixel_values.dim() != 4:
+            return pixel_values
         image_features = self.extract_feature(pixel_values)
         return image_features
+
+    def get_video_feature(self, items: List[MultimodalDataItem]):
+        # items: each item corresponds to one video (recommended)
+        # item.feature shape: [num_frames, 3, 448, 448]  (or [num_tiles, 3, 448, 448])
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # If already precomputed embeddings, skip vision encoder.
+        if pixel_values.dim() != 4:
+            return pixel_values
+        video_features = self.extract_feature(pixel_values)
+        return video_features
 
     @torch.no_grad()
     def forward(

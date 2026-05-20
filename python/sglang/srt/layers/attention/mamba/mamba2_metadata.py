@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,11 +29,24 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # For prefill radix cache
+    track_conv_indices: Optional[torch.Tensor] = None
+    track_ssm_h_src: Optional[torch.Tensor] = None
+    track_ssm_h_dst: Optional[torch.Tensor] = None
+    track_ssm_final_src: Optional[torch.Tensor] = None
+    track_ssm_final_dst: Optional[torch.Tensor] = None
+
     is_target_verify: bool = False
     draft_token_num: int = 1
+
+    has_mamba_track_mask: bool = False
+    mamba_track_mask_indices: Optional[torch.Tensor] = None
+    conv_states_mask_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
