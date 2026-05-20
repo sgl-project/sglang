@@ -962,6 +962,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         merge_profiles=obj.merge_profiles,
         profile_prefix=obj.profile_prefix,
         profile_stages=obj.profile_stages,
+        roofline_annotations=obj.roofline_annotations,
     )
     return Response(
         content="Start profiling.\n",
