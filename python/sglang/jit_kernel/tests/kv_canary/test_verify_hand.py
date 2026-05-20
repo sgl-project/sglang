@@ -22,6 +22,10 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_verify as _run_both,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
+from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+    _hand_fold_all,
+    _hand_fold_partial,
+)
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
