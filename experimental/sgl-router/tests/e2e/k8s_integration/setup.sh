@@ -173,7 +173,11 @@ log "Deploying sgl-router..."
 kubectl --context "${CONTEXT}" apply -f "${MANIFESTS_DIR}/router.yaml"
 
 log "Waiting for sgl-router rollout..."
-kubectl --context "${CONTEXT}" -n "${NAMESPACE}" rollout status deployment/sgl-router --timeout=120s
+# 5-minute timeout: a cold kind cluster needs to pull the runtime base
+# image + initialize the router + receive the first EndpointSlice event
+# before /readyz flips green. 120s was tight on shared GitHub-hosted
+# runners and a slow watch-list cycle could blow past it.
+kubectl --context "${CONTEXT}" -n "${NAMESPACE}" rollout status deployment/sgl-router --timeout=300s
 
 # ---------------------------------------------------------------------------
 # Done

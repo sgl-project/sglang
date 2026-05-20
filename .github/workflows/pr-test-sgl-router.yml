@@ -270,9 +270,33 @@ jobs:
           /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
       - name: Run E2E
         run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
-      - name: Dump router logs on failure
+      - name: Dump cluster + router diagnostics on failure
         if: failure()
-        run: kubectl -n sgl-router-test logs deploy/sgl-router --tail=200 || true
+        # The default `kubectl logs deploy/sgl-router` is empty when the
+        # pod hasn't yet emitted any log line (image-pull pending,
+        # CrashLoopBackOff before first stdout write, scheduling stuck,
+        # etc.). Dump pod state + events + previous-container logs so
+        # the rollout-timeout failure has enough context to diagnose
+        # without a re-run.
+        run: |
+          set +e
+          echo "=== pods ==="
+          kubectl -n sgl-router-test get pods -o wide
+          echo "=== describe sgl-router pod(s) ==="
+          kubectl -n sgl-router-test describe pod -l app=sgl-router
+          echo "=== describe fake-worker pod(s) ==="
+          kubectl -n sgl-router-test describe pod -l app=sglang
+          echo "=== current sgl-router logs ==="
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300
+          echo "=== previous sgl-router logs (if container restarted) ==="
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300 --previous
+          echo "=== namespace events (newest last) ==="
+          kubectl -n sgl-router-test get events --sort-by=.lastTimestamp
+          echo "=== endpointslices ==="
+          kubectl -n sgl-router-test get endpointslices -o wide
+          echo "=== services ==="
+          kubectl -n sgl-router-test get svc
+          true  # always succeed so the failure step itself doesn't mask the actual error
 
   sgl-router-e2e:
     name: tier-3 — e2e
