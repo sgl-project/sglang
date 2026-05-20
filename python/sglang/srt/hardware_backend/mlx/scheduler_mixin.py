@@ -132,7 +132,7 @@ class SchedulerMlxOverlapMixin:
                 pending.reqs,
             )
             if result.next_token_ids is not None:
-                pending.batch_copy.output_ids = result.next_token_ids
+                pending.batch_copy.input_ids = result.next_token_ids
             self.process_batch_result(pending.batch_copy, result)
 
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
