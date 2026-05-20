@@ -1,10 +1,15 @@
-"""GPU forward-pass occupancy sanity kit.
+"""GPU forward-pass occupancy sanity kit (single-batch decode).
 
-Probes the ``sglang:fwd_occupancy`` Prometheus gauge under sustained
-``/generate`` load and asserts the steady-state value clears a
-threshold. Catches CPU-side regressions (overlap scheduler hiccups,
-metadata copy bloat, host-side syncs) that don't break correctness but
-starve the GPU.
+Probes the ``sglang:fwd_occupancy`` Prometheus gauge while a single
+long ``/generate`` request is in flight (batch_size = 1 decode) and
+asserts the steady-state value clears a threshold.
+
+Single-batch decode is the worst case for CPU overhead: each decode
+step produces just one token, so per-step host-side work (kernel
+dispatch, sampling, metadata bookkeeping) competes with a single tiny
+forward pass. If the overlap scheduler or cuda graph capture stalls,
+GPU idle ratio shoots up here before anything shows in batched
+throughput numbers.
 
 The gauge is a percentage in [0, 100] -- ``gpu_busy / wall_clock * 100``
 over the most recent ``decode_log_interval`` batches. It cycles back to
@@ -24,40 +29,39 @@ import re
 import statistics
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 _FWD_OCCUPANCY_RE = re.compile(
     r"^sglang:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
 )
-_GENERATE_REQUEST_TIMEOUT = 300
+_GENERATE_REQUEST_TIMEOUT = 600
 _METRICS_REQUEST_TIMEOUT = 10
 
 
 class FwdOccupancyMixin:
-    """Assert steady-state ``sglang:fwd_occupancy`` under sustained load.
+    """Assert steady-state ``sglang:fwd_occupancy`` for single-batch decode.
 
     Threshold is a percentage in [0, 100]. Default is conservative for
-    single-batch decode with overlap scheduler + cuda graph on a
-    mid-size model; saturated multi-batch decode on H100/H200 should
-    reach 95+.
+    overlap scheduler + cuda graph on a decent GPU; saturated multi-batch
+    decode on H100/H200 reaches 95+, so this kit's value lives in the
+    single-batch regime where CPU overhead dominates.
     """
 
     # Threshold + detection
-    fwd_occupancy_threshold: float = 85.0
+    fwd_occupancy_threshold: float = 80.0
     fwd_occupancy_min_samples: int = 5
     fwd_occupancy_scrape_interval: float = 0.5
 
-    # Warmup phase -- fires synchronously before measurement starts
-    fwd_occupancy_warmup_requests: int = 8
+    # Warmup phase -- one short request to fill cuda graphs and let the
+    # device-timer window emit its first non-NaN sample.
     fwd_occupancy_warmup_max_new_tokens: int = 64
     fwd_occupancy_warmup_settle_seconds: float = 1.0
 
-    # Measurement load
-    fwd_occupancy_workers: int = 32
-    fwd_occupancy_total_requests: int = 128
-    fwd_occupancy_max_new_tokens: int = 256
+    # Measurement load -- one long single-batch request. max_new_tokens
+    # must cover many decode_log_interval windows worth of decode steps
+    # so the scraper collects enough samples.
+    fwd_occupancy_max_new_tokens: int = 2048
     fwd_occupancy_prompt: str = "Write a long, detailed, multi-paragraph story about "
 
     def _scrape_fwd_occupancy(self):
@@ -100,6 +104,9 @@ class FwdOccupancyMixin:
         )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
+        """Synchronously fire one /generate request. Single batch_size=1
+        decode -- this method must never be called concurrently if the
+        probe's single-batch invariant is to hold."""
         try:
             requests.post(
                 self.base_url + "/generate",
@@ -118,69 +125,43 @@ class FwdOccupancyMixin:
             pass
 
     def _fwd_occupancy_warmup(self):
-        """Fire a few requests synchronously to drive the server into
-        steady-state before sampling. The device-timer window also needs
-        a few batches of activity before the gauge produces non-NaN
-        values."""
-        prompts = [
-            f"warmup#{i} {self.fwd_occupancy_prompt}"
-            for i in range(self.fwd_occupancy_warmup_requests)
-        ]
-        with ThreadPoolExecutor(
-            max_workers=self.fwd_occupancy_warmup_requests
-        ) as executor:
-            futures = [
-                executor.submit(
-                    self._fwd_occupancy_fire,
-                    p,
-                    self.fwd_occupancy_warmup_max_new_tokens,
-                )
-                for p in prompts
-            ]
-            for f in futures:
-                f.result()
-        # Give the scheduler a beat to settle before measurement starts.
+        """Fire one short request synchronously to fill cuda graphs and
+        let the device-timer window emit its first non-NaN sample before
+        measurement starts."""
+        self._fwd_occupancy_fire(
+            "warmup " + self.fwd_occupancy_prompt,
+            self.fwd_occupancy_warmup_max_new_tokens,
+        )
         time.sleep(self.fwd_occupancy_warmup_settle_seconds)
 
     def _fwd_occupancy_measure(self):
-        """Fire concurrent load + scrape /metrics in a background
-        thread; return the list of non-NaN occupancy samples observed
-        while the load was in-flight."""
+        """Fire one long single-batch request in a background thread and
+        scrape /metrics from the main thread while it's in flight;
+        return the list of non-NaN occupancy samples observed."""
         samples = []
         samples_lock = threading.Lock()
-        scraping_done = threading.Event()
+        request_done = threading.Event()
 
-        def scrape_loop():
-            while not scraping_done.is_set():
-                v = self._scrape_fwd_occupancy()
-                if v is not None:
-                    with samples_lock:
-                        samples.append(v)
-                time.sleep(self.fwd_occupancy_scrape_interval)
+        def fire_one():
+            try:
+                self._fwd_occupancy_fire(
+                    self.fwd_occupancy_prompt,
+                    self.fwd_occupancy_max_new_tokens,
+                )
+            finally:
+                request_done.set()
 
-        scraper = threading.Thread(target=scrape_loop, daemon=True)
-        scraper.start()
+        firer = threading.Thread(target=fire_one, daemon=True)
+        firer.start()
 
-        prompts = [
-            f"#{i} {self.fwd_occupancy_prompt}"
-            for i in range(self.fwd_occupancy_total_requests)
-        ]
-        try:
-            with ThreadPoolExecutor(max_workers=self.fwd_occupancy_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._fwd_occupancy_fire,
-                        p,
-                        self.fwd_occupancy_max_new_tokens,
-                    )
-                    for p in prompts
-                ]
-                for f in futures:
-                    f.result()
-        finally:
-            scraping_done.set()
-            scraper.join(timeout=5.0)
+        while not request_done.is_set():
+            v = self._scrape_fwd_occupancy()
+            if v is not None:
+                with samples_lock:
+                    samples.append(v)
+            time.sleep(self.fwd_occupancy_scrape_interval)
 
+        firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
         return samples
 
     def test_fwd_occupancy(self):
