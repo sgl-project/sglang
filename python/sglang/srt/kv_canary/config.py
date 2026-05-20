@@ -47,7 +47,7 @@ class CanaryConfig:
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
         allreduce_violation_signal: True = end-of-step pump performs TP- and PP-group allreduce on the local
             is_errored byte so all ranks raise in lockstep; False = each rank raises independently (faster
-            but produces partial-failure logs across TP/PP groups). Default True.
+            but produces partial-failure logs across TP/PP groups). Default False (allreduce is expensive).
     """
 
     mode: Literal["off", "log", "raise"]
@@ -55,8 +55,8 @@ class CanaryConfig:
     sweep_interval: int = 64
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.PARTIAL
     input_check_mode: CanaryInputCheckMode = CanaryInputCheckMode.OFF
-    stats_print_every_n_steps: int = 0
-    allreduce_violation_signal: bool = True
+    stats_print_every_n_steps: int = 100
+    allreduce_violation_signal: bool = False
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
