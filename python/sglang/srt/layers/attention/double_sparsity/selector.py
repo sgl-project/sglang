@@ -13,22 +13,38 @@ The class does NOT inherit from any HiSparse base and is NOT registered in
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
     from sglang.srt.layers.attention.double_sparsity.config import (
         DoubleSparsityConfig,
+    )
+    from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+        PageSignatureTable,
     )
 
 
 class DoubleSparsitySelector:
     """Sequence-order-ascending top-K logical-page selector.
 
-    The real implementation (selection kernels + page signature projection)
-    lands later. The placeholder picks the first ``top_k`` logical pages of
-    each sequence so that downstream FlashMLA wiring is exercisable.
+    Two modes:
+
+    * **Placeholder** (default after construction). ``retrieve_topk`` returns
+      deterministic ascending logical-page IDs so the downstream FlashMLA
+      wiring is exercisable in unit tests before real selection kernels and
+      a real channel mask are wired. Production serving is refused by the
+      placeholder guard unless ``SGLANG_DS_ALLOW_PLACEHOLDER=1`` is set.
+
+    * **Real** — after :meth:`bind_runtime_data` is called with a populated
+      :class:`PageSignatureTable` and a loaded :class:`ChannelMask`, the
+      selector switches to the real score → all-reduce → top-K flow from
+      :mod:`selection_kernel`. ``IS_PLACEHOLDER`` flips to ``False``.
+
+    The class does NOT inherit from any HiSparse base and is NOT registered
+    in ``_ALGORITHM_REGISTRY``.
     """
 
     IS_PLACEHOLDER: bool = True
@@ -51,6 +67,45 @@ class DoubleSparsitySelector:
                 f"Double Sparsity max_top_k must be positive, got {self.max_top_k}."
             )
 
+        self.page_signature_table: Optional["PageSignatureTable"] = None
+        self.channel_mask: Optional["ChannelMask"] = None
+        self.process_group = None
+        self.IS_PLACEHOLDER = True
+
+    def bind_runtime_data(
+        self,
+        page_signature_table: "PageSignatureTable",
+        channel_mask: "ChannelMask",
+        *,
+        process_group=None,
+    ) -> None:
+        """Switch the selector from placeholder to real mode.
+
+        Both arguments must be non-None and shape-compatible. Subsequent
+        calls to ``retrieve_topk`` use the real score → all-reduce → top-K
+        flow from :mod:`selection_kernel`.
+        """
+
+        if page_signature_table is None:
+            raise ValueError("page_signature_table is required for real selection.")
+        if channel_mask is None:
+            raise ValueError("channel_mask is required for real selection.")
+        if channel_mask.label_dim != page_signature_table.label_dim:
+            raise ValueError(
+                f"channel_mask.label_dim={channel_mask.label_dim} does not match "
+                f"page_signature_table.label_dim={page_signature_table.label_dim}."
+            )
+        if page_signature_table.num_heads_local != self.num_local_heads:
+            raise ValueError(
+                f"page_signature_table.num_heads_local={page_signature_table.num_heads_local} "
+                f"does not match selector.num_local_heads={self.num_local_heads}."
+            )
+
+        self.page_signature_table = page_signature_table
+        self.channel_mask = channel_mask
+        self.process_group = process_group
+        self.IS_PLACEHOLDER = False
+
     def retrieve_topk(
         self,
         queries: torch.Tensor,
@@ -58,6 +113,7 @@ class DoubleSparsitySelector:
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
+        hot_pages: Optional[Sequence[Sequence[int]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(selected_indices, valid_lengths)``.
 
@@ -65,15 +121,32 @@ class DoubleSparsitySelector:
             **sequence-order ascending**, ``-1`` padded.
         ``valid_lengths``: int32 ``[bs]``, the unpadded length of each row.
 
-        Placeholder: pick the first ``min(num_pages, max_top_k)`` logical pages
-        of each request. The active in-fill page is the last entry of the
-        unpadded prefix by construction, satisfying the hot-page rule for the
-        placeholder path.
+        Dispatches to the real :mod:`selection_kernel` pipeline once
+        :meth:`bind_runtime_data` has installed a populated page signature
+        table and channel mask; otherwise runs the placeholder ascending-IDs
+        scheme so downstream wiring is exercisable in unit tests.
         """
 
         if queries.dim() < 2:
             raise ValueError(
                 f"Double Sparsity expects queries with at least 2 dims, got shape {tuple(queries.shape)}."
+            )
+
+        if self.page_signature_table is not None and self.channel_mask is not None:
+            from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                retrieve_topk_via_signatures,
+            )
+
+            return retrieve_topk_via_signatures(
+                queries=queries,
+                page_signatures=self.page_signature_table.signatures,
+                valid_mask=self.page_signature_table.valid_mask,
+                channel_selection=self.channel_mask.channel_selection,
+                channel_weights=self.channel_mask.channel_weights,
+                layer_id=layer_id,
+                max_top_k=self.max_top_k,
+                hot_pages=hot_pages,
+                process_group=self.process_group,
             )
 
         batch_size = req_pool_indices.shape[0]

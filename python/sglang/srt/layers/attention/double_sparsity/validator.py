@@ -4,17 +4,25 @@ Mirrors the role of ``arg_groups.hisparse_hook.validate_hisparse`` but lives
 inside the Double Sparsity package per the upstream-shaped path budget
 (``arg_groups/`` is intentionally out of scope for this feature).
 
-Real schema / content-hash / capability checks land alongside the channel
-mask file loader and selection kernels in later milestones; this minimal
-validator only enforces the startup-time rules needed to keep AC-1
-honest:
+Enforces, at server startup:
 
 * mutual-exclusion with ``--enable-hisparse`` (DEC-8),
-* presence of ``--double-sparsity-config`` with a parseable
+* rejection of ``--disaggregation-mode`` (HiSparse owns the PD path),
+* presence of ``--double-sparsity-config`` JSON with at least
   ``channel_mask_path``,
-* page-size pairing (the JSON ``page_size`` must equal ``server_args.page_size``),
-* placeholder-guard sentinel: warn (and refuse to serve in production) when
-  the placeholder selector is still wired.
+* JSON page-size pairing with ``--page-size``,
+* backend / KV-dtype pairing (AC-3): ``fp8_e4m3 ↔ flashmla_kv``,
+  ``bfloat16 ↔ flashmla_sparse``,
+* unsupported page-size rejection (page must be in ``{32, 64, 128}``),
+* capability check (DEC-10): the running model must expose the ``nsa.Indexer``
+  hook surface — proxied via :func:`is_deepseek_nsa` so GLM-5.1 falls in for
+  free once it ships the same indexer interface,
+* channel-mask file existence + content-hash verification (delegates to
+  :func:`channel_mask.load_channel_mask`),
+* DEC-2 radix-cache permission: refuse to serve with radix cache enabled
+  until the M3-B page-stability fixture has been recorded as passing
+  (``server_args._double_sparsity_radix_fixture_passed = True``), unless the
+  developer override ``SGLANG_DS_RADIX_OVERRIDE=1`` is set.
 """
 
 from __future__ import annotations
@@ -29,12 +37,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_SUPPORTED_PAGE_SIZES = (32, 64, 128)
+
+_BACKEND_BY_DTYPE = {
+    "bfloat16": {"flashmla_sparse"},
+    "fp8_e4m3": {"flashmla_kv"},
+}
+
+
 def validate_double_sparsity(server_args: "ServerArgs") -> None:
     """Validate ``--enable-double-sparsity`` constraints.
 
-    Called from ``ServerArgs._handle_other_validations`` after
-    ``validate_hisparse``. The early-return semantics keep this safe to call
-    unconditionally.
+    Called from ``ServerArgs.check_server_args`` after ``validate_hisparse``.
+    The early-return semantics keep this safe to call unconditionally.
     """
 
     if not getattr(server_args, "enable_double_sparsity", False):
@@ -76,18 +91,123 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
+    # Page size pairing (config vs server) + supported set.
     server_page_size = getattr(server_args, "page_size", None)
+    if config.page_size not in _SUPPORTED_PAGE_SIZES:
+        raise ValueError(
+            f"Double Sparsity page_size={config.page_size} is not supported. "
+            f"Supported values: {_SUPPORTED_PAGE_SIZES}."
+        )
     if server_page_size is not None and config.page_size != server_page_size:
         raise ValueError(
             f"Double Sparsity config page_size={config.page_size} does not match "
             f"--page-size={server_page_size}. The two must agree at startup."
         )
 
+    # Backend / KV dtype pairing (AC-3).
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
+    if kv_cache_dtype in ("auto", None):
+        # The model's default dtype is resolved later; let the runtime decide.
+        pass
+    elif kv_cache_dtype not in _BACKEND_BY_DTYPE:
+        raise ValueError(
+            f"Double Sparsity requires --kv-cache-dtype in {sorted(_BACKEND_BY_DTYPE)}, "
+            f"got {kv_cache_dtype!r}."
+        )
+    else:
+        allowed = _BACKEND_BY_DTYPE[kv_cache_dtype]
+        for attr, label in (
+            ("nsa_prefill_backend", "prefill"),
+            ("nsa_decode_backend", "decode"),
+        ):
+            backend = getattr(server_args, attr, None)
+            if backend is not None and backend not in allowed:
+                raise ValueError(
+                    f"Double Sparsity with --kv-cache-dtype={kv_cache_dtype} requires "
+                    f"--nsa-{label}-backend in {sorted(allowed)}, but got {backend!r}."
+                )
+
+    # Capability check (DEC-10): the running model must expose the NSA Indexer
+    # hook surface that Double Sparsity replaces. is_deepseek_nsa() recognises
+    # DeepSeek V3.2 today; GLM-5.1 should also pass once it ships the same
+    # interface (DEC-6 deferred-but-hard requirement).
+    if _has_method(server_args, "get_model_config"):
+        try:
+            hf_config = server_args.get_model_config().hf_config  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Double Sparsity capability check could not resolve hf_config: %s",
+                exc,
+            )
+            hf_config = None
+        if hf_config is not None:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            if not is_deepseek_nsa(hf_config):
+                raise ValueError(
+                    "Double Sparsity currently requires a model that exposes the NSA "
+                    "Indexer hook surface (e.g. DeepSeek V3.2). The capability check "
+                    "via is_deepseek_nsa(hf_config) returned False for this model. "
+                    "Note: this generalizes to GLM-5.1 once it ships the same "
+                    "indexer interface (DEC-6 / DEC-10)."
+                )
+
+    # Channel-mask file existence + content-hash verification.
+    if not os.path.isfile(config.channel_mask_path):
+        raise FileNotFoundError(
+            f"channel mask file required by Double Sparsity not found at "
+            f"{config.channel_mask_path!r}. Produce it via "
+            "'python -m sglang.srt.layers.attention.double_sparsity.calibrate' "
+            "or point --double-sparsity-config['channel_mask_path'] at a valid file."
+        )
+    from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+        load_channel_mask,
+    )
+
+    mask = load_channel_mask(config.channel_mask_path)
+
+    # Cross-check mask vs runtime config (dtype / page_size / label_dim). The
+    # head_dim check is best-effort: the running attention layer is the
+    # authoritative head_dim, but it's not yet constructed here, so we
+    # accept the mask's recorded head_dim if it is internally consistent.
+    if kv_cache_dtype not in (None, "auto") and mask.dtype != kv_cache_dtype:
+        raise ValueError(
+            f"channel mask dtype={mask.dtype!r} does not match "
+            f"--kv-cache-dtype={kv_cache_dtype!r}."
+        )
+    if server_page_size is not None and mask.page_size != server_page_size:
+        raise ValueError(
+            f"channel mask page_size={mask.page_size} does not match "
+            f"--page-size={server_page_size}."
+        )
+
+    # DEC-2 radix-cache permission. Default: refuse until the M3-B page-
+    # stability fixture has been recorded as passing for this configuration.
+    # Developers can override with SGLANG_DS_RADIX_OVERRIDE=1.
+    if not getattr(server_args, "disable_radix_cache", True):
+        fixture_passed = bool(
+            getattr(server_args, "_double_sparsity_radix_fixture_passed", False)
+        )
+        if not fixture_passed and os.environ.get(
+            "SGLANG_DS_RADIX_OVERRIDE"
+        ) != "1":
+            raise ValueError(
+                "Double Sparsity requires --disable-radix-cache until the "
+                "M3-B page-stability fixture has been recorded as passing "
+                "(server_args._double_sparsity_radix_fixture_passed = True). "
+                "Set SGLANG_DS_RADIX_OVERRIDE=1 to override during development."
+            )
+
     if os.environ.get("SGLANG_DS_ALLOW_PLACEHOLDER") != "1":
         logger.warning(
-            "Double Sparsity selector is still the placeholder implementation. "
-            "Set SGLANG_DS_ALLOW_PLACEHOLDER=1 for explicit test runs; production "
-            "serving will be refused until the real selection kernels land."
+            "Double Sparsity selector may still be the placeholder implementation. "
+            "Production serving will be refused at the layer-level guard until the "
+            "real selection kernels land."
         )
 
     setattr(server_args, "_double_sparsity_parsed_config", config)
+    setattr(server_args, "_double_sparsity_channel_mask", mask)
+
+
+def _has_method(obj, name: str) -> bool:
+    return callable(getattr(obj, name, None))

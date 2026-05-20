@@ -206,19 +206,35 @@ class TestValidator(unittest.TestCase):
         self.assertIn("page_size", str(ctx.exception))
 
     def test_valid_path(self):
-        args = self._args(
-            enable_double_sparsity=True,
-            double_sparsity_config=_valid_payload(),
-            page_size=64,
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
         )
-        os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
-        try:
-            validate_double_sparsity(args)
-            self.assertIsInstance(
-                args._double_sparsity_parsed_config, DoubleSparsityConfig
+        import tempfile, os as _os
+        sel_t = torch.randint(0, 512, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                path, sel_t, w_t, dtype="fp8_e4m3", head_dim=128, page_size=64,
+                label_dim=16, created_at="2026-05-20T00:00:00Z",
             )
-        finally:
-            os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+            args = self._args(
+                enable_double_sparsity=True,
+                double_sparsity_config=_valid_payload(path),
+                page_size=64,
+                kv_cache_dtype="fp8_e4m3",
+                nsa_prefill_backend="flashmla_kv",
+                nsa_decode_backend="flashmla_kv",
+                disable_radix_cache=True,
+            )
+            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            try:
+                validate_double_sparsity(args)
+                self.assertIsInstance(
+                    args._double_sparsity_parsed_config, DoubleSparsityConfig
+                )
+            finally:
+                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
 
 
 class TestPlaceholderGuard(unittest.TestCase):
@@ -331,6 +347,387 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
                 forward_batch=forward_batch,
                 layer_id=0,
             )
+
+
+class TestChannelMaskLoader(unittest.TestCase):
+    def _make_payload(self, *, L=4, H=4, label_dim=16):
+        sel = torch.randint(0, 512, (L, H, label_dim), dtype=torch.int32)
+        w = torch.randn(L, H, label_dim, dtype=torch.float32)
+        return sel, w
+
+    def test_roundtrip(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+            load_channel_mask,
+        )
+        import tempfile, os
+        sel, w = self._make_payload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cm.safetensors")
+            h = save_channel_mask(
+                path, sel, w, dtype="fp8_e4m3", head_dim=128, page_size=64,
+                label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            cm = load_channel_mask(path)
+        self.assertEqual(cm.content_sha256, h)
+        self.assertEqual(cm.dtype, "fp8_e4m3")
+        self.assertEqual(cm.head_dim, 128)
+        self.assertEqual(cm.page_size, 64)
+        self.assertEqual(cm.label_dim, 16)
+        self.assertTrue(torch.equal(cm.channel_selection, sel))
+
+    def test_content_hash_mismatch(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask, load_channel_mask, compute_content_sha256,
+        )
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        import tempfile, os
+        sel, w = self._make_payload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                path, sel, w, dtype="fp8_e4m3", head_dim=128, page_size=64,
+                label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            # Tamper: rewrite with a metadata content_sha256 from a different payload.
+            tampered_sel = sel.clone()
+            tampered_sel[0, 0, 0] = 999
+            tampered_hash = compute_content_sha256(tampered_sel, w)
+            # Read original metadata then resave with bogus hash
+            with safe_open(path, framework="pt") as f:
+                tensors = {k: f.get_tensor(k) for k in f.keys()}
+                md = dict(f.metadata() or {})
+            md["content_sha256"] = tampered_hash
+            save_file(tensors, path, metadata=md)
+            with self.assertRaises(ValueError) as ctx:
+                load_channel_mask(path)
+            self.assertIn("hash mismatch", str(ctx.exception))
+
+    def test_missing_file(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            load_channel_mask,
+        )
+        with self.assertRaises(FileNotFoundError):
+            load_channel_mask("/nonexistent/path.safetensors")
+
+    def test_validate_runtime_mismatches(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, validate_against_runtime,
+        )
+        mask = ChannelMask(
+            channel_selection=torch.zeros(2, 2, 4, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 2, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        validate_against_runtime(
+            mask,
+            server_kv_cache_dtype="fp8_e4m3",
+            server_page_size=64,
+            server_label_dim=4,
+            model_head_dim=128,
+        )
+        with self.assertRaises(ValueError):
+            validate_against_runtime(
+                mask, server_kv_cache_dtype="bfloat16",
+                server_page_size=64, server_label_dim=4, model_head_dim=128,
+            )
+
+    def test_sanity_probe_placeholder_inconclusive(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, startup_sanity_probe,
+        )
+        mask = ChannelMask(
+            channel_selection=torch.zeros(2, 2, 4, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 2, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        selector = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        r = startup_sanity_probe(mask, selector)
+        self.assertFalse(r.passed)
+        self.assertEqual(r.skipped_reason, "placeholder_selector")
+
+
+class TestPageSignatureTableLifecycle(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        self.table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=32, num_heads_local=4, label_dim=16,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+
+    def test_assign_populate_free(self):
+        self.table.on_pages_assigned(0, [3, 7])
+        self.table.mark_populated(0, [3, 7])
+        self.assertTrue(bool(self.table.valid_mask[0, 3].item()))
+        self.assertTrue(bool(self.table.valid_mask[0, 7].item()))
+        self.table.on_page_freed(0, 7)
+        self.assertFalse(bool(self.table.valid_mask[0, 7].item()))
+
+    def test_evict_idempotent(self):
+        self.table.on_pages_assigned(1, [5])
+        self.table.mark_populated(1, [5])
+        self.table.on_page_evicted(1, 5)
+        self.table.on_page_evicted(1, 5)  # idempotent
+        self.assertFalse(bool(self.table.valid_mask[1, 5].item()))
+
+    def test_hot_page_clears_on_free(self):
+        self.table.set_hot_page(0, 11)
+        self.assertEqual(self.table.get_hot_page(0), 11)
+        self.table.on_page_freed(0, 11)
+        self.assertIsNone(self.table.get_hot_page(0))
+
+    def test_estimate_hbm_bytes(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            estimate_hbm_bytes,
+        )
+        b = estimate_hbm_bytes(
+            num_layers_local=60, max_pages=15_625, num_heads_local=16,
+            label_dim=16, dtype=torch.float16,
+        )
+        # within ±10% of the documented 480 MB budget
+        self.assertGreater(b, 400 * 1024 * 1024)
+        self.assertLess(b, 520 * 1024 * 1024)
+
+
+class TestSelectionKernel(unittest.TestCase):
+    def test_project_query(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            project_query_onto_channels,
+        )
+        queries = torch.randn(2, 4, 16)
+        sel = torch.randint(0, 16, (4, 8), dtype=torch.int32)
+        w = torch.randn(4, 8, dtype=torch.float32)
+        out = project_query_onto_channels(queries, sel, w)
+        self.assertEqual(tuple(out.shape), (2, 4, 8))
+
+    def test_invalid_pages_excluded(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            compute_page_scores, select_topk_sequence_order,
+        )
+        torch.manual_seed(11)
+        L, P, H, D = 2, 8, 4, 4
+        queries = torch.randn(2, H, 16)
+        sigs = torch.randn(L, P, H, D, dtype=torch.float16)
+        vmask = torch.ones(L, P, dtype=torch.bool)
+        vmask[0, 2] = False
+        sel = torch.randint(0, 16, (L, H, D), dtype=torch.int32)
+        w = torch.randn(L, H, D, dtype=torch.float32)
+        scores = compute_page_scores(queries, sigs, vmask, sel, w, layer_id=0)
+        idx, lens = select_topk_sequence_order(scores, max_top_k=4)
+        for r in range(2):
+            self.assertNotIn(2, idx[r, : lens[r]].tolist())
+
+    def test_hot_page_overrides_invalid(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            select_topk_sequence_order,
+        )
+        scores = torch.full((1, 8), -1e9, dtype=torch.float32)
+        scores[0, 5] = 0.5  # one valid
+        scores[0, 2] = float("-inf")  # invalid
+        idx, lens = select_topk_sequence_order(scores.clone(), max_top_k=3, hot_pages=[[2]])
+        # Hot page 2 was -inf and we want it forced in.
+        # Note: per the kernel, hot pages set score to +inf which forces them in.
+        row = idx[0, : lens[0]].tolist()
+        self.assertIn(2, row)
+
+    def test_ascending_invariant(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            select_topk_sequence_order,
+        )
+        torch.manual_seed(7)
+        scores = torch.randn(3, 16)
+        idx, lens = select_topk_sequence_order(scores, max_top_k=6)
+        for r in range(3):
+            row = idx[r, : lens[r]].tolist()
+            self.assertTrue(
+                all(row[i] < row[i + 1] for i in range(len(row) - 1)),
+                f"row {r} not ascending: {row}",
+            )
+
+    def test_all_reduce_noop_without_group(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            all_reduce_page_scores,
+        )
+        x = torch.randn(8)
+        y = all_reduce_page_scores(x, process_group=None)
+        self.assertTrue(torch.equal(x, y))
+
+
+class TestPageSignatureWrite(unittest.TestCase):
+    def test_dequant_per_tile(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            dequant_nope_fp8_to_bf16,
+        )
+        torch.manual_seed(0)
+        n = 4
+        nope_fp8 = torch.randn(n, 512).to(torch.float8_e4m3fn)
+        scales = torch.rand(n, 4) * 2.0
+        u8 = torch.zeros(n, 528, dtype=torch.uint8)
+        u8[:, :512] = nope_fp8.view(torch.uint8)
+        u8[:, 512:].view(torch.float32)[:, :] = scales.contiguous()
+        bf16 = dequant_nope_fp8_to_bf16(u8)
+        self.assertEqual(tuple(bf16.shape), (n, 512))
+        # Tolerance accommodates bf16 rounding noise; max observed ~0.015.
+        ref0 = nope_fp8[0, :128].to(torch.float32) * scales[0, 0]
+        got0 = bf16[0, :128].to(torch.float32)
+        self.assertTrue(torch.allclose(got0, ref0, atol=5e-2))
+
+    def test_compute_hot_pages(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            compute_hot_pages,
+        )
+        seq_lens = torch.tensor([0, 100, 200, 320], dtype=torch.int32)
+        hot = compute_hot_pages(seq_lens=seq_lens, page_size=64, local_window=2)
+        # 0 → []
+        # 100 → last=1, window=2: [0,1]
+        # 200 → last=3, window=2: [2,3]
+        # 320 → last=4, window=2: [3,4]
+        self.assertEqual(hot, [[], [0, 1], [2, 3], [3, 4]])
+
+    def test_project_page_signature(self):
+        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
+            project_page_to_signature,
+        )
+        nope = torch.randn(8, 512, dtype=torch.bfloat16)
+        sel = torch.randint(0, 512, (4, 16), dtype=torch.int32)
+        w = torch.randn(4, 16, dtype=torch.float32)
+        sig = project_page_to_signature(nope, sel, w, reduce="mean")
+        self.assertEqual(tuple(sig.shape), (4, 16))
+
+
+class TestSelectorRealMode(unittest.TestCase):
+    def test_bind_runtime_data_flips_placeholder(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        self.assertTrue(sel.IS_PLACEHOLDER)
+        table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=16, num_heads_local=4, label_dim=16,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+        mask = ChannelMask(
+            channel_selection=torch.zeros(2, 4, 16, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 4, 16, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=16, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+        self.assertFalse(sel.IS_PLACEHOLDER)
+
+    def test_real_mode_topk_uses_signatures(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=16, num_heads_local=4, label_dim=16,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+        table.signatures.uniform_(-1, 1)
+        table.valid_mask.fill_(True)
+        mask = ChannelMask(
+            channel_selection=torch.randint(0, 128, (2, 4, 16), dtype=torch.int32),
+            channel_weights=torch.randn(2, 4, 16, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=16, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+
+        queries = torch.randn(2, 4, 128)
+        req_pool = torch.tensor([0, 1], dtype=torch.int32)
+        seq_lens = torch.tensor([500, 320], dtype=torch.int32)
+        sparse_mask = torch.ones(2, 16, dtype=torch.int32)
+        indices, lengths = sel.retrieve_topk(
+            queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=sparse_mask, seq_lens=seq_lens,
+        )
+        # max_top_k=2048 from default _valid_payload; output shape matches
+        self.assertEqual(tuple(indices.shape), (2, 2048))
+
+
+class TestMetrics(unittest.TestCase):
+    def test_meta_info_shape(self):
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        stats = m.DoubleSparsityRequestStats(
+            sparsity_rate=0.0625, selected_pages=128, dense_fallback=0
+        )
+        info = m.meta_info_for_request(stats)
+        self.assertEqual(set(info.keys()), {"sparsity_rate", "selected_pages", "dense_fallback"})
+        self.assertAlmostEqual(info["sparsity_rate"], 0.0625)
+        self.assertEqual(info["selected_pages"], 128)
+        self.assertEqual(info["dense_fallback"], 0)
+
+    def test_record_selection_increments_counters(self):
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        m.reset_for_testing()
+        m.record_selection(selected_pages=10, total_valid_pages=100)
+        m.record_selection(selected_pages=20, total_valid_pages=100)
+        # Best-effort: if prometheus_client unavailable, metrics are no-ops.
+        if "selected_pages_sum" in m._metric_objs:
+            sps = m._metric_objs["selected_pages_sum"]._value.get()
+            cnt = m._metric_objs["selected_pages_count"]._value.get()
+            self.assertEqual(sps, 30)
+            self.assertEqual(cnt, 2)
+
+
+class TestCUDAGraphCapture(unittest.TestCase):
+    def test_allocate_state_shapes(self):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        s = allocate_graph_state(
+            max_bs=4, max_top_k=8, num_score_blocks=2, partial_topk=3,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(tuple(s.selected_indices.shape), (4, 8))
+        self.assertEqual(tuple(s.valid_lengths.shape), (4,))
+        self.assertEqual(tuple(s.scratch_partial_scores.shape), (4, 2, 3))
+        self.assertTrue(torch.all(s.selected_indices == -1).item())
+
+    def test_eager_replay_on_cpu(self):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        state = allocate_graph_state(
+            max_bs=2, max_top_k=2048, device=torch.device("cpu"),
+        )
+        queries = torch.zeros(2, 4, 128)
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            sparse_mask=torch.ones(2, 16, dtype=torch.int32),
+            seq_lens=torch.tensor([200, 320], dtype=torch.int32),
+        )
+        idx1, lens1 = replay()
+        idx2, lens2 = replay()
+        self.assertTrue(torch.equal(idx1, idx2))
+        self.assertTrue(torch.equal(lens1, lens2))
 
 
 if __name__ == "__main__":

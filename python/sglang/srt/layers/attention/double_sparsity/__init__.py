@@ -5,9 +5,22 @@ branch. Does NOT register with the HiSparse algorithm registry, does NOT
 require ``--enable-hisparse``, and does NOT require PD-disaggregation.
 """
 
+from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+    ChannelMask,
+    SanityProbeResult,
+    load_channel_mask,
+    save_channel_mask,
+    startup_sanity_probe,
+    validate_against_runtime,
+)
 from sglang.srt.layers.attention.double_sparsity.config import (
     DoubleSparsityConfig,
     parse_double_sparsity_config,
+)
+from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+    PageSignatureTable,
+    allocate_page_signature_table,
+    estimate_hbm_bytes,
 )
 from sglang.srt.layers.attention.double_sparsity.selector import (
     DoubleSparsitySelector,
@@ -17,8 +30,17 @@ from sglang.srt.layers.attention.double_sparsity.validator import (
 )
 
 __all__ = [
+    "ChannelMask",
     "DoubleSparsityConfig",
     "DoubleSparsitySelector",
+    "PageSignatureTable",
+    "SanityProbeResult",
+    "allocate_page_signature_table",
+    "estimate_hbm_bytes",
+    "load_channel_mask",
     "parse_double_sparsity_config",
+    "save_channel_mask",
+    "startup_sanity_probe",
+    "validate_against_runtime",
     "validate_double_sparsity",
 ]

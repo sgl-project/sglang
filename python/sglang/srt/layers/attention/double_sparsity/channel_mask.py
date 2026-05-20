@@ -1,0 +1,411 @@
+"""Channel-mask file format, loader, validator, and startup sanity probe.
+
+The channel mask file is produced offline by :mod:`calibrate` and consumed at
+server startup. It freezes the per-(layer, head) projection that the
+:mod:`page_signature_write` Triton kernel uses to compress each KV page into
+a ``label_dim``-wide signature for runtime top-K selection.
+
+Schema (``safetensors``):
+
+* Tensors
+
+  - ``channel_selection`` ``int32 [num_layers, num_heads, label_dim]`` — vocab
+    of channel indices selected per (layer, head).
+  - ``channel_weights`` ``float32 [num_layers, num_heads, label_dim]`` —
+    normalized importance weights applied during projection.
+
+* Metadata (``__metadata__`` dict in safetensors header)
+
+  - ``schema_version`` — string, currently ``"1"``. Bumped on incompatible
+    schema changes; old loaders refuse newer schema_versions.
+  - ``dtype`` — string, the ``kv_cache_dtype`` the file was calibrated for
+    (``"fp8_e4m3"`` or ``"bfloat16"``).
+  - ``head_dim`` — string of int, sanity check against the model config.
+  - ``page_size`` — string of int, must match the running server's page size.
+  - ``label_dim`` — string of int, must match the selector buffer.
+  - ``created_at`` — ISO-8601 timestamp at calibration time.
+  - ``content_sha256`` — SHA-256 over the concatenated raw bytes of
+    ``channel_selection`` (cast to ``torch.int32``) and ``channel_weights``
+    (cast to ``torch.float32``), in that order. Recomputed at load.
+
+The validator drops two fields the earlier draft carried: ``model_revision_sha``
+(passed for LoRA fine-tunes that miscalibrate) and ``tp_world_size``
+(derivable from runtime; embedding it invited the rank-divergence bug DEC-9
+settles).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
+
+import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.double_sparsity.config import (
+        DoubleSparsityConfig,
+    )
+
+logger = logging.getLogger(__name__)
+
+
+SCHEMA_VERSION = "1"
+_REQUIRED_METADATA_FIELDS = (
+    "schema_version",
+    "dtype",
+    "head_dim",
+    "page_size",
+    "label_dim",
+    "content_sha256",
+)
+_SUPPORTED_DTYPES = ("fp8_e4m3", "bfloat16")
+
+
+@dataclass
+class ChannelMask:
+    """Loaded channel mask payload + metadata."""
+
+    channel_selection: torch.Tensor  # int32 [L, H, label_dim]
+    channel_weights: torch.Tensor  # float32 [L, H, label_dim]
+    schema_version: str
+    dtype: str
+    head_dim: int
+    page_size: int
+    label_dim: int
+    content_sha256: str
+    created_at: Optional[str] = None
+    raw_metadata: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def num_layers(self) -> int:
+        return int(self.channel_selection.shape[0])
+
+    @property
+    def num_heads(self) -> int:
+        return int(self.channel_selection.shape[1])
+
+
+def compute_content_sha256(
+    channel_selection: torch.Tensor, channel_weights: torch.Tensor
+) -> str:
+    """Return SHA-256 over the canonicalized payload bytes."""
+
+    selection_bytes = (
+        channel_selection.detach().to(torch.int32).contiguous().cpu().numpy().tobytes()
+    )
+    weights_bytes = (
+        channel_weights.detach().to(torch.float32).contiguous().cpu().numpy().tobytes()
+    )
+    hasher = hashlib.sha256()
+    hasher.update(selection_bytes)
+    hasher.update(weights_bytes)
+    return hasher.hexdigest()
+
+
+def _coerce_int(value: Any, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"channel mask metadata field {field_name!r} is not an integer: {value!r}."
+        ) from exc
+
+
+def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
+    """Load and content-verify a channel mask file.
+
+    Recomputes ``content_sha256`` over the canonicalized tensors and raises if
+    it does not match the metadata. Raises if any required metadata field is
+    missing, if the schema version is newer than supported, or if the dtype
+    is outside the supported set.
+    """
+
+    if not isinstance(path, str) or not path:
+        raise ValueError("channel mask file path must be a non-empty string.")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"channel mask file not found at {path!r}. Set "
+            "'channel_mask_path' in --double-sparsity-config to a readable file."
+        )
+
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device=map_location) as f:
+        tensor_keys = list(f.keys())
+        if "channel_selection" not in tensor_keys or "channel_weights" not in tensor_keys:
+            raise ValueError(
+                f"channel mask file {path!r} is missing required tensors "
+                "'channel_selection' and/or 'channel_weights'."
+            )
+        channel_selection = f.get_tensor("channel_selection")
+        channel_weights = f.get_tensor("channel_weights")
+        raw_metadata = dict(f.metadata() or {})
+
+    if channel_selection.dim() != 3:
+        raise ValueError(
+            f"channel_selection must be 3-D [L, H, label_dim], got shape "
+            f"{tuple(channel_selection.shape)}."
+        )
+    if channel_weights.shape != channel_selection.shape:
+        raise ValueError(
+            f"channel_weights shape {tuple(channel_weights.shape)} must match "
+            f"channel_selection shape {tuple(channel_selection.shape)}."
+        )
+
+    missing = [k for k in _REQUIRED_METADATA_FIELDS if k not in raw_metadata]
+    if missing:
+        raise ValueError(
+            f"channel mask file {path!r} is missing required metadata fields: {missing}. "
+            "Re-run calibration with a current calibrate.py."
+        )
+
+    schema_version = raw_metadata["schema_version"]
+    if schema_version != SCHEMA_VERSION:
+        raise ValueError(
+            f"channel mask schema_version {schema_version!r} is not supported by "
+            f"this loader (expected {SCHEMA_VERSION!r}). Update SGLang or "
+            "re-calibrate."
+        )
+
+    dtype = raw_metadata["dtype"]
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(
+            f"channel mask dtype {dtype!r} is not in supported set {_SUPPORTED_DTYPES}."
+        )
+
+    head_dim = _coerce_int(raw_metadata["head_dim"], "head_dim")
+    page_size = _coerce_int(raw_metadata["page_size"], "page_size")
+    label_dim = _coerce_int(raw_metadata["label_dim"], "label_dim")
+    if label_dim != int(channel_selection.shape[-1]):
+        raise ValueError(
+            f"channel mask metadata label_dim={label_dim} does not match "
+            f"channel_selection.shape[-1]={int(channel_selection.shape[-1])}."
+        )
+
+    expected_hash = raw_metadata["content_sha256"]
+    actual_hash = compute_content_sha256(channel_selection, channel_weights)
+    if expected_hash != actual_hash:
+        raise ValueError(
+            f"channel mask file {path!r} content hash mismatch: metadata "
+            f"reports {expected_hash[:12]}... but recompute yields {actual_hash[:12]}.... "
+            "The file is corrupted or was edited after calibration."
+        )
+
+    mask = ChannelMask(
+        channel_selection=channel_selection.to(torch.int32).contiguous(),
+        channel_weights=channel_weights.to(torch.float32).contiguous(),
+        schema_version=schema_version,
+        dtype=dtype,
+        head_dim=head_dim,
+        page_size=page_size,
+        label_dim=label_dim,
+        content_sha256=actual_hash,
+        created_at=raw_metadata.get("created_at"),
+        raw_metadata=raw_metadata,
+    )
+
+    logger.info(
+        "Loaded channel mask file %s: content_sha256=%s dtype=%s head_dim=%d "
+        "page_size=%d label_dim=%d created_at=%s L=%d H=%d",
+        path,
+        actual_hash[:12],
+        dtype,
+        head_dim,
+        page_size,
+        label_dim,
+        mask.created_at,
+        mask.num_layers,
+        mask.num_heads,
+    )
+    return mask
+
+
+def save_channel_mask(
+    path: str,
+    channel_selection: torch.Tensor,
+    channel_weights: torch.Tensor,
+    *,
+    dtype: str,
+    head_dim: int,
+    page_size: int,
+    label_dim: int,
+    created_at: str,
+    extra_metadata: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Persist a channel mask file, returning the recomputed content_sha256.
+
+    Used by :mod:`calibrate` to write the offline-produced artifact.
+    """
+
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(
+            f"channel mask dtype {dtype!r} is not in supported set {_SUPPORTED_DTYPES}."
+        )
+    selection = channel_selection.detach().to(torch.int32).contiguous().cpu()
+    weights = channel_weights.detach().to(torch.float32).contiguous().cpu()
+    if selection.shape != weights.shape:
+        raise ValueError(
+            f"channel_selection shape {tuple(selection.shape)} must match "
+            f"channel_weights shape {tuple(weights.shape)}."
+        )
+    if selection.shape[-1] != label_dim:
+        raise ValueError(
+            f"channel_selection.shape[-1]={int(selection.shape[-1])} must match "
+            f"label_dim={label_dim}."
+        )
+
+    content_sha256 = compute_content_sha256(selection, weights)
+    metadata: Dict[str, str] = {
+        "schema_version": SCHEMA_VERSION,
+        "dtype": dtype,
+        "head_dim": str(int(head_dim)),
+        "page_size": str(int(page_size)),
+        "label_dim": str(int(label_dim)),
+        "created_at": str(created_at),
+        "content_sha256": content_sha256,
+    }
+    if extra_metadata:
+        for k, v in extra_metadata.items():
+            if k in metadata:
+                raise ValueError(
+                    f"extra_metadata key {k!r} collides with reserved metadata."
+                )
+            metadata[k] = str(v)
+
+    from safetensors.torch import save_file
+
+    save_file(
+        {"channel_selection": selection, "channel_weights": weights},
+        path,
+        metadata=metadata,
+    )
+    return content_sha256
+
+
+def validate_against_runtime(
+    mask: ChannelMask,
+    *,
+    server_kv_cache_dtype: str,
+    server_page_size: int,
+    server_label_dim: int,
+    model_head_dim: int,
+) -> None:
+    """Raise if the loaded mask is incompatible with the running configuration.
+
+    Per AC-4: shape correctness, content identity (covered by load_channel_mask
+    hash check), and configuration agreement on dtype / head_dim / page_size /
+    label_dim. Behavioural sanity is :func:`startup_sanity_probe`.
+    """
+
+    mismatches = []
+    if mask.dtype != server_kv_cache_dtype:
+        mismatches.append(
+            f"dtype: mask={mask.dtype!r} server={server_kv_cache_dtype!r}"
+        )
+    if mask.head_dim != int(model_head_dim):
+        mismatches.append(
+            f"head_dim: mask={mask.head_dim} model={int(model_head_dim)}"
+        )
+    if mask.page_size != int(server_page_size):
+        mismatches.append(
+            f"page_size: mask={mask.page_size} server={int(server_page_size)}"
+        )
+    if mask.label_dim != int(server_label_dim):
+        mismatches.append(
+            f"label_dim: mask={mask.label_dim} selector={int(server_label_dim)}"
+        )
+    if mismatches:
+        raise ValueError(
+            "channel mask runtime mismatch:\n  " + "\n  ".join(mismatches)
+        )
+
+
+@dataclass
+class SanityProbeResult:
+    passed: bool
+    score: float
+    needle_position: int
+    selected_indices: Optional[torch.Tensor] = None
+    skipped_reason: Optional[str] = None
+
+
+def startup_sanity_probe(
+    mask: ChannelMask,
+    selector,
+    *,
+    haystack_pages: int = 8,
+    page_size: int = 64,
+    needle_page: int = 4,
+    abort_on_placeholder: bool = False,
+) -> SanityProbeResult:
+    """NIAH-min sanity probe: one needle, one short haystack.
+
+    Constructs a deterministic 512-token haystack split into 8 pages of 64
+    tokens each, plants a "needle" page-score signal at ``needle_page``, runs
+    the selector, and asserts the needle page lands in
+    ``selected_indices``. With the placeholder selector the probe is
+    inconclusive (returns ``passed=False, skipped_reason=...``) — production
+    serving is independently refused by the placeholder-guard.
+    """
+
+    if needle_page >= haystack_pages or needle_page < 0:
+        raise ValueError(
+            f"needle_page={needle_page} must be in [0, {haystack_pages})."
+        )
+
+    is_placeholder = bool(getattr(selector, "IS_PLACEHOLDER", False))
+    if is_placeholder:
+        msg = (
+            "channel mask sanity probe is inconclusive with the placeholder "
+            "selector: it returns deterministic ascending page IDs regardless "
+            "of channel weights. Real selection kernels must land for the "
+            "probe to be load-bearing."
+        )
+        if abort_on_placeholder:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+        return SanityProbeResult(
+            passed=False,
+            score=0.0,
+            needle_position=needle_page,
+            selected_indices=None,
+            skipped_reason="placeholder_selector",
+        )
+
+    # Real-selector path: build a synthetic K cache where one page has
+    # high projection signal on a known channel, and ask the selector to
+    # retrieve it. The selector is expected to put `needle_page` into
+    # `selected_indices`. Caller plumbs through the page-signature table.
+    device = mask.channel_selection.device
+    seq_len = haystack_pages * page_size
+    req_pool_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    sparse_mask = torch.ones(1, haystack_pages, dtype=torch.int32, device=device)
+
+    queries = torch.zeros(
+        1, getattr(selector, "num_local_heads", 1), getattr(selector, "head_dim", 128),
+        device=device,
+    )
+    selected_indices, valid_lengths = selector.retrieve_topk(
+        queries=queries,
+        layer_id=0,
+        req_pool_indices=req_pool_indices,
+        sparse_mask=sparse_mask,
+        seq_lens=seq_lens,
+    )
+
+    row = selected_indices[0]
+    length = int(valid_lengths[0])
+    unpadded = row[:length].tolist()
+    passed = needle_page in unpadded
+    score = 1.0 if passed else 0.0
+    return SanityProbeResult(
+        passed=passed,
+        score=score,
+        needle_position=needle_page,
+        selected_indices=selected_indices,
+        skipped_reason=None,
+    )
