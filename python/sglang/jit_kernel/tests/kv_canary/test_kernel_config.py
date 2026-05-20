@@ -16,6 +16,7 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
+from sglang.jit_kernel.tests.kv_canary._fixtures import _empty_extras
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -197,17 +198,6 @@ def _build_plan_fixtures(
     else:
         req_to_token = req_to_token_int32
     return fb_req_pool_indices, fb_prefix_lens, fb_extend_seq_lens, req_to_token
-
-
-def _empty_extras(
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-    )
 
 
 def _make_extras(
@@ -430,7 +420,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
             fb_prefix_lens=fb_prefix,
             fb_extend_seq_lens=fb_extend,
             req_to_token=req_to_token,
-            extras=_empty_extras(_DEVICE),
+            extras=_empty_extras(),
         )
 
         _assert_plan_equal(
@@ -534,7 +524,7 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
             device=_DEVICE,
         )
     else:
-        extras = _empty_extras(_DEVICE)
+        extras = _empty_extras()
 
     triton_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE)
     triton_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE)

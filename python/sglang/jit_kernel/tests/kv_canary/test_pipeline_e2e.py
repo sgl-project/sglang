@@ -17,7 +17,11 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
-from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _empty_extras,
+    clone_real_kv_sources,
+    make_req_to_token,
+)
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -33,21 +37,6 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _DEVICE = torch.device("cuda")
-
-
-def _build_req_to_token(*, max_reqs: int, max_seq_len: int) -> torch.Tensor:
-    rp_axis = torch.arange(max_reqs, device=_DEVICE, dtype=torch.int32).unsqueeze(1)
-    pos_axis = torch.arange(max_seq_len, device=_DEVICE, dtype=torch.int32).unsqueeze(0)
-    return (rp_axis * max_seq_len + pos_axis).contiguous()
-
-
-def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-    )
 
 
 def _run_pipeline(
@@ -242,7 +231,7 @@ def _run_both_and_assert_pipeline_equal(
 def test_pipeline_basic_5_step_single_req() -> None:
     """Single req, prefix_len=0, extend_seq_len=5: basic plan→write→verify byte-equal."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([5], dtype=torch.int32, device=_DEVICE)
@@ -278,7 +267,7 @@ def test_pipeline_basic_5_step_single_req() -> None:
 def test_pipeline_multi_req_mixed_extend_decode() -> None:
     """bs=3: pure extend req, decode req (prefix+1 extend), and padding sentinel row."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=8, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=8, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1, 2, 0], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0, 5, 0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([4, 1, 0], dtype=torch.int32, device=_DEVICE)
@@ -317,7 +306,7 @@ def test_pipeline_swa_window() -> None:
     max_seq_len = 16
     num_slots_full = 64
     max_reqs = 4
-    req_to_token = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE)
 
     swa_window_size = 4
     full_pool_size = max_reqs * max_seq_len
@@ -358,7 +347,7 @@ def test_pipeline_swa_window() -> None:
 def test_pipeline_sweep_no_write() -> None:
     """All extend_seq_lens=0: write_step is no-op, verify sweeps prefix, buf unchanged."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
 
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
@@ -393,7 +382,7 @@ def test_pipeline_sweep_no_write() -> None:
 def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None:
     """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
@@ -427,7 +416,7 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None
 def test_pipeline_pseudo_mode_on_match() -> None:
     """pseudo_mode=ON, expected==actual: zero violations, buf byte-equal."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([4], dtype=torch.int32, device=_DEVICE)
@@ -468,7 +457,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
 def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
     """pseudo_mode=ON, expected tokens all wrong: write records N violations, verify does not cascade CHAIN_HASH."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([3], dtype=torch.int32, device=_DEVICE)
@@ -510,7 +499,7 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
 def test_pipeline_empty_batch() -> None:
     """bs=1 with req_pool_idx=0 (padding): write and verify are no-op, kernel_run_counter == 2 (write+verify)."""
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
@@ -540,7 +529,7 @@ def test_pipeline_negative_slot_swa_out_of_window() -> None:
     max_seq_len = 16
     max_reqs = 4
     full_pool_size = max_reqs * max_seq_len
-    req_to_token = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE)
     swa_window_size = 4
 
     full_to_swa_index_mapping = torch.arange(
@@ -579,7 +568,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     """Verify detects >capacity violations when prev_hash is pre-corrupted; write_index byte-equal, ring relaxed."""
     max_seq_len = 16
     max_reqs = 4
-    req_to_token = _build_req_to_token(max_reqs=max_reqs, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE)
     n_slots = 8
 
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
@@ -684,7 +673,7 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     """Different CanaryLaunchTag values: violation ring's kernel_kind field matches on both sides."""
 
     max_seq_len = 16
-    req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
+    req_to_token = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE)
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
     fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
