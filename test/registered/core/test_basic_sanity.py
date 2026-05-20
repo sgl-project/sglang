@@ -9,6 +9,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,17 +18,21 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
+register_cuda_ci(est_time=160, stage="base-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=160, suite="stage-a-test-1-gpu-small-amd")
 
 
 class TestBasicSanity(
     BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
+    FwdOccupancyMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    # Conservative for 5090 + Llama-3.1-8B single-batch decode; saturated
+    # multi-batch runners on H100/H200 can push the default 95.0.
+    fwd_occupancy_threshold = 90.0
 
     @classmethod
     def setUpClass(cls):
@@ -43,6 +48,7 @@ class TestBasicSanity(
                 "0.7",
                 "--enable-metrics",
             ],
+            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )
 
     @classmethod
