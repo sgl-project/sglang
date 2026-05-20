@@ -417,51 +417,39 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
     ):
-        # Construct the input messages
+        """Errors propagate to ``create_responses``, which converts the
+        expected set (``ValueError`` / ``TypeError`` / ``RuntimeError`` /
+        ``jinja2.TemplateError``) into proper error responses. A previous
+        fallback to ad-hoc ``"{role}: {content}\\n"`` concatenation silently
+        degraded multimodal / tool / template output and is intentionally
+        gone.
+        """
         messages = self._construct_input_messages(request, prev_response)
 
-        # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
-        processed_messages: Optional[MessageProcessingResult] = None
-        try:
-            # Convert ResponsesRequest to ChatCompletionRequest for processing
-            chat_tools = self._response_tools_to_chat_tools(request)
-            chat_request = ChatCompletionRequest(
-                model=request.model,
-                messages=messages,
-                stream=request.stream,
-                tools=chat_tools or None,
-                tool_choice=request.tool_choice if chat_tools else "none",
-                parallel_tool_calls=(
-                    request.parallel_tool_calls
-                    if request.parallel_tool_calls is not None
-                    else True
-                ),
-                stop=request.stop,
-            )
+        chat_tools = self._response_tools_to_chat_tools(request)
+        chat_request = ChatCompletionRequest(
+            model=request.model,
+            messages=messages,
+            stream=request.stream,
+            tools=chat_tools or None,
+            tool_choice=request.tool_choice if chat_tools else "none",
+            parallel_tool_calls=(
+                request.parallel_tool_calls
+                if request.parallel_tool_calls is not None
+                else True
+            ),
+            stop=request.stop,
+        )
 
-            # Follow SGLang's _process_messages pattern
-            is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-            processed_messages = self._process_messages(chat_request, is_multimodal)
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+        processed_messages = self._process_messages(chat_request, is_multimodal)
 
-            # Extract the results
-            if is_multimodal:
-                request_prompts = [processed_messages.prompt]
-                engine_prompts = [processed_messages.prompt]
-            else:
-                request_prompts = [processed_messages.prompt_ids]
-                engine_prompts = [processed_messages.prompt_ids]
-
-        except Exception as e:
-            logger.warning(f"Chat processing failed, using fallback: {e}")
-            # Fallback to simple encoding
-            prompt_text = ""
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
-            request_prompts = [prompt_ids]
-            engine_prompts = [prompt_ids]
+        if is_multimodal:
+            request_prompts = [processed_messages.prompt]
+            engine_prompts = [processed_messages.prompt]
+        else:
+            request_prompts = [processed_messages.prompt_ids]
+            engine_prompts = [processed_messages.prompt_ids]
 
         return messages, request_prompts, engine_prompts, processed_messages
 
@@ -504,7 +492,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
-            # TODO: these are all 0 for now!
+            # HarmonyContext.append_output populates prompt / cached /
+            # output counts from the engine's meta_info; num_reasoning_tokens
+            # is not yet wired through and remains 0.
             num_prompt_tokens = context.num_prompt_tokens
             num_generated_tokens = context.num_output_tokens
             num_cached_tokens = context.num_cached_tokens
@@ -659,6 +649,9 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
+        # Built-in tools (web_search_preview, code_interpreter) flow through
+        # the harmony/tool_server path; an empty return is the caller's
+        # signal to force tool_choice="none" on the chat request.
         chat_tools = []
         for tool in request.tools:
             if tool.type != "function":
@@ -678,6 +671,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
+        # `detail` is defaulted to "auto" because the chat-templating layer
+        # treats absence as ambiguous; flat `min_dynamic_patch` /
+        # `max_dynamic_patch` are lifted onto the `image_url` object so the
+        # downstream image preprocessor sees them.
         if hasattr(content_part, "model_dump"):
             content_part = content_part.model_dump(exclude_none=True)
         if not isinstance(content_part, dict):
@@ -720,10 +717,51 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
+        """Convert one Responses-API input item to a chat-completions message.
+
+        Handles the three input shapes the Responses API allows:
+        - ``type=message`` (or no ``type``): a chat-style user/assistant/system
+          turn — content parts are normalized via
+          ``_normalize_response_content_part_for_chat``.
+        - ``type=function_call``: a prior assistant tool call. Rendered as
+          ``{role: assistant, tool_calls: [...]}`` for chat templating.
+        - ``type=function_call_output``: the result of a prior tool call.
+          Rendered as ``{role: tool, tool_call_id, content}``.
+
+        ``id`` / ``status`` are stripped because chat-template processing does
+        not consume them. Unknown ``type`` values raise rather than silently
+        passing through as malformed chat messages.
+        """
         if hasattr(message, "model_dump"):
             message = message.model_dump(exclude_none=True)
         if not isinstance(message, dict):
             return message
+
+        msg_type = message.get("type")
+        if msg_type == "function_call":
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": message.get("call_id") or message.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": message.get("name"),
+                            "arguments": message.get("arguments", ""),
+                        },
+                    }
+                ],
+            }
+        if msg_type == "function_call_output":
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": message.get("output", ""),
+            }
+        if msg_type not in (None, "message"):
+            raise ValueError(
+                f"Unsupported Responses API input item type: {msg_type!r}"
+            )
 
         content = message.get("content")
         if not isinstance(content, list):
@@ -747,6 +785,16 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _output_message_text(output_item: Any) -> Optional[str]:
+        """Return the assistant text payload of an output item, or None.
+
+        Used during ``previous_response_id`` history replay. Only true
+        assistant ``message`` items with ``output_text`` content parts produce
+        text; reasoning items, tool calls (``function_call``,
+        ``web_search_call``, ``code_interpreter_call``, …) and any other
+        non-message outputs return ``None`` so the caller can skip them.
+        Multiple ``output_text`` parts are joined with newlines so the result
+        can be appended as a single assistant chat turn.
+        """
         if isinstance(output_item, ResponseReasoningItem):
             return None
         if hasattr(output_item, "model_dump"):
@@ -790,9 +838,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             prev_msg = self.msg_store[prev_response.id]
             messages.extend(prev_msg)
 
-            # Add the previous output
+            # Add the previous output. Only assistant `message` items with
+            # `output_text` parts are replayed as plain assistant text;
+            # reasoning items, tool calls, and other non-message outputs are
+            # intentionally dropped from the chat-format history (see
+            # _output_message_text). Multi-turn tool-calling via
+            # previous_response_id therefore loses prior tool calls — a
+            # known gap, tracked separately.
             for output_item in prev_response.output:
-                # NOTE: We skip the reasoning output of the previous response
                 assistant_text = self._output_message_text(output_item)
                 if assistant_text is None:
                     continue

@@ -1388,7 +1388,13 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 2 token
+        # Reserve 2 tokens of headroom against context_len. The caller in
+        # serving_responses subtracts `num_reserved_tokens` (e.g. EAGLE spec
+        # slots) from `default_max_tokens` already, but the engine appends
+        # one or two special tokens (e.g. BOS/EOS, an extra GPT-OSS marker)
+        # on top of the rendered prompt + budget, so a tight max_tokens that
+        # exactly fills context_len can still trip the length check. The
+        # value was bumped from 1 to 2 to accommodate the GPT-OSS path.
         max_tokens -= 2
 
         # Get parameters with defaults
@@ -1426,8 +1432,15 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
+            # Refuse the request rather than silently dropping the tool-call
+            # grammar: leaving the user-supplied constraint active while the
+            # tool-call constraint is never installed would silently disable
+            # tool calling and the caller would never know.
+            raise ValueError(
+                "Cannot combine tool calls with constrained decoding "
+                "(regex / ebnf / structural_tag / json_schema). Remove one."
+            )
+        if tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type in ("structural_tag", "json_schema"):
                 params[constraint_type] = convert_json_schema_to_str(

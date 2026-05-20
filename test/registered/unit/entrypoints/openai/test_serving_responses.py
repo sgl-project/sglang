@@ -377,6 +377,91 @@ class ServingResponsesTestCase(unittest.TestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_function_tool_requires_name(self):
+        with self.assertRaises(ValueError):
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                tools=[{"type": "function"}],
+                store=False,
+            )
+        with self.assertRaises(ValueError):
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                tools=[{"type": "function", "name": ""}],
+                store=False,
+            )
+
+    def test_function_call_input_item_becomes_assistant_tool_call(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_abc",
+                "name": "lookup",
+                "arguments": '{"key": "val"}',
+                "status": "completed",
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"key": "val"}',
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_function_call_output_input_item_becomes_tool_message(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": "42",
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
+        )
+
+    def test_unknown_input_item_type_raises(self):
+        with self.assertRaises(ValueError):
+            OpenAIServingResponses._normalize_response_message_for_chat(
+                {"type": "web_search_call", "id": "ws_1"}
+            )
+
+    def test_tool_call_and_constraint_conflict_raises(self):
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        with self.assertRaises(ValueError):
+            request.to_sampling_params(
+                default_max_tokens=128,
+                default_params={"json_schema": '{"type": "object"}'},
+                tool_call_constraint=("json_schema", {"type": "object"}),
+            )
+
+    def test_to_sampling_params_structural_tag_with_model_dump(self):
+        class _FakeStructuralTag:
+            def model_dump(self, by_alias=False):
+                return {"type": "structural_tag"}
+
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        params = request.to_sampling_params(
+            default_max_tokens=128,
+            default_params={},
+            tool_call_constraint=("structural_tag", _FakeStructuralTag()),
+        )
+        self.assertEqual(params["structural_tag"], '{"type": "structural_tag"}')
+
 
 if __name__ == "__main__":
     unittest.main()
