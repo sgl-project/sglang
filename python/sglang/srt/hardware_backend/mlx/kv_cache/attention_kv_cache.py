@@ -1,4 +1,4 @@
-"""ContiguousKVCache, PoolBackedCache and OffsetCache for MLX backend."""
+"""Attention KV cache adapters for the MLX backend."""
 
 from __future__ import annotations
 
@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
+    from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
+        MlxAttentionKVPool,
+    )
 
 
-class OffsetCache:
+class AttentionOffsetCache:
     """Data-free shim satisfying mlx-lm's cache protocol.
 
     Provides ``make_mask`` and ``state`` without storing actual K/V.
@@ -27,14 +29,14 @@ class OffsetCache:
         return None if N == 1 else "causal"
 
     def update_and_fetch(self, keys, values):
-        raise RuntimeError("OffsetCache should not store data")
+        raise RuntimeError("AttentionOffsetCache should not store data")
 
 
 _DEFAULT_MAX_SEQ_LEN = 4096
 
 
-class ContiguousKVCache:
-    """Pre-allocated KV buffer for one request × one layer.
+class ContiguousAttentionKVCache:
+    """Pre-allocated attention KV buffer for one request and one layer.
 
     Shape ``(1, n_kv_heads, max_seq_len, head_dim)``.  Slice assignment
     instead of ``mx.concatenate``.  Lazy-allocated on first write.
@@ -119,12 +121,12 @@ class ContiguousKVCache:
         return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
 
 
-class PoolBackedCache:
-    """Lazily gathers cached KV from the shared pool during forward pass.
+class PoolBackedAttentionKVCache:
+    """Lazily gathers cached attention KV from the shared pool during forward.
 
     Each ``update_and_fetch`` gathers this layer's prefix from the pool
     on demand, keeping operations in the lazy compute graph.  Convert to
-    ``ContiguousKVCache`` via ``to_contiguous`` after the forward pass.
+    ``ContiguousAttentionKVCache`` via ``to_contiguous`` after the forward pass.
     """
 
     __slots__ = (
@@ -140,7 +142,7 @@ class PoolBackedCache:
 
     def __init__(
         self,
-        pool: MlxKVPool,
+        pool: MlxAttentionKVPool,
         layer_idx: int,
         slots: mx.array,
         prefix_len: int,
@@ -197,9 +199,9 @@ class PoolBackedCache:
         self._new_values = values
         return k_all, v_all
 
-    def to_contiguous(self, max_seq_len: int = 4096) -> ContiguousKVCache:
-        """Convert to ContiguousKVCache reusing forward-pass arrays."""
-        cache = ContiguousKVCache(max_seq_len=max_seq_len)
+    def to_contiguous(self, max_seq_len: int = 4096) -> ContiguousAttentionKVCache:
+        """Convert to contiguous attention KV reusing forward-pass arrays."""
+        cache = ContiguousAttentionKVCache(max_seq_len=max_seq_len)
         if self._full_keys is not None:
             cache.update_and_fetch(self._full_keys, self._full_values)
         return cache

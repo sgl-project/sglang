@@ -2,7 +2,7 @@
 
 Routes forward passes through the MLX model runner, bypassing PyTorch
 MPS.  A lightweight stub provides scheduler bookkeeping; the actual
-KV data lives in MlxKVPool.
+attention KV data lives in MlxAttentionKVPool.
 
 The worker also exposes an async (lazy-eval) surface used by the MLX
 overlap scheduler: ``async_forward_batch_generation_mlx`` launches a
@@ -87,9 +87,9 @@ class MlxTpModelWorker(TpModelWorker):
         return None
 
     def _ensure_mlx_pool_initialized(self):
-        """Lazily initialize the MlxKVPool after the stub's pools are ready."""
+        """Lazily initialize MLX cache pools after the stub pools are ready."""
         if not self._mlx_pool_initialized:
-            self._mlx_runner.init_kv_pool(self._model_runner.req_to_token_pool)
+            self._mlx_runner.init_cache_pools(self._model_runner.req_to_token_pool)
             self._mlx_pool_initialized = True
 
     def forward_batch_generation(
@@ -144,7 +144,7 @@ class MlxTpModelWorker(TpModelWorker):
         next_token_ids_list: list[int] = []
 
         if forward_mode.is_extend():
-            # Ensure pool is up-to-date before PoolBackedCache reads it
+            # Ensure pool is up-to-date before pool-backed attention reads it
             # for prefix-cached prefills.  Only runs on extend batches.
             self._mlx_runner.flush_all_decode_kv()
             input_ids_cpu = batch.input_ids.cpu().tolist()
@@ -185,6 +185,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                     prefill_rids.append((req.rid, next_token))
 
@@ -270,7 +271,7 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_extend():
             # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before any PoolBackedCache
+            # Ensure the pool is up-to-date before pool-backed attention
             # reads it for prefix-cached prefills. Mirror the sync path.
             self._mlx_runner.flush_all_decode_kv()
             return self._async_extend_batch(batch)
@@ -330,6 +331,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                 )
 

@@ -1,4 +1,4 @@
-"""Unit tests for MLX attention discovery and hybrid cache handling."""
+"""Unit tests for MLX attention discovery and generic cache handling."""
 
 from __future__ import annotations
 
@@ -20,22 +20,51 @@ if _HAS_MLX:
     import mlx.nn as nn
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
-        ContiguousKVCache,
+        ContiguousAttentionKVCache,
+        MlxAttentionKVPool,
         MLXAttentionWrapper,
+        MlxAuxiliaryStateComponent,
+        MlxAuxiliaryStatePool,
+        MlxAuxiliaryStateReqToTokenPool,
+        MlxModelCacheLayout,
         find_attention_layers,
         is_attention_module,
         patch_model_attention,
     )
-    from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
-    from sglang.srt.hardware_backend.mlx.model_runner_stub import (
-        _DummyMambaPool,
-        _DummyMambaReqToTokenPool,
+    from sglang.srt.hardware_backend.mlx.model_runner import (
+        MlxModelRunner,
+        MlxPendingDecode,
     )
     from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+
+def _set_runner_cache_layout(
+    runner,
+    *,
+    num_layers: int,
+    attention_layer_indices: list[int],
+    attention_modules: dict[int, object] | None = None,
+) -> None:
+    attention_modules = attention_modules or {}
+    attention_set = set(attention_layer_indices)
+    layers = []
+    attrs = []
+    for layer_idx in range(num_layers):
+        if layer_idx in attention_set:
+            attrs.append("self_attn")
+            layers.append(
+                SimpleNamespace(self_attn=attention_modules.get(layer_idx, object()))
+            )
+        else:
+            attrs.append(None)
+            layers.append(SimpleNamespace())
+    runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(layers, attrs)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -66,7 +95,7 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(patch_model_attention(model), 1)
         self.assertIsInstance(model.layers[0].attention, MLXAttentionWrapper)
 
-    def test_hybrid_model_returns_per_layer_attention_attrs(self):
+    def test_auxiliary_state_model_returns_per_layer_attention_attrs(self):
         model = FakeModel(
             [
                 FakeLayer("linear_attn", ProjectionOnlyMixer()),
@@ -85,16 +114,29 @@ class TestMlxAttentionPatching(unittest.TestCase):
     def test_projection_only_mixer_is_not_attention(self):
         self.assertFalse(is_attention_module(ProjectionOnlyMixer()))
 
-    def test_qwen_next_gated_query_projection_keeps_attention_width(self):
+    def test_cache_layout_separates_attention_and_auxiliary_layers(self):
+        layout = MlxModelCacheLayout.from_attention_discovery(
+            [object(), object(), object(), object()],
+            [None, "self_attn", None, "self_attn"],
+        )
+
+        self.assertEqual(layout.num_layers, 4)
+        self.assertEqual(layout.attention_layer_indices, (1, 3))
+        self.assertEqual(layout.auxiliary_layer_indices, (0, 2))
+        self.assertEqual(layout.attention_pool_index(1), 0)
+        self.assertEqual(layout.attention_pool_index(3), 1)
+        self.assertTrue(layout.has_auxiliary_state)
+
+    def test_gated_query_projection_keeps_attention_width(self):
         inner = FakeGatedAttention()
         wrapper = MLXAttentionWrapper(inner, layer_idx=0)
-        cache = ContiguousKVCache(
+        cache = ContiguousAttentionKVCache(
             n_kv_heads=1, head_dim=2, max_seq_len=4, dtype=mx.float32
         )
         ctx = BatchedDecodeContext(
             batch_size=1,
             seq_lens=[0],
-            layer_caches=[[cache]],
+            attention_layer_caches=[[cache]],
         )
 
         out = wrapper._batched_decode(mx.zeros((1, 1, 4), dtype=mx.float32), ctx)
@@ -103,31 +145,404 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(out.shape, (1, 1, 4))
         self.assertEqual(inner.o_proj.last_input_shape, (1, 1, 4))
 
+    def test_attn_config_uses_float_dtype_for_quantized_projection(self):
+        runner = object.__new__(MlxModelRunner)
+        attn = FakeAttention()
+        attn.k_proj.weight = mx.zeros((2, 4), dtype=mx.uint32)
+        _set_runner_cache_layout(
+            runner,
+            num_layers=1,
+            attention_layer_indices=[0],
+            attention_modules={0: attn},
+        )
+
+        n_kv_heads, head_dim, dtype = MlxModelRunner._get_attn_config(runner)
+
+        self.assertEqual(n_kv_heads, 1)
+        self.assertEqual(head_dim, 2)
+        self.assertEqual(dtype, mx.float32)
+
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
-class TestMlxHybridRunnerCache(unittest.TestCase):
-    def test_hybrid_prefill_uses_full_prompt_and_native_cache(self):
+class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
+    def test_dense_prefill_keeps_pool_backed_radix_path(self):
         runner = object.__new__(MlxModelRunner)
-        runner.model = FakeHybridModel()
-        runner._has_non_attention_layers = True
-        runner._num_layers = 2
-        runner._attention_layer_indices = [1]
+        runner.model = FakeDenseModel(num_layers=2)
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[0, 1],
+        )
         runner._max_seq_len = 8
         runner._cache_pool = []
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=8,
+            num_layers=2,
+            n_kv_heads=1,
+            head_dim=2,
+            dtype=mx.float32,
+        )
+        runner._req_to_token_pool = None
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        prefix_slots = mx.array([2, 3], dtype=mx.int32)
+        k_prefix = mx.stack(
+            [
+                mx.ones((2, 1, 2), dtype=mx.float32) * 10,
+                mx.ones((2, 1, 2), dtype=mx.float32) * 20,
+            ]
+        )
+        runner._attention_kv_pool.set_kv_all_layers(
+            prefix_slots, k_prefix, k_prefix * 2
+        )
+        mx.eval(*runner._attention_kv_pool.all_buffers())
 
         pending = runner.prefill_start(
             req_id="r0",
-            new_token_ids=[],
+            new_token_ids=[13],
             full_token_ids=[11, 12, 13],
-            prefix_slot_ids=[2, 3, 4],
-            new_slot_ids=[],
+            prefix_slot_ids=[2, 3],
+            new_slot_ids=[4],
             req_pool_idx=0,
         )
+        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        mx.eval(*runner._attention_kv_pool.all_buffers())
+        runner.prefill_finalize(pending)
 
-        self.assertEqual(runner.model.seen_inputs, [[[11, 12, 13]]])
-        self.assertEqual(pending.synced_offset, 0)
+        self.assertEqual(runner.model.seen_inputs, [[[13]]])
+        self.assertEqual(runner.model.seen_offsets, [[2, 2]])
+        self.assertEqual(pending.synced_offset, 3)
+        self.assertTrue(
+            all(isinstance(c, ContiguousAttentionKVCache) for c in pending.cache)
+        )
+        layer0_k, layer0_v = runner._attention_kv_pool.get_kv(
+            0, mx.array([4], dtype=mx.int32)
+        )
+        layer1_k, layer1_v = runner._attention_kv_pool.get_kv(
+            1, mx.array([4], dtype=mx.int32)
+        )
+        mx.eval(layer0_k, layer0_v, layer1_k, layer1_v)
+        self.assertEqual(layer0_k.tolist(), [[[1.0, 1.0]]])
+        self.assertEqual(layer0_v.tolist(), [[[2.0, 2.0]]])
+        self.assertEqual(layer1_k.tolist(), [[[2.0, 2.0]]])
+        self.assertEqual(layer1_v.tolist(), [[[4.0, 4.0]]])
+
+    def test_dense_decode_uses_batched_attention_for_single_and_multi_request(self):
+        for req_ids in (["r0"], ["r0", "r1"]):
+            with self.subTest(req_ids=req_ids):
+                runner = object.__new__(MlxModelRunner)
+                _set_runner_cache_layout(
+                    runner,
+                    num_layers=1,
+                    attention_layer_indices=[0],
+                )
+                runner._req_caches = {rid: [object()] for rid in req_ids}
+                runner._req_token_ids = {
+                    rid: [idx + 10] for idx, rid in enumerate(req_ids)
+                }
+                calls = []
+
+                def fake_batched(caches, batched_input):
+                    calls.append((len(caches), batched_input.tolist()))
+                    return mx.array(list(range(len(caches))), dtype=mx.int32)
+
+                def fail_native(*args, **kwargs):
+                    raise AssertionError("dense decode should use batched attention")
+
+                runner._decode_with_batched_attention = fake_batched
+                runner._decode_with_native_cache = fail_native
+
+                pending = runner.decode_batch_start(req_ids)
+
+                self.assertEqual(
+                    calls,
+                    [
+                        (
+                            len(req_ids),
+                            [[idx + 10] for idx in range(len(req_ids))],
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    pending.lazy_tokens.tolist(),
+                    list(range(len(req_ids))),
+                )
+
+    def test_dense_chained_decode_uses_batched_attention_for_single_request(self):
+        runner = object.__new__(MlxModelRunner)
+        _set_runner_cache_layout(
+            runner,
+            num_layers=1,
+            attention_layer_indices=[0],
+        )
+        calls = []
+
+        def fake_batched(caches, batched_input):
+            calls.append((len(caches), batched_input.tolist()))
+            return mx.array([8], dtype=mx.int32)
+
+        def fail_native(*args, **kwargs):
+            raise AssertionError("dense chained decode should use batched attention")
+
+        runner._decode_with_batched_attention = fake_batched
+        runner._decode_with_native_cache = fail_native
+        prev = MlxPendingDecode(
+            lazy_tokens=mx.array([7], dtype=mx.int32),
+            req_ids=["r0"],
+            caches=[[object()]],
+        )
+
+        pending = runner.decode_batch_start_chained(prev)
+
+        self.assertEqual(calls, [(1, [[7]])])
+        self.assertEqual(pending.lazy_tokens.tolist(), [8])
+
+    def test_dense_batched_attention_helper_supports_single_request(self):
+        runner = object.__new__(MlxModelRunner)
+        model = FakeWrappedAttentionModel()
+        runner.model = model
+        _set_runner_cache_layout(
+            runner,
+            num_layers=1,
+            attention_layer_indices=[0],
+        )
+        cache = [
+            [
+                ContiguousAttentionKVCache(
+                    n_kv_heads=1,
+                    head_dim=2,
+                    max_seq_len=4,
+                    dtype=mx.float32,
+                )
+            ]
+        ]
+
+        lazy_tokens = runner._decode_with_batched_attention(
+            cache,
+            mx.array([[7]], dtype=mx.int32),
+        )
+        mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
+
+        self.assertEqual(lazy_tokens.tolist(), [0])
+        self.assertEqual(cache[0][0].offset, 1)
+        self.assertEqual(model.seen_inputs, [[[7]]])
+        self.assertEqual(model.seen_cache_types, [["AttentionOffsetCache"]])
+
+    def test_auxiliary_decode_keeps_native_cache_for_multi_request(self):
+        runner = object.__new__(MlxModelRunner)
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[1],
+        )
+        req_ids = ["r0", "r1"]
+        runner._req_caches = {rid: [object(), object()] for rid in req_ids}
+        runner._req_token_ids = {rid: [idx + 20] for idx, rid in enumerate(req_ids)}
+        calls = []
+
+        def fake_native(caches, input_ids_by_request):
+            calls.append(
+                (
+                    len(caches),
+                    [input_ids.tolist() for input_ids in input_ids_by_request],
+                )
+            )
+            return mx.array([4, 5], dtype=mx.int32)
+
+        def fail_batched(*args, **kwargs):
+            raise AssertionError("auxiliary decode should use native caches")
+
+        runner._decode_with_native_cache = fake_native
+        runner._decode_with_batched_attention = fail_batched
+
+        pending = runner.decode_batch_start(req_ids)
+
+        self.assertEqual(calls, [(2, [[[20]], [[21]]])])
+        self.assertEqual(pending.lazy_tokens.tolist(), [4, 5])
+
+    def test_auxiliary_state_prefill_restores_prefix_state(self):
+        runner = object.__new__(MlxModelRunner)
+        runner.model = FakeAuxiliaryStateModel()
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[1],
+        )
+        runner._max_seq_len = 8
+        runner._cache_pool = []
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=8,
+            num_layers=1,
+            n_kv_heads=1,
+            head_dim=2,
+            dtype=mx.float32,
+        )
+        runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        req = FakeRequest()
+        runner._req_to_token_pool.alloc([req])
+        runner._req_to_token_pool.auxiliary_state_pool.store_cache(
+            req.mamba_pool_idx,
+            [FakeNativeCache(mx.array([42.0], dtype=mx.float32)), None],
+            [0],
+        )
+
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=[13],
+            full_token_ids=[11, 12, 13],
+            prefix_slot_ids=[2, 3],
+            new_slot_ids=[4],
+            req_pool_idx=req.req_pool_idx,
+        )
+        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.prefill_finalize(pending)
+
+        self.assertEqual(runner.model.seen_inputs, [[[13]]])
+        self.assertEqual(runner.model.seen_auxiliary_states, [[42.0]])
+        self.assertEqual(pending.synced_offset, 3)
         self.assertIsInstance(pending.cache[0], FakeNativeCache)
-        self.assertIsInstance(pending.cache[1], ContiguousKVCache)
+        self.assertIsInstance(pending.cache[1], ContiguousAttentionKVCache)
+        restored = [FakeNativeCache(), None]
+        runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
+            req.mamba_pool_idx, restored, [0]
+        )
+        self.assertEqual(restored[0].state[0].tolist(), [1.0])
+
+    def test_auxiliary_state_prefill_tracks_chunk_aligned_auxiliary_state(self):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
+        runner = object.__new__(MlxModelRunner)
+        runner.model = FakeAuxiliaryStateModel()
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[1],
+        )
+        runner._max_seq_len = 128
+        runner._cache_pool = []
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=96,
+            num_layers=1,
+            n_kv_heads=1,
+            head_dim=2,
+            dtype=mx.float32,
+        )
+        runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=128,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        req = FakeRequest()
+        runner._req_to_token_pool.alloc([req])
+        token_ids = list(range(70))
+
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=token_ids,
+            full_token_ids=token_ids,
+            prefix_slot_ids=[],
+            new_slot_ids=list(range(1, 71)),
+            req_pool_idx=req.req_pool_idx,
+            req=req,
+        )
+        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.prefill_finalize(pending)
+        tracked = [FakeNativeCache(), None]
+        runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
+            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+        )
+
+        self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [64, 6])
+        self.assertEqual(req.mamba_last_track_seqlen, 64)
+        self.assertEqual(tracked[0].state[0].tolist(), [64.0])
+        self.assertEqual(pending.synced_offset, 70)
+
+    def test_auxiliary_state_prefill_advances_tracked_boundary_after_cached_prefix(
+        self,
+    ):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
+        runner = object.__new__(MlxModelRunner)
+        runner.model = FakeAuxiliaryStateModel()
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[1],
+        )
+        runner._max_seq_len = 512
+        runner._cache_pool = []
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=320,
+            num_layers=1,
+            n_kv_heads=1,
+            head_dim=2,
+            dtype=mx.float32,
+        )
+        runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=512,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        req = FakeRequest()
+        runner._req_to_token_pool.alloc([req])
+        runner._req_to_token_pool.auxiliary_state_pool.store_cache(
+            req.mamba_pool_idx,
+            [FakeNativeCache(mx.array([64.0], dtype=mx.float32)), None],
+            [0],
+        )
+        token_ids = list(range(257))
+
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=token_ids[64:],
+            full_token_ids=token_ids,
+            prefix_slot_ids=list(range(1, 65)),
+            new_slot_ids=list(range(65, 258)),
+            req_pool_idx=req.req_pool_idx,
+            req=req,
+        )
+        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.prefill_finalize(pending)
+        tracked = [FakeNativeCache(), None]
+        runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
+            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+        )
+
+        self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [192, 1])
+        self.assertEqual(runner.model.seen_auxiliary_states, [[64.0], [192.0]])
+        self.assertEqual(req.mamba_last_track_seqlen, 256)
+        self.assertEqual(tracked[0].state[0].tolist(), [192.0])
+        self.assertEqual(pending.synced_offset, 257)
 
     def test_cache_arrays_flattens_native_array_cache_state(self):
         cache = FakeNestedStateCache()
@@ -137,41 +552,228 @@ class TestMlxHybridRunnerCache(unittest.TestCase):
         self.assertEqual(len(arrays), 2)
         self.assertTrue(all(isinstance(arr, mx.array) for arr in arrays))
 
-    def test_dummy_mamba_pool_tracks_scheduler_slots_without_state(self):
-        pool = _DummyMambaPool(size=4, device="cpu")
+    def test_auxiliary_state_pool_tracks_scheduler_slots_and_snapshots(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
 
         first = pool.alloc(2)
-        forked = pool.fork_from(torch.zeros((1, 2), dtype=torch.int64))
+        cache = [FakeNativeCache(mx.array([1.0], dtype=mx.float32))]
+        pool.store_cache(first[0], cache, [0])
+        cache[0].state[0][0] = 9.0
+        forked = pool.fork_from(first[0].unsqueeze(0))
+        restored = [FakeNativeCache()]
+        pool.restore_cache(forked[0], restored, [0])
         pool.free(first)
 
         self.assertEqual(first.tolist(), [1, 2])
         self.assertEqual(forked.tolist(), [3])
+        self.assertEqual(restored[0].state[0].tolist(), [1.0])
         self.assertEqual(pool.available_size(), 3)
-        self.assertIsNone(pool.mamba_cache)
 
-    def test_dummy_mamba_req_pool_maps_request_indices(self):
-        pool = _DummyMambaReqToTokenPool(
+    def test_auxiliary_state_pool_restores_instance_meta_state(self):
+        pool = MlxAuxiliaryStatePool(size=2, device="cpu")
+        slot = pool.alloc(1)
+        cache = [
+            FakeNativeCache(
+                mx.array([1.0], dtype=mx.float32),
+                meta_state={"seen": mx.array([3.0], dtype=mx.float32)},
+            )
+        ]
+        pool.store_cache(slot[0], cache, [0])
+        cache[0].meta_state["seen"][0] = 9.0
+
+        restored = [FakeNativeCache(meta_state={})]
+        pool.restore_cache(slot[0], restored, [0])
+
+        self.assertEqual(restored[0].meta_state["seen"].tolist(), [3.0])
+
+    def test_auxiliary_state_req_pool_maps_request_indices(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
             max_context_len=8,
             device="cpu",
             enable_memory_saver=False,
-            mamba_size=4,
+            auxiliary_state_size=4,
         )
         req = FakeRequest()
 
         req_indices = pool.alloc([req])
-        mamba_idx = pool.get_mamba_indices(req.req_pool_idx)
+        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
         pool.free(req)
 
         self.assertEqual(req_indices, [1])
-        self.assertIsNotNone(mamba_idx)
+        self.assertIsNotNone(auxiliary_state_idx)
         self.assertIsNone(req.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
-        self.assertEqual(pool.mamba_pool.available_size(), 3)
-        pool.free_mamba_cache(req)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
+        pool.free_auxiliary_state_cache(req)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(pool.available_size(), 2)
-        self.assertEqual(pool.mamba_pool.available_size(), 4)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
+
+    def test_auxiliary_state_req_pool_can_keep_tracked_auxiliary_slot(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba_next_track_idx = 0
+
+        pool.free_auxiliary_state_cache(req, track_buffer_to_keep=0)
+
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
+
+    def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba_next_track_idx = 0
+        req.mamba_last_track_seqlen = 64
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        insert_params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=req,
+            insert_params=insert_params,
+            token_ids_len=70,
+            is_finished=True,
+        )
+        component.cleanup_after_caching_req(
+            req=req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
+            insert_params=insert_params,
+        )
+
+        self.assertEqual(cache_len, 64)
+        self.assertTrue(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
+        self.assertEqual(insert_params.mamba_value.tolist(), [2])
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
+
+    def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba_next_track_idx = 0
+        req.mamba_last_track_seqlen = 64
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        insert_params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=req,
+            insert_params=insert_params,
+            token_ids_len=70,
+            is_finished=False,
+        )
+        component.cleanup_after_caching_req(
+            req=req,
+            is_finished=False,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
+            insert_params=insert_params,
+        )
+
+        self.assertEqual(cache_len, 64)
+        self.assertEqual(insert_params.mamba_value.tolist(), [3])
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
+
+    def test_auxiliary_state_component_keeps_new_live_slot_owned_by_radix(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        insert_params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=req,
+            insert_params=insert_params,
+            token_ids_len=7,
+            is_finished=True,
+        )
+        component.cleanup_after_caching_req(
+            req=req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
+            insert_params=insert_params,
+        )
+
+        self.assertEqual(cache_len, 7)
+        self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
+        self.assertEqual(insert_params.mamba_value.tolist(), [1])
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
+
+    def test_auxiliary_state_component_frees_duplicate_live_slot(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        insert_params = InsertParams()
+
+        component.prepare_for_caching_req(
+            req=req,
+            insert_params=insert_params,
+            token_ids_len=7,
+            is_finished=True,
+        )
+        component.cleanup_after_caching_req(
+            req=req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=7, mamba_exist=True),
+            insert_params=insert_params,
+        )
+
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -285,20 +887,71 @@ if _HAS_MLX:
             self.rope = IdentityRope()
 
     class FakeNativeCache:
+        def __init__(self, value=None, meta_state=None):
+            self._state = [
+                value if value is not None else mx.array([0.0], dtype=mx.float32)
+            ]
+            if meta_state is not None:
+                self.meta_state = meta_state
+            self.lengths = None
+            self.left_padding = None
+
         @property
         def state(self):
-            return [mx.array([1.0], dtype=mx.float32)]
+            return self._state
 
-    class FakeHybridModel:
+        @state.setter
+        def state(self, value):
+            self._state = value
+
+    class FakeAuxiliaryStateModel:
         def __init__(self):
             self.seen_inputs = []
+            self.seen_auxiliary_states = []
 
         def make_cache(self):
             return [FakeNativeCache(), FakeNativeCache()]
 
         def __call__(self, inputs, cache=None):
             self.seen_inputs.append(inputs.tolist())
+            if cache is not None:
+                self.seen_auxiliary_states.append(cache[0].state[0].tolist())
+                cache[0].state = [mx.array([float(inputs.shape[1])], dtype=mx.float32)]
+                keys = mx.ones((1, 1, inputs.shape[1], 2), dtype=mx.float32)
+                values = keys * 2
+                cache[1].update_and_fetch(keys, values)
             return mx.zeros((1, inputs.shape[1], 4), dtype=mx.float32)
+
+    class FakeDenseModel:
+        def __init__(self, num_layers):
+            self.num_layers = num_layers
+            self.seen_inputs = []
+            self.seen_offsets = []
+
+        def __call__(self, inputs, cache=None):
+            self.seen_inputs.append(inputs.tolist())
+            if cache is not None:
+                offsets = []
+                for layer_idx in range(self.num_layers):
+                    offsets.append(cache[layer_idx].offset)
+                    scale = float(layer_idx + 1)
+                    keys = mx.ones((1, 1, inputs.shape[1], 2), dtype=mx.float32) * scale
+                    cache[layer_idx].update_and_fetch(keys, keys * 2)
+                self.seen_offsets.append(offsets)
+            return mx.zeros((1, inputs.shape[1], 4), dtype=mx.float32)
+
+    class FakeWrappedAttentionModel:
+        def __init__(self):
+            self.attn = MLXAttentionWrapper(FakeAttention(), layer_idx=0)
+            self.seen_inputs = []
+            self.seen_cache_types = []
+
+        def __call__(self, inputs, cache=None):
+            self.seen_inputs.append(inputs.tolist())
+            self.seen_cache_types.append([type(c).__name__ for c in cache])
+            hidden = mx.zeros((*inputs.shape, 4), dtype=mx.float32)
+            self.attn(hidden, cache=cache[0])
+            return mx.zeros((*inputs.shape, 8), dtype=mx.float32)
 
     class FakeNestedStateCache:
         @property

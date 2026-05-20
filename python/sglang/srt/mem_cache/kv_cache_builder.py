@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
@@ -239,7 +240,7 @@ def build_kv_cache(
 
             logger.info("Using experimental C++ radix tree implementation.")
             tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-        elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+        elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
             from sglang.srt.mem_cache.unified_cache_components import (
                 ComponentType,
             )
@@ -253,6 +254,14 @@ def build_kv_cache(
                     ComponentType.SWA if is_hybrid_swa else ComponentType.MAMBA
                 )
             params.tree_components = tuple(tree_components)
+            if use_mlx() and is_hybrid_ssm:
+                from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+                    MlxAuxiliaryStateComponent,
+                )
+
+                params.component_registry_override = {
+                    ComponentType.MAMBA: MlxAuxiliaryStateComponent,
+                }
             tree_cache = UnifiedRadixCache(params)
             if enable_hierarchical_cache:
                 tree_cache.init_hicache(server_args, params)

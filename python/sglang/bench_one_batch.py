@@ -536,7 +536,7 @@ class _MlxBenchRunner:
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens
         self.mlx_runner = MlxModelRunner(**init_kwargs)
-        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
+        self.mlx_runner.init_cache_pools(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):

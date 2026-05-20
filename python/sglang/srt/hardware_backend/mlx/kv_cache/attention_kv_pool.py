@@ -1,4 +1,6 @@
-"""Flat KV pool with per-layer buffers of shape (pool_size, n_kv_heads, head_dim).
+"""Flat attention KV pool for the MLX backend.
+
+Each layer buffer has shape ``(pool_size, n_kv_heads, head_dim)``.
 
 Slot 0 is reserved as padding (1-based indexing).
 """
@@ -10,8 +12,8 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
-class MlxKVPool:
-    """Pre-allocated KV pool indexed by integer slot IDs."""
+class MlxAttentionKVPool:
+    """Pre-allocated attention KV pool indexed by integer slot IDs."""
 
     def __init__(
         self,
@@ -27,7 +29,7 @@ class MlxKVPool:
         self.head_dim = head_dim
         self.dtype = dtype
 
-        # Per-layer buffers: (pool_size, n_kv_heads, head_dim)
+        # Per-attention-layer buffers: (pool_size, n_kv_heads, head_dim)
         self.k_buffer: list[mx.array] = [
             mx.zeros((pool_size, n_kv_heads, head_dim), dtype=dtype)
             for _ in range(num_layers)
@@ -41,8 +43,8 @@ class MlxKVPool:
             1024 * 1024
         )
         logger.info(
-            f"MlxKVPool: {pool_size} slots × {num_layers} layers "
-            f"× {n_kv_heads} heads × {head_dim} dim, "
+            f"MlxAttentionKVPool: {pool_size} slots x {num_layers} layers "
+            f"x {n_kv_heads} heads x {head_dim} dim, "
             f"dtype={dtype}, ~{mem_mb:.1f} MB"
         )
 

@@ -6,11 +6,11 @@ the scheduler runs its CPU-side bookkeeping on the tokens of the
 older one.  The lazy-graph primitives live in
 ``hardware_backend/mlx/tp_worker.py`` and ``model_runner.py``.
 
-Each request's KV lives ina set of per-request, per-layer ``ContiguousKVCache``
-objects that the ``MLXAttentionWrapper`` mutates in place during the forward pass.
-Chained decodes reuse the same cache objects: step N+1's graph reads
-step N's lazy writes via MLX's dependency tracking, so the GPU runs
-both steps back-to-back with no idle gap.
+Each request's attention KV lives in per-request, per-layer
+``ContiguousAttentionKVCache`` objects that ``MLXAttentionWrapper`` mutates
+in place during the forward pass. Chained decodes reuse the same cache objects:
+step N+1's graph reads step N's lazy writes via MLX's dependency tracking, so
+the GPU runs both steps back-to-back with no idle gap.
 """
 
 from __future__ import annotations
