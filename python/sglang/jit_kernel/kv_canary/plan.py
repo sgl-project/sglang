@@ -278,11 +278,11 @@ def _plan_offsets_kernel(
     full_to_swa_lut_ptr,
     extra_verify_num_valid_ptr,
     # Output pointers.
-    verify_offsets_ptr,
-    write_offsets_ptr,
-    write_seed_slot_indices_ptr,
-    verify_num_valid_ptr,
-    write_num_valid_reqs_ptr,
+    out_verify_offsets_ptr,
+    out_write_offsets_ptr,
+    out_write_seed_slot_indices_ptr,
+    out_verify_num_valid_ptr,
+    out_write_num_valid_reqs_ptr,
     # Runtime sizes.
     bs,
     req_to_token_stride0,
@@ -355,13 +355,13 @@ def _plan_offsets_kernel(
     # position bs gets the total (totals = verify_inclusive at index bs - 1 if bs > 0, else 0).
     out_offsets_mask = bs_mask
     tl.store(
-        verify_offsets_ptr + bs_offs,
+        out_verify_offsets_ptr + bs_offs,
         verify_exclusive.to(tl.int32),
         mask=out_offsets_mask,
     )
     write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN
     tl.store(
-        write_offsets_ptr + bs_offs,
+        out_write_offsets_ptr + bs_offs,
         write_exclusive.to(tl.int32),
         mask=write_offsets_mask & bs_mask,
     )
@@ -369,7 +369,7 @@ def _plan_offsets_kernel(
     # Scatter seed slots (capped to write_req_capacity).
     seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)
     tl.store(
-        write_seed_slot_indices_ptr + bs_offs,
+        out_write_seed_slot_indices_ptr + bs_offs,
         seed_slot.to(tl.int32),
         mask=seed_mask,
     )
@@ -380,11 +380,11 @@ def _plan_offsets_kernel(
 
     # Store the [bs] slot of verify_offsets and write_offsets (one element past the last per-req entry).
     # verify_offsets scratch has length BS_BLOCK + 1 so the bs slot is always in range.
-    tl.store(verify_offsets_ptr + bs, total_verify.to(tl.int32))
+    tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int32))
     # write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
     write_tail_in_range = bs < WRITE_OFFSETS_LEN
     tl.store(
-        write_offsets_ptr + bs,
+        out_write_offsets_ptr + bs,
         total_write.to(tl.int32),
         mask=write_tail_in_range,
     )
@@ -392,8 +392,8 @@ def _plan_offsets_kernel(
     # Scalar writes: verify_num_valid = total_verify + extras_count; write_num_valid_reqs = bs.
     extras_count = tl.load(extra_verify_num_valid_ptr)
     extras_count = tl.where(extras_count > 0, extras_count, 0)
-    tl.store(verify_num_valid_ptr, (total_verify + extras_count).to(tl.int32))
-    tl.store(write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
+    tl.store(out_verify_num_valid_ptr, (total_verify + extras_count).to(tl.int32))
+    tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
 
 
 @triton.jit
@@ -405,9 +405,9 @@ def _plan_entries_kernel(
     full_to_swa_lut_ptr,
     verify_offsets_ptr,
     # Output pointers.
-    verify_slot_indices_ptr,
-    verify_positions_ptr,
-    verify_prev_slot_indices_ptr,
+    out_verify_slot_indices_ptr,
+    out_verify_positions_ptr,
+    out_verify_prev_slot_indices_ptr,
     # Runtime sizes.
     req_to_token_stride0,
     swa_lut_len,
@@ -484,17 +484,17 @@ def _plan_entries_kernel(
     write_mask = j_mask & cap_mask
 
     tl.store(
-        verify_slot_indices_ptr + out_offs,
+        out_verify_slot_indices_ptr + out_offs,
         slot.to(tl.int32),
         mask=write_mask,
     )
     tl.store(
-        verify_positions_ptr + out_offs,
+        out_verify_positions_ptr + out_offs,
         positions.to(tl.int32),
         mask=write_mask,
     )
     tl.store(
-        verify_prev_slot_indices_ptr + out_offs,
+        out_verify_prev_slot_indices_ptr + out_offs,
         prev_slot.to(tl.int32),
         mask=write_mask,
     )
@@ -536,9 +536,9 @@ def _plan_extras_kernel(
     extra_num_valid_ptr,
     verify_offsets_ptr,
     # Output pointers.
-    verify_slot_indices_ptr,
-    verify_positions_ptr,
-    verify_prev_slot_indices_ptr,
+    out_verify_slot_indices_ptr,
+    out_verify_positions_ptr,
+    out_verify_prev_slot_indices_ptr,
     # Runtime sizes.
     bs,
     verify_capacity,
@@ -566,8 +566,8 @@ def _plan_extras_kernel(
     cap_mask = out_offs < verify_capacity
     write_mask = in_range_mask & cap_mask
 
-    tl.store(verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask)
-    tl.store(verify_positions_ptr + out_offs, positions.to(tl.int32), mask=write_mask)
+    tl.store(out_verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask)
+    tl.store(out_verify_positions_ptr + out_offs, positions.to(tl.int32), mask=write_mask)
     tl.store(
-        verify_prev_slot_indices_ptr + out_offs, prevs.to(tl.int32), mask=write_mask
+        out_verify_prev_slot_indices_ptr + out_offs, prevs.to(tl.int32), mask=write_mask
     )
