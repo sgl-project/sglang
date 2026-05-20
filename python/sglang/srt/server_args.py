@@ -6082,9 +6082,10 @@ class ServerArgs:
                 "current batch (chain hash check is skipped in this path). "
                 "0 (default) disables the sweep. The per-step head/tail "
                 "canary only covers slots the current forward reads or "
-                "writes; the sweep also catches drift on history slots that "
-                "were frozen earlier (e.g. PD-transfer bit-rot, idle dummy "
-                "writes, rowhammer-style flips). Requires "
+                "writes; the sweep also catches corruption on slots that "
+                "sit in the KV pool unused by the current forward — "
+                "typically radix-cached slots from completed requests that "
+                "aren't actively being verified per step. Requires "
                 "--kv-canary-real-data in {bit, all} and "
                 "--kv-canary in {log, raise}."
             ),
