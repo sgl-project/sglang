@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_int_env_var,
     get_nvidia_driver_version,
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
@@ -3117,9 +3118,10 @@ class ServerArgs:
             assert self.moe_a2a_backend in [
                 "none",
                 "deepep",
+                "flashinfer",
             ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
-                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+                f"got '{self.moe_a2a_backend}'."
             )
             self.disable_shared_experts_fusion = True
             logger.warning(
@@ -3259,6 +3261,9 @@ class ServerArgs:
                     self.quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
+            assert (
+                self.enable_dp_attention and self.dp_size == self.tp_size
+            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             self.ep_size = self.tp_size
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -3275,8 +3280,40 @@ class ServerArgs:
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+                "flashinfer_cutlass",
+                "flashinfer_cutedsl",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+            if (
+                self.moe_runner_backend == "flashinfer_cutedsl"
+                and self.max_prefill_tokens is not None
+                and self.max_prefill_tokens > 0
+                and self.disaggregation_mode != "decode"
+            ):
+                max_dispatch_tokens_per_rank = get_int_env_var(
+                    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+                )
+                max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
+                if max_cutedsl_tokens < self.max_prefill_tokens:
+                    required_per_rank = (
+                        self.max_prefill_tokens + self.ep_size - 1
+                    ) // self.ep_size
+                    raise ValueError(
+                        "FlashInfer MoE A2A with flashinfer_cutedsl requires "
+                        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
+                        "ep_size to cover --max-prefill-tokens. Otherwise the "
+                        "FlashInfer dispatcher can crash at runtime with "
+                        "`ValueError: num_tokens (...) exceeds max_num_tokens (...)` "
+                        "when a local DP rank schedules too many prefill tokens. "
+                        "Current values: "
+                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
+                        f"capacity={max_cutedsl_tokens}, "
+                        f"max_prefill_tokens={self.max_prefill_tokens}. "
+                        f"Set `export "
+                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{required_per_rank}` or lower `--max-prefill-tokens` "
+                        f"to <= {max_cutedsl_tokens}."
+                    )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
