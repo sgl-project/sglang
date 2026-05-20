@@ -298,6 +298,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
+
+    # SWA (Sliding Window Attention) — derived from token_to_kv_pool, set in prepare phase
+    swa_loc: Optional[torch.Tensor] = None  # the current swa_loc tensor held by token_to_kv_pool
+    kv_cache_dtype: Optional[torch.dtype] = None  # token_to_kv_pool.dtype
+    is_swa: bool = False  # isinstance(token_to_kv_pool, SWAKVPool)
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
