@@ -11,6 +11,7 @@ from sglang.srt.utils import is_cuda, is_hip
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -50,34 +51,38 @@ class FutureMap:
         context_len: int,
         device: torch.device,
         spec_algo: SpeculativeAlgorithm,
+        req_to_token_pool: ReqToTokenPool,
     ):
-        # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
-        self.future_ct = 0
-
-        # Circular buffer layout (wraps in this order):
-        # Running decode batch -> Prefill chunk 1 -> ... -> Prefill chunk N
-        # A running decode batch's result will be resolved after all prefill chunks are done.
-        # reserve `max_num_chunks` extra future slots on top of `max_running_requests * 3`.
-        max_num_chunks = (
-            (context_len + chunked_prefill_size - 1) // chunked_prefill_size
-            if chunked_prefill_size
-            else 0
-        )
-        self.future_limit = max_running_requests * (3 + max_num_chunks)
-        # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
-        self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
         self.spec_algo = spec_algo
 
         if self.spec_algo.is_none():
-            # For non-speculative decoding, we only need to store the token ids.
+            # token_ids_buf is addressed directly by req_pool_idx (see
+            # alloc_future_indices below). Sizing follows ReqToTokenPool's
+            # allocated rows (req_to_token.shape[0] == size + 1) so slot 0
+            # is the padding row shared with the KV cache pool: CUDA-graph
+            # padded batches default req_pool_idx to 0, and dummy reads/
+            # writes here land harmlessly on that same row. Real req_pool_idx
+            # in [1, size] => `-req_pool_idx` is strictly negative and
+            # unambiguous as the resolve_future placeholder.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
-                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+                (req_to_token_pool.req_to_token.shape[0],),
+                dtype=torch.int64,
+                device=self.device,
             )
         else:
-            # For speculative decoding, we lazily initialize the buffers
-            # This is to make the shape derivation easier.
+            # Spec v2 buffers still use a ring slot allocator; sizing follows
+            # the historical worst-case formula. Follow-up will migrate spec v2
+            # buffers to the same req-indexed scheme as token_ids_buf.
+            self.future_ct = 0
+            max_num_chunks = (
+                (context_len + chunked_prefill_size - 1) // chunked_prefill_size
+                if chunked_prefill_size
+                else 0
+            )
+            self.future_limit = max_running_requests * (3 + max_num_chunks)
+            self.future_buffer_len = self.future_limit + 2 * max_running_requests
             self.buf_initialized = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -118,8 +123,20 @@ class FutureMap:
                 device=self.device,
             )
 
-    def alloc_future_indices(self, bs: int) -> FutureIndices:
-        """Update the circular buffer pointer and allocate future indices."""
+    def alloc_future_indices(self, batch: ScheduleBatch) -> FutureIndices:
+        """Allocate future-token slot handles for this batch.
+
+        For non-spec, the slot identity is the request's req_pool_idx itself:
+        we reuse ``batch.req_pool_indices`` as the indices into
+        ``token_ids_buf``. No fresh tensor is allocated, so there is no
+        cross-stream lifetime concern for the indices tensor (the SB owns it).
+
+        For spec v2, the ring allocator is preserved.
+        """
+        if self.spec_algo.is_none():
+            return FutureIndices(indices=batch.req_pool_indices)
+
+        bs = len(batch.seq_lens)
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
@@ -161,11 +178,9 @@ class FutureMap:
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         if self.spec_algo.is_none():
-            intv = future_indices.interval
-            if self.is_empty_slice(intv):
-                # idle indices in dp attention do not need store info
-                return
-            self.token_ids_buf[intv] = batch_result.next_token_ids
+            # Empty indices (e.g. DP attention idle rank) advanced-index into
+            # token_ids_buf as a natural no-op; no explicit guard needed.
+            self.token_ids_buf[future_indices.indices] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)

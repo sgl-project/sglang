@@ -121,6 +121,7 @@ class SpeculativeAlgorithm(Enum):
         chunked_prefill_size: int,
         context_len: int,
         device: torch.device,
+        req_to_token_pool,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
@@ -130,6 +131,7 @@ class SpeculativeAlgorithm(Enum):
             context_len,
             device,
             self,
+            req_to_token_pool,
         )
 
     def supports_spec_v2(self) -> bool:

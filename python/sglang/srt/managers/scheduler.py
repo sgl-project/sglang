@@ -1282,6 +1282,7 @@ class Scheduler(
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
+            self.req_to_token_pool,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -2836,8 +2837,7 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
-                    bs = len(batch.seq_lens)
-                    future_indices = self.future_map.alloc_future_indices(bs)
+                    future_indices = self.future_map.alloc_future_indices(batch)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
