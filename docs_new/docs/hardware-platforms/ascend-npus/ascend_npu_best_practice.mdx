@@ -4238,7 +4238,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 # bind cpu
-# bind cpu
 export SGLANG_SET_CPU_AFFINITY=1
 
 unset https_proxy
@@ -4368,7 +4367,7 @@ sglang serve --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8001 --dataset-name random  --max-concurrency 32 --num-prompts 128 --random-range-ratio 1  --random-output-len 16000 --random-input-len 1000
+python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8001 --dataset-name random  --max-concurrency 32 --num-prompts 128 --random-range-ratio 1  --random-output-len 1000 --random-input-len 16000
 ```
 
 ### Qwen3-27B 64K-1K 20ms on A3 2 Cards Mixed Mode
@@ -4440,7 +4439,7 @@ python -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8004 --dataset-name random  --max-concurrency 9 --num-prompts 36 --random-range-ratio 1  --random-output-len 64000 --random-input-len 1000
+python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8004 --dataset-name random  --max-concurrency 9 --num-prompts 36 --random-range-ratio 1  --random-output-len 1000 --random-input-len 64000
 ```
 
 ### Qwen3-27B 3_5K-1_5K 50ms on A3 2 Cards Mixed Mode
@@ -4511,7 +4510,7 @@ python -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8000 --dataset-name random  --max-concurrency 48 --num-prompts 192 --random-range-ratio 1  --random-output-len 3500 --random-input-len 1500
+python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8000 --dataset-name random  --max-concurrency 48 --num-prompts 192 --random-range-ratio 1  --random-output-len 1000 --random-input-len 3500
 ```
 
 ### Qwen3-27B 16K-1K 50ms on A3 4 Cards Mixed Mode
@@ -4585,7 +4584,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8001 --dataset-name random  --max-concurrency 28 --num-prompts 152 --random-range-ratio 1  --random-output-len 16000 --random-input-len 1000
+python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 8001 --dataset-name random  --max-concurrency 28 --num-prompts 152 --random-range-ratio 1  --random-output-len 1000 --random-input-len 16000
 ```
 
 ### Qwen3-27B 64K-1K 50ms on A3 4 Cards Mixed Mode
@@ -4658,5 +4657,5 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 9000 --dataset-name random  --max-concurrency 9 --num-prompts 36 --random-range-ratio 1  --random-output-len 64000 --random-input-len 1000
+python3 -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 9000 --dataset-name random  --max-concurrency 9 --num-prompts 36 --random-range-ratio 1  --random-output-len 1000 --random-input-len 64000
 ```
