@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
@@ -47,7 +48,7 @@ class TestHiCacheSpecFileStorage(HiCacheSpecStorageMixin, CustomTestCase):
         for filename in filenames:
             if not filename.endswith(".bin"):
                 continue
-            if filename.startswith("d:"):
+            if f".{PoolName.DRAFT}" in filename:
                 draft_pages += 1
             else:
                 target_pages += 1
