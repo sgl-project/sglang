@@ -55,6 +55,29 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     if not getattr(server_args, "enable_double_sparsity", False):
         return
 
+    # Fail-fast at startup: the page-table adapter that bridges the DS
+    # selector's page-level (selected_indices, valid_lengths) output to the
+    # NSA backend's token-level topk_indices tensor has not landed yet (see
+    # REVIEWER_GUIDE.md "Known gaps for the integration that the deploying
+    # team must close"). Without the adapter a DS-enabled server can pass
+    # startup validation but would crash on its first request; reject the
+    # flag here instead so the failure surfaces at boot. The
+    # SGLANG_DS_ALLOW_NO_ADAPTER=1 dev override exists so smoke-test paths
+    # (e.g. serve_double_sparsity.sh) can still exercise the rest of the
+    # boot pipeline.
+    if os.environ.get("SGLANG_DS_ALLOW_NO_ADAPTER") != "1":
+        raise ValueError(
+            "Double Sparsity is wired into the V3.2 attention path, but the "
+            "page-table adapter that translates the selector's page-level "
+            "output into the NSA backend's token-level topk_indices tensor "
+            "has not landed yet. Refusing to enable --enable-double-sparsity "
+            "until the adapter is in place. Set SGLANG_DS_ALLOW_NO_ADAPTER=1 "
+            "to override for development / smoke tests; production "
+            "deployments must wait for the adapter milestone (see "
+            "REVIEWER_GUIDE.md 'Known gaps for the integration that the "
+            "deploying team must close')."
+        )
+
     if getattr(server_args, "enable_hisparse", False):
         raise ValueError(
             "Double Sparsity and HiSparse are mutually exclusive; there are no plans "

@@ -171,19 +171,44 @@ class TestValidator(unittest.TestCase):
     def test_disabled_is_no_op(self):
         validate_double_sparsity(self._args(enable_double_sparsity=False))
 
-    def test_mutual_exclusion_with_hisparse(self):
-        args = self._args(enable_double_sparsity=True, enable_hisparse=True)
+    def test_adapter_gate_rejects_by_default(self):
+        """Round-3 fix [P1]: validator rejects --enable-double-sparsity at
+        startup until the page-table adapter lands, so a misconfigured
+        server fails at boot instead of on first request.
+        """
+
+        args = self._args(
+            enable_double_sparsity=True,
+            double_sparsity_config=_valid_payload(),
+            page_size=64,
+        )
+        os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
         with self.assertRaises(ValueError) as ctx:
             validate_double_sparsity(args)
-        self.assertIn("mutually exclusive", str(ctx.exception).lower())
+        self.assertIn("adapter", str(ctx.exception).lower())
+        self.assertIn("SGLANG_DS_ALLOW_NO_ADAPTER", str(ctx.exception))
+
+    def test_mutual_exclusion_with_hisparse(self):
+        args = self._args(enable_double_sparsity=True, enable_hisparse=True)
+        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                validate_double_sparsity(args)
+            self.assertIn("mutually exclusive", str(ctx.exception).lower())
+        finally:
+            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_missing_config(self):
         args = self._args(
             enable_double_sparsity=True, double_sparsity_config=None
         )
-        with self.assertRaises(ValueError) as ctx:
-            validate_double_sparsity(args)
-        self.assertIn("channel_mask_path", str(ctx.exception))
+        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                validate_double_sparsity(args)
+            self.assertIn("channel_mask_path", str(ctx.exception))
+        finally:
+            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_disaggregation_rejected(self):
         args = self._args(
@@ -191,9 +216,13 @@ class TestValidator(unittest.TestCase):
             disaggregation_mode="decode",
             double_sparsity_config=_valid_payload(),
         )
-        with self.assertRaises(ValueError) as ctx:
-            validate_double_sparsity(args)
-        self.assertIn("disaggregation", str(ctx.exception).lower())
+        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                validate_double_sparsity(args)
+            self.assertIn("disaggregation", str(ctx.exception).lower())
+        finally:
+            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_page_size_mismatch(self):
         args = self._args(
@@ -201,9 +230,13 @@ class TestValidator(unittest.TestCase):
             double_sparsity_config=_valid_payload(),
             page_size=32,
         )
-        with self.assertRaises(ValueError) as ctx:
-            validate_double_sparsity(args)
-        self.assertIn("page_size", str(ctx.exception))
+        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                validate_double_sparsity(args)
+            self.assertIn("page_size", str(ctx.exception))
+        finally:
+            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_valid_path(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
@@ -228,6 +261,7 @@ class TestValidator(unittest.TestCase):
                 disable_radix_cache=True,
             )
             os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
             try:
                 validate_double_sparsity(args)
                 self.assertIsInstance(
@@ -235,6 +269,7 @@ class TestValidator(unittest.TestCase):
                 )
             finally:
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
 
 class TestPlaceholderGuard(unittest.TestCase):

@@ -43,10 +43,12 @@ The validator uses `is_deepseek_nsa(hf_config)` as a proxy for "exposes the NSA 
 
 ## Known gaps for the integration that the deploying team must close
 
+* **Page-table adapter (the gating milestone)**: the DS selector returns `(selected_indices, valid_lengths)` at the page level; the NSA backend consumes a token-level `topk_indices` tensor with `.shape` and `!= -1` semantics. The adapter that bridges these two ABIs is not in the repo. As of Round 3 the startup validator refuses `--enable-double-sparsity` until this lands; `SGLANG_DS_ALLOW_NO_ADAPTER=1` is the documented dev override for smoke testing the rest of the boot pipeline. The per-step hook also raises `NotImplementedError` as a defense-in-depth guard for unit-test paths that bypass the validator.
 * End-to-end AC-8 SLO verification: requires a calibrated channel mask file + V3.2 FP8 weights on the deploying hardware.
 * AC-9 quality runs (NIAH / MMLU): same.
 * AC-6 conc 16/32/64 CUDA-graph capture verification: requires real V3.2 boot.
 * DEC-2 radix-cache permission: the validator gates radix cache until `_double_sparsity_radix_fixture_passed` is recorded as True (set by the M3-B page-stability fixture, which the deploying team runs alongside calibration).
+* TP head sharding at bind time: the calibrated mask is TP-agnostic on disk; the deploying-team integration glue must call `slice_per_rank(mask, num_local_heads=..., rank=..., tp_size=...)` before `bind_runtime_data`. The selector rejects an un-sliced mask at bind time with an error that names the helper.
 
 ## meta_info integration (Round 2 wiring point)
 

@@ -6,10 +6,15 @@
 # node, 8-way TP, page=64. Mutually exclusive with --enable-hisparse at
 # startup (per DEC-8).
 #
-# The selection kernels and FP8-aware page_signature_write are still under
-# development. SGLANG_DS_ALLOW_PLACEHOLDER=1 lets a server boot with the
-# placeholder selector for development / smoke tests; production traffic
-# must wait for the real kernels (later milestones).
+# DEV-ONLY launcher. The DS startup validator refuses --enable-double-sparsity
+# until the page-table adapter milestone lands; this script sets the dev
+# override env vars so the rest of the boot pipeline still runs end-to-end
+# for smoke tests. The first request will still raise NotImplementedError
+# from the per-step hook (the adapter is the next milestone). Production
+# deployments MUST drop both env vars below.
+
+export SGLANG_DS_ALLOW_NO_ADAPTER="${SGLANG_DS_ALLOW_NO_ADAPTER:-1}"
+export SGLANG_DS_ALLOW_PLACEHOLDER="${SGLANG_DS_ALLOW_PLACEHOLDER:-1}"
 
 set -euo pipefail
 

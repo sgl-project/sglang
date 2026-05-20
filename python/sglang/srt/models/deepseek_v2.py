@@ -1795,17 +1795,14 @@ class DeepseekV2AttentionMLA(
             assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
 
             raise NotImplementedError(
-                "Double Sparsity selector is wired into the V3.2 attention "
-                "path, but the page-table adapter that translates the "
-                "selector's (selected_indices, valid_lengths) page-level "
-                "output into the NSA backend's token-level topk_indices "
-                "tensor has not landed yet. This is the documented "
-                "next-milestone boundary (REVIEWER_GUIDE.md 'Known gaps "
-                "for the integration that the deploying team must close'). "
-                "Disable Double Sparsity (drop --enable-double-sparsity) "
-                "until the adapter is in place. The selector ABI itself is "
-                "independently testable via "
-                "DoubleSparsitySelector.retrieve_topk(...)."
+                "Double Sparsity selector reached the per-step hook but the "
+                "page-table adapter (page-level -> token-level topk_indices) "
+                "is missing. This should normally be caught at startup by "
+                "validate_double_sparsity; the in-hook raise is a "
+                "defense-in-depth guard for code paths that bypass the "
+                "validator (e.g. constructed via object.__new__ in unit "
+                "tests). See REVIEWER_GUIDE.md 'Known gaps for the "
+                "integration that the deploying team must close'."
             )
 
         return self.indexer(
