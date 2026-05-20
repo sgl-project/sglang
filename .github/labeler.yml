@@ -105,6 +105,13 @@ hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
+      - '**/*HiCache*'
+      - 'python/sglang/srt/mem_cache/hiradix_cache.py'
+      - 'python/sglang/srt/mem_cache/memory_pool_host.py'
+      - 'python/sglang/srt/mem_cache/storage/**'
+      - 'python/sglang/srt/mem_cache/hybrid_cache/**'
+      - 'python/sglang/srt/managers/cache_controller.py'
+      - 'test/registered/hicache/**'
 
 # Deterministic
 deterministic:
