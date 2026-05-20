@@ -9,7 +9,7 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
 
-_ON_MODE_VERBOSE_LIMIT: int = 10
+_LOG_MODE_VERBOSE_LIMIT: int = 10
 
 
 class ViolationReporter:
@@ -23,7 +23,7 @@ class ViolationReporter:
         self._config = config
         self._device_state = device_state
         self._pump_and_allreduce = pump_and_allreduce
-        self._on_mode_violations_logged: int = 0
+        self._log_mode_violations_logged: int = 0
         self._raised: bool = False
 
     @property
@@ -43,9 +43,9 @@ class ViolationReporter:
             ring_overflow=ring_overflow,
             step_when_pumped=self._pump_and_allreduce.step_counter,
         )
-        if self._config.mode == "on":
-            self._on_mode_violations_logged += 1
-            if self._on_mode_violations_logged <= _ON_MODE_VERBOSE_LIMIT:
+        if self._config.mode == "log":
+            self._log_mode_violations_logged += 1
+            if self._log_mode_violations_logged <= _LOG_MODE_VERBOSE_LIMIT:
                 logger.warning(message)
             else:
                 logger.debug(message)

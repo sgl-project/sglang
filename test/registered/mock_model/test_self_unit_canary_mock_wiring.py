@@ -123,12 +123,12 @@ def test_mock_model_engine_kwargs_returns_defaults() -> None:
 
 def test_mock_model_engine_kwargs_overrides_win() -> None:
     kwargs = mock_model_engine_kwargs(
-        kv_canary="on",
+        kv_canary="log",
         sampling_backend="pytorch",
         tp_size=2,
     )
 
-    assert kwargs["kv_canary"] == "on"
+    assert kwargs["kv_canary"] == "log"
     assert kwargs["sampling_backend"] == "pytorch"
     assert kwargs["tp_size"] == 2
     assert kwargs["load_format"] == "dummy"
