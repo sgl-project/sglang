@@ -71,8 +71,6 @@ def _setup_pair_with_canned_chain(
     )
 
 
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _VerifySingleSlotInput:
     token: int = 42
