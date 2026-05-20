@@ -592,6 +592,7 @@ class MQALayer(nn.Module):
                 swa_cache=swa_cache,
                 swa_loc=swa_loc,
                 swa_page_size=swa_page_size,
+                q_out=q_out,
                 dtype=x.dtype,
             )
 
