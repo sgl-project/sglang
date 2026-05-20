@@ -686,7 +686,6 @@ class ServerArgs:
     kv_canary_jitter_max_cycles: Optional[int] = None
     kv_canary_jitter_seed: Optional[int] = None
     mock_model_enabled: bool = False
-    num_hidden_layers_override: Optional[int] = None
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -6177,15 +6176,6 @@ class ServerArgs:
                 "check + dummy weights + 1-layer override. Defaults for each flag "
                 "are filled by apply_mock_model_defaults during ServerArgs "
                 "post-parse if the user has not already set them."
-            ),
-        )
-        parser.add_argument(
-            "--num-hidden-layers-override",
-            type=int,
-            default=ServerArgs.num_hidden_layers_override,
-            help=(
-                "Override num_hidden_layers on the model config. Useful for "
-                "mock-model testing to truncate large models to a few layers."
             ),
         )
         parser.add_argument(

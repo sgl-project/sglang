@@ -19,7 +19,6 @@ def test_eagle_positions_misalign_regression(capfd, monkeypatch) -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
-        num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
         kv_canary_input_check_mode="ON",
@@ -40,7 +39,6 @@ def test_eagle_positions_match_with_fix() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
-        num_hidden_layers_override=1,
         speculative_algorithm="EAGLE",
         kv_canary="raise",
         kv_canary_input_check_mode="ON",

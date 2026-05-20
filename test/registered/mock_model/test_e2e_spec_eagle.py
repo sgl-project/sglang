@@ -22,7 +22,6 @@ def test_spec_eagle_no_canary_violation() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
         mock_model_enabled=True,
-        num_hidden_layers_override=1,
         kv_canary="raise",
         kv_canary_input_check_mode="ON",
         speculative_algorithm="EAGLE",

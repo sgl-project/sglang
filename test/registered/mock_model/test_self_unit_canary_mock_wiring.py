@@ -6,6 +6,7 @@ mock_model is opted in.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import torch
 
@@ -123,7 +124,7 @@ def test_apply_mock_model_defaults_fills_holes_when_enabled() -> None:
     result = apply_mock_model_defaults(original)
 
     assert result.load_format == "dummy"
-    assert result.num_hidden_layers_override == 1
+    assert json.loads(result.json_model_override_args).get("num_hidden_layers") == 1
     assert result.sampling_backend == "oracle"
     assert result.kv_canary == "raise"
     assert result.kv_canary_input_check_mode == "ON"
@@ -135,12 +136,12 @@ def test_apply_mock_model_defaults_preserves_user_overrides() -> None:
     original = ServerArgs(
         model_path="dummy",
         mock_model_enabled=True,
-        num_hidden_layers_override=4,
+        json_model_override_args='{"num_hidden_layers":4}',
         kv_canary="on",
     )
     result = apply_mock_model_defaults(original)
 
-    assert result.num_hidden_layers_override == 4
+    assert json.loads(result.json_model_override_args).get("num_hidden_layers") == 4
     assert result.kv_canary == "on"
     assert result.load_format == "dummy"
 
