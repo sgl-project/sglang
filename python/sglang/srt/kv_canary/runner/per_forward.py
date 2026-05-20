@@ -87,8 +87,6 @@ class PerForwardOrchestrator:
         self._write_entry_capacity = write_entry_capacity
         self._verify_capacity = max(1, per_forward_verify_capacity)
 
-        self._last_forward_batch: Optional["ForwardBatch"] = None
-
     def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
         self._token_oracle_manager = manager
 
@@ -128,7 +126,6 @@ class PerForwardOrchestrator:
 
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
-        self._last_forward_batch = forward_batch
 
         if self._config.input_check_mode == CanaryInputCheckMode.ON:
             manager = self._token_oracle_manager

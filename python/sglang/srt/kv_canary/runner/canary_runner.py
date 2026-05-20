@@ -84,7 +84,6 @@ class CanaryRunner:
         swa_window_size: int = 0,
     ) -> None:
         self.config = config
-        self._device = device
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = int(swa_window_size)
 
@@ -116,7 +115,6 @@ class CanaryRunner:
 
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
-            device=device,
             device_state=self._device_state,
             tp_group=tp_group,
             pp_group=pp_group,
