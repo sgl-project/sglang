@@ -665,13 +665,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             )
 
-        # Populate SWA-related derived fields from pool
+        # Populate pool-derived fields so forward-time code reads from ForwardBatch
+        pool = model_runner.token_to_kv_pool
+        ret.kv_cache_dtype = getattr(pool, "dtype", None)
         if model_runner.is_hybrid_swa:
             from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-            pool = model_runner.token_to_kv_pool
             ret.is_swa = isinstance(pool, SWAKVPool)
-            ret.kv_cache_dtype = getattr(pool, "dtype", None)
             ret.swa_loc = getattr(pool, "swa_loc", None)
 
         # Init lora information
