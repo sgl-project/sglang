@@ -50,7 +50,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -1067,7 +1066,9 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        self.alt_streams = [torch.cuda.Stream() for _ in range(5)] if _is_cuda else None
+        self.alt_streams = (
+            [torch.cuda.Stream() for _ in range(5)] if _is_cuda or _is_hip else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
