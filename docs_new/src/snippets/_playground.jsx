@@ -40,12 +40,37 @@
 // part of the engine should ever switch on an axis id.
 //
 // Each handler exposes a uniform 4-method interface:
-//   initState(featureConfig)               → initial delta value
+//   initState(featureConfig)               → initial delta value (sentinels)
 //   revertHidden(value, fc, base, helpers) → next value (same ref if unchanged)
-//   apply({flags, env, value, fc, sel, helpers}) → next {flags, env}
-//   render({axisId, value, setValue, fc, base, s, h, renderChip, renderSelect}) → JSX | null
-// Plus one optional method:
+//   apply({flags, env, value, fc, sel, h, derived}) → next {flags, env}
+//   render({axisId, value, setValue, fc, base, s, h, renderChip,
+//           renderSelect, derived}) → JSX | null
+// Plus two optional methods:
+//   deriveFromBase(cell, fc, h)            → value-shaped object recovered
+//                                            from the base cell's flags.
+//                                            Render uses it for default
+//                                            dropdown display when state
+//                                            slot is the inherit sentinel;
+//                                            apply uses it (where needed)
+//                                            to no-op when the user's pick
+//                                            matches base.
 //   getRenderHints(value, fc)              → {pdMode?, ...} hints for renderer
+//
+// DROPDOWN DEFAULT-FROM-BASE
+// --------------------------
+// Sentinel state (`null` / `"current"` / `"disabled"`) still represents
+// "follow base." `deriveFromBase` reads the base cell's flags back into
+// the same shape and the render layer DISPLAYS that derived value as the
+// dropdown's selected entry — so users see their cell's actual --tp / MoE
+// backend / spec preset, not an opaque "auto." When derive returns a real
+// value, the inherit-sentinel option is filtered out of the dropdown via
+// `renderSelect`'s `opts.hideValues`. State only flips off the sentinel
+// when the user explicitly picks a different value; clicking "Reset all
+// overrides" puts every axis back at its sentinel (and thus back at
+// derived-from-base).
+//
+// Flag-parsing helpers available on the helpers bundle: `parseIntFlag`,
+// `hasFlag`, `findFlagArg` — used inside `deriveFromBase` methods.
 //
 // LAYOUT CONVENTION
 // -----------------
@@ -232,17 +257,63 @@ export const Playground = ({ config }) => {
     return out;
   };
 
-  // Insert one or more new flags right after the FIRST flag whose first token
-  // is in `afterAnyOf`. Falls back to right-after --model-path if none match.
-  // The order of `afterAnyOf` is irrelevant (set semantics); pass any subset
-  // of conceptual siblings so the override lands near them.
+  // Insert one or more new flags right after the most-specific anchor flag
+  // present in `flags`. `afterAnyOf` is PRIORITY-ORDERED — the engine tries
+  // each anchor in turn and uses the first one actually present, falling
+  // through to less-specific siblings only when the more-specific anchors
+  // are absent. Final fallback is right-after --model-path (always present).
+  //
+  // Priority order matters because cells often contain multiple anchor
+  // candidates (e.g. both --tp and --model-path). Treating `afterAnyOf` as
+  // a SET — i.e. returning the first flag in the FLAG list whose token is
+  // anywhere in the set — would land on --model-path in many cells, even
+  // though --tp is the closer conceptual sibling. That tiny placement
+  // error then ripples into the diff: when a re-emitted flag lands at a
+  // different position from base, the LCS-like diff silently drops shared
+  // lines around the swap. Iterating anchors in priority order keeps
+  // position-stable when the canonical sibling is present.
   const insertAfter = (flags, afterAnyOf, additions) => {
-    const set = new Set(afterAnyOf);
-    let idx = flags.findIndex((f) => set.has(f.split(/[\s=]/)[0]));
+    let idx = -1;
+    for (const anchor of afterAnyOf) {
+      idx = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
+      if (idx !== -1) break;
+    }
     if (idx === -1) idx = flags.findIndex((f) => f.startsWith("--model-path"));
     const out = flags.slice();
     out.splice(idx + 1, 0, ...additions);
     return out;
+  };
+
+  // -------- Flag-reading helpers (used by `deriveFromBase` methods) ------
+  // These exist so each axis can recover its initial display state from the
+  // base cell's flag array — e.g. attention reads back "--tp 8" → 8, moe
+  // reads back "--moe-a2a-backend deepep" → "deepep". All three are pure
+  // and tolerate missing/empty inputs (return null when nothing matches).
+
+  // Return the first integer arg of `--prefix N` (space- or `=`-delimited)
+  // anywhere in `flags`, or null if the flag is absent / its arg isn't an int.
+  const parseIntFlag = (flags, prefix) => {
+    for (const f of (flags || [])) {
+      if (f.split(/[\s=]/)[0] !== prefix) continue;
+      const rest = f.slice(prefix.length).replace(/^[\s=]+/, "");
+      const n = parseInt(rest, 10);
+      if (!isNaN(n)) return n;
+    }
+    return null;
+  };
+  // True if any flag's first token equals `name` (used for boolean flags
+  // like `--enable-dp-attention` that take no argument).
+  const hasFlag = (flags, name) =>
+    (flags || []).some((f) => f.split(/[\s=]/)[0] === name);
+  // Return the string arg of `--prefix arg` (space- or `=`-delimited),
+  // or null. Used for enum flags like --moe-a2a-backend.
+  const findFlagArg = (flags, prefix) => {
+    for (const f of (flags || [])) {
+      if (f.split(/[\s=]/)[0] !== prefix) continue;
+      const rest = f.slice(prefix.length).replace(/^[\s=]+/, "");
+      return rest.length ? rest : null;
+    }
+    return null;
   };
 
   // Insertion-anchor sets — declared once so axis handlers stay terse and
@@ -261,6 +332,7 @@ export const Playground = ({ config }) => {
   const helpers = {
     matchConstraint, evaluateChip, findEntry, isHidden,
     stripFlagsByFirstToken, stripEnvByPrefix, insertBeforeTail, insertAfter,
+    parseIntFlag, hasFlag, findFlagArg,
     ANCHOR_NEAR_MODEL_PATH, ANCHOR_NEAR_TP, ANCHOR_NEAR_DP,
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
@@ -285,11 +357,17 @@ export const Playground = ({ config }) => {
   //                                  (so base's flag survives "inherit")
   //   - moe.backend / moe.ep       : strip ONLY when value !== null
   //   - speculative                : strip ONLY when value !== "current"
-  //                                  ("current" = inherit, "off" = strip
-  //                                  without re-emit)
-  //   - parsers                    : UNCONDITIONAL strip (engine owns parser
-  //                                  flags whenever the parsers axis is
-  //                                  declared)
+  //                                  AND value !== derived (latter guard
+  //                                  keeps base's spec flags in their
+  //                                  original middle-of-list position when
+  //                                  the user picks the preset that
+  //                                  already matches base)
+  //   - parsers                    : strip ONLY when ANY item's effective
+  //                                  on/off differs from derived-from-base
+  //                                  (used to be unconditional; switching
+  //                                  to "only when overridden" preserves
+  //                                  base's parser flag position when none
+  //                                  of the toggles are user-touched)
   //   - pdDisagg                   : UNCONDITIONAL strip
   //   - hicache                    : UNCONDITIONAL strip
   //   - megamoe                    : strip ONLY when value !== "disabled"
@@ -303,6 +381,25 @@ export const Playground = ({ config }) => {
     // insertion anchor so overrides land near their conceptual siblings.
     attention: {
       initState: () => ({ tp: null, dp: null, cp: null, dpAttn: null }),
+
+      // Read the base cell's parallelism flags back into the same shape that
+      // initState/apply use. The dropdowns DISPLAY this when the user hasn't
+      // explicitly overridden a knob (state slot is null). Apply is unchanged
+      // — it still no-ops on null, so untouched slots leave the base cell's
+      // flag in place at its original position and the diff stays clean.
+      //
+      // CP currently emits no numeric arg in apply (`--nsa-prefill-cp-mode
+      // round-robin-split`), so derivation can only tell you on/off — we
+      // collapse a present `--enable-nsa-prefill-context-parallel` to 2.
+      deriveFromBase: (cell, fc, h) => {
+        const flags = (cell && cell.flags) || [];
+        return {
+          tp: h.parseIntFlag(flags, "--tp"),
+          dp: h.parseIntFlag(flags, "--dp"),
+          cp: h.hasFlag(flags, "--enable-nsa-prefill-context-parallel") ? 2 : null,
+          dpAttn: h.hasFlag(flags, "--enable-dp-attention"),
+        };
+      },
 
       revertHidden: (value, fc, base, h) => {
         let changed = false;
@@ -348,7 +445,7 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
         const knobs = fc.knobs || [];
         if (!knobs.length) return null;
         const setKnob = (k, v) => setValue({ ...value, [k]: v });
@@ -363,6 +460,19 @@ export const Playground = ({ config }) => {
           }
           return c.value === null ? "auto" : String(c.value);
         };
+        // Display rule: explicit user pick (non-null) > derived-from-base >
+        // null sentinel. When derive produced a real value, hide the
+        // sentinel option from the dropdown.
+        const knobDisplay = (knob) => {
+          const v = value[knob.id];
+          if (v !== null && v !== undefined) return v;
+          if (derived && derived[knob.id] !== undefined) return derived[knob.id];
+          return null;
+        };
+        const hideNullFor = (knob) => {
+          const d = derived ? derived[knob.id] : null;
+          return (d !== null && d !== undefined) ? [null] : [];
+        };
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -370,8 +480,9 @@ export const Playground = ({ config }) => {
               {knobs.map((knob) => (
                 <span key={knob.id} style={s.field}>
                   <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
-                  {renderSelect(value[knob.id], knob.values || [null],
-                    (nv) => setKnob(knob.id, nv), base, labelFor(knob))}
+                  {renderSelect(knobDisplay(knob), knob.values || [null],
+                    (nv) => setKnob(knob.id, nv), base, labelFor(knob),
+                    { hideValues: hideNullFor(knob) })}
                 </span>
               ))}
             </div>
@@ -385,6 +496,21 @@ export const Playground = ({ config }) => {
     // and EP (numeric knob). Either sub-axis is independently optional.
     moe: {
       initState: () => ({ backend: null, ep: null }),
+
+      // Recover MoE backend choice from the base cell's flags. When BOTH
+      // `--moe-a2a-backend` and `--moe-runner-backend` are present (e.g.
+      // h200 fp8 max-throughput layers both), we prefer `--moe-a2a-backend`
+      // — it's the "louder" architectural pick and matches the
+      // single-select dropdown's semantics.
+      deriveFromBase: (cell, fc, h) => {
+        const flags = (cell && cell.flags) || [];
+        const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
+        const runner = h.findFlagArg(flags, "--moe-runner-backend");
+        return {
+          backend: a2a || runner || null,
+          ep: h.parseIntFlag(flags, "--ep"),
+        };
+      },
 
       revertHidden: (value, fc, base, h) => {
         let changed = false;
@@ -419,9 +545,20 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
         if (!fc.backend && !fc.ep) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        // Same display rule as attention: explicit > derived > null.
+        const slotDisplay = (k) => {
+          const v = value[k];
+          if (v !== null && v !== undefined) return v;
+          if (derived && derived[k] !== undefined) return derived[k];
+          return null;
+        };
+        const hideNull = (k) => {
+          const d = derived ? derived[k] : null;
+          return (d !== null && d !== undefined) ? [null] : [];
+        };
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -429,15 +566,17 @@ export const Playground = ({ config }) => {
               {fc.backend && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>Backend</span>
-                  {renderSelect(value.backend, fc.backend.options || [],
-                    (v) => setSlot("backend", v), base)}
+                  {renderSelect(slotDisplay("backend"), fc.backend.options || [],
+                    (v) => setSlot("backend", v), base, undefined,
+                    { hideValues: hideNull("backend") })}
                 </span>
               )}
               {fc.ep && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
-                  {renderSelect(value.ep, fc.ep.values || [null],
-                    (v) => setSlot("ep", v), base)}
+                  {renderSelect(slotDisplay("ep"), fc.ep.values || [null],
+                    (v) => setSlot("ep", v), base, undefined,
+                    { hideValues: hideNull("ep") })}
                 </span>
               )}
             </div>
@@ -452,9 +591,27 @@ export const Playground = ({ config }) => {
     // is declared (so the playground takes ownership of these flags), then
     // re-emits one item.flag per toggled-on item.
     parsers: {
+      // Tri-state per item: null = inherit-from-base, true/false = explicit
+      // user pick. Stored as null so the toggle button can show base's
+      // current parser state by default and apply can preserve base's flag
+      // position when nothing's been overridden.
       initState: (fc) => {
         const out = {};
-        for (const item of (fc.items || [])) out[item.id] = false;
+        for (const item of (fc.items || [])) out[item.id] = null;
+        return out;
+      },
+
+      // Look up each item's `--reasoning-parser` / `--tool-call-parser`
+      // (etc.) flag in the base cell and report on/off accordingly.
+      deriveFromBase: (cell, fc, h) => {
+        const flags = (cell && cell.flags) || [];
+        const out = {};
+        for (const item of (fc.items || [])) {
+          // Each `item.flag` is like "--reasoning-parser deepseek-v4". Take
+          // the first token as the prefix to look up.
+          const prefix = item.flag.split(/[\s=]/)[0];
+          out[item.id] = h.hasFlag(flags, prefix);
+        }
         return out;
       },
 
@@ -462,36 +619,60 @@ export const Playground = ({ config }) => {
         let changed = false;
         const next = { ...value };
         for (const item of (fc.items || [])) {
-          if (next[item.id] && h.evaluateChip(item, base).hidden) {
-            next[item.id] = false; changed = true;
+          if (next[item.id] !== null && next[item.id] !== undefined
+              && h.evaluateChip(item, base).hidden) {
+            next[item.id] = null; changed = true;
           }
         }
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
+        const items = fc.items || [];
+        // Per-item effective state: explicit value if non-null, else derived
+        // from base, else false. The `effective !== base-derived` check below
+        // determines whether ANY user override is in play — if none, we skip
+        // the strip+emit so base's parser flag (if any) stays in place at
+        // its original position and the diff stays clean.
+        const eff = {};
+        const baseOf = {};
+        for (const item of items) {
+          baseOf[item.id] = derived ? !!derived[item.id] : false;
+          const v = value[item.id];
+          eff[item.id] = (v === null || v === undefined) ? baseOf[item.id] : v;
+        }
+        const anyOverride = items.some((it) => eff[it.id] !== baseOf[it.id]);
+        if (!anyOverride) return { flags, env };
         flags = h.stripFlagsByFirstToken(flags, ["--reasoning-parser", "--tool-call-parser"]);
         const adds = [];
-        for (const item of (fc.items || [])) {
-          if (value[item.id]) adds.push(item.flag);
+        for (const item of items) {
+          if (eff[item.id]) adds.push(item.flag);
         }
         if (adds.length) flags = h.insertBeforeTail(flags, adds);
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, h, renderChip }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
         const visible = (fc.items || [])
           .map((item) => ({ item, c: h.evaluateChip(item, base) }))
           .filter(({ c }) => !c.hidden);
         if (visible.length === 0) return null;
+        // Effective on/off per item: explicit pick > derived-from-base > off.
+        // Click flips the effective value and stores it as an explicit pick.
+        const effOn = (id) => {
+          const v = value[id];
+          if (v !== null && v !== undefined) return v;
+          if (derived && derived[id] !== undefined) return derived[id];
+          return false;
+        };
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>Parsers</span>
               {visible.map(({ item, c }) => (
                 <span key={item.id} style={s.field}>
-                  {renderChip(item.label, value[item.id], true,
-                    () => setValue({ ...value, [item.id]: !value[item.id] }),
+                  {renderChip(item.label, effOn(item.id), true,
+                    () => setValue({ ...value, [item.id]: !effOn(item.id) }),
                     { disabled: c.disabled, disabledReason: c.disableReason })}
                 </span>
               ))}
@@ -509,6 +690,31 @@ export const Playground = ({ config }) => {
     speculative: {
       initState: () => "current",
 
+      // Try to recover which preset the base cell already encodes by
+      // comparing the base's `--speculative-*` flag set against each
+      // option's `flags` array as a multiset. If nothing matches:
+      //   - no spec flags at all in base → "off"
+      //   - some spec flags but no preset matches → "current" (preserve
+      //     base as-is; the dropdown will fall back to "Inherited" since
+      //     "current" is still a valid sentinel here)
+      deriveFromBase: (cell, fc) => {
+        const flags = (cell && cell.flags) || [];
+        const baseSpec = flags.filter((f) => {
+          const head = f.split(/[\s=]/)[0];
+          return head === "--speculative-algo"
+              || head === "--speculative-num-steps"
+              || head === "--speculative-eagle-topk"
+              || head === "--speculative-num-draft-tokens";
+        });
+        if (baseSpec.length === 0) return "off";
+        for (const opt of (fc.options || [])) {
+          if (!opt.flags || opt.flags.length !== baseSpec.length) continue;
+          const ok = opt.flags.every((pf) => baseSpec.includes(pf));
+          if (ok) return opt.id;
+        }
+        return "current";
+      },
+
       revertHidden: (value, fc, base, h) => {
         if (value !== "current" && h.isHidden(fc.options || [], value, base)) {
           return "current";
@@ -516,8 +722,14 @@ export const Playground = ({ config }) => {
         return value;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
         if (value === "current") return { flags, env };
+        // Position-preservation shortcut: if the user picked the same preset
+        // the base cell already encodes, no-op. Without this, strip +
+        // insertBeforeTail would re-place the spec block at the tail, but
+        // base cells keep their spec flags in the middle — so the diff
+        // would show base's lines as removed and identical lines as added.
+        if (derived && value === derived) return { flags, env };
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algo", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
@@ -527,15 +739,24 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
         const opts = fc.options || [];
         if (!opts.length) return null;
+        // Display rule: explicit pick (!= "current") wins; otherwise show
+        // whatever deriveFromBase matched. Hide the "current" sentinel from
+        // the dropdown when derive resolved to a real preset (or "off") —
+        // keep it only when nothing matched, so "Inherited from base" is
+        // still pickable as the no-match fallback.
+        const display = (value !== "current") ? value
+                       : (derived ? derived : "current");
+        const hideValues = (derived && derived !== "current") ? ["current"] : [];
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>Speculative</span>
               <span style={s.field}>
-                {renderSelect(value, opts, setValue, base)}
+                {renderSelect(display, opts, setValue, base, undefined,
+                  { hideValues })}
               </span>
             </div>
           </div>
@@ -779,7 +1000,7 @@ export const Playground = ({ config }) => {
   // Thread the base cell's (flags, env) through every declared axis's apply
   // method, in AXIS_HANDLERS declaration order. Also collects render hints
   // from any axis that emits them (currently only pdDisagg's role banner).
-  const applyAllDeltas = (baseFlags, baseEnv, allDeltas, sel) => {
+  const applyAllDeltas = (baseFlags, baseEnv, allDeltas, sel, derivedMap) => {
     let flags = [...baseFlags];
     let env = [...(baseEnv || [])];
     let pdMode = null;
@@ -788,7 +1009,8 @@ export const Playground = ({ config }) => {
       if (!fc) continue;
       const value = allDeltas[axisId];
       if (value === undefined) continue;
-      const out = handler.apply({ flags, env, value, fc, sel, h: helpers });
+      const derived = derivedMap ? derivedMap[axisId] : null;
+      const out = handler.apply({ flags, env, value, fc, sel, h: helpers, derived });
       flags = out.flags;
       env = out.env;
       if (handler.getRenderHints) {
@@ -869,32 +1091,50 @@ export const Playground = ({ config }) => {
   };
 
   // ==========================================================================
-  // 7. Diff (line-level, greedy LCS-like)
+  // 7. Diff (line-level, true LCS)
   // ==========================================================================
-  // Walk both sides, emit `unchanged` when they agree, `added` for
-  // playground-only, `removed` for base-only. Not optimal but produces
-  // readable output when the two share most lines (the common case).
+  // Dynamic-programming LCS + backtrace. Emits `unchanged` for matching
+  // line pairs, `added` for playground-only lines, `removed` for base-only.
+  // Never silently drops lines — every input line ends up in the output
+  // exactly once.
+  //
+  // Why bother with full LCS over a greedy one-pass: the playground's apply
+  // pipeline sometimes reorders flags (e.g. picking a different speculative
+  // preset moves the `--speculative-*` block from the middle of the cell
+  // toward `--host` via insertBeforeTail). A greedy diff that walks both
+  // sides in lockstep silently drops the shared lines (e.g. `--speculative-
+  // algo EAGLE`) when they appear at different positions on the two sides,
+  // producing visibly truncated commands. True LCS handles reordering by
+  // computing the maximal matching set first, then aligning.
+  //
+  // Our commands are ~15 lines so the O(m·n) cost is trivial.
   const computeDiff = (baseStr, pgStr) => {
     const a = baseStr.split("\n");
     const b = pgStr.split("\n");
-    const aSet = new Set(a);
-    const bSet = new Set(b);
-    let i = 0, j = 0;
+    const m = a.length, n = b.length;
+    // dp[i][j] = LCS length between a[0..i] and b[0..j].
+    const dp = Array(m + 1).fill(null).map(() => new Array(n + 1).fill(0));
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    // Backtrace. Walk from (m, n) → (0, 0); when both sides match, emit
+    // `unchanged`; otherwise prefer the side whose DP value is higher
+    // (standard LCS tie-breaking).
     const out = [];
-    while (i < a.length || j < b.length) {
-      if (i < a.length && j < b.length && a[i] === b[j]) {
-        out.push({ line: b[j], kind: "unchanged" });
-        i++; j++;
-      } else if (j < b.length && !aSet.has(b[j])) {
-        out.push({ line: b[j], kind: "added" });
-        j++;
-      } else if (i < a.length && !bSet.has(a[i])) {
-        out.push({ line: a[i], kind: "removed" });
-        i++;
-      } else if (i < a.length) {
-        i++;
+    let i = m, j = n;
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+        out.unshift({ line: a[i - 1], kind: "unchanged" });
+        i--; j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        out.unshift({ line: b[j - 1], kind: "added" });
+        j--;
       } else {
-        j++;
+        out.unshift({ line: a[i - 1], kind: "removed" });
+        i--;
       }
     }
     return out;
@@ -1244,12 +1484,26 @@ export const Playground = ({ config }) => {
   const baseCell = findCell(config.cells, base);
   const modelName = resolveModelName(base);
 
+  // Per-axis "derived from base" map — each handler's `deriveFromBase`
+  // (when defined) reads its own slots out of the base cell's flag array.
+  // Used by render (for default dropdown display when state slot is the
+  // inherit sentinel) AND by apply (parsers needs it to decide whether
+  // anything is actually overridden vs matching base).
+  const derivedMap = {};
+  if (baseCell) {
+    for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
+      const fc = pgFeatures[axisId];
+      if (!fc || !handler.deriveFromBase) continue;
+      derivedMap[axisId] = handler.deriveFromBase(baseCell, fc, helpers);
+    }
+  }
+
   let baseCommand = "";
   let playgroundCommand = "";
   let diffLines = [];
   if (baseCell) {
     baseCommand = renderCommandLines(baseCell, baseCell.flags, baseCell.env, base, env, null, runMode);
-    const { flags: pgFlags, env: pgEnv, pdMode } = applyAllDeltas(baseCell.flags, baseCell.env, deltas, base);
+    const { flags: pgFlags, env: pgEnv, pdMode } = applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap);
     playgroundCommand = renderCommandLines(baseCell, pgFlags, pgEnv, base, env, pdMode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
@@ -1322,29 +1576,36 @@ export const Playground = ({ config }) => {
   // `labelFor(c)` is an optional custom label resolver — receives the
   // evaluated chip and returns a string. Falls back to c.label, then to
   // "auto" for null, then to String(c.value).
-  const renderSelect = (current, entries, onPick, base, labelFor) => {
-    const opts = [];
+  //
+  // `opts.hideValues` (optional) — array of chip values to suppress from
+  // the dropdown entirely. Used when an axis derives a real default from
+  // the base cell, so the inherit-sentinel ("auto" / "Inherited" /
+  // "current") doesn't clutter the dropdown.
+  const renderSelect = (current, entries, onPick, base, labelFor, opts = {}) => {
+    const hideSet = new Set(opts.hideValues || []);
+    const items = [];
     for (const entry of (entries || [])) {
       const c = helpers.evaluateChip(entry, base);
       if (c.hidden) continue;
+      if (hideSet.has(c.value)) continue;
       const lbl = labelFor
         ? labelFor(c)
         : (c.label !== undefined ? c.label
           : c.value === null ? "auto" : String(c.value));
-      opts.push({ ...c, label: lbl });
+      items.push({ ...c, label: lbl });
     }
-    let idx = opts.findIndex((c) => c.value === current);
+    let idx = items.findIndex((c) => c.value === current);
     if (idx === -1) idx = 0;
     return (
       <select
         style={s.select}
         value={idx}
         onChange={(e) => {
-          const next = opts[parseInt(e.target.value, 10)];
+          const next = items[parseInt(e.target.value, 10)];
           if (next && !next.disabled) onPick(next.value);
         }}
       >
-        {opts.map((c, i) => (
+        {items.map((c, i) => (
           <option
             key={i}
             value={i}
@@ -1395,6 +1656,7 @@ export const Playground = ({ config }) => {
         return handler.render({
           axisId, value: deltas[axisId], setValue,
           fc, base, s, h: helpers, renderChip, renderSelect,
+          derived: derivedMap[axisId] || null,
         });
       })}
 
