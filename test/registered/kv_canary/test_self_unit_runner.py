@@ -82,6 +82,7 @@ def _make_runner(
     group=None,
     req_pool=None,
     per_forward_verify_capacity: int = 16,
+    sweep_verify_capacity: int = 8,
 ):
     if config is None:
         config = CanaryConfig(
@@ -100,7 +101,7 @@ def _make_runner(
             per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=2,
             per_forward_write_entry_capacity=8,
-            sweep_verify_capacity=8,
+            sweep_verify_capacity=sweep_verify_capacity,
         ),
     )
 
@@ -290,6 +291,17 @@ class TestSelfUnitRunner(CustomTestCase):
         fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
         with runner.with_forward_pass(fb):
             pass
+
+    def test_sweep_throws_when_walker_output_exceeds_sweep_capacity(self):
+        runner = _make_runner(device=self.device, sweep_verify_capacity=1)
+        cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
+        cache.req_to_token_pool = make_req_to_token_pool(self.device)
+        runner.attach_radix_cache(cache)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"radix-walker emitted .* sweep verify entries"
+        ):
+            runner._sweep_orchestrator.maybe_run_sweep()
 
 
 class TestComputeLaunchCapacities(CustomTestCase):
