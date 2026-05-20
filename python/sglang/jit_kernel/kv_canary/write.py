@@ -72,10 +72,6 @@ class WritePlan:
             write_num_valid_reqs=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
-    def reset_to_skip_sentinel(self) -> None:
-        """Zero write_num_valid_reqs; other tensors are left as-is."""
-        self.write_num_valid_reqs.zero_()
-
 
 def canary_write_step(
     *,

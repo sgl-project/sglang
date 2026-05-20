@@ -190,10 +190,6 @@ class VerifyPlan:
             verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
-    def reset_to_skip_sentinel(self) -> None:
-        """Zero verify_num_valid; other tensors are left as-is."""
-        self.verify_num_valid.zero_()
-
 
 def canary_verify_step(
     *,
