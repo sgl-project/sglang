@@ -134,13 +134,19 @@ class FutureMap:
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
+        indices = future_indices.indices
+        if indices.shape[0] == 0:
+            # DP idle rank: draft_input fields are empty stubs without a usable
+            # shape, so _lazy_init_buf's shape peek (draft_input.topk_p[0])
+            # would IndexError. Defer init until a real batch arrives.
+            return
+
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
         # Slice assignment used to coerce src dtype to buf dtype implicitly;
         # advanced index requires an explicit cast. bonus_tokens / new_seq_lens
         # in particular differ across disagg (int64) and forward (int32) paths.
-        indices = future_indices.indices
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
