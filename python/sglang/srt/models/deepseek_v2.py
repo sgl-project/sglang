@@ -2012,15 +2012,22 @@ class DeepseekV2AttentionMLA(
                 # failed row indices into `row_errors` and clamps those
                 # rows to -1 instead of raising for the whole batch.
                 row_errors: Dict[int, Tuple[str, str]] = {}
-                # Per-batch allocator-owned out= buffer. Allocated once
-                # on the first DS layer's call per batch and reused by
-                # every subsequent DS layer in the same forward — so
-                # there are O(batches) allocations on the hot path, not
-                # O(batches × layers). The NSA backend may pre-allocate
-                # this in init_forward_metadata; if it does, we honor
-                # that buffer; otherwise we lazily allocate on
-                # forward_batch here.
+                # AC-8: prefer the NSA-metadata-owned buffer, allocated
+                # once per batch in init_forward_metadata (also for
+                # capture/replay). Fall back to per-batch lazy alloc on
+                # forward_batch only when the NSA backend has not
+                # allocated one (e.g. synthetic unit tests with
+                # SimpleNamespace forward_batches).
                 ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
+                if ds_out is None:
+                    attn_backend = getattr(forward_batch, "attn_backend", None)
+                    nsa_metadata = (
+                        getattr(attn_backend, "forward_metadata", None)
+                        if attn_backend is not None
+                        else None
+                    )
+                    if nsa_metadata is not None:
+                        ds_out = getattr(nsa_metadata, "ds_topk_indices_out", None)
                 bs = int(selected_indices.shape[0])
                 if ds_out is None:
                     ds_out = torch.empty_like(selected_indices)
@@ -2057,18 +2064,44 @@ class DeepseekV2AttentionMLA(
                 selector_id=f"layer{layer_id}",
             )
             if not ok:
-                # Non-row-level DS exceptions (e.g. selector RuntimeError
-                # before retrieve_topk produces output) are still
-                # batch-fatal — they cannot be sanitized per-row because
-                # we have no per-row tensor to clamp. Re-raise the
-                # original typed exception so callers see it.
-                original = error_state.get("ds_original_exception")
-                if original is not None:
-                    raise original
-                raise RuntimeError(
-                    f"Double Sparsity step failed: "
-                    f"{error_state.get('ds_error_cls')}: "
-                    f"{error_state.get('ds_error_message')}"
+                # Non-row-level DS exception (selector RuntimeError /
+                # mask corruption / TP misconfig — anything raised before
+                # row tensors exist). Convert to per-row failure records
+                # so the scheduler aborts each affected request via the
+                # standard AC-9 abort path rather than crashing the batch.
+                error_cls = error_state.get("ds_error_cls", "selector_runtime_error")
+                error_message = error_state.get("ds_error_message", "")
+                bs = int(forward_batch.batch_size) if hasattr(
+                    forward_batch, "batch_size"
+                ) else 1
+                records: List[Optional[Dict[str, Any]]] = []
+                for _b in range(bs):
+                    records.append(
+                        {
+                            "sparsity_rate": 0.0,
+                            "selected_pages": 0,
+                            "dense_fallback": 1,
+                            "error_class": error_cls,
+                            "error_message": error_message,
+                        }
+                    )
+                summary = getattr(forward_batch, "ds_per_request_summary", None)
+                if summary is None:
+                    summary = {}
+                    setattr(forward_batch, "ds_per_request_summary", summary)
+                summary["double_sparsity"] = records
+
+                # Return an all-(-1) topk_indices so downstream consumers
+                # treat every row as "no selected pages" (the scheduler
+                # will abort them on the next collector pass).
+                max_top_k = self.double_sparsity_selector.max_top_k
+                return torch.full(
+                    (bs, max_top_k),
+                    -1,
+                    dtype=torch.int32,
+                    device=forward_batch.req_pool_indices.device
+                    if hasattr(forward_batch, "req_pool_indices") and forward_batch.req_pool_indices is not None
+                    else "cpu",
                 )
             return result
 

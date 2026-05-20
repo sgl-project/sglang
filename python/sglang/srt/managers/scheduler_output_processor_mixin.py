@@ -178,6 +178,53 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def maybe_abort_on_ds_error(
+        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ) -> bool:
+        """Early-abort hook for AC-9.
+
+        Returns True iff `logits_output.per_request_summary["double_sparsity"][i]`
+        carries an `error_class` (i.e., the DS adapter sanitized this row).
+        On True, this also:
+          - clears `req.customized_info["double_sparsity"]`,
+          - stores the failure summary on `req.per_request_summary`,
+          - calls `req.set_finish_with_abort(...)`,
+          - immediately calls `req.check_finished()` so `finished_reason`
+            is materialised on the current scheduler step.
+
+        Callers must run this BEFORE token append, logprob/grammar/
+        hidden-state bookkeeping. The returned True signals the caller
+        to skip normal output processing for this request.
+        """
+        if logits_output is None:
+            return False
+        summary = getattr(logits_output, "per_request_summary", None)
+        if summary is None:
+            return False
+        ds_list = summary.get("double_sparsity")
+        if ds_list is None or i >= len(ds_list):
+            return False
+        entry = ds_list[i]
+        if not (isinstance(entry, dict) and entry.get("error_class")):
+            return False
+
+        # Capture the failure record on the request, then trigger abort.
+        if req.per_request_summary is None:
+            req.per_request_summary = {}
+        req.per_request_summary["double_sparsity"] = entry
+        if req.customized_info is not None:
+            req.customized_info.pop("double_sparsity", None)
+
+        error_class = entry.get("error_class", "DSAdapterError")
+        error_message = entry.get("error_message", "")
+        if getattr(req, "to_finish", None) is None:
+            req.set_finish_with_abort(
+                f"Double Sparsity {error_class}: {error_message}"
+            )
+        # Materialise finished_reason on the current step.
+        req.check_finished()
+        return True
+
     def maybe_collect_per_request_summary(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
     ):
@@ -294,6 +341,15 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
+                    continue
+
+                # AC-9 early-abort: if the DS adapter sanitized this
+                # row, mark the request finished with an abort reason
+                # BEFORE token append + check_finished, so the abort
+                # materialises on the current scheduler step.
+                if self.maybe_abort_on_ds_error(i, req, logits_output):
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
                     continue
 
                 if req.is_chunked <= 0:
@@ -589,6 +645,14 @@ class SchedulerOutputProcessorMixin:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                continue
+
+            # AC-9 early-abort: a DS row-error surfaced in the
+            # per_request_summary aborts this request BEFORE the
+            # successful token append; the abort finish reason is
+            # materialised on the current scheduler step.
+            if self.maybe_abort_on_ds_error(i, req, logits_output):
+                self._handle_finished_req(req, i, logits_output)
                 continue
 
             if is_spec_v1:

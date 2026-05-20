@@ -398,23 +398,37 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         attn.indexer.assert_called_once()
         self.assertTrue(torch.equal(result, torch.tensor([7, 8, 9], dtype=torch.int32)))
 
-    def test_ds_branch_refuses_when_selector_is_placeholder(self):
+    def test_ds_branch_contains_placeholder_failure_per_row(self):
+        """Non-row DS failures (e.g. selector RuntimeError from the
+        placeholder guard) are now contained per AC-9: instead of
+        raising and crashing the batch, the DS branch publishes a
+        per-row failure record to forward_batch.ds_per_request_summary
+        and returns an all-(-1) topk_indices tensor. The scheduler then
+        aborts each affected request via the standard abort path.
+        """
         attn = self._make_attn(use_ds=True)
         # Selector left in default placeholder mode (no bind_runtime_data
-        # called); the per-step guard must refuse with RuntimeError.
+        # called); the per-step guard would raise RuntimeError, but the
+        # DS branch now catches it and converts to per-row failure.
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([100], dtype=torch.int32),
             sparse_mask=None,
+            batch_size=1,
         )
-        with self.assertRaises(RuntimeError):
-            attn._select_topk_indices(
-                x=torch.zeros(1, 16, 128),
-                q_lora=torch.zeros(1, 16, 128),
-                positions=torch.zeros(1, dtype=torch.int32),
-                forward_batch=forward_batch,
-                layer_id=0,
-            )
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+        # All-(-1) tensor returned; per-request summary records the failure.
+        self.assertTrue(torch.all(result == -1).item())
+        summary = forward_batch.ds_per_request_summary["double_sparsity"]
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["error_class"], "selector_runtime_error")
+        self.assertEqual(summary[0]["dense_fallback"], 1)
 
     def test_ds_branch_sanitizes_out_of_range_row_and_records_error(self):
         """AC-2 + AC-9 live path: a selector returning an out-of-range
@@ -3880,6 +3894,133 @@ class TestR6Coverage(unittest.TestCase):
             page_size=1,
         )
         self.assertTrue(torch.equal(kwargs["page_table_1"], expected_physical))
+
+
+class TestR7Coverage(unittest.TestCase):
+    """R7 verifies AC-8 capture/replay buffer + AC-9 early-abort + non-row containment."""
+
+    def test_select_topk_indices_reads_metadata_buffer_via_attn_backend(self):
+        """AC-8 capture/replay path: when forward_batch lacks the
+        ds_topk_indices_out attribute but the NSA backend's
+        forward_metadata has one (the capture/replay case), the DS
+        branch reads from metadata and writes in place.
+        """
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 0
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(
+            return_value=(sel, vl)
+        )
+
+        # Synthesize an NSA backend whose forward_metadata carries the
+        # pre-allocated ds_topk_indices_out buffer (mirrors the
+        # capture/replay path).
+        metadata_buf = torch.zeros((1, max_top_k), dtype=torch.int32)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
+            ),
+            batch_size=1,
+            attn_backend=SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    ds_topk_indices_out=metadata_buf,
+                )
+            ),
+        )
+
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+        # The metadata buffer is the same tensor object the adapter wrote into.
+        self.assertIs(result, metadata_buf)
+        # The first selected page (0) becomes token-pos 0 = 0.
+        self.assertEqual(int(result[0, 0].item()), 0)
+
+    def test_maybe_abort_on_ds_error_fires_check_finished(self):
+        """AC-9 early-abort: the helper marks the request as finished
+        on the current step (check_finished materialises finished_reason).
+        """
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            SchedulerOutputProcessorMixin,
+        )
+
+        check_finished_calls = []
+
+        req = SimpleNamespace(
+            customized_info={"double_sparsity": [{"x": 1}]},
+            per_request_summary=None,
+            rid="rid-abort",
+            to_finish=None,
+        )
+
+        def _set_finish_with_abort(error_msg):
+            req.to_finish = SimpleNamespace(error_msg=error_msg)
+
+        def _check_finished():
+            check_finished_calls.append(True)
+            req.finished_reason = SimpleNamespace(reason="abort")
+
+        req.set_finish_with_abort = _set_finish_with_abort
+        req.check_finished = _check_finished
+
+        logits_output = SimpleNamespace(
+            per_request_summary={
+                "double_sparsity": [
+                    {
+                        "sparsity_rate": 0.0,
+                        "selected_pages": 0,
+                        "dense_fallback": 1,
+                        "error_class": "DSAdapterPageOutOfRange",
+                        "error_message": "row 0",
+                    }
+                ]
+            }
+        )
+
+        aborted = SchedulerOutputProcessorMixin.maybe_abort_on_ds_error(
+            None, 0, req, logits_output
+        )
+        self.assertTrue(aborted)
+        self.assertEqual(len(check_finished_calls), 1)
+        self.assertIsNotNone(req.to_finish)
+        self.assertNotIn("double_sparsity", req.customized_info)
+
+    def test_maybe_abort_on_ds_error_returns_false_for_normal(self):
+        """AC-9 early-abort: normal summaries do NOT trigger abort."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            SchedulerOutputProcessorMixin,
+        )
+
+        req = SimpleNamespace(
+            customized_info=None,
+            per_request_summary=None,
+            rid="rid-ok",
+            to_finish=None,
+            set_finish_with_abort=lambda msg: None,
+            check_finished=lambda: None,
+        )
+        logits_output = SimpleNamespace(
+            per_request_summary={
+                "double_sparsity": [
+                    {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0}
+                ]
+            }
+        )
+        aborted = SchedulerOutputProcessorMixin.maybe_abort_on_ds_error(
+            None, 0, req, logits_output
+        )
+        self.assertFalse(aborted)
 
 
 if __name__ == "__main__":

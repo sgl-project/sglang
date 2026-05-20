@@ -996,6 +996,14 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
+        ds_topk_indices_out = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (bs, self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1012,6 +1020,7 @@ class NativeSparseAttnBackend(
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
+            ds_topk_indices_out=ds_topk_indices_out,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
