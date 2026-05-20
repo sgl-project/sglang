@@ -728,4 +728,218 @@ mod tests {
         assert_eq!(added[0].mode, WorkerMode::Prefill);
         assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
     }
+
+    /// End-to-end K8s + PD integration: synthesize EndpointSlice events
+    /// for two prefill pods and two decode pods (each backed by a real
+    /// HTTP listener mounting `/server_info`), pipe them through
+    /// `process_events` → DiscoveryEvent channel → manager, and assert
+    /// the resulting registry has:
+    ///   * two `Prefill` workers, each with `bootstrap_port` matching
+    ///     what its own `/server_info` advertised (so per-worker
+    ///     plumbing is verified, not just "some prefill registered"),
+    ///   * two `Decode` workers with `bootstrap_port = None`.
+    ///
+    /// This is the load-bearing integration covering the seam this PR
+    /// just opened: the K8s backend emits `bootstrap_port: None`, the
+    /// PD-disaggregation classification comes from slice labels, and
+    /// `WorkerMode` + `bootstrap_port` are re-resolved by the manager
+    /// from each worker's `/server_info`. A regression at *any* of
+    /// those three layers (k8s extract → process_events label
+    /// classification → manager introspect-and-override) fails this
+    /// test.
+    #[tokio::test]
+    async fn k8s_pd_pipeline_registers_workers_with_per_pod_bootstrap_port() {
+        use crate::workers::introspect::WorkerIntrospector;
+        use crate::workers::manager::run_with_introspector;
+        use crate::workers::WorkerRegistry;
+        use axum::{routing::get, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        /// Bind axum on an OS-assigned 127.0.0.1 port, mount a
+        /// `/server_info` returning `body`, return the port + shutdown
+        /// channel so the test can join cleanly.
+        async fn spawn_fake_server_info(body: Value) -> (u16, oneshot::Sender<()>) {
+            let body = Arc::new(body);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new().route(
+                "/server_info",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json((*body).clone()) }
+                }),
+            );
+            let (tx, rx) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+            (port, tx)
+        }
+
+        // Four fake SGLang workers — two prefill (each with a distinct
+        // bootstrap_port to verify per-pod plumbing) and two decode.
+        let (port_p1, _shut_p1) = spawn_fake_server_info(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "prefill",
+            "disaggregation_bootstrap_port": 8998,
+        }))
+        .await;
+        let (port_p2, _shut_p2) = spawn_fake_server_info(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "prefill",
+            "disaggregation_bootstrap_port": 8999,
+        }))
+        .await;
+        let (port_d1, _shut_d1) = spawn_fake_server_info(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "decode",
+        }))
+        .await;
+        let (port_d2, _shut_d2) = spawn_fake_server_info(json!({
+            "served_model_name": "m",
+            "disaggregation_mode": "decode",
+        }))
+        .await;
+
+        // One EndpointSlice per worker (one address each, so the slice
+        // port matches the worker's axum listener port exactly).
+        // Labels match the PD selectors so `classify_mode` sends each
+        // slice to the right pool.
+        let prefill_labels = &[("app", "sglang"), ("role", "prefill")];
+        let decode_labels = &[("app", "sglang"), ("role", "decode")];
+        let p1 = with_uid(
+            make_slice_full(
+                &["127.0.0.1"],
+                port_p1 as i32,
+                true,
+                "ns",
+                "prefill-1",
+                prefill_labels,
+            ),
+            "u-p1",
+        );
+        let p2 = with_uid(
+            make_slice_full(
+                &["127.0.0.1"],
+                port_p2 as i32,
+                true,
+                "ns",
+                "prefill-2",
+                prefill_labels,
+            ),
+            "u-p2",
+        );
+        let d1 = with_uid(
+            make_slice_full(
+                &["127.0.0.1"],
+                port_d1 as i32,
+                true,
+                "ns",
+                "decode-1",
+                decode_labels,
+            ),
+            "u-d1",
+        );
+        let d2 = with_uid(
+            make_slice_full(
+                &["127.0.0.1"],
+                port_d2 as i32,
+                true,
+                "ns",
+                "decode-2",
+                decode_labels,
+            ),
+            "u-d2",
+        );
+
+        // Manager pipeline: DiscoveryEvent channel → run_with_introspector.
+        let registry = Arc::new(WorkerRegistry::default());
+        let (dtx, drx) = mpsc::channel::<DiscoveryEvent>(16);
+        let introspector = Arc::new(WorkerIntrospector::new(Duration::from_millis(500)));
+        let manager_handle = tokio::spawn(run_with_introspector(
+            drx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            introspector,
+        ));
+
+        // Drive process_events with the four slice Apply events, then
+        // drop dtx so the manager loop exits cleanly once it has drained.
+        let events = vec![
+            Ok(watcher::Event::Apply(p1)),
+            Ok(watcher::Event::Apply(p2)),
+            Ok(watcher::Event::Apply(d1)),
+            Ok(watcher::Event::Apply(d2)),
+        ];
+        let producer = tokio::spawn(async move {
+            let stream = futures::stream::iter(events);
+            process_events(stream, dtx, pd_mode()).await;
+        });
+
+        // Poll the registry until all four workers are present with
+        // their resolved mode + bootstrap_port — order isn't deterministic
+        // because each worker's `/server_info` round-trip happens in a
+        // separate manager task.
+        let expected_p1_id = WorkerId(format!("ns/prefill-1/127.0.0.1:{port_p1}"));
+        let expected_p2_id = WorkerId(format!("ns/prefill-2/127.0.0.1:{port_p2}"));
+        let expected_d1_id = WorkerId(format!("ns/decode-1/127.0.0.1:{port_d1}"));
+        let expected_d2_id = WorkerId(format!("ns/decode-2/127.0.0.1:{port_d2}"));
+
+        let settled = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let p1 = registry.get(&expected_p1_id);
+                let p2 = registry.get(&expected_p2_id);
+                let d1 = registry.get(&expected_d1_id);
+                let d2 = registry.get(&expected_d2_id);
+                if let (Some(p1), Some(p2), Some(d1), Some(d2)) = (p1, p2, d1, d2) {
+                    if p1.mode() == WorkerMode::Prefill
+                        && p2.mode() == WorkerMode::Prefill
+                        && d1.mode() == WorkerMode::Decode
+                        && d2.mode() == WorkerMode::Decode
+                        && p1.bootstrap_port() == Some(8998)
+                        && p2.bootstrap_port() == Some(8999)
+                        && d1.bootstrap_port().is_none()
+                        && d2.bootstrap_port().is_none()
+                    {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "registry did not converge to (2 prefill + 2 decode) with per-pod \
+             bootstrap_port within 3s. current state: \
+             p1={:?}, p2={:?}, d1={:?}, d2={:?}",
+            registry
+                .get(&expected_p1_id)
+                .map(|w| (w.mode(), w.bootstrap_port())),
+            registry
+                .get(&expected_p2_id)
+                .map(|w| (w.mode(), w.bootstrap_port())),
+            registry
+                .get(&expected_d1_id)
+                .map(|w| (w.mode(), w.bootstrap_port())),
+            registry
+                .get(&expected_d2_id)
+                .map(|w| (w.mode(), w.bootstrap_port())),
+        );
+
+        // Producer should exit when the iter stream ends; manager exits
+        // when the producer drops dtx. Both should finish quickly.
+        let _ = tokio::time::timeout(Duration::from_secs(1), producer).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle).await;
+    }
 }
