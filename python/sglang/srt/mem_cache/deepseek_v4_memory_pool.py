@@ -493,6 +493,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def invalidate_loc_cache(self) -> None:
+        """Discard the cached SWA location translation (cached_loc)."""
+        self.cached_loc = None
+
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
         is_speculative = server_args.speculative_algorithm is not None
