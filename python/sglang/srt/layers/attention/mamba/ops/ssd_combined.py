@@ -96,9 +96,10 @@ def _mamba_chunk_scan_combined_fwd(
         states_in_fp32=True,
     )
 
-    # 3. Compute the inter-chunk SSM recurrence. The returned states are
-    # post-chunk states, so final per-sequence states are a gather below.
-    states = _state_passing_fwd(
+    # 3. Compute the inter-chunk SSM recurrence. Returns start-of-chunk states
+    # (init_state or end-of-previous-chunk) in `states`, and per-sequence
+    # final states for the SSM cache.
+    states, final_states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,
         last_chunk_indices,
@@ -110,6 +111,7 @@ def _mamba_chunk_scan_combined_fwd(
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
     )
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+    final_states = rearrange(final_states, "... (p n) -> ... p n", n=dstate)
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms.
     CB = _bmm_chunk_fwd(
@@ -120,8 +122,9 @@ def _mamba_chunk_scan_combined_fwd(
         output_dtype=torch.float32,
     )
 
-    # 5. Scan and compute diagonal blocks using either initial states at
-    # sequence boundaries or the previous chunk's post-state.
+    # 5. Scan and compute diagonal blocks. chunk_scan reads
+    # `states[pid_c]` directly as prev_state (start-of-chunk state) — no
+    # init_state / seq_idx branching needed inside the kernel.
     _chunk_scan_fwd(
         CB,
         x,
@@ -131,15 +134,13 @@ def _mamba_chunk_scan_combined_fwd(
         states,
         cu_chunk_seqlens,
         out,
-        seq_idx,
         D=D,
         z=z,
-        initial_states=initial_states,
     )
 
     if return_intermediate_states:
-        return states
-    return states[last_chunk_indices]
+        return states, final_states
+    return final_states
 
 
 def mamba_chunk_scan_combined(
@@ -183,8 +184,8 @@ def mamba_chunk_scan_combined(
         dt_softplus: Whether to apply softplus to dt
         state_dtype: The data type of the SSM state
     Return:
-        final_states: (num_sequences, nheads, headdim, dstate), or all
-        post-chunk states when return_intermediate_states=True.
+        final_states: (num_sequences, nheads, headdim, dstate), or
+        (start-of-chunk states, final_states) when return_intermediate_states=True.
     """
     return _mamba_chunk_scan_combined_fwd(
         x,

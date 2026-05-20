@@ -88,7 +88,6 @@ def ssd_minimal_discrete(
     decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
     new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
-    post_chunk_states = new_states[:, 1:]
 
     # 4. Compute state -> output conversion per chunk
     # (left term of low-rank factorization of off-diagonal blocks; C terms)
@@ -99,7 +98,7 @@ def ssd_minimal_discrete(
     # (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
     if return_intermediate_states:
-        return Y, final_state, post_chunk_states
+        return Y, final_state, states
     return Y, final_state
 
 
@@ -480,7 +479,7 @@ def test_mamba_chunk_scan_packed_initial_states_without_varlen_return(
     )
 
     Y = torch.empty_like(X)
-    states = mamba_chunk_scan_combined(
+    _, final_states = mamba_chunk_scan_combined(
         X[0],
         dt[0],
         A,
@@ -495,7 +494,6 @@ def test_mamba_chunk_scan_packed_initial_states_without_varlen_return(
         return_intermediate_states=True,
         out=Y[0],
     )
-    final_states = states[last_chunk_indices]
 
     torch.testing.assert_close(Y, Y_ref, atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(final_states, final_states_ref, atol=5e-3, rtol=5e-3)
@@ -744,7 +742,7 @@ def test_mamba_chunk_scan_intermediate_states(
         cu_seqlens, chunk_size
     )
     Y = torch.empty_like(X)
-    states = mamba_chunk_scan_combined(
+    states, final_state = mamba_chunk_scan_combined(
         X[0],
         dt[0],
         A,
@@ -759,7 +757,6 @@ def test_mamba_chunk_scan_intermediate_states(
         return_intermediate_states=True,
         out=Y[0],
     )
-    final_state = states[last_chunk_indices]
 
     num_chunks = seqlen // chunk_size
     assert states.shape == (num_chunks, n_heads, d_head, d_head)

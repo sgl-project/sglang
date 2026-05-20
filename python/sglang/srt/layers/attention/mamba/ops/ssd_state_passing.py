@@ -18,6 +18,7 @@ def _state_passing_fwd_kernel(
     # Pointers to matrices
     states_ptr,
     out_ptr,
+    final_states_ptr,
     dA_cs_ptr,
     initstates_ptr,
     last_chunk_indices_ptr,
@@ -31,6 +32,9 @@ def _state_passing_fwd_kernel(
     stride_out_chunk,
     stride_out_head,
     stride_out_dim,
+    stride_final_states_batch,
+    stride_final_states_head,
+    stride_final_states_dim,
     stride_dA_cs_head,
     stride_dA_cs_chunk,
     stride_dA_cs_csize,
@@ -49,6 +53,7 @@ def _state_passing_fwd_kernel(
     chunk_start = (
         tl.load(last_chunk_indices_ptr + pid_b - 1, mask=pid_b > 0, other=-1) + 1
     )
+    n_chunks_in_seq = chunk_end - chunk_start
 
     states_ptr += chunk_start * stride_states_chunk + pid_h * stride_states_head
     dA_cs_ptr += (
@@ -61,6 +66,12 @@ def _state_passing_fwd_kernel(
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     states_ptrs = states_ptr + offs_m * stride_states_dim
     out_ptrs = out_ptr + offs_m * stride_out_dim
+    final_states_ptrs = (
+        final_states_ptr
+        + pid_b * stride_final_states_batch
+        + pid_h * stride_final_states_head
+        + offs_m * stride_final_states_dim
+    )
 
     if HAS_INITSTATES:
         initstates_ptrs = (
@@ -69,15 +80,25 @@ def _state_passing_fwd_kernel(
             + pid_h * stride_initstates_head
             + offs_m * stride_initstates_dim
         )
-        states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        state = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     else:
-        states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        state = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for _ in range(chunk_end - chunk_start):
-        new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+    # Write the start-of-chunk state for the first chunk of this sequence
+    # (= init_state). Subsequent iterations write start-of-chunk states for
+    # following chunks (= end-of-previous-chunk states). The last chunk's
+    # post-state goes to final_states for the SSM cache.
+    tl.store(out_ptrs, state, mask=offs_m < dim)
+    out_ptrs += stride_out_chunk
+
+    for c in range(n_chunks_in_seq):
+        new_state = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-        states = tl.exp(dA_cs) * states + new_states
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+        state = tl.exp(dA_cs) * state + new_state
+        if c < n_chunks_in_seq - 1:
+            tl.store(out_ptrs, state, mask=offs_m < dim)
+        else:
+            tl.store(final_states_ptrs, state, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
@@ -91,6 +112,16 @@ def _state_passing_fwd(
     initial_states=None,
     out_dtype=None,
 ):
+    """Run inter-chunk SSM recurrence.
+
+    Returns:
+        out: (nchunks, nheads, dim) start-of-chunk states. For each sequence,
+            out[chunk_start] is the initial state (init_state or zero), and
+            out[c] for chunk_start < c < chunk_end is the post-state of the
+            previous chunk (which equals the start state of chunk c).
+        final_states: (num_seqs, nheads, dim) post-state of the last chunk of
+            each sequence, used to update the SSM cache.
+    """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     batch = last_chunk_indices.shape[0]
@@ -100,6 +131,9 @@ def _state_passing_fwd(
 
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+    final_states = torch.empty(
+        (batch, nheads, dim), device=states.device, dtype=torch.float32
+    )
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
@@ -112,6 +146,7 @@ def _state_passing_fwd(
         _state_passing_fwd_kernel[grid](
             states,
             out,
+            final_states,
             dA_cumsum,
             initial_states,
             last_chunk_indices,
@@ -123,6 +158,9 @@ def _state_passing_fwd(
             out.stride(0),
             out.stride(1),
             out.stride(2),
+            final_states.stride(0),
+            final_states.stride(1),
+            final_states.stride(2),
             dA_cumsum.stride(0),
             dA_cumsum.stride(1),
             dA_cumsum.stride(2),
@@ -131,4 +169,4 @@ def _state_passing_fwd(
             initial_states_strides[2],
             HAS_INITSTATES=initial_states is not None,
         )
-    return out
+    return out, final_states
