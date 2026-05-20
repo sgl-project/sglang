@@ -24,7 +24,7 @@ from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.kv_canary.pool_patch.utils import (
-    alloc_canary_buf_pair,
+    alloc_canary_buf,
     ensure_swa_lut_int32,
     make_row_source,
     patch_buf_info_method,
@@ -426,7 +426,8 @@ def _build_fake_dsv4_group(
     swa_lut: Optional[torch.Tensor],
 ) -> CanaryBufferGroup:
     num_slots = int(sub_pool.kv_buffer[0].shape[0])
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
     return CanaryBufferGroup(
         kind=kind,
         k_head=k_head,

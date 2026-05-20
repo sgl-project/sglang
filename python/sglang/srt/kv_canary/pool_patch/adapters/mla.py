@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patch.utils import (
-    alloc_canary_buf_pair,
+    alloc_canary_buf,
     make_packed_source,
     make_row_source,
     patch_buf_info_method,
@@ -22,7 +22,8 @@ def attach_mla(
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to an MLA-style pool (single ``kv_buffer`` per layer, no V half)."""
     num_slots = int(pool.kv_buffer[0].shape[0])
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
 
     group = CanaryBufferGroup(
         kind=PoolKind.FULL,
@@ -55,7 +56,8 @@ def attach_nsa(
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to an NSA pool (MLA-style ``kv_buffer`` + a packed index buffer)."""
     num_slots = int(pool.kv_buffer[0].shape[0])
-    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
+    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
 
     index_buffer = pool.index_k_with_scale_buffer[0]
     index_page_size = pool.page_size
