@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
 
 #if defined(_OPENMP)
@@ -43,6 +44,14 @@ namespace {
       }                                                                  \
     }                                                                    \
   }()
+
+// Half + BFloat16, plus one extra scalar type
+#define AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, ...) \
+  AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES(__VA_ARGS__)               \
+  AT_DISPATCH_CASE(SCALARTYPE, __VA_ARGS__)
+
+#define AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, __VA_ARGS__))
 
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
@@ -170,7 +179,6 @@ namespace {
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
-
 #define CHECK_INPUT(x) \
   CHECK_CPU(x);        \
   CHECK_CONTIGUOUS(x)
