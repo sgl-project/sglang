@@ -3695,9 +3695,6 @@ class ServerArgs:
                     self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
 
             if self.disable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True

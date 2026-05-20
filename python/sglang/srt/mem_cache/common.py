@@ -44,7 +44,7 @@ def page_align_floor(length: int, page_size: int) -> int:
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if getattr(req, "skip_radix_cache_insert", False) and not kwargs.get("chunked", False):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
