@@ -175,9 +175,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=self.seq_lens,
             )
-            # prepare_for_extend shifts batch.input_ids in place — keep it
-            # as the prefill prompt, not the [bs] last-token tensor.
-            spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 spec_info.future_indices = future_map.alloc_future_indices(
