@@ -15,9 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, suite="extra-a-2-gpu")
 
-pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
-)
+pytestmark = pytest.mark.skip(reason="MockEngine harness not yet implemented.")
 
 
 def _fake_prompt(length: int) -> list[int]:

@@ -2,12 +2,11 @@
 
 DSV4-Flash combines three axes (MLA, SWA dual-pool, packed pool / page_size=128)
 that mha_full does not exercise; co-locating them in one fixture file avoids
-spinning up separate mha_swa / mla_full servers (testing.md SOT §3.2 cross-axis
-note).
+spinning up separate mha_swa / mla_full servers.
 
-testing.md SOT §3.2 — 11 cases (7 inherited from mha_full + 4 DSV4-specific
-axes). All under ``extra-a`` / ``1-gpu-large``; per-case timeout is bumped to
-120s to cover the heavier server warmup.
+11 cases (7 inherited from mha_full + 4 DSV4-specific axes). All under
+``extra-a`` / ``1-gpu-large``; per-case timeout is bumped to 120s to cover the
+heavier server warmup.
 """
 
 from __future__ import annotations
@@ -264,14 +263,13 @@ class TestSwaWindowClipOnlyLast128(_DSV4FlashBase, unittest.TestCase):
         self.assert_health_ok()
 
 
-@unittest.skip("phase-2; hardcoded packed-pool byte offsets pending DSV4 layout review")
+@unittest.skip("DSV4 packed-pool byte-offset table not yet derived.")
 class TestDsv4PackedPoolRealKvSourceLayout(_DSV4FlashBase, unittest.TestCase):
     """Special pool axis: packed pool layout, byte-hit assertion.
 
-    Per testing.md §3.2 the assertion shape is "I read bytes X-Y from the
-    packed slot at index Z" — that requires hardcoded byte offsets derived
-    from the DSV4 packed layout formula. Plan §"风险点" says "不许猜". Shipped
-    as a phase-2 skip preserving the SOT case name.
+    The assertion shape is "I read bytes X-Y from the packed slot at index Z",
+    which requires hardcoded byte offsets derived from the DSV4 packed layout
+    formula. Those offsets have not yet been derived.
     """
 
     extra_server_args: ClassVar[List[str]] = [

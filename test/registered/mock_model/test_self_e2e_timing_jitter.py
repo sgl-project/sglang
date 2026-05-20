@@ -1,4 +1,4 @@
-"""Timing-jitter self-e2e (type-c): v1 out-of-scope marker."""
+"""Timing-jitter self-e2e: placeholder until the jitter-measurement harness is implemented."""
 
 from __future__ import annotations
 
@@ -13,10 +13,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="extra-a-test-1-gpu-large")
 
-pytestmark = pytest.mark.skip(
-    reason="awaits mock_mode subsystem reimplementation; deleted in commit 8dcfc979d3"
-)
+pytestmark = pytest.mark.skip(reason="MockEngine harness not yet implemented.")
 
 
-def test_skipped_v1_oos() -> None:
-    pytest.skip("phase-2 timing jitter infrastructure")
+def test_timing_jitter_not_yet_implemented() -> None:
+    pytest.skip("timing jitter measurement infrastructure not yet implemented")

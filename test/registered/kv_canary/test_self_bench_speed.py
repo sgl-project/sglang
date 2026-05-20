@@ -3,18 +3,17 @@
 Launches a Qwen3-0.6B server twice per case — once with the canary disabled,
 once with ``--kv-canary raise`` — and reports steady-state latency for
 each. The overhead percentage is printed to stdout and appended to the sibling
-``test_self_bench_speed.baseline.json`` file (warn-only; no hard gate yet —
-see testing.md SOT §3.3 "首次 commit 不 hard-gate" + plan 04 step 7).
+``test_self_bench_speed.baseline.json`` file (warn-only; no hard gate yet).
 
-testing.md SOT §3.3 — 2 cases:
+2 cases:
 
 - ``bench_qwen3_prefill_bs32_isl16384_osl1``
 - ``bench_qwen3_decode_bs256_isl4096_osl1024``
 
 Both registered to ``extra-a`` (label-gated PR) and ``nightly-1-gpu`` (auto
-nightly accumulation per plan 04 step 6). Method prefix ``bench_`` is the SOT
-casename convention; ``unittest.TestLoader.testMethodPrefix`` is rebound in
-``__main__`` so ``python3 file.py -f`` still discovers them.
+nightly accumulation). Method prefix ``bench_`` keeps bench cases easily
+grep-able; ``unittest.TestLoader.testMethodPrefix`` is rebound in ``__main__``
+so ``python3 file.py -f`` still discovers them.
 """
 
 from __future__ import annotations
@@ -183,7 +182,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
 
 def _main() -> int:
     # Step 1: rebind the discovery prefix so ``bench_*`` methods become
-    # runnable test methods (SOT §3.3 casename convention).
+    # runnable test methods.
     unittest.TestLoader.testMethodPrefix = "bench_"
 
     # Step 2: hand control to the standard CLI so ``python3 file.py -f`` and
