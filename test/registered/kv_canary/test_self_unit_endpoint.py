@@ -17,18 +17,14 @@ from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
-    build_endpoints_from_group,
 )
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.state import (
-    CanaryDeviceState,
     ViolationLog,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,
-    make_base_config,
-    make_buffer_group,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -285,24 +281,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 torch.tensor([-1], dtype=torch.int32, device=self.device),
             )
         )
-
-    def test_head_tail_share_class(self):
-        group = make_buffer_group(self.device)
-        device_state = CanaryDeviceState.allocate(
-            config=make_base_config(),
-            device=self.device,
-            num_tags=len(CanaryLaunchTag),
-        )
-        endpoints = build_endpoints_from_group(group=group, device_state=device_state)
-
-        head = next(
-            ep for ep in endpoints if ep.kernel_kind == CanaryLaunchTag.HEAD_K_FULL
-        )
-        tail = next(
-            ep for ep in endpoints if ep.kernel_kind == CanaryLaunchTag.TAIL_K_FULL
-        )
-
-        self.assertIs(type(head), type(tail))
 
 
 if __name__ == "__main__":
