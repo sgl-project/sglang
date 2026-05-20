@@ -195,42 +195,6 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertGreaterEqual(plan_calls.count("plan"), 1)
 
-    def test_violation_pump_d2h_detects_errored(self):
-        runner = _make_runner(device=self.device)
-        self.assertEqual(
-            int(runner._device_state.violation_log.violation_write_index.item()), 0
-        )
-        runner._device_state.violation_log.violation_write_index[0] = 1
-        self.assertEqual(
-            int(runner._device_state.violation_log.violation_write_index.item()), 1
-        )
-
-    def test_cross_rank_allreduce_lockstep_raise(self):
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
-            allreduce_violation_signal=True,
-        )
-        runner = _make_runner(device=self.device, config=config)
-
-        fake_group = SimpleNamespace(device_group=object())
-        runner._pump_and_allreduce._tp_group = fake_group
-
-        def fake_all_reduce(tensor, op, group):
-            tensor.fill_(1)
-
-        with patch.object(
-            torch.distributed, "is_initialized", lambda: True
-        ), patch.object(torch.distributed, "all_reduce", fake_all_reduce):
-            self.assertIsNotNone(runner._device_state.allreduce_buf)
-            runner._device_state.allreduce_buf.fill_(0)
-            torch.distributed.all_reduce(
-                runner._device_state.allreduce_buf,
-                op=torch.distributed.ReduceOp.MAX,
-                group=fake_group.device_group,
-            )
-            self.assertEqual(int(runner._device_state.allreduce_buf.item()), 1)
-
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
@@ -328,32 +292,6 @@ class TestSelfUnitRunner(CustomTestCase):
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
-
-    def test_runner_raises_when_other_rank_errored_but_local_clean(self):
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
-            allreduce_violation_signal=True,
-        )
-        runner = _make_runner(device=self.device, config=config)
-        runner._pump_and_allreduce._tp_group = SimpleNamespace(device_group=object())
-
-        def lockstep_all_reduce(tensor, op, group):
-            tensor.fill_(1)
-
-        with patch.object(
-            torch.distributed, "is_initialized", lambda: True
-        ), patch.object(torch.distributed, "all_reduce", lockstep_all_reduce):
-            self.assertEqual(
-                int(runner._device_state.violation_log.violation_write_index.item()), 0
-            )
-            runner._device_state.allreduce_buf.fill_(0)
-            torch.distributed.all_reduce(
-                runner._device_state.allreduce_buf,
-                op=torch.distributed.ReduceOp.MAX,
-                group=runner._pump_and_allreduce._tp_group.device_group,
-            )
-            self.assertEqual(int(runner._device_state.allreduce_buf.item()), 1)
 
 
 if __name__ == "__main__":
