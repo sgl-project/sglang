@@ -1429,3 +1429,98 @@ def test_chain_advance_formula_matches_spec() -> None:
             f"chain advance mismatch: prev={prev_hash:#x} token={token:#x} pos={position:#x} "
             f"rkv={real_kv_hash:#x} expected={expected:#x} actual={actual:#x}"
         )
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_violation_ring_row_byte_layout_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    import struct
+
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    anchor_hash_signed = chain_anchor_signed()
+
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=5,
+            token=33,
+            position=0,
+            prev_hash=anchor_hash_signed,
+            real_kv_hash=0,
+        )
+
+    plan_cuda = make_verify_plan(
+        slot_indices=[5], positions=[99], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[5], positions=[99], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(capacity=4, device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 1
+
+    # splitmix64(CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
+    # Slot 5 was stamped with position=0 (stored); plan claims position=99 → POSITION mismatch.
+    # stored_chain_hash == expected_chain_hash (both splitmix64(ANCHOR)) → no CHAIN_HASH bit.
+    # verify path has no token oracle → expected_token field is always 0.
+    # expected_aux = expected_chain_hash = splitmix64(ANCHOR) signed (same value as stored_chain_hash).
+    kernel_kind_val = int(CanaryLaunchTag.HEAD_K_FULL)
+    slot_idx_val = 5
+    position_val = 0
+    stored_token_val = 33
+    expected_token_val = 0
+    stored_chain_hash_val = anchor_hash_signed
+    expected_aux_val = anchor_hash_signed
+    fail_reason_bits_val = _FAIL_REASON_BIT_POSITION
+
+    expected_bytes = struct.pack(
+        "<8q",
+        kernel_kind_val,
+        slot_idx_val,
+        position_val,
+        stored_token_val,
+        expected_token_val,
+        stored_chain_hash_val,
+        expected_aux_val,
+        fail_reason_bits_val,
+    )
+
+    actual_bytes = cuda_log.ring[0].cpu().numpy().tobytes()
+
+    if actual_bytes != expected_bytes:
+        expected_fields = struct.unpack("<8q", expected_bytes)
+        actual_fields = struct.unpack("<8q", actual_bytes)
+        field_names = [
+            "kernel_kind",
+            "slot_idx",
+            "position",
+            "stored_token",
+            "expected_token",
+            "stored_chain_hash",
+            "expected_aux",
+            "fail_reason_bits",
+        ]
+        mismatches = [
+            f"  [{i}] {name}: expected {e} ({e:#x}) got {a} ({a:#x})"
+            for i, (name, e, a) in enumerate(zip(field_names, expected_fields, actual_fields))
+            if e != a
+        ]
+        raise AssertionError(
+            "violation_ring row binary layout mismatch:\n" + "\n".join(mismatches)
+        )
+
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
