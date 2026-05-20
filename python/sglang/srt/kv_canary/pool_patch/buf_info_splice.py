@@ -28,7 +28,7 @@ def patch_buf_info_method(
 
     def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:
         ptrs, lens, item_lens = original(*args, **kwargs)
-        return _splice_kv_buf_info(
+        return splice_kv_buf_info(
             ptrs=ptrs,
             lens=lens,
             item_lens=item_lens,
@@ -40,38 +40,7 @@ def patch_buf_info_method(
     wrap_method(pool, method_name, wrapper=_with_splice)
 
 
-def splice_segmented_buf_info(
-    *,
-    ptrs: List[int],
-    lens: List[int],
-    item_lens: List[int],
-    segment_offsets: List[int],
-    group: CanaryBufferGroup,
-    page_size: int,
-) -> BufInfoTriple:
-    """For multi-segment packed pools (DSV4): prepend/append head + tail canary entries around EACH
-    segment, using only ``group.k_head`` / ``group.k_tail`` (these pools have no V half).
-    """
-    entries = list(zip(ptrs, lens, item_lens))
-    head = _entry_triple(group.k_head, page_size=page_size)
-    tail = _entry_triple(group.k_tail, page_size=page_size)
-
-    out: List[Tuple[int, int, int]] = []
-    for seg_idx in range(len(segment_offsets)):
-        start = segment_offsets[seg_idx]
-        stop = (
-            segment_offsets[seg_idx + 1]
-            if seg_idx + 1 < len(segment_offsets)
-            else len(entries)
-        )
-        out.append(head)
-        out.extend(entries[start:stop])
-        out.append(tail)
-
-    return _untranspose_entries(out)
-
-
-def _splice_kv_buf_info(
+def splice_kv_buf_info(
     *,
     ptrs: List[int],
     lens: List[int],

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.pool_patch.buf_info_splice import (
     BufInfoTriple,
-    splice_segmented_buf_info,
+    splice_kv_buf_info,
 )
 from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
@@ -116,11 +116,6 @@ def _patch_contiguous_buf_info(pool: object, *, group: CanaryBufferGroup) -> Non
     c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
     indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
     c128_layer_num = len(pool.c128_kv_pool.kv_buffer)
-    segment_offsets: List[int] = [
-        0,
-        c4_layer_num,
-        c4_layer_num + indexer_layer_num,
-    ]
     expected_total = c4_layer_num + indexer_layer_num + c128_layer_num
     page_size = pool.page_size
 
@@ -130,12 +125,12 @@ def _patch_contiguous_buf_info(pool: object, *, group: CanaryBufferGroup) -> Non
             raise RuntimeError(
                 f"DSV4 buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
             )
-        return splice_segmented_buf_info(
+        return splice_kv_buf_info(
             ptrs=ptrs,
             lens=lens,
             item_lens=item_lens,
-            segment_offsets=segment_offsets,
             group=group,
+            has_v_half=False,
             page_size=page_size,
         )
 
@@ -148,16 +143,6 @@ def _patch_state_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
     indexer_compress_state_count = sum(
         1 for p in pool.indexer_compress_state_pools if p is not None
     )
-    if compress_state_count == 0 and indexer_compress_state_count == 0:
-        raise NotImplementedError(
-            "kv-canary: DSV4 SWA segmentation has empty compress_state_pools and "
-            "indexer_compress_state_pools — cannot splice head/tail canary per segment"
-        )
-    segment_offsets: List[int] = [
-        0,
-        swa_layer_num,
-        swa_layer_num + compress_state_count,
-    ]
     expected_total = swa_layer_num + compress_state_count + indexer_compress_state_count
     page_size = pool.page_size
 
@@ -167,12 +152,12 @@ def _patch_state_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
             raise RuntimeError(
                 f"DSV4 state buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
             )
-        return splice_segmented_buf_info(
+        return splice_kv_buf_info(
             ptrs=ptrs,
             lens=lens,
             item_lens=item_lens,
-            segment_offsets=segment_offsets,
             group=group,
+            has_v_half=False,
             page_size=page_size,
         )
 
