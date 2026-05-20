@@ -12,13 +12,17 @@ register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-large")
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 
-# DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
-# canary e2e test. The canary kernel must run inside the cuda graph alongside
-# the real attn kernel; disabling the graph silently bypasses the only path
-# that exercises that invariant end-to-end.
+# DO NOT pass --disable-cuda-graph in any canary e2e test. The canary kernel
+# must run inside the (main) cuda graph alongside the real attn kernel;
+# disabling the main graph silently bypasses the only path that exercises that
+# invariant end-to-end. --disable-piecewise-cuda-graph IS allowed: the
+# piecewise warmup path triggers an upstream sglang IMA on 1-layer Qwen that
+# is unrelated to canary, and sglang's own error message suggests this
+# workaround.
 
-# Cap canary install-time capacities below the 1M cuda-grid-safe ceiling
-# enforced by install_canary. Two guards trip otherwise:
+# Cap canary install-time capacities below the cuda-grid-safe ceiling
+# enforced by install_canary (4M, see api.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
+# Two guards trip otherwise:
 #   per-forward: max(cuda_graph_max_bs, max_running_requests) * max_seq_len_per_req
 #   sweep:       max_total_num_tokens
 # All three sources must be capped or the pool sizing (driven by
@@ -32,6 +36,7 @@ _CANARY_CAPACITY_CAPS: List[str] = [
     "2048",
     "--max-total-tokens",
     "16384",
+    "--disable-piecewise-cuda-graph",
 ]
 
 
