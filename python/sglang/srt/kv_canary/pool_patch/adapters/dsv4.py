@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from sglang.jit_kernel.kv_canary_verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
@@ -10,6 +10,7 @@ from sglang.srt.kv_canary.pool_patch.helpers import (
     _make_packed_source,
     _make_row_source,
     _splice_packed_buf_info,
+    _wrap_method,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
@@ -83,13 +84,6 @@ def _patch_dsv4_contiguous_buf_info(
     *,
     group: CanaryBufferGroup,
 ) -> None:
-    method_name = "get_contiguous_buf_infos"
-    if not hasattr(pool, method_name):
-        raise AttributeError(
-            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
-        )
-    original = getattr(pool, method_name)
-
     c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
     indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
     c128_layer_num = len(pool.c128_kv_pool.kv_buffer)
@@ -102,8 +96,8 @@ def _patch_dsv4_contiguous_buf_info(
 
     page_size = pool.page_size
 
-    def patched() -> _BufInfoTriple:
-        ptrs, lens, item_lens = original()
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> _BufInfoTriple:
+        ptrs, lens, item_lens = original(*args, **kwargs)
         if len(ptrs) != expected_total:
             raise RuntimeError(
                 f"DSV4 buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
@@ -117,7 +111,7 @@ def _patch_dsv4_contiguous_buf_info(
             page_size=page_size,
         )
 
-    setattr(pool, method_name, patched)
+    _wrap_method(pool, "get_contiguous_buf_infos", wrapper=_with_splice)
 
 
 def _patch_dsv4_state_buf_info(
@@ -125,13 +119,6 @@ def _patch_dsv4_state_buf_info(
     *,
     group: CanaryBufferGroup,
 ) -> None:
-    method_name = "get_state_buf_infos"
-    if not hasattr(pool, method_name):
-        raise AttributeError(
-            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
-        )
-    original = getattr(pool, method_name)
-
     swa_layer_num = len(pool.swa_kv_pool.kv_buffer)
     compress_state_count = sum(1 for p in pool.compress_state_pools if p is not None)
     indexer_compress_state_count = sum(
@@ -151,8 +138,8 @@ def _patch_dsv4_state_buf_info(
 
     page_size = pool.page_size
 
-    def patched() -> _BufInfoTriple:
-        ptrs, lens, item_lens = original()
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> _BufInfoTriple:
+        ptrs, lens, item_lens = original(*args, **kwargs)
         if len(ptrs) != expected_total:
             raise RuntimeError(
                 f"DSV4 state buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
@@ -166,4 +153,4 @@ def _patch_dsv4_state_buf_info(
             page_size=page_size,
         )
 
-    setattr(pool, method_name, patched)
+    _wrap_method(pool, "get_state_buf_infos", wrapper=_with_splice)

@@ -179,38 +179,24 @@ def _patch_allocator_lut_mirror(
     always see a coherent value. The wrapped method's return value (the full-pool indices) is preserved.
     """
     for name in _LUT_ALLOC_METHOD_NAMES:
-        original = getattr(allocator, name, None)
-        if original is None:
+        if not hasattr(allocator, name):
             continue
-        wrapped = _make_lut_mirror_wrapper(
-            original=original,
-            int64_lut=int64_lut,
-            int32_mirror=int32_mirror,
-        )
-        setattr(allocator, name, wrapped)
 
-
-def _make_lut_mirror_wrapper(
-    *,
-    original: Callable,
-    int64_lut: torch.Tensor,
-    int32_mirror: torch.Tensor,
-) -> Callable:
-    def wrapped(*args, **kwargs):
-        alloc_full_indices = original(*args, **kwargs)
-        if not isinstance(alloc_full_indices, torch.Tensor):
+        def _with_mirror(original: Callable, *args: Any, **kwargs: Any) -> Any:
+            alloc_full_indices = original(*args, **kwargs)
+            if not isinstance(alloc_full_indices, torch.Tensor):
+                return alloc_full_indices
+            if alloc_full_indices.numel() == 0:
+                return alloc_full_indices
+            idx_long = (
+                alloc_full_indices
+                if alloc_full_indices.dtype is torch.int64
+                else alloc_full_indices.to(torch.int64)
+            )
+            int32_mirror[idx_long] = int64_lut[idx_long].to(torch.int32)
             return alloc_full_indices
-        if alloc_full_indices.numel() == 0:
-            return alloc_full_indices
-        idx_long = (
-            alloc_full_indices
-            if alloc_full_indices.dtype is torch.int64
-            else alloc_full_indices.to(torch.int64)
-        )
-        int32_mirror[idx_long] = int64_lut[idx_long].to(torch.int32)
-        return alloc_full_indices
 
-    return wrapped
+        _wrap_method(allocator, name, wrapper=_with_mirror)
 
 
 def _resolve_read_bytes(config: CanaryConfig) -> int:
@@ -317,14 +303,8 @@ def _patch_buf_info_method(
     has_v_half: bool,
     page_size: int,
 ) -> None:
-    if not hasattr(pool, method_name):
-        raise AttributeError(
-            f"kv-canary: pool {type(pool).__name__} missing required method {method_name!r}"
-        )
-    original = getattr(pool, method_name)
-
-    def patched() -> _BufInfoTriple:
-        ptrs, lens, item_lens = original()
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> _BufInfoTriple:
+        ptrs, lens, item_lens = original(*args, **kwargs)
         return _splice_canary_buf_info(
             ptrs=ptrs,
             lens=lens,
@@ -334,7 +314,7 @@ def _patch_buf_info_method(
             page_size=page_size,
         )
 
-    setattr(pool, method_name, patched)
+    _wrap_method(pool, method_name, wrapper=_with_splice)
 
 
 def _splice_canary_buf_info(

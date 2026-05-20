@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import functools
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
+from sglang.srt.kv_canary.pool_patch.helpers import _wrap_method
 from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
@@ -141,22 +141,18 @@ def _compute_launch_capacities(
 
 
 def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -> None:
-    model = model_runner.model
-    original_forward = model.forward
-
-    @functools.wraps(original_forward)
-    def patched_model_forward(*args, **kwargs):
+    def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
         forward_batch = _extract_forward_batch(args, kwargs)
         assert (
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
         runner.launch_head_kernels(forward_batch)
-        output = original_forward(*args, **kwargs)
+        output = original(*args, **kwargs)
         runner.launch_tail_kernels(forward_batch)
         return output
 
-    model.forward = patched_model_forward
+    _wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
 
 
 def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:
