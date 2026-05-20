@@ -87,9 +87,7 @@ class SweepOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        sweep_capacity = int(
-            self._verify_plan_sweep_radix.verify_slot_indices.shape[0]
-        )
+        sweep_capacity = int(self._verify_plan_sweep_radix.verify_slot_indices.shape[0])
         for group in self._buffer_groups:
             window = self._swa_window_size if group.kind is PoolKind.SWA else 0
             radix_input = build_plan_input_radix_sweep(
