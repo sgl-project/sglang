@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Mapping, Protocol, Sequence
+from typing import Protocol
 
 
 class Oracle(Protocol):
@@ -13,13 +13,6 @@ class Oracle(Protocol):
     """
 
     def expected_token(self, *, req_id: int, position: int) -> int: ...
-
-    def expected_tokens_batch(
-        self,
-        *,
-        req_ids: Sequence[int],
-        positions: Sequence[int],
-    ) -> List[int]: ...
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -36,51 +29,6 @@ class HashOracle:
     def expected_token(self, *, req_id: int, position: int) -> int:
         mixed = (self.seed ^ req_id ^ position) & _U64_MASK
         return _splitmix64(mixed) % self.vocab_size
-
-    def expected_tokens_batch(
-        self,
-        *,
-        req_ids: Sequence[int],
-        positions: Sequence[int],
-    ) -> List[int]:
-        if len(req_ids) != len(positions):
-            raise ValueError(
-                f"req_ids ({len(req_ids)}) and positions ({len(positions)}) must have equal length"
-            )
-        return [
-            self.expected_token(req_id=r, position=p)
-            for r, p in zip(req_ids, positions)
-        ]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ScriptedOracle:
-    """Pre-loaded ``{(req_id, position): token_id}`` table.
-
-    Used by manual edge-case tests that need exact token sequences, e.g.
-    'req 7 must see token 42 at position 100'. Lookup outside the table raises KeyError -
-    caller is expected to fully cover every (req_id, position) the test will hit.
-    """
-
-    table: Mapping[tuple[int, int], int]
-
-    def expected_token(self, *, req_id: int, position: int) -> int:
-        return self.table[(req_id, position)]
-
-    def expected_tokens_batch(
-        self,
-        *,
-        req_ids: Sequence[int],
-        positions: Sequence[int],
-    ) -> List[int]:
-        if len(req_ids) != len(positions):
-            raise ValueError(
-                f"req_ids ({len(req_ids)}) and positions ({len(positions)}) must have equal length"
-            )
-        return [
-            self.expected_token(req_id=r, position=p)
-            for r, p in zip(req_ids, positions)
-        ]
 
 
 _U64_MASK = (1 << 64) - 1

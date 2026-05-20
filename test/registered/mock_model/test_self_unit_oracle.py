@@ -1,4 +1,4 @@
-"""Oracle implementations: HashOracle determinism + ScriptedOracle lookup behavior."""
+"""HashOracle determinism + splitmix64 finalizer behavior."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import pytest
 from sglang.srt.kv_canary.mock_model.oracle import (
     HashOracle,
     Oracle,
-    ScriptedOracle,
     _splitmix64,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -67,28 +66,6 @@ def test_hash_oracle_satisfies_oracle_protocol() -> None:
     assert oracle.expected_token(req_id=0, position=0) is not None
 
 
-def test_scripted_oracle_returns_table_value() -> None:
-    table = {(0, 0): 42, (0, 1): 7, (1, 0): 99}
-    oracle = ScriptedOracle(table=table)
-
-    assert oracle.expected_token(req_id=0, position=0) == 42
-    assert oracle.expected_token(req_id=0, position=1) == 7
-    assert oracle.expected_token(req_id=1, position=0) == 99
-
-
-def test_scripted_oracle_missing_key_raises_key_error() -> None:
-    oracle = ScriptedOracle(table={(0, 0): 1})
-
-    with pytest.raises(KeyError):
-        oracle.expected_token(req_id=99, position=99)
-
-
-def test_scripted_oracle_satisfies_oracle_protocol() -> None:
-    oracle: Oracle = ScriptedOracle(table={(0, 0): 5})
-
-    assert oracle.expected_token(req_id=0, position=0) == 5
-
-
 def test_splitmix64_finalizer_is_deterministic() -> None:
     assert _splitmix64(0) == _splitmix64(0)
     assert _splitmix64(1) != _splitmix64(0)
@@ -107,10 +84,3 @@ def test_hash_oracle_is_frozen_dataclass() -> None:
 
     with pytest.raises(Exception):
         oracle.seed = 2  # type: ignore[misc]
-
-
-def test_scripted_oracle_is_frozen_dataclass() -> None:
-    oracle = ScriptedOracle(table={(0, 0): 1})
-
-    with pytest.raises(Exception):
-        oracle.table = {}  # type: ignore[misc]

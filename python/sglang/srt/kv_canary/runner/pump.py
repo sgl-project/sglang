@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor, stage_d2h_future
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
@@ -43,7 +43,7 @@ class PumpAndAllreduce:
         local_errored = False
         if self._previous_pump_future is not None:
             local_errored = bool(int(self._previous_pump_future.wait().item()))
-        self._previous_pump_future = stage_d2h_future(
+        self._previous_pump_future = FutureTensor.create(
             src_device=signal.view(-1)[:1], stream=self._d2h_stream
         )
 
@@ -69,7 +69,7 @@ class PumpAndAllreduce:
                 )
             else:
                 any_rank_errored = local_errored
-            self._previous_allreduce_future = stage_d2h_future(
+            self._previous_allreduce_future = FutureTensor.create(
                 src_device=allreduce_buf, stream=self._d2h_stream
             )
 
