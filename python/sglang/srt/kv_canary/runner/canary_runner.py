@@ -14,7 +14,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
+from sglang.srt.kv_canary.mock_model.oracle_manager import OracleSamplerHook
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook

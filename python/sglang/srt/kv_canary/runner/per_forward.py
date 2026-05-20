@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
+from sglang.srt.kv_canary.mock_model.oracle_manager import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,

@@ -15,7 +15,7 @@ from sglang.srt.kv_canary.runner.canary_runner import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
+    from sglang.srt.kv_canary.mock_model.oracle_manager import OracleSamplerHook
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
