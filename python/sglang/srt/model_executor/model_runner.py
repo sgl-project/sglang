@@ -2309,14 +2309,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
 
-        max_num_tokens = envs.SGLANG_DSV4_MHC_PREWARM_MAX_TOKENS.get()
-        if max_num_tokens < 0:
-            raise ValueError(
-                "SGLANG_DSV4_MHC_PREWARM_MAX_TOKENS expects a non-negative "
-                f"integer, got {max_num_tokens}"
-            )
-        if max_num_tokens == 0:
-            return
+        max_num_tokens = self.server_args.chunked_prefill_size
+        if max_num_tokens is None or max_num_tokens <= 0:
+            max_num_tokens = 8192
 
         token_counts = self.model.prewarm_mhc_token_count_buckets(
             max_num_tokens, self.device
