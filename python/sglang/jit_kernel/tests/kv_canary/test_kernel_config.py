@@ -591,7 +591,8 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
 
     if not per_req_present and not extras_present:
         assert int(triton_v.verify_num_valid[0].item()) == 0
-        assert int(triton_w.write_num_valid_reqs[0].item()) == 0
+        bs = int(fb_rpi.shape[0])
+        assert int(triton_w.write_offsets[bs].item()) == 0
 
     if not per_req_present and extras_present:
         assert int(triton_v.verify_num_valid[0].item()) == 2
