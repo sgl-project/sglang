@@ -77,10 +77,6 @@ class SteppableEngineConfig:
     sweep_every_n: int = 0
 
     apply_pr_25015_fix: Optional[bool] = None
-    apply_pr_22819_fix: Optional[bool] = None
-    apply_pr_24230_fix: Optional[bool] = None
-    apply_pr_24401_fix: Optional[bool] = None
-    apply_pr_20711_fix: Optional[bool] = None
 
     scripted_pr_scenario: Optional[int] = None
     extra_server_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -188,20 +184,9 @@ class SteppableEngine:
         self._send_to_scheduler(EnterSteppingModeReq())
 
     def _apply_pr_fix_toggles(self) -> None:
-        choices: Dict[int, Optional[bool]] = {
-            25015: self._config.apply_pr_25015_fix,
-            22819: self._config.apply_pr_22819_fix,
-            24230: self._config.apply_pr_24230_fix,
-            24401: self._config.apply_pr_24401_fix,
-            20711: self._config.apply_pr_20711_fix,
-        }
-        if all(c is None for c in choices.values()):
+        if self._config.apply_pr_25015_fix is None:
             return
-        for pr_num, choice in choices.items():
-            if choice is not None and pr_num != 25015:
-                raise NotImplementedError(
-                    f"apply_pr_{pr_num}_fix toggle is not supported yet"
-                )
+        choices: Dict[int, Optional[bool]] = {25015: self._config.apply_pr_25015_fix}
         self._send_to_scheduler(
             _ApplyPrFixTogglesReq(choices_pickled=pickle.dumps(choices))
         )
