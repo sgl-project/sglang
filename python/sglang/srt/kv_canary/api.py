@@ -104,7 +104,12 @@ def _resolve_tp_group():
 
     try:
         return get_tp_group()
-    except (AssertionError, RuntimeError, AttributeError):
+    except AssertionError:
+        logger.warning(
+            "kv-canary: TP group not initialized; cross-rank error allreduce disabled "
+            "(raise mode will not be globally synchronized)",
+            exc_info=True,
+        )
         return None
 
 
@@ -113,7 +118,11 @@ def _resolve_pp_group():
 
     try:
         return get_pp_group()
-    except (AssertionError, RuntimeError, AttributeError):
+    except AssertionError:
+        logger.warning(
+            "kv-canary: PP group not initialized; cross-stage error allreduce disabled",
+            exc_info=True,
+        )
         return None
 
 
