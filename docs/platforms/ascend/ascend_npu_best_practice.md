@@ -1113,8 +1113,8 @@ do
         --nnodes 2 --node-rank $i \
         --disaggregation-bootstrap-port 8995 \
         --moe-dense-tp-size 1 \
-	    --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+	    --enable-dsa-prefill-context-parallel \
+        --dsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
         --dist-init-addr ${P_IP[0]}:10000
