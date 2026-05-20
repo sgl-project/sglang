@@ -685,9 +685,7 @@ class TestMultiItemScoringRejectsGenerate(CustomTestCase):
         gen_results = results[8:]
 
         for r in score_results:
-            self.assertFalse(
-                isinstance(r, BaseException), f"score raised: {r!r}"
-            )
+            self.assertFalse(isinstance(r, BaseException), f"score raised: {r!r}")
             self.assertEqual(len(r.scores), len(score_items))
             for sl in r.scores:
                 self.assertAlmostEqual(sum(sl), 1.0, places=5)
