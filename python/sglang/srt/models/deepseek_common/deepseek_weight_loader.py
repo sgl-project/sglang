@@ -459,6 +459,27 @@ class DeepseekV2WeightLoaderMixin:
                     )
             else:
                 w = self_attn.kv_b_proj.weight
+                if (
+                    getattr(
+                        getattr(self_attn.kv_b_proj, "scheme", None),
+                        "is_petit_mxfp4_linear",
+                        False,
+                    )
+                    and w.dtype == torch.uint8
+                    and not _use_aiter_gfx95
+                ):
+                    # On non-gfx95 ROCm we do not have the AFP4 batched GEMM path
+                    # for MLA. Materialize kv_b_proj through the Petit MXFP4 dense
+                    # kernel before splitting it into w_kc / w_vc, so downstream
+                    # torch.bmm sees the full logical hidden dimension.
+                    from sglang.srt.layers.quantization.petit_utils import (
+                        materialize_petit_mxfp4_weight,
+                    )
+
+                    w = materialize_petit_mxfp4_weight(
+                        self_attn.kv_b_proj,
+                        out_dtype=torch.bfloat16,
+                    )
 
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
             # This may affect the accuracy of fp8 model.

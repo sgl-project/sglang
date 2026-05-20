@@ -47,7 +47,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Yes</td>
       <td>WIP</td>
-      <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+      <td>Supports MXFP4 dense linear and MXFP4 MoE on AMD MI300X; uses Aiter/Petit paths on ROCm</td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -152,7 +152,14 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>No</td>
       <td>Yes (MI250/MI300X/MI325X)</td>
       <td>No</td>
-      <td>Enables NVFP4 on ROCm via <a href="https://github.com/causalflow-ai/petit-kernel">Petit</a>; use <code>modelopt_fp4</code> on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See <a href="https://lmsys.org/blog/2025-09-21-petit-amdgpu/">LMSYS blog</a> and <a href="https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html">AMD ROCm blog</a>.</td>
+      <td>Enables NVFP4 dense linear on ROCm via <a href="https://github.com/causalflow-ai/petit-kernel">Petit</a>; use <code>modelopt_fp4</code> on NVIDIA Blackwell. Auto-selected for dense NVFP4 models on AMD. See <a href="https://lmsys.org/blog/2025-09-21-petit-amdgpu/">LMSYS blog</a> and <a href="https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html">AMD ROCm blog</a>.</td>
+    </tr>
+    <tr>
+      <td><code>petit_mxfp4</code></td>
+      <td>No</td>
+      <td>Yes (MI300X/MI325X)</td>
+      <td>No</td>
+      <td>Enables MXFP4 dense linear and MXFP4 MoE on ROCm via Petit/Aiter; compatible with MXFP4/Quark checkpoints on AMD MI300X.</td>
     </tr>
     <tr>
       <td><code>bitsandbytes</code></td>
@@ -179,6 +186,33 @@ The following table summarizes quantization method support across NVIDIA and AMD
 </table>
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../hardware-platforms/amd_gpu) for installation and configuration details.
+
+AMD MI300X FP4 support includes the following layer scopes:
+
+<table>
+  <thead>
+    <tr>
+      <th>FP4 path</th>
+      <th>AMD MI300X support</th>
+      <th>Scope</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>NVFP4 via <code>petit_nvfp4</code></td>
+      <td>Yes</td>
+      <td>Dense linear</td>
+      <td>Requires Petit; intended for dense ModelOpt FP4/NVFP4 checkpoints on ROCm.</td>
+    </tr>
+    <tr>
+      <td>MXFP4 via <code>mxfp4</code> / <code>petit_mxfp4</code></td>
+      <td>Yes</td>
+      <td>Dense linear and MoE</td>
+      <td>Requires <code>SGLANG_USE_AITER=1</code>; Petit is used where the checkpoint is routed through the ROCm Petit path.</td>
+    </tr>
+  </tbody>
+</table>
 
 On Ascend, various layers quantization configurations are supported, see [Ascend NPU quantization](../hardware-platforms/ascend-npus/ascend_npu_quantization) for details.
 
