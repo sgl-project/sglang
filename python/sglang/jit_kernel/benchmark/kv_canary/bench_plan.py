@@ -10,9 +10,9 @@ import triton.testing
 from sglang.jit_kernel.benchmark.kv_canary.bench_helpers import (
     POOL_AXIS,
     SWA_WINDOW,
+    BenchCase,
     build_fast_matrix_cases,
     build_full_matrix_cases,
-    cases_to_x_vals,
     naive_cumsum_fn,
 )
 from sglang.jit_kernel.benchmark.utils import (
@@ -56,7 +56,18 @@ def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
 
 
 _X_NAMES_MATRIX = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
-_X_VALS_MATRIX = cases_to_x_vals(
+
+
+def _cases_to_matrix_x_vals(
+    cases: list[BenchCase],
+) -> list[tuple[int, int, str, int, str]]:
+    return [
+        (c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
+        for c in cases
+    ]
+
+
+_X_VALS_MATRIX = _cases_to_matrix_x_vals(
     get_benchmark_range(
         full_range=build_full_matrix_cases(),
         ci_range=build_fast_matrix_cases(),
