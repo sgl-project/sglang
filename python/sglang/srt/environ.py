@@ -686,22 +686,22 @@ class Envs:
     SGLANG_PSEUDO_INPUT_PERTURB_SEED = EnvInt(0)
     # Position-side counterpart: when >0 perturb ``forward_batch.positions``
     # so the canary's ``INPUT_POSITION_MISMATCH`` detection fires. Positions
-    # are computed by sglang scheduler internals; the v1 install path
+    # are computed by sglang scheduler internals; the current install path
     # leaves this unwired with a TODO (see install.py).
     SGLANG_PSEUDO_INPUT_POSITION_PERTURB_PROB = EnvFloat(0.0)
     SGLANG_PSEUDO_INPUT_POSITION_PERTURB_SEED = EnvInt(0)
 
-    # Testing SOT (testing.md §3.1) canary perturb / mock perturb env vars.
-    # Primitive float / int values (no compound types) so the registry
-    # reflection self-unit test can assert declared types are primitive.
+    # Canary perturb / mock perturb env vars. Primitive float / int values (no
+    # compound types) so the registry reflection self-unit test can assert
+    # declared types are primitive.
     # Per-write probability the canary self-unit perturb hook flips a
     # ``req_to_token_pool`` slot to force INPUT_TOKEN_MISMATCH / chain hash
     # violations. Counterpart of ``SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB``;
-    # this SOT-named alias is consumed by the new testing harness.
+    # this alias is consumed by the testing harness.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN = EnvFloat(0.0)
-    # KV cache canary upper-level config (upper-level SOT §10). All
-    # canary tunables are read once by ``CanaryConfig.from_env`` at
-    # server start; deeper modules must not read env vars directly.
+    # KV cache canary runtime config. All canary tunables are read once by
+    # ``CanaryConfig.from_env`` at server start; deeper modules must not read
+    # env vars directly.
     SGLANG_KV_CANARY_MODE = EnvStr("off")
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_SWEEP_EVERY_N_STEPS = EnvInt(64)

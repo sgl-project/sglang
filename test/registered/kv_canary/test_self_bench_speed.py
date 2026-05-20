@@ -1,31 +1,24 @@
 """Canary on/off overhead self-bench.
 
 Launches a Qwen3-0.6B server twice per case — once with the canary disabled,
-once with ``--kv-canary raise`` — and reports steady-state latency for
-each. The overhead percentage is printed to stdout and appended to the sibling
-``test_self_bench_speed.baseline.json`` file (warn-only; no hard gate yet —
-see testing.md SOT §3.3 "首次 commit 不 hard-gate" + plan 04 step 7).
+once with ``--kv-canary raise`` — and reports steady-state latency for each.
+The overhead percentage is printed to stdout. A sanity assert catches
+catastrophic regressions (> 200% overhead) but is not a perf gate.
 
-testing.md SOT §3.3 — 2 cases:
+2 cases:
 
-- ``bench_qwen3_prefill_bs32_isl16384_osl1``
-- ``bench_qwen3_decode_bs256_isl4096_osl1024``
+- ``test_qwen3_prefill_overhead_bs32_isl16384_osl1``
+- ``test_qwen3_decode_overhead_bs256_isl4096_osl1024``
 
 Both registered to ``extra-a`` (label-gated PR) and ``nightly-1-gpu`` (auto
-nightly accumulation per plan 04 step 6). Method prefix ``bench_`` is the SOT
-casename convention; ``unittest.TestLoader.testMethodPrefix`` is rebound in
-``__main__`` so ``python3 file.py -f`` still discovers them.
+nightly).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import sys
-import time
 import unittest
-from pathlib import Path
-from typing import ClassVar, List, Tuple
+from typing import ClassVar, List
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -42,8 +35,6 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
-_BASELINE_FILENAME = "test_self_bench_speed.baseline.json"
-_RUNNER_CONFIG_KEY = "1-gpu-large"
 
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
@@ -99,41 +90,9 @@ def _run_one_canary_setting(
     return results[0]
 
 
-def _append_baseline_sample(
-    *,
-    scenario_key: str,
-    latency_off: float,
-    latency_on: float,
-    overhead_pct: float,
-) -> None:
-    baseline_path = Path(__file__).parent / _BASELINE_FILENAME
-    if baseline_path.exists():
-        with baseline_path.open("r") as f:
-            blob = json.load(f)
-    else:
-        blob = {}
-
-    bucket = blob.setdefault(_RUNNER_CONFIG_KEY, {})
-    slot = bucket.setdefault(
-        scenario_key,
-        {"samples": [], "p50_ms": None, "p90_ms": None, "p99_ms": None},
-    )
-    slot["samples"].append(
-        {
-            "ts_unix": time.time(),
-            "latency_off_s": round(latency_off, 4),
-            "latency_on_s": round(latency_on, 4),
-            "overhead_pct": round(overhead_pct, 4),
-        }
-    )
-    with baseline_path.open("w") as f:
-        json.dump(blob, f, indent=2)
-        f.write("\n")
-
-
 def _measure_overhead(
     *, scenario_key: str, batch_size: int, input_len: int, output_len: int
-) -> Tuple[float, float, float]:
+) -> None:
     off = _run_one_canary_setting(
         canary_on=False,
         batch_size=batch_size,
@@ -152,19 +111,16 @@ def _measure_overhead(
         f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%",
         flush=True,
     )
-    _append_baseline_sample(
-        scenario_key=scenario_key,
-        latency_off=off.latency,
-        latency_on=on.latency,
-        overhead_pct=overhead_pct,
+    assert overhead_pct < 200.0, (
+        f"canary overhead {overhead_pct:.1f}% suspiciously high for "
+        f"{scenario_key} (off={off.latency:.4f}s, on={on.latency:.4f}s)"
     )
-    return off.latency, on.latency, overhead_pct
 
 
 class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
-    def bench_qwen3_prefill_bs32_isl16384_osl1(self) -> None:
+    def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
         _measure_overhead(
             scenario_key="qwen3-0.6b/prefill_bs32_isl16384_osl1",
             batch_size=32,
@@ -172,7 +128,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=1,
         )
 
-    def bench_qwen3_decode_bs256_isl4096_osl1024(self) -> None:
+    def test_qwen3_decode_overhead_bs256_isl4096_osl1024(self) -> None:
         _measure_overhead(
             scenario_key="qwen3-0.6b/decode_bs256_isl4096_osl1024",
             batch_size=256,
@@ -181,17 +137,5 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
 
-def _main() -> int:
-    # Step 1: rebind the discovery prefix so ``bench_*`` methods become
-    # runnable test methods (SOT §3.3 casename convention).
-    unittest.TestLoader.testMethodPrefix = "bench_"
-
-    # Step 2: hand control to the standard CLI so ``python3 file.py -f`` and
-    # any explicit ``bench_*`` selectors work unchanged.
-    return unittest.main(
-        module=__name__, exit=False, argv=sys.argv
-    ).result.wasSuccessful()
-
-
 if __name__ == "__main__":
-    sys.exit(0 if _main() else 1)
+    unittest.main()

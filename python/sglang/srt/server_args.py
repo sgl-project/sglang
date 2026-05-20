@@ -1183,7 +1183,7 @@ class ServerArgs:
             self.speculative_draft_model_quantization = None
 
     def _apply_mock_model_defaults(self):
-        """Bridge to kv-canary mock_model args_modifier.
+        """Apply mock_model defaults to this ServerArgs instance.
 
         The helper returns a new ServerArgs via dataclasses.replace; we copy the resolved
         fields back into self because __post_init__ cannot reassign self.

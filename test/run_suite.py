@@ -269,8 +269,8 @@ def run_a_suite(args):
     repo_root = os.path.dirname(script_dir)
 
     # Registered tests under test/registered/. Leading-underscore module
-    # names are the Python convention for test-internal helpers (e.g.
-    # ``pseudo_mode/_pseudo_engine.py``) and are not test entry points.
+    # names are the Python convention for test-internal helpers and are not
+    # test entry points.
     files = [
         f
         for f in glob.glob(

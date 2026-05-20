@@ -4,7 +4,7 @@ Qwen3-0.6B with ``num_hidden_layers=1`` baked into ``--json-model-override-args`
 gives the cheapest possible "real attention + real KV pool + canary attached"
 e2e configuration so PR CI catches integration regressions in 1-2 minutes.
 
-testing.md SOT §3.2 — 7 cases, all under ``extra-a`` / ``1-gpu-large``.
+7 cases, all registered to ``extra-a`` / ``1-gpu-large``.
 """
 
 from __future__ import annotations

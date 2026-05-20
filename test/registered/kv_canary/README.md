@@ -7,7 +7,4 @@ via the `register_cuda_ci(...)` decorator in each test file; all files are tagge
 registered to the nightly `nightly-kernel-1-gpu` suite for weekly performance
 gating.
 
-The single source of truth for the file list, per-case names, and assertions is
-[`lab/docs/pkgs/sglang/notes/2026-05-18-testing/source-of-truth/testing.md`](https://github.com/fzyzcjy/lab) §3
-(internal). Do not add, rename, or remove cases here without first updating that
-document.
+See `test/README.md` for how tests are discovered, registered, and run.
