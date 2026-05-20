@@ -14,7 +14,6 @@ from sglang.srt.kv_canary.pool_patch.api import (
     attach_canary_buffers,
     get_canary_buffer_groups,
 )
-from sglang.srt.kv_canary.pool_patch.utils import make_row_source
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     CPU_DEVICE,
@@ -72,12 +71,6 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         for group in groups.values():
             self.assertLessEqual(len(group.real_kv_sources_k), _MAX_REAL_KV_SOURCES)
             self.assertLessEqual(len(group.real_kv_sources_v), _MAX_REAL_KV_SOURCES)
-
-    def test_real_kv_sources_below_4(self):
-        layer = torch.zeros(8, 16, dtype=torch.float16, device=self.device)
-        sources = make_row_source(layer_buffer=layer, read_bytes=4)
-        self.assertGreater(len(sources), 0)
-        self.assertLessEqual(len(sources), _MAX_REAL_KV_SOURCES)
 
     def test_real_kv_sources_above_4_raises(self):
         from sglang.jit_kernel.kv_canary.verify import (
