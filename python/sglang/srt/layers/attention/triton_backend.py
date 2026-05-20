@@ -1060,7 +1060,7 @@ class TritonAttnBackend(AttentionBackend):
         # For SWA layers, translate out_cache_loc to the SWA-pool index space.
         # Uses the pool's per-batch cached translation (one gather per forward pass).
         extend_kv_indices = forward_batch.out_cache_loc
-        pool = self.token_to_kv_pool
+        pool = forward_batch.token_to_kv_pool
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
