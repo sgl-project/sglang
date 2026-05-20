@@ -88,15 +88,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
-# mscclpp
-FetchContent_Declare(
-    repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-mscclpp)
-
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
 find_program(CCACHE_FOUND ccache)
@@ -250,7 +241,6 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
@@ -321,7 +311,6 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -371,17 +360,8 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-# mscclpp option
-set(MSCCLPP_USE_CUDA ON)
-set(MSCCLPP_BYPASS_GPU_CHECK ON)
-set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(
-    ${repo-mscclpp_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
-)
-
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
