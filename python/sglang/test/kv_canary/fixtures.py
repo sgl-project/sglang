@@ -20,7 +20,6 @@ from sglang.jit_kernel.kv_canary.verify import (
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
-from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.kv_canary.pool_patch.buf_info_splice import patch_buf_info_method
@@ -47,19 +46,6 @@ class FakeMHAPool:
         item_lens = [b[0].nbytes * self.page_size for b in self.k_buffer] + [
             b[0].nbytes * self.page_size for b in self.v_buffer
         ]
-        return ptrs, lens, item_lens
-
-
-@dataclass
-class FakeMLAPool:
-    layer_num: int
-    kv_buffer: List[torch.Tensor]
-    page_size: int = 1
-
-    def get_contiguous_buf_infos(self):
-        ptrs = [b.data_ptr() for b in self.kv_buffer]
-        lens = [b.nbytes for b in self.kv_buffer]
-        item_lens = [b[0].nbytes * self.page_size for b in self.kv_buffer]
         return ptrs, lens, item_lens
 
 
@@ -166,20 +152,6 @@ def make_mha_pool(
         for _ in range(layer_num)
     ]
     return FakeMHAPool(layer_num=layer_num, k_buffer=k_layers, v_buffer=v_layers)
-
-
-def make_mla_pool(
-    device: torch.device = CPU_DEVICE,
-    *,
-    num_slots: int = 16,
-    dim: int = 16,
-    layer_num: int = 2,
-) -> FakeMLAPool:
-    kv_layers = [
-        torch.zeros(num_slots, dim, dtype=torch.float16, device=device)
-        for _ in range(layer_num)
-    ]
-    return FakeMLAPool(layer_num=layer_num, kv_buffer=kv_layers)
 
 
 def make_swa_pool(
@@ -442,6 +414,5 @@ def _build_fake_dsv4_group(
 
 
 register_pool_attacher(FakeMHAPool, attach_mha)
-register_pool_attacher(FakeMLAPool, attach_mla)
 register_pool_attacher(FakeSWAPool, attach_swa)
 register_pool_attacher(FakeDsv4Pool, _attach_fake_dsv4)
