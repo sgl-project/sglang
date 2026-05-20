@@ -1,9 +1,9 @@
 """Canary on/off overhead self-bench.
 
 Launches a Qwen3-0.6B server twice per case — once with the canary disabled,
-once with ``--kv-canary raise`` — and reports steady-state latency for
-each. The overhead percentage is printed to stdout and appended to the sibling
-``test_self_bench_speed.baseline.json`` file (warn-only; no hard gate yet).
+once with ``--kv-canary raise`` — and reports steady-state latency for each.
+The overhead percentage is printed to stdout. A sanity assert catches
+catastrophic regressions (> 200% overhead) but is not a perf gate.
 
 2 cases:
 
@@ -11,17 +11,14 @@ each. The overhead percentage is printed to stdout and appended to the sibling
 - ``test_qwen3_decode_overhead_bs256_isl4096_osl1024``
 
 Both registered to ``extra-a`` (label-gated PR) and ``nightly-1-gpu`` (auto
-nightly accumulation).
+nightly).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import time
 import unittest
-from pathlib import Path
-from typing import ClassVar, List, Tuple
+from typing import ClassVar, List
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -38,8 +35,6 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
-_BASELINE_FILENAME = "test_self_bench_speed.baseline.json"
-_RUNNER_CONFIG_KEY = "1-gpu-large"
 
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
@@ -95,41 +90,9 @@ def _run_one_canary_setting(
     return results[0]
 
 
-def _append_baseline_sample(
-    *,
-    scenario_key: str,
-    latency_off: float,
-    latency_on: float,
-    overhead_pct: float,
-) -> None:
-    baseline_path = Path(__file__).parent / _BASELINE_FILENAME
-    if baseline_path.exists():
-        with baseline_path.open("r") as f:
-            blob = json.load(f)
-    else:
-        blob = {}
-
-    bucket = blob.setdefault(_RUNNER_CONFIG_KEY, {})
-    slot = bucket.setdefault(
-        scenario_key,
-        {"samples": [], "p50_ms": None, "p90_ms": None, "p99_ms": None},
-    )
-    slot["samples"].append(
-        {
-            "ts_unix": time.time(),
-            "latency_off_s": round(latency_off, 4),
-            "latency_on_s": round(latency_on, 4),
-            "overhead_pct": round(overhead_pct, 4),
-        }
-    )
-    with baseline_path.open("w") as f:
-        json.dump(blob, f, indent=2)
-        f.write("\n")
-
-
 def _measure_overhead(
     *, scenario_key: str, batch_size: int, input_len: int, output_len: int
-) -> Tuple[float, float, float]:
+) -> None:
     off = _run_one_canary_setting(
         canary_on=False,
         batch_size=batch_size,
@@ -148,13 +111,10 @@ def _measure_overhead(
         f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%",
         flush=True,
     )
-    _append_baseline_sample(
-        scenario_key=scenario_key,
-        latency_off=off.latency,
-        latency_on=on.latency,
-        overhead_pct=overhead_pct,
+    assert overhead_pct < 200.0, (
+        f"canary overhead {overhead_pct:.1f}% suspiciously high for "
+        f"{scenario_key} (off={off.latency:.4f}s, on={on.latency:.4f}s)"
     )
-    return off.latency, on.latency, overhead_pct
 
 
 class TestCanarySelfBenchSpeed(unittest.TestCase):
