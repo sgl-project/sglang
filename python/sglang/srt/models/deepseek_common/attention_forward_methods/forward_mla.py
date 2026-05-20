@@ -238,7 +238,15 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if not self.skip_topk or prev_topk_indices is None:
+                # Gate skip_topk on `not use_double_sparsity`: the DS
+                # selector is per-step (channel-mask scores depend on the
+                # current query) and must not be short-circuited by
+                # prev_topk_indices reuse. NSA's skip_topk reuse stays.
+                if (
+                    self.use_double_sparsity
+                    or not self.skip_topk
+                    or prev_topk_indices is None
+                ):
                     topk_indices = self._select_topk_indices(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -257,7 +265,13 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    if not self.skip_topk or prev_topk_indices is None:
+                    # See alt-stream branch above: DS selector is per-step
+                    # and must run even when skip_topk is set.
+                    if (
+                        self.use_double_sparsity
+                        or not self.skip_topk
+                        or prev_topk_indices is None
+                    ):
                         topk_indices = self._select_topk_indices(
                             x=hidden_states,
                             q_lora=q_lora,

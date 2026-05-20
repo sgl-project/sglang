@@ -1769,40 +1769,45 @@ class DeepseekV2AttentionMLA(
     ):
         """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
 
-        When ``self.use_double_sparsity`` is false (the default and current
-        production path), this dispatches to the existing NSA ``Indexer`` and
-        returns its token-level ``topk_indices`` tensor (or ``None`` when the
-        backend skips selection for this batch).
+        Both branches return the same shape — a token-level ``topk_indices``
+        ``int32 [bs, max_top_k]`` tensor (or ``None`` when the NSA backend
+        skips selection for this batch). The caller (``forward_absorb_*``)
+        treats the return uniformly and the downstream
+        ``transform_index_page_table_decode`` runs on both paths without
+        any isinstance dispatch.
 
-        When ``self.use_double_sparsity`` is true, the selector's page-level
-        output ``(selected_indices, valid_lengths)`` is **not yet
-        ABI-compatible** with the NSA backend that consumes ``topk_indices``
-        as a token-level int32 tensor (it calls ``.shape`` and ``!= -1`` on
-        it). The page-table adapter that translates page-level selections
-        into the backend's token-level tensor is the documented next
-        milestone (see development/loop1/REVIEWER_GUIDE.md "Known gaps for the integration
-        that the deploying team must close"). Until the adapter lands, the
-        DS branch raises ``NotImplementedError`` after the placeholder
-        guard, so the failure surfaces here with a clear pointer rather
-        than as an opaque shape crash inside the backend.
+        When ``self.use_double_sparsity`` is true the selector returns
+        page-level ``(selected_indices, valid_lengths)``; the page-table
+        adapter (``expand_ds_selection_to_topk_indices``) translates that
+        page-level output into the token-level ``topk_indices`` shape so
+        the downstream pipeline is unchanged. See
+        :mod:`sglang.srt.layers.attention.double_sparsity.page_table_adapter`.
         """
 
         if self.use_double_sparsity:
+            from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+                expand_ds_selection_to_topk_indices,
+            )
             from sglang.srt.layers.attention.double_sparsity.selector import (
                 assert_real_selector_or_placeholder_allowed,
             )
 
             assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
 
-            raise NotImplementedError(
-                "Double Sparsity selector reached the per-step hook but the "
-                "page-table adapter (page-level -> token-level topk_indices) "
-                "is missing. This should normally be caught at startup by "
-                "validate_double_sparsity; the in-hook raise is a "
-                "defense-in-depth guard for code paths that bypass the "
-                "validator (e.g. constructed via object.__new__ in unit "
-                "tests). See development/loop1/REVIEWER_GUIDE.md 'Known gaps for the "
-                "integration that the deploying team must close'."
+            selected_indices, valid_lengths = (
+                self.double_sparsity_selector.retrieve_topk(
+                    queries=q_lora,
+                    layer_id=layer_id,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    sparse_mask=getattr(forward_batch, "sparse_mask", None),
+                    seq_lens=getattr(forward_batch, "seq_lens", None),
+                )
+            )
+
+            return expand_ds_selection_to_topk_indices(
+                selected_indices=selected_indices,
+                valid_lengths=valid_lengths,
+                page_size=self.double_sparsity_selector.page_size,
             )
 
         return self.indexer(

@@ -374,13 +374,11 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
             )
         return attn
 
-    def test_ds_branch_raises_pending_adapter(self):
-        """With the placeholder guard satisfied, the DS branch must still
-        fail loudly because the page-table adapter that translates
-        ``(selected_indices, valid_lengths)`` to the NSA backend's
-        token-level ``topk_indices`` tensor has not landed yet. The selector
-        ABI itself is exercised independently via
-        ``DoubleSparsitySelector.retrieve_topk`` (see ``TestSelectorAbi``).
+    def test_ds_branch_returns_topk_indices_via_adapter(self):
+        """The DS branch returns a token-level ``topk_indices`` tensor —
+        the same shape NSA returns — via the page-table adapter
+        (Strategy 2: expand DS-selected page IDs to token positions and
+        feed them through the existing transform pipeline downstream).
         """
 
         os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
@@ -388,18 +386,30 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
             attn = self._make_attn(use_ds=True)
             forward_batch = SimpleNamespace(
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-                seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+                seq_lens=torch.tensor([128, 256], dtype=torch.int32),
                 sparse_mask=None,
             )
-            with self.assertRaises(NotImplementedError):
-                attn._select_topk_indices(
-                    x=torch.zeros(2, 16, 128),
-                    q_lora=torch.zeros(2, 16, 128),
-                    positions=torch.zeros(2, dtype=torch.int32),
-                    forward_batch=forward_batch,
-                    layer_id=0,
-                )
+            result = attn._select_topk_indices(
+                x=torch.zeros(2, 16, 128),
+                q_lora=torch.zeros(2, 16, 128),
+                positions=torch.zeros(2, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
             attn.indexer.assert_not_called()
+            # max_top_k from the placeholder selector config payload above.
+            self.assertEqual(result.dtype, torch.int32)
+            self.assertEqual(result.dim(), 2)
+            self.assertEqual(result.shape[0], 2)
+            page_size = attn.double_sparsity_selector.page_size
+            # Placeholder selector's first row covers logical pages
+            # 0..ceil(128/page_size); each becomes page_id * page_size in
+            # token coordinates. Verify a few representative entries.
+            self.assertGreaterEqual(result.shape[1], 1)
+            # The first valid entry of row 0 must be 0 * page_size = 0.
+            self.assertEqual(int(result[0, 0].item()), 0)
+            # Padding past valid_lengths must be -1.
+            self.assertEqual(int(result[0, -1].item()), -1)
         finally:
             os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
 
@@ -431,6 +441,242 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
                 forward_batch=forward_batch,
                 layer_id=0,
             )
+
+
+class TestPageTableAdapter(unittest.TestCase):
+    """Verify ``expand_ds_selection_to_topk_indices`` honours the unified-shape
+    return contract and raises one named exception per contract violation
+    (no parametrised broad ``assertRaises(Exception)``).
+    """
+
+    def _adapter(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            expand_ds_selection_to_topk_indices,
+        )
+
+        return expand_ds_selection_to_topk_indices
+
+    def test_basic_mapping(self):
+        """``selected_indices * page_size`` for in-range entries; ``-1`` preserved."""
+        adapter = self._adapter()
+        sel = torch.tensor(
+            [
+                [0, 3, 5, 7, -1, -1],
+                [1, 2, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        vl = torch.tensor([4, 2], dtype=torch.int32)
+        out = adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+        expected = torch.tensor(
+            [
+                [0, 192, 320, 448, -1, -1],
+                [64, 128, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(out, expected))
+        self.assertEqual(out.dtype, torch.int32)
+
+    def test_dtype_mismatch_selected_indices(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterDtypeMismatch,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 1, -1]], dtype=torch.int64)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterDtypeMismatch):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_dtype_mismatch_valid_lengths(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterDtypeMismatch,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int64)
+        with self.assertRaises(DSAdapterDtypeMismatch):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_batch_mismatch(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterBatchMismatch,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 1, -1], [2, 3, -1]], dtype=torch.int32)
+        vl = torch.tensor([2, 2, 2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterBatchMismatch):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_valid_length_overflow(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterValidLengthOverflow,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+        vl = torch.tensor([4], dtype=torch.int32)
+        with self.assertRaises(DSAdapterValidLengthOverflow):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_valid_length_negative(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterValidLengthOverflow,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+        vl = torch.tensor([-1], dtype=torch.int32)
+        with self.assertRaises(DSAdapterValidLengthOverflow):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_padding_violation(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterPaddingViolation,
+        )
+
+        adapter = self._adapter()
+        # valid_lengths says 2, but position 2 (the "padding" slot) is not -1.
+        sel = torch.tensor([[0, 1, 7]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterPaddingViolation):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_non_ascending(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterNonAscending,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[5, 3, -1]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterNonAscending):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_non_ascending_duplicate(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterNonAscending,
+        )
+
+        adapter = self._adapter()
+        # Strict ascending — duplicates are also a contract violation.
+        sel = torch.tensor([[3, 3, -1]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterNonAscending):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_page_out_of_range_negative(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterPageOutOfRange,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[-5, 1, -1]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterPageOutOfRange):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+    def test_page_out_of_range_above_max(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterPageOutOfRange,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([[0, 100, -1]], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterPageOutOfRange):
+            adapter(
+                selected_indices=sel,
+                valid_lengths=vl,
+                page_size=64,
+                max_logical_pages=50,
+            )
+
+    def test_empty_selection_returns_minus_one_row(self):
+        adapter = self._adapter()
+        sel = torch.tensor([[-1, -1, -1]], dtype=torch.int32)
+        vl = torch.tensor([0], dtype=torch.int32)
+        out = adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+        self.assertTrue(torch.equal(out, sel))
+
+    def test_2d_rank_required(self):
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            DSAdapterDtypeMismatch,
+        )
+
+        adapter = self._adapter()
+        sel = torch.tensor([0, 1, -1], dtype=torch.int32)  # 1D
+        vl = torch.tensor([2], dtype=torch.int32)
+        with self.assertRaises(DSAdapterDtypeMismatch):
+            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
+
+
+class TestSkipTopkGateRespectsDS(unittest.TestCase):
+    """Verify that ``forward_absorb_prepare`` gates ``skip_topk`` on
+    ``not use_double_sparsity`` in BOTH the alt-stream and the normal
+    branch, so the DS selector is not short-circuited by
+    ``prev_topk_indices`` reuse.
+
+    The full ``forward_absorb_prepare`` pulls in CUDA-only dependencies
+    that are not available in CPU unit tests; a structural assertion
+    against the source is the deterministic way to verify this gate
+    landed in BOTH branches. Two separate matches are required so a
+    one-branch regression is caught.
+    """
+
+    def _module_source(self) -> str:
+        import importlib.util
+
+        spec = importlib.util.find_spec(
+            "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla"
+        )
+        self.assertIsNotNone(spec)
+        with open(spec.origin, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_gate_present_in_both_branches(self):
+        import re
+
+        src = self._module_source()
+        # Indentation-agnostic match: alt-stream and normal branches sit at
+        # different depths inside forward_absorb_prepare. We require the
+        # three-clause predicate (use_double_sparsity OR not skip_topk OR
+        # prev_topk_indices is None) in that order, with arbitrary
+        # whitespace including newlines between clauses.
+        pattern = re.compile(
+            r"self\.use_double_sparsity\s+or\s+not\s+self\.skip_topk\s+or\s+"
+            r"prev_topk_indices\s+is\s+None",
+            re.MULTILINE,
+        )
+        occurrences = len(pattern.findall(src))
+        self.assertGreaterEqual(
+            occurrences,
+            2,
+            "Expected the DS-aware skip_topk gate "
+            "(`use_double_sparsity or not skip_topk or prev_topk_indices is None`) "
+            "in both the alt-stream and the normal branch of "
+            "forward_absorb_prepare; found {} occurrence(s).".format(occurrences),
+        )
+
+    def test_old_unconditional_gate_removed(self):
+        src = self._module_source()
+        # The pre-fix code did NOT include `self.use_double_sparsity or` in
+        # the predicate. If we still see the bare predicate without the DS
+        # term right before it, one branch was missed.
+        bare = "if not self.skip_topk or prev_topk_indices is None:"
+        # Allow at most ZERO occurrences after the fix.
+        occurrences = src.count(bare)
+        self.assertEqual(
+            occurrences,
+            0,
+            "Found the un-gated `if not self.skip_topk or prev_topk_indices "
+            "is None:` predicate; DS selector can still be short-circuited "
+            "by prev_topk_indices reuse. Add `self.use_double_sparsity or` "
+            "to the predicate.",
+        )
 
 
 class TestChannelMaskLoader(unittest.TestCase):
