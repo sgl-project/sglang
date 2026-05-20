@@ -1057,9 +1057,8 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
-        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
-        # as a fallback when pool.swa_loc is not pre-populated.
+        # For SWA layers, translate out_cache_loc to the SWA-pool index space.
+        # Uses the pool's per-batch cached translation (one gather per forward pass).
         extend_kv_indices = forward_batch.out_cache_loc
         pool = self.token_to_kv_pool
         if (

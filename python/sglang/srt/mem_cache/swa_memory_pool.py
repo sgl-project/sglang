@@ -92,16 +92,17 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-        # Per-batch translation cache keyed on Python object identity.
-        # Same ForwardBatch.out_cache_loc object → same batch → reuse result.
-        # Different object → different batch → recompute. Safe against allocator
-        # address reuse (unlike data_ptr()) because object identity is never
-        # reused while the old reference is alive.
+        # Per-batch translation cache keyed on (storage_ptr, numel).
+        # Views of the same parent tensor (e.g. out_cache_loc[:real_num_tokens])
+        # share storage and hit the same cache entry, so only one gather fires per
+        # forward pass even in piecewise / extend paths that create a new slice
+        # object per layer. Explicit invalidation (invalidate_loc_cache) is called
+        # by model_runner once per forward to prevent stale results across batches
+        # and by register_mapping when the mapping tensor is replaced.
         # In full CUDA-graph mode, Python does not re-run at replay; the gather
-        # CUDA kernel recorded at capture fires every replay, keeping the result
-        # tensor fresh without any Python involvement.
+        # CUDA kernel recorded at capture fires every replay.
         self._cached_swa_loc: Optional[torch.Tensor] = None
-        self._cached_kv_ref: Optional[torch.Tensor] = None
+        self._cached_loc_key: Optional[tuple] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -111,6 +112,16 @@ class SWAKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.invalidate_loc_cache()  # mapping replaced; discard any cached translation
+
+    def invalidate_loc_cache(self) -> None:
+        """Invalidate the translate_loc_from_full_to_swa cache.
+
+        Call once per forward pass from model_runner before attention forward.
+        Also called automatically by register_mapping when the mapping changes.
+        """
+        self._cached_swa_loc = None
+        self._cached_loc_key = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         # Wait happens at this wrapper. Inner pools must not wait again.
@@ -170,16 +181,18 @@ class SWAKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
-        # Cache on object identity: all N SWA layers in one forward receive the
-        # same ForwardBatch.out_cache_loc Python object, so only the first layer
-        # triggers a gather; the rest are O(1) cache hits.
+        # Key on (storage_ptr, numel): views of the same parent share storage, so
+        # out_cache_loc[:real_n] from different layers all hit the same entry.
+        # invalidate_loc_cache() is called at the start of every forward pass to
+        # prevent stale results when a new batch allocates the same storage block.
         # Note: kv_indices could have -1 values (from alloc_extend), which will
         # be mapped to -1 since the last item of full_to_swa_index_mapping is -1.
-        if self._cached_kv_ref is not kv_indices:
+        key = (kv_indices.untyped_storage().data_ptr(), kv_indices.numel())
+        if key != self._cached_loc_key:
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
             )
-            self._cached_kv_ref = kv_indices
+            self._cached_loc_key = key
         return self._cached_swa_loc
 
     def set_kv_buffer(

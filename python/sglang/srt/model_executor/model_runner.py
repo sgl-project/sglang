@@ -3244,6 +3244,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
+        # Invalidate SWA loc translation cache so the first translate call in this
+        # forward computes fresh results. Called here once per batch to close the
+        # allocator-address-reuse window between batches.
+        if self.is_hybrid_swa:
+            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                self.token_to_kv_pool.invalidate_loc_cache()
+
         # Hisparse coordinator
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
