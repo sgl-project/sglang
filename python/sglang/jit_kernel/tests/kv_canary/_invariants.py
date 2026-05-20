@@ -356,19 +356,19 @@ def assert_slot_minus_one_skipped(
 
 def assert_pseudo_violation_only_on_mismatch(
     *,
-    pseudo_mode: consts.CanaryPseudoMode,
+    enable_write_verify_inputs: bool,
     log_before: FakeViolationLog,
     log_after: FakeViolationLog,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     plan: WritePlan,
 ) -> None:
     delta = int(log_after.write_index[0].item()) - int(log_before.write_index[0].item())
-    if pseudo_mode == consts.CanaryPseudoMode.OFF:
-        assert delta == 0, f"pseudo_mode=OFF must produce no violations, got {delta}"
+    if enable_write_verify_inputs == False:
+        assert delta == 0, f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
         return
     n_active = int(plan.write_num_valid_reqs[0].item())
     if n_active == 0:
@@ -377,8 +377,8 @@ def assert_pseudo_violation_only_on_mismatch(
     total = int(plan.write_offsets[n_active].item())
     tok = fb_input_ids[:total].detach().cpu().tolist()
     pos = fb_positions[:total].detach().cpu().tolist()
-    exp_tok = pseudo_expected_tokens[:total].detach().cpu().tolist()
-    exp_pos = pseudo_expected_positions[:total].detach().cpu().tolist()
+    exp_tok = expected_input_tokens[:total].detach().cpu().tolist()
+    exp_pos = expected_input_positions[:total].detach().cpu().tolist()
     slots_cpu = fb_out_cache_loc[:total].detach().cpu().tolist()
     mismatch_entries = sum(
         1
@@ -389,7 +389,7 @@ def assert_pseudo_violation_only_on_mismatch(
     if no_mismatch:
         assert (
             delta == 0
-        ), f"pseudo_mode=ON with no mismatch produced {delta} violations"
+        ), f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
 
 
 def assert_write_slot_run_counter_incremented(
@@ -434,9 +434,9 @@ def assert_all_write_invariants(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: Optional[torch.Tensor],
-    pseudo_expected_positions: Optional[torch.Tensor],
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: Optional[torch.Tensor],
+    expected_input_positions: Optional[torch.Tensor],
     log_before: FakeViolationLog,
     log_after: FakeViolationLog,
 ) -> None:
@@ -454,28 +454,28 @@ def assert_all_write_invariants(
         fb_out_cache_loc=fb_out_cache_loc,
     )
     if (
-        pseudo_mode == consts.CanaryPseudoMode.ON
-        and pseudo_expected_tokens is not None
-        and pseudo_expected_positions is not None
+        enable_write_verify_inputs == True
+        and expected_input_tokens is not None
+        and expected_input_positions is not None
     ):
         assert_pseudo_violation_only_on_mismatch(
-            pseudo_mode=pseudo_mode,
+            enable_write_verify_inputs=enable_write_verify_inputs,
             log_before=log_before,
             log_after=log_after,
-            pseudo_expected_tokens=pseudo_expected_tokens,
-            pseudo_expected_positions=pseudo_expected_positions,
+            expected_input_tokens=expected_input_tokens,
+            expected_input_positions=expected_input_positions,
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,
             plan=plan,
         )
-    elif pseudo_mode == consts.CanaryPseudoMode.OFF:
+    elif enable_write_verify_inputs == False:
         assert_pseudo_violation_only_on_mismatch(
-            pseudo_mode=pseudo_mode,
+            enable_write_verify_inputs=enable_write_verify_inputs,
             log_before=log_before,
             log_after=log_after,
-            pseudo_expected_tokens=fb_input_ids,
-            pseudo_expected_positions=fb_positions,
+            expected_input_tokens=fb_input_ids,
+            expected_input_positions=fb_positions,
             fb_input_ids=fb_input_ids,
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc,

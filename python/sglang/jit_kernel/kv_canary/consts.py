@@ -49,11 +49,6 @@ class RealKvHashMode(IntEnum):
     ALL = 2
 
 
-class CanaryPseudoMode(IntEnum):
-    OFF = 0
-    ON = 1
-
-
 _U64_MASK: int = (1 << 64) - 1
 
 

@@ -81,9 +81,9 @@ def canary_write_step(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: consts.CanaryPseudoMode,
-    pseudo_expected_tokens: torch.Tensor,
-    pseudo_expected_positions: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -111,11 +111,12 @@ def canary_write_step(
     ``running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)``. ``write_seed_slot_indices`` is already
     SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (no runtime seed).
 
-    Pseudo-mode (caller-driven, kernel is oracle-agnostic): when ``pseudo_mode == ON`` the kernel additionally
-    compares ``fb_input_ids[i]`` against ``pseudo_expected_tokens[i]`` and ``fb_positions[i]`` against
-    ``pseudo_expected_positions[i]``; mismatch on either field records a violation. The chain still advances on
-    the actual values (not the expected ones) so a downstream verify won't cascade. Whoever produced the pseudo
-    inputs is responsible for filling these expected tensors; the kernel runs no oracle internally.
+    Write-time input verification (caller-driven, kernel is oracle-agnostic): when
+    ``enable_write_verify_inputs`` is True the kernel additionally compares ``fb_input_ids[i]`` against
+    ``expected_input_tokens[i]`` and ``fb_positions[i]`` against ``expected_input_positions[i]``; mismatch
+    on either field records a violation. The chain still advances on the actual values (not the expected
+    ones) so a downstream verify won't cascade. Whoever produced the expected tensors is responsible for
+    filling them; the kernel runs no oracle internally.
 
     Write only writes canary_buf (reads only at seed slots). Block uses no shared memory.
 
@@ -136,14 +137,15 @@ def canary_write_step(
             The kernel does not consult any LUT.
         kernel_kind: CanaryLaunchTag stamped into violation rows (see canary_verify_step). Sweep callers do not
             invoke this kernel.
-        pseudo_mode: CanaryPseudoMode toggle. OFF = real-mode, pseudo_expected_* tensors ignored. ON = compare
+        enable_write_verify_inputs: bool toggle. False = expected_input_* tensors ignored. True = compare
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
-        pseudo_expected_tokens: Expected token id per write entry, shape [num_tokens_padded], int32. Only read
-            when pseudo_mode == ON; may be uninitialized / cuda-graph dummy when OFF. Layout mirrors fb_input_ids
-            (flattened across reqs in plan.write_offsets order); padding tail is ignored. Filled by the caller
-            from whichever oracle drives the pseudo input — the kernel knows no oracle.
-        pseudo_expected_positions: Expected position per write entry, shape [num_tokens_padded], int32. Same
-            shape/layout/lifetime rules as pseudo_expected_tokens.
+        expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int32. Only read
+            when enable_write_verify_inputs is True; may be uninitialized / cuda-graph dummy when False.
+            Layout mirrors fb_input_ids (flattened across reqs in plan.write_offsets order); padding tail
+            is ignored. Filled by the caller from whichever oracle produces expected inputs — the kernel
+            knows no oracle.
+        expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int32. Same
+            shape/layout/lifetime rules as expected_input_tokens.
         violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared with
             verify launches.
         violation_write_index: Global monotonic violation counter, shape [1], int32.
@@ -170,8 +172,8 @@ def canary_write_step(
               token = fb_input_ids[i]; position = fb_positions[i];
               real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
-              if pseudo_mode == ON:
-                  if token != pseudo_expected_tokens[i] or position != pseudo_expected_positions[i]:
+              if enable_write_verify_inputs:
+                  if token != expected_input_tokens[i] or position != expected_input_positions[i]:
                       record_violation();  // chain still advances on the ACTUAL (token, position) below
               store (token, position, running_prev_hash, real_kv_hash) to canary_buf[slot] as 4 int64 fields;
               running_prev_hash = splitmix64_mix4(running_prev_hash, token, position, real_kv_hash);
@@ -183,7 +185,7 @@ def canary_write_step(
 
     Calling contract:
         - Pure side-effect; never raises.
-        - Pseudo-mode mismatch records violations but does NOT abort the chain.
+        - Input-verification mismatch records violations but does NOT abort the chain.
         - kernel_run_counter is bumped every call.
         - Safe in cuda-graph capture; caller refills fb_input_ids / fb_positions / fb_out_cache_loc / plan
           in-place before replay.
@@ -205,8 +207,8 @@ def canary_write_step(
     _assert_contiguous(fb_input_ids, "fb_input_ids")
     _assert_contiguous(fb_positions, "fb_positions")
     _assert_contiguous(fb_out_cache_loc, "fb_out_cache_loc")
-    _assert_contiguous(pseudo_expected_tokens, "pseudo_expected_tokens")
-    _assert_contiguous(pseudo_expected_positions, "pseudo_expected_positions")
+    _assert_contiguous(expected_input_tokens, "expected_input_tokens")
+    _assert_contiguous(expected_input_positions, "expected_input_positions")
     _assert_contiguous(violation_ring, "violation_ring")
     _assert_contiguous(violation_write_index, "violation_write_index")
     _assert_contiguous(slot_run_counter, "slot_run_counter")
@@ -226,9 +228,9 @@ def canary_write_step(
         fb_positions,
         fb_out_cache_loc,
         int(kernel_kind),
-        int(pseudo_mode),
-        pseudo_expected_tokens,
-        pseudo_expected_positions,
+        int(enable_write_verify_inputs),
+        expected_input_tokens,
+        expected_input_positions,
         violation_ring,
         violation_write_index,
         slot_run_counter,

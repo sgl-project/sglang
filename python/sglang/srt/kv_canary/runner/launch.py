@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
 )
@@ -61,7 +60,7 @@ def launch_endpoints_per_forward(
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
-    input_check_mode: CanaryInputCheckMode,
+    input_check_mode: bool,
 ) -> None:
     positions = forward_batch.positions
     if positions.dtype != torch.int32:

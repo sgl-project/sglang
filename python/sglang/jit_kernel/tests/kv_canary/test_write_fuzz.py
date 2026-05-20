@@ -48,9 +48,9 @@ class WriteFuzzInputs:
     fb_positions: torch.Tensor
     fb_out_cache_loc: torch.Tensor
     kernel_kind: CanaryLaunchTag
-    pseudo_mode: consts.CanaryPseudoMode
-    pseudo_expected_tokens: torch.Tensor
-    pseudo_expected_positions: torch.Tensor
+    enable_write_verify_inputs: bool
+    expected_input_tokens: torch.Tensor
+    expected_input_positions: torch.Tensor
     real_kv_sources_cuda: tuple[RealKvSource, ...]
     real_kv_sources_ref: tuple[RealKvSource, ...]
     real_kv_hash_mode: consts.RealKvHashMode
@@ -58,7 +58,7 @@ class WriteFuzzInputs:
 
 
 def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
-    pseudo_mode = rng.choice([consts.CanaryPseudoMode.OFF, consts.CanaryPseudoMode.ON])
+    enable_write_verify_inputs = rng.choice([False, True])
     hash_mode = rng.choice(
         [
             consts.RealKvHashMode.OFF,
@@ -142,8 +142,8 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     fb_out_cache_loc = torch.tensor(
         out_cache_loc_list, dtype=torch.int32, device=_DEVICE
     )
-    pseudo_expected_tokens = fb_input_ids.clone()
-    pseudo_expected_positions = fb_positions.clone()
+    expected_input_tokens = fb_input_ids.clone()
+    expected_input_positions = fb_positions.clone()
 
     return WriteFuzzInputs(
         cuda_canary_buf=cuda_buf,
@@ -154,9 +154,9 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=kernel_kind,
-        pseudo_mode=pseudo_mode,
-        pseudo_expected_tokens=pseudo_expected_tokens,
-        pseudo_expected_positions=pseudo_expected_positions,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
         real_kv_hash_mode=hash_mode,
@@ -179,9 +179,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         fb_input_ids=inputs.fb_input_ids,
         fb_positions=inputs.fb_positions,
         fb_out_cache_loc=inputs.fb_out_cache_loc,
-        pseudo_mode=inputs.pseudo_mode,
-        pseudo_expected_tokens=inputs.pseudo_expected_tokens,
-        pseudo_expected_positions=inputs.pseudo_expected_positions,
+        enable_write_verify_inputs=inputs.enable_write_verify_inputs,
+        expected_input_tokens=inputs.expected_input_tokens,
+        expected_input_positions=inputs.expected_input_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
         real_kv_sources_cuda=inputs.real_kv_sources_cuda,
@@ -206,9 +206,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         fb_input_ids=inputs.fb_input_ids,
         fb_positions=inputs.fb_positions,
         fb_out_cache_loc=inputs.fb_out_cache_loc,
-        pseudo_mode=inputs.pseudo_mode,
-        pseudo_expected_tokens=inputs.pseudo_expected_tokens,
-        pseudo_expected_positions=inputs.pseudo_expected_positions,
+        enable_write_verify_inputs=inputs.enable_write_verify_inputs,
+        expected_input_tokens=inputs.expected_input_tokens,
+        expected_input_positions=inputs.expected_input_positions,
         log_before=log_before,
         log_after=cuda_log,
     )
@@ -219,7 +219,7 @@ def _summarize(inputs: WriteFuzzInputs) -> str:
     total = int(inputs.plan_cuda.write_offsets[n_active].item())
     return (
         f"n_reqs={n_active} total_tokens={total} kind={inputs.kernel_kind.name} "
-        f"pseudo={inputs.pseudo_mode.name} hash_mode={inputs.real_kv_hash_mode.name} "
+        f"pseudo={inputs.enable_write_verify_inputs.name} hash_mode={inputs.real_kv_hash_mode.name} "
         f"sources={len(inputs.real_kv_sources_cuda)}"
     )
 

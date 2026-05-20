@@ -328,7 +328,7 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
     assert int(ref_log.write_index[0].item()) == 0
 
 
-def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
+def test_disabled_input_verify_does_not_deref_expected_inputs() -> None:
     cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
     ref_buf = cuda_buf.clone()
 
@@ -359,9 +359,9 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=garbage_expected_tokens,
-        pseudo_expected_positions=garbage_expected_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=garbage_expected_tokens,
+        expected_input_positions=garbage_expected_positions,
         violation_ring=cuda_log.ring,
         violation_write_index=cuda_log.write_index,
         slot_run_counter=cuda_log.slot_run_counter,
@@ -376,9 +376,9 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=consts.CanaryPseudoMode.OFF,
-        pseudo_expected_tokens=garbage_expected_tokens,
-        pseudo_expected_positions=garbage_expected_positions,
+        enable_write_verify_inputs=False,
+        expected_input_tokens=garbage_expected_tokens,
+        expected_input_positions=garbage_expected_positions,
         violation_ring=ref_log.ring,
         violation_write_index=ref_log.write_index,
         slot_run_counter=ref_log.slot_run_counter,

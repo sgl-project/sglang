@@ -37,9 +37,9 @@ struct WriteKernelParams {
   const int32_t* fb_out_cache_loc;
 
   // Pseudo-mode oracle inputs.
-  CanaryPseudoMode pseudo_mode;
-  const int32_t* pseudo_expected_tokens;
-  const int32_t* pseudo_expected_positions;
+  bool enable_write_verify_inputs;
+  const int32_t* expected_input_tokens;
+  const int32_t* expected_input_positions;
 
   // Violation sink (ring + write_index + capacity + kernel_kind bundled in canary_common.cuh).
   ViolationSink violation_sink;
@@ -96,11 +96,12 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
 
-    // Pseudo-mode comparison. Mismatch records a single violation row carrying both bits OR'd together;
-    // chain still advances on the actual (token, position) below so a downstream verify won't cascade.
-    if (p.pseudo_mode == CanaryPseudoMode::kOn) {
-      const int64_t expected_token = static_cast<int64_t>(p.pseudo_expected_tokens[fb_idx]);
-      const int64_t expected_position = static_cast<int64_t>(p.pseudo_expected_positions[fb_idx]);
+    // Write-time input verification: compare actual (token, position) against caller-supplied expected
+    // values; mismatch records a single violation row carrying both bits OR'd together. Chain still
+    // advances on the actual (token, position) below so a downstream verify won't cascade.
+    if (p.enable_write_verify_inputs) {
+      const int64_t expected_token = static_cast<int64_t>(p.expected_input_tokens[fb_idx]);
+      const int64_t expected_position = static_cast<int64_t>(p.expected_input_positions[fb_idx]);
       FailReason mismatch_bits{};
       if (token != expected_token) {
         mismatch_bits |= FailReason::kWriteTokenMismatch;
@@ -161,9 +162,9 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView fb_positions,
     tvm::ffi::TensorView fb_out_cache_loc,
     int64_t kernel_kind,
-    int64_t pseudo_mode,
-    tvm::ffi::TensorView pseudo_expected_tokens,
-    tvm::ffi::TensorView pseudo_expected_positions,
+    int64_t enable_write_verify_inputs,
+    tvm::ffi::TensorView expected_input_tokens,
+    tvm::ffi::TensorView expected_input_positions,
     tvm::ffi::TensorView violation_ring,
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
@@ -199,8 +200,8 @@ inline void canary_write_step_cuda(
       .verify(fb_input_ids)
       .verify(fb_positions)
       .verify(fb_out_cache_loc)
-      .verify(pseudo_expected_tokens)
-      .verify(pseudo_expected_positions);
+      .verify(expected_input_tokens)
+      .verify(expected_input_positions);
 
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(violation_write_index);
   SymbolicSize N_ring = {"ring_capacity"};
@@ -277,9 +278,9 @@ inline void canary_write_step_cuda(
   p.fb_input_ids = static_cast<const int32_t*>(fb_input_ids.data_ptr());
   p.fb_positions = static_cast<const int32_t*>(fb_positions.data_ptr());
   p.fb_out_cache_loc = static_cast<const int32_t*>(fb_out_cache_loc.data_ptr());
-  p.pseudo_mode = static_cast<CanaryPseudoMode>(pseudo_mode);
-  p.pseudo_expected_tokens = static_cast<const int32_t*>(pseudo_expected_tokens.data_ptr());
-  p.pseudo_expected_positions = static_cast<const int32_t*>(pseudo_expected_positions.data_ptr());
+  p.enable_write_verify_inputs = (enable_write_verify_inputs != 0);
+  p.expected_input_tokens = static_cast<const int32_t*>(expected_input_tokens.data_ptr());
+  p.expected_input_positions = static_cast<const int32_t*>(expected_input_positions.data_ptr());
   p.violation_sink.ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_sink.write_index = static_cast<int32_t*>(violation_write_index.data_ptr());
   p.violation_sink.ring_capacity = ring_capacity;

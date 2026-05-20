@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
 )
@@ -69,7 +68,7 @@ class CanaryEndpoint:
         fb_input_ids: torch.Tensor,
         fb_positions: torch.Tensor,
         fb_out_cache_loc: torch.Tensor,
-        input_check_mode: CanaryInputCheckMode,
+        input_check_mode: bool,
         expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
@@ -112,9 +111,9 @@ class CanaryEndpoint:
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
-            pseudo_mode=input_check_mode,
-            pseudo_expected_tokens=expected_inputs.tokens,
-            pseudo_expected_positions=expected_inputs.positions,
+            enable_write_verify_inputs=input_check_mode,
+            expected_input_tokens=expected_inputs.tokens,
+            expected_input_positions=expected_inputs.positions,
             violation_ring=violation_log.violation_ring,
             violation_write_index=violation_log.violation_write_index,
             slot_run_counter=self.slot_run_counter_view,

@@ -50,11 +50,6 @@ enum class RealKvHashMode : int32_t {
   kAll = 2,
 };
 
-enum class CanaryPseudoMode : int32_t {
-  kOff = 0,
-  kOn = 1,
-};
-
 constexpr int kMaxRealKvSources = 4;
 
 constexpr int kRealKvSourceFieldsPerEntry = 3;

@@ -13,7 +13,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvHashMode,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
@@ -64,7 +64,7 @@ def _make_kernel_args(device):
         fb_input_ids=torch.zeros(1, dtype=torch.int32, device=device),
         fb_positions=torch.zeros(1, dtype=torch.int32, device=device),
         fb_out_cache_loc=torch.zeros(1, dtype=torch.int32, device=device),
-        input_check_mode=CanaryPseudoMode.OFF,
+        input_check_mode=False,
         expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
         real_kv_hash_mode=RealKvHashMode.OFF,
     )

@@ -178,7 +178,7 @@ class CanaryRunner:
 
     def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
         """Bind the TokenOracleManager returned by install_oracle_sampler so the per-forward
-        input-check path (input_check_mode == ON) can fill expected_input_* tensors from the
+        input-check path (input_check_mode is True) can fill expected_input_* tensors from the
         same oracle that drives sampling.
         """
         self._per_forward_orchestrator.attach_token_oracle_manager(manager)
