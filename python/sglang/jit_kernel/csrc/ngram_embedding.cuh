@@ -126,9 +126,9 @@ __global__ void UpdateTokenTableKernel(
 
 __global__ void UpdateTokenTableDecodeKernel(
     int batch_size,
-    const int* __restrict__ tokens,          // [batch_size]
-    int* __restrict__ ne_token_table,        // [max_running_reqs, max_context_len]
-    int max_context_len,                     // max_context_len
+    const int* __restrict__ tokens,           // [batch_size]
+    int* __restrict__ ne_token_table,         // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
     const int64_t* __restrict__ row_indices,  // [batch_size]
     const int* __restrict__ column_starts     // [batch_size]
 ) {
@@ -349,8 +349,7 @@ struct NgramEmbeddingKernel {
 
     constexpr int kBlockSize = device::ngram_embedding::kDecodeBlockSize;
     const int grid_size = std::min(
-        device::ngram_embedding::kMaxUpdateTokenTableDecodeBlocks,
-        static_cast<int>(host::div_ceil(bs, kBlockSize)));
+        device::ngram_embedding::kMaxUpdateTokenTableDecodeBlocks, static_cast<int>(host::div_ceil(bs, kBlockSize)));
 
     LaunchKernel(grid_size, kBlockSize, stream)(
         device::ngram_embedding::UpdateTokenTableDecodeKernel,
