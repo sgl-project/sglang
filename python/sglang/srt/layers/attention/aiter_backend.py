@@ -2331,6 +2331,7 @@ class AiterAttnBackend(AttentionBackend):
     ):
         self.logits_soft_cap = layer.logit_cap
 
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -2380,10 +2381,22 @@ class AiterAttnBackend(AttentionBackend):
                         v_scale=v_descale,
                     )
                 elif self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        loc_swa=cache_loc_swa,
+                    )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_descale, v_descale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        k_descale,
+                        v_descale,
+                        loc_swa=cache_loc_swa,
                     )
 
         if self.use_mla:
@@ -2783,6 +2796,7 @@ class AiterAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         k_descale = None
@@ -2837,7 +2851,11 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    loc_swa=cache_loc_swa,
                 )
 
         if self.use_mla:

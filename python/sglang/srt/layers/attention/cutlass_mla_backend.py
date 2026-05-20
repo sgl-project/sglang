@@ -236,6 +236,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         if k is not None:
             assert v is not None
@@ -253,6 +254,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                         cache_loc,
                         k,
                         v,
+                        loc_swa=cache_loc_swa,
                     )
 
         # Reshape inputs

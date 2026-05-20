@@ -248,7 +248,7 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
+                torch.zeros((self.max_num_tokens,), dtype=self._cache_loc_dtype())
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -806,9 +806,6 @@ class PiecewiseCudaGraphRunner:
                 or forward_batch.return_pooled_hidden_states
             ),
         )
-
-        if out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 
