@@ -1425,3 +1425,80 @@ def test_real_kv_hash_all_mode_writes_expected_hash_hardcoded(hardcoded: bool) -
     assert stored_real_kv_hash == to_signed_int64(_EXPECTED_HASH), (
         f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(_EXPECTED_HASH):#x}"
     )
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_seed_slot_resume_5_step_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    cuda_buf = make_canary_buf(num_slots=50, slot_stride_bytes=32, device=_DEVICE)
+    ref_buf = cuda_buf.clone()
+
+    seed_token = 7
+    seed_position = 10
+    seed_prev_hash_signed = to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=42,
+            token=seed_token,
+            position=seed_position,
+            prev_hash=seed_prev_hash_signed,
+            real_kv_hash=0,
+        )
+
+    predecessor_advance = splitmix64_mix4(splitmix64(CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0)
+
+    tokens = [101, 202, 303, 404, 505]
+    positions = [11, 12, 13, 14, 15]
+    real_kv = [0, 0, 0, 0, 0]
+    out_cache_loc = [0, 1, 2, 3, 4]
+
+    expected_prev_hashes: list[int] = []
+    running = predecessor_advance
+    for t, p, r in zip(tokens, positions, real_kv):
+        expected_prev_hashes.append(running)
+        running = splitmix64_mix4(running, t, p, r)
+
+    plan_cuda = make_write_plan(
+        write_offsets=[0, 5], seed_slot_indices=[42], num_valid_reqs=1, device=_DEVICE
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, 5], seed_slot_indices=[42], num_valid_reqs=1, device=_DEVICE
+    )
+    fb_input_ids = torch.tensor(tokens, dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor(out_cache_loc, dtype=torch.int32, device=_DEVICE)
+    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both_and_assert_buf_and_state_equal(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+    for slot_idx, expected_token, expected_position, expected_prev_u64 in zip(
+        out_cache_loc, tokens, positions, expected_prev_hashes
+    ):
+        stored_token, stored_position, stored_prev_hash, stored_real_kv_hash = (
+            read_slot_fields(canary_buf=cuda_buf, slot_idx=slot_idx)
+        )
+        assert stored_token == expected_token
+        assert stored_position == expected_position
+        assert stored_prev_hash == to_signed_int64(expected_prev_u64)
+        assert stored_real_kv_hash == 0
+
+    assert int(cuda_log.write_index[0].item()) == 0
