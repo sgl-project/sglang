@@ -115,7 +115,7 @@ class SteppableEngine:
             token_ids_logprob=[],
             stream=False,
         )
-        self._engine.tokenizer_manager.send_to_scheduler.send_pyobj(req)
+        self._engine.tokenizer_manager._send_one_request(req)
         return SteppableReqHandle(
             rid=rid,
             prompt_len=len(prompt),
