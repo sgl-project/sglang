@@ -143,7 +143,9 @@ class PartitionAssignment:
 def get_case_est_time(case_id: str) -> float:
     scenario = BASELINE_CONFIG.scenarios.get(case_id)
     if scenario is None:
-        return DEFAULT_EST_TIME_SECONDS
+        return BASELINE_CONFIG.partition_estimates_s.get(
+            case_id, DEFAULT_EST_TIME_SECONDS
+        )
     if scenario.estimated_full_test_time_s is not None:
         return scenario.estimated_full_test_time_s
     return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
