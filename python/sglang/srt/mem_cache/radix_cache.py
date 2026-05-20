@@ -77,7 +77,7 @@ class RadixKey:
     ):
         # TODO(Jialin): clean up callers that still pass list[int] to
         # RadixKey, then drop this coercion eventually.
-        self.token_ids: array = (
+        self.token_ids: array[int] = (
             token_ids if isinstance(token_ids, array) else array("q", token_ids)
         )
         # extra key (e.g. lora_id, cache_salt)

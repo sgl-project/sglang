@@ -557,7 +557,7 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
-            input_ids_list: List[array] = []
+            input_ids_list: List[array[int]] = []
             for i in range(128):
                 chunk_size = int(
                     self.chunked_prefill_size * 1.25

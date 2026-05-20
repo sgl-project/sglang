@@ -74,7 +74,9 @@ class LlavaBaseForCausalLM(nn.Module):
             return "pad"
         return "anyres"
 
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: array[int], image_inputs: MultimodalInputs
+    ) -> array[int]:
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
         )
