@@ -61,9 +61,7 @@ def test_fp32_layernorm_cache_invalidates_on_param_update():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fp32_layernorm_grad_mode_preserves_autograd_path():
     norm = FP32LayerNorm(16, eps=1e-5).cuda().to(torch.bfloat16)
-    inputs = torch.randn(
-        4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True
-    )
+    inputs = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
     output = norm(inputs).float().sum()
     output.backward()
