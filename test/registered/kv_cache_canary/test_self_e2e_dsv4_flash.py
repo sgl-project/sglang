@@ -19,7 +19,7 @@ from typing import ClassVar, List
 from sglang.test.canary_e2e_base import CanaryE2EBase
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=1200, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1200, stage="extra-a", runner_config="dsv4-8-gpu-h200")
 
 
 _DSV4_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
@@ -48,13 +48,15 @@ _DSV4_BASE_ARGS: List[str] = [
     "marlin",
     "--watchdog-timeout",
     "900",
-    # Real DSV4-Flash safetensor is ~149GB; even with 5-layer override sglang
-    # still pre-allocates KV cache against the configured mem fraction. Cap it
-    # so the loader has headroom and avoids SIGKILL on H200 (141GB HBM).
+    # DSV4-Flash has 256+ MoE experts/layer; even 5 layers + real weights blow
+    # a single H200's HBM. Cookbook recipe is TP=4. Run TP=4 here too (the
+    # sci-h200 runner has 8x H200; canary just claims 4 of them).
+    "--tp",
+    "4",
     "--mem-fraction-static",
-    "0.5",
+    "0.6",
     "--max-running-requests",
-    "16",
+    "32",
 ]
 _PER_CASE_TIMEOUT = 300.0
 
