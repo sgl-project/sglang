@@ -879,7 +879,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 for module_name, lora_layers_dict in target_modules:
                     effective_merge_weights = merge_weights_by_module[module_name]
                     count = None
-                    if not effective_merge_weights:
+                    if not effective_merge_weights and not adapter_updated:
                         count = self._reactivate_cached_dynamic_lora_layers(
                             lora_layers_dict,
                             tgt_nicknames,
