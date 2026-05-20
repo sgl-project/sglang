@@ -26,6 +26,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_GPU_HEALTH_SNAPSHOT: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
