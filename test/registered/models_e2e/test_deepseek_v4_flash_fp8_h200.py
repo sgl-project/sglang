@@ -9,12 +9,11 @@ Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP
 """
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -29,8 +28,14 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP8H200(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
+
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -76,20 +81,6 @@ class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(f"[DSV4 Flash FP4 Marlin H200] GSM8K {metrics=}")
-        self.assertGreater(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":

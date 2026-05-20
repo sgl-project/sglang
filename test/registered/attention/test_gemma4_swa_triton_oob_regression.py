@@ -38,7 +38,7 @@ CONCURRENCY = 128
 MAX_TOKENS = 256
 
 
-class TestGemma4MoeDeterministic(CustomTestCase):
+class TestGemma4SwaTritonOobRegression(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "google/gemma-4-26B-A4B-it"
