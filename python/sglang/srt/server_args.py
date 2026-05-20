@@ -4187,7 +4187,7 @@ class ServerArgs:
         else:
             try:
                 json_mapping = parse_json_mapping(device_str)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 json_mapping = None
 
         # Strip whitespace from device names
