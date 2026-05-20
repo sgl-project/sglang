@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
@@ -21,7 +23,7 @@ if _is_cuda or _is_hip or _is_musa:
 
 
 def apply_eagle_prefill_input_rotation(
-    batch: "ScheduleBatch", next_token_ids: torch.Tensor
+    batch: ScheduleBatch, next_token_ids: torch.Tensor
 ) -> None:
     """EAGLE input rotation for draft prefill.
 
