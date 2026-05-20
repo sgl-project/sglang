@@ -152,106 +152,6 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
-def remap_compressed_phys_to_workspace(
-    phys_indices: torch.Tensor,
-    page_table: torch.Tensor,
-    c_page_size: int,
-) -> torch.Tensor:
-    """Remap per-query physical compressed-cache slot ids to the request-local
-    positional workspace.
-
-    The C4 indexer emits ``phys_id = page_table[q, block_in_seq] * c_page_size
-    + in_page`` for each (query, topk-slot) pair. The flat workspace from
-    ``dequantize_k_cache_paged`` lays the request's compressed-cache prefix
-    out positionally as ``[block_in_seq * c_page_size + in_page]_{block,in_page}``,
-    so the workspace position for a given phys_id is ``block_in_seq * c_page_size
-    + in_page``. Recovering ``block_in_seq`` requires an argmax-equality lookup
-    in ``page_table[q, :max_blocks]``.
-
-    Args:
-        phys_indices: (num_qo_tokens, topk) int32. Physical compressed-cache
-            token ids; -1 sentinels for invalid slots.
-        page_table: (num_qo_tokens, max_blocks) int32. Per-query page list
-            in the compressed-cache pool (rows that share a request are
-            duplicates).
-        c_page_size: tokens per page in the compressed cache (e.g. 32 for c4).
-
-    Returns:
-        (num_qo_tokens, topk) int32. Request-local workspace positions, with
-        -1 for invalid input slots and for phys_ids whose page is not in the
-        request's page_table (should not happen in practice).
-    """
-    assert phys_indices.dtype == torch.int32
-    assert page_table.dtype == torch.int32
-    assert phys_indices.is_contiguous()
-    assert page_table.is_contiguous()
-
-    num_qo_tokens, topk = phys_indices.shape
-    max_blocks = page_table.shape[-1]
-    out = torch.empty_like(phys_indices)
-
-    BLOCK_J = max(triton.next_power_of_2(topk), 16)
-    MAX_BLOCKS_POW2 = triton.next_power_of_2(max_blocks)
-    _remap_compressed_phys_kernel[(num_qo_tokens,)](
-        out,
-        out.stride(0),
-        phys_indices,
-        phys_indices.stride(0),
-        page_table,
-        page_table.stride(0),
-        topk,
-        max_blocks,
-        BLOCK_J=BLOCK_J,
-        MAX_BLOCKS=MAX_BLOCKS_POW2,
-        C_PAGE_SIZE=c_page_size,
-    )
-    return out
-
-
-@triton.jit
-def _remap_compressed_phys_kernel(
-    out_ptr,
-    out_stride,
-    phys_ptr,
-    phys_stride,
-    page_table_ptr,
-    page_table_stride,
-    topk,
-    max_blocks,
-    BLOCK_J: tl.constexpr,
-    MAX_BLOCKS: tl.constexpr,
-    C_PAGE_SIZE: tl.constexpr,
-):
-    q = tl.program_id(0)
-
-    block_arange = tl.arange(0, MAX_BLOCKS)
-    block_mask = block_arange < max_blocks
-    page_table_q = tl.load(
-        page_table_ptr + q * page_table_stride + block_arange,
-        mask=block_mask,
-        other=-1,
-    )
-
-    j_offsets = tl.arange(0, BLOCK_J)
-    j_mask = j_offsets < topk
-    phys_ids = tl.load(phys_ptr + q * phys_stride + j_offsets, mask=j_mask, other=-1)
-    valid = phys_ids >= 0
-    page_ids = phys_ids // C_PAGE_SIZE
-    in_pages = phys_ids - page_ids * C_PAGE_SIZE
-
-    eq = page_ids[:, None] == page_table_q[None, :]
-    idx_plus1 = tl.where(eq, block_arange[None, :] + 1, 0).to(tl.int32)
-    block_plus1 = tl.max(idx_plus1, axis=1)
-    block_in_seq = block_plus1 - 1
-
-    workspace = tl.where(
-        valid & (block_in_seq >= 0),
-        block_in_seq * C_PAGE_SIZE + in_pages,
-        -1,
-    ).to(tl.int32)
-    tl.store(out_ptr + q * out_stride + j_offsets, workspace, mask=j_mask)
-
-
 def build_swa_token_ids(
     seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
@@ -647,17 +547,17 @@ class SparsePrefillChunkCache:
 
     def combine_c4_layer(
         self,
-        c4_sparse_page_indices: torch.Tensor,
-        page_table: torch.Tensor,
+        c4_sparse_raw_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-layer combine for c4: the indexer overwrites
-        ``c4_sparse_page_indices`` each c4 forward, so the workspace
-        ``topk_indices`` cannot be cached. Wraps ``remap + combine`` so the
-        backend mirrors the c128 / c0 access pattern (read-only on cache).
+        """Per-layer combine for c4. ``c4_sparse_raw_indices`` is the topk
+        kernel's positional output (``block_in_seq * c_page_size + in_page``)
+        — already in the request-local workspace coordinate that
+        ``combine_topk_swa_indices`` expects, so no remap is needed.
+
         Reuses preallocated ``c4_combined_indices`` / ``c4_combined_lens``
         buffers across layers — the kernel only overwrites the valid prefix.
         """
-        topk = c4_sparse_page_indices.shape[-1]
+        topk = c4_sparse_raw_indices.shape[-1]
         if self.c4_combined_indices is None:
             device = self.seq_lens.device
             self.c4_combined_indices = torch.full(
@@ -669,13 +569,8 @@ class SparsePrefillChunkCache:
             self.c4_combined_lens = torch.empty(
                 self.num_qo_tokens, dtype=torch.int32, device=device
             )
-        topk_indices = remap_compressed_phys_to_workspace(
-            phys_indices=c4_sparse_page_indices,
-            page_table=page_table,
-            c_page_size=self.c4_page_size,
-        )
         return combine_topk_swa_indices(
-            topk_indices=topk_indices,
+            topk_indices=c4_sparse_raw_indices,
             query_start_loc=self.query_start_loc,
             seq_lens=self.seq_lens,
             gather_lens=self.swa_gather_lens,
