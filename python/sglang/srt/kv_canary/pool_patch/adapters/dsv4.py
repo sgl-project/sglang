@@ -17,7 +17,9 @@ from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
 
 
 def _dsv4_packed_nope_rope_bytes_per_token(pool: object) -> int:
-    nbytes = pool.qk_nope_head_dim + pool.qk_rope_head_dim * pool.rope_storage_dtype.itemsize
+    nbytes = (
+        pool.qk_nope_head_dim + pool.qk_rope_head_dim * pool.rope_storage_dtype.itemsize
+    )
     assert nbytes == 576, f"unexpected DSv4 nope+rope width: {nbytes}"
     return nbytes
 
