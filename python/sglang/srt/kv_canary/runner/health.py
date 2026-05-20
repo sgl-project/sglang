@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.d2h_pipeline import CanaryD2HPipeline
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+from sglang.srt.kv_canary.violation_state import CanaryDeviceState, CanaryHostState
 
 logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
 
@@ -25,12 +25,14 @@ class HealthAndStats:
         config: CanaryConfig,
         device: torch.device,
         device_state: CanaryDeviceState,
+        host_state: CanaryHostState,
         active_tags: tuple[CanaryLaunchTag, ...],
         pump_and_allreduce: PumpAndAllreduce,
         sweep_orchestrator: SweepOrchestrator,
     ) -> None:
         self._config = config
         self._device_state = device_state
+        self._host_state = host_state
         self._active_tags = active_tags
         self._pump_and_allreduce = pump_and_allreduce
         self._sweep_orchestrator = sweep_orchestrator
@@ -49,9 +51,10 @@ class HealthAndStats:
             return
 
         device_state = self._device_state
+        host_state = self._host_state
         if self._previous_health_event is not None:
             CanaryD2HPipeline.wait(self._previous_health_event)
-            counters = device_state.kernel_run_counters_host.tolist()
+            counters = host_state.kernel_run_counters_host.tolist()
             zero_tags = [
                 tag for tag in self._active_tags if int(counters[tag.value]) == 0
             ]
@@ -63,7 +66,7 @@ class HealthAndStats:
                 )
 
         self._previous_health_event = self._d2h.stage(
-            dst_host=device_state.kernel_run_counters_host,
+            dst_host=host_state.kernel_run_counters_host,
             src_device=device_state.kernel_run_counters,
         )
 
@@ -76,14 +79,15 @@ class HealthAndStats:
             return
 
         device_state = self._device_state
+        host_state = self._host_state
         if (
             self._previous_stats_slot_sum_event is not None
             and self._previous_stats_write_index_event is not None
         ):
             CanaryD2HPipeline.wait(self._previous_stats_slot_sum_event)
             CanaryD2HPipeline.wait(self._previous_stats_write_index_event)
-            protected = int(device_state.slot_run_counters_sum_host.item())
-            violations = int(device_state.violation_write_index_host.item())
+            protected = int(host_state.slot_run_counters_sum_host.item())
+            violations = int(host_state.violation_write_index_host.item())
             active = len(self._active_tags)
             logger.info(
                 "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
@@ -98,10 +102,10 @@ class HealthAndStats:
 
         slot_sum_device = device_state.slot_run_counters.sum().view(1)
         self._previous_stats_slot_sum_event = self._d2h.stage(
-            dst_host=device_state.slot_run_counters_sum_host,
+            dst_host=host_state.slot_run_counters_sum_host,
             src_device=slot_sum_device,
         )
         self._previous_stats_write_index_event = self._d2h.stage(
-            dst_host=device_state.violation_write_index_host,
+            dst_host=host_state.violation_write_index_host,
             src_device=device_state.violation_log.violation_write_index,
         )
