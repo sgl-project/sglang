@@ -67,6 +67,7 @@ class PipelineStage(StageDedupMixin, ABC):
         self._profile_stage_name: str | None = None
         # Layerwise NVTX hooks; registered lazily via _apply_nvtx_gate.
         self._nvtx_hooks: DiffusionNvtxHooks | None = None
+        self._nvtx_registered_ids: frozenset[int] = frozenset()
         self._nvtx_zero_warned: bool = False
         self._current_use_nvtx: bool = False
 
@@ -212,7 +213,7 @@ class PipelineStage(StageDedupMixin, ABC):
         return []
 
     # ---- Layerwise NVTX instrumentation (--enable-layerwise-nvtx-marker) ----
-    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         """Modules to instrument with layerwise NVTX hooks; default none.
 
         Override in stages that own forward-able components. Each entry is
@@ -221,17 +222,29 @@ class PipelineStage(StageDedupMixin, ABC):
         return []
 
     def _maybe_register_nvtx_hooks(self) -> None:
-        """Idempotently attach hooks. No-op when the flag is off or no
-        modules are available yet (retries on the next call). The
-        zero-modules warning fires at most once per stage instance to
-        keep lazy-load paths from spamming logs."""
+        """Idempotently attach hooks; re-register when modules change.
+
+        Tracks the set of declared module identities and re-attaches when
+        it changes (lazy load, cache-dit wrap, hot swap), so hooks never
+        end up bound to an orphan module after the stage's underlying
+        components are rebound between calls. The zero-modules warning
+        fires at most once per stage instance.
+        """
         if not self.server_args.enable_layerwise_nvtx_marker:
             return
+        current = self.nvtx_hookable_modules()
+        current_ids = frozenset(id(m) for m, _ in current if m is not None)
         if self._nvtx_hooks is not None:
-            return
+            if current_ids == self._nvtx_registered_ids:
+                return
+            # Underlying modules changed identity — detach and re-register.
+            self._nvtx_hooks.remove_hooks()
+            self._nvtx_hooks = None
+            self._nvtx_registered_ids = frozenset()
+            self._nvtx_zero_warned = False
         hooks = DiffusionNvtxHooks()
         total = 0
-        for module, prefix in self._nvtx_hookable_modules():
+        for module, prefix in current:
             if module is None:
                 continue
             total += hooks.register_hooks(module, prefix=prefix)
@@ -249,6 +262,7 @@ class PipelineStage(StageDedupMixin, ABC):
             total,
         )
         self._nvtx_hooks = hooks
+        self._nvtx_registered_ids = current_ids
 
     def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
         """Register (if needed) and toggle hooks for this request.
@@ -280,6 +294,8 @@ class PipelineStage(StageDedupMixin, ABC):
         if self._nvtx_hooks is not None:
             self._nvtx_hooks.remove_hooks()
             self._nvtx_hooks = None
+        self._nvtx_registered_ids = frozenset()
+        self._nvtx_zero_warned = False
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property

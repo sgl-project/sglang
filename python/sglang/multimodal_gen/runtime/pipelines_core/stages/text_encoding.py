@@ -101,7 +101,7 @@ class TextEncodingStage(PipelineStage):
             for i in range(len(self.text_encoders))
         ]
 
-    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
         # Mirror ``component_uses`` naming so trace labels stay consistent.
         return [
             (enc, "text_encoder" if i == 0 else f"text_encoder_{i + 1}")
