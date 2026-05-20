@@ -12,12 +12,10 @@ from typing import ClassVar, Dict, Iterable, List, Optional
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
 register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 
@@ -64,9 +62,7 @@ def _send_parallel_requests(
             "sampling_params": {"max_new_tokens": max_new_tokens, "temperature": 0.0},
         }
         try:
-            resp = requests.post(
-                base_url + "/generate", json=payload, timeout=timeout
-            )
+            resp = requests.post(base_url + "/generate", json=payload, timeout=timeout)
             return {"index": i, "status_code": resp.status_code, "text": resp.text}
         except requests.exceptions.RequestException as exc:
             return {"index": i, "error": repr(exc)}
@@ -198,7 +194,9 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
 
 
-class TestPdTransferCorruptedByteDetected(PDDisaggregationServerBase, unittest.TestCase):
+class TestPdTransferCorruptedByteDetected(
+    PDDisaggregationServerBase, unittest.TestCase
+):
     """Inject byte corruption; canary sweep must report a violation."""
 
     model: ClassVar[str] = _MODEL
@@ -245,8 +243,6 @@ class TestPdTransferCorruptedByteDetected(PDDisaggregationServerBase, unittest.T
 
     @classmethod
     def start_prefill(cls) -> None:
-        from sglang.srt.environ import envs
-        from sglang.test.test_utils import is_in_ci
 
         prefill_args = [
             "--trust-remote-code",
@@ -298,12 +294,14 @@ class TestPdTransferCorruptedByteDetected(PDDisaggregationServerBase, unittest.T
         """Assert at least one canary sweep_ violation appears in captured server output."""
         if flush_wait_seconds > 0:
             time.sleep(flush_wait_seconds)
-        haystack = "".join([
-            self._prefill_stdout.getvalue(),
-            self._prefill_stderr.getvalue(),
-            self._decode_stdout.getvalue(),
-            self._decode_stderr.getvalue(),
-        ])
+        haystack = "".join(
+            [
+                self._prefill_stdout.getvalue(),
+                self._prefill_stderr.getvalue(),
+                self._decode_stdout.getvalue(),
+                self._decode_stderr.getvalue(),
+            ]
+        )
         prefixes = list(kind_prefixes)
         hits = [p for p in prefixes if f"canary_kind:       {p}" in haystack]
         if hits:
@@ -323,9 +321,7 @@ class TestPdTransferCorruptedByteDetected(PDDisaggregationServerBase, unittest.T
             return
 
         # Step 2: drive heavy traffic to maximize perturb trigger probability.
-        _send_parallel_requests(
-            self.lb_url, n=32, max_new_tokens=32, timeout=60.0
-        )
+        _send_parallel_requests(self.lb_url, n=32, max_new_tokens=32, timeout=60.0)
 
         # Step 3: assert that the sweep path caught a real-KV byte corruption.
         self._assert_sweep_violation_logged(["sweep_"], flush_wait_seconds=2.0)
