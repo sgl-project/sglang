@@ -3,15 +3,15 @@ name: Build DeepSeek V4 Nightly CUDA 13 Docker Image
 # NOTE:
 # - GitHub Actions schedule runs from the default branch workflow definition.
 # - This workflow should eventually live on ep_main/default-branch, but always
-#   checks out deepseek_v4 (or the manually selected ref) explicitly.
+#   checks out bytedance/deepseek_v4 (or the manually selected ref) explicitly.
 
 on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Git ref to build. Defaults to deepseek_v4."
+        description: "Git ref to build. Leave empty to use the default bytedance/deepseek_v4 branch."
         required: false
-        default: "deepseek_v4"
+        default: ""
       compile_kernel:
         description: "Build sgl-kernel from source before building the image"
         required: false
@@ -26,12 +26,27 @@ on:
     - cron: "0 18 * * *"
 
 concurrency:
-  group: release-docker-deepseek-v4-nightly-${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || 'deepseek_v4' }}
+  group: release-docker-deepseek-v4-nightly-${{ github.event_name == 'workflow_dispatch' && (inputs.target_ref || 'default-target-ref') || 'default-target-ref' }}
   cancel-in-progress: true
 
 jobs:
-  resolve-image-metadata:
+  resolve-target-ref:
     if: ${{ github.repository == 'bytedance-iaas/sglang' }}
+    runs-on: ubuntu-22.04
+    outputs:
+      target_ref: ${{ steps.resolve.outputs.target_ref }}
+    steps:
+      - name: Resolve target ref
+        id: resolve
+        run: |
+          set -euo pipefail
+          target_ref="${{ inputs.target_ref || 'bytedance/deepseek_v4' }}"
+          echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
+
+  resolve-image-metadata:
+    needs: [resolve-target-ref]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' }}
+    environment: prod
     runs-on: ubuntu-22.04
     outputs:
       image_repo: ${{ steps.resolve.outputs.image_repo }}
@@ -47,7 +62,7 @@ jobs:
       - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || 'deepseek_v4' }}
+          ref: ${{ needs.resolve-target-ref.outputs.target_ref }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -56,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          target_ref="${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || 'deepseek_v4' }}"
+          target_ref="${{ needs.resolve-target-ref.outputs.target_ref }}"
           image_repo="${IMAGE_REPO}"
           if [ -z "${image_repo}" ]; then
             if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
@@ -75,18 +90,49 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             tag_mode="nightly"
           fi
-          image_tag="$(python3 scripts/ci/get_volcengine_image_tag.py --mode "${tag_mode}" --variant-suffix deepseek-v4 --cuda-suffix cu130)"
+          version="$(python3 python/tools/get_version_tag.py --tag-only)"
+          version="${version#v}"
+          timestamp="$(TZ=Asia/Shanghai date +%Y%m%d%H%M)"
+          if [ "${tag_mode}" = "nightly" ]; then
+            image_tag="v${version}.iaas.nightly.${timestamp}"
+          else
+            image_tag="v${version}.iaas.dev.${timestamp}"
+          fi
+          image_tag="${image_tag}-deepseek-v4-cu130"
 
           echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
           echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
           echo "image_ref=${image_repo}:${image_tag}" >> "${GITHUB_OUTPUT}"
           echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
 
+      - name: Write image metadata artifact
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deepseek-v4-image-metadata
+          jq -n \
+            --arg image_repo "${{ steps.resolve.outputs.image_repo }}" \
+            --arg image_tag "${{ steps.resolve.outputs.image_tag }}" \
+            --arg image_ref "${{ steps.resolve.outputs.image_ref }}" \
+            --arg target_ref "${{ steps.resolve.outputs.target_ref }}" \
+            --arg sglang_commit "$(git rev-parse HEAD)" \
+            --arg workflow_run_id "${GITHUB_RUN_ID}" \
+            --arg workflow_run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{image_repo:$image_repo,image_tag:$image_tag,image_ref:$image_ref,target_ref:$target_ref,sglang_commit:$sglang_commit,workflow_run_id:$workflow_run_id,workflow_run_url:$workflow_run_url}' \
+            > /tmp/deepseek-v4-image-metadata/image-metadata.json
+
+      - name: Upload image metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-v4-image-metadata
+          path: /tmp/deepseek-v4-image-metadata/image-metadata.json
+          retention-days: 30
+
   build-kernel-wheel:
+    needs: [resolve-target-ref]
     if: ${{ github.repository == 'bytedance-iaas/sglang' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     uses: ./.github/workflows/release-whl-kernel.yml
     with:
-      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || 'deepseek_v4' }}
+      checkout_ref: ${{ needs.resolve-target-ref.outputs.target_ref }}
       cuda_version: "13.0"
       artifact_name: sgl-kernel-deepseek-v4-cu13
 
@@ -96,7 +142,7 @@ jobs:
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
-      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || 'deepseek_v4' }}
+      checkout_ref: ${{ needs.resolve-image-metadata.outputs.target_ref }}
       cuda_key: cu130
       cuda_version: 13.0.1
       cuda_suffix: cu130
@@ -118,203 +164,3 @@ jobs:
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit
-
-  deploy:
-    needs: [resolve-image-metadata, build-kernel-wheel, build-nightly]
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && always() }}
-    runs-on: x64-docker-build-node
-    env:
-      DEPLOY_RELEASE: tmp
-      DEPLOY_NAMESPACE: default
-      SERVINGKIT_REPO: git@code.byted.org:infcp/servingkit.git
-      SERVINGKIT_BRANCH: feat/deepseek_v4
-      CHART_PATH: releases/release_010/deepseek-v4-pd-sep
-      HELM_TIMEOUT: 90m
-      SMOKE_MODEL: deepseek-v4-flash
-      KUBECONFIG_ARKCLAW_B64: ${{ secrets.KUBECONFIG_ARKCLAW_B64 }}
-      SERVINGKIT_SSH_KEY: ${{ secrets.SERVINGKIT_SSH_KEY }}
-      RESOLVED_IMAGE_REF: ${{ needs.resolve-image-metadata.outputs.image_ref }}
-      BUILD_NIGHTLY_RESULT: ${{ needs.build-nightly.result }}
-      BUILD_KERNEL_RESULT: ${{ needs.build-kernel-wheel.result }}
-    steps:
-      - name: Deploy servingkit chart
-        run: |
-          set -Eeuo pipefail
-
-          : "${KUBECONFIG_ARKCLAW_B64:?KUBECONFIG_ARKCLAW_B64 is required}"
-          : "${SERVINGKIT_SSH_KEY:?SERVINGKIT_SSH_KEY is required}"
-          for tool in base64 curl git helm jq kubectl; do
-            command -v "${tool}" >/dev/null || { echo "::error::${tool} is required"; exit 1; }
-          done
-
-          PREV_REVISION=""
-          CURRENT_IMAGE=""
-          TARGET_IMAGE=""
-          IMAGE_SOURCE=""
-          SERVINGKIT_COMMIT=""
-          UPGRADE_ATTEMPTED="false"
-          HELM_UPGRADE_DONE="false"
-          PF_PID=""
-
-          notify() {
-            local title="$1"
-            local text="$2"
-            printf '[feishu-disabled] %s\n%s\n' "${title}" "${text}"
-          }
-
-          collect_diagnostics() {
-            helm history "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}" || true
-            helm status "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}" || true
-            kubectl get pods -n "${DEPLOY_NAMESPACE}" -o wide || true
-            kubectl describe pods -n "${DEPLOY_NAMESPACE}" -l "app.kubernetes.io/instance=${DEPLOY_RELEASE}" || true
-            kubectl logs -n "${DEPLOY_NAMESPACE}" -l "app.kubernetes.io/instance=${DEPLOY_RELEASE}" --all-containers --tail=200 || true
-          }
-
-          wait_pods_ready() {
-            local timeout_seconds=5400
-            local start
-            start="$(date +%s)"
-
-            while true; do
-              local bad=""
-              local crash=""
-              bad="$(kubectl get pods -n "${DEPLOY_NAMESPACE}" --no-headers | awk -v prefix="${DEPLOY_RELEASE}-" '$1 ~ "^" prefix { split($2, ready, "/"); if (ready[1] != ready[2] || $3 != "Running") print }')"
-              crash="$(kubectl get pods -n "${DEPLOY_NAMESPACE}" --no-headers | awk -v prefix="${DEPLOY_RELEASE}-" '$1 ~ "^" prefix && $3 ~ /(CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|Error)/ { print }')"
-
-              if [ -z "${bad}" ] && [ -z "${crash}" ]; then
-                return 0
-              fi
-
-              if [ $(( $(date +%s) - start )) -gt "${timeout_seconds}" ]; then
-                printf '%s\n%s\n' "${bad}" "${crash}"
-                return 1
-              fi
-
-              sleep 30
-            done
-          }
-
-          cleanup() {
-            if [ -n "${PF_PID}" ] && kill -0 "${PF_PID}" 2>/dev/null; then
-              kill "${PF_PID}" || true
-            fi
-          }
-
-          on_error() {
-            local rc=$?
-            trap - ERR
-            collect_diagnostics
-
-            local rollback_status="not-attempted"
-            if [ "${UPGRADE_ATTEMPTED}" = "true" ] && [ "${HELM_UPGRADE_DONE}" != "true" ]; then
-              if [ "$(helm status "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}" -o json 2>/dev/null | jq -r '.info.status // empty')" = "deployed" ]; then
-                rollback_status="success"
-              else
-                rollback_status="failed"
-              fi
-            elif [ "${UPGRADE_ATTEMPTED}" = "true" ] && [ -n "${PREV_REVISION}" ]; then
-              if helm rollback "${DEPLOY_RELEASE}" "${PREV_REVISION}" -n "${DEPLOY_NAMESPACE}" --wait --timeout "${HELM_TIMEOUT}"; then
-                kubectl rollout status "deploy/${DEPLOY_RELEASE}-router" -n "${DEPLOY_NAMESPACE}" --timeout=10m || true
-                wait_pods_ready || true
-                rollback_status="success"
-              else
-                rollback_status="failed"
-              fi
-            fi
-
-            if [ "${rollback_status}" = "failed" ]; then
-              notify "[DeepSeek V4 Nightly] 严重：部署失败且回滚失败，需要人工介入" "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\nrelease=${DEPLOY_RELEASE}\nnamespace=${DEPLOY_NAMESPACE}\ntarget_image=${TARGET_IMAGE:-unknown}\nservingkit_commit=${SERVINGKIT_COMMIT:-unknown}" || true
-            elif [ "${rollback_status}" = "success" ]; then
-              notify "[DeepSeek V4 Nightly] 部署失败，已回滚成功" "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\nrelease=${DEPLOY_RELEASE}\nnamespace=${DEPLOY_NAMESPACE}\nrollback_revision=${PREV_REVISION}\ntarget_image=${TARGET_IMAGE:-unknown}\nservingkit_commit=${SERVINGKIT_COMMIT:-unknown}" || true
-            else
-              notify "[DeepSeek V4 Nightly] 部署前检查失败" "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\nrelease=${DEPLOY_RELEASE}\nnamespace=${DEPLOY_NAMESPACE}\nbuild_nightly=${BUILD_NIGHTLY_RESULT}\nbuild_kernel=${BUILD_KERNEL_RESULT}" || true
-            fi
-
-            exit "${rc}"
-          }
-
-          trap cleanup EXIT
-          trap on_error ERR
-
-          mkdir -p "${HOME}/.kube"
-          echo "${KUBECONFIG_ARKCLAW_B64}" | base64 -d > "${HOME}/.kube/arkclaw.config"
-          export KUBECONFIG="${HOME}/.kube/arkclaw.config"
-          chmod 600 "${KUBECONFIG}"
-
-          kubectl cluster-info
-          helm list -n "${DEPLOY_NAMESPACE}"
-
-          PREV_REVISION="$(helm history "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}" -o json | jq -r '[.[] | select(.status=="deployed")][-1].revision // empty')"
-          CURRENT_IMAGE="$(kubectl get "deploy/${DEPLOY_RELEASE}-router" -n "${DEPLOY_NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}')"
-          if [ -z "${PREV_REVISION}" ] || [ -z "${CURRENT_IMAGE}" ]; then
-            echo "::error::Failed to resolve current release revision or router image"
-            exit 1
-          fi
-          helm get values "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}" -o yaml > /tmp/helm-current-user-values.yaml
-
-          if [ "${BUILD_NIGHTLY_RESULT}" = "success" ]; then
-            if [ -z "${RESOLVED_IMAGE_REF}" ]; then
-              echo "::error::Build succeeded but resolved image ref is empty"
-              exit 1
-            fi
-            TARGET_IMAGE="${RESOLVED_IMAGE_REF}"
-            IMAGE_SOURCE="newly-built"
-          else
-            TARGET_IMAGE="${CURRENT_IMAGE}"
-            IMAGE_SOURCE="current-cluster-image"
-            notify "[DeepSeek V4 Nightly] 镜像构建失败，继续部署最新 chart，镜像保持当前线上版本" "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\nbuild_nightly=${BUILD_NIGHTLY_RESULT}\nbuild_kernel=${BUILD_KERNEL_RESULT}\ncurrent_image=${CURRENT_IMAGE}" || true
-          fi
-
-          mkdir -p "${HOME}/.ssh"
-          printf '%s\n' "${SERVINGKIT_SSH_KEY}" > "${HOME}/.ssh/servingkit"
-          chmod 600 "${HOME}/.ssh/servingkit"
-          cat > "${HOME}/.ssh/config" <<'EOF'
-          Host code.byted.org
-            HostName code.byted.org
-            User git
-            IdentityFile ~/.ssh/servingkit
-            StrictHostKeyChecking no
-          EOF
-
-          rm -rf /tmp/servingkit
-          git clone --depth 1 --branch "${SERVINGKIT_BRANCH}" "${SERVINGKIT_REPO}" /tmp/servingkit
-          SERVINGKIT_COMMIT="$(git -C /tmp/servingkit rev-parse HEAD)"
-          cd "/tmp/servingkit/${CHART_PATH}"
-
-          helm lint .
-          helm template "${DEPLOY_RELEASE}" . \
-            -n "${DEPLOY_NAMESPACE}" \
-            -f /tmp/helm-current-user-values.yaml \
-            --set-string "global.image=${TARGET_IMAGE}" \
-            > /tmp/rendered.yaml
-          grep -F "${TARGET_IMAGE}" /tmp/rendered.yaml >/dev/null
-
-          UPGRADE_ATTEMPTED="true"
-          helm upgrade "${DEPLOY_RELEASE}" . \
-            -n "${DEPLOY_NAMESPACE}" \
-            -f /tmp/helm-current-user-values.yaml \
-            --set-string "global.image=${TARGET_IMAGE}" \
-            --wait \
-            --timeout "${HELM_TIMEOUT}" \
-            --atomic \
-            --history-max 20
-          HELM_UPGRADE_DONE="true"
-
-          helm status "${DEPLOY_RELEASE}" -n "${DEPLOY_NAMESPACE}"
-          kubectl rollout status "deploy/${DEPLOY_RELEASE}-router" -n "${DEPLOY_NAMESPACE}" --timeout=10m
-          kubectl wait --for=condition=Available "deploy/${DEPLOY_RELEASE}-router" -n "${DEPLOY_NAMESPACE}" --timeout=10m
-          wait_pods_ready
-
-          kubectl port-forward -n "${DEPLOY_NAMESPACE}" "svc/${DEPLOY_RELEASE}-router" 18080:8000 &
-          PF_PID=$!
-          sleep 10
-
-          curl -sS --fail --max-time 300 http://127.0.0.1:18080/v1/models > /tmp/models.json
-          curl -sS --fail --max-time 600 \
-            http://127.0.0.1:18080/v1/chat/completions \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -n --arg model "${SMOKE_MODEL}" '{model:$model,messages:[{role:"user",content:"Say OK only."}],max_tokens:8,temperature:0}')" \
-            > /tmp/smoke-response.json
-          jq -e '.choices | length > 0' /tmp/smoke-response.json >/dev/null
-
-          notify "[DeepSeek V4 Nightly] 部署成功" "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\nrelease=${DEPLOY_RELEASE}\nnamespace=${DEPLOY_NAMESPACE}\nimage_source=${IMAGE_SOURCE}\ntarget_image=${TARGET_IMAGE}\nservingkit_commit=${SERVINGKIT_COMMIT}" || true
