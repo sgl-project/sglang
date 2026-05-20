@@ -360,7 +360,6 @@ def cutlass_moe_fp4(
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
     no_combine: bool = False,
-    activation: str = "silu",
 ):
     """
     MoE implementation for FP4 Inputs
@@ -405,9 +404,6 @@ def cutlass_moe_fp4(
     e: number of experts for the current rank, dtype: int
     assumes that topk < k < n to satisfy - up/down projection expectations.
     """
-    assert (
-        activation == "silu"
-    ), f"cutlass_moe_fp4 only supports activation='silu', got {activation!r}. "
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
     assert w2_fp4.dtype == torch.uint8, "weight 2 must be uint8"
