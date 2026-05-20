@@ -14,17 +14,14 @@ pub struct Config {
     pub active_load: ActiveLoadConfig,
 }
 
-/// Outbound proxy tuning — controls how long the router waits on each
-/// per-worker HTTP request. The default mirrors SGLang's typical
-/// prefill / decode latency budget (long context windows take time);
-/// e2e tests typically lower it so per-request failures surface fast
-/// enough to trip the circuit breaker within the test's wall-time.
+/// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
+/// decode latency budget; e2e tests lower it so per-request failures
+/// trip the circuit breaker within the test's wall-time.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
     /// return headers + body. Default 300 s. The circuit breaker
-    /// records a failure when this fires; the chat handler's caller
-    /// observes `ApiError::UpstreamTimeout`.
+    /// records a failure when this fires.
     #[serde(default = "default_proxy_request_timeout_secs")]
     pub request_timeout_secs: u64,
 }
@@ -41,13 +38,10 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Active-load (per-request) tracking tuning — controls how long a
-/// leaked or stalled request entry stays in the registry before the
-/// janitor reclaims it. Setting it short in tests lets
-/// `test_stale_request_expired_returns_504` fire the janitor within
-/// the test's wall-time budget; production defaults to 10 minutes,
-/// kept above `proxy.request_timeout_secs` so the proxy timeout is
-/// the one users hit first for normal slow upstreams.
+/// Active-load (per-request) tracking. Production default (10 min)
+/// sits above `proxy.request_timeout_secs` so the proxy timeout is the
+/// one users hit first for normal slow upstreams; tests lower it to
+/// let the janitor fire within their wall-time budget.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ActiveLoadConfig {
     /// How long a request entry can live in the registry before the
@@ -200,7 +194,7 @@ pub struct CircuitBreakerConfig {
 }
 
 fn default_cb_threshold() -> NonZeroU32 {
-    NonZeroU32::new(3).expect("3 is non-zero")
+    NonZeroU32::new(3).unwrap()
 }
 fn default_cb_cool_down() -> u64 {
     30
@@ -226,8 +220,8 @@ fn default_cb_cool_down() -> u64 {
 ///       - http://10.0.0.2:30000
 /// ```
 ///
-/// After deserialization `validate()` converts the raw fields into
-/// `DiscoveryConfig::backend` for convenient pattern matching.
+/// The custom `Deserialize` impl on [`DiscoveryConfig`] converts the
+/// raw fields into the resolved `DiscoveryBackend` enum via `try_from`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryConfigRaw {
     pub backend: String,
@@ -422,15 +416,13 @@ fn is_equality_selector(selector: &str) -> bool {
             }
             continue;
         }
-        if let Some((k, v)) = term.split_once('=') {
+        if let Some((k, _value)) = term.split_once('=') {
             // Reject `!=` (rendered as `key!` + `=value` by split_once).
+            // Empty value is legal in K8s — `label_selector = "tier="`
+            // matches pods with `tier=""` — so we don't constrain it.
             if k.trim().is_empty() || k.trim().ends_with('!') {
                 return false;
             }
-            // Reject leading whitespace-only values? An empty value is
-            // technically legal in K8s — `label_selector = "tier="` matches
-            // pods that explicitly set `tier=""`. Allow it.
-            let _ = v;
             continue;
         }
         // No `=` at all → set-based operator, presence test, or garbage.
@@ -611,6 +603,52 @@ mod k8s_discovery_config_tests {
             m,
             K8sDiscoveryMode::Plain {
                 label_selector: "app=sglang,zone=us-east".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mode_rejects_when_no_selector_is_set() {
+        let err = cfg(None, None, None).mode().unwrap_err();
+        assert!(matches!(err, ConfigError::NoSelector), "got {err:?}");
+    }
+
+    #[test]
+    fn mode_rejects_mixed_plain_and_pd_selectors() {
+        let err = cfg(
+            Some("app=sglang"),
+            Some("role=prefill"),
+            Some("role=decode"),
+        )
+        .mode()
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::MixedModes), "got {err:?}");
+    }
+
+    #[test]
+    fn mode_rejects_partial_pd_selectors() {
+        let err = cfg(None, Some("role=prefill"), None).mode().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PartialPdSelectors),
+            "got {err:?}"
+        );
+        let err = cfg(None, None, Some("role=decode")).mode().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PartialPdSelectors),
+            "got {err:?}"
+        );
+    }
+
+    /// Empty plain `label_selector` is valid — matches every
+    /// EndpointSlice in the namespace (documented K8s behavior; the
+    /// operator opts in by setting plain mode at all).
+    #[test]
+    fn mode_accepts_empty_plain_label_selector() {
+        let m = cfg(Some(""), None, None).mode().unwrap();
+        assert_eq!(
+            m,
+            K8sDiscoveryMode::Plain {
+                label_selector: String::new()
             }
         );
     }
