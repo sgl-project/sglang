@@ -27,7 +27,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 # Upper bound on bs for _plan_offsets_kernel's block-level cumsum. Reqs larger than this exceed Triton's
 # single-program tl.cumsum reach. Increase if real workloads ever push past it; the cap is intentionally
 # generous so the wrapper never silently truncates.
-_PLAN_BS_BLOCK_SIZE: int = 1024
+_PLAN_BS_BLOCK_SIZE: int = 4096
 
 # Inner-tile width for _plan_entries_kernel. Each (req, j-tile) program owns this many entries along the
 # j-axis of the (bs, max_verify_per_req) logical grid.

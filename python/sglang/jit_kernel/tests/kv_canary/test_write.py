@@ -1117,6 +1117,85 @@ def test_chain_link_byte_equal_5_step_hardcoded(hardcoded: bool) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
+@pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
+@pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
+def test_mock_violation_bit_injection_position_matrix(
+    bit_to_trigger: str,
+    injection_position: str,
+) -> None:
+    """Sweep injection_position x bit_to_trigger for write-kernel pseudo-mode fail-reason coverage."""
+    slot_count = 5
+    tokens = [10, 20, 30, 40, 50]
+    positions = [0, 1, 2, 3, 4]
+    out_cache_locs = [0, 1, 2, 3, 4]
+    corruption_index = {"head": 0, "mid": 2, "last": 4}[injection_position]
+    corrupt_slot = out_cache_locs[corruption_index]
+
+    expected_bit = {
+        "MOCK_TOKEN": _FAIL_REASON_BIT_WRITE_TOKEN_MISMATCH,
+        "MOCK_POSITION": _FAIL_REASON_BIT_WRITE_POSITION_MISMATCH,
+    }[bit_to_trigger]
+
+    cuda_buf, ref_buf = _setup_pair()
+    plan_cuda = make_write_plan(
+        write_offsets=[0, slot_count],
+        seed_slot_indices=[-1],
+        num_valid_reqs=1,
+        device=_DEVICE,
+    )
+    plan_ref = make_write_plan(
+        write_offsets=[0, slot_count],
+        seed_slot_indices=[-1],
+        num_valid_reqs=1,
+        device=_DEVICE,
+    )
+    fb_input_ids = torch.tensor(tokens, dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.tensor(out_cache_locs, dtype=torch.int32, device=_DEVICE)
+
+    pseudo_tokens = fb_input_ids.clone()
+    pseudo_positions = fb_positions.clone()
+
+    if bit_to_trigger == "MOCK_TOKEN":
+        pseudo_tokens[corruption_index] = tokens[corruption_index] + 999
+    else:
+        pseudo_positions[corruption_index] = positions[corruption_index] + 99
+
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_expected_tokens=pseudo_tokens,
+        pseudo_expected_positions=pseudo_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=RealKvHashMode.OFF,
+    )
+
+    found = False
+    for row_idx in range(int(cuda_log.write_index[0].item())):
+        fail_bits = int(cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+        row_slot = int(cuda_log.ring[row_idx, 1].item())
+        if (fail_bits & expected_bit) and row_slot == corrupt_slot:
+            found = True
+            break
+    assert found, (
+        f"expected bit {expected_bit:#x} at slot {corrupt_slot} not found in ring "
+        f"(bit_to_trigger={bit_to_trigger} injection_position={injection_position})"
+    )
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
 @pytest.mark.parametrize("hardcoded", [True])
 def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
     assert hardcoded

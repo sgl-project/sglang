@@ -1472,6 +1472,205 @@ def test_chain_link_byte_equal_100_step_hardcoded(hardcoded: bool) -> None:
         )
 
 
+@pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
+@pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
+@pytest.mark.parametrize("ring_state", ["open", "full"])
+def test_violation_bit_injection_position_ring_state_matrix(
+    bit_to_trigger: str,
+    injection_position: str,
+    ring_state: str,
+) -> None:
+    """Sweep injection_position x bit_to_trigger x ring_state for verify-kernel fail-reason coverage."""
+    _RING_CAPACITY = 4
+    slot_indices = [0, 1, 2, 3, 4]
+    tokens = [11, 22, 33, 44, 55]
+    positions = [0, 1, 2, 3, 4]
+
+    corruption_index = {"head": 0, "mid": 2, "last": 4}[injection_position]
+    corrupt_slot = slot_indices[corruption_index]
+
+    expected_bit = {
+        "POSITION": _FAIL_REASON_BIT_POSITION,
+        "PREV_HASH": _FAIL_REASON_BIT_CHAIN_HASH,
+        "REAL_KV": _FAIL_REASON_BIT_REAL_KV_HASH,
+    }[bit_to_trigger]
+
+    if bit_to_trigger == "REAL_KV":
+        cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=16)
+        sources_cuda = make_real_kv_sources(count=1, device=_DEVICE)
+
+        write_plan = make_write_plan(
+            write_offsets=[0, 5],
+            seed_slot_indices=[-1],
+            num_valid_reqs=1,
+            device=_DEVICE,
+        )
+        fb_input_ids = torch.tensor(tokens, dtype=torch.int32, device=_DEVICE)
+        fb_positions = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
+        fb_out_cache_loc = torch.tensor(slot_indices, dtype=torch.int32, device=_DEVICE)
+        pseudo_tokens = torch.zeros(5, dtype=torch.int32, device=_DEVICE)
+        pseudo_positions = torch.zeros(5, dtype=torch.int32, device=_DEVICE)
+        write_log = FakeViolationLog.allocate(device=_DEVICE)
+        canary_write_step_torch_reference(
+            canary_buf=cuda_buf,
+            plan=write_plan,
+            fb_input_ids=fb_input_ids,
+            fb_positions=fb_positions,
+            fb_out_cache_loc=fb_out_cache_loc,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            pseudo_mode=CanaryPseudoMode.OFF,
+            pseudo_expected_tokens=pseudo_tokens,
+            pseudo_expected_positions=pseudo_positions,
+            violation_ring=write_log.ring,
+            violation_write_index=write_log.write_index,
+            slot_run_counter=write_log.slot_run_counter,
+            kernel_run_counter=write_log.kernel_run_counter,
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=RealKvHashMode.ALL,
+        )
+        ref_buf.copy_(cuda_buf)
+        sources_ref = (
+            RealKvSource(
+                tensor=sources_cuda[0].tensor.clone(),
+                page_size=sources_cuda[0].page_size,
+                num_bytes_per_token=sources_cuda[0].num_bytes_per_token,
+                read_bytes=sources_cuda[0].read_bytes,
+            ),
+        )
+
+        sources_cuda[0].tensor[corrupt_slot, 0] ^= 0xFF
+        sources_ref[0].tensor.copy_(sources_cuda[0].tensor)
+        real_kv_hash_mode = RealKvHashMode.ALL
+        real_kv_sources_cuda = sources_cuda
+        real_kv_sources_ref = sources_ref
+    else:
+        cuda_buf, ref_buf = _setup_pair_with_canned_chain(num_slots=16)
+        _stamp_chain(
+            cuda_buf=cuda_buf,
+            ref_buf=ref_buf,
+            tokens=tokens,
+            positions=positions,
+            slot_indices=slot_indices,
+        )
+        real_kv_hash_mode = RealKvHashMode.OFF
+        real_kv_sources_cuda = ()
+        real_kv_sources_ref = ()
+
+        if bit_to_trigger == "POSITION":
+            stored_token, stored_pos, stored_prev, stored_rkv = read_slot_fields(
+                canary_buf=cuda_buf, slot_idx=corrupt_slot
+            )
+            for buf in (cuda_buf, ref_buf):
+                write_slot_fields(
+                    canary_buf=buf,
+                    slot_idx=corrupt_slot,
+                    token=stored_token,
+                    position=stored_pos + 99,
+                    prev_hash=stored_prev,
+                    real_kv_hash=stored_rkv,
+                )
+        else:
+            stored_token, stored_pos, stored_prev, stored_rkv = read_slot_fields(
+                canary_buf=cuda_buf, slot_idx=corrupt_slot
+            )
+            flipped_prev = stored_prev ^ 1
+            for buf in (cuda_buf, ref_buf):
+                write_slot_fields(
+                    canary_buf=buf,
+                    slot_idx=corrupt_slot,
+                    token=stored_token,
+                    position=stored_pos,
+                    prev_hash=flipped_prev,
+                    real_kv_hash=stored_rkv,
+                )
+
+    ring_capacity = _RING_CAPACITY
+    cuda_log = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
+
+    if ring_state == "full":
+        anchor_signed = chain_anchor_signed()
+        prefill_slots = list(range(8, 8 + ring_capacity))
+        for slot_idx in prefill_slots:
+            for buf in (cuda_buf, ref_buf):
+                write_slot_fields(
+                    canary_buf=buf,
+                    slot_idx=slot_idx,
+                    token=1,
+                    position=0,
+                    prev_hash=anchor_signed,
+                    real_kv_hash=0,
+                )
+        prefill_plan_cuda = make_verify_plan(
+            slot_indices=prefill_slots,
+            positions=[99] * ring_capacity,
+            prev_slot_indices=[-1] * ring_capacity,
+            device=_DEVICE,
+        )
+        prefill_plan_ref = make_verify_plan(
+            slot_indices=prefill_slots,
+            positions=[99] * ring_capacity,
+            prev_slot_indices=[-1] * ring_capacity,
+            device=_DEVICE,
+        )
+        _run_both(
+            cuda_canary_buf=cuda_buf,
+            ref_canary_buf=ref_buf,
+            plan_cuda=prefill_plan_cuda,
+            plan_ref=prefill_plan_ref,
+            cuda_log=cuda_log,
+            ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+        )
+        assert int(cuda_log.write_index[0].item()) == ring_capacity
+
+    prev_slot_indices = [-1, 0, 1, 2, 3]
+    plan_cuda = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=prev_slot_indices,
+        device=_DEVICE,
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=prev_slot_indices,
+        device=_DEVICE,
+    )
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_cuda,
+        real_kv_sources_ref=real_kv_sources_ref,
+        real_kv_hash_mode=real_kv_hash_mode,
+    )
+
+    if ring_state == "open":
+        write_index = int(cuda_log.write_index[0].item())
+        rows_stored = min(write_index, ring_capacity)
+        found = False
+        for row_idx in range(rows_stored):
+            fail_bits = int(cuda_log.ring[row_idx, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+            if fail_bits & expected_bit:
+                found = True
+                break
+        assert found, (
+            f"expected bit {expected_bit:#x} not found in any ring row "
+            f"(bit_to_trigger={bit_to_trigger} injection_position={injection_position})"
+        )
+    else:
+        assert int(cuda_log.write_index[0].item()) > ring_capacity, (
+            "write_index did not advance beyond ring_capacity after overflow"
+        )
+
+
 def test_chain_advance_formula_matches_spec() -> None:
     """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
     # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
