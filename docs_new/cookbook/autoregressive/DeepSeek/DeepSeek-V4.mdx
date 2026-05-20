@@ -87,7 +87,7 @@ docker run --gpus all \
 
 ## 3. Model Deployment
 
-SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus specialized recipes for long-context (`cp`, prefill context-parallel) and prefill/decode disaggregation (`pd-disagg`). The interactive generator below emits the exact launch command for any `(hardware, variant, recipe)` combination.
+SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus a specialized recipe for prefill/decode disaggregation (`pd-disagg`). Long-context workloads are handled by the **Context-Parallel (CP)** feature toggle, which layers prefill context-parallel attention on top of any of the three main recipes — see §3.2. The interactive generator below emits the exact launch command for any `(hardware, variant, recipe, feature toggles)` combination.
 
 
 ### 3.1 Basic Configuration
@@ -128,6 +128,46 @@ PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
 
+**Context-Parallel (CP)**
+
+CP shards the prefill attention across `attn_cp_size = tp_size / dp_size` ranks
+via DeepSeek's NSA (Native Sparse Attention) prefill kernels, dramatically
+reducing per-rank attention FLOPs and KV footprint on long contexts. Enable it
+with the **Context-Parallel** toggle in the
+[command generator above](#3-model-deployment).
+
+When enabled, the generator:
+
+- Adds `--enable-nsa-prefill-context-parallel` and
+  `--nsa-prefill-cp-mode round-robin-split`.
+- Overrides `--chunked-prefill-size` to `16384`.
+- Overrides `--mem-fraction-static` to a CP-friendly value (0.88 for GB300 Pro,
+  0.78 elsewhere) since CP prefill buffers need extra HBM headroom.
+- Forces `--moe-a2a-backend deepep` (strips any
+  `--moe-runner-backend flashinfer_mxfp4` from the base recipe — CP is verified
+  against the DeepEP backend only).
+- **Strips `--dp <N>` and `--enable-dp-attention` from the base recipe.**
+  `round-robin-split` requires `dp_size == 1`; sglang's
+  `validate_deepseek_v4_cp` hook auto-enables DP-attention internally and
+  auto-computes `attn_cp_size = tp_size`, so `--attn-cp-size` is intentionally
+  omitted from the generated command (the hook overrides it anyway).
+
+CP composes with MTP — the speculative-decoding flags from the base recipe are
+kept intact. The CP+MTP path was end-to-end verified on B200/B300 +
+DeepSeek-V4-Flash; the reference combination is balanced + CP + EAGLE (1 step,
+2 draft tokens) from [PR #24934](https://github.com/sgl-project/sglang/pull/24934).
+
+**Restrictions:**
+
+- Single-machine only (`tp_size ≤ 8`). Multinode big variants (H200 Pro tp=16,
+  GB200 Pro tp=8×2, H100 Pro tp=16) are disabled in the UI — cross-machine CP
+  has known precision issues.
+- Not supported on the Marlin (FP4) Hopper paths (H200-FP4, H100) — those
+  paths don't expose the NSA prefill kernels.
+- Not supported with `pd-disagg` (CP and the disaggregation router have not been
+  composed yet).
+- Not compatible with MegaMoE — the generator gates them mutually exclusive.
+
 **MegaMoE**
 
 MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
@@ -145,7 +185,7 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `cp` settings. When running MegaMoE, don't set `--moe-runner-backend` manually.
+- MegaMoE is **not** supported on Hopper (H100 / H200), on `low-latency`, or when the Context-Parallel toggle is enabled. When running MegaMoE, don't set `--moe-runner-backend` manually.
 - Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 4096 for balanced, 8320 for max-throughput).
 
 **GB300 PD-Disagg cross-pod MNNVL**

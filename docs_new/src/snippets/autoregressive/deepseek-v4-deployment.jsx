@@ -16,8 +16,14 @@ export const DeepSeekV4Deployment = () => {
   //     low-latency    → TP(+DP on H200 no, Blackwell no), MTP 3/4
   //     balanced       → DP-attn + DeepEP + MTP 1/2
   //     max-throughput → DP-attn + DeepEP, no MTP
-  //     cp             → TP + DeepEP + context-parallel flags, no MTP
   //     pd-disagg      → 1P1D (prefill + decode + router), separate commands shown together
+  //
+  //   Context-Parallel (CP) is an opt-in feature toggle layered on top of
+  //   low-latency / balanced / max-throughput (NOT a separate recipe). When
+  //   enabled it adds --enable-nsa-prefill-context-parallel +
+  //   --nsa-prefill-cp-mode round-robin-split + chunked-prefill-size 16384,
+  //   plus --attn-cp-size <tp> on DP-attn recipes (balanced / max-throughput),
+  //   plus a CP-friendly --mem-fraction-static override. See cookbook §3.2.
   //
   // HF slugs, parser names, and `sglang serve` flag parity are all confirmed —
   // see cookbook_v2/DISCUSSION.md ("人类提供的事实" and 设计决定 §3).
@@ -51,7 +57,6 @@ export const DeepSeekV4Deployment = () => {
         { id: "low-latency",    label: "Low-Latency",      default: true  },
         { id: "balanced",       label: "Balanced",         default: false },
         { id: "max-throughput", label: "Max-Throughput",   default: false },
-        { id: "cp",             label: "Context-Parallel", default: false },
         { id: "pd-disagg",      label: "PD-Disagg",        default: false },
       ],
     },
@@ -79,6 +84,14 @@ export const DeepSeekV4Deployment = () => {
         { id: "l2",       label: "L2",       default: false, subtitle: "GPU+CPU" },
       ],
     },
+    cp: {
+      name: "cp",
+      title: "Context-Parallel",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "enabled",  label: "Enabled",  default: false, subtitle: "NSA prefill CP" },
+      ],
+    },
     megamoe: {
       name: "megamoe",
       title: "MegaMoE",
@@ -92,18 +105,44 @@ export const DeepSeekV4Deployment = () => {
 
   // Recipes that are not supported on the Marlin (FP4) Hopper paths
   // (H200 FP4, H100 FP4).
-  const MARLIN_UNSUPPORTED_RECIPES = new Set(["cp", "pd-disagg"]);
+  const MARLIN_UNSUPPORTED_RECIPES = new Set(["pd-disagg"]);
   const MARLIN_HARDWARE = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
+  // Context-Parallel toggle: only on NSA-capable single-machine Blackwell
+  // paths. Constraints (enforced by sglang's validate_deepseek_v4_cp hook):
+  //   1. nsa_prefill_cp_mode == "round-robin-split" requires dp_size == 1
+  //      (so the cookbook DROPS --dp / --enable-dp-attention when CP is on).
+  //   2. tp_size <= 8 (single-machine). Multi-node paths (h200|big tp=16,
+  //      gb200|big tp=8 ×2, h100|big tp=16) are disqualified — cross-machine
+  //      CP has known precision issues.
+  //   3. Marlin (FP4) Hopper paths don't expose the NSA prefill kernels.
+  //   4. pd-disagg has its own router layout that doesn't compose with CP yet.
+  const CP_UNSUPPORTED_HARDWARE = MARLIN_HARDWARE;
+  const CP_UNSUPPORTED_RECIPES = new Set(["pd-disagg"]);
+  // (hardware, modelSize) pairs that span multiple nodes — CP needs tp_size <= 8
+  // on a single machine, so multinode + big variants are disqualified.
+  const CP_UNSUPPORTED_HW_SIZE = new Set([
+    "h200|big",   // tp=16, 2 nodes
+    "gb200|big",  // tp=8, 2 nodes (multinode disqualifies even at tp=8)
+    "h100|big",   // tp=16, 2 nodes
+  ]);
+  const isCpUnsupported = (vals) =>
+    CP_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
+    CP_UNSUPPORTED_RECIPES.has(vals.recipe) ||
+    CP_UNSUPPORTED_HW_SIZE.has(`${vals.hardware}|${vals.modelSize}`);
+
   // MegaMoE is only supported on Blackwell with DeepEP-based recipes
   // (balanced / max-throughput / pd-disagg). It's disabled on Hopper
-  // (H100 / H200 / H200-FP4) and on low-latency / cp recipes.
-  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp"]);
+  // (H100 / H200 / H200-FP4), on low-latency, and when CP is enabled
+  // (MegaMoE replaces --moe-a2a-backend deepep with megamoe, and the CP path
+  // is verified against the DeepEP backend only).
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency"]);
   const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200", "h200-fp4"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
-    MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
+    MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe) ||
+    vals.cp === "enabled";
 
   const resolveItems = (option, vals) => {
     if (option.name === "recipe" && vals && MARLIN_HARDWARE.has(vals.hardware)) {
@@ -114,9 +153,22 @@ export const DeepSeekV4Deployment = () => {
       );
     }
     if (option.name === "megamoe" && vals && isMegamoeUnsupported(vals)) {
-      const reason = MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)
-        ? "MegaMoE is only supported on Blackwell"
-        : "MegaMoE is not supported on this recipe";
+      let reason;
+      if (MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)) {
+        reason = "MegaMoE is only supported on Blackwell";
+      } else if (MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe)) {
+        reason = "MegaMoE is not supported on this recipe";
+      } else {
+        reason = "MegaMoE is not supported when Context-Parallel is enabled";
+      }
+      return option.items.map((it) =>
+        it.id === "disabled" ? it : { ...it, disabled: true, disabledReason: reason }
+      );
+    }
+    if (option.name === "cp" && vals && isCpUnsupported(vals)) {
+      const reason = CP_UNSUPPORTED_HARDWARE.has(vals.hardware)
+        ? "Context-Parallel is not supported on the Marlin (FP4) Hopper paths"
+        : "Context-Parallel is not supported on this recipe";
       return option.items.map((it) =>
         it.id === "disabled" ? it : { ...it, disabled: true, disabledReason: reason }
       );
@@ -158,8 +210,8 @@ export const DeepSeekV4Deployment = () => {
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
       const next = { ...prev, [optionName]: value };
-      // Switching to a Marlin (FP4) Hopper path while cp / pd-disagg is
-      // selected: fall back to low-latency since those recipes are not
+      // Switching to a Marlin (FP4) Hopper path while pd-disagg is
+      // selected: fall back to low-latency since pd-disagg is not
       // supported on Marlin.
       if (
         optionName === "hardware" &&
@@ -168,10 +220,19 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.recipe = "low-latency";
       }
-      // Switching to a hardware/recipe combo that doesn't support MegaMoE
+      // Switching to a hardware/modelSize/recipe combo that doesn't support CP
+      // while CP is enabled: fall back to disabled.
+      if (
+        (optionName === "hardware" || optionName === "modelSize" || optionName === "recipe") &&
+        next.cp === "enabled" &&
+        isCpUnsupported(next)
+      ) {
+        next.cp = "disabled";
+      }
+      // Switching to a hardware/recipe/cp combo that doesn't support MegaMoE
       // while w4a8 / w4a4 is selected: fall back to disabled.
       if (
-        (optionName === "hardware" || optionName === "recipe") &&
+        (optionName === "hardware" || optionName === "recipe" || optionName === "cp") &&
         next.megamoe !== "disabled" &&
         isMegamoeUnsupported(next)
       ) {
@@ -253,12 +314,10 @@ export const DeepSeekV4Deployment = () => {
     "b200|small|low-latency",
     "b200|small|balanced",
     "b200|small|max-throughput",
-    "b200|small|cp",
     "b200|small|pd-disagg",
     "b200|big|low-latency",
     "b200|big|balanced",
     "b200|big|max-throughput",
-    "b200|big|cp",
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
@@ -268,20 +327,16 @@ export const DeepSeekV4Deployment = () => {
     "gb300|big|balanced",
     "gb300|small|max-throughput",
     "gb300|big|max-throughput",
-    "h200|small|cp",
     "h200|small|pd-disagg",
     "h200|big|low-latency",
     "h200|big|balanced",
     "h200|big|max-throughput",
     "h200|big|pd-disagg",
-    "gb300|small|cp",
-    "gb300|big|cp",
     "gb300|small|pd-disagg",
     "gb300|big|pd-disagg",
     "gb200|small|low-latency",
     "gb200|small|balanced",
     "gb200|small|max-throughput",
-    "gb200|small|cp",
     "gb200|big|low-latency",
     "gb200|big|balanced",
     "gb200|big|max-throughput",
@@ -302,7 +357,6 @@ export const DeepSeekV4Deployment = () => {
   // upstream limitation). Showing a minimal placeholder is friendlier to users
   // than emitting a commented-out invalid command.
   const TBD_RECIPES = new Set([
-    "h200|big|cp",
     "gb200|small|pd-disagg",
     "gb200|big|pd-disagg",
   ]);
@@ -338,7 +392,7 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall, hicache, megamoe } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall, hicache, megamoe, cp } = values;
     // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
     const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
@@ -497,15 +551,32 @@ export const DeepSeekV4Deployment = () => {
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
-    } else if (recipe === "cp") {
-      if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      } else {
-        // Blackwell cp: small=1024, big=256 (allinone ternary).
+    }
+    // Context-Parallel toggle (NOT a recipe). Two env adjustments:
+    //   1. DeepEP dispatch buffer sizing if the base recipe hasn't set it.
+    //      Layered after base-recipe envs so CP wins for low-latency on
+    //      Blackwell, which would otherwise emit no DEEPEP cap and run into
+    //      the CP path's higher per-rank token traffic.
+    //   2. SGLANG_OPT_FUSE_WQA_WKV=0 — disables the fused wqkv_a linear path
+    //      in DeepseekV4 attention. When the fused path is on, the CP-only
+    //      kv slice (`qkv_a[..., q_lora_rank:]` at deepseek_v4.py:421) is a
+    //      non-contiguous view, and `fused_norm_rope_inplace` aborts at
+    //      runtime with `tvm.error.InternalError: Tensor not contiguous as
+    //      expected` (jit_kernel/csrc/deepseek_v4/fused_norm_rope.cuh:192).
+    //      Reproduced on B300 + DeepSeek-V4-Flash, latest main 2026-05-20.
+    //      Until the upstream call site adds .contiguous(), CP requires this
+    //      opt-out.
+    if (cp === "enabled") {
+      const alreadyCapped = recipeEnv.some((e) =>
+        e.startsWith("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=")
+      );
+      if (!alreadyCapped) {
+        // Mirrors the previous standalone cp recipe's dispatch cap.
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
+      recipeEnv.push("SGLANG_OPT_FUSE_WQA_WKV=0");
     }
     // SGLANG_ENABLE_SPEC_V2=1 was in allinone's _ENV_MTP for low-latency / balanced
     // recipes, but V4 auto-enables spec-v2 when MTP is detected — human confirmed
@@ -643,38 +714,71 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --max-running-requests 256");
       }
       if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
-    } else if (recipe === "cp") {
-      // allinone cp: TP (NO --dp) + DeepEP + _CP_FLAGS (mem-frac 0.78, max-run 1024).
-      //   Blackwell big additionally: mem-frac 0.70 (overrides), cg=256, max-run=256.
-      //   No flashinfer_mxfp4 even on Blackwell (allinone omits).
-      flags.push(`  --tp ${tp}`);
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      flags.push("  --moe-a2a-backend deepep");
+    }
+
+    // Context-Parallel feature toggle (layered on top of low-latency /
+    // balanced / max-throughput; not compatible with pd-disagg or Marlin).
+    //
+    // Why these specific edits — from validate_deepseek_v4_cp() at
+    // python/sglang/srt/arg_groups/deepseek_v4_hook.py:
+    //   * dp_size MUST equal 1 ("round-robin-split CP doesn't support DP attn")
+    //     → strip `--dp <N>` and `--enable-dp-attention` from the base recipe.
+    //     The hook re-enables DP-attention internally with dp_size=1 + attn_cp.
+    //   * attn_cp_size is auto-computed (= tp_size // dp_size = tp_size)
+    //     → DON'T pass `--attn-cp-size` here, the hook overrides it anyway.
+    //   * tp_size MUST be ≤ 8 — single-machine only. UI gates multinode big
+    //     variants via CP_UNSUPPORTED_HW_SIZE.
+    //
+    // The CP-only MoE backend is DeepEP — strip the low-latency
+    // `--moe-runner-backend flashinfer_mxfp4` and force `--moe-a2a-backend
+    // deepep` (matches PR #24934 reference run + the previous standalone
+    // cp recipe).
+    //
+    // mem-fraction-static is overridden to a CP-friendly value (CP prefill
+    // buffers are large): 0.88 for GB300 Pro (weights tight on 273 GB),
+    // else 0.78. chunked-prefill-size is overridden to 16384.
+    if (cp === "enabled") {
+      // Strip DP flags — round-robin-split requires dp_size=1.
+      const stripPrefixes = [
+        "  --dp ",
+        "  --moe-runner-backend ",
+        "  --disable-flashinfer-autotune",
+        "  --swa-full-tokens-ratio ",
+      ];
+      const stripExact = new Set([
+        "  --enable-dp-attention",
+      ]);
+      for (let i = flags.length - 1; i >= 0; i--) {
+        if (stripExact.has(flags[i]) || stripPrefixes.some((p) => flags[i].startsWith(p))) {
+          flags.splice(i, 1);
+        }
+      }
+      // Ensure DeepEP MoE a2a backend is present (replace flashinfer_mxfp4
+      // path or add to recipes that didn't already include it).
+      if (!flags.includes("  --moe-a2a-backend deepep")) {
+        flags.push("  --moe-a2a-backend deepep");
+      }
       flags.push("  --enable-nsa-prefill-context-parallel");
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
-      flags.push("  --chunked-prefill-size 16384");
-      // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
-      // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
-      // KV pool (init_memory_pool fails: "Not enough memory ... weights
-      // 224 GB > static target 213 GB"). 0.88 gives weights 224 + KV 16 +
-      // runtime 33. Other Blackwell tp=8 paths fit fine at 0.78.
-      // Verified on 2026-04-25 (journal 2026-04-25-001 Cell B, Δ4).
-      if (hardware === "gb300" && isBig) {
-        flags.push("  --mem-fraction-static 0.88");
+      // Replace any base-recipe --chunked-prefill-size with the CP target
+      // (16384). Base low-latency on Blackwell already emits 4096 / 8192;
+      // appending again would produce a duplicate flag where argparse's
+      // last-wins behavior masks the bug from runtime errors but leaves the
+      // generated command ugly.
+      const chunkedIdx = flags.findIndex((f) => f.startsWith("  --chunked-prefill-size "));
+      if (chunkedIdx !== -1) {
+        flags[chunkedIdx] = "  --chunked-prefill-size 16384";
       } else {
-        flags.push("  --mem-fraction-static 0.78");
+        flags.push("  --chunked-prefill-size 16384");
       }
-      // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
-      // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
-      // for big Blackwell, else the default 1024.
-      if (isBig && hardware !== "h200") {
-        flags.push("  --cuda-graph-max-bs 256");
-        flags.push("  --max-running-requests 256");
+      // Replace any base-recipe --mem-fraction-static with the CP override.
+      const cpMemFrac = hardware === "gb300" && isBig ? "0.88" : "0.78";
+      const memFracIdx = flags.findIndex((f) => f.startsWith("  --mem-fraction-static "));
+      if (memFracIdx !== -1) {
+        flags[memFracIdx] = `  --mem-fraction-static ${cpMemFrac}`;
       } else {
-        flags.push("  --max-running-requests 1024");
+        flags.push(`  --mem-fraction-static ${cpMemFrac}`);
       }
-      // H200 CP gates DEEPEP_LARGE_SMS_FLAG on !multinode; Blackwell always gets it.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
     }
 
     // Optional parsers (cookbook UI extension; not in allinone — opt-in toggles only).
