@@ -125,6 +125,7 @@ class CanaryRunner:
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
+            d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
         )
         self._health_and_stats = HealthAndStats(
@@ -185,6 +186,7 @@ class CanaryRunner:
         if self.config.mode == "off":
             return
 
+        self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
         any_rank_errored = self._pump_and_allreduce.pump_and_drain()
         self._health_and_stats.health_check_step()
