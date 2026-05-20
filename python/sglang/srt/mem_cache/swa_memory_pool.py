@@ -521,13 +521,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         """Allocate full KV for the whole extend and SWA KV only for the tail.
 
         This is used by disaggregated decode preallocation: decode receives full
         prompt KV for full-attention layers, but only the sliding-window state is
         transferred for SWA layers.
         """
+        self._kvcache.invalidate_loc_cache()  # mapping will be modified
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1
