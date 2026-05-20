@@ -5,12 +5,12 @@ import json
 import logging
 import time
 import uuid
-from enum import StrEnum
+from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 
-class ThinkingMode(StrEnum):
+class ThinkingMode(str, Enum):
     """Mode for message encoding - chat vs thinking/reasoning."""
 
     CHAT = "chat"
