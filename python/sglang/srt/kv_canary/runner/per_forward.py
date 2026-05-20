@@ -85,6 +85,7 @@ class PerForwardOrchestrator:
 
         self._write_req_capacity = write_req_capacity
         self._write_entry_capacity = write_entry_capacity
+        self._verify_capacity = max(1, per_forward_verify_capacity)
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
@@ -107,6 +108,17 @@ class PerForwardOrchestrator:
             f"write_entry_capacity={self._write_entry_capacity}; raise "
             f"--chunked-prefill-size / --max-prefill-tokens or check "
             f"install_canary._compute_launch_capacities"
+        )
+
+        # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
+        # group; if it exceeds verify_capacity the plan kernel masks stores past capacity while
+        # the kernel grid's tail threads still read up to active, OOB-loading verify_slot_indices.
+        # Fail fast host-side using the ForwardBatch CPU mirrors so it never reaches the kernel.
+        prefix_lens_sum = _sum_prefix_lens(forward_batch=forward_batch, bs=bs)
+        assert prefix_lens_sum <= self._verify_capacity, (
+            f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds pre-allocated "
+            f"per_forward_verify_capacity={self._verify_capacity}; raise the verify capacity in "
+            f"install_canary._compute_launch_capacities (or _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
         )
 
         self._perturb_hook.perturb_hook(forward_batch)
@@ -180,6 +192,22 @@ class PerForwardOrchestrator:
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 input_check_mode=self._config.input_check_mode,
             )
+
+
+def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
+    """Host-side sum of per-req prefix lens, matching the prefix_lens computed by
+    fill_plan_input_per_forward: extend → sum(extend_prefix_lens_cpu); decode → seq_lens_sum - bs.
+    The scheduler always populates these CPU mirrors, so this never triggers a D2H sync.
+    """
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is not None and forward_mode.is_extend():
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        assert extend_prefix_lens_cpu is not None, (
+            "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
+            "scheduler should populate it before forward"
+        )
+        return int(sum(extend_prefix_lens_cpu[:bs]))
+    return int(forward_batch.seq_lens_sum) - bs
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

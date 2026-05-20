@@ -58,20 +58,31 @@ def _make_pool(device, max_reqs: int = 4, max_seq: int = 8):
     return SimpleNamespace(req_to_token=table, size=max_reqs)
 
 
-def _make_forward_batch(device, bs: int = 2):
+def _make_forward_batch(device, bs: int = 2, seq_lens_list=(3, 4)):
+    seq_lens_list = list(seq_lens_list[:bs])
     return SimpleNamespace(
         forward_mode=SimpleNamespace(is_extend=lambda: False, is_mixed=lambda: False),
+        batch_size=bs,
         req_pool_indices=torch.tensor([1, 2][:bs], dtype=torch.int64, device=device),
-        seq_lens=torch.tensor([3, 4][:bs], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(seq_lens_list, dtype=torch.int32, device=device),
+        seq_lens_sum=int(sum(seq_lens_list)),
         extend_prefix_lens=None,
         extend_seq_lens=None,
+        extend_prefix_lens_cpu=None,
         input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
         positions=torch.zeros(bs, dtype=torch.int32, device=device),
         out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=device),
     )
 
 
-def _make_runner(*, device, config=None, group=None, req_pool=None):
+def _make_runner(
+    *,
+    device,
+    config=None,
+    group=None,
+    req_pool=None,
+    per_forward_verify_capacity: int = 16,
+):
     if config is None:
         config = CanaryConfig(
             mode=CanaryMode.RAISE, real_kv_hash_mode=RealKvHashMode.OFF
@@ -86,7 +97,7 @@ def _make_runner(*, device, config=None, group=None, req_pool=None):
         device=device,
         req_to_token_pool=req_pool,
         launch_capacities=CanaryLaunchCapacities(
-            per_forward_verify_capacity=4,
+            per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=2,
             per_forward_write_entry_capacity=8,
             sweep_verify_capacity=8,
@@ -260,6 +271,51 @@ class TestSelfUnitRunner(CustomTestCase):
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
+
+    def test_before_forward_asserts_when_sum_prefix_lens_exceeds_verify_capacity(self):
+        # Multi-req batch whose summed prefix lens exceeds any single req's length: with the old
+        # sizing (per_forward_verify_capacity = max_seq_len_per_req) this slipped past the plan
+        # kernel's silent cap_mask and OOB-read the verify kernel's tail threads.
+        runner = _make_runner(device=self.device, per_forward_verify_capacity=4)
+        # decode: sum(prefix_lens) = (5 - 1) + (5 - 1) = 8 > capacity=4
+        fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
+        with self.assertRaisesRegex(AssertionError, "sum\\(prefix_lens\\)=8"):
+            with runner.with_forward_pass(fb):
+                pass
+
+    def test_before_forward_passes_when_sum_prefix_lens_fits(self):
+        # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
+        runner = _make_runner(device=self.device, per_forward_verify_capacity=16)
+        fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
+        with runner.with_forward_pass(fb):
+            pass
+
+
+class TestComputeLaunchCapacities(CustomTestCase):
+    def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self):
+        from sglang.srt.kv_canary.api import _compute_launch_capacities
+
+        max_bs = 8
+        max_seq_len = 64
+        model_runner = SimpleNamespace(
+            server_args=SimpleNamespace(
+                cuda_graph_max_bs=max_bs,
+                speculative_num_draft_tokens=0,
+                chunked_prefill_size=None,
+                max_prefill_tokens=128,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                size=max_bs,
+                req_to_token=torch.zeros(max_bs, max_seq_len, dtype=torch.int32),
+            ),
+            max_total_num_tokens=max_bs * max_seq_len,
+        )
+        capacities = _compute_launch_capacities(model_runner=model_runner)
+        # Old buggy sizing was max_seq_len (= 64); new sizing must fit the full table extent so a
+        # multi-req batch with sum(prefix_lens) up to max_bs * max_seq_len never OOBs.
+        self.assertGreaterEqual(
+            capacities.per_forward_verify_capacity, max_bs * max_seq_len
+        )
 
 
 if __name__ == "__main__":

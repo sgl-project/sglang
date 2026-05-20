@@ -144,9 +144,19 @@ def _compute_launch_capacities(
         1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
     )
     max_seq_len_per_req = int(model_runner.req_to_token_pool.req_to_token.shape[1])
+    # Per-forward verify entries = sum_r (prefix_lens[r] - SWA_window_start[r]); the FULL group
+    # never clips with a window, so the upper bound is sum_r prefix_lens[r]. Under radix prefix
+    # sharing reqs can collectively reference more tokens than the pool holds, so the hard bound
+    # is the req_to_token table size (max_bs rows * max_seq_len_per_req cols), capped by the
+    # cuda-grid-safe ceiling. PerForwardOrchestrator.before_forward asserts the per-step actual
+    # sum stays within this capacity.
+    per_forward_verify_capacity_upper = max_bs * max_seq_len_per_req
 
     return CanaryLaunchCapacities(
-        per_forward_verify_capacity=max(1, max_seq_len_per_req),
+        per_forward_verify_capacity=max(
+            1,
+            min(per_forward_verify_capacity_upper, _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY),
+        ),
         per_forward_write_req_capacity=max(1, max_bs),
         per_forward_write_entry_capacity=write_entry_capacity,
         sweep_verify_capacity=max(
