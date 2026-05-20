@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
-
-if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
+from sglang.srt.kv_canary.violation_state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
 
@@ -14,12 +13,25 @@ _ON_MODE_VERBOSE_LIMIT: int = 10
 
 
 class ViolationReporter:
-    def __init__(self, *, owner: "CanaryRunner") -> None:
-        self._owner = owner
+    def __init__(
+        self,
+        *,
+        config: CanaryConfig,
+        device_state: CanaryDeviceState,
+        pump: PumpAndAllreduce,
+    ) -> None:
+        self._config = config
+        self._device_state = device_state
+        self._pump = pump
         self._on_mode_violations_logged: int = 0
+        self._raised: bool = False
+
+    @property
+    def is_raised(self) -> bool:
+        return self._raised
 
     def raise_violation(self) -> None:
-        violation_log = self._owner._device_state.violation_log
+        violation_log = self._device_state.violation_log
         write_index = int(violation_log.violation_write_index.cpu().item())
         if write_index == 0:
             return
@@ -29,16 +41,16 @@ class ViolationReporter:
             row=ring[0].tolist(),
             total=write_index,
             ring_overflow=ring_overflow,
-            step_when_pumped=self._owner._step_counter,
+            step_when_pumped=self._pump.step_counter,
         )
-        if self._owner.config.mode == "on":
+        if self._config.mode == "on":
             self._on_mode_violations_logged += 1
             if self._on_mode_violations_logged <= _ON_MODE_VERBOSE_LIMIT:
                 logger.warning(message)
             else:
                 logger.debug(message)
             return
-        self._owner._raised = True
+        self._raised = True
         raise RuntimeError(message)
 
 

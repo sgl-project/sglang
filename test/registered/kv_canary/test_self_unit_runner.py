@@ -15,6 +15,7 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
+from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import (
     CanaryLaunchCapacities,
     CanaryRunner,
@@ -88,7 +89,7 @@ def _make_runner(*, device, config=None, group=None, req_pool=None):
 
 def _stub_plan_and_kernels(monkeypatch):
     """Make plan / verify / write kernels no-op so CPU runs without CUDA jit."""
-    monkeypatch.setattr(runner_module, "canary_plan_step", lambda **kwargs: None)
+    monkeypatch.setattr(launch_module, "canary_plan_step", lambda **kwargs: None)
     monkeypatch.setattr(endpoint_module, "canary_verify_step", lambda **kwargs: None)
     monkeypatch.setattr(endpoint_module, "canary_write_step", lambda **kwargs: None)
 
@@ -96,7 +97,7 @@ def _stub_plan_and_kernels(monkeypatch):
 def test_per_forward_orchestrates_plan_head_tail(device, monkeypatch):
     calls: List = []
     monkeypatch.setattr(
-        runner_module,
+        launch_module,
         "canary_plan_step",
         lambda **kwargs: calls.append("plan"),
     )
@@ -140,15 +141,15 @@ def test_sweep_every_n_cadence(device, monkeypatch):
     runner.launch_head_kernels(fb)
 
     sweep_calls: List[int] = []
-    real_maybe = runner.maybe_run_sweep
+    real_maybe = runner._sweep.maybe_run_sweep
 
     def _spy():
-        before = runner._last_sweep_step
+        before = runner._sweep._last_sweep_step
         real_maybe()
-        if runner._last_sweep_step != before:
-            sweep_calls.append(runner._step_counter)
+        if runner._sweep._last_sweep_step != before:
+            sweep_calls.append(runner._pump._step_counter)
 
-    monkeypatch.setattr(runner, "maybe_run_sweep", _spy)
+    monkeypatch.setattr(runner._sweep, "maybe_run_sweep", _spy)
 
     for _ in range(12):
         runner.end_of_step()
@@ -176,11 +177,11 @@ def test_sweep_runs_radix_path(
 
     plan_calls: List[str] = []
     monkeypatch.setattr(
-        runner_module,
+        launch_module,
         "canary_plan_step",
         lambda **kwargs: plan_calls.append("plan"),
     )
-    runner.maybe_run_sweep()
+    runner._sweep.maybe_run_sweep()
     assert plan_calls.count("plan") >= 1
 
 
@@ -202,7 +203,7 @@ def test_cross_rank_allreduce_lockstep_raise(device, monkeypatch):
     runner = _make_runner(device=device, config=config)
 
     fake_group = SimpleNamespace(device_group=object())
-    runner._tp_group = fake_group
+    runner._pump._tp_group = fake_group
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
@@ -223,10 +224,10 @@ def test_cross_rank_allreduce_lockstep_raise(device, monkeypatch):
 def test_kernel_run_counter_watchdog_raises_on_zero(device, monkeypatch):
     _stub_plan_and_kernels(monkeypatch)
     runner = _make_runner(device=device)
-    runner._step_counter = 1000
+    runner._pump._step_counter = 1000
     runner._device_state.kernel_run_counters.zero_()
     with pytest.raises(RuntimeError):
-        runner.health_check_step()
+        runner._health.health_check_step()
 
 
 def test_runner_disabled_short_circuits(device, monkeypatch):
@@ -236,7 +237,7 @@ def test_runner_disabled_short_circuits(device, monkeypatch):
 
     plan_calls: List[str] = []
     monkeypatch.setattr(
-        runner_module,
+        launch_module,
         "canary_plan_step",
         lambda **kwargs: plan_calls.append("plan"),
     )
@@ -244,7 +245,7 @@ def test_runner_disabled_short_circuits(device, monkeypatch):
     runner.before_forward(fb)
     runner.launch_head_kernels(fb)
     runner.launch_tail_kernels(fb)
-    runner.maybe_run_sweep()
+    runner._sweep.maybe_run_sweep()
     runner.end_of_step()
     assert plan_calls == []
 
@@ -264,8 +265,8 @@ def test_periodic_stats_log_every_n_step(device, monkeypatch, caplog):
 
     with caplog.at_level(logging.INFO, logger=runner_module.logger.name):
         for _ in range(10):
-            runner._print_periodic_stats()
-            runner._step_counter += 1
+            runner._health.print_periodic_stats()
+            runner._pump._step_counter += 1
     log_text = caplog.text
     assert "protected_tokens=" in log_text
     assert "step=5" in log_text or "step=10" in log_text
@@ -331,7 +332,7 @@ def test_sweep_path_detects_chain_mismatch(
         "canary_verify_step",
         lambda **kwargs: sweep_kernel_kinds.append(kwargs["kernel_kind"].name),
     )
-    runner.maybe_run_sweep()
+    runner._sweep.maybe_run_sweep()
     assert any("SWEEP" in k for k in sweep_kernel_kinds)
 
 
@@ -343,7 +344,7 @@ def test_runner_raises_when_other_rank_errored_but_local_clean(device, monkeypat
         allreduce_violation_signal=True,
     )
     runner = _make_runner(device=device, config=config)
-    runner._tp_group = SimpleNamespace(device_group=object())
+    runner._pump._tp_group = SimpleNamespace(device_group=object())
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
@@ -357,6 +358,6 @@ def test_runner_raises_when_other_rank_errored_but_local_clean(device, monkeypat
     torch.distributed.all_reduce(
         runner._device_state.allreduce_buf,
         op=torch.distributed.ReduceOp.MAX,
-        group=runner._tp_group.device_group,
+        group=runner._pump._tp_group.device_group,
     )
     assert int(runner._device_state.allreduce_buf.item()) == 1

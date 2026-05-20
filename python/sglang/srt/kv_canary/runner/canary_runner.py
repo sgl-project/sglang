@@ -3,29 +3,21 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
 from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
-from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
-from sglang.srt.kv_canary.runner.jitter import JitterRunner, JitterSlot
-from sglang.srt.kv_canary.runner.per_forward import (
-    PerForwardOrchestrator,
-    _endpoint_belongs_to_group,
-    _is_sweep_tag,
-)
+from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
@@ -40,17 +32,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# sglang's KV pool reserves slot 0 as the padded-output sink (memory_pool.py: free_slots starts at 1) and
-# zero-initializes req_to_token. Unfilled positions therefore read as slot 0; treating it as a verify
-# sentinel keeps canary launches from producing spurious chain_hash/position violations on those entries.
-_PAD_SENTINEL_SLOT: int = 0
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryLaunchCapacities:
     """Pre-allocation sizes for the per-forward and sweep tensors a CanaryRunner owns. Computed
     once at install_canary from ServerArgs + ModelRunner metadata; all four fields are upper
-    bounds — actual per-step usage may be smaller but never larger.
+    bounds - actual per-step usage may be smaller but never larger.
 
     Fields:
         per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
@@ -71,21 +58,9 @@ class CanaryLaunchCapacities:
 
 class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
-    until server shutdown.
-
-    Internal state (private — never touched outside this class):
-        config: CanaryConfig
-        device_state: CanaryDeviceState
-        groups: tuple[CanaryBufferGroup, ...]  # one entry per group (FULL, optional SWA)
-        endpoints: tuple[CanaryEndpoint, ...]
-        verify_plan_per_forward / write_plan_per_forward: VerifyPlan / WritePlan sized for
-            per-forward capacity.
-        plan_input_per_forward: PlanInput with STATIC per-forward fb_* buffers (allocated once,
-            mutated in place by before_forward each step).
-        verify_plan_sweep_radix / write_plan_sweep: sized for sweep capacity (= total pool
-            slots).
-        step_counter: int, host-side, bumped per forward.
-        last_sweep_step: int, host-side.
+    until server shutdown. The runner itself is a thin facade; per-concern state and behavior
+    live on the component classes (PumpAndAllreduce, SweepOrchestrator, ViolationReporter,
+    PerturbHook, PerForwardOrchestrator, HealthAndStats).
     """
 
     def __init__(
@@ -104,9 +79,7 @@ class CanaryRunner:
     ) -> None:
         self.config = config
         self._device = device
-        self._tp_group = tp_group
         self._req_to_token_pool = req_to_token_pool
-        self._radix_cache = radix_cache
         self._swa_window_size = int(swa_window_size)
 
         if buffer_groups is not None:
@@ -138,12 +111,6 @@ class CanaryRunner:
             )
         self._endpoints: tuple[CanaryEndpoint, ...] = tuple(endpoints)
 
-        self._step_counter: int = 0
-        self._last_sweep_step: int = -1
-        self._sweep_passes: int = 0
-        self._raised: bool = False
-        self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
-
         active: set[CanaryLaunchTag] = set()
         for endpoint in self._endpoints:
             active.add(endpoint.kernel_kind)
@@ -151,39 +118,80 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
+        self._pump = PumpAndAllreduce(
+            config=config,
+            device=device,
+            device_state=self._device_state,
+            tp_group=tp_group,
+        )
+        self._sweep = SweepOrchestrator(
+            config=config,
+            device=device,
+            device_state=self._device_state,
+            groups=self._groups,
+            endpoints=self._endpoints,
+            req_to_token_pool=req_to_token_pool,
+            swa_window_size=self._swa_window_size,
+            sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
+            pump=self._pump,
+        )
+        self._violation = ViolationReporter(
+            config=config,
+            device_state=self._device_state,
+            pump=self._pump,
+        )
+        self._perturb = PerturbHook(
+            config=config,
+            req_to_token_pool=req_to_token_pool,
+            groups=self._groups,
+        )
         self._per_forward = PerForwardOrchestrator(
-            owner=self,
+            config=config,
+            device=device,
+            device_state=self._device_state,
+            groups=self._groups,
+            endpoints=self._endpoints,
+            req_to_token_pool=req_to_token_pool,
+            swa_window_size=self._swa_window_size,
+            perturb=self._perturb,
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
         )
-        self._sweep = SweepOrchestrator(
-            owner=self,
-            sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
+        self._health = HealthAndStats(
+            config=config,
+            device=device,
+            device_state=self._device_state,
+            active_tags=self._active_tags,
+            pump=self._pump,
+            sweep=self._sweep,
         )
-        self._pump = PumpAndAllreduce(owner=self)
-        self._violation = ViolationReporter(owner=self)
-        self._perturb = PerturbHook(owner=self)
-        self._health = HealthAndStats(owner=self)
-        self._jitter: Optional[JitterRunner] = (
-            JitterRunner(config=config.jitter_config, device=device)
-            if config.jitter_config.enabled and config.mode != "off"
-            else None
-        )
+
+        if radix_cache is not None:
+            self.attach_radix_cache(radix_cache)
 
     @property
     def active_tag_count(self) -> int:
         return len(self._active_tags)
 
+    @property
+    def step_counter(self) -> int:
+        return self._pump.step_counter
+
+    @property
+    def sweep_passes(self) -> int:
+        return self._sweep.sweep_passes
+
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
-        self._radix_cache = radix_cache
+        self._sweep.attach_radix_cache(radix_cache)
+        self._perturb.attach_radix_cache(radix_cache)
 
     def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
         """Bind the OracleSamplerHook returned by install_oracle_sampler so the per-forward
         input-check path (input_check_mode == ON) can fill expected_input_* tensors from the
         same oracle that drives sampling.
         """
-        self._oracle_sampler_hook = hook
+        self._per_forward.attach_oracle_sampler_hook(hook)
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
@@ -210,26 +218,16 @@ class CanaryRunner:
         region. Prefer ``with_forward_pass`` over calling this + ``end_of_step`` directly.
         """
         self._per_forward.before_forward(forward_batch)
-        if self._jitter is not None:
-            self._jitter.randomize_for_next_step()
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
-        ``model.forward`` — kernels here are captured into the cuda graph.
+        ``model.forward`` - kernels here are captured into the cuda graph.
         """
-        if self._jitter is not None:
-            self._jitter.launch_slot(slot=JitterSlot.PRE_HEAD)
         self._per_forward.launch_head_kernels(forward_batch)
-        if self._jitter is not None:
-            self._jitter.launch_slot(slot=JitterSlot.POST_HEAD)
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
-        if self._jitter is not None:
-            self._jitter.launch_slot(slot=JitterSlot.POST_ATTN)
         self._per_forward.launch_tail_kernels(forward_batch)
-        if self._jitter is not None:
-            self._jitter.launch_slot(slot=JitterSlot.POST_TAIL)
 
     def end_of_step(self) -> None:
         """Sweep + async D2H pump + step bump + drain previous pump + allreduce + raise.
@@ -240,114 +238,11 @@ class CanaryRunner:
         if self.config.mode == "off":
             return
 
-        self.maybe_run_sweep()
-
+        self._sweep.maybe_run_sweep()
         any_rank_errored = self._pump.pump_and_drain()
-
-        self.health_check_step()
-        self._print_periodic_stats()
-
+        self._health.health_check_step()
+        self._health.print_periodic_stats()
         self._perturb.undo_after_step()
 
-        if any_rank_errored and not self._raised:
-            self._raise_violation()
-
-    def maybe_run_sweep(self) -> None:
-        self._sweep.maybe_run_sweep()
-
-    def _raise_violation(self) -> None:
-        self._violation.raise_violation()
-
-    def health_check_step(self) -> None:
-        self._health.health_check_step()
-
-    def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        self._perturb.perturb_hook(forward_batch)
-
-    def _perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        self._perturb.perturb_real_kv_hook(forward_batch)
-
-    def _print_periodic_stats(self) -> None:
-        self._health.print_periodic_stats()
-
-    def _invoke_plan(
-        self,
-        *,
-        plan_input: PlanInput,
-        verify_plan: VerifyPlan,
-        write_plan: WritePlan,
-        group: CanaryBufferGroup,
-    ) -> None:
-        window = self._swa_window_size if group.kind is PoolKind.SWA else 0
-        canary_plan_step(
-            verify_plan_out=verify_plan,
-            write_plan_out=write_plan,
-            fb_req_pool_indices=plan_input.fb_req_pool_indices,
-            fb_prefix_lens=plan_input.fb_prefix_lens,
-            fb_extend_seq_lens=plan_input.fb_extend_seq_lens,
-            req_to_token=self._req_to_token_pool.req_to_token,
-            extra_verify_slot_indices=plan_input.extra_verify_slot_indices,
-            extra_verify_positions=plan_input.extra_verify_positions,
-            extra_verify_prev_slot_indices=plan_input.extra_verify_prev_slot_indices,
-            extra_verify_num_valid=plan_input.extra_verify_num_valid,
-            swa_window_size=window,
-            full_to_swa_index_mapping=group.swa_index_lut,
-        )
-
-    def _launch_endpoints(
-        self,
-        *,
-        group: CanaryBufferGroup,
-        tag_filter: Callable[[CanaryLaunchTag], bool],
-        verify_plan: VerifyPlan,
-        forward_batch: Optional["ForwardBatch"],
-    ) -> None:
-        violation_log = self._device_state.violation_log
-        positions: Optional[torch.Tensor] = None
-        out_cache_loc: Optional[torch.Tensor] = None
-        input_ids: Optional[torch.Tensor] = None
-        if forward_batch is not None:
-            positions = forward_batch.positions
-            if positions.dtype != torch.int32:
-                positions = positions.to(torch.int32)
-            out_cache_loc = forward_batch.out_cache_loc
-            if out_cache_loc is not None and out_cache_loc.dtype != torch.int32:
-                out_cache_loc = out_cache_loc.to(torch.int32)
-            input_ids = forward_batch.input_ids
-            if input_ids is not None and input_ids.dtype != torch.int32:
-                input_ids = input_ids.to(torch.int32)
-
-        for endpoint in self._endpoints:
-            if not _endpoint_belongs_to_group(endpoint, group):
-                continue
-            if not tag_filter(endpoint.kernel_kind):
-                continue
-            if _is_sweep_tag(endpoint.kernel_kind):
-                endpoint.launch_sweep(
-                    verify_plan=verify_plan,
-                    violation_log=violation_log,
-                    real_kv_hash_mode=self.config.real_kv_hash_mode,
-                    pad_sentinel_slot=_PAD_SENTINEL_SLOT,
-                )
-                continue
-            assert forward_batch is not None and positions is not None
-            num_tokens = int(positions.shape[0])
-            expected_tokens_slice = self._per_forward._expected_input_tokens[
-                :num_tokens
-            ]
-            expected_positions_slice = self._per_forward._expected_input_positions[
-                :num_tokens
-            ]
-            endpoint.launch_per_forward(
-                verify_plan=verify_plan,
-                write_plan=self._per_forward._write_plan_per_forward,
-                fb_input_ids=input_ids,
-                fb_positions=positions,
-                fb_out_cache_loc=out_cache_loc,
-                input_check_mode=self.config.input_check_mode,
-                expected_input_tokens=expected_tokens_slice,
-                expected_input_positions=expected_positions_slice,
-                violation_log=violation_log,
-                real_kv_hash_mode=self.config.real_kv_hash_mode,
-                pad_sentinel_slot=_PAD_SENTINEL_SLOT,
-            )
+        if any_rank_errored and not self._violation.is_raised:
+            self._violation.raise_violation()

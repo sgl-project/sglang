@@ -8,11 +8,19 @@ from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode as CanaryInputCheckMode
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
+from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
+from sglang.srt.kv_canary.runner.launch import (
+    invoke_plan,
+    launch_endpoints_per_forward,
+)
+from sglang.srt.kv_canary.runner.perturb import PerturbHook
+from sglang.srt.kv_canary.violation_state import CanaryDeviceState
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -34,13 +42,26 @@ class PerForwardOrchestrator:
     def __init__(
         self,
         *,
-        owner: "CanaryRunner",
+        config: CanaryConfig,
+        device: torch.device,
+        device_state: CanaryDeviceState,
+        groups: tuple[CanaryBufferGroup, ...],
+        endpoints: tuple[CanaryEndpoint, ...],
+        req_to_token_pool: "ReqToTokenPool",
+        swa_window_size: int,
+        perturb: PerturbHook,
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
     ) -> None:
-        self._owner = owner
-        device = owner._device
+        self._config = config
+        self._device_state = device_state
+        self._groups = groups
+        self._endpoints = endpoints
+        self._req_to_token_pool = req_to_token_pool
+        self._swa_window_size = swa_window_size
+        self._perturb = perturb
+        self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=max(1, per_forward_verify_capacity), device=device
@@ -76,17 +97,19 @@ class PerForwardOrchestrator:
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
+    def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
+        self._oracle_sampler_hook = hook
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
-        owner = self._owner
-        if owner.config.mode == "off":
+        if self._config.mode == "off":
             return
 
-        owner._perturb.perturb_hook(forward_batch)
-        owner._perturb.perturb_real_kv_hook(forward_batch)
+        self._perturb.perturb_hook(forward_batch)
+        self._perturb.perturb_real_kv_hook(forward_batch)
         self._last_forward_batch = forward_batch
 
-        if owner.config.input_check_mode == CanaryInputCheckMode.ON:
-            hook = owner._oracle_sampler_hook
+        if self._config.input_check_mode == CanaryInputCheckMode.ON:
+            hook = self._oracle_sampler_hook
             if hook is None:
                 raise RuntimeError(
                     "kv-canary: input_check_mode=ON requires an OracleSamplerHook; call "
@@ -105,35 +128,51 @@ class PerForwardOrchestrator:
         )
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
-        owner = self._owner
-        if owner.config.mode == "off":
+        if self._config.mode == "off":
             return
 
-        for group in owner._groups:
-            owner._invoke_plan(
+        violation_log = self._device_state.violation_log
+        for group in self._groups:
+            invoke_plan(
                 plan_input=self._plan_input_per_forward,
                 verify_plan=self._verify_plan_per_forward,
                 write_plan=self._write_plan_per_forward,
                 group=group,
+                req_to_token=self._req_to_token_pool.req_to_token,
+                swa_window_size=self._swa_window_size,
             )
-            owner._launch_endpoints(
+            launch_endpoints_per_forward(
+                endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_head_tag,
                 verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
+                expected_input_tokens=self._expected_input_tokens,
+                expected_input_positions=self._expected_input_positions,
+                violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
+                input_check_mode=self._config.input_check_mode,
             )
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
-        owner = self._owner
-        if owner.config.mode == "off":
+        if self._config.mode == "off":
             return
 
-        for group in owner._groups:
-            owner._launch_endpoints(
+        violation_log = self._device_state.violation_log
+        for group in self._groups:
+            launch_endpoints_per_forward(
+                endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_tail_tag,
                 verify_plan=self._verify_plan_per_forward,
+                write_plan=self._write_plan_per_forward,
                 forward_batch=forward_batch,
+                expected_input_tokens=self._expected_input_tokens,
+                expected_input_positions=self._expected_input_positions,
+                violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
+                input_check_mode=self._config.input_check_mode,
             )
 
 
@@ -153,19 +192,3 @@ def _is_tail_tag(tag: CanaryLaunchTag) -> bool:
         CanaryLaunchTag.TAIL_K_SWA,
         CanaryLaunchTag.TAIL_V_SWA,
     )
-
-
-def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
-    return tag in (
-        CanaryLaunchTag.SWEEP_K_FULL,
-        CanaryLaunchTag.SWEEP_V_FULL,
-        CanaryLaunchTag.SWEEP_K_SWA,
-        CanaryLaunchTag.SWEEP_V_SWA,
-    )
-
-
-def _endpoint_belongs_to_group(
-    endpoint: CanaryEndpoint, group: CanaryBufferGroup
-) -> bool:
-    suffix = endpoint.kernel_kind.name.rsplit("_", 1)[1]
-    return suffix == group.kind.name
