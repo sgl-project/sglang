@@ -7,10 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_SLOT_BYTES,
-    RealKvSource,
-)
+from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
@@ -230,40 +227,6 @@ def make_real_kv_source(
         page_size=page_size,
         num_bytes_per_token=num_bytes_per_token,
         read_bytes=read_bytes,
-    )
-
-
-def make_buffer_group(
-    device: torch.device = CPU_DEVICE,
-    *,
-    kind: PoolKind = PoolKind.FULL,
-    num_slots: int = 16,
-    has_v_half: bool = True,
-    real_kv_sources_k: tuple = (),
-    real_kv_sources_v: tuple = (),
-    swa_index_lut: Optional[torch.Tensor] = None,
-) -> CanaryBufferGroup:
-    k_head = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-    k_tail = torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-    v_head = (
-        torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-        if has_v_half
-        else None
-    )
-    v_tail = (
-        torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-        if has_v_half
-        else None
-    )
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=k_head,
-        k_tail=k_tail,
-        v_head=v_head,
-        v_tail=v_tail,
-        real_kv_sources_k=real_kv_sources_k,
-        real_kv_sources_v=real_kv_sources_v,
-        swa_index_lut=swa_index_lut,
     )
 
 

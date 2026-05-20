@@ -9,7 +9,6 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
 )
 
 FUZZ_SEEDS_PR: list[int] = [0]
-FUZZ_SEEDS_NIGHTLY: list[int] = list(range(10))
 
 
 def check_repro(inputs: Any, *, run_one_fn: Callable[[Any], Any]) -> bool:
