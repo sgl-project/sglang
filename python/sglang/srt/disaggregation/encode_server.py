@@ -308,6 +308,12 @@ class MMEncoder:
                     )
 
             self.embedding_to_send = dict()
+            # Defect C: serialize (send_pyobj to rank>0 + await rank0 encode) so
+            # NCCL launch order on rank0 matches the dispatch order rank>0 sees on
+            # ZMQ. Without this lock, two concurrent /encode coroutines can interleave
+            # at the `await _process_mm_items` yield point and reorder NCCL ops,
+            # causing rank>0 communicator-init `store->get` to time out and hang.
+            self.encode_dispatch_lock = asyncio.Lock()
 
             # Async mooncake state: track background VIT forward completion
             if self.server_args.encoder_transfer_backend == "mooncake":
@@ -1419,12 +1425,34 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # Register src GPU buffer, push to prefill server's pre-registered landing buffer, then deregister
-            self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            self.engine.transfer_sync(
-                session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
+            # Defect G: MR was registered once in _run_forward; here we just
+            # transfer. Skip per-/send register/deregister to eliminate the
+            # rkey-invalidation race between concurrent sibling-TP /sends.
+            mr_already_registered = (
+                self._forward_results.get(req_id, {}).get("mr_ptr")
+                == embedding.data_ptr()
             )
-            self.engine.deregister(embedding.data_ptr())
+            _t0 = time.monotonic()
+            if not mr_already_registered:
+                # Fallback path (Defect G register-once failed) — old behavior.
+                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            _t1 = time.monotonic()
+            await asyncio.to_thread(
+                self.engine.transfer_sync,
+                session_id,
+                embedding.data_ptr(),
+                buffer_address,
+                embedding.nbytes,
+            )
+            _t2 = time.monotonic()
+            if not mr_already_registered:
+                self.engine.deregister(embedding.data_ptr())
+            _t3 = time.monotonic()
+            logger.info(
+                f"[{req_id}] mooncake _send timing: register={(_t1-_t0)*1000:.1f}ms "
+                f"transfer_sync={(_t2-_t1)*1000:.1f}ms deregister={(_t3-_t2)*1000:.1f}ms "
+                f"nbytes={embedding.nbytes} mr_shared={mr_already_registered}"
+            )
 
             mm_data.embedding = None
 
@@ -1437,7 +1465,13 @@ class MMEncoder:
 
         # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
-            serialized_data = pickle.dumps(mm_data)
+            # Mooncake already pushed the embedding via RDMA; the ack only carries
+            # metadata. Use copy_without_embedding (which also drops cached_embedding)
+            # instead of mutating the shared mm_data — multiple sibling TP-rank /send
+            # coroutines read cached_embedding concurrently, so clearing on the live
+            # object is a race. Cleanup is centralized in _cleanup_inflight_encode_state.
+            new_mm_data = mm_data.copy_without_embedding()
+            serialized_data = pickle.dumps(new_mm_data)
             buffer = None
         else:
             new_mm_data = mm_data.copy_without_embedding()
@@ -1580,7 +1614,19 @@ class MMEncoder:
         mm_data = self.embedding_to_send.pop(req_id, None)
         if mm_data is not None:
             mm_data.cached_embedding = None
-        self._forward_results.pop(req_id, None)
+        # Defect G: deregister the MR that was registered once in _run_forward.
+        # All /send calls for this req have completed (we're in cleanup), so
+        # it's safe to release the rkey now.
+        forward_state = self._forward_results.pop(req_id, None)
+        if forward_state is not None:
+            mr_ptr = forward_state.get("mr_ptr")
+            if mr_ptr is not None:
+                try:
+                    self.engine.deregister(mr_ptr)
+                except Exception as dereg_err:
+                    logger.warning(
+                        f"Defect G deregister failed for {req_id}: {dereg_err}"
+                    )
         self._forward_ready_events.pop(req_id, None)
 
     def _schedule_inflight_encode_cleanup(self, req_id: str):
@@ -1636,6 +1682,23 @@ class MMEncoder:
                         if len(emb.shape) != 2:
                             emb = emb.reshape(-1, emb.shape[-1])
                     if self.rank == 0:
+                        # Defect G: register MR once here so all sibling-TP /send
+                        # coroutines share a single registration. Before this,
+                        # each /send did register/transfer/deregister on the
+                        # SAME mm_data.cached_embedding ptr, racing on the 4
+                        # concurrent /send paths (TP fan-out). First /send's
+                        # deregister invalidated rkey for slices still in-flight
+                        # on the other 3 transfers, producing 1000+ "local
+                        # protection error" entries per concurrent 4k request.
+                        try:
+                            self.engine.register(emb.data_ptr(), emb.nbytes)
+                            self._forward_results[req_id]["mr_ptr"] = emb.data_ptr()
+                        except Exception as reg_err:
+                            logger.warning(
+                                f"Defect G register-once failed for {req_id}, "
+                                f"falling back to per-/send register: {reg_err}"
+                            )
+                            self._forward_results[req_id]["mr_ptr"] = None
                         self._forward_results[req_id]["embedding"] = emb
                         logger.info(
                             f"VIT forward completed for {req_id}, " f"shape={emb.shape}"
@@ -1964,20 +2027,22 @@ async def handle_encode_request(request: dict):
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request
-        request.update({"enter_time": time.time()})
-        for socket in send_sockets:
-            socket.send_pyobj(request)
-        nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-            await encoder._encode_fn(
-                mm_items=request["mm_items"],
-                modality=Modality.from_str(request["modality"]),
-                req_id=request["req_id"],
-                num_parts=request["num_parts"],
-                part_idx=request["part_idx"],
-                hashes=request.get("hashes", None),
+        # broadcast request — Defect C: lock together with rank0 await so NCCL
+        # launch order matches the ZMQ dispatch order rank>0 sees.
+        async with encoder.encode_dispatch_lock:
+            request.update({"enter_time": time.time()})
+            for socket in send_sockets:
+                socket.send_pyobj(request)
+            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                await encoder._encode_fn(
+                    mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                    hashes=request.get("hashes", None),
+                )
             )
-        )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":

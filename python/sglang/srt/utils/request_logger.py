@@ -206,8 +206,13 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
-                    "lora_path",
-                    "sampling_params",
+                    # EPD-mooncake side-channel byte payloads — same scale as
+                    # image_data (megabytes per image). Without this skip,
+                    # log_received_request stringifies the full base64 URLs and
+                    # blocks the master event loop ~500ms per 4×4k request.
+                    "mm_data_mooncake",
+                    # "lora_path",
+                    # "sampling_params",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
@@ -219,6 +224,7 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
+                    "mm_data_mooncake",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
@@ -252,9 +258,25 @@ def _dataclass_to_string_truncated(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
+            head = ", ".join(
+                _dataclass_to_string_truncated(v, max_length, skip_names)
+                for v in data[:half_length]
+            )
+            tail = ", ".join(
+                _dataclass_to_string_truncated(v, max_length, skip_names)
+                for v in data[-half_length:]
+            )
+            return f"[{head} ... {tail}]"
+        # Recurse so a short list containing huge strings/dicts gets each element
+        # truncated (e.g. mm_data_mooncake = 4 dicts × 4MB base64 URL → ~530ms
+        # log-stringify cost before this fix).
+        return (
+            "["
+            + ", ".join(
+                _dataclass_to_string_truncated(v, max_length, skip_names) for v in data
+            )
+            + "]"
+        )
     elif isinstance(data, dict):
         return (
             "{"

@@ -447,6 +447,23 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
+        # Normalize device across chunks before concat. In language_only EPD,
+        # finished requests' precomputed_embeddings get offloaded to CPU
+        # (this file's offload block) so chunked-prefill can reload them
+        # without keeping all images on GPU. When a continuing request (CPU
+        # chunk) is batched with a newly arrived request (GPU chunk from
+        # mooncake RDMA), torch.concat raises a device-mismatch RuntimeError.
+        # Pick the first cuda chunk's device if any; otherwise the first
+        # chunk's device. The .to() is non_blocking and effectively free
+        # vs the H2D required later for forward.
+        target_device = next(
+            (t.device for t in precomputed_embeddings if t.is_cuda),
+            precomputed_embeddings[0].device,
+        )
+        precomputed_embeddings = [
+            t if t.device == target_device else t.to(target_device, non_blocking=True)
+            for t in precomputed_embeddings
+        ]
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -1087,6 +1104,25 @@ def general_mm_embed_routine(
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda
                                 ):
+                                    # Opt-in skip for mooncake pool-owned items.
+                                    # When the tensor is a view of the persistent
+                                    # MooncakeLandingPool, offload→reload via
+                                    # .to(cpu)/.to(cuda) burns ~1GB PCIe per
+                                    # chunk-prefill transition without freeing
+                                    # real memory (pool is allocated regardless).
+                                    # Gated off by default — enabling needs a
+                                    # large pool (SGLANG_EMBEDDING_POOL_SIZE_MB)
+                                    # AND enough free GPU budget to hold all
+                                    # in-flight mm_items concurrently. For 4×4k
+                                    # at n=2 with mem-fraction-static=0.65, the
+                                    # extra GPU residency OOMs at the concat in
+                                    # _get_precomputed_embedding. For 4×1080p
+                                    # at n=2, opting in saves ~100ms TTFT.
+                                    if (
+                                        getattr(mm_item, "pool_owned", False)
+                                        and envs.SGLANG_MOONCAKE_KEEP_DEVICE.get()
+                                    ):
+                                        continue
                                     mm_item.precomputed_embeddings = (
                                         precomputed_embeddings.to(
                                             "cpu", non_blocking=True

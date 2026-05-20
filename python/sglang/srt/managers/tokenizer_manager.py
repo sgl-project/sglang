@@ -537,7 +537,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
-            self._handle_epd_disaggregation_encode_request(obj)
+            await self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -793,8 +793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             elif (
                 self.server_args.language_only
-                and self.server_args.encoder_transfer_backend
-                in ["zmq_to_scheduler", "mooncake"]
+                and self.server_args.encoder_transfer_backend in ["zmq_to_scheduler"]
                 and not obj.need_wait_for_mm_inputs
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
@@ -2659,7 +2658,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         return total_mm_items >= envs.SGLANG_ENCODER_DISPATCH_MIN_ITEMS.get()
 
-    def _handle_epd_disaggregation_encode_request(
+    async def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""

@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -182,7 +182,10 @@ class EmbeddingData:
             error_code=self.error_code,
         )
         for key, value in self.__dict__.items():
-            if key.startswith("_") or key == "embedding":
+            # cached_embedding is a GPU tensor used only by mooncake's in-process
+            # /send sharing; it must never appear in serialized data (would trigger
+            # a 67 MB D2H copy per ack).
+            if key.startswith("_") or key in ("embedding", "cached_embedding"):
                 continue
             setattr(new_data, key, value)
         return new_data
@@ -468,6 +471,7 @@ class WaitingImageRequest:
         self.start_time = time.time()
 
     def send_encode_request(self):
+
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:
@@ -671,6 +675,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         dtype,
         gpu_id=0,
         model_type: Optional[str] = None,
+        landing_pool=None,
     ):
         super().__init__(
             rid,
@@ -685,6 +690,11 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.dtype = dtype
         self.gpu_id = gpu_id
         self.embeddings_buffer = None
+        # Pre-registered landing pool (MooncakeLandingPool). When set, skip per-request
+        # register/deregister so encoder's openSegment cache hits across requests.
+        self.landing_pool = landing_pool
+        self._buffer_from_pool = False
+        self._pool_slot_id: Optional[int] = None
 
     def send_encode_request(self):
         self._encode_thread = threading.Thread(
@@ -750,7 +760,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
-            # Phase 1: POST /encode → get metadata immediately
+            # Phase 1: POST /encode to all encoder shards in parallel.
             tasks = [
                 session.post(
                     f"{self.encoder_urls[r['encoder_idx']]}/encode",
@@ -761,7 +771,6 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             if not await self._check_encoder_responses(responses, "/encode"):
                 return
-
             response_json_list = [await r.json() for r in responses]
 
             # Sort by part_idx
@@ -771,27 +780,60 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 )
             )
 
-            # Phase 2: Pre-allocate and register GPU landing buffer with Mooncake engine
-            # (encode server will write embeddings directly to this address via GPU-direct transfer)
+            # Phase 2: Pre-allocate GPU landing buffer.
+            # Prefer the pre-registered persistent pool when available; this avoids
+            # per-request register/deregister and keeps the encoder's openSegment
+            # cache warm (cold open costs ~7s on first call). When the pool is
+            # full alloc() blocks on a Condition until a peer releases a slot;
+            # see MooncakeLandingPool.
             if total_bytes > 0:
-                gpu_buffer = torch.empty(
-                    total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
-                )
-                self.embeddings_engine.register(
-                    gpu_buffer.data_ptr(), gpu_buffer.nbytes
-                )
-                self.embeddings_buffer = gpu_buffer
-                buffer_address = gpu_buffer.data_ptr()
-
-                logger.info(
-                    f"Pre-allocated Mooncake GPU landing buffer: "
-                    f"rid={self.rid}, size={total_bytes}, addr={buffer_address}"
-                )
+                if self.landing_pool is not None:
+                    alloc_result = await asyncio.to_thread(
+                        self.landing_pool.alloc, total_bytes
+                    )
+                    if alloc_result is None:
+                        # Either the request exceeds pool capacity outright, or
+                        # the wait timed out. Both are fatal for this request
+                        # — fall through to error handling.
+                        self.status = WaitingImageRequestStatus.FAIL
+                        self.error_msg = (
+                            f"MooncakeLandingPool could not allocate "
+                            f"{total_bytes // (1024 * 1024)}MB (oversize or "
+                            f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
+                        )
+                        self.recv_socket.close()
+                        return
+                    pool_view, buffer_address, slot_id = alloc_result
+                    self.embeddings_buffer = pool_view
+                    self._buffer_from_pool = True
+                    self._pool_slot_id = slot_id
+                    logger.info(
+                        f"Pool-allocated Mooncake GPU landing buffer: "
+                        f"rid={self.rid}, size={total_bytes}, "
+                        f"addr={buffer_address}, slot={slot_id}"
+                    )
+                else:
+                    gpu_buffer = torch.empty(
+                        total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                    )
+                    self.embeddings_engine.register(
+                        gpu_buffer.data_ptr(), gpu_buffer.nbytes
+                    )
+                    self.embeddings_buffer = gpu_buffer
+                    buffer_address = gpu_buffer.data_ptr()
+                    self._buffer_from_pool = False
+                    logger.info(
+                        f"Per-request registered Mooncake GPU landing buffer "
+                        f"(pool disabled): rid={self.rid}, size={total_bytes}, "
+                        f"addr={buffer_address}"
+                    )
             else:
                 self.embeddings_buffer = None
                 buffer_address = 0
 
-            # Phase 2 cont: POST /send with RDMA info
+            # Phase 2 cont: POST /send with RDMA info. Scheduler owns the ZMQ
+            # ack endpoint (per-TP-rank), so embedding_port / prefill_host are
+            # filled in here, not on the master.
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
@@ -801,6 +843,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     {
                         "session_id": self.embeddings_engine.session_id,
                         "buffer_address": offset + buffer_address,
+                        "embedding_port": self.embedding_port,
+                        "prefill_host": self.host_name,
                     }
                 )
                 send_tasks.append(
@@ -912,6 +956,18 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        # Mark mm_items as pool-owned so mm_utils chunked-prefill offload skips
+        # the precomputed_embeddings.to("cpu") round-trip. The slices reference
+        # the persistent MooncakeLandingPool and stay valid for the lifetime of
+        # the request; CPU offload+reload would burn ~1GB PCIe per chunk × N
+        # chunks × N items without freeing any real memory (pool is allocated
+        # regardless).
+        if self._buffer_from_pool and mm_inputs is not None:
+            for item in getattr(mm_inputs, "mm_items", []) or []:
+                try:
+                    setattr(item, "pool_owned", True)
+                except Exception:
+                    pass
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
@@ -921,6 +977,14 @@ class WaitingImageRDMARequest(WaitingImageRequest):
     def _cleanup_gpu_buffer(self):
         """Deregister and release the GPU buffer."""
         if self.embeddings_buffer is not None:
+            # Pool-backed views share the pre-registered backing tensor; just
+            # release the slot back to the pool so a queued alloc can proceed.
+            if self._buffer_from_pool:
+                if self._pool_slot_id is not None and self.landing_pool is not None:
+                    self.landing_pool.release(self._pool_slot_id)
+                    self._pool_slot_id = None
+                self.embeddings_buffer = None
+                return
             try:
                 self.embeddings_engine.deregister(self.embeddings_buffer.data_ptr())
             except Exception:
@@ -938,6 +1002,133 @@ def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts)
         response_sorted[idx] = rj
     total_bytes = sum(s for s in embedding_sizes if s is not None)
     return embedding_sizes, response_sorted, total_bytes
+
+
+class MooncakeLandingPool:
+    """Persistent GPU buffer pool registered once with the Mooncake engine.
+
+    Eliminates per-request register/deregister and keeps the encoder's
+    openSegment cache warm — first openSegment costs ~7s, subsequent
+    transfers reuse the same pool address and hit cache.
+
+    Allocator: first-fit on a free-segment list with 256-byte alignment.
+    `alloc()` blocks on a Condition when the pool is full and resumes once
+    a peer `release()`s a slot. Each successful alloc returns a slot_id
+    that must be passed back to release() when the consumer is done with
+    the buffer (after RDMA write completes and the data has been read).
+    """
+
+    _ALIGN = 256
+
+    def __init__(self, engine, gpu_id: int, size_bytes: int):
+        self.engine = engine
+        self.gpu_id = gpu_id
+        self.size_bytes = size_bytes
+        self.buffer = torch.empty(
+            size_bytes, dtype=torch.uint8, device=f"cuda:{gpu_id}"
+        )
+        self.base = self.buffer.data_ptr()
+        self.engine.register(self.base, self.buffer.nbytes)
+        self._segments_free: List[Tuple[int, int]] = [(0, size_bytes)]
+        self._inflight: Dict[int, Tuple[int, int]] = {}
+        self._next_slot_id = 0
+        self._total_inflight = 0
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        logger.info(
+            f"MooncakeLandingPool registered: gpu={gpu_id}, "
+            f"size={size_bytes // (1024 * 1024)}MB, base=0x{self.base:x}"
+        )
+
+    def alloc(
+        self, nbytes: int, timeout: float = 60.0
+    ) -> Optional[Tuple[torch.Tensor, int, int]]:
+        """Allocate `nbytes` from the pool.
+
+        Returns ``(tensor_view, gpu_addr, slot_id)`` on success, or ``None``
+        when (a) the request is bigger than the pool itself or (b) the wait
+        for a free slot exceeds ``timeout`` seconds. On (a) this is a
+        permanent configuration error — bump ``SGLANG_EMBEDDING_POOL_SIZE_MB``.
+
+        When the pool is full of in-flight slots, this call blocks the
+        calling thread on a Condition until a peer ``release()`` opens
+        enough contiguous space.
+        """
+        if nbytes > self.size_bytes:
+            logger.error(
+                f"MooncakeLandingPool: requested {nbytes // (1024 * 1024)}MB "
+                f"exceeds pool capacity {self.size_bytes // (1024 * 1024)}MB. "
+                f"Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
+            )
+            return None
+        aligned = (nbytes + self._ALIGN - 1) & ~(self._ALIGN - 1)
+        deadline = time.monotonic() + timeout
+        warned = False
+        with self._cond:
+            while True:
+                slot = self._try_alloc_locked(nbytes, aligned)
+                if slot is not None:
+                    return slot
+                if not warned:
+                    inflight_mb = self._total_inflight // (1024 * 1024)
+                    cap_mb = self.size_bytes // (1024 * 1024)
+                    logger.warning(
+                        f"MooncakeLandingPool full: "
+                        f"{inflight_mb}/{cap_mb}MB in-flight across "
+                        f"{len(self._inflight)} requests; queueing a "
+                        f"{nbytes // (1024 * 1024)}MB request. Raise "
+                        f"SGLANG_EMBEDDING_POOL_SIZE_MB if this is frequent."
+                    )
+                    warned = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        f"MooncakeLandingPool alloc timed out after "
+                        f"{timeout}s waiting for {nbytes // (1024 * 1024)}MB."
+                    )
+                    return None
+                self._cond.wait(timeout=remaining)
+
+    def _try_alloc_locked(
+        self, nbytes: int, aligned: int
+    ) -> Optional[Tuple[torch.Tensor, int, int]]:
+        for i, (off, length) in enumerate(self._segments_free):
+            if length >= aligned:
+                if length == aligned:
+                    self._segments_free.pop(i)
+                else:
+                    self._segments_free[i] = (off + aligned, length - aligned)
+                slot_id = self._next_slot_id
+                self._next_slot_id += 1
+                self._inflight[slot_id] = (off, aligned)
+                self._total_inflight += aligned
+                view = self.buffer[off : off + nbytes]
+                return view, self.base + off, slot_id
+        return None
+
+    def release(self, slot_id: int) -> None:
+        """Return a previously-allocated slot to the free list and wake any
+        blocked alloc() waiters."""
+        with self._cond:
+            seg = self._inflight.pop(slot_id, None)
+            if seg is None:
+                return
+            off, aligned = seg
+            self._total_inflight -= aligned
+            self._coalesce_free_locked(off, aligned)
+            self._cond.notify_all()
+
+    def _coalesce_free_locked(self, off: int, length: int) -> None:
+        self._segments_free.append((off, length))
+        self._segments_free.sort()
+        merged: List[Tuple[int, int]] = []
+        for s_off, s_len in self._segments_free:
+            if merged and merged[-1][0] + merged[-1][1] == s_off:
+                p_off, p_len = merged[-1]
+                merged[-1] = (p_off, p_len + s_len)
+            else:
+                merged.append((s_off, s_len))
+        self._segments_free = merged
 
 
 def _slice_embedding_buffer(raw_buffer, embedding_data, dtype):
@@ -1014,6 +1205,22 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
+            # Persistent landing pool: register once, reuse across requests so
+            # the encoder's openSegment lookup hits cache (~7s -> ~0ms).
+            self.landing_pool = None
+            pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
+            if pool_mb and pool_mb > 0 and scheduler is not None:
+                gpu_id = getattr(scheduler, "gpu_id", 0)
+                try:
+                    self.landing_pool = MooncakeLandingPool(
+                        self.embeddings_engine, gpu_id, pool_mb * 1024 * 1024
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to allocate MooncakeLandingPool, "
+                        "falling back to per-request register"
+                    )
+                    self.landing_pool = None
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
@@ -1510,6 +1717,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=gpu_id,
+                landing_pool=self.landing_pool,
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
