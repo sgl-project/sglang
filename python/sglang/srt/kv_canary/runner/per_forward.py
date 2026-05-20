@@ -199,7 +199,9 @@ def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
     The scheduler always populates these CPU mirrors, so this never triggers a D2H sync.
     """
     forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend(include_draft_extend_v2=True):
+    if forward_mode is not None and forward_mode.is_extend(
+        include_draft_extend_v2=True
+    ):
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         if extend_prefix_lens_cpu is None:
             raise RuntimeError(

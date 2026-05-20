@@ -73,9 +73,6 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        """Call canary_verify_step then canary_write_step against this endpoint's canary_buf. Both use
-        the shared violation_log. Used by head and tail endpoints; sweep endpoints raise NotImplementedError.
-        """
         if _is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_per_forward not supported on sweep endpoint {self.kernel_kind.name}"
@@ -132,9 +129,6 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        """Call only canary_verify_step against this endpoint's canary_buf. Used by sweep endpoints;
-        head/tail endpoints raise NotImplementedError.
-        """
         if not _is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_sweep not supported on non-sweep endpoint {self.kernel_kind.name}"

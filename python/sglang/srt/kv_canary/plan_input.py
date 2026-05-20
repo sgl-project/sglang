@@ -131,7 +131,9 @@ def fill_plan_input_per_forward(
     # TODO: extend_prefix_lens / extend_seq_lens (and DRAFT_EXTEND_V2's separate forward_mode) are being refactored
     # upstream; once the unified per-req prefix/extend lens are guaranteed populated for every forward mode, collapse
     # this branch into a single unconditional copy.
-    if forward_mode is not None and forward_mode.is_extend(include_draft_extend_v2=True):
+    if forward_mode is not None and forward_mode.is_extend(
+        include_draft_extend_v2=True
+    ):
         plan_input_out.fb_prefix_lens[:bs].copy_(
             forward_batch.extend_prefix_lens.to(torch.int32)
         )
