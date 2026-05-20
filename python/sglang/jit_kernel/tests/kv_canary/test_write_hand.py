@@ -23,7 +23,10 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_and_assert_write_buf_and_state_equal as _run_both_and_assert_buf_and_state_equal,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write as _run_both
-from sglang.jit_kernel.tests.kv_canary._fixtures import _dummy_pseudo_tensors
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    _dummy_pseudo_tensors,
+    clone_real_kv_sources,
+)
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -76,15 +79,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
     fb_out_cache_loc = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
     sources_cuda = case.real_kv_sources
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in case.real_kv_sources
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
     _run_both_and_assert_buf_and_state_equal(
@@ -685,15 +680,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
 def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
     cuda_buf, ref_buf = _setup_pair()
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     plan_cuda = make_write_plan(
         write_offsets=[0, 3], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
@@ -740,15 +727,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
     cuda_buf, ref_buf = _setup_pair()
     sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     plan_cuda = make_write_plan(
         write_offsets=[0, 2], seed_slot_indices=[-1], num_valid_reqs=1, device=_DEVICE
@@ -1496,15 +1475,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
         num_slots=16,
         device=_DEVICE,
     )
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     slot_indices = [1, 2, 3, 4, 5]
     tokens = [11, 22, 33, 44, 55]
@@ -1693,15 +1664,7 @@ def test_paged_real_kv_hash_consistent_across_slots() -> None:
         num_slots=16,
         device=_DEVICE,
     )
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     plan_cuda = make_write_plan(
         write_offsets=[0, 2],

@@ -28,6 +28,7 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_verify as _run_both,
 )
+from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
@@ -132,15 +133,7 @@ def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
             real_kv_hash=case.stored_real_kv_hash_signed,
         )
     sources_cuda = case.real_kv_sources
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in case.real_kv_sources
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
     plan_cuda = make_verify_plan(
         slot_indices=[1],
         positions=[case.position],
@@ -467,15 +460,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
     """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=1, device=_DEVICE)
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     # Step: write a chain with real_kv_hash mixin, then mutate one byte in the source tensors so the next
     # verify reconstructs a hash that differs from the stored one.
@@ -597,15 +582,7 @@ def test_real_kv_mode_off_yields_zero() -> None:
 def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     # Write a chain through the ref so both buffers are byte-equal post-write.
     write_plan = make_write_plan(
@@ -683,15 +660,7 @@ def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     """Fold ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     write_plan = make_write_plan(
         write_offsets=[0, 2],
@@ -877,14 +846,7 @@ def test_real_kv_source_holey_dim1() -> None:
     # Fill those skipped trailing bytes with garbage; CUDA must not read them.
     holey_source.tensor[:, 8:].fill_(0xAA)
     sources = (holey_source,)
-    sources_ref = (
-        RealKvSource(
-            tensor=holey_source.tensor.clone(),
-            page_size=holey_source.page_size,
-            num_bytes_per_token=holey_source.num_bytes_per_token,
-            read_bytes=holey_source.read_bytes,
-        ),
-    )
+    sources_ref = clone_real_kv_sources(sources)
 
     write_plan = make_write_plan(
         write_offsets=[0, 2],
@@ -967,14 +929,7 @@ def test_page_size_gt_1_access_pattern() -> None:
             flat_index = row * (src.page_size * src.num_bytes_per_token) + col + k
             flat[flat_index] = (slot_idx * 13 + k) & 0xFF
     sources = (src,)
-    sources_ref = (
-        RealKvSource(
-            tensor=src.tensor.clone(),
-            page_size=src.page_size,
-            num_bytes_per_token=src.num_bytes_per_token,
-            read_bytes=src.read_bytes,
-        ),
-    )
+    sources_ref = clone_real_kv_sources(sources)
 
     write_plan = make_write_plan(
         write_offsets=[0, 2],
@@ -1527,14 +1482,7 @@ def test_violation_bit_injection_position_ring_state_matrix(
             real_kv_hash_mode=RealKvHashMode.ALL,
         )
         ref_buf.copy_(cuda_buf)
-        sources_ref = (
-            RealKvSource(
-                tensor=sources_cuda[0].tensor.clone(),
-                page_size=sources_cuda[0].page_size,
-                num_bytes_per_token=sources_cuda[0].num_bytes_per_token,
-                read_bytes=sources_cuda[0].read_bytes,
-            ),
-        )
+        sources_ref = clone_real_kv_sources(sources_cuda)
 
         sources_cuda[0].tensor[corrupt_slot, 0] ^= 0xFF
         sources_ref[0].tensor.copy_(sources_cuda[0].tensor)
@@ -2009,15 +1957,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
         num_slots=32,
         device=_DEVICE,
     )
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     slot_indices = [1, 2, 3]
     tokens = [100, 200, 300]
@@ -2109,15 +2049,7 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
         )
 
     sources_cuda[0].tensor[slot_idx, 0] ^= 1
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     plan_cuda = make_verify_plan(
         slot_indices=[slot_idx],
@@ -2164,15 +2096,7 @@ def test_paged_layout_page_size_16() -> None:
         num_slots=64,
         device=_DEVICE,
     )
-    sources_ref = tuple(
-        RealKvSource(
-            tensor=s.tensor.clone(),
-            page_size=s.page_size,
-            num_bytes_per_token=s.num_bytes_per_token,
-            read_bytes=s.read_bytes,
-        )
-        for s in sources_cuda
-    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     # Step: cross a page boundary by writing slots [15, 16] which straddle pages 0 and 1.
     slot_indices = [15, 16]
