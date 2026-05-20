@@ -139,7 +139,11 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            contents = [
+                TextContent(text=(text_prefix if i == 0 else "") + c.get("text", ""))
+                for i, c in enumerate(content)
+                if c.get("type") in ("text", "input_text")
+            ]
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]
