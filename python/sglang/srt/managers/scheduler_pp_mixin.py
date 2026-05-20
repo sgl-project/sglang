@@ -531,7 +531,7 @@ class SchedulerPPMixin:
         #   would mix non-identical data and produce incorrect results.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
-            and self.server_args.moe_a2a_backend == "none"
+            and self.server_args.moe_a2a_backend == "deepep"
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
