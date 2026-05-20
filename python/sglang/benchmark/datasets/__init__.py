@@ -10,6 +10,7 @@ from sglang.benchmark.datasets.image import ImageDataset
 from sglang.benchmark.datasets.longbench_v2 import LongBenchV2Dataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
+from sglang.benchmark.datasets.multimodal import MultimodalDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
 from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
@@ -27,6 +28,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
+    "multimodal": MultimodalDataset,
     "longbench_v2": LongBenchV2Dataset,
 }
 
