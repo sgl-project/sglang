@@ -13,6 +13,13 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -134,18 +141,6 @@ def _jit_compress_module(
             ("prefill", f"{kernel_class}::run_prefill"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
-def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
-    args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
-    kernel_class = f"RMSNormKernel<{args}>"
-    return load_jit(
-        make_name("rmsnorm_head"),
-        *args,
-        cuda_files=["deepseek_v4/rmsnorm.cuh"],
-        cuda_wrappers=[("run_self", f"{kernel_class}::run_self")],
     )
 
 
@@ -657,6 +652,23 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
+    """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
+
+    Args:
+        q: [batch_size, num_q_heads, rope_dim] bfloat16
+        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
+        freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
+        positions: [batch_size] int32 or int64, indices into freqs_cis
+        inverse: if True, apply inverse rotation (conjugate freqs)
+    """
+    if _is_hip:
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+        return
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
@@ -953,16 +965,6 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(
-    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    if out is None:
-        out = q.new_empty(q.shape)
-    module.run_self(q, out, eps)
-    return out
-
-
 @cache_once
 def _jit_torch_cublas_bf16_fp32() -> Any:
     import torch.utils.cpp_extension
@@ -1042,5 +1044,7 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=torch.float32)
     else:
         return torch.nn.functional.linear(x.float(), y.float())

@@ -1758,6 +1758,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+        ):
+            w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
+            w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
+
         # Create shared parameters
         copy_or_rebind_param(
             layer,
@@ -2075,7 +2082,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            ensure_cutedsl_wrapper(layer)
+            ensure_cutedsl_wrapper(layer, dispatch_output.hidden_states.shape[0])
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -2175,6 +2182,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            no_combine=moe_runner_config.no_combine,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
