@@ -484,9 +484,13 @@ class ModelRunnerKVCacheMixin:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
+                max_total_num_tokens = self.max_total_num_tokens
+                if self.kv_cache_pruning_config is not None:
+                    # override the default (maximum) size with user-specified value
+                    max_total_num_tokens = min(self.max_total_num_tokens, self.kv_cache_pruning_config["kv_cache_size"])
 
                 self.token_to_kv_pool = NPUMHATokenToKVPool(
-                    self.max_total_num_tokens,
+                    max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -805,6 +809,15 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, user_limit)
 
+        if self.kv_cache_pruning_config is not None:
+            kv_cache_size = self.kv_cache_pruning_config["kv_cache_size"]
+            if kv_cache_size > token_capacity:
+                logging.warning(
+                    f"kv_cache_size={kv_cache_size} is larger than the capacity "
+                    f"{token_capacity}. Using the capacity instead."
+                )
+                self.kv_cache_pruning_config["kv_cache_size"] = token_capacity
+            
         # Sync across PP ranks (each may have different layer counts)
         if self.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
