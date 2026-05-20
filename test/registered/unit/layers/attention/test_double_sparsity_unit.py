@@ -3637,5 +3637,250 @@ class TestR5Coverage(unittest.TestCase):
         self.assertEqual(int(physical_page_table_1[1, 0].item()), 101)
 
 
+class TestR6Coverage(unittest.TestCase):
+    """R6 closes AC-2 real-consumer probe, AC-8 metadata field, AC-9
+    set_finish_with_abort wire-in.
+    """
+
+    def test_set_finish_with_abort_on_ds_row_error(self):
+        """AC-9: when the per-request summary carries an error_class,
+        the scheduler calls req.set_finish_with_abort so the request
+        returns a non-2xx response.
+        """
+        # Build a minimal scheduler self-stand-in that hosts the new
+        # method via .__func__. We use the mixin method directly with a
+        # synthesized req object that exposes set_finish_with_abort.
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            SchedulerOutputProcessorMixin,
+        )
+
+        req = SimpleNamespace(
+            customized_info={"double_sparsity": [{"sparsity_rate": 0.5}]},
+            per_request_summary=None,
+            rid="rid-failed-1",
+            to_finish=None,
+        )
+        # Track set_finish_with_abort calls.
+        abort_calls = []
+
+        def _set_finish_with_abort(error_msg):
+            abort_calls.append(error_msg)
+            req.to_finish = SimpleNamespace(error_msg=error_msg)
+
+        req.set_finish_with_abort = _set_finish_with_abort
+
+        logits_output = SimpleNamespace(
+            per_request_summary={
+                "double_sparsity": [
+                    {
+                        "sparsity_rate": 0.0,
+                        "selected_pages": 0,
+                        "dense_fallback": 1,
+                        "error_class": "DSAdapterPageOutOfRange",
+                        "error_message": "row 0: out of range",
+                    }
+                ]
+            }
+        )
+
+        # Call the unbound mixin method with `self=None`.
+        SchedulerOutputProcessorMixin.maybe_collect_per_request_summary(
+            None, 0, req, logits_output
+        )
+
+        # Assertions: abort fired with typed error class in the message;
+        # partial customized_info DS namespace was cleared.
+        self.assertEqual(len(abort_calls), 1)
+        self.assertIn("DSAdapterPageOutOfRange", abort_calls[0])
+        self.assertIn("out of range", abort_calls[0])
+        self.assertNotIn("double_sparsity", req.customized_info)
+
+    def test_set_finish_with_abort_skipped_for_normal_summary(self):
+        """AC-9: normal (non-error) per-request summaries do NOT trigger
+        an abort; the request proceeds as usual.
+        """
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            SchedulerOutputProcessorMixin,
+        )
+
+        req = SimpleNamespace(
+            customized_info={"double_sparsity": [{"x": 1}]},
+            per_request_summary=None,
+            rid="rid-ok",
+            to_finish=None,
+        )
+        abort_calls = []
+
+        def _set_finish_with_abort(error_msg):
+            abort_calls.append(error_msg)
+            req.to_finish = SimpleNamespace(error_msg=error_msg)
+
+        req.set_finish_with_abort = _set_finish_with_abort
+
+        logits_output = SimpleNamespace(
+            per_request_summary={
+                "double_sparsity": [
+                    {
+                        "sparsity_rate": 0.7,
+                        "selected_pages": 12,
+                        "dense_fallback": 0,
+                    }
+                ]
+            }
+        )
+        SchedulerOutputProcessorMixin.maybe_collect_per_request_summary(
+            None, 0, req, logits_output
+        )
+        self.assertEqual(abort_calls, [])
+        self.assertEqual(
+            req.per_request_summary["double_sparsity"],
+            {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0},
+        )
+
+    def test_nsametadata_has_ds_topk_indices_out_field(self):
+        """AC-8: NSAMetadata exposes the DS-owned output buffer field
+        with a None default for non-DS configurations.
+        """
+        from sglang.srt.layers.attention.nsa_backend import NSAMetadata
+
+        # The field exists on the dataclass.
+        self.assertIn("ds_topk_indices_out", NSAMetadata.__dataclass_fields__)
+        # Default is None so non-DS configs are unaffected.
+        field = NSAMetadata.__dataclass_fields__["ds_topk_indices_out"]
+        self.assertIsNone(field.default)
+
+    def test_forward_decode_dispatches_to_flashmla_kv(self):
+        """AC-2 real-consumer probe.
+
+        Construct `NativeSparseAttnBackend` via `object.__new__`, set the
+        minimal attributes its `flashmla_kv` dispatch branch reads, patch
+        the instance's `_forward_flashmla_kv`, and call `forward_decode`.
+        Assert the real method is invoked exactly once with the
+        DS-expanded page_table_1 (post-transform).
+        """
+        import os
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.nsa_backend import (
+            NativeSparseAttnBackend,
+            NSAMetadata,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            expand_ds_selection_to_topk_indices,
+        )
+
+        bs = 1
+        max_top_k = 2048
+        max_seqlen_k = 1024
+        head_dim = 64
+        v_head_dim = 64
+        tp_q_head_num = 4
+
+        # Build DS topk_indices via the adapter.
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)
+        vl = torch.tensor([2], dtype=torch.int32)
+        topk = expand_ds_selection_to_topk_indices(
+            selected_indices=sel,
+            valid_lengths=vl,
+            page_size=64,
+        )
+
+        # Synthetic page table: token_pos → page_id 100 + (token_pos // 64).
+        page_table_1 = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
+        for token_pos in range(max_seqlen_k):
+            page_table_1[:, token_pos] = (token_pos // 64) + 100
+
+        metadata = NSAMetadata(
+            page_size=1,
+            cache_seqlens_int32=torch.tensor([128], dtype=torch.int32),
+            max_seq_len_q=1,
+            max_seq_len_k=max_seqlen_k,
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 128], dtype=torch.int32),
+            page_table_1=page_table_1,
+            real_page_table=page_table_1,
+            nsa_cache_seqlens_int32=torch.tensor([2], dtype=torch.int32),
+            nsa_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            nsa_cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
+            nsa_extend_seq_lens_list=[1],
+            nsa_seqlens_expanded=torch.tensor([2], dtype=torch.int32),
+        )
+
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.nsa_decode_impl = "flashmla_kv"
+        backend.use_mha = False
+        backend.forward_metadata = metadata
+        backend.enable_double_sparsity = True
+        # `_pad_topk_indices` shape passthrough — keep the DS-expanded
+        # tensor as-is.
+        backend._pad_topk_indices = lambda topk, _qn: topk
+
+        kv_cache = torch.zeros(bs, max_seqlen_k, head_dim, dtype=torch.float32)
+
+        layer = SimpleNamespace(
+            tp_q_head_num=tp_q_head_num,
+            v_head_dim=v_head_dim,
+            head_dim=head_dim,
+            layer_id=0,
+            scaling=1.0,
+            is_cross_attention=False,
+        )
+
+        forward_batch = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda layer_id: kv_cache,
+                set_mla_kv_buffer=lambda *args, **kwargs: None,
+            ),
+            hisparse_coordinator=None,
+            out_cache_loc=None,
+            encoder_out_cache_loc=None,
+        )
+
+        # Patch the instance's `_forward_flashmla_kv` to capture args.
+        call_records = []
+
+        def _capture(**kwargs):
+            call_records.append(kwargs)
+            return torch.zeros(bs, tp_q_head_num, v_head_dim)
+
+        backend._forward_flashmla_kv = _capture
+
+        # Prevent the SGLANG_NSA_FUSE_TOPK env from short-circuiting the
+        # transform: force `page_table_1 = transform_index_page_table_decode(...)`
+        # path. The env var is False by default.
+        with patch.dict(os.environ, {"SGLANG_NSA_FUSE_TOPK": "0"}):
+            # Call forward_decode with q_rope=None so q_all is pre-built;
+            # k=v=None and save_kv_cache=False skip the KV-write block.
+            q = torch.zeros(
+                bs, tp_q_head_num * head_dim, dtype=torch.float32
+            )
+            backend.forward_decode(
+                q=q,
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=False,
+                topk_indices=topk,
+            )
+
+        # Exactly one call to the patched real method.
+        self.assertEqual(len(call_records), 1)
+        kwargs = call_records[0]
+        # The post-transform physical page_table_1 should match what
+        # transform_index_page_table_decode would produce from `topk` and
+        # the synthetic page_table_1.
+        from sglang.srt.layers.attention.nsa.transform_index import (
+            transform_index_page_table_decode,
+        )
+        expected_physical = transform_index_page_table_decode(
+            page_table=page_table_1,
+            topk_indices=topk,
+            page_size=1,
+        )
+        self.assertTrue(torch.equal(kwargs["page_table_1"], expected_physical))
+
+
 if __name__ == "__main__":
     unittest.main()

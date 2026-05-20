@@ -211,16 +211,27 @@ class SchedulerOutputProcessorMixin:
                 continue
             req.per_request_summary[k] = entry
 
-            # If the DS row was sanitized, clear the partial per-token
-            # accumulator for this request's DS namespace so the request
-            # does not surface mixed pre-failure and post-failure stats.
+            # If the DS row was sanitized, abort that single request via
+            # the existing scheduler error-finish path. Siblings in the
+            # same batch continue; the failed request returns a non-2xx
+            # response with the typed error class as the reason. Clear
+            # the partial per-token DS accumulator so the abort response
+            # does not surface stale pre-failure stats.
             if (
                 k == "double_sparsity"
                 and isinstance(entry, dict)
                 and entry.get("error_class")
-                and req.customized_info is not None
             ):
-                req.customized_info.pop("double_sparsity", None)
+                if req.customized_info is not None:
+                    req.customized_info.pop("double_sparsity", None)
+                error_class = entry.get("error_class", "DSAdapterError")
+                error_message = entry.get("error_message", "")
+                # Avoid double-aborting if some other path already marked
+                # the request finished with an error.
+                if getattr(req, "to_finish", None) is None:
+                    req.set_finish_with_abort(
+                        f"Double Sparsity {error_class}: {error_message}"
+                    )
 
     def process_batch_result_prefill(
         self: Scheduler,

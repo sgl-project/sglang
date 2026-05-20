@@ -157,6 +157,13 @@ class NSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # Double Sparsity output buffer (preallocated by init_forward_metadata
+    # when DS is enabled). The DS adapter writes the expanded topk_indices
+    # into this buffer in-place so the captured path stays
+    # allocation-free. Shape: int32 [bs, max_top_k=2048]. None when DS is
+    # not in use.
+    ds_topk_indices_out: Optional[torch.Tensor] = None
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -337,6 +344,28 @@ class NativeSparseAttnBackend(
             model_runner.server_args.nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        # Cache the DS enable flag so init_forward_metadata can allocate
+        # the DS adapter's out buffer without re-checking server_args
+        # every batch.
+        self.enable_double_sparsity: bool = bool(
+            getattr(
+                model_runner.server_args, "enable_double_sparsity", False
+            )
+        )
+        self.ds_max_top_k: int = 2048
+        if self.enable_double_sparsity:
+            try:
+                from sglang.srt.layers.attention.double_sparsity.config import (
+                    parse_double_sparsity_config,
+                )
+
+                ds_cfg = parse_double_sparsity_config(
+                    model_runner.server_args.double_sparsity_config
+                )
+                self.ds_max_top_k = int(ds_cfg.top_k)
+            except Exception:
+                # Fall back to the canonical V3.2 default.
+                self.ds_max_top_k = 2048
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -667,6 +696,14 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
+        ds_topk_indices_out = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (int(forward_batch.batch_size), self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -698,8 +735,14 @@ class NativeSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            ds_topk_indices_out=ds_topk_indices_out,
         )
         self.forward_metadata = metadata
+        if ds_topk_indices_out is not None:
+            # Expose the metadata-owned buffer on forward_batch so
+            # `_select_topk_indices` can write into it via `out=` without
+            # per-step allocation.
+            forward_batch.ds_topk_indices_out = ds_topk_indices_out
 
     def _cal_indexer_k_start_end(
         self,
