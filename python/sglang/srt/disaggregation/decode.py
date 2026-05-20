@@ -954,7 +954,7 @@ class DecodePreallocQueue:
                     window_kv_indices_swa.cpu().numpy(), page_size
                 )
 
-            def _nsa_payload():
+            def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
@@ -971,8 +971,8 @@ class DecodePreallocQueue:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
-                    state_indices.append(_nsa_payload())
+                elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)
 

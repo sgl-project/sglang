@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
 )
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
@@ -37,7 +37,7 @@ else:
         )
 
 
-class HiSparseNSATokenToKVPool(NSATokenToKVPool):
+class HiSparseDSATokenToKVPool(DSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -143,7 +143,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseNSATokenToKVPool,
+        kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):
