@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.fused_rope_hadamard import fused_rope_hadamard
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
@@ -85,6 +86,11 @@ from sglang.srt.server_args import get_global_server_args
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+logger = logging.getLogger(__name__)
+
+# Logged once per process, on the first call that takes the fused fast path.
+_FUSED_ROPE_HAD_FIRST_HIT_LOGGED: bool = False
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
@@ -263,6 +269,56 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # Static eligibility for the fused RoPE+Hadamard JIT kernel.
+        # Combines into one launch the chain
+        #   rotary_emb (q + k)  →  Hadamard(q)  →  Hadamard(k).
+        # The kernel's internal asserts require:
+        #   - kHeadDim is a power of 2 in [32, 256] (kWorkThreads in [4, 32])
+        #   - kRopeDim divisible by 2 * (16 / sizeof(DType)); for bf16/fp16 that is 16
+        #   - neox-style RoPE
+        # Runtime checks the dtype is bf16/fp16 and the device is CUDA / non-fnuz FP8.
+        # Both neox and non-neox RoPE are supported; the kernel branches on
+        # `is_neox` at compile time and is templated separately per JIT-cache key.
+        self._fused_rope_had_eligible = (
+            _is_cuda
+            and not _is_fp8_fnuz
+            and self.head_dim in (32, 64, 128, 256)
+            and 0 < self.rope_head_dim <= self.head_dim
+            and self.rope_head_dim % 16 == 0
+        )
+        # Log once per process (gate on layer_id==0) so we can confirm at server
+        # startup whether the fast path is reachable for this model config.
+        if self.layer_id == 0:
+            rope_neox = bool(getattr(self.rotary_emb, "is_neox_style", is_neox_style))
+            if self._fused_rope_had_eligible:
+                logger.info(
+                    "[NSA] fused_rope_hadamard fast path ELIGIBLE "
+                    "(head_dim=%d, rope_head_dim=%d, neox=%s); "
+                    "JIT compile happens on the first forward.",
+                    self.head_dim,
+                    self.rope_head_dim,
+                    rope_neox,
+                )
+            else:
+                reasons = []
+                if not _is_cuda:
+                    reasons.append("not CUDA")
+                if _is_fp8_fnuz:
+                    reasons.append("FP8-fnuz device")
+                if self.head_dim not in (32, 64, 128, 256):
+                    reasons.append(f"head_dim={self.head_dim} unsupported")
+                if not (0 < self.rope_head_dim <= self.head_dim):
+                    reasons.append(f"rope_head_dim={self.rope_head_dim} out of range")
+                if self.rope_head_dim % 16 != 0:
+                    reasons.append(
+                        f"rope_head_dim={self.rope_head_dim} not divisible by 16"
+                    )
+                logger.info(
+                    "[NSA] fused_rope_hadamard fast path DISABLED, "
+                    "falling back to (rotary_emb + Hadamard×2): %s",
+                    "; ".join(reasons) if reasons else "unknown",
+                )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -364,6 +420,67 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
+        # Fused fast path: one launch that does RoPE on the rope-half + the
+        # kHeadDim-wide Hadamard on the full per-head row, in place on q and k.
+        # Replaces the (rotary_emb + 2× _update_rope_guarded + 2× rotate_activation)
+        # chain. See sglang/jit_kernel/csrc/elementwise/fused_rope_hadamard.cuh.
+        if self._fused_rope_had_eligible and query.dtype == torch.bfloat16:
+            # `key` comes out of `self.wk(x) → self.k_norm(...)` as 2-D `[L, head_dim]`
+            # (MQA, single kv head). The fused kernel's TensorMatcher requires a
+            # 3-D layout `[L, num_kv_heads, head_dim]`, so reshape to a same-storage
+            # 3-D view here. Mutations through `key_3d` are visible on `key`.
+            key_3d = key.view(key.size(0), 1, self.head_dim)
+            global _FUSED_ROPE_HAD_FIRST_HIT_LOGGED
+            if not _FUSED_ROPE_HAD_FIRST_HIT_LOGGED:
+                _FUSED_ROPE_HAD_FIRST_HIT_LOGGED = True
+                logger.info(
+                    "[NSA] fused_rope_hadamard fast path ACTIVE "
+                    "(layer_id=%d, num_tokens=%d, num_qo_heads=%d, "
+                    "num_kv_heads=%d, head_dim=%d, rope_dim=%d, dtype=%s)",
+                    self.layer_id,
+                    query.size(0),
+                    query.size(1),
+                    key_3d.size(1),
+                    self.head_dim,
+                    self.rope_head_dim,
+                    query.dtype,
+                )
+            fused_rope_hadamard(
+                q=query,
+                k=key_3d,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                rope_dim=self.rope_head_dim,
+            )
+            # CP path still needs the all-gather; overlap it on alt_stream when
+            # available so the next kernel on the main stream can start sooner.
+            if (
+                forward_batch.attn_cp_metadata is not None
+                and self.nsa_enable_prefill_cp
+            ):
+                if self.alt_stream is not None:
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        key = cp_all_gather_rerange_output(
+                            key.contiguous(),
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+                    current_stream.wait_stream(self.alt_stream)
+                else:
+                    key = cp_all_gather_rerange_output(
+                        key.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+            return query, key
+
+        # Fallback: original RoPE + per-side Hadamard chain. Used on AMD/HIP,
+        # NPU, FP8-fnuz, non-neox RoPE, or unsupported head_dim/rope_dim shapes.
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
