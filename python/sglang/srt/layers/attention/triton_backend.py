@@ -27,6 +27,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
+else:
+    is_arch_support_pdl = lambda: False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
