@@ -9,6 +9,8 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List
 
+import torch
+
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -82,7 +84,7 @@ class PipelineExecutor(ABC):
     ) -> OutputBatch:
 
         with self.profile_execution(batch, dump_rank=0):
-            with current_platform.inference_mode():
+            with self._model_execution_context(server_args):
                 batch = self.execute(stages, batch, server_args)
 
         return batch
@@ -95,9 +97,20 @@ class PipelineExecutor(ABC):
     ):
         """Execute a grouped request under the same profiler as a single request."""
         with self.profile_execution(batches[0], dump_rank=0):
-            with current_platform.inference_mode():
+            with self._model_execution_context(server_args):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
+
+    @staticmethod
+    def _model_execution_context(server_args: ServerArgs):
+        if (
+            server_args.use_fsdp_inference
+            or server_args.dit_layerwise_offload
+            or server_args.layerwise_offload_components
+        ):
+            # fsdp and layerwise-offload hooks need tensor version counters
+            return torch.no_grad()
+        return current_platform.inference_mode()
 
     @abstractmethod
     def execute(

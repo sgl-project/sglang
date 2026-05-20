@@ -1,6 +1,7 @@
 import contextlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.executors import pipeline_executor
@@ -33,6 +34,16 @@ def _batch():
     return SimpleNamespace(profile=False, is_warmup=False)
 
 
+def _server_args(**overrides):
+    values = {
+        "use_fsdp_inference": False,
+        "dit_layerwise_offload": False,
+        "layerwise_offload_components": (),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 class _NoGradPlatform:
     @classmethod
     @contextlib.contextmanager
@@ -52,7 +63,7 @@ def test_execute_with_profiling_uses_inference_tensor_platform(monkeypatch):
     executor = _RecordingExecutor()
 
     with torch.inference_mode(False):
-        executor.execute_with_profiling([], _batch(), SimpleNamespace())
+        executor.execute_with_profiling([], _batch(), _server_args())
 
     assert executor.single_inference_mode is True
     assert executor.single_grad_enabled is False
@@ -63,7 +74,7 @@ def test_execute_with_profiling_uses_platform_inference_mode(monkeypatch):
     executor = _RecordingExecutor()
 
     with torch.inference_mode(False):
-        executor.execute_with_profiling([], _batch(), SimpleNamespace())
+        executor.execute_with_profiling([], _batch(), _server_args())
 
     assert executor.single_inference_mode is False
     assert executor.single_grad_enabled is False
@@ -74,12 +85,31 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
     executor = _RecordingExecutor()
 
     with torch.inference_mode(False):
-        executor.execute_group_with_profiling(
-            [], [_batch(), _batch()], SimpleNamespace()
-        )
+        executor.execute_group_with_profiling([], [_batch(), _batch()], _server_args())
 
     assert executor.group_inference_mode is False
     assert executor.group_grad_enabled is False
+
+
+@pytest.mark.parametrize(
+    "server_args",
+    [
+        _server_args(use_fsdp_inference=True),
+        _server_args(dit_layerwise_offload=True),
+        _server_args(layerwise_offload_components=("text_encoder",)),
+    ],
+)
+def test_execute_with_profiling_preserves_version_counters_when_needed(
+    monkeypatch, server_args
+):
+    monkeypatch.setattr(pipeline_executor, "current_platform", _InferenceTensorPlatform)
+    executor = _RecordingExecutor()
+
+    with torch.inference_mode(False):
+        executor.execute_with_profiling([], _batch(), server_args)
+
+    assert executor.single_inference_mode is False
+    assert executor.single_grad_enabled is False
 
 
 def test_npu_platform_inference_mode_preserves_version_counters():
