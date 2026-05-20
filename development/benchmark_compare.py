@@ -151,10 +151,11 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         or server_info.get("max_concurrency")
         or _filename_concurrency(path)
     )
+    gpu_raw = _from_either("gpu_id")
+    if gpu_raw is None:
+        gpu_raw = _from_either("device")
     context = RunContext(
-        gpu_id=str(
-            _from_either("gpu_id") or _from_either("device") or ""
-        ),
+        gpu_id=str(gpu_raw) if gpu_raw is not None else None,
         tp_size=_from_either("tp_size"),
         page_size=_from_either("page_size"),
         disable_radix_cache=_from_either("disable_radix_cache"),
@@ -216,10 +217,16 @@ def _match_or_refuse(
     """
 
     reasons: List[str] = []
-    if strict_gpu and baseline.gpu_id != ds.gpu_id:
-        reasons.append(
-            f"gpu_id mismatch: native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
-        )
+    if strict_gpu:
+        if baseline.gpu_id is None or ds.gpu_id is None:
+            reasons.append(
+                "gpu_id missing from one or both runs (strict-gpu requires "
+                f"a verified match): native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
+            )
+        elif baseline.gpu_id != ds.gpu_id:
+            reasons.append(
+                f"gpu_id mismatch: native_nsa={baseline.gpu_id!r} ds={ds.gpu_id!r}"
+            )
     required = (
         ("tp_size", baseline.tp_size, ds.tp_size),
         ("page_size", baseline.page_size, ds.page_size),

@@ -168,8 +168,26 @@ def customized_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, 
 
 
 def reset_for_testing() -> None:
-    """Clear registered metric state. Tests only."""
+    """Clear registered metric state. Tests only.
+
+    Also unregisters the underlying collectors from the default
+    ``prometheus_client.REGISTRY`` so a subsequent ``_try_register()`` does
+    not raise ``ValueError: Duplicated timeseries``. The ``unregister`` call
+    is best-effort: ``KeyError`` is suppressed for collectors that were
+    never registered (e.g. when prometheus_client is unavailable).
+    """
+
     global _metrics_registered
     with _lock:
+        try:
+            from prometheus_client import REGISTRY
+        except ImportError:
+            REGISTRY = None
+        if REGISTRY is not None:
+            for obj in list(_metric_objs.values()):
+                try:
+                    REGISTRY.unregister(obj)
+                except KeyError:
+                    pass
         _metric_objs.clear()
         _metrics_registered = False

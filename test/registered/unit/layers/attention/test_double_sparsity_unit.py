@@ -1098,6 +1098,53 @@ class TestBenchmarkCompareReader(unittest.TestCase):
         self.assertIn("No-op detector:** unknown", md)
         self.assertNotIn("No-op detector:** clean", md)
 
+    def test_strict_gpu_rejects_when_both_missing(self):
+        """Round-6 fix [P2]: --strict-gpu must reject when GPU IDs are
+        absent on both sides, not silently accept None==None.
+        """
+
+        bc = self._import_compare()
+        empty = bc.RunContext(
+            gpu_id=None, tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(empty, empty, strict_gpu=True)
+        self.assertTrue(
+            any("gpu_id missing" in r for r in reasons),
+            f"expected gpu_id missing reason; got {reasons}",
+        )
+
+    def test_strict_gpu_rejects_when_one_missing(self):
+        bc = self._import_compare()
+        base = bc.RunContext(
+            gpu_id="H200", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        ds = bc.RunContext(
+            gpu_id=None, tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(base, ds, strict_gpu=True)
+        self.assertTrue(
+            any("gpu_id missing" in r for r in reasons),
+            f"expected gpu_id missing reason; got {reasons}",
+        )
+
+    def test_strict_gpu_accepts_when_both_match(self):
+        """Sanity: strict-GPU still publishes when GPU IDs match."""
+
+        bc = self._import_compare()
+        base = bc.RunContext(
+            gpu_id="H200", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        ds = bc.RunContext(
+            gpu_id="H200", tp_size=8, page_size=64,
+            disable_radix_cache=True, concurrency=32,
+        )
+        reasons = bc._match_or_refuse(base, ds, strict_gpu=True)
+        self.assertEqual(reasons, [])
+
     def test_no_op_status_clean_when_metrics_present_and_zero(self):
         """Sanity-check the new ``clean`` path: all observability fields
         present, fallback zero, selected != total → ``clean``.
@@ -1166,6 +1213,33 @@ class TestMetrics(unittest.TestCase):
             cnt = m._metric_objs["selected_pages_count"]._value.get()
             self.assertEqual(sps, 30)
             self.assertEqual(cnt, 2)
+
+    def test_reset_for_testing_unregisters_collectors(self):
+        """Round-6 fix [P3]: reset_for_testing must unregister collectors
+        from prometheus_client.REGISTRY, otherwise a subsequent
+        re-registration raises ValueError: Duplicated timeseries.
+        """
+
+        from sglang.srt.layers.attention.double_sparsity import metrics as m
+        try:
+            import prometheus_client  # noqa: F401
+        except ImportError:
+            self.skipTest("prometheus_client not installed")
+        # First registration cycle.
+        m.reset_for_testing()
+        m.mark_channel_mask_valid(True)
+        m.record_selection(selected_pages=5, total_valid_pages=10)
+        self.assertTrue(m._metrics_registered)
+        # Reset, then re-register. The second registration must not raise.
+        m.reset_for_testing()
+        self.assertFalse(m._metrics_registered)
+        # If reset didn't unregister, this re-registration raises
+        # "Duplicated timeseries" during the next Gauge/Counter construction.
+        m.mark_channel_mask_valid(False)
+        m.record_selection(selected_pages=7, total_valid_pages=10)
+        self.assertTrue(m._metrics_registered)
+        # Clean up so other tests do not see this state.
+        m.reset_for_testing()
 
 
 class TestCUDAGraphCapture(unittest.TestCase):
