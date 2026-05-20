@@ -210,6 +210,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.steppable_engine.messages import EnterSteppingModeReq
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -505,6 +506,10 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        # steppable_engine stepping mode (see SOT §3.3)
+        self._stepping_mode: bool = False
+        self._stepping_queue: List[Any] = []
 
         self.is_initializing = False
 
@@ -1504,6 +1509,7 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (EnterSteppingModeReq, self._handle_enter_stepping_mode),
             ]
         )
 
@@ -1689,25 +1695,10 @@ class Scheduler(
 
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                recv_reqs = []
+                recv_reqs = self._drain_zmq_nonblock()
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                if self._stepping_mode:
+                    return self._recv_requests_stepping(initial_msgs=recv_reqs)
             else:
                 recv_reqs = None
         else:
@@ -1831,6 +1822,64 @@ class Scheduler(
                 unwrap_shm_features(req)
 
         return recv_reqs
+
+    def _drain_zmq_nonblock(self) -> List[Any]:
+        recv_reqs: List[Any] = []
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_req)
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_rpc)
+
+        return recv_reqs
+
+    def _recv_requests_stepping(self, *, initial_msgs: List[Any]) -> List[Any]:
+        """Stepping-mode recv loop. See steppable-engine SOT §3.3.
+
+        Invariant: returns only when self._stepping_queue contains a StepReq;
+        return value is the prefix before that StepReq (StepReq itself filtered out).
+        """
+        from sglang.srt.steppable_engine.messages import (
+            _OBSERVATION_TYPES,
+            StepReq,
+        )
+
+        self._stepping_queue.extend(initial_msgs)
+
+        while True:
+            i = 0
+            while i < len(self._stepping_queue):
+                msg = self._stepping_queue[i]
+                if isinstance(msg, _OBSERVATION_TYPES):
+                    self.process_input_requests([msg])
+                    self._stepping_queue.pop(i)
+                else:
+                    i += 1
+
+            for k, msg in enumerate(self._stepping_queue):
+                if isinstance(msg, StepReq):
+                    ret = self._stepping_queue[:k]
+                    self._stepping_queue = self._stepping_queue[k + 1 :]
+                    return ret
+
+            time.sleep(0.01)
+            self._stepping_queue.extend(self._drain_zmq_nonblock())
+
+    def _handle_enter_stepping_mode(self, req: EnterSteppingModeReq) -> None:
+        self._stepping_mode = True
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [
