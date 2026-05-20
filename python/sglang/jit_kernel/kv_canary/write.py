@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -51,9 +51,11 @@ class WritePlan:
     """Write plan consumed by canary_write_step: per-token slot indices + per-req metadata.
 
     Fully per-req — no per-token tile. canary_write_step uses write_offsets to map each thread's (req, j) into a
-    flat index i, then reads token-level data from ForwardBatch's input_ids / positions / out_cache_loc[i]
-    directly. SWA translation of write slots is done inline in canary_write_step via full_to_swa_index_mapping;
-    only the chain-seed slot (a per-req gather from req_to_token at plan time) is SWA-translated here.
+    flat index i, then reads token-level data from fb_input_ids / fb_positions / fb_out_cache_loc[i] directly.
+    SWA translation of per-token slots is done **host-side by the caller** (typically the endpoint) before
+    invoking canary_write_step — the kernel is SWA-agnostic and only understands "slot ≥ 0 ⇒ write;
+    slot < 0 ⇒ skip this entry". Only the chain-seed slot (a per-req gather from req_to_token at plan time)
+    is SWA-translated by the plan kernel and lives in write_seed_slot_indices.
 
     Req r's write entries occupy flat indices [write_offsets[r], write_offsets[r+1]). seed_slot_idx == -1 means
     K_req_old == 0 (anchor on CANARY_CHAIN_ANCHOR; §6.1).
@@ -118,7 +120,6 @@ def canary_write_step(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
     kernel_kind: CanaryLaunchTag,
     pseudo_mode: CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
@@ -135,7 +136,7 @@ def canary_write_step(
     Grid: one CUDA block per active write req, single thread per block (chain is intrinsically serial).
     Block r walks entries ``[plan.write_offsets[r], plan.write_offsets[r+1])``. Per chain step ``i``:
 
-    - ``slot`` = ``full_to_swa_index_mapping[fb_out_cache_loc[i]]`` if mapping non-None else ``fb_out_cache_loc[i]``.
+    - ``slot`` = ``fb_out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
     - ``token / position`` = ``fb_input_ids[i] / fb_positions[i]``.
     - ``real_kv_hash`` = ``fold_real_kv_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
@@ -167,11 +168,11 @@ def canary_write_step(
             Flattened across reqs in plan.write_offsets order; tail beyond
             plan.write_offsets[plan.write_num_valid_reqs[0]] is cuda-graph padding.
         fb_positions: ForwardBatch.positions; sequence positions of fb_input_ids, shape [num_tokens_padded], int32.
-        fb_out_cache_loc: ForwardBatch.out_cache_loc; full-pool slot index per token, shape [num_tokens_padded],
-            int32. SWA-translated inline by this kernel via full_to_swa_index_mapping.
-        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int32, or None. Required (non-None) iff
-            this canary is on the SWA group; the trailing -1 sentinel row maps out-of-window full-pool slots to
-            a skip-this-entry marker.
+        fb_out_cache_loc: Per-token canary slot index, shape [num_tokens_padded], int32. The caller is
+            responsible for translating ForwardBatch.out_cache_loc into the canary's index space for SWA
+            groups (typically a host-side LUT gather in the endpoint); FULL groups pass it through
+            unchanged. A -1 entry signals skip-this-token (used for SWA out-of-window slots or padding).
+            The kernel does not consult any LUT.
         kernel_kind: CanaryLaunchTag stamped into violation rows (see canary_verify_step). Sweep callers do not
             invoke this kernel.
         pseudo_mode: CanaryPseudoMode toggle. OFF = real-mode, pseudo_expected_* tensors ignored. ON = compare
@@ -203,8 +204,8 @@ def canary_write_step(
           real_kv_hash); else running_prev_hash = splitmix64(kCanaryChainAnchor).
         - Serial chain loop `for j in range(entry_count)`:
               i = entry_start + j;
-              slot_full = fb_out_cache_loc[i];
-              slot = (full_to_swa_index_mapping is None) ? slot_full : full_to_swa_index_mapping[slot_full];
+              slot = fb_out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
+              if (slot < 0) continue;       // -1 sentinel = skip (SWA out-of-window or padding)
               token = fb_input_ids[i]; position = fb_positions[i];
               real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : fold_real_kv_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
@@ -249,21 +250,10 @@ def canary_write_step(
     _assert_contiguous(violation_write_index, "violation_write_index")
     _assert_contiguous(slot_run_counter, "slot_run_counter")
     _assert_contiguous(kernel_run_counter, "kernel_run_counter")
-    if full_to_swa_index_mapping is not None:
-        _assert_contiguous(full_to_swa_index_mapping, "full_to_swa_index_mapping")
 
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
     )
-
-    # The SWA LUT is presence-flagged via a separate int. When None, pass a tiny dummy tensor that the
-    # kernel never dereferences (kSwaMappingAbsent disables the indexing path).
-    if full_to_swa_index_mapping is None:
-        swa_lut = torch.zeros(1, dtype=torch.int32, device=canary_buf.device)
-        swa_present = 0
-    else:
-        swa_lut = full_to_swa_index_mapping
-        swa_present = 1
 
     module = _jit_canary_write_module()
     module.canary_write_step_cuda(
@@ -274,8 +264,6 @@ def canary_write_step(
         fb_input_ids,
         fb_positions,
         fb_out_cache_loc,
-        swa_lut,
-        swa_present,
         int(kernel_kind),
         int(pseudo_mode),
         pseudo_expected_tokens,

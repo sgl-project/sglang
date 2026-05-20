@@ -1,29 +1,27 @@
-"""Sweep-matrix benchmark for canary_verify_step.
-
-Cartesian product over (bs, prefix_len, mode, pool_kind). Fast subset runs by default; full
-cartesian product is gated behind ``--runslow`` / ``--bench-full`` via this directory's
-``conftest.py``.
-
-Per case the bench reports: name, microseconds per call, nanoseconds per processed verify slot,
-and the ratio against a naive ``kv_buf[slot] = payload`` baseline of the same total slot count.
-"""
+"""Sweep-matrix benchmark for canary_verify_step (triton.testing.perf_report style)."""
 
 from __future__ import annotations
 
-import sys
+from typing import Tuple
 
-import pytest
 import torch
+import triton
+import triton.testing
 
 from sglang.jit_kernel.benchmark.kv_canary.bench_helpers import (
     RING_CAPACITY,
     SWA_WINDOW,
     BenchCase,
-    baseline_us_slot_copy,
-    do_bench,
-    select_matrix_cases,
+    build_fast_matrix_cases,
+    build_full_matrix_cases,
+    cases_to_x_vals,
+    naive_slot_copy_fn,
 )
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
+from sglang.jit_kernel.benchmark.utils import (
+    DEFAULT_DEVICE,
+    get_benchmark_range,
+    run_benchmark,
+)
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     VIOLATION_FIELDS,
@@ -38,6 +36,15 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
+_X_NAMES = ["bs", "prefix_len", "mode", "extend_len", "pool_kind"]
+_X_VALS = cases_to_x_vals(
+    get_benchmark_range(
+        full_range=build_full_matrix_cases(),
+        ci_range=build_fast_matrix_cases(),
+    )
+)
+
+
 def _verify_entry_count(case: BenchCase) -> int:
     if case.pool_kind == "swa_window_128":
         per_req = min(case.prefix_len, SWA_WINDOW)
@@ -48,7 +55,7 @@ def _verify_entry_count(case: BenchCase) -> int:
 
 def _build_verify_inputs(
     case: BenchCase, *, device: torch.device
-) -> tuple[
+) -> Tuple[
     torch.Tensor, VerifyPlan, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     total_entries = _verify_entry_count(case)
@@ -109,67 +116,64 @@ def _build_verify_inputs(
     )
 
 
-def _run_one_case(case: BenchCase) -> dict:
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=_X_NAMES,
+        x_vals=_X_VALS,
+        line_arg="provider",
+        line_vals=["canary", "naive"],
+        line_names=["canary_verify_step", "naive index_copy_"],
+        styles=[("blue", "-"), ("red", "--")],
+        ylabel="us",
+        plot_name="kv-canary-verify-perf",
+        args={},
+    )
+)
+def benchmark(
+    bs: int,
+    prefix_len: int,
+    mode: str,
+    extend_len: int,
+    pool_kind: str,
+    provider: str,
+) -> Tuple[float, float, float]:
+    case = BenchCase(
+        bs=bs,
+        prefix_len=prefix_len,
+        mode=mode,
+        extend_len=extend_len,
+        pool_kind=pool_kind,
+    )
     device = torch.device(DEFAULT_DEVICE)
-    (
-        canary_buf,
-        plan,
-        violation_ring,
-        violation_write_index,
-        slot_run_counter,
-        kernel_run_counter,
-    ) = _build_verify_inputs(case, device=device)
 
-    def fn() -> None:
-        canary_verify_step(
-            canary_buf=canary_buf,
-            plan=plan,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=violation_ring,
-            violation_write_index=violation_write_index,
-            slot_run_counter=slot_run_counter,
-            kernel_run_counter=kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=RealKvHashMode.OFF,
-        )
+    if provider == "canary":
+        (
+            canary_buf,
+            plan,
+            violation_ring,
+            violation_write_index,
+            slot_run_counter,
+            kernel_run_counter,
+        ) = _build_verify_inputs(case, device=device)
 
-    fn()
-    torch.cuda.synchronize()
+        def fn() -> None:
+            canary_verify_step(
+                canary_buf=canary_buf,
+                plan=plan,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=violation_ring,
+                violation_write_index=violation_write_index,
+                slot_run_counter=slot_run_counter,
+                kernel_run_counter=kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=RealKvHashMode.OFF,
+            )
 
-    canary_us = do_bench(fn)
-    baseline_us = baseline_us_slot_copy(total=_verify_entry_count(case), device=device)
-    total_entries = _verify_entry_count(case)
-    per_slot_ns = (canary_us * 1000.0 / total_entries) if total_entries > 0 else 0.0
-    ratio = canary_us / baseline_us if baseline_us > 0 else float("inf")
+    else:
+        fn = naive_slot_copy_fn(total=_verify_entry_count(case), device=device)
 
-    return {
-        "name": case.case_id,
-        "us_per_call": canary_us,
-        "per_slot_ns": per_slot_ns,
-        "ratio": ratio,
-    }
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _print_header():
-    print(
-        "\n[bench_kv_canary_verify] name | us/call | per_slot_ns | ratio_vs_naive_write",
-        flush=True,
-    )
-    yield
-
-
-@pytest.mark.parametrize("case", select_matrix_cases())
-def test_bench_verify(case: BenchCase) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    result = _run_one_case(case)
-    print(
-        f"  {result['name']} | {result['us_per_call']:.3f} | "
-        f"{result['per_slot_ns']:.3f} | {result['ratio']:.3f}",
-        flush=True,
-    )
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    benchmark.run(print_data=True)
