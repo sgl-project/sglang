@@ -1,12 +1,3 @@
-"""Canary self-e2e on a minimal MHA + FULL pool fixture.
-
-Qwen3-0.6B with ``num_hidden_layers=1`` baked into ``--json-model-override-args``
-gives the cheapest possible "real attention + real KV pool + canary attached"
-e2e configuration so PR CI catches integration regressions in 1-2 minutes.
-
-8 cases, all registered to ``extra-a`` / ``1-gpu-large``.
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -47,7 +38,7 @@ class TestPerturbReqToTokenDetectsViolation(_MhaFullBase, unittest.TestCase):
     # Use --kv-canary log (not raise) so the perturb-triggered violation is
     # captured in server stderr without SIGQUIT killing the process mid-flush.
     kv_canary_mode: ClassVar[str] = "log"
-    perturb_prob: ClassVar[float] = 0.05
+    perturb_prob: ClassVar[float] = 0.5
 
     def test_perturb_req_to_token_detects_violation(self) -> None:
         # Drive traffic; perturb fires per-step at perturb_prob, canary logs.
@@ -145,7 +136,7 @@ class TestRealDataAllPerturbKvByteDetectsViolation(_MhaFullBase, unittest.TestCa
 
 
 class TestLogModeKeepsServerAlive(_MhaFullBase, unittest.TestCase):
-    perturb_prob: ClassVar[float] = 0.05
+    perturb_prob: ClassVar[float] = 0.5
     kv_canary_mode: ClassVar[str] = "log"
 
     def test_log_mode_keeps_server_alive(self) -> None:

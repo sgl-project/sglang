@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
 from sglang.srt.kv_canary.pool_patch.adapters.nsa import attach_nsa
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
-from sglang.srt.kv_canary.pool_patch.utils import resolve_read_bytes
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import resolve_read_bytes
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -40,7 +40,6 @@ _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
 
 
 def register_pool_attacher(pool_class: Type, attacher: PoolAttacher) -> None:
-    """Register an attacher for an additional pool class. Used by tests with fake pools."""
     _POOL_ATTACHERS[pool_class] = attacher
 
 
@@ -89,9 +88,6 @@ def attach_canary_buffers(
 
 
 def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]:
-    """Return the ``{PoolKind: CanaryBufferGroup}`` mapping stashed on ``pool`` by a prior
-    :func:`attach_canary_buffers` call. Raises ``RuntimeError`` if canary has not been attached.
-    """
     groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
     if groups is None:
         raise RuntimeError(

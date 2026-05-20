@@ -1,5 +1,3 @@
-"""End-to-end EAGLE speculative-decoding smoke under mock_model + canary."""
-
 from __future__ import annotations
 
 import unittest

@@ -1,7 +1,3 @@
-"""TokenOracleManager.fill_expected_inputs writes oracle-derived (token, position) into canary
-placeholders, and mock_model_engine_kwargs returns the right Engine kwargs for mock-model tests.
-"""
-
 from __future__ import annotations
 
 import dataclasses

@@ -5,10 +5,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.pool_patch.utils import (
+from sglang.srt.kv_canary.pool_patch.buf_info_splice import patch_buf_info_method
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
     make_row_source,
-    patch_buf_info_method,
 )
 
 
@@ -19,7 +19,6 @@ def attach_mha(
     read_bytes: int,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Attach canary buffers to an MHA-style pool (separate K and V buffers per layer)."""
     num_slots = int(pool.k_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
     k_tail = alloc_canary_buf(num_slots=num_slots, device=device)

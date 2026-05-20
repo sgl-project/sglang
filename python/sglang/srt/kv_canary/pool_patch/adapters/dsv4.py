@@ -5,14 +5,16 @@ from typing import Any, Callable, List, Optional
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.pool_patch.utils import (
+from sglang.srt.kv_canary.pool_patch.buf_info_splice import (
     BufInfoTriple,
+    splice_segmented_buf_info,
+)
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     alloc_canary_buf,
     make_packed_source,
     make_row_source,
-    splice_segmented_buf_info,
-    wrap_method,
 )
+from sglang.srt.kv_canary.pool_patch.wrap_method import wrap_method
 
 
 def attach_dsv4(

@@ -1,5 +1,3 @@
-"""Random differential fuzz tests: CUDA canary_write_step vs the torch reference, byte-equal."""
-
 from __future__ import annotations
 
 import random

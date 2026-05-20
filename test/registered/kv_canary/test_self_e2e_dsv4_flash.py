@@ -1,14 +1,3 @@
-"""Canary self-e2e on the DSV4-Flash superset fixture.
-
-DSV4-Flash combines three axes (MLA, SWA dual-pool, packed pool / page_size=128)
-that mha_full does not exercise; co-locating them in one fixture file avoids
-spinning up separate mha_swa / mla_full servers.
-
-11 cases (7 inherited from mha_full + 4 DSV4-specific axes). All under
-``extra-a`` / ``1-gpu-large``; per-case timeout is bumped to 120s to cover the
-heavier server warmup.
-"""
-
 from __future__ import annotations
 
 import os

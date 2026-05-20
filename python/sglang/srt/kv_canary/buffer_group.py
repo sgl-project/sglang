@@ -1,5 +1,3 @@
-"""CanaryBufferGroup and PoolKind. New API: holds tuples of RealKvSource (defined in jit_kernel)."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -50,7 +48,7 @@ class CanaryBufferGroup:
             canary_write_step to translate write slots inline. None iff kind == PoolKind.FULL.
     """
 
-    kind: PoolKind  # enum {FULL, SWA}
+    kind: PoolKind
     k_head: torch.Tensor
     k_tail: torch.Tensor
     v_head: Optional[torch.Tensor]

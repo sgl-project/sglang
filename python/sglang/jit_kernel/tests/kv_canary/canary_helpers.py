@@ -1,12 +1,3 @@
-"""Shared fixtures and helpers for the kv_canary jit_kernel diff tests.
-
-These helpers exist purely so the three per-kernel test files
-(``kv_canary/test_verify.py`` / ``kv_canary/test_write.py`` /
-``kv_canary/test_plan.py``) can compose plans, canary buffers, violation
-logs, and real-KV sources without copy-pasting glue. They are not part of the
-public jit_kernel API surface; downstream code must not import from here.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -61,13 +52,6 @@ _I64_SIGN_BIT: int = 1 << 63
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FakeViolationLog:
-    """In-memory mirror of a ViolationLog's three tensors, owned by tests.
-
-    Allocates the violation ring, the monotonic write index, and both health counters on the requested
-    device with the right dtypes / shapes; passing the same instance to verify/write step calls lets a
-    test inspect the post-kernel state without dragging in srt-layer code.
-    """
-
     ring: torch.Tensor
     write_index: torch.Tensor
     slot_run_counter: torch.Tensor
@@ -93,7 +77,6 @@ def make_canary_buf(
     slot_stride_bytes: int = DEFAULT_SLOT_STRIDE_BYTES,
     device: torch.device,
 ) -> torch.Tensor:
-    """Allocate a fresh canary buffer of the conventional uint8 [num_slots, slot_stride_bytes] shape."""
     return torch.zeros(num_slots, slot_stride_bytes, dtype=torch.uint8, device=device)
 
 
@@ -103,7 +86,6 @@ def make_canary_buf_pair(
     slot_stride_bytes: int = DEFAULT_SLOT_STRIDE_BYTES,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate (cuda_buf, ref_buf) of byte-identical contents — both zero-filled."""
     cuda_buf = make_canary_buf(
         num_slots=num_slots, slot_stride_bytes=slot_stride_bytes, device=device
     )
@@ -186,7 +168,6 @@ def make_write_plan(
 
 
 def to_signed_int64(value: int) -> int:
-    """Reinterpret a uint64 bit pattern as signed int64 for torch.int64 storage."""
     value &= _U64_MASK
     if value >= _I64_SIGN_BIT:
         value -= 1 << 64
@@ -194,7 +175,6 @@ def to_signed_int64(value: int) -> int:
 
 
 def chain_anchor_signed() -> int:
-    """Convenience: signed-int64 reinterpretation of splitmix64(CANARY_CHAIN_ANCHOR)."""
     return to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
 
 
@@ -207,7 +187,6 @@ def write_slot_fields(
     prev_hash: int,
     real_kv_hash: int,
 ) -> None:
-    """Stamp 4 int64 fields into canary_buf[slot_idx]; helper for "verify against canned state" cases."""
     view = canary_buf.view(torch.int64)
     view[slot_idx, 0] = token
     view[slot_idx, 1] = position
@@ -218,7 +197,6 @@ def write_slot_fields(
 def read_slot_fields(
     *, canary_buf: torch.Tensor, slot_idx: int
 ) -> tuple[int, int, int, int]:
-    """Return ``(token, position, prev_hash, real_kv_hash)`` from canary_buf[slot_idx]."""
     row = canary_buf.view(torch.int64)[slot_idx, :4].detach().cpu().tolist()
     return int(row[0]), int(row[1]), int(row[2]), int(row[3])
 
@@ -226,11 +204,6 @@ def read_slot_fields(
 def assert_canary_state_equal(
     *, log_a: FakeViolationLog, log_b: FakeViolationLog
 ) -> None:
-    """Byte-equal check on the three globals carried in a FakeViolationLog.
-
-    Used to compare the CUDA-path FakeViolationLog against the ref-path FakeViolationLog in differential
-    tests.
-    """
     assert torch.equal(log_a.ring, log_b.ring), "violation_ring diverged (CUDA vs ref)"
     assert torch.equal(
         log_a.write_index, log_b.write_index
@@ -244,7 +217,6 @@ def assert_canary_state_equal(
 
 
 def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None:
-    """Byte-equal check on two canary buffers (uint8 [num_slots, slot_stride_bytes])."""
     assert torch.equal(buf_a, buf_b), "canary_buf diverged (CUDA vs ref)"
 
 
