@@ -18,10 +18,12 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 DCP_SIZE = 2
 WORLD_SIZE = 8
+register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
 def _get_open_port() -> int:
