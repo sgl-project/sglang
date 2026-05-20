@@ -122,6 +122,45 @@ def _run_both(
     torch.cuda.synchronize()
 
 
+def _run_both_and_assert_byte_equal(
+    *,
+    triton_verify: VerifyPlan,
+    triton_write: WritePlan,
+    ref_verify: VerifyPlan,
+    ref_write: WritePlan,
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    fb_extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    active_verify_entries: Optional[int] = None,
+    active_write_reqs: Optional[int] = None,
+) -> None:
+    _run_both(
+        triton_verify=triton_verify,
+        triton_write=triton_write,
+        ref_verify=ref_verify,
+        ref_write=ref_write,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extras=extras,
+        swa_window_size=swa_window_size,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+    )
+    _assert_plans_byte_equal(
+        triton_verify=triton_verify,
+        triton_write=triton_write,
+        ref_verify=ref_verify,
+        ref_write=ref_write,
+        active_verify_entries=active_verify_entries,
+        active_write_reqs=active_write_reqs,
+    )
+
+
 def _assert_plans_byte_equal(
     *,
     triton_verify: VerifyPlan,
@@ -190,7 +229,7 @@ def test_single_req_extend_basic() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -210,12 +249,6 @@ def test_single_req_extend_basic() -> None:
     assert int(triton_w.write_offsets[0].item()) == 0
     assert int(triton_w.write_offsets[1].item()) == 5
     assert int(triton_w.write_seed_slot_indices[0].item()) == -1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_single_req_decode() -> None:
@@ -229,7 +262,7 @@ def test_single_req_decode() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -246,12 +279,6 @@ def test_single_req_decode() -> None:
     # Step: verify covers positions [0..7); seed slot for req rp=2 is at position 6 = rp * max_seq_len + 6.
     assert int(triton_v.verify_num_valid[0].item()) == 7
     assert int(triton_w.write_seed_slot_indices[0].item()) == 2 * max_seq_len + 6
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_multi_req_mixed_extend_decode() -> None:
@@ -265,7 +292,7 @@ def test_multi_req_mixed_extend_decode() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -285,12 +312,6 @@ def test_multi_req_mixed_extend_decode() -> None:
         assert int(triton_w.write_offsets[i].item()) == value
     # Verify count = 0 + 4 + 10 = 14.
     assert int(triton_v.verify_num_valid[0].item()) == 14
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_prefix_zero_seed_is_minus_one() -> None:
@@ -303,7 +324,7 @@ def test_prefix_zero_seed_is_minus_one() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -318,12 +339,6 @@ def test_prefix_zero_seed_is_minus_one() -> None:
     )
 
     assert int(triton_w.write_seed_slot_indices[0].item()) == -1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_padding_rows_contribute_zero() -> None:
@@ -337,7 +352,7 @@ def test_padding_rows_contribute_zero() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -359,12 +374,6 @@ def test_padding_rows_contribute_zero() -> None:
         assert int(triton_w.write_offsets[i].item()) == value
     # Padding row's seed must be -1.
     assert int(triton_w.write_seed_slot_indices[1].item()) == -1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_swa_window_clip_prefix_less_than_window() -> None:
@@ -380,7 +389,7 @@ def test_swa_window_clip_prefix_less_than_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=256, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -395,12 +404,6 @@ def test_swa_window_clip_prefix_less_than_window() -> None:
     )
 
     assert int(triton_v.verify_num_valid[0].item()) == 3
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_swa_window_clip_prefix_gt_window() -> None:
@@ -415,7 +418,7 @@ def test_swa_window_clip_prefix_gt_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=512, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -432,12 +435,6 @@ def test_swa_window_clip_prefix_gt_window() -> None:
     assert int(triton_v.verify_num_valid[0].item()) == 128
     # First verify entry should be at position 72.
     assert int(triton_v.verify_positions[0].item()) == 72
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_swa_lut_translates_verify_slots() -> None:
@@ -457,7 +454,7 @@ def test_swa_lut_translates_verify_slots() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -475,12 +472,6 @@ def test_swa_lut_translates_verify_slots() -> None:
     assert int(triton_v.verify_slot_indices[0].item()) == 1 * max_seq_len + 0 + 100
     assert int(triton_v.verify_slot_indices[1].item()) == 1 * max_seq_len + 1 + 100
     assert int(triton_v.verify_slot_indices[2].item()) == 1 * max_seq_len + 2 + 100
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_swa_lut_translates_seed_slot() -> None:
@@ -498,7 +489,7 @@ def test_swa_lut_translates_seed_slot() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -514,12 +505,6 @@ def test_swa_lut_translates_seed_slot() -> None:
 
     # FULL slot at (rp=1, pos=2) = 1 * max_seq_len + 2 = 18; expected SWA seed = 18 + 100 = 118.
     assert int(triton_w.write_seed_slot_indices[0].item()) == 1 * max_seq_len + 2 + 100
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_prev_slot_minus_one_at_chain_head() -> None:
@@ -532,7 +517,7 @@ def test_prev_slot_minus_one_at_chain_head() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -548,12 +533,6 @@ def test_prev_slot_minus_one_at_chain_head() -> None:
 
     # First entry has pos=0 → prev_slot = -1.
     assert int(triton_v.verify_prev_slot_indices[0].item()) == -1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_prev_slot_is_self_minus_one() -> None:
@@ -567,7 +546,7 @@ def test_prev_slot_is_self_minus_one() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -585,12 +564,6 @@ def test_prev_slot_is_self_minus_one() -> None:
     assert int(triton_v.verify_prev_slot_indices[1].item()) == 2 * max_seq_len + 0
     # entry[2] is pos=2: prev_slot = req_to_token[2, 1] = 2 * max_seq_len + 1 = 33.
     assert int(triton_v.verify_prev_slot_indices[2].item()) == 2 * max_seq_len + 1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_extra_verify_entries_appended_after_per_req() -> None:
@@ -609,7 +582,7 @@ def test_extra_verify_entries_appended_after_per_req() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -631,12 +604,6 @@ def test_extra_verify_entries_appended_after_per_req() -> None:
     assert int(triton_v.verify_positions[4].item()) == 6
     assert int(triton_v.verify_prev_slot_indices[3].item()) == -1
     assert int(triton_v.verify_prev_slot_indices[4].item()) == 77
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_extra_verify_num_valid_zero_no_op() -> None:
@@ -657,7 +624,7 @@ def test_extra_verify_num_valid_zero_no_op() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -672,12 +639,6 @@ def test_extra_verify_num_valid_zero_no_op() -> None:
     )
 
     assert int(triton_v.verify_num_valid[0].item()) == 3
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_sweep_caller_writes_dummy_write_plan() -> None:
@@ -690,7 +651,7 @@ def test_sweep_caller_writes_dummy_write_plan() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -713,12 +674,6 @@ def test_sweep_caller_writes_dummy_write_plan() -> None:
     # Seeds for write-empty reqs must be -1 per plan semantics.
     assert int(triton_w.write_seed_slot_indices[0].item()) == -1
     assert int(triton_w.write_seed_slot_indices[1].item()) == -1
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_verify_num_valid_aggregate() -> None:
@@ -737,7 +692,7 @@ def test_verify_num_valid_aggregate() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -753,12 +708,6 @@ def test_verify_num_valid_aggregate() -> None:
 
     # Aggregate = 2 + 5 + 4 + 3 = 14.
     assert int(triton_v.verify_num_valid[0].item()) == 14
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_verify_covers_all_tokens_no_skip() -> None:
@@ -774,7 +723,7 @@ def test_verify_covers_all_tokens_no_skip() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=128, write_req_capacity=8
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -789,12 +738,6 @@ def test_verify_covers_all_tokens_no_skip() -> None:
     )
 
     assert int(triton_v.verify_num_valid[0].item()) == sum(prefix_values)
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_plan_verify_positions_strictly_increment_per_req() -> None:
@@ -807,7 +750,7 @@ def test_plan_verify_positions_strictly_increment_per_req() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -826,12 +769,6 @@ def test_plan_verify_positions_strictly_increment_per_req() -> None:
     req1_positions = triton_v.verify_positions[5:13].cpu().tolist()
     assert req0_positions == [0, 1, 2, 3, 4]
     assert req1_positions == [0, 1, 2, 3, 4, 5, 6, 7]
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_verify_covers_all_tokens_in_swa_window() -> None:
@@ -849,7 +786,7 @@ def test_verify_covers_all_tokens_in_swa_window() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=1024, write_req_capacity=8
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -865,12 +802,6 @@ def test_verify_covers_all_tokens_in_swa_window() -> None:
 
     expected_total = sum(min(p, window) for p in prefix_values)
     assert int(triton_v.verify_num_valid[0].item()) == expected_total
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_write_num_valid_reqs_excludes_padding() -> None:
@@ -884,7 +815,7 @@ def test_write_num_valid_reqs_excludes_padding() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=8
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -902,12 +833,6 @@ def test_write_num_valid_reqs_excludes_padding() -> None:
     expected_write_offsets = [0, 1, 2, 2, 2]
     for i, value in enumerate(expected_write_offsets):
         assert int(triton_w.write_offsets[i].item()) == value
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 def test_byte_equal_python_reference() -> None:
@@ -926,7 +851,7 @@ def test_byte_equal_python_reference() -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=128, write_req_capacity=8
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -940,12 +865,6 @@ def test_byte_equal_python_reference() -> None:
         full_to_swa_index_mapping=None,
     )
 
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
 
 
 @pytest.mark.parametrize("hardcoded", [True])
@@ -967,7 +886,7 @@ def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=64, write_req_capacity=4
     )
-    _run_both(
+    _run_both_and_assert_byte_equal(
         triton_verify=triton_v,
         triton_write=triton_w,
         ref_verify=ref_v,
@@ -1003,9 +922,3 @@ def test_byte_equal_python_reference_hardcoded(hardcoded: bool) -> None:
         ), f"write_seed_slot_indices[{i}] expected {expected_seed}"
 
     # Also confirm Triton == ref byte-equal.
-    _assert_plans_byte_equal(
-        triton_verify=triton_v,
-        triton_write=triton_w,
-        ref_verify=ref_v,
-        ref_write=ref_w,
-    )
