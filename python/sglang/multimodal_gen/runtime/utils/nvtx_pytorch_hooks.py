@@ -84,10 +84,11 @@ class DiffusionNvtxHooks:
         self._skip_types = skip_types
         self._module_to_name_map: dict[torch.nn.Module, str] = {}
         self._hook_handles: list[RemovableHandle] = []
-        # Toggled by the caller around the active denoising loop so warmup
-        # forwards stay out of the captured timeline. The pre/post hooks
-        # both honor this flag, so they always emit a matched push/pop pair.
-        self._enabled: bool = True
+        # Caller must explicitly enable via ``set_enabled`` (typically
+        # routed through ``PipelineStage._apply_nvtx_gate``). Default off
+        # so a forward that bypasses the gate (e.g. an early warmup pass)
+        # cannot accidentally pollute the captured timeline.
+        self._enabled: bool = False
 
     def register_hooks(
         self,

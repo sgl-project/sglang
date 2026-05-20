@@ -927,7 +927,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         inner ``predict_noise`` / ``scheduler_step`` NVTX markers emitted
         below; mirror them in the override if those markers are needed.
         """
-        use_nvtx = server_args.enable_layerwise_nvtx_marker and not ctx.is_warmup
+        use_nvtx = self.current_use_nvtx
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -1271,9 +1271,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        # Register layer hooks (idempotent, after cache-dit / torch.compile
-        # have finalized the transformer tree) and gate every NVTX range —
-        # including the explicit ones below — on warmup-exclusion.
+        # Re-apply the gate after the transformer's lazy load / cache-dit /
+        # torch.compile setup, so layer hooks bind to the finalized module
+        # tree (the gate already fired once in __call__ but the lazy-load
+        # path may have registered zero modules then).
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with torch.autocast(

@@ -53,6 +53,11 @@ class EncodingStage(PipelineStage):
             )
         ]
 
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # ``vae_encoder`` rather than ``vae`` to disambiguate from
+        # DecodingStage when both stages are present in the same trace.
+        return [(self.vae, "vae_encoder")]
+
     @torch.no_grad()
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage inputs."""

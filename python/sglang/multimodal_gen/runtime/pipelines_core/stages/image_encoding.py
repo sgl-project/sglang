@@ -156,6 +156,17 @@ class ImageEncodingStage(PipelineStage):
             uses.append(ComponentUse(stage_name, "text_encoder"))
         return uses
 
+    def _nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
+        # Use ``image_text_encoder`` for the text encoder owned by this
+        # stage to avoid colliding with TextEncodingStage's ``text_encoder``
+        # prefix when both stages are present in the same trace.
+        mods: list[tuple[torch.nn.Module, str]] = []
+        if self.image_encoder is not None:
+            mods.append((self.image_encoder, "image_encoder"))
+        if self.text_encoder is not None:
+            mods.append((self.text_encoder, "image_text_encoder"))
+        return mods
+
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
         """Encode image-edit text features via pipeline-configured postprocess hook."""
         postprocess_funcs = getattr(pipeline_config, "postprocess_text_funcs", ())
