@@ -180,6 +180,149 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
+# MiMo-V2.5-Pro AMD CI enablement.
+#
+# Two unconditional fixes applied via a single `docker exec python3` call so
+# the upstream source tree is untouched and so output is captured cleanly in
+# the install log under the [AMD CI mimo-v25-pro] tag:
+#
+#   1. Stub `torchcodec` (with PEP 376 dist-info) -- the MiMoV2 multimodal
+#      processor imports `from torchcodec.decoders import AudioDecoder` at
+#      module load. The real wheel can't load on the AMD ROCm container
+#      (cores 5-8 need libavutil 5/6/7/8, but Ubuntu 22.04 only ships FFmpeg
+#      4 / libavutil.so.56; core 4 hits a torch ABI mismatch on torch 2.11+).
+#      MiMo-V2.5-Pro is text-only and never invokes the audio decoder, so a
+#      stub that satisfies the import path + importlib.metadata.version is
+#      sufficient.
+#
+#   2. Text-only guard for `MiMoV2Processor.__init__` -- once registration
+#      succeeds, SGLang instantiates the multimodal processor for the
+#      text-only V2.5-Pro config too (it shares `MiMoV2ForCausalLM` with the
+#      multimodal V2.5 variant). The processor's `__init__` reads
+#      `hf_config.vision_config`, which doesn't exist on V2.5-Pro and aborts
+#      the server with `AttributeError: 'MiMoV2Config' object has no
+#      attribute 'vision_config'`. Wrap the body in a `hasattr` guard so the
+#      processor returns immediately for text-only configs.
+#
+# Runs unconditionally (i.e. also under --skip-test-time-deps) so the ROCm
+# default and ROCm 7.2 paths both benefit.
+echo "[AMD CI mimo-v25-pro] applying torchcodec stub + multimodal text-only guard"
+docker exec ci_sglang pip uninstall -y torchcodec >/dev/null 2>&1 || true
+# `-i` is required so the heredoc body is forwarded to python3's stdin inside
+# the container; without it docker exec leaves stdin closed and python silently
+# exits, leaving both fixes unapplied.
+docker exec -i ci_sglang python3 - <<'PYALL'
+import os
+import site
+import sys
+import textwrap
+
+TAG = "[AMD CI mimo-v25-pro]"
+
+
+def _emit(msg: str) -> None:
+    print(f"{TAG} {msg}", flush=True)
+
+
+# ---- (1) install stub torchcodec --------------------------------------------
+SITE_DIR = site.getsitepackages()[0]
+STUB_VERSION = "0.11.1"
+TC_PKG = os.path.join(SITE_DIR, "torchcodec")
+TC_DECODERS = os.path.join(TC_PKG, "decoders")
+TC_DIST_INFO = os.path.join(SITE_DIR, f"torchcodec-{STUB_VERSION}.dist-info")
+
+import shutil
+
+for stale in os.listdir(SITE_DIR):
+    if stale == "torchcodec" or stale.startswith("torchcodec-"):
+        shutil.rmtree(os.path.join(SITE_DIR, stale), ignore_errors=True)
+
+os.makedirs(TC_DECODERS, exist_ok=True)
+os.makedirs(TC_DIST_INFO, exist_ok=True)
+
+with open(os.path.join(TC_PKG, "__init__.py"), "w") as f:
+    f.write(textwrap.dedent(f'''\
+        """Stub torchcodec for AMD CI (text-only MiMo-V2.5-Pro)."""
+        __version__ = "{STUB_VERSION}"
+    '''))
+
+with open(os.path.join(TC_DECODERS, "__init__.py"), "w") as f:
+    f.write(textwrap.dedent('''\
+        """Stub torchcodec.decoders providing a placeholder AudioDecoder.
+
+        MiMo-V2.5-Pro is text-only, so the AMD nightly tests never invoke
+        this. The stub exists solely so that
+        `from torchcodec.decoders import AudioDecoder` succeeds and the
+        MiMoV2 multimodal processor can register itself.
+        """
+
+
+        class AudioDecoder:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "torchcodec is stubbed in AMD CI; "
+                    "audio inputs are not supported."
+                )
+    '''))
+
+with open(os.path.join(TC_DIST_INFO, "METADATA"), "w") as f:
+    f.write(textwrap.dedent(f'''\
+        Metadata-Version: 2.1
+        Name: torchcodec
+        Version: {STUB_VERSION}
+        Summary: Stub torchcodec for AMD CI (text-only MiMo-V2.5-Pro)
+    '''))
+
+with open(os.path.join(TC_DIST_INFO, "INSTALLER"), "w") as f:
+    f.write("amd-ci-stub\n")
+open(os.path.join(TC_DIST_INFO, "RECORD"), "w").close()
+
+_emit(f"installed stub torchcodec=={STUB_VERSION} into {SITE_DIR}")
+
+# Sanity-check the stub end-to-end (matches transformers.audio_utils path).
+import importlib
+import importlib.metadata
+
+importlib.invalidate_caches()
+import torchcodec  # noqa: F401
+from torchcodec.decoders import AudioDecoder  # noqa: F401
+
+assert importlib.metadata.version("torchcodec") == STUB_VERSION
+_emit("stub torchcodec import + metadata sanity check passed")
+
+# ---- (2) patch MiMoV2 multimodal processor for text-only configs ------------
+MIMO_PATH = "/sglang-checkout/python/sglang/srt/multimodal/processors/mimo_v2.py"
+ANCHOR = (
+    "        super().__init__(hf_config, server_args, _processor, *args, **kwargs)\n"
+    "        self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)"
+)
+GUARD_MARK = "AMD CI: MiMo-V2.5-Pro shares MiMoV2ForCausalLM"
+PATCHED = (
+    "        super().__init__(hf_config, server_args, _processor, *args, **kwargs)\n"
+    "        # AMD CI: MiMo-V2.5-Pro shares MiMoV2ForCausalLM with the multimodal\n"
+    "        # V2.5 variant but is text-only and has no vision_config; skip the\n"
+    "        # vision/audio init so the server can launch.\n"
+    "        if not hasattr(hf_config, \"vision_config\"):\n"
+    "            return\n"
+    "        self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)"
+)
+
+with open(MIMO_PATH) as f:
+    src = f.read()
+
+if GUARD_MARK in src:
+    _emit(f"text-only guard already present in {MIMO_PATH}")
+elif ANCHOR in src:
+    src = src.replace(ANCHOR, PATCHED, 1)
+    with open(MIMO_PATH, "w") as f:
+        f.write(src)
+    _emit(f"applied text-only guard to MiMoV2Processor.__init__ in {MIMO_PATH}")
+else:
+    sys.exit(f"{TAG} ERROR: anchor not found in {MIMO_PATH}; upstream changed")
+
+_emit("done")
+PYALL
+
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
   exit 0
 fi
