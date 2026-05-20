@@ -68,8 +68,9 @@ class ParallelExecutor(PipelineExecutor):
             rank = get_world_rank()
         cfg_group = get_cfg_group()
         group = get_world_group()
-        # Match the warmup gating used inside DenoisingStage so the executor
-        # wrappers don't leak a stage_<Name> range during server-side warmup.
+        # Match the warmup gating applied inside PipelineStage.__call__ so
+        # the executor wrapper doesn't leak a stage_<Name> range during
+        # server-side warmup.
         # ``batch`` can be a single Req or a list of Req (execute_group);
         # treat the group as warmup only if all entries agree.
         if isinstance(batch, list):

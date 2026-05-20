@@ -142,12 +142,17 @@ class DiffusionNvtxHooks:
     def remove_hooks(self) -> None:
         """Remove every hook registered by this instance.
 
-        Safe to call multiple times; subsequent calls are no-ops.
+        Safe to call multiple times; subsequent calls are no-ops. The
+        bookkeeping is cleared in a ``finally`` so a misbehaving
+        ``handle.remove()`` cannot leave the instance with stale
+        handles or name-map entries.
         """
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles.clear()
-        self._module_to_name_map.clear()
+        try:
+            for handle in self._hook_handles:
+                handle.remove()
+        finally:
+            self._hook_handles.clear()
+            self._module_to_name_map.clear()
 
     def set_enabled(self, enabled: bool) -> None:
         """Toggle whether the registered hooks emit NVTX ranges.
