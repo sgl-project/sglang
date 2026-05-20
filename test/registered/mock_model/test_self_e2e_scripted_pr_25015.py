@@ -44,6 +44,8 @@ def _spec_eagle_server_args() -> List[str]:
         # auto-sized to ~32M slots. Pin them small.
         "--cuda-graph-max-bs",
         "8",
+        "--max-running-requests",
+        "32",
         "--context-length",
         "2048",
         "--max-total-tokens",
