@@ -220,6 +220,24 @@ class DeepseekMHAForwardMixin:
             kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        # Backend prefill hook: the backend owns the BF16->FP8 transition
+        # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
+        # returns FP8 tensors ready for its kernel. Backends without the
+        # hook fall through to the BF16 path below.
+        backend = _resolve_attn_backend(forward_batch)
+        if hasattr(backend, "prepare_prefill_qkv"):
+            q_out, k_out, v_out = backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q_pe,
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=positions,
+                layer=self,
+                forward_batch=forward_batch,
+            )
+            return q_out, k_out, v_out, forward_batch
+
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
