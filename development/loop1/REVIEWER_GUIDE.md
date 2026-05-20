@@ -92,7 +92,7 @@ Post-loop, the root cause was traced to a humanize-plugin bug: `loop-codex-stop-
 
 - Git log: `09f6da94d` (Round 0 backbone), `fbe9fd64f` (Round 1 package + kernels + ship-gate), `13fd92977` (Round 2 Triton + NSA cross-validation), `6c11fbf3e` (Round 3 end-to-end pipeline), `3c29a4d41` (post-review finalize-phase simplifications: drop dead field, inline 1-use helper, prefer `masked_fill`).
 - Unit tests: `python -m pytest test/registered/unit/layers/attention/test_double_sparsity_unit.py` — 52/52 pass on the H200 box, including the `TestEndToEndPipeline` integration suite.
-- Documentation: this guide, `PR_DESCRIPTION.md`, `kernel_audit_memo.md`, `docs/advanced_features/double_sparsity_calibration.md`, `docs/advanced_features/double_sparsity_schema_memo.md`.
+- Documentation: this guide, `PR_DESCRIPTION.md` (alongside this file in `development/loop1/`), `development/kernel_audit_memo.md`, `docs/advanced_features/double_sparsity_calibration.md`, `docs/advanced_features/double_sparsity_schema_memo.md`.
 
 ## Round 2 perf path (Triton kernels)
 

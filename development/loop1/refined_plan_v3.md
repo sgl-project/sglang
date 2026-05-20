@@ -380,6 +380,9 @@ Per DEC-6 + DEC-8 resolutions, **HiSparse integration is out of all scope — in
   - Tradeoff Summary: Per-request 30 tok/s at conc=64 implies aggregate ≈ 1920 tok/s decode. Aggregate 30 tok/s would be trivial.
   - Decision Status: **RESOLVED**. Hardware is **2 nodes of H200**, specifically `h200-10-220-51-6` (8 GPUs) and `h200-10-220-51-8` (8 GPUs). Two deployment shapes are allowed: cross-node **16-way TP** or **2× replicas of 8-way TP behind SMG**. Client explicitly requested H200s. The 8-way TP / 2× replica shape is the default operating point for SLO claims (lower latency on the per-layer all-reduce that DEC-9 introduces); cross-node 16-way TP is supported but expected to be slower. "30 tok/s per request" is equivalent to `1000 / TPOT_ms` and to `output_tok_per_sec / concurrency` (consistency check). AC-7 and AC-8 cite this hardware exactly.
 
+<comment>
+I think claude's position is fine.
+</comment>
 - DEC-2: Radix cache reconciliation
   - Claude Position: DS keeps radix cache enabled by default. The DS validator gates radix cache on the M3-B page-stability fixture; failure makes the validator require `--disable-radix-cache` until resolved. The 55 % prefix-cache-hit workload is preserved.
   - Codex Position: Apples-to-apples concern resolved with the two-column comparison on the same single-instance server.

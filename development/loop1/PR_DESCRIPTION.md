@@ -85,4 +85,4 @@ Manual tests at `test/manual/test_double_sparsity_v32.py` for NIAH (4K / 16K / 6
 
 ## Reviewer Notes
 
-See `development/REVIEWER_GUIDE.md` for a tour of the load-bearing files, the AC-12 path-whitelist amendment, and the V3.2-only scope per DEC-10's capability check seam.
+See `development/loop1/REVIEWER_GUIDE.md` for a tour of the load-bearing files, the AC-12 path-whitelist amendment, and the V3.2-only scope per DEC-10's capability check seam.

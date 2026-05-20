@@ -55,7 +55,7 @@ The repository's CI runs the same script with a tiny NSA-shaped model fixture (`
 
 ## NIAH-min sanity probe
 
-After calibration, the runtime validator runs a one-needle / 512-token-haystack probe at server startup to verify the channel mask actually retrieves a planted needle. The probe is inconclusive while the selector is still the placeholder; production deployment requires the real selection kernels to be wired (see `development/REVIEWER_GUIDE.md`).
+After calibration, the runtime validator runs a one-needle / 512-token-haystack probe at server startup to verify the channel mask actually retrieves a planted needle. The probe is inconclusive while the selector is still the placeholder; production deployment requires the real selection kernels to be wired (see `development/loop1/REVIEWER_GUIDE.md`).
 
 ## Where the artifact lives
 

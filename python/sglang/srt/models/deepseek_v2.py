@@ -1780,7 +1780,7 @@ class DeepseekV2AttentionMLA(
         as a token-level int32 tensor (it calls ``.shape`` and ``!= -1`` on
         it). The page-table adapter that translates page-level selections
         into the backend's token-level tensor is the documented next
-        milestone (see REVIEWER_GUIDE.md "Known gaps for the integration
+        milestone (see development/loop1/REVIEWER_GUIDE.md "Known gaps for the integration
         that the deploying team must close"). Until the adapter lands, the
         DS branch raises ``NotImplementedError`` after the placeholder
         guard, so the failure surfaces here with a clear pointer rather
@@ -1801,7 +1801,7 @@ class DeepseekV2AttentionMLA(
                 "validate_double_sparsity; the in-hook raise is a "
                 "defense-in-depth guard for code paths that bypass the "
                 "validator (e.g. constructed via object.__new__ in unit "
-                "tests). See REVIEWER_GUIDE.md 'Known gaps for the "
+                "tests). See development/loop1/REVIEWER_GUIDE.md 'Known gaps for the "
                 "integration that the deploying team must close'."
             )
 

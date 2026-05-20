@@ -58,7 +58,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     # Fail-fast at startup: the page-table adapter that bridges the DS
     # selector's page-level (selected_indices, valid_lengths) output to the
     # NSA backend's token-level topk_indices tensor has not landed yet (see
-    # REVIEWER_GUIDE.md "Known gaps for the integration that the deploying
+    # development/loop1/REVIEWER_GUIDE.md "Known gaps for the integration that the deploying
     # team must close"). Without the adapter a DS-enabled server can pass
     # startup validation but would crash on its first request; reject the
     # flag here instead so the failure surfaces at boot. The
@@ -74,7 +74,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "until the adapter is in place. Set SGLANG_DS_ALLOW_NO_ADAPTER=1 "
             "to override for development / smoke tests; production "
             "deployments must wait for the adapter milestone (see "
-            "REVIEWER_GUIDE.md 'Known gaps for the integration that the "
+            "development/loop1/REVIEWER_GUIDE.md 'Known gaps for the integration that the "
             "deploying team must close')."
         )
 
