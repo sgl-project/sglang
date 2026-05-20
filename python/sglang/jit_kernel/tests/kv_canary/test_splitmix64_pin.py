@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 from sglang.jit_kernel.kv_canary.verify import CANARY_CHAIN_ANCHOR
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import splitmix64
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -40,3 +42,10 @@ def test_splitmix64_independent_impl_matches_frozen_hex() -> None:
         assert (
             actual == expected
         ), f"_splitmix64_independent({input_val:#x}) expected {expected:#x} got {actual:#x}"
+
+
+def test_splitmix64_no_collision_in_1000_random_inputs() -> None:
+    random.seed(0)
+    inputs = random.sample(range(1 << 64), 1000)
+    outputs = [splitmix64(x) for x in inputs]
+    assert len(set(outputs)) == 1000

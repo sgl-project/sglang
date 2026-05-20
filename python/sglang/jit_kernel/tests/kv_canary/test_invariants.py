@@ -279,13 +279,6 @@ def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50() -> None:
         ), f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
 
 
-def test_splitmix64_no_collision_in_1000_random_inputs() -> None:
-    random.seed(0)
-    inputs = random.sample(range(1 << 64), 1000)
-    outputs = [splitmix64(x) for x in inputs]
-    assert len(set(outputs)) == 1000
-
-
 def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
     cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
     ref_buf = cuda_buf.clone()
