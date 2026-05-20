@@ -11,10 +11,9 @@ from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     _to_signed_int64,
     splitmix64,
+    splitmix64_mix4,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
-
-_U64_MASK: int = (1 << 64) - 1
 
 
 def canary_write_step_torch_reference(
@@ -110,13 +109,12 @@ def canary_write_step_torch_reference(
             seed_real_kv_signed = int(
                 buf_i64[seed_slot, consts.CANARY_FIELD_REAL_KV_HASH].item()
             )
-            seed_combined = (
-                (seed_prev_hash_signed & _U64_MASK)
-                ^ (seed_token_signed & _U64_MASK)
-                ^ (seed_position_signed & _U64_MASK)
-                ^ (seed_real_kv_signed & _U64_MASK)
+            running_prev_hash = splitmix64_mix4(
+                seed_prev_hash_signed,
+                seed_token_signed,
+                seed_position_signed,
+                seed_real_kv_signed,
             )
-            running_prev_hash = splitmix64(seed_combined)
 
         for j in range(entry_count):
             i = entry_start + j
@@ -164,13 +162,9 @@ def canary_write_step_torch_reference(
                 real_kv_hash_u64
             )
 
-            combined = (
-                running_prev_hash
-                ^ (token & _U64_MASK)
-                ^ (position & _U64_MASK)
-                ^ real_kv_hash_u64
+            running_prev_hash = splitmix64_mix4(
+                running_prev_hash, token, position, real_kv_hash_u64
             )
-            running_prev_hash = splitmix64(combined)
 
             total_slots_written += 1
 

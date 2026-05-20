@@ -1713,8 +1713,12 @@ def test_real_kv_hash_fold_mode_hardcoded(
 
 
 def test_chain_advance_formula_matches_spec() -> None:
-    """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
-    # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
+    """Ref impl agrees with the chained splitmix64 chain-step formula.
+
+    The chain step folds each of the 4 inputs into the accumulator sequentially via
+    ``acc = splitmix64(acc ^ next)``, starting from ``splitmix64(prev_hash)``. The vec helper must produce
+    the same result as the explicit chain.
+    """
     cases = [
         (consts.CANARY_CHAIN_ANCHOR, 0, 0, 0),
         (0x1234567890ABCDEF, 100, 5, 0xDEADBEEF),
@@ -1723,11 +1727,12 @@ def test_chain_advance_formula_matches_spec() -> None:
         (0xFFFFFFFFFFFFFFFF, 0xFFFF, 0xFFFF, 0xFFFF),
     ]
     for prev_hash, token, position, real_kv_hash in cases:
-        # Step 2: hand-compute the expected via Python splitmix64.
-        expected = splitmix64(
-            (prev_hash ^ token ^ position ^ real_kv_hash) & ((1 << 64) - 1)
-        )
-        # Step 3: compute through ref-impl helper splitmix64_mix4 (same logic, alternate entry point).
+        u64_mask = (1 << 64) - 1
+        h = splitmix64(prev_hash & u64_mask)
+        h = splitmix64(h ^ (token & u64_mask))
+        h = splitmix64(h ^ (position & u64_mask))
+        expected = splitmix64(h ^ (real_kv_hash & u64_mask))
+
         from sglang.jit_kernel.kv_canary.verify_ref import _splitmix64_mix4_vec
 
         prev_t = torch.tensor([to_signed_int64(prev_hash)], dtype=torch.int64)
@@ -1737,7 +1742,7 @@ def test_chain_advance_formula_matches_spec() -> None:
         actual_signed = int(
             _splitmix64_mix4_vec(prev_t, token_t, pos_t, rkv_t)[0].item()
         )
-        actual = actual_signed & ((1 << 64) - 1)
+        actual = actual_signed & u64_mask
         assert actual == expected, (
             f"chain advance mismatch: prev={prev_hash:#x} token={token:#x} pos={position:#x} "
             f"rkv={real_kv_hash:#x} expected={expected:#x} actual={actual:#x}"

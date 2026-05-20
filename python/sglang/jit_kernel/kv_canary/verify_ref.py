@@ -95,13 +95,9 @@ def canary_verify_step_torch_reference(
             prev_tok = int(buf_i64[prev_slot, consts.CANARY_FIELD_TOKEN].item())
             prev_pos = int(buf_i64[prev_slot, consts.CANARY_FIELD_POSITION].item())
             prev_rkv = int(buf_i64[prev_slot, consts.CANARY_FIELD_REAL_KV_HASH].item())
-            combined = (
-                (prev_ph & _U64_MASK)
-                ^ (prev_tok & _U64_MASK)
-                ^ (prev_pos & _U64_MASK)
-                ^ (prev_rkv & _U64_MASK)
+            expected_chain_hash = _to_signed_int64(
+                splitmix64_mix4(prev_ph, prev_tok, prev_pos, prev_rkv)
             )
-            expected_chain_hash = _to_signed_int64(splitmix64(combined))
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
@@ -163,6 +159,18 @@ def splitmix64(value: int) -> int:
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
     x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
     return (x ^ (x >> 31)) & _U64_MASK
+
+
+def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
+    """Chained 4-input splitmix64. Folds each input into a running accumulator via
+    ``acc = splitmix64(acc ^ next)``; order-sensitive, no XOR self-cancellation between equal inputs.
+    Must stay byte-equal to ``splitmix64_mix4`` in csrc/kv_canary/canary_common.cuh.
+    """
+    h = splitmix64(a & _U64_MASK)
+    h = splitmix64(h ^ (b & _U64_MASK))
+    h = splitmix64(h ^ (c & _U64_MASK))
+    h = splitmix64(h ^ (d & _U64_MASK))
+    return h
 
 
 def _to_signed_int64(value: int) -> int:
@@ -272,8 +280,12 @@ def _splitmix64_mix4_vec(
     position: torch.Tensor,
     real_kv_hash: torch.Tensor,
 ) -> torch.Tensor:
-    combined = prev_hash ^ token ^ position ^ real_kv_hash
-    return _splitmix64_finalize_vec(combined)
+    """Chained 4-input splitmix64 over int64 tensors. Byte-equal to the scalar ``splitmix64_mix4``."""
+    h = _splitmix64_finalize_vec(prev_hash)
+    h = _splitmix64_finalize_vec(h ^ token)
+    h = _splitmix64_finalize_vec(h ^ position)
+    h = _splitmix64_finalize_vec(h ^ real_kv_hash)
+    return h
 
 
 def _compute_real_kv_hash_vec(

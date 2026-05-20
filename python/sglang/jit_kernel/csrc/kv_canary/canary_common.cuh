@@ -31,10 +31,15 @@ SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-// 4-arg chain step: XOR all four uint64 inputs, then splitmix64-finalize. Matches the Python helper
-// _splitmix64_mix4_vec in kv_canary/verify_ref.py.
+// 4-arg chain step: nested splitmix64 of the four uint64 inputs. Each input is folded into the running
+// accumulator via `acc = splitmix64(acc ^ next)`, so order is significant and a pair of equal inputs no
+// longer self-cancels. Matches the Python helper splitmix64_mix4 in kv_canary/verify_ref.py.
 SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
-  return splitmix64(a ^ b ^ c ^ d);
+  uint64_t h = splitmix64(a);
+  h = splitmix64(h ^ b);
+  h = splitmix64(h ^ c);
+  h = splitmix64(h ^ d);
+  return h;
 }
 
 // Read one byte from a source following the RealKvSource access invariant. The invariant (from

@@ -1572,7 +1572,7 @@ def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
 
 
 def test_seed_continues_existing_chain() -> None:
-    """Pre-stamp seed slot; subsequent write should continue chain from splitmix64(seed.* XOR)."""
+    """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix4(seed.*)."""
     cuda_buf, ref_buf = _setup_pair()
     seed_slot = 3
     seed_token = 7

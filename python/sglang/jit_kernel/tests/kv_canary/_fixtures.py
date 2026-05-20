@@ -262,7 +262,12 @@ def splitmix64(value: int) -> int:
 
 
 def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
-    return splitmix64((a ^ b ^ c ^ d) & _U64_MASK)
+    """Chained 4-input splitmix64; byte-equal to the canonical helper in verify_ref/csrc canary_common.cuh."""
+    h = splitmix64(a & _U64_MASK)
+    h = splitmix64(h ^ (b & _U64_MASK))
+    h = splitmix64(h ^ (c & _U64_MASK))
+    h = splitmix64(h ^ (d & _U64_MASK))
+    return h
 
 
 def _allocate_plan_pair(
