@@ -273,13 +273,19 @@ python3 -m sglang.launch_server \
 
 ### Multi-node Deployment
 
+<Tip>
+Recommended model: [`Qwen/Qwen3.5-35B-A3B`](https://www.modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)
+
+Other Qwen3.5 series models can also be deployed in multi-node configurations following this workflow. Simply change `--model-path` to the corresponding model, and adjust parameters like `--tp-size`, `--nnodes`, and `--mem-fraction-static` according to the model size and available resources.
+</Tip>
+
 **A2 series**
 
 Modify the IP of 2 nodes, then run the same scripts on two nodes.
 
 **node 0/1**
 
-```shell Launch Multi-node Server
+```bash Command
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -310,10 +316,6 @@ export GLOO_SOCKET_IFNAME=lo
 
 P_IP=('your ip1' 'your ip2')
 P_MASTER="${P_IP[0]}:your port"
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -326,13 +328,13 @@ do
         --model-path $MODEL_PATH \
         --attention-backend ascend \
         --device npu \
-        --tp-size 16 --nnodes 2 --node-rank $i --dist-init-addr $P_MASTER \
+        --tp-size 8 --nnodes 2 --node-rank $i --dist-init-addr $P_MASTER \
         --chunked-prefill-size 16384 --max-prefill-tokens 131072 \
         --trust-remote-code \
         --host 127.0.0.1 \
         --mem-fraction-static 0.8\
         --port 8000 \
-        --served-model-name glm-5 \
+        --served-model-name qwen3.5 \
         --cuda-graph-max-bs 16 \
         --disable-radix-cache
         NODE_RANK=$i
