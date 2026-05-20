@@ -564,7 +564,6 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
-    speculative_adaptive_preset: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -5591,20 +5590,8 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs. "
-            "Takes priority over --speculative-adaptive-preset.",
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs.",
             default=ServerArgs.speculative_adaptive_config,
-        )
-        parser.add_argument(
-            "--speculative-adaptive-preset",
-            type=str,
-            choices=["conservative", "balanced", "aggressive"],
-            help="Use a built-in preset for adaptive speculative decoding. "
-            "Conservative: for weak draft models. "
-            "Balanced: for strong draft models. "
-            "Aggressive: for high-variance draft models. "
-            "Ignored if --speculative-adaptive-config is provided.",
-            default=ServerArgs.speculative_adaptive_preset,
         )
         parser.add_argument(
             "--speculative-skip-dp-mlp-sync",
@@ -6873,7 +6860,6 @@ class ServerArgs:
         candidate_steps = resolve_candidate_steps_from_config(
             initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
-            preset=self.speculative_adaptive_preset,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.

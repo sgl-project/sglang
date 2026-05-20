@@ -11,15 +11,24 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
-    def _make_params_from_config(self, initial_steps: int, config: dict[str, object]):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(config, f)
-            f.flush()
-            return AdaptiveSpeculativeParams(
-                initial_steps=initial_steps, cfg_path=f.name
-            )
+    def _make_params(self, initial_steps: int, config: dict):
+        """Create params from a dict (the per-slot config passed by _init_per_bs)."""
+        return AdaptiveSpeculativeParams(initial_steps=initial_steps, bs_cfg=config)
 
-    def test_params_loads_config_path(self):
+    def test_params_from_dict(self):
+        params = self._make_params(
+            5,
+            {
+                "candidate_steps": [1, 5],
+                "ema_alpha": 0.75,
+                "warmup_batches": 2,
+            },
+        )
+        self.assertEqual(params.candidate_steps, [1, 5])
+        self.assertEqual(params.ema_alpha, 0.75)
+        self.assertEqual(params.warmup_batches, 2)
+
+    def test_params_from_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
                 {
@@ -30,22 +39,21 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
                 f,
             )
             f.flush()
-
-            params = AdaptiveSpeculativeParams(initial_steps=5, cfg_path=f.name)
+            params = AdaptiveSpeculativeParams(initial_steps=5, bs_cfg=f.name)
 
         self.assertEqual(params.candidate_steps, [1, 5])
         self.assertEqual(params.ema_alpha, 0.75)
         self.assertEqual(params.warmup_batches, 2)
 
     def test_initial_steps_snaps_to_middle_when_missing(self):
-        params = self._make_params_from_config(2, {"candidate_steps": [1, 3, 7]})
+        params = self._make_params(2, {"candidate_steps": [1, 3, 7]})
 
         self.assertEqual(params.candidate_steps, [1, 3, 7])
         self.assertEqual(params.current_steps, 3)
         self.assertEqual(params.ema_accept_len, 2.0)
 
     def test_update_respects_warmup_and_interval(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -65,7 +73,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 1)
 
     def test_empty_batches_do_not_consume_warmup_or_shift_steps(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -86,7 +94,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 1)
 
     def test_update_scales_up_across_candidates(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             1,
             {
                 "candidate_steps": [1, 3, 7],
@@ -104,7 +112,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 7)
 
     def test_update_can_scale_down_across_candidates_in_one_recompute(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             7,
             {
                 "candidate_steps": [1, 3, 7],
@@ -118,7 +126,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 1)
 
     def test_exact_rise_threshold_does_not_upshift(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -137,7 +145,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 7)
 
     def test_exact_drop_threshold_does_downshift(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -154,7 +162,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.ema_accept_len, 0.5)
 
     def test_hysteresis_can_prevent_premature_upshift(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -172,7 +180,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 7)
 
     def test_down_hysteresis_can_prevent_premature_downshift(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             7,
             {
                 "candidate_steps": [1, 3, 7],
@@ -190,7 +198,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 3)
 
     def test_multi_batch_sequence_can_ramp_up_then_back_down(self):
-        params = self._make_params_from_config(
+        params = self._make_params(
             3,
             {
                 "candidate_steps": [1, 3, 7],
@@ -217,6 +225,37 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 1)
         self.assertEqual(params.ema_accept_len, 0.375)
+
+    def test_ceiling_coeff_caps_steps(self):
+        params = self._make_params(
+            7,
+            {
+                "candidate_steps": [1, 3, 7],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "ceiling_coeff": 1.0,
+            },
+        )
+        # ema=6.0 (initial), ceiling=ceil(6*1.0)=6 >= 7 is false, so ceiling fires
+        # ema starts at current_steps-1=6, ceiling=ceil(6*1.0)=6, target=7>6 and 7<=7
+        # walks down: step=3 <= 6, so stops at 3... wait, let's just test with low ema
+        params.ema_accept_len = 1.0  # force low ema
+        self.assertTrue(params.update([1, 1]))  # ema stays ~1.0
+        # ceiling = ceil(1.0 * 1.0) = 1, target should be capped to 1
+        self.assertEqual(params.current_steps, 1)
+
+    def test_ceiling_disabled_by_default(self):
+        params = self._make_params(
+            3,
+            {
+                "candidate_steps": [1, 3, 7],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+            },
+        )
+        self.assertEqual(params.ceiling_coeff, 0)
 
 
 if __name__ == "__main__":

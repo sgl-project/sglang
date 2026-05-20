@@ -5,7 +5,6 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 
 from __future__ import annotations
 
-import bisect
 import json
 import logging
 import math
@@ -19,106 +18,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default per-BS config (used when no preset or config file is specified)
-# Keys are lower bounds of BS ranges: 1 covers [1,64), 64 covers [64,128), etc.
+# Default adaptive config (conservative).
+# Used when --speculative-adaptive is enabled without --speculative-adaptive-config.
+#
+# Config format: integer-keyed dict where each key is a BS lower bound.
+# BS lookup uses bisect (largest key <= actual padded BS).
+# See docs/advanced_features/adaptive_speculative_decoding_per_bs.md for
+# recommended configs for different draft model qualities.
 # ---------------------------------------------------------------------------
-DEFAULT_BS_HYSTERESIS: dict[int, dict[str, float]] = {
-    1: {"up_hysteresis": 0.0, "down_hysteresis": -0.25},
-    64: {"up_hysteresis": 0.0, "down_hysteresis": 0.0},
-    128: {"up_hysteresis": -0.1, "down_hysteresis": 0.25},
-}
-
-DEFAULT_BS_STEPS: dict[int, list] = {
-    1: [1, 3, 7],
-    64: [1, 2, 5],
-    128: [1, 2, 6],
-}
-
-# ---------------------------------------------------------------------------
-# Universal presets: conservative / balanced / aggressive
-# Users pick one based on draft model quality. Per-model config files
-# override these when --speculative-adaptive-config is provided.
-# ---------------------------------------------------------------------------
-PRESET_CONFIGS: dict[str, dict] = {
-    # TODO: add step=0 (nospec fallback) for BS>=64 once supported —
-    # on hard workloads, even step=1 loses to nospec at high batch sizes.
-    "conservative": {
-        "1": {
-            "steps": [1, 3, 7],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -0.25,
-            "ceiling_coeff": 0,
-        },
-        "8": {
-            "steps": [1],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": 0.0,
-            "ceiling_coeff": 0,
-        },
+# TODO: add step=0 (nospec fallback) for BS>=64 once supported —
+# on hard workloads, even step=1 loses to nospec at high batch sizes.
+DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "steps": [1, 3, 7],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
     },
-    "balanced": {
-        "1": {
-            "steps": [1, 3, 6],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -1.0,
-            "ceiling_coeff": 0,
-        },
-        "16": {
-            "steps": [1, 3, 5],
-            "up_hysteresis": -1.0,
-            "down_hysteresis": -1.0,
-            "ceiling_coeff": 0,
-        },
-        "64": {
-            "steps": [1, 2, 6],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -1.0,
-            "ceiling_coeff": 3.0,
-        },
-        "128": {
-            "steps": [1, 2, 5],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -1.0,
-            "ceiling_coeff": 3.0,
-        },
-    },
-    "aggressive": {
-        "1": {
-            "steps": [1, 3, 7],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -0.25,
-            "ceiling_coeff": 0,
-        },
-        "8": {
-            "steps": [1, 3, 7],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -0.25,
-            "ceiling_coeff": 3.0,
-        },
-        "64": {
-            "steps": [1, 3],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -0.25,
-            "ceiling_coeff": 1.67,
-        },
-        "128": {
-            "steps": [1, 3],
-            "up_hysteresis": 0.0,
-            "down_hysteresis": -0.25,
-            "ceiling_coeff": 1.2,
-        },
+    "8": {
+        "steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
     },
 }
-
-
-def get_preset_config(preset_name: str) -> dict:
-    """Return the built-in preset config dict, or raise ValueError."""
-    if preset_name not in PRESET_CONFIGS:
-        raise ValueError(
-            f"Unknown adaptive preset '{preset_name}'. "
-            f"Available: {list(PRESET_CONFIGS.keys())}"
-        )
-    return PRESET_CONFIGS[preset_name]
 
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
@@ -156,24 +79,14 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def _bisect_lookup(table: dict[int, dict], bs: int) -> dict:
-    """Find the entry in *table* whose key is the largest <= *bs*."""
-    keys = sorted(table.keys())
-    idx = bisect.bisect_right(keys, bs) - 1
-    idx = max(0, idx)
-    return table[keys[idx]]
-
-
-def get_default_hysteresis(bs: int) -> dict[str, float]:
-    return _bisect_lookup(DEFAULT_BS_HYSTERESIS, bs)
-
-
 def load_adaptive_config(path: str | None) -> dict:
     """Load adaptive speculative config from a JSON file.
 
-    The file is a flat JSON object. Integer keys (``"1"``, ``"64"``, …) are
-    per-BS entries parsed by :func:`load_bs_config`.  All other keys
-    (``ema_alpha``, ``update_interval``, ``warmup_batches``, …) are global
+    The file is a JSON object with integer-string keys as BS lower bounds::
+
+        {"1": {"steps": [1,3,7], ...}, "64": {"steps": [1,2,5], ...}}
+
+    Non-integer keys (``ema_alpha``, ``update_interval``, …) are global
     overrides applied to every BS slot.
 
     Returns an empty dict when *path* is ``None``.
@@ -190,17 +103,13 @@ def load_adaptive_config(path: str | None) -> dict:
     return cfg
 
 
-def load_bs_config(config: dict) -> dict[int, dict] | None:
-    """Parse per-BS config from the loaded JSON.
+def _resolve_candidate_steps(config: dict) -> dict[int, dict] | None:
+    """Extract per-BS entries from a config dict.
 
-    The config is a flat dict whose keys are BS lower-bound strings::
+    Integer-string keys (``"1"``, ``"64"``, …) become ``{1: {...}, 64: {...}}``.
+    Non-integer keys are ignored (they are global overrides).
 
-        {"1": {"steps": [1,3,7], ...}, "64": {"steps": [1,3,5], ...}}
-
-    Non-integer keys (e.g. ``ema_alpha``) are treated as global overrides
-    and ignored here — they are passed through in *config* directly.
-
-    Returns ``{bs_int: entry_dict}`` or ``None`` when no BS entries found.
+    Returns ``None`` when no BS entries found.
     """
     result: dict[int, dict] = {}
     for key, entry in config.items():
@@ -209,40 +118,99 @@ def load_bs_config(config: dict) -> dict[int, dict] | None:
         except ValueError:
             continue
         if not isinstance(entry, dict):
-            result[bs] = {"steps": entry if isinstance(entry, list) else []}
-        else:
-            result[bs] = entry
-
+            raise ValueError(
+                f"Invalid adaptive config for BS {bs}: "
+                f"expected a dict, got {type(entry).__name__}"
+            )
+        result[bs] = entry
     return result if result else None
+
+
+def _load_validated_config(
+    cfg_path: str | None,
+) -> tuple[dict, dict[int, dict]]:
+    """Load, parse, and validate adaptive config. Falls back to default on error.
+
+    Returns ``(cfg, bs_config)`` where *cfg* is the full config dict and
+    *bs_config* is the validated ``{bs_int: entry_dict}`` mapping.
+    Both ``resolve_candidate_steps_from_config`` and ``build_per_bs_params``
+    use this so that allocation sizing and runtime controller always agree.
+    """
+    try:
+        cfg = load_adaptive_config(cfg_path) if cfg_path else DEFAULT_ADAPTIVE_CONFIG
+        bs_config = _resolve_candidate_steps(cfg)
+        if bs_config is None:
+            raise ValueError("no per-BS entries found")
+        for bs, entry in bs_config.items():
+            steps = entry.get("steps")
+            if steps is not None and (
+                not isinstance(steps, list)
+                or not steps
+                # TODO: allow step=0 (nospec fallback) once supported
+                or not all(isinstance(s, int) and s > 0 for s in steps)
+            ):
+                raise ValueError(
+                    f"BS {bs}: 'steps' must be a non-empty list of positive ints, "
+                    f"got {steps!r}"
+                )
+    except Exception as e:
+        log_info_on_rank0(
+            logger,
+            f"Invalid adaptive config ({e}), falling back to default",
+        )
+        cfg = DEFAULT_ADAPTIVE_CONFIG
+        bs_config = _resolve_candidate_steps(cfg)
+    return cfg, bs_config
 
 
 def resolve_candidate_steps_from_config(
     initial_steps: int,
     cfg_path: str | None = None,
-    preset: str | None = None,
 ) -> list[int]:
-    """Load adaptive config and resolve candidate steps.
+    """Resolve the union of all candidate steps from config.
 
     Used by ``ServerArgs.effective_max_speculative_num_draft_tokens()``
     to determine the max draft-token count without building the full
     AdaptiveController.
     """
-    if cfg_path is not None:
-        cfg = load_adaptive_config(cfg_path)
-    elif preset is not None:
-        cfg = get_preset_config(preset)
-    else:
-        cfg = {}
-    bs_config = load_bs_config(cfg)
+    _, bs_config = _load_validated_config(cfg_path)
     all_steps: set[int] = set()
-    if bs_config:
-        for entry in bs_config.values():
-            steps = entry.get("steps", [1, 3, 7])
-            all_steps.update(steps)
-    else:
-        all_steps.update(cfg.get("candidate_steps", [1, 3, 7]))
+    for entry in bs_config.values():
+        all_steps.update(entry.get("steps", [1, 3, 7]))
     all_steps.add(initial_steps)
     return sorted(all_steps)
+
+
+def build_per_bs_params(
+    cfg_path: str | None = None,
+) -> tuple[list[int], dict[int, "AdaptiveSpeculativeParams"]]:
+    """Parse config and build one ``AdaptiveSpeculativeParams`` per BS slot.
+
+    Returns ``(bs_list, bs_params)`` where *bs_list* is the sorted list of
+    BS lower-bound keys and *bs_params* maps each key to its params instance.
+    """
+    cfg, bs_config = _load_validated_config(cfg_path)
+
+    bs_list = sorted(bs_config.keys())
+    bs_params: dict[int, AdaptiveSpeculativeParams] = {}
+    for bs, entry in sorted(bs_config.items()):
+        steps = entry.get("steps", [1, 3, 7])
+        initial = steps[len(steps) // 2]
+        params_cfg = {
+            **cfg,
+            "candidate_steps": steps,
+            "up_hysteresis": entry.get("up_hysteresis", cfg.get("up_hysteresis", 0.0)),
+            "down_hysteresis": entry.get(
+                "down_hysteresis", cfg.get("down_hysteresis", -0.25)
+            ),
+        }
+        if "ceiling_coeff" in entry:
+            params_cfg["ceiling_coeff"] = entry["ceiling_coeff"]
+        bs_params[bs] = AdaptiveSpeculativeParams(
+            initial_steps=initial,
+            bs_cfg=params_cfg,
+        )
+    return bs_list, bs_params
 
 
 class AdaptiveSpeculativeParams:
@@ -261,12 +229,12 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        cfg_path: str | dict | None = None,
+        bs_cfg: str | dict | None = None,
     ):
-        if isinstance(cfg_path, dict):
-            cfg = cfg_path
+        if isinstance(bs_cfg, dict):
+            cfg = bs_cfg
         else:
-            cfg = load_adaptive_config(cfg_path)
+            cfg = load_adaptive_config(bs_cfg)
         candidates = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
 
         assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
@@ -344,10 +312,9 @@ class AdaptiveSpeculativeParams:
             else:
                 break
 
-        # EMA ceiling: prevent over-speculation when draft quality is low.
-        # ceiling_coeff controls aggressiveness (default 1.67 = 60% accept_rate breakeven).
-        # Only applied as a downward cap — never blocks step-ups that hysteresis allows,
-        # so the system can explore higher steps and let the EMA catch up.
+        # EMA ceiling: cap num_steps proportionally to observed draft quality.
+        # Only applied as a downward cap — never blocks step-ups that hysteresis
+        # allows, so the system can explore higher steps and let the EMA catch up.
         target = self.candidate_steps[current_idx]
         if self.ceiling_coeff > 0:
             ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))

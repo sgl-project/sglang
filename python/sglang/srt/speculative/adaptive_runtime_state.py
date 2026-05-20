@@ -3,16 +3,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import (
-    DEFAULT_BS_HYSTERESIS,
-    DEFAULT_BS_STEPS,
-    AdaptiveSpeculativeParams,
-    get_default_hysteresis,
-    get_preset_config,
-    load_adaptive_config,
-    load_bs_config,
-)
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.speculative.adaptive_spec_params import build_per_bs_params
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -82,37 +73,16 @@ class AdaptiveController:
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(num_correct_drafts_per_req)`` after each decode verify.
+      2. Call ``on_verify_complete(num_correct_drafts_per_req, batch_size)`` after each decode verify.
     """
 
     def __init__(
         self,
         worker: AdaptiveSpecWorker,
         config_path: str | None = None,
-        preset: str | None = None,
     ):
         self.worker = worker
-
-        if config_path is not None:
-            cfg = load_adaptive_config(config_path)
-        elif preset is not None:
-            cfg = get_preset_config(preset)
-            log_info_on_rank0(
-                logger,
-                f"Using adaptive preset '{preset}'",
-            )
-        else:
-            cfg = {}
-
-        bs_config = load_bs_config(cfg)
-
-        if bs_config is None:
-            bs_config = {
-                bs: {"steps": steps, **DEFAULT_BS_HYSTERESIS[bs]}
-                for bs, steps in DEFAULT_BS_STEPS.items()
-            }
-
-        self._init_per_bs(cfg, bs_config)
+        self._bs_list, self._bs_params = build_per_bs_params(config_path)
         self._states: dict[int, SpecRuntimeState] = {}
         self._cuda_graph_bs: list[int] | None = None
 
@@ -120,31 +90,6 @@ class AdaptiveController:
             f"AdaptiveController initialized: bs_list={self._bs_list}, "
             f"candidate_steps={self.candidate_steps}"
         )
-
-    def _init_per_bs(self, cfg: dict, bs_config: dict[int, dict]):
-        """Initialize per-BS adaptive params from *bs_config*."""
-        self._bs_list = sorted(bs_config.keys())
-        self._bs_params: dict[int, AdaptiveSpeculativeParams] = {}
-
-        for bs, entry in sorted(bs_config.items()):
-            steps = entry.get("steps", DEFAULT_BS_STEPS.get(bs, [1, 3, 7]))
-            initial = steps[len(steps) // 2]
-
-            defaults = get_default_hysteresis(bs)
-            up_h = entry.get("up_hysteresis", defaults["up_hysteresis"])
-            down_h = entry.get("down_hysteresis", defaults["down_hysteresis"])
-            params_cfg = {
-                **cfg,
-                "candidate_steps": steps,
-                "up_hysteresis": up_h,
-                "down_hysteresis": down_h,
-            }
-            if "ceiling_coeff" in entry:
-                params_cfg["ceiling_coeff"] = entry["ceiling_coeff"]
-            self._bs_params[bs] = AdaptiveSpeculativeParams(
-                initial_steps=initial,
-                cfg_path=params_cfg,
-            )
 
     @property
     def candidate_steps(self) -> list[int]:
