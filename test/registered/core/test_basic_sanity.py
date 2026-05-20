@@ -30,9 +30,9 @@ class TestBasicSanity(
     CustomTestCase,
 ):
     served_model_name = DEFAULT_MODEL_NAME_FOR_TEST
-    # Conservative for 5090 + Llama-3.1-8B single-batch decode; saturated
-    # multi-batch runners on H100/H200 can push the default 95.0.
-    fwd_occupancy_threshold = 90.0
+    # 5090 + Llama-3.1-8B single-batch decode with overlap scheduler +
+    # cuda graph measured ~99 median in CI; keep ~2pp headroom.
+    fwd_occupancy_threshold = 97.0
 
     @classmethod
     def setUpClass(cls):
