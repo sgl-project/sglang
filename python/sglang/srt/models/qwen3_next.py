@@ -106,6 +106,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
         self.activation = config.hidden_act
+        self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -186,12 +187,21 @@ class Qwen3GatedDeltaNet(nn.Module):
                 norm_before_gate=True,
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
+                **(
+                    {"activation": self.output_gate_type}
+                    if self.output_gate_type is not None
+                    else {}
+                ),
             )
             if not get_global_server_args().disable_piecewise_cuda_graph
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
-                activation=self.activation,
+                activation=(
+                    self.output_gate_type
+                    if self.output_gate_type is not None
+                    else self.activation
+                ),
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )

@@ -1002,7 +1002,7 @@ class VisionAttention(nn.Module):
             major, minor = get_device_capability()
             if major == 9:
                 backend = "fa3"
-            elif major == 10:
+            elif major == 10 and minor != 3:
                 backend = "fa4"
             else:
                 backend = "triton_attn"
