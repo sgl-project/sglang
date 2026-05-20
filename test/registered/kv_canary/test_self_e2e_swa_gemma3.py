@@ -89,7 +89,9 @@ class TestLongPromptSwaWindowClip(_Gemma3SwaBase, unittest.TestCase):
         )
         violations = [line for line in haystack.splitlines() if "canary_kind:" in line]
         self.assertEqual(
-            violations, [], f"Unexpected canary violation lines under SWA clip: {violations}"
+            violations,
+            [],
+            f"Unexpected canary violation lines under SWA clip: {violations}",
         )
 
 
@@ -125,7 +127,9 @@ class TestMixedBatchNoViolations(_Gemma3SwaBase, unittest.TestCase):
         )
         violations = [line for line in haystack.splitlines() if "canary_kind:" in line]
         self.assertEqual(
-            violations, [], f"Unexpected canary violation lines in mixed batch: {violations}"
+            violations,
+            [],
+            f"Unexpected canary violation lines in mixed batch: {violations}",
         )
 
 
