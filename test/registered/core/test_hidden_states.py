@@ -26,11 +26,14 @@ class TestHiddenState(CustomTestCase):
         cls.prompts = ["Today is", "Today is a sunny day and I like"]
         cls.input_ids = cls.tokenizer(cls.prompts).input_ids
         cls.sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        # mem_fraction_static=0.7 leaves headroom for the HF reference
+        # model that test_return_hidden_states loads on the same GPU.
         cls.engine = sgl.Engine(
             model_path=cls.model_path,
             random_seed=42,
             skip_tokenizer_init=True,
             enable_return_hidden_states=True,
+            mem_fraction_static=0.7,
         )
 
     @classmethod
