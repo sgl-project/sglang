@@ -36,11 +36,11 @@ void store_cache_kernel_impl(
     int64_t vc_stride) {
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
     for (int64_t bs = begin; bs < end; ++bs) {
-      const int64_t cache_idx = static_cast<int64_t>(indices[bs]);
+      const int64_t idx = static_cast<int64_t>(indices[bs]);
       const scalar_t* k_ptr = k + bs * k_stride;
       const scalar_t* v_ptr = v + bs * v_stride;
-      scalar_t* kc_ptr = k_cache + cache_idx * kc_stride;
-      scalar_t* vc_ptr = v_cache + cache_idx * vc_stride;
+      scalar_t* kc_ptr = k_cache + idx * kc_stride;
+      scalar_t* vc_ptr = v_cache + idx * vc_stride;
       copy_stub(kc_ptr, k_ptr, row_dim);
       copy_stub(vc_ptr, v_ptr, row_dim);
     }
