@@ -8,18 +8,13 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.adapters.dsv4 import attach_dsv4
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
-from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla
-from sglang.srt.kv_canary.pool_patch.adapters.nsa import attach_nsa
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.buffer_alloc import resolve_read_bytes
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
-    DSATokenToKVPool,
     KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
-    MLATokenToKVPool,
-    MLATokenToKVPoolFP4,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
@@ -31,9 +26,6 @@ _CANARY_BUFFER_GROUPS_ATTR = "_kv_canary_buffer_groups"
 _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
     MHATokenToKVPool: attach_mha,
     MHATokenToKVPoolFP4: attach_mha,
-    MLATokenToKVPool: attach_mla,
-    MLATokenToKVPoolFP4: attach_mla,
-    DSATokenToKVPool: attach_nsa,
     SWAKVPool: attach_swa,
     DeepSeekV4TokenToKVPool: attach_dsv4,
 }
