@@ -1671,6 +1671,217 @@ def test_violation_bit_injection_position_ring_state_matrix(
         )
 
 
+def _hand_fold_bit(raw_bytes: bytes) -> int:
+    """BIT-mode fold: parity of low bits across all read bytes, then splitmix64 mix into acc=0."""
+    _u64 = (1 << 64) - 1
+    parity = sum(b & 1 for b in raw_bytes) & 1
+    source_hash = parity
+    combined = 0 ^ source_hash
+    x = combined & _u64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _u64
+    return (x ^ (x >> 31)) & _u64
+
+
+def _hand_fold_all(raw_bytes: bytes) -> int:
+    """ALL-mode fold: pack bytes little-endian into 8-byte words, fold each via splitmix64, then mix into acc=0."""
+    _u64 = (1 << 64) - 1
+
+    def _sm64(v: int) -> int:
+        v = v & _u64
+        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
+        return (v ^ (v >> 31)) & _u64
+
+    pad = (8 - len(raw_bytes) % 8) % 8
+    padded = raw_bytes + bytes(pad)
+    num_words = len(padded) // 8
+    acc = 0
+    for w in range(num_words):
+        chunk = padded[w * 8 : (w + 1) * 8]
+        word = sum(b << (8 * k) for k, b in enumerate(chunk))
+        acc = _sm64(acc ^ word)
+    source_hash = acc
+    return _sm64(0 ^ source_hash)
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_real_kv_hash_bit_mode_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
+    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    _EXPECTED_HASH: int = 0x5692161D100B05E5
+
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    source_cuda = make_real_kv_source(
+        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+    )
+    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_ref = RealKvSource(
+        tensor=source_cuda.tensor.clone(),
+        page_size=source_cuda.page_size,
+        num_bytes_per_token=source_cuda.num_bytes_per_token,
+        read_bytes=source_cuda.read_bytes,
+    )
+
+    # Step 2: verify hand-computed fold matches the hex literal.
+    assert _hand_fold_bit(_PATTERN) == _EXPECTED_HASH
+
+    # Step 3: stamp slot 0 with a chain-head entry whose real_kv_hash equals the expected value.
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=7,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=to_signed_int64(_EXPECTED_HASH),
+        )
+
+    # Step 4: 1-entry verify plan; no violation because stored matches recomputed.
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.BIT,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 0
+
+    # Step 5: mutate one byte in the source so the recomputed hash diverges from stored.
+    source_cuda.tensor[0, 0] ^= 0xFF
+    source_ref.tensor.copy_(source_cuda.tensor)
+
+    plan_cuda2 = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref2 = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log2 = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log2 = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda2,
+        plan_ref=plan_ref2,
+        cuda_log=cuda_log2,
+        ref_log=ref_log2,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.BIT,
+    )
+
+    fail_bits = int(cuda_log2.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert fail_bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
+
+
+@pytest.mark.parametrize("hardcoded", [True])
+def test_real_kv_hash_all_mode_hardcoded(hardcoded: bool) -> None:
+    assert hardcoded
+    # Step 1: build one RealKvSource with read_bytes=8 and a fixed byte pattern at slot 0.
+    _PATTERN = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80])
+    _EXPECTED_HASH: int = 0xC4C41792E6578644
+
+    cuda_buf, ref_buf = _setup_pair_with_canned_chain()
+    source_cuda = make_real_kv_source(
+        num_slots=16, num_bytes_per_token=8, page_size=1, read_bytes=8, device=_DEVICE
+    )
+    source_cuda.tensor[0, :8] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+    source_ref = RealKvSource(
+        tensor=source_cuda.tensor.clone(),
+        page_size=source_cuda.page_size,
+        num_bytes_per_token=source_cuda.num_bytes_per_token,
+        read_bytes=source_cuda.read_bytes,
+    )
+
+    # Step 2: verify hand-computed fold matches the hex literal.
+    assert _hand_fold_all(_PATTERN) == _EXPECTED_HASH
+
+    # Step 3: stamp slot 0 with a chain-head entry whose real_kv_hash equals the expected value.
+    anchor_signed = chain_anchor_signed()
+    for buf in (cuda_buf, ref_buf):
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=0,
+            token=7,
+            position=0,
+            prev_hash=anchor_signed,
+            real_kv_hash=to_signed_int64(_EXPECTED_HASH),
+        )
+
+    # Step 4: 1-entry verify plan; no violation because stored matches recomputed.
+    plan_cuda = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.ALL,
+    )
+
+    assert int(cuda_log.write_index[0].item()) == 0
+
+    # Step 5: mutate one byte in the source so the recomputed hash diverges from stored.
+    source_cuda.tensor[0, 0] ^= 0xFF
+    source_ref.tensor.copy_(source_cuda.tensor)
+
+    plan_cuda2 = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    plan_ref2 = make_verify_plan(
+        slot_indices=[0], positions=[0], prev_slot_indices=[-1], device=_DEVICE
+    )
+    cuda_log2 = FakeViolationLog.allocate(device=_DEVICE)
+    ref_log2 = FakeViolationLog.allocate(device=_DEVICE)
+
+    _run_both(
+        cuda_canary_buf=cuda_buf,
+        ref_canary_buf=ref_buf,
+        plan_cuda=plan_cuda2,
+        plan_ref=plan_ref2,
+        cuda_log=cuda_log2,
+        ref_log=ref_log2,
+        real_kv_sources_cuda=(source_cuda,),
+        real_kv_sources_ref=(source_ref,),
+        real_kv_hash_mode=RealKvHashMode.ALL,
+    )
+
+    fail_bits = int(cuda_log2.ring[0, _VIOLATION_FIELD_FAIL_REASON_BITS].item())
+    assert fail_bits & _FAIL_REASON_BIT_REAL_KV_HASH
+    assert_canary_state_equal(log_a=cuda_log2, log_b=ref_log2)
+
+
+
 def test_chain_advance_formula_matches_spec() -> None:
     """Ref impl agrees with Python-side ``splitmix64(prev XOR token XOR pos XOR real_kv_hash)`` formula."""
     # Step 1: 5 hardcoded 4-tuples covering positive / zero / large prev_hash values.
