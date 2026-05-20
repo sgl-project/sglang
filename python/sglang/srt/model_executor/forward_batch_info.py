@@ -503,10 +503,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_lens_cpu = batch.seq_lens_cpu
 
-        # Lazy CPU-sum if upstream left seq_lens_sum=None (filter/merge/prepare).
-        # sync=False: seq_lens_cpu is already fresh by this point (eagerly
-        # maintained on non-spec paths; refreshed by Scheduler.run_batch's
-        # pre-isolation call for spec v2).
         if batch.seq_lens_sum is None:
             batch.refresh_seq_lens_cpu(sync=False)
 
