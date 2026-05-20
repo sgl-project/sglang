@@ -122,11 +122,15 @@ class FutureMap:
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         if self.spec_algo.is_none():
+            indices = future_indices.indices
+            if indices.shape[0] == 0:
+                # DP attention idle rank: indices is empty but next_token_ids
+                # may carry padded values from sibling ranks. Nothing to store
+                # for this rank.
+                return
             # next_token_ids is int32; buf is int64. Slice assignment used to
             # cast implicitly, but advanced indexing requires an explicit match.
-            self.token_ids_buf[future_indices.indices] = batch_result.next_token_ids.to(
-                torch.int64
-            )
+            self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
