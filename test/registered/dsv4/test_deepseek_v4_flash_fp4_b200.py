@@ -130,5 +130,51 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
         _gsm8k_check(self)
 
 
+class TestDSV4FlashFP4B200Balanced_CP(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--enable-nsa-prefill-context-parallel",
+                "--nsa-prefill-cp-mode",
+                "round-robin-split",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _gsm8k_check(self)
+
+
 if __name__ == "__main__":
     unittest.main()
