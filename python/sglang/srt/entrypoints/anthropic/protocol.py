@@ -23,8 +23,8 @@ class AnthropicErrorResponse(BaseModel):
 class AnthropicUsage(BaseModel):
     """Token usage information"""
 
-    input_tokens: int
-    output_tokens: int
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     cache_creation_input_tokens: Optional[int] = None
     cache_read_input_tokens: Optional[int] = None
 
@@ -38,12 +38,14 @@ class AnthropicContentBlock(BaseModel):
         "tool_use",
         "tool_result",
         "tool_reference",
+        "search_result",
         "thinking",
         "redacted_thinking",
     ]
     text: Optional[str] = None
-    # For image content
-    source: Optional[dict[str, Any]] = None
+    # For image content and search results
+    source: Optional[dict[str, Any] | str] = None
+    title: Optional[str] = None
     # For tool use/result
     id: Optional[str] = None
     tool_use_id: Optional[str] = None
@@ -67,13 +69,16 @@ class AnthropicTool(BaseModel):
     """Tool definition"""
 
     name: str
+    type: Optional[str] = None
     description: Optional[str] = None
-    input_schema: dict[str, Any]
+    input_schema: Optional[dict[str, Any]] = None
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
     @classmethod
     def validate_input_schema(cls, v):
+        if v is None:
+            return v
         if not isinstance(v, dict):
             raise ValueError("input_schema must be a dictionary")
         if "type" not in v:
@@ -138,9 +143,18 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
+    type: Optional[
+        Literal[
+            "text_delta",
+            "input_json_delta",
+            "thinking_delta",
+            "signature_delta",
+        ]
+    ] = None
     text: Optional[str] = None
     partial_json: Optional[str] = None
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
 
     # Message delta fields
     stop_reason: Optional[

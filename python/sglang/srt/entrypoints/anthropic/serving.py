@@ -10,7 +10,7 @@ import json
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -49,6 +49,57 @@ STOP_REASON_MAP = {
     "length": "max_tokens",
     "tool_calls": "tool_use",
 }
+
+ERROR_TYPE_MAP = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    408: "request_timeout_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    502: "api_error",
+    503: "overloaded_error",
+    504: "api_error",
+}
+
+
+def _cached_prompt_tokens(usage) -> int:
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+
+
+def _anthropic_input_tokens(usage) -> int:
+    return max(
+        (getattr(usage, "prompt_tokens", 0) or 0) - _cached_prompt_tokens(usage),
+        0,
+    )
+
+
+def _anthropic_usage_from_openai(
+    usage,
+    *,
+    include_input: bool,
+    include_output: bool,
+    force_zero_output: bool = False,
+) -> AnthropicUsage:
+    if usage is None:
+        return AnthropicUsage(
+            input_tokens=0 if include_input else None,
+            output_tokens=0 if include_output else None,
+        )
+
+    usage_fields: dict[str, int] = {}
+    cached_tokens = _cached_prompt_tokens(usage)
+    if include_input:
+        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+        if cached_tokens:
+            usage_fields["cache_read_input_tokens"] = cached_tokens
+    if include_output:
+        usage_fields["output_tokens"] = (
+            0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
+        )
+    return AnthropicUsage(**usage_fields)
 
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
@@ -94,7 +145,7 @@ class AnthropicServing:
         openai_messages = []
 
         def _convert_anthropic_image_source_to_openai_part(
-            source: Optional[dict],
+            source: Optional[dict[str, Any] | str],
         ) -> Optional[dict]:
             if not isinstance(source, dict):
                 return None
@@ -122,6 +173,35 @@ class AnthropicServing:
                 }
 
             return None
+
+        def _text_from_search_result(item: dict[str, Any]) -> str:
+            search_parts = []
+            title = item.get("title")
+            if title:
+                search_parts.append(f"Title: {title}")
+
+            source = item.get("source")
+            if isinstance(source, dict):
+                source_text = source.get("url") or source.get("text")
+                if source_text:
+                    search_parts.append(f"Source: {source_text}")
+            elif source:
+                search_parts.append(f"Source: {source}")
+
+            content = item.get("content")
+            content_parts = []
+            if isinstance(content, str):
+                content_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text" and part.get("text"):
+                        content_parts.append(part["text"])
+            if content_parts:
+                search_parts.append("Content: " + "\n".join(content_parts))
+
+            return "\n".join(search_parts)
 
         def _convert_tool_result_content(
             content: Optional[str | list[dict]],
@@ -153,6 +233,13 @@ class AnthropicServing:
                         if ref_name:
                             tool_content_parts.append(
                                 {"type": "tool_reference", "name": ref_name}
+                            )
+                    elif item_type == "search_result":
+                        search_text = _text_from_search_result(item)
+                        if search_text:
+                            tool_text_parts.append(search_text)
+                            tool_content_parts.append(
+                                {"type": "text", "text": search_text}
                             )
 
                 tool_text = "\n".join(tool_text_parts)
@@ -203,6 +290,11 @@ class AnthropicServing:
                     )
                     if image_part is not None:
                         content_parts.append(image_part)
+
+                elif block.type == "search_result":
+                    search_text = _text_from_search_result(block.model_dump())
+                    if search_text:
+                        content_parts.append({"type": "text", "text": search_text})
 
                 elif block.type == "tool_use":
                     tool_call = {
@@ -274,7 +366,10 @@ class AnthropicServing:
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
-            request_data["stream_options"] = StreamOptions(include_usage=True)
+            request_data["stream_options"] = StreamOptions(
+                include_usage=True,
+                continuous_usage_stats=True,
+            )
 
         chat_request = ChatCompletionRequest(**request_data)
 
@@ -282,18 +377,31 @@ class AnthropicServing:
         # the chat template hides them from the initial <tools> block and renders
         # them on demand when a tool_reference block names them.
         if anthropic_request.tools:
-            chat_request.tools = [
-                Tool(
-                    type="function",
-                    defer_loading=tool.defer_loading,
-                    function={
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "parameters": tool.input_schema,
-                    },
+            converted_tools = []
+            for tool in anthropic_request.tools:
+                tool_type = tool.type or ""
+                is_builtin_server_tool = tool_type.startswith(
+                    "web_search"
+                ) or tool.name.startswith("web_search")
+                if tool.input_schema is None:
+                    if is_builtin_server_tool:
+                        continue
+                    raise ValueError("input_schema is required for custom tools")
+
+                converted_tools.append(
+                    Tool(
+                        type="function",
+                        defer_loading=tool.defer_loading,
+                        function={
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "parameters": tool.input_schema,
+                        },
+                    )
                 )
-                for tool in anthropic_request.tools
-            ]
+
+            if converted_tools:
+                chat_request.tools = converted_tools
 
         # Convert tool choice
         if anthropic_request.tool_choice is not None:
@@ -363,11 +471,7 @@ class AnthropicServing:
         # Check for error responses from OpenAI handler
         if not isinstance(response, ChatCompletionResponse):
             # It's an error response (ORJSONResponse)
-            return self._error_response(
-                status_code=500,
-                error_type="internal_error",
-                message="Internal processing error",
-            )
+            return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
         anthropic_response = self._convert_response(response)
@@ -436,13 +540,90 @@ class AnthropicServing:
         )
 
         # State tracking
-        first_chunk = True
         content_block_index = 0
         content_block_open = False
+        content_block_type: Optional[str] = None
         finish_reason: Optional[str] = None
-        usage_info: Optional[dict] = None
+        final_usage: Optional[AnthropicUsage] = None
+        message_started = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+
+        def _message_start_event(usage) -> AnthropicStreamEvent:
+            return AnthropicStreamEvent(
+                type="message_start",
+                message=AnthropicMessagesResponse(
+                    id=message_id,
+                    content=[],
+                    model=model,
+                    usage=_anthropic_usage_from_openai(
+                        usage,
+                        include_input=True,
+                        include_output=True,
+                        force_zero_output=True,
+                    ),
+                ),
+            )
+
+        def _close_content_block_events() -> list[tuple[str, AnthropicStreamEvent]]:
+            nonlocal content_block_index, content_block_open, content_block_type
+
+            events = []
+            if not content_block_open:
+                return events
+
+            if content_block_type == "thinking":
+                events.append(
+                    (
+                        "content_block_delta",
+                        AnthropicStreamEvent(
+                            type="content_block_delta",
+                            index=content_block_index,
+                            delta=AnthropicDelta(
+                                type="signature_delta",
+                                signature="",
+                            ),
+                        ),
+                    )
+                )
+
+            events.append(
+                (
+                    "content_block_stop",
+                    AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    ),
+                )
+            )
+            content_block_open = False
+            content_block_type = None
+            content_block_index += 1
+            return events
+
+        def _ensure_content_block_events(
+            block_type: str,
+            content_block: AnthropicContentBlock,
+        ) -> list[tuple[str, AnthropicStreamEvent]]:
+            nonlocal content_block_open, content_block_type
+
+            events = []
+            if content_block_open and content_block_type != block_type:
+                events.extend(_close_content_block_events())
+            if not content_block_open:
+                events.append(
+                    (
+                        "content_block_start",
+                        AnthropicStreamEvent(
+                            type="content_block_start",
+                            index=content_block_index,
+                            content_block=content_block,
+                        ),
+                    )
+                )
+                content_block_open = True
+                content_block_type = block_type
+            return events
 
         async for sse_line in openai_stream:
             if not sse_line.startswith("data: "):
@@ -451,15 +632,19 @@ class AnthropicServing:
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
-                # Close any open content block
-                if content_block_open:
-                    stop_event = AnthropicStreamEvent(
-                        type="content_block_stop",
-                        index=content_block_index,
-                    )
+                if not message_started:
+                    start_event = _message_start_event(None)
                     yield _wrap_sse_event(
-                        stop_event.model_dump_json(exclude_none=True),
-                        "content_block_stop",
+                        start_event.model_dump_json(exclude_none=True),
+                        "message_start",
+                    )
+                    message_started = True
+
+                # Close any open content block
+                for event_name, event in _close_content_block_events():
+                    yield _wrap_sse_event(
+                        event.model_dump_json(exclude_none=True),
+                        event_name,
                     )
 
                 # Emit message_delta with stop_reason and usage
@@ -467,14 +652,7 @@ class AnthropicServing:
                 delta_event = AnthropicStreamEvent(
                     type="message_delta",
                     delta=AnthropicDelta(stop_reason=stop_reason),
-                    usage=AnthropicUsage(
-                        input_tokens=(
-                            usage_info.get("input_tokens", 0) if usage_info else 0
-                        ),
-                        output_tokens=(
-                            usage_info.get("output_tokens", 0) if usage_info else 0
-                        ),
-                    ),
+                    usage=final_usage or AnthropicUsage(output_tokens=0),
                 )
                 yield _wrap_sse_event(
                     delta_event.model_dump_json(exclude_none=True),
@@ -505,38 +683,15 @@ class AnthropicServing:
                 )
                 continue
 
-            # First chunk: emit message_start
-            if first_chunk:
-                first_chunk = False
-
-                start_event = AnthropicStreamEvent(
-                    type="message_start",
-                    message=AnthropicMessagesResponse(
-                        id=message_id,
-                        content=[],
-                        model=model,
-                        usage=AnthropicUsage(
-                            input_tokens=(
-                                chunk.usage.prompt_tokens if chunk.usage else 0
-                            ),
-                            output_tokens=0,
-                        ),
-                    ),
+            if chunk.usage is not None:
+                final_usage = _anthropic_usage_from_openai(
+                    chunk.usage,
+                    include_input=False,
+                    include_output=True,
                 )
-                yield _wrap_sse_event(
-                    start_event.model_dump_json(exclude_none=True),
-                    "message_start",
-                )
-                # Skip if this was just the role chunk with empty content
-                if chunk.choices and chunk.choices[0].delta.content == "":
-                    continue
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
-                usage_info = {
-                    "input_tokens": chunk.usage.prompt_tokens,
-                    "output_tokens": chunk.usage.completion_tokens or 0,
-                }
                 continue
 
             if not chunk.choices:
@@ -547,9 +702,65 @@ class AnthropicServing:
             # Capture finish reason
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
+                if not message_started:
+                    start_event = _message_start_event(chunk.usage)
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "message_start",
+                    )
+                    message_started = True
                 continue
 
             delta = choice.delta
+
+            has_delta_payload = bool(
+                delta.reasoning_content
+                or delta.tool_calls
+                or (delta.content is not None and delta.content != "")
+                or chunk.usage
+            )
+            if has_delta_payload and not message_started:
+                start_event = _message_start_event(chunk.usage)
+                yield _wrap_sse_event(
+                    start_event.model_dump_json(exclude_none=True),
+                    "message_start",
+                )
+                message_started = True
+
+            if (
+                not has_delta_payload
+                and delta.role == "assistant"
+                and (delta.content is None or delta.content == "")
+            ):
+                continue
+
+            # Handle reasoning content deltas
+            if delta.reasoning_content:
+                for event_name, event in _ensure_content_block_events(
+                    "thinking",
+                    AnthropicContentBlock(
+                        type="thinking",
+                        thinking="",
+                        signature="",
+                    ),
+                ):
+                    yield _wrap_sse_event(
+                        event.model_dump_json(exclude_none=True),
+                        event_name,
+                    )
+
+                delta_event = AnthropicStreamEvent(
+                    type="content_block_delta",
+                    index=content_block_index,
+                    delta=AnthropicDelta(
+                        type="thinking_delta",
+                        thinking=delta.reasoning_content,
+                    ),
+                )
+                yield _wrap_sse_event(
+                    delta_event.model_dump_json(exclude_none=True),
+                    "content_block_delta",
+                )
 
             # Handle tool call deltas
             if delta.tool_calls:
@@ -559,34 +770,20 @@ class AnthropicServing:
 
                     # New tool call: close previous block, start new one
                     if tc_func and tc_func.name:
-                        # Close previous content block if open
-                        if content_block_open:
-                            stop_event = AnthropicStreamEvent(
-                                type="content_block_stop",
-                                index=content_block_index,
-                            )
-                            yield _wrap_sse_event(
-                                stop_event.model_dump_json(exclude_none=True),
-                                "content_block_stop",
-                            )
-                            content_block_index += 1
-
                         # Start tool_use content block
-                        start_event = AnthropicStreamEvent(
-                            type="content_block_start",
-                            index=content_block_index,
-                            content_block=AnthropicContentBlock(
+                        for event_name, event in _ensure_content_block_events(
+                            "tool_use",
+                            AnthropicContentBlock(
                                 type="tool_use",
                                 id=tc_id or f"toolu_{uuid.uuid4().hex}",
                                 name=tc_func.name,
                                 input={},
                             ),
-                        )
-                        yield _wrap_sse_event(
-                            start_event.model_dump_json(exclude_none=True),
-                            "content_block_start",
-                        )
-                        content_block_open = True
+                        ):
+                            yield _wrap_sse_event(
+                                event.model_dump_json(exclude_none=True),
+                                event_name,
+                            )
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -605,6 +802,8 @@ class AnthropicServing:
 
                     elif tc_func and tc_func.arguments:
                         # Continuing arguments for current tool call
+                        if content_block_type != "tool_use":
+                            continue
                         delta_event = AnthropicStreamEvent(
                             type="content_block_delta",
                             index=content_block_index,
@@ -617,22 +816,18 @@ class AnthropicServing:
                             delta_event.model_dump_json(exclude_none=True),
                             "content_block_delta",
                         )
-                continue
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
                 # Start a text content block if needed
-                if not content_block_open:
-                    start_event = AnthropicStreamEvent(
-                        type="content_block_start",
-                        index=content_block_index,
-                        content_block=AnthropicContentBlock(type="text", text=""),
-                    )
+                for event_name, event in _ensure_content_block_events(
+                    "text",
+                    AnthropicContentBlock(type="text", text=""),
+                ):
                     yield _wrap_sse_event(
-                        start_event.model_dump_json(exclude_none=True),
-                        "content_block_start",
+                        event.model_dump_json(exclude_none=True),
+                        event_name,
                     )
-                    content_block_open = True
 
                 # Emit text delta
                 delta_event = AnthropicStreamEvent(
@@ -651,7 +846,7 @@ class AnthropicServing:
     def _convert_response(
         self, response: ChatCompletionResponse
     ) -> AnthropicMessagesResponse:
-        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
+        """Convert an OpenAI ChatCompletionResponse to an Anthropic response."""
         if not response.choices:
             return AnthropicMessagesResponse(
                 content=[AnthropicContentBlock(type="text", text="")],
@@ -662,6 +857,16 @@ class AnthropicServing:
 
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
+
+        # Add reasoning content
+        if choice.message.reasoning_content:
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking",
+                    thinking=choice.message.reasoning_content,
+                    signature="",
+                )
+            )
 
         # Add text content
         if choice.message.content:
@@ -694,10 +899,43 @@ class AnthropicServing:
             content=content,
             model=response.model,
             stop_reason=stop_reason,
-            usage=AnthropicUsage(
-                input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                output_tokens=response.usage.completion_tokens if response.usage else 0,
+            usage=_anthropic_usage_from_openai(
+                response.usage,
+                include_input=True,
+                include_output=True,
             ),
+        )
+
+    def _convert_openai_error_response(self, response) -> JSONResponse:
+        status_code = getattr(response, "status_code", 500)
+        error_type = ERROR_TYPE_MAP.get(status_code, "api_error")
+        message = "Internal processing error"
+
+        body = getattr(response, "body", None)
+        if body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                payload = None
+
+            if isinstance(payload, dict):
+                error_payload = payload.get("error", payload)
+                if isinstance(error_payload, dict):
+                    message = (
+                        error_payload.get("message")
+                        or payload.get("message")
+                        or message
+                    )
+                    error_type = error_payload.get("type") or error_type
+                elif isinstance(error_payload, str):
+                    message = error_payload
+                elif payload.get("message"):
+                    message = payload["message"]
+
+        return self._error_response(
+            status_code=status_code,
+            error_type=error_type,
+            message=message,
         )
 
     def _error_response(
