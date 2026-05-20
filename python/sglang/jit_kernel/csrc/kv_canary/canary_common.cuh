@@ -1,9 +1,5 @@
 // Shared device helpers for the KV cache canary verify + write kernels.
 //
-// Mirrors module-level constants and helpers from
-// python/sglang/jit_kernel/kv_canary/verify.py and
-// python/sglang/jit_kernel/kv_canary/write.py. Value parity is enforced by test_const_sync.py.
-//
 // Real-KV source ABI (tvm-ffi cannot pass tuple[RealKvSource, ...] directly): the host wrapper unpacks the
 // tuple into a fixed-size array of 4 sources and passes 4 separate uint8 tensors plus a single int32 array
 // of (page_size, num_bytes_per_token, read_bytes) triplets of length 12 (4 sources x 3 fields). Unused
