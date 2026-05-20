@@ -63,6 +63,9 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "--disable-radix-cache",
                 "--disable-cuda-graph",
             ],
+            env={
+                "TRANSFORMERS_VERBOSITY": "error",
+            },
         )
 
         ### Calculate initial used memory
