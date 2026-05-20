@@ -1,5 +1,6 @@
 import re
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.glmasr import GlmAsrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -44,10 +45,10 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+        )

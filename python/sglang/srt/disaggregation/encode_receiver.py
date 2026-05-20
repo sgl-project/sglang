@@ -13,6 +13,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
+import numpy as np
 import torch
 import zmq
 import zmq.asyncio
@@ -192,16 +193,53 @@ _MODALITY_GRID_ATTRS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
-_VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
+# Per-part video metadata for EPD. Tensor attrs cat on dim=0 across parts;
+# others chain as lists. video_meta_attrs_for(model_type) resolves the active
+# set per instance so non-MiMo runs skip the MiMo audio fields entirely.
+_GENERAL_VIDEO_META_ATTRS = (
+    "video_timestamps",
+    "second_per_grid_ts",
+)
+# MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
+_MIMO_VIDEO_AUDIO_META_ATTRS = (
+    "video_audio_feature_lens",
+    "video_audio_segment_lens_flat",
+    "video_audio_per_video_num_units",
+    "video_audio_embedding",
+)
+_VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
+
+
+def video_meta_attrs_for(model_type: Optional[str]) -> tuple:
+    """Video-meta attrs for model_type. MiMo appends its audio-in-video fields."""
+    attrs = _GENERAL_VIDEO_META_ATTRS
+    if model_type and "mimo" in model_type.lower():
+        attrs = attrs + _MIMO_VIDEO_AUDIO_META_ATTRS
+    return attrs
 
 
 def _cat_grid(dims, flatten_items=False):
-    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
-    valid = (
-        [g.flatten() for g in dims if g is not None]
-        if flatten_items
-        else [g for g in dims if g is not None]
-    )
+    """Concatenate non-None grid entries; supports tensor/ndarray/list inputs."""
+
+    def _to_tensor(g):
+        if isinstance(g, torch.Tensor):
+            return g.cpu() if g.is_cuda else g
+        if isinstance(g, np.ndarray):
+            return torch.from_numpy(g)
+        return torch.as_tensor(g)
+
+    valid = []
+    for g in dims:
+        if g is None:
+            continue
+        t = _to_tensor(g)
+        if flatten_items:
+            t = t.flatten()
+        elif t.ndim == 0:
+            # Keep cat semantics stable for scalar-like metadata.
+            t = t.unsqueeze(0)
+        valid.append(t)
+
     return torch.cat(valid, dim=0) if valid else None
 
 
@@ -215,6 +253,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         modality,
         embedding,
         embedding_shape,
+        model_type: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -227,6 +266,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape,
             **kwargs,
         )
+        self.video_meta_attrs = video_meta_attrs_for(model_type)
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
@@ -240,8 +280,8 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
         ]
-        self.video_timestamps = [None] * num_parts
-        self.second_per_grid_ts = [None] * num_parts
+        for attr in self.video_meta_attrs:
+            setattr(self, attr, [None] * num_parts)
 
         self._set_part_grid(part_idx, modality, self.get_grid())
         if modality == Modality.VIDEO:
@@ -258,7 +298,7 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def _set_video_meta_for_part(self, part_idx, source):
         """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
-        for attr_name in _VIDEO_META_ATTRS:
+        for attr_name in self.video_meta_attrs:
             val = (
                 source.get(attr_name)
                 if isinstance(source, dict)
@@ -268,11 +308,15 @@ class MultiModalEmbeddingData(EmbeddingData):
                 getattr(self, attr_name)[part_idx] = val
 
     @classmethod
-    def from_embedding_data(cls, embedding_data: EmbeddingData):
+    def from_embedding_data(
+        cls,
+        embedding_data: EmbeddingData,
+        model_type: Optional[str] = None,
+    ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
-        for attr in _VIDEO_META_ATTRS:
+        for attr in video_meta_attrs_for(model_type):
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
@@ -284,6 +328,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality=embedding_data.modality,
             embedding=embedding_data.embedding,
             embedding_shape=embedding_data.shape,
+            model_type=model_type,
             **extra,
         )
         mm_data.send_time = embedding_data.send_time
@@ -297,11 +342,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
-                    groups[self.modality_list[i]].append(e.cuda())
-            return {
-                mod: torch.concat(tensors).to("cpu", non_blocking=True)
-                for mod, tensors in groups.items()
-            }
+                    groups[self.modality_list[i]].append(e)
+            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
     @property
@@ -317,17 +359,26 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
-        for attr in _VIDEO_META_ATTRS:
+        for attr in self.video_meta_attrs:
             lst = getattr(self, attr, None)
             if not lst:
                 continue
             valid = [a for a in lst if a is not None]
-            if valid:
+            if not valid:
+                continue
+            if attr in _VIDEO_META_TENSOR_ATTRS:
+                kwargs[attr] = torch.cat(valid, dim=0)
+            else:
                 kwargs[attr] = list(itertools.chain(*valid))
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
-        assert self.req_id == embedding_data.req_id
+        if self.req_id != embedding_data.req_id:
+            logger.warning(
+                f"Dropping embedding data with mismatched req_id: "
+                f"expected {self.req_id}, got {embedding_data.req_id}"
+            )
+            return False
         assert not self.ready_list[embedding_data.part_idx]
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
@@ -505,6 +556,17 @@ class WaitingImageRequest:
                 self.recv_socket.close()
                 return
 
+            # Extract original req_id from part_req_id and drop stale payloads
+            # that may arrive on a reused ZMQ port after a prior request aborted.
+            original_req_id = extract_original_req_id(recv_obj.req_id)
+            if original_req_id != self.recv_req.rid:
+                logger.warning(
+                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                )
+                continue
+            recv_obj.req_id = original_req_id
+
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
             recv_obj.embedding = (
                 torch.frombuffer(buffer, dtype=recv_obj.dtype)
@@ -512,15 +574,9 @@ class WaitingImageRequest:
                 .clone()
             )
 
-            # Extract original req_id from part_req_id
-            part_req_id = recv_obj.req_id
-            original_req_id = extract_original_req_id(part_req_id)
-            # Update recv_obj.req_id to original for aggregation
-            recv_obj.req_id = original_req_id
-
             if self.recv_embedding_data is None:
                 self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj
+                    recv_obj, model_type=self.model_type
                 )
             else:
                 self.recv_embedding_data.add(recv_obj)
@@ -532,7 +588,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs["input_ids"]
+        self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -608,7 +664,13 @@ class MMReceiverBase(ABC):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
+        self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
+        self.model_type = (
+            getattr(hf_config, "model_type", "").lower()
+            if hf_config is not None
+            else None
+        )
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -646,6 +708,7 @@ class MMReceiverBase(ABC):
                         trust_remote_code=server_args.trust_remote_code,
                         revision=server_args.revision,
                         use_fast=not server_args.disable_fast_image_processor,
+                        tokenizer_backend=server_args.tokenizer_backend,
                     )
                 except ValueError as e:
                     error_message = str(e)
@@ -659,6 +722,7 @@ class MMReceiverBase(ABC):
                             trust_remote_code=server_args.trust_remote_code,
                             revision=server_args.revision,
                             use_fast=True,
+                            tokenizer_backend=server_args.tokenizer_backend,
                         )
                     else:
                         raise e
@@ -672,6 +736,11 @@ class MMReceiverBase(ABC):
                     server_args,
                     _processor,
                     transport_mode,
+                    model_config=(
+                        getattr(self.scheduler, "model_config", None)
+                        if self.scheduler is not None
+                        else None
+                    ),
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
@@ -691,15 +760,25 @@ class MMReceiverBase(ABC):
                 self.context, zmq.PULL, host=self.host
             )
             mm_data = self._extract_url_data(request_obj)
+            modalities = [m.get("modality") for m in mm_data]
+            logger.info(
+                f"[{req_id}] Sending encode request to E, "
+                f"modalities={modalities}, num_items={len(mm_data)}"
+            )
+            send_time = time.monotonic()
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")
             )
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=20,
+                timeout=self.recv_timeout,
             )
+            elapsed = time.monotonic() - send_time
+            logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")
+            return result
         except asyncio.TimeoutError:
-            logger.warning(f"Embedding recv timeout for request {req_id}")
+            elapsed = time.monotonic() - send_time
+            logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
             if req_id is not None:
                 self._cleanup_mooncake_buffer(req_id)
             return None
@@ -764,7 +843,7 @@ class MMReceiverBase(ABC):
                     )
                 if recv_embedding_data is None:
                     recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                        recv_obj
+                        recv_obj, model_type=self.model_type
                     )
                 else:
                     recv_embedding_data.add(recv_obj)
@@ -940,6 +1019,7 @@ class MMReceiverBase(ABC):
             require_reasoning=recv_req.require_reasoning,
             return_hidden_states=recv_req.return_hidden_states,
             return_routed_experts=recv_req.return_routed_experts,
+            routed_experts_start_len=recv_req.routed_experts_start_len,
             eos_token_ids=self.scheduler.model_config.hf_eos_token_id,
             bootstrap_host=recv_req.bootstrap_host,
             bootstrap_port=recv_req.bootstrap_port,
@@ -951,7 +1031,7 @@ class MMReceiverBase(ABC):
             priority=recv_req.priority,
             metrics_collector=(
                 self.scheduler.metrics_collector
-                if self.scheduler.enable_metrics
+                if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
             http_worker_ipc=recv_req.http_worker_ipc,
@@ -1016,6 +1096,26 @@ class MMReceiverBase(ABC):
         return num_items_assigned
 
     def _extract_url_data(self, request_obj) -> List[Dict]:
+        def flatten_mm_items(items):
+            if not isinstance(items, list):
+                return [items]
+
+            flat = []
+            for item in items:
+                if isinstance(item, (list, tuple)):
+                    flat.extend(flatten_mm_items(list(item)))
+                else:
+                    flat.append(item)
+            return flat
+
+        def to_raw_url(mm_item):
+            if isinstance(mm_item, ImageData):
+                return mm_item.url
+            if isinstance(mm_item, dict):
+                # tolerate {"url": ...} shaped payloads
+                return mm_item.get("url", mm_item)
+            return mm_item
+
         mm_data = []
         for attr, modality in [
             ("image_data", Modality.IMAGE),
@@ -1024,16 +1124,11 @@ class MMReceiverBase(ABC):
         ]:
             mm_items = getattr(request_obj, attr, None)
             if mm_items:
-                if not isinstance(mm_items, list):
-                    mm_items = [mm_items]
+                mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
                     mm_data.append(
                         {
-                            "url": (
-                                mm_item.url
-                                if isinstance(mm_item, ImageData)
-                                else mm_item
-                            ),
+                            "url": to_raw_url(mm_item),
                             "modality": modality,
                         }
                     )

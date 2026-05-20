@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_expand_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -11,12 +12,16 @@ from sglang.srt.utils import cached_triton_kernel
 @cached_triton_kernel(
     lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
 )
-@triton.jit(do_not_specialize=["num_segs"])
+@triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
     x,
     weights,
     output,
+    # Output strides may differ from OUTPUT_DIM when compact LoRA output is
+    # accumulated into a wider base projection.
+    output_stride_0,
+    output_stride_1,
     # Information on sequence lengths and weight id
     seg_indptr,
     weight_indices,
@@ -49,19 +54,14 @@ def _chunked_lora_expand_kernel(
         weights (Tensor): The LoRA B weights for all adapters.
             Shape: (num_lora, output_dim, K).
         output (Tensor): The output tensor where the result is stored.
-            Shape: (s, output_dim).
+            Shape: (s, output_dim) or a wider base output.
     """
-    tl.static_assert(NUM_SLICES <= 3)
-
     x_stride_0: tl.constexpr = NUM_SLICES * MAX_RANK
     x_stride_1: tl.constexpr = 1
 
     w_stride_0: tl.constexpr = OUTPUT_DIM * MAX_RANK
     w_stride_1: tl.constexpr = MAX_RANK
     w_stride_2: tl.constexpr = 1
-
-    output_stride_0: tl.constexpr = OUTPUT_DIM
-    output_stride_1: tl.constexpr = 1
 
     pid_s = tl.program_id(axis=2)
     if pid_s >= num_segs:
@@ -175,10 +175,13 @@ def chunked_sgmv_lora_expand_forward(
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * MAX_RANK
 
-    # TODO (lifuhuang): fine-tune per operation
+    # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
-    BLOCK_K = 16
-    BLOCK_N = 64
+    config = get_lora_expand_config(
+        K=OUTPUT_DIM, R=MAX_RANK, num_slices=num_slices, chunk_size=BLOCK_M
+    )
+    BLOCK_K = config["BLOCK_K"]
+    BLOCK_N = config["BLOCK_N"]
 
     num_segments = batch_info.num_segments
 
@@ -193,10 +196,21 @@ def chunked_sgmv_lora_expand_forward(
     else:
         output = base_output
 
+    # Optional launch params from tuned config
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
+    if "maxnreg" in config:
+        extra_kwargs["maxnreg"] = config["maxnreg"]
+
     _chunked_lora_expand_kernel[grid](
         x=x,
         weights=weights,
         output=output,
+        output_stride_0=output.stride(0),
+        output_stride_1=output.stride(1),
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
@@ -211,6 +225,7 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **extra_kwargs,
     )
 
     return output

@@ -36,7 +36,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -140,6 +139,7 @@ def register_fake_ops():
         "causal_conv1d_fwd_cpu",
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
+        "gemma4_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -222,6 +222,7 @@ def register_fake_ops():
         use_fp8_w8a16,
         qkv_a_proj_scale,
         q_b_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
         q_lora_rank,
@@ -407,6 +408,18 @@ def register_fake_ops():
         return mixed_qkv, z, b, a
 
     @torch.library.register_fake(
+        "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
+    )
+    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+        batch = mixed_qkvz.shape[0]
+        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+        b = mixed_ba.new_empty(batch, num_heads_v)
+        a = mixed_ba.new_empty(batch, num_heads_v)
+        return mixed_qkv, z, b, a
+
+    @torch.library.register_fake(
         "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
     )
     def _(
@@ -514,7 +527,7 @@ class CPUGraphRunner:
             not self.require_gathered_buffer
         ), "CPUGraphRunner does not support gathered buffer yet."
         assert (
-            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
+            model_runner.spec_algorithm.is_none()
         ), "CPUGraphRunner does not support speculative inference yet."
         # TODO add compile support for encoder-decoder models
         assert (
@@ -788,7 +801,7 @@ class CPUGraphRunner:
             captured_forward_batch.encoder_lens[:raw_bs].copy_(
                 forward_batch.encoder_lens
             )
-        if enable_num_token_non_padded(self.model_runner.server_args):
+        if enable_num_token_non_padded():
             captured_forward_batch.num_token_non_padded.copy_(
                 forward_batch.num_token_non_padded
             )
@@ -840,10 +853,10 @@ class CPUGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

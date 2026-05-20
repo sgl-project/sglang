@@ -4,7 +4,7 @@ Loads weights pre-quantized by msmodelslim (float8_e4m3fn weights,
 uint8 scales) and runs MXFP8 matmul at inference.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch_npu
@@ -19,6 +19,16 @@ _FLOAT8_E8M0FNU_DTYPE = getattr(
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
+
+    def __init__(
+        self,
+        quant_config: Optional[Dict[str, any]] = None,
+        prefix: Optional[str] = None,
+    ):
+        # quant_config / prefix are accepted to match the linear-scheme
+        # dispatch signature used by ModelSlimConfig.get_linear_scheme;
+        # MXFP8 needs no per-layer config beyond what create_weights derives.
+        del quant_config, prefix
 
     def create_weights(
         self,

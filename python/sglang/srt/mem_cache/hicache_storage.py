@@ -1,48 +1,20 @@
-import hashlib
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
-
-
-def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
-    hasher = hashlib.sha256()
-
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
-
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
-        else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
-
-    return hasher.hexdigest()
-
-
-def hash_str_to_int64(hash_str: str) -> int:
-    """Convert SHA256 hex string to signed 64-bit integer for events.
-
-    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
-    """
-    # Take first 16 hex chars to get 64-bit value
-    uint64_val = int(hash_str[:16], 16)
-    # Convert to signed int64 range [-2^63, 2^63-1]
-    if uint64_val >= 2**63:
-        return uint64_val - 2**64
-    return uint64_val
 
 
 @dataclass
@@ -51,6 +23,8 @@ class HiCacheStorageConfig:
     tp_size: int
     pp_rank: int
     pp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     is_mla_model: bool
     enable_storage_metrics: bool
     is_page_first_layout: bool
@@ -62,8 +36,17 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 0.1  # seconds per 1024 tokens
+    max: float = 30.0  # seconds, upper bound for the linear timeout
 
 
 class PoolName(str, Enum):
@@ -71,12 +54,25 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
+    INDEXER = "indexer"
+    # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
+    # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
+    DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
+    DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
-    ALL_PAGES      : every page in [0, kv_hit) must exist (default).
+    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
     """
 
@@ -90,12 +86,24 @@ class PoolTransfer:
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
+    nodes_to_load      : evicted nodes this transfer covers
     """
 
     name: PoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    nodes_to_load: Optional[List[Any]] = None
+    indices_from_pool: Optional[PoolName] = None
+
+
+@dataclass(frozen=True)
+class SidecarPoolSpec:
+    """Pool whose transfer indices are reused from one real source pool."""
+
+    pool_name: PoolName
+    indices_from_pool: PoolName
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
@@ -307,17 +315,21 @@ class HiCacheFile(HiCacheStorage):
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
-        tp_rank, tp_size, model_name, is_mla_model = (
+        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
+            storage_config.pp_rank,
+            storage_config.pp_size,
             storage_config.model_name,
             storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
-        if is_mla_model:
-            self.config_suffix = f"_{model_name}"
-        else:
-            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        enable_pp = pp_size > 1
+        self.config_suffix = f"_{model_name}"
+        if not is_mla_model:
+            self.config_suffix += f"_{tp_rank}_{tp_size}"
+        if enable_pp:
+            self.config_suffix += f"_{pp_size}_{pp_rank}"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

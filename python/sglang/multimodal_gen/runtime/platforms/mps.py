@@ -32,6 +32,11 @@ class MpsPlatform(Platform):
         return False
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("mps")
 

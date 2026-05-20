@@ -1,4 +1,4 @@
-"""MI35x Kimi-K2.5-MXFP4 aiter MLA backend accuracy tests (4-GPU)
+"""MI35x Kimi-K2.5-MXFP4 aiter MLA backend accuracy tests (8-GPU)
 
 Tests Kimi-K2.5-MXFP4 with the aiter unified attention backend on MI35x,
 covering both default and FP8 KV cache configurations.
@@ -6,13 +6,6 @@ covering both default and FP8 KV cache configurations.
 The FP8 KV cache variant validates the fix for assertion failure
 `q_scale.has_value() && kv_scale.has_value()` in aiter ASM MLA decode
 when layer.k_scale is None (the RadixAttention default).
-
-NOTE: TP must be <= 4 for Kimi-K2.5 with the aiter MLA kernel.
-Kimi-K2.5 has num_attention_heads=64; with tp_size=8 that gives
-64/8 = 8 heads per GPU, but the aiter ASM MLA kernel requires
-heads_per_gpu % 16 == 0. With tp_size=4: 64/4 = 16 heads, which
-satisfies the constraint. (DeepSeek-R1/V3 has 128 heads so TP=8
-yields 128/8 = 16 heads and works fine.)
 
 Registry: nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla suite
 """
@@ -61,7 +54,7 @@ class ModelConfig:
     """Configuration for a model variant to test."""
 
     model_path: str
-    tp_size: int = 4
+    tp_size: int = 8
     accuracy_threshold: float = 0.92
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
@@ -85,9 +78,7 @@ def get_kimi_k25_mxfp4_models() -> List[ModelConfig]:
     model_path = get_model_path()
     common_kwargs = {
         "model_path": model_path,
-        # TP=4 required: Kimi-K2.5 has 64 attn heads; aiter ASM MLA needs
-        # heads_per_gpu % 16 == 0 -> 64/4=16 works, 64/8=8 does not.
-        "tp_size": 4,
+        "tp_size": 8,
         "accuracy_threshold": 0.92,
         "timeout": 3600,
     }

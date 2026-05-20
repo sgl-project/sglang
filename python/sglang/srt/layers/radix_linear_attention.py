@@ -117,18 +117,33 @@ def unified_linear_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_out_cache_loc_swa is not None:
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
+        if hasattr(token_to_kv_pool, "set_swa_loc"):
+            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
     ret = forward_batch.attn_backend.forward(
         layer=attention_layer,
         forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv,
-        a=a,
-        b=b,
+        mixed_qkv=mixed_qkv[:real_num_tokens],
+        a=a[:real_num_tokens],
+        b=b[:real_num_tokens],
     )
+    forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+    if original_out_cache_loc_swa is not None and hasattr(
+        token_to_kv_pool, "set_swa_loc"
+    ):
+        token_to_kv_pool.set_swa_loc(original_swa_loc)
 
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
+    output[:, :real_num_tokens].copy_(ret)
     return

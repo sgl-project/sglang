@@ -21,9 +21,16 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
-import re
 from typing import Dict, Optional
 
+from sglang.srt.managers.template_detection import (
+    REASONING_PARSER_RULES,
+    TOOL_CALL_PARSER_RULES,
+    ReasoningToggleConfig,
+    build_detection_context,
+    detect_reasoning_pattern,
+    match_rules,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
@@ -58,6 +65,9 @@ class TemplateManager:
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = "openai"
         self._force_reasoning: bool = False
+        self._reasoning_config: Optional[ReasoningToggleConfig] = None
+        self._suggested_reasoning_parser: Optional[str] = None
+        self._suggested_tool_call_parser: Optional[str] = None
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -84,21 +94,39 @@ class TemplateManager:
         """
         return self._force_reasoning
 
-    def _detect_reasoning_pattern(self, template: str) -> bool:
-        """
-        Detect if the chat template contains reasoning/thinking patterns.
-        """
-        if template is None:
-            return False
+    @property
+    def reasoning_config(self) -> Optional[ReasoningToggleConfig]:
+        """Get the reasoning toggle config inferred from chat template."""
+        return self._reasoning_config
 
-        # TODO: remove this hard code the reasoning pattern
-        force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
-        has_reasoning = re.search(force_reasoning_pattern, template) is not None
+    @property
+    def suggested_reasoning_parser(self) -> Optional[str]:
+        """Get the auto-detected reasoning parser name, or None."""
+        return self._suggested_reasoning_parser
 
-        if has_reasoning:
-            logger.info("Detected the force reasoning pattern in chat template.")
+    @property
+    def suggested_tool_call_parser(self) -> Optional[str]:
+        """Get the auto-detected tool-call parser name, or None."""
+        return self._suggested_tool_call_parser
 
-        return has_reasoning
+    def _run_template_detection(self, template, tokenizer) -> None:
+        """Run reasoning pattern and parser detection on a template."""
+        self._force_reasoning, self._reasoning_config = detect_reasoning_pattern(
+            template
+        )
+        # Build context once, reuse for both parser detections (avoids
+        # duplicate tokenizer.get_vocab() calls).
+        ctx = build_detection_context(
+            template, tokenizer, self._reasoning_config, self._force_reasoning
+        )
+        if ctx is None:
+            return
+        self._suggested_reasoning_parser = match_rules(
+            ctx, REASONING_PARSER_RULES, "reasoning parser"
+        )
+        self._suggested_tool_call_parser = match_rules(
+            ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
+        )
 
     def load_chat_template(
         self,
@@ -141,11 +169,18 @@ class TemplateManager:
                         "No chat template found, defaulting to 'string' content format"
                     )
 
-        # Detect reasoning pattern from chat template
+        # Detect reasoning pattern and suggest parser from chat template
         if tokenizer_manager.tokenizer:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
-            )
+            template = tokenizer_manager.tokenizer.chat_template
+            self._run_template_detection(template, tokenizer_manager.tokenizer)
+            if self._suggested_reasoning_parser:
+                logger.info(
+                    f"Auto-detected reasoning parser: {self._suggested_reasoning_parser}"
+                )
+            if self._suggested_tool_call_parser:
+                logger.info(
+                    f"Auto-detected tool-call parser: {self._suggested_tool_call_parser}"
+                )
 
     def _load_explicit_chat_template(
         self, tokenizer_manager: TokenizerManager, chat_template_arg: str

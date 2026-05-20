@@ -106,21 +106,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
-    remote_instance_transfer_engine_info = {}
-    for data in scheduler_infos:
-        if (
-            "tp_rank" in data
-            and "remote_instance_transfer_engine_session_id" in data
-            and "remote_instance_transfer_engine_weights_info_dict" in data
-        ):
-            remote_instance_transfer_engine_info[data["tp_rank"]] = (
-                data["remote_instance_transfer_engine_session_id"],
-                data["remote_instance_transfer_engine_weights_info_dict"],
-            )
-    return remote_instance_transfer_engine_info
-
-
 def register_memory_region(model, transfer_engine):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)

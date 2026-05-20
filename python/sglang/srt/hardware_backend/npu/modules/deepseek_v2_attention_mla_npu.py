@@ -11,9 +11,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
-from sglang.srt.layers.attention.nsa.utils import (
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.dsa_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 
@@ -43,9 +43,9 @@ def forward_mha_prepare_npu(
             )
         )
 
-        # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+        # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-        if m.use_nsa:
+        if m.use_dsa:
             q_lora = m.q_a_layernorm(q)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             _ = m.indexer(
@@ -206,7 +206,7 @@ def forward_mla_prepare_npu(
             k_nope = m.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if m.use_nsa:
+            if m.use_dsa:
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
@@ -226,7 +226,7 @@ def forward_mla_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -302,6 +302,7 @@ def forward_dsa_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
+    prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
@@ -358,7 +359,9 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535:
+            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
+                forward_batch
+            ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
                     m.q_a_layernorm,
@@ -395,21 +398,24 @@ def forward_dsa_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    topk_indices = m.indexer(
-        hidden_states,
-        q_lora,
-        positions,
-        forward_batch,
-        m.layer_id,
-        layer_scatter_modes,
-        dynamic_scale,
-    )
+    if m.skip_topk:
+        topk_indices = prev_topk_indices
+    else:
+        topk_indices = m.indexer(
+            hidden_states,
+            q_lora,
+            positions,
+            forward_batch,
+            m.layer_id,
+            layer_scatter_modes,
+            dynamic_scale,
+        )
 
     return (
         q_pe,
@@ -472,7 +478,10 @@ def forward_dsa_core_npu(
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
     output, _ = m.o_proj(attn_bmm_output)
-    return output
+    if not m.next_skip_topk:
+        return output, None
+    else:
+        return output, topk_indices
 
 
 def npu_mla_preprocess(

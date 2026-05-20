@@ -42,7 +42,6 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
-    **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
@@ -83,6 +82,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        return_lse=return_softmax_lse,
     )
 
     if return_softmax_lse:

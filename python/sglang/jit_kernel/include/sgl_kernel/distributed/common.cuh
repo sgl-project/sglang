@@ -48,6 +48,8 @@ struct alignas(128) Semaphore {
 
 struct PullController {
  public:
+  using SignalType = Semaphore;
+
   PullController(void** signals, uint32_t num_gpu) {
     for (uint32_t i = 0; i < num_gpu; ++i) {
       m_signals[i] = static_cast<Semaphore*>(signals[i]);
@@ -90,25 +92,29 @@ struct PullController {
 
 struct PushController {
  public:
+  using SignalType = uint32_t;
   static constexpr int64_t kNumStages = 2;
 
-  PushController(void* ptr) : m_local_signal(static_cast<Semaphore*>(ptr)) {}
+  PushController(void* ptr) : m_local_signal(static_cast<SignalType*>(ptr)) {}
 
-  SGL_DEVICE uint32_t epoch() const {
-    return m_local_signal[blockIdx.x].get_counter();
+  SGL_DEVICE SignalType epoch() const {
+    return m_local_signal[blockIdx.x];
   }
 
   SGL_DEVICE void exit() const {
     __syncthreads();
     if (threadIdx.x == 0) {
-      auto& signal = m_local_signal[blockIdx.x];
-      const auto epoch = signal.get_counter();
-      signal.set_counter((epoch + 1) % kNumStages);
+      this->exit_unsafe(blockIdx.x);
     }
   }
 
+  SGL_DEVICE void exit_unsafe(uint32_t which) const {
+    auto& signal = m_local_signal[which];
+    signal = (signal + 1) % kNumStages;
+  }
+
  private:
-  Semaphore* m_local_signal;
+  SignalType* m_local_signal;
 };
 
 }  // namespace device::distributed

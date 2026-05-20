@@ -11,7 +11,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
 #Deepep communication settings
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export HCCL_BUFFSIZE=1600
 
@@ -64,7 +63,6 @@ export STREAMS_PER_DEVICE=32
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
 #Deepep communication settings
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1536
 
 #npu acceleration operator
@@ -214,7 +212,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -262,7 +259,6 @@ done
 2. SGLang Model Gateway (former Router):
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \

@@ -14,7 +14,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket_on_host
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
+from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -33,9 +33,10 @@ from sglang.test.vlm_utils import (
 
 # Omni model for local testing; override via env var EPD_OMNI_MODEL
 DEFAULT_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 
 
-register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=97, suite="nightly-4-gpu", nightly=True)
 
 
 @unittest.skipIf(
@@ -618,13 +619,18 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
-class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
+class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
+
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port = f"{int(cls.lb_port) + 300}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
 
@@ -743,86 +749,205 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        """
-        Evaluate a VLM on the MMMU validation set with lmms-eval.
-        Reference: test_vlm_models.py
 
-        Args:
-            model_version: Model version/checkpoint to evaluate
-            output_path: Path to save evaluation results
-            limit: Number of samples to evaluate (default: "50" for CI time constraints)
-        """
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
+@unittest.skipIf(
+    is_in_ci(),
+    "Qwen3.5 EPD image/video test runs locally only",
+)
+class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
+    """EPD disaggregation test for Qwen3.5 image and video requests."""
 
-        model_args = f'model_version="{model_version}",tp={tp}'
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.process_encode = None
+        cls.model = QWEN35_27B_MODEL
+        cls.encode_port = f"{int(cls.lb_port) + 300}"
+        cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
+        cls.language_url = cls.prefill_url
+        cls.image_man_ironing = IMAGE_MAN_IRONING_URL
+        cls.video_jobs = VIDEO_JOBS_URL
 
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
+        print(
+            f"Setting up Qwen3.5 encoder disaggregation: model={cls.model}, "
+            f"encode={cls.encode_port}, language={cls.prefill_port}"
+        )
+
+        cls.start_encode()
+        cls.start_prefill()
+
+        cls.wait_server_ready(cls.encode_url + "/health", process=cls.process_encode)
+        cls.wait_server_ready(cls.language_url + "/health", process=cls.process_prefill)
+
+        cls.api_key = "sk-123456"
+
+    @classmethod
+    def start_encode(cls):
+        encode_args = [
+            "--trust-remote-code",
+            "--encoder-only",
+            "--encoder-transfer-backend",
+            "zmq_to_scheduler",
+            "--tp",
+            "1",
+            "--port",
+            cls.encode_port,
+            "--reasoning-parser",
+            "qwen3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
+        cls.process_encode = popen_launch_server(
+            cls.model,
+            base_url=cls.encode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=encode_args,
+        )
 
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
+    @classmethod
+    def start_prefill(cls):
+        language_args = [
+            "--trust-remote-code",
+            "--language-only",
+            "--encoder-urls",
+            cls.encode_url,
+            "--encoder-transfer-backend",
+            "zmq_to_scheduler",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--port",
+            cls.prefill_port,
+            "--reasoning-parser",
+            "qwen3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
+        ]
+        cls.process_prefill = popen_launch_server(
+            cls.model,
+            base_url=cls.language_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=language_args,
+        )
 
-    def test_mmmu(self):
-        """Test MMMU evaluation with EPD disaggregation"""
-        import glob
-        import json
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process_lb:
+            kill_process_tree(cls.process_lb.pid)
+        if cls.process_decode:
+            kill_process_tree(cls.process_decode.pid)
+        if cls.process_prefill:
+            kill_process_tree(cls.process_prefill.pid)
+        if cls.process_encode:
+            kill_process_tree(cls.process_encode.pid)
 
-        output_path = "./logs/epd_one_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
+    def _client(self):
+        return openai.Client(api_key=self.api_key, base_url=f"{self.language_url}/v1")
 
-        # Get the result file
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
+    def test_image(self):
+        client = self._client()
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": self.image_man_ironing},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            max_tokens=256,
+            extra_body={"reasoning_effort": "none"},
+        )
+        text = response.choices[0].message.content
+        print(f"[Qwen3.5 EPD] Image response:\n{text}")
+        self.assertIsNotNone(text)
+        self.assertGreater(len(text), 0)
 
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
+        text_lower = text.lower()
+        self.assertTrue(
+            any(w in text_lower for w in ("man", "person", "driver")),
+            f"Image response should mention a person: {text}",
+        )
+        self.assertTrue(
+            any(w in text_lower for w in ("iron", "cloth", "hang", "holding")),
+            f"Image response should mention ironing/clothes: {text}",
+        )
 
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result: {result}")
+    def test_video(self):
+        client = self._client()
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the video."},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": self.video_jobs},
+                        },
+                    ],
+                },
+            ],
+            max_tokens=1024,
+            stream=False,
+        )
+        text = response.choices[0].message.content
+        print(f"[Qwen3.5 EPD] Video response:\n{text}")
+        self.assertIsNotNone(text)
+        self.assertGreater(len(text), 0)
 
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy: {mmmu_accuracy:.4f}")
+        text_lower = text.lower()
+        self.assertTrue(
+            any(
+                w in text_lower
+                for w in ("ipod", "device", "microphone", "smartphone", "phone")
+            ),
+            f"Video response should mention a device: {text}",
+        )
+        self.assertTrue(
+            any(
+                w in text_lower
+                for w in (
+                    "man",
+                    "person",
+                    "individual",
+                    "speaker",
+                    "presenter",
+                    "steve",
+                    "hand",
+                    "hands",
+                )
+            ),
+            f"Video response should mention a person: {text}",
+        )
 
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
 
-
-class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
+class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
     Both encode servers run on GPU 0 (different ports) for testing load distribution.
     """
 
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port1 = f"{int(cls.lb_port) + 300}"
         cls.encode_port2 = f"{int(cls.lb_port) + 301}"
         cls.encode_url1 = f"http://{cls.base_host}:{cls.encode_port1}"
@@ -963,83 +1088,20 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        """
-        Evaluate a VLM on the MMMU validation set with lmms-eval.
-        Reference: test_vlm_models.py
-
-        Args:
-            model_version: Model version/checkpoint to evaluate
-            output_path: Path to save evaluation results
-            limit: Number of samples to evaluate (default: "50" for CI time constraints)
-        """
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        """Test MMMU evaluation with EPD disaggregation (multiple encoders)"""
-        import glob
-        import json
-
-        output_path = "./logs/epd_multi_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
-
-        # Get the result file
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
-
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
-
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result (multi encoder): {result}")
-
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
-
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
-class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
+class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase):
     """Test MMMU evaluation with gRPC encoder in EPD mode."""
+
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port = f"{int(cls.lb_port) + 304}"
         cls.encode_url = f"grpc://{cls.base_host}:{cls.encode_port}"
 
@@ -1188,63 +1250,6 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
-
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        import glob
-        import json
-
-        output_path = "./logs/epd_grpc_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
-
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
-
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
-
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result (grpc encoder): {result}")
-
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy (grpc encoder): {mmmu_accuracy:.4f}")
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")

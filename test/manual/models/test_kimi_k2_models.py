@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -48,22 +48,22 @@ class TestKimiK2Thinking(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (Kimi-K2-Thinking)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (Kimi-K2-Thinking)\n" f'{metrics["score"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.95)
+            self.assertGreater(metrics["score"], 0.95)
 
 
 if __name__ == "__main__":
