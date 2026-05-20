@@ -102,11 +102,12 @@ def fill_plan_input_per_forward(
 
     - plan_input_out.fb_req_pool_indices[:bs] ← forward_batch.req_pool_indices; rows beyond bs
       are zeroed (padding sentinel).
-    - plan_input_out.fb_prefix_lens[:bs] ← extend mode: forward_batch.extend_prefix_lens;
-      decode mode: forward_batch.seq_lens - 1. Rows beyond bs are zeroed (padding skipped via
-      req_pool_indices sentinel; the lens value there is irrelevant).
-    - plan_input_out.fb_extend_seq_lens[:bs] ← extend: forward_batch.extend_seq_lens;
-      decode: all-ones.
+    - plan_input_out.fb_prefix_lens[:bs] ← extend / target-verify / draft-extend (incl. v2):
+      forward_batch.extend_prefix_lens; decode mode: forward_batch.seq_lens - 1. Rows beyond bs
+      are zeroed (padding skipped via req_pool_indices sentinel; the lens value there is
+      irrelevant).
+    - plan_input_out.fb_extend_seq_lens[:bs] ← extend / target-verify / draft-extend (incl. v2):
+      forward_batch.extend_seq_lens; decode: all-ones.
     - extra_verify_* untouched — they stay all-zero / num_valid = 0 (allocated once with 0
       capacity).
 
@@ -127,7 +128,12 @@ def fill_plan_input_per_forward(
     plan_input_out.fb_extend_seq_lens.zero_()
 
     forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend():
+    # TODO: extend_prefix_lens / extend_seq_lens (and DRAFT_EXTEND_V2's separate forward_mode) are being refactored
+    # upstream; once the unified per-req prefix/extend lens are guaranteed populated for every forward mode, collapse
+    # this branch into a single unconditional copy.
+    if forward_mode is not None and forward_mode.is_extend(
+        include_draft_extend_v2=True
+    ):
         plan_input_out.fb_prefix_lens[:bs].copy_(
             forward_batch.extend_prefix_lens.to(torch.int32)
         )

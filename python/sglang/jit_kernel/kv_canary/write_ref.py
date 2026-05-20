@@ -73,7 +73,6 @@ def canary_write_step_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    enable_write_verify_inputs = int(enable_write_verify_inputs) != int(False)
     expected_input_tokens_host = expected_input_tokens.detach().to(
         device=work_device, dtype=torch.int64
     )

@@ -216,8 +216,32 @@ class TestSelfUnitRunner(CustomTestCase):
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
+        runner._health_and_stats.health_check_step()
+        runner._pump_and_allreduce._step_counter = 2000
         with self.assertRaises(RuntimeError):
             runner._health_and_stats.health_check_step()
+
+    def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
+        config = CanaryConfig(
+            mode=CanaryMode.RAISE,
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            sweep_interval=0,
+            allreduce_violation_signal=False,
+        )
+        runner = _make_runner(device=self.device, config=config)
+        runner._device_state.kernel_run_counters.zero_()
+        for tag in (
+            CanaryLaunchTag.HEAD_K_FULL,
+            CanaryLaunchTag.HEAD_V_FULL,
+            CanaryLaunchTag.TAIL_K_FULL,
+            CanaryLaunchTag.TAIL_V_FULL,
+        ):
+            runner._device_state.kernel_run_counters[tag.value] = 1
+
+        runner._pump_and_allreduce._step_counter = 1000
+        runner._health_and_stats.health_check_step()
+        runner._pump_and_allreduce._step_counter = 2000
+        runner._health_and_stats.health_check_step()
 
     def test_runner_disabled_short_circuits(self):
         config = CanaryConfig(mode=CanaryMode.OFF)

@@ -36,6 +36,7 @@ register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _X_NAMES = [
+    "scenario",
     "bs",
     "prefix_len",
     "mode",
@@ -154,6 +155,7 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
     )
 )
 def benchmark(
+    scenario: str,
     bs: int,
     prefix_len: int,
     mode: str,
@@ -164,6 +166,7 @@ def benchmark(
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
+        scenario=scenario,
         bs=bs,
         prefix_len=prefix_len,
         mode=mode,
@@ -224,6 +227,7 @@ def benchmark_kernel_kind(
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
+        scenario="kernel_kind",
         bs=32,
         prefix_len=4096,
         mode="extend",

@@ -27,30 +27,6 @@ def install_canary(
     model_runner: "ModelRunner",
     token_oracle_manager: Optional["TokenOracleManager"] = None,
 ) -> Optional[CanaryRunner]:
-    """Build and install canary for a ModelRunner. Returns the CanaryRunner, or None when
-    config.mode == "off". The caller is responsible for assigning the return value onto the
-    ModelRunner (``model_runner.canary_runner = install_canary(...)``).
-
-    Steps when enabled:
-
-    1. Build CanaryConfig from server_args + env vars.
-    2. attach_canary_buffers on model_runner.token_to_kv_pool.
-    3. Build CanaryEndpoint tuple.
-    4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
-    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers and,
-       when ``token_oracle_manager`` is provided, wires it into the per-forward input-check path
-       so expected_input_* tensors are filled from the same oracle that drives sampling).
-    6. Monkeypatch the model nn.Module's ``.forward`` to bracket the original with
-       ``canary_runner.launch_head_kernels(forward_batch)`` +
-       ``canary_runner.launch_tail_kernels(forward_batch)``. These two calls run kernel launches
-       only — they execute inside cuda graph capture region and therefore get captured into the
-       graph, auto-replaying every step.
-
-    The host-side hooks are exposed as a single context manager
-    ``canary_runner.with_forward_pass(forward_batch)``. ``ModelRunner.forward`` wraps its
-    ``_forward_raw(...)`` call with that context (falling back to contextlib.nullcontext when
-    no canary is installed).
-    """
     config = CanaryConfig.from_env(server_args)
     if config.mode == "off":
         return None

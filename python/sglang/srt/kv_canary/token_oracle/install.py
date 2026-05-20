@@ -18,5 +18,5 @@ def install_token_oracle_from_env(
     if server_args.sampling_backend != "token_oracle":
         return None
 
-    oracle = HashOracle(seed=0, vocab_size=vocab_size)
+    oracle = HashOracle(vocab_size=vocab_size)
     return install_oracle_sampler(oracle=oracle)

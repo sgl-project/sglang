@@ -10,6 +10,7 @@ from utils import mock_model_engine_kwargs
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
+from sglang.srt.kv_canary.token_oracle.oracle_manager import _stable_hash_rid_i64
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -32,6 +33,7 @@ class _StubForwardBatch:
     req_pool_indices: torch.Tensor
     forward_mode: _StubForwardMode
     extend_seq_lens: object
+    rids: list
 
 
 def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) -> int:
@@ -44,15 +46,18 @@ def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) ->
 
 class TestFillExpectedInputs(CustomTestCase):
     def test_fill_expected_inputs_decode_one_token_per_req(self) -> None:
-        oracle = HashOracle(seed=1, vocab_size=32000)
+        oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
+        rid_a = "req-a"
+        rid_b = "req-b"
         fb = _StubForwardBatch(
             input_ids=torch.tensor([0, 0], dtype=torch.int64),
             positions=torch.tensor([10, 20], dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=False),
             extend_seq_lens=None,
+            rids=[rid_a, rid_b],
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=8, device=torch.device("cpu")
@@ -66,22 +71,31 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(
             expected_inputs.tokens[:2].tolist(),
             [
-                _scalar_expected_token(oracle, req_id=5, position=10),
-                _scalar_expected_token(oracle, req_id=7, position=20),
+                _scalar_expected_token(
+                    oracle, req_id=_stable_hash_rid_i64(rid_a), position=10
+                ),
+                _scalar_expected_token(
+                    oracle, req_id=_stable_hash_rid_i64(rid_b), position=20
+                ),
             ],
         )
         self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])
 
     def test_fill_expected_inputs_extend_uses_extend_seq_lens(self) -> None:
-        oracle = HashOracle(seed=2, vocab_size=32000)
+        oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
+        rid_a = "req-a"
+        rid_b = "req-b"
+        hashed_a = _stable_hash_rid_i64(rid_a)
+        hashed_b = _stable_hash_rid_i64(rid_b)
         fb = _StubForwardBatch(
             input_ids=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
             positions=torch.tensor([0, 1, 2, 0], dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=True),
             extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
+            rids=[rid_a, rid_b],
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=8, device=torch.device("cpu")
@@ -95,25 +109,28 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(
             expected_inputs.tokens[:4].tolist(),
             [
-                _scalar_expected_token(oracle, req_id=5, position=0),
-                _scalar_expected_token(oracle, req_id=5, position=1),
-                _scalar_expected_token(oracle, req_id=5, position=2),
-                _scalar_expected_token(oracle, req_id=7, position=0),
+                _scalar_expected_token(oracle, req_id=hashed_a, position=0),
+                _scalar_expected_token(oracle, req_id=hashed_a, position=1),
+                _scalar_expected_token(oracle, req_id=hashed_a, position=2),
+                _scalar_expected_token(oracle, req_id=hashed_b, position=0),
             ],
         )
         self.assertEqual(expected_inputs.positions[:4].tolist(), [0, 1, 2, 0])
 
-    def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_req_pool(
+    def test_fill_expected_inputs_zero_tokens_is_noop_but_stashes_rids(
         self,
     ) -> None:
-        hook = install_oracle_sampler(oracle=HashOracle(seed=0, vocab_size=100))
+        hook = install_oracle_sampler(oracle=HashOracle(vocab_size=100))
 
+        rid_a = "req-a"
+        rid_b = "req-b"
         fb = _StubForwardBatch(
             input_ids=torch.empty(0, dtype=torch.int64),
             positions=torch.empty(0, dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=False),
             extend_seq_lens=None,
+            rids=[rid_a, rid_b],
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=4, device=torch.device("cpu")
@@ -124,8 +141,11 @@ class TestFillExpectedInputs(CustomTestCase):
             expected_inputs_out=expected_inputs,
         )
 
-        self.assertIsNotNone(hook._req_pool_indices_per_row)
-        self.assertEqual(hook._req_pool_indices_per_row.tolist(), [5, 7])
+        self.assertIsNotNone(hook._rids_per_row)
+        self.assertEqual(
+            hook._rids_per_row.tolist(),
+            [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
+        )
 
 
 class TestMockModelEngineKwargs(CustomTestCase):

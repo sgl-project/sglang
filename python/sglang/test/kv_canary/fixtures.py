@@ -234,12 +234,14 @@ def make_forward_batch(
     extend_prefix_lens: Optional[torch.Tensor] = None,
     extend_seq_lens: Optional[torch.Tensor] = None,
     is_extend: bool = False,
+    is_draft_extend_v2: bool = False,
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
 ) -> SimpleNamespace:
     mode = SimpleNamespace(
-        is_extend=lambda: is_extend,
+        is_extend=lambda include_draft_extend_v2=False: is_extend
+        or (include_draft_extend_v2 and is_draft_extend_v2),
         is_mixed=lambda: False,
     )
     return SimpleNamespace(

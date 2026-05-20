@@ -28,8 +28,8 @@ class TestInstallOracleSampler(CustomTestCase):
     def test_install_oracle_sampler_twice_returns_distinct_hooks_with_replaced_oracle(
         self,
     ) -> None:
-        oracle_a = HashOracle(seed=10, vocab_size=100)
-        oracle_b = HashOracle(seed=99, vocab_size=100)
+        oracle_a = HashOracle(vocab_size=100)
+        oracle_b = HashOracle(vocab_size=100)
 
         hook_a = install_oracle_sampler(oracle=oracle_a)
         self.assertIn("token_oracle", _CUSTOM_SAMPLER_FACTORIES)
