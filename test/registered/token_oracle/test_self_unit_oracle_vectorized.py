@@ -1,5 +1,3 @@
-"""Vectorized oracle batch helpers (predict_input_tokens_for_plan / predict_next_tokens_for_active_batch)."""
-
 from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_cuda_ci

@@ -1,5 +1,3 @@
-"""End-to-end multimodal smoke under token_oracle + canary."""
-
 from __future__ import annotations
 
 import pytest
