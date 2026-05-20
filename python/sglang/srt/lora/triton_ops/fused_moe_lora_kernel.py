@@ -8,7 +8,23 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
+from sglang.srt.utils.common import is_blackwell_supported, is_hip, is_sm90_supported
+
+_IS_HIP = is_hip()
+
+
+def _safe_num_stages(num_stages: int, dtype: torch.dtype) -> int:
+    """Clamp software-pipelining stages to a value the backend can compile.
+
+    The Triton AMD backend fails to legalize
+    `ttg.async_copy_global_to_local` for the fp32 GEMM emitted by
+    `_fused_moe_lora_kernel` when `num_stages > 1`. fp16 / bf16 pipeline
+    fine, so we only disable pipelining for the fp32 path on HIP.
+    """
+    if _IS_HIP and dtype == torch.float32:
+        return 1
+    return num_stages
+
 
 # Import SGLang's standard PDL support detection
 
@@ -249,7 +265,7 @@ def _fused_moe_lora_shrink(
         "BLOCK_SIZE_K": block_size_k,
         "GROUP_SIZE_M": group_size_m,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_stages": _safe_num_stages(num_stages, qcurr_hidden_states.dtype),
         "SPLIT_K": split_k,
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
@@ -358,7 +374,7 @@ def _fused_moe_lora_expand(
         "BLOCK_SIZE_K": block_size_k,
         "GROUP_SIZE_M": group_size_m,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_stages": _safe_num_stages(num_stages, a_intermediate_cache1.dtype),
         "SPLIT_K": split_k,  # Set split_k = 1 for expand calls
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
